@@ -75,7 +75,12 @@ all shared state: configuration, the route table, counters and the ledger.
 
 The MVP runs the brain inside a single api process. The brain reaches the
 rest only through Postgres, so moving it into its own process later changes
-packaging, not design. The [README](./README.md) documents the architecture.
+packaging, not design.
+
+Requests move between the pieces as Hale bus topics, keyed by node and by
+request. There is no message broker: with more than one api instance those
+topics are bound to NATS, which is a binding on `main`, not new code. State
+never travels as events; it stays in Postgres. The [README](./README.md) documents the architecture.
 
 ## Phases
 

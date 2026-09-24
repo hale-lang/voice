@@ -71,9 +71,9 @@ callers and nodes cannot tell how many api instances stand behind the
 address.
 
 **In the MVP there is one process.** The brain runs inside the api, and there
-is one api instance. The brain still reaches the rest only through Postgres,
-never through memory or the bus, so moving it into its own program later is
-a change of packaging, not of design. See [In Hale](#in-hale).
+is one api instance. The brain still shares state with the rest only through
+Postgres, never through memory or the bus, so moving it into its own program
+later is a change of packaging, not of design. See [In Hale](#in-hale).
 
 ### Nouns
 
@@ -108,12 +108,13 @@ the coordinator admits only nodes it issued a token to.
    the answer is `503 no_capacity` with the earliest reset. If the seats are
    only busy, the api tries again as slots free or the route table changes,
    until the request's deadline.
-4. **Serve.** The api sends `serve` over the connection of the slot's node.
-   If another api instance holds that connection, the request is forwarded
-   to it. The body is the standard Open Responses request; a Chat
-   Completions request is converted first. The node's engine runs, and its
-   standard streaming events are relayed to the caller as they arrive, as
-   server-sent events or collected into one response.
+4. **Serve.** The api publishes `serve` on a bus topic keyed by node, and
+   the session holding that node's connection sends it on. The body is the
+   standard Open Responses request; a Chat Completions request is converted
+   first. The node's engine runs, and its standard streaming events come
+   back on a topic keyed by request, to whichever instance holds the
+   caller, and are relayed as they arrive, as server-sent events or
+   collected into one response. See [Events](#events).
 5. **Retry.** If the seat fails before anything reached the caller, the api
    releases the slot and claims another, on a different seat and within the
    named account if there is one. The move is recorded as an attempt. After
@@ -142,7 +143,8 @@ The brain turns the state of the fleet into rows the api can claim.
   the next one. That is the compare-and-swap, and Postgres already has it.
 - **Versions.** Each rewrite bumps the table's version. `pond/pq` has no
   `LISTEN/NOTIFY` yet, so the api polls the version, and rereads the table
-  when a claim misses. Notification can replace the polling once pq has it.
+  when a claim misses. A change notice on the bus replaces the polling once
+  there is more than one process (see [Events](#events)).
 - **Leases.** Every api instance heartbeats a row. When one stops, the
   brain frees its claimed slots, releases its reservations, and records its
   in-flight requests as abandoned.
@@ -150,6 +152,40 @@ The brain turns the state of the fleet into rows the api can claim.
 The brain being down does not stop serving. Slots already written can still
 be claimed and are still bounded by each seat's concurrency; they only go
 stale.
+
+## Events
+
+Voice is evented through Hale's bus, and has no message broker. Everything
+that moves between the pieces of a request is a typed topic:
+
+- `serve`, keyed by node: from the instance that claimed the slot to the
+  session holding the node's connection.
+- the node's events and its `result`, keyed by request: from that session
+  to the child holding the caller's request.
+
+Each subscriber names its own key (`where key == ...`), so nothing filters
+traffic in a handler. In one process these are in-memory dispatches.
+
+**Scaling out adds no code.** With several api instances, the node's
+connection and the caller's request can be on different instances. The
+request topics are then bound to NATS in `main`'s `bindings { }` block,
+through pond's NATS adapter
+([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
+and the same publishes and subscriptions cross instances. The same
+connection carries the brain's notice that the route table changed, which
+ends the polling. See Hale's
+[across binaries](https://hale-lang.org/docs/services/multi-binary).
+
+**What does not go on the bus: state.** The claim, the reservation and the
+settlement are transactions, and a broker cannot make them atomic, so they
+stay in Postgres. Usage is written once, to the ledger; publishing it to a
+broker as well would be a second write that can disagree with the first. A
+consumer that wants usage as it happens reads the ledger by cursor.
+
+**Why not a broker from the start:** in one process there is nothing for it
+to carry that the bus does not already deliver, and it would be one more
+stateful service to run. It earns its place with the second api instance,
+and adding it then is a binding, not a redesign.
 
 ## State
 
@@ -250,9 +286,9 @@ also runs the brain. The shapes come from Hale's
   ends. A streaming request takes over its connection to write server-sent
   events itself.
 - Each connected node is an accepted child holding its WebSocket (server
-  side of `pond/websocket`). It publishes the node's events on a topic keyed
-  by `request_id`, and each request child subscribes to its own key, so no
-  handler filters traffic.
+  side of `pond/websocket`). It subscribes to `serve` for its own node, and
+  publishes the node's events on a topic keyed by `request_id`, to which
+  each request child subscribes with its own key.
 - The store owns the Postgres connections: a pool for reads and a dedicated
   connection for transactions, since `pq`'s pool does not do transactions.
   Because `pq` blocks, the store is pinned, away from the pool that serves
@@ -263,12 +299,12 @@ also runs the brain. The shapes come from Hale's
 - One locus with its own store and its own Postgres connection. It takes a
   Postgres advisory lock before doing anything, so there is only ever one
   brain, even when several api instances each start one.
-- It has no bus edges to the api's loci. That is the seam that makes the
-  split cheap, and it is stated as a claim, so the compiler refuses a
-  shortcut through memory.
+- It shares no state with the api's loci except through Postgres; the only
+  thing it may publish is the notice that the route table changed. That is
+  the seam that makes the split cheap, and it is stated as a claim, so the
+  compiler refuses a shortcut through memory.
 - Splitting it out is a new `main` that instantiates it. Running a second api
-  instance adds one piece of code: forwarding a request to the instance that
-  holds its node's connection.
+  instance is a `bindings { }` entry per request topic, not new code.
 
 **Node**
 
@@ -288,4 +324,5 @@ also runs the brain. The shapes come from Hale's
 - **Personal:** the api and Postgres on a machine that stays up, with a node
   on each machine whose CLIs are logged in, one seat per account.
 - **Scaled out:** several api instances behind a load balancer that also
-  terminates TLS, the brain as its own process, and nodes anywhere.
+  terminates TLS, a NATS server carrying the request topics between them,
+  the brain as its own process, and nodes anywhere.

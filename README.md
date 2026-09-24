@@ -29,35 +29,51 @@ The code conforms to these documents, not the other way round.
      callers                                operator, UI
         |                               +-------------------+
         | /v1                           | /admin/v1         | /node/v1
-        |                               |                   |
         v                               v                   |
-  +-------------------- coordinator --------------------+   |
-  |  gateway -> enforcer -> router -> node sessions     |   |
+  +--------------------- api (x N) ---------------------+   |
+  |  gateway -> admission -> claim -> node sessions     |   |
   |                                                     |   |
-  |  config store   ledger writer                       |   |
-  |                                                     |   |
+  |  settle, ledger                                     |   |
   +-----------------------------------------------------+   |
-          |             |                   ^               |
-          |   SQL       |                   |               |
-          v             v                   | WebSocket,    |
-  +-----------------------------+           | opened by     |
-  |          Postgres           |           | the node      |
-  +-----------------------------+           |               |
-                                            |               v
-                                  +---------+--- node ------+-----+
-                                  |  session -> seats -> engines  |
-                                  |  data directory               |
-                                  +-------------------------------+
+          |                                 ^               |
+          | SQL                             | WebSocket,    |
+          v                                 | opened by     |
+  +--------- Postgres --------+             | the node      v
+  |  configuration            |   +---------+ node (x N) ---+-----+
+  |  route table, counters    |   |  session -> seats -> engines  |
+  |  ledger                   |   |  data directory               |
+  +---------------------------+   +-------------------------------+
+          ^
+          | SQL
+  +------- brain (x 1) -------+
+  |  reads state, writes      |
+  |  the route table          |
+  +---------------------------+
 ```
 
-- **The coordinator** is the one endpoint. It serves callers and the admin
-  plane, holds every node's connection, decides which seat serves each
-  request, and meters it. There is one, on a machine that stays up.
+- **The api** is the endpoint. Every instance serves the caller plane and
+  the admin plane, accepts nodes' connections, admits and routes requests,
+  and settles them. Instances hold no state of their own beyond their open
+  connections, so they scale out behind a load balancer and restart one at a
+  time.
+- **The brain** keeps the route table. It reads what the api instances write
+  (seat declarations, heartbeats, quota windows, configuration) and decides
+  which seats should take the next requests for each model. There is exactly
+  one, it is not on the request path, and it talks to nothing but Postgres.
 - **A node** runs on each machine that has engines. It runs the seats its
-  operator configured and nothing else, and it dials out to the coordinator,
-  so it needs no open port.
-- **Postgres** is the coordinator's only durable store. Nodes have no
-  database.
+  operator configured and nothing else, and dials out to the api, so it needs
+  no open port.
+- **Postgres** is the shared state: configuration, the route table,
+  counters and the ledger. Nodes have no database.
+
+What the specs call the **coordinator** is the api and the brain together;
+callers and nodes cannot tell how many api instances stand behind the
+address.
+
+**In the MVP there is one process.** The brain runs inside the api, and there
+is one api instance. The brain still reaches the rest only through Postgres,
+never through memory or the bus, so moving it into its own program later is
+a change of packaging, not of design. See [In Hale](#in-hale).
 
 ### Nouns
 
@@ -79,38 +95,61 @@ the coordinator admits only nodes it issued a token to.
 
 ## A request, end to end
 
-1. **Admit.** The gateway reads the key and finds its project, from memory.
-   It checks that the model is visible to the key, the data class is one the
-   project may send, and the named account, if any, is one the key may
-   spend.
-2. **Reserve.** The enforcer reserves the estimated input plus the requested
-   maximum output against every limit that applies (project, key, model and
-   account) and against the project's budget, at the model's current price.
-   Anything that doesn't fit is refused with `429` before any work is done.
-3. **Route.** The router takes the seats that serve the model, sit on a
-   connected node, carry the data class and spend a permitted account. It
-   drops accounts with no headroom and seats at their concurrency, then
-   picks the account with the most headroom and its least-loaded seat. If
-   every account is exhausted the answer is `503 no_capacity`. If the seats
-   are only busy, the request waits for one until its deadline.
-4. **Serve.** The coordinator sends `serve` to the seat's node over that
-   node's connection. The body is the standard Open Responses request; a
-   Chat Completions request is converted first. The node's engine runs, and
-   its standard streaming events come back and are relayed to the caller as
-   they arrive, as server-sent events or collected into one response.
-5. **Retry.** If the seat fails before anything reached the caller, the
-   request moves to another seat (within the named account, if there is
-   one), and the move is recorded as an attempt. After output has begun, a
-   failure fails the response.
-6. **Settle.** The node's `result` carries the model that actually ran,
-   cache writes, timing and, from the CLI engines, the account's quota
-   windows. The enforcer settles the reservation on actual usage, the ledger
-   writer queues the usage record, and the response's `voice` object reports
-   what served it and what it cost.
+1. **Admit.** The api reads the key and finds its project. It checks that
+   the model is visible to the key, the data class is one the project may
+   send, and the named account, if any, is one the key may spend.
+2. **Claim and reserve,** in one transaction. The api claims the best free
+   slot in the route table for the model, among the permitted accounts, and
+   reserves the estimated input plus the requested maximum output against
+   every limit that applies (project, key, model and account) and against
+   the project's budget, at the model's current price. If a limit does not
+   fit, nothing is held and the answer is `429`.
+3. **Wait, if there is no slot.** If the model's accounts are all exhausted,
+   the answer is `503 no_capacity` with the earliest reset. If the seats are
+   only busy, the api tries again as slots free or the route table changes,
+   until the request's deadline.
+4. **Serve.** The api sends `serve` over the connection of the slot's node.
+   If another api instance holds that connection, the request is forwarded
+   to it. The body is the standard Open Responses request; a Chat
+   Completions request is converted first. The node's engine runs, and its
+   standard streaming events are relayed to the caller as they arrive, as
+   server-sent events or collected into one response.
+5. **Retry.** If the seat fails before anything reached the caller, the api
+   releases the slot and claims another, on a different seat and within the
+   named account if there is one. The move is recorded as an attempt. After
+   output has begun, a failure fails the response.
+6. **Settle,** in one transaction. The node's `result` carries the model
+   that actually ran, cache writes, timing and, from the CLI engines, the
+   account's quota windows. The api frees the slot, settles the reservation
+   on actual usage, and writes the usage record. The response's `voice`
+   object reports what served it and what it cost.
 
 The coordinator never redirects and never stores prompts or responses. Content
-passes through the coordinator and one node in memory; what is kept is the
+passes through one api instance and one node in memory; what is kept is the
 numbers and the caller's `metadata`.
+
+## The route table
+
+The brain turns the state of the fleet into rows the api can claim.
+
+- **Slots.** Each seat that is up gets one slot per unit of its concurrency,
+  for each model it serves. Slots are ranked: accounts with the most
+  headroom first, then the least loaded seats. Accounts that are exhausted
+  get no slots, and the table records, per model, that they are exhausted
+  and until when.
+- **Claims** use `SELECT ... FOR UPDATE SKIP LOCKED`: two api instances
+  reaching for the same slot never wait on each other, and the loser takes
+  the next one. That is the compare-and-swap, and Postgres already has it.
+- **Versions.** Each rewrite bumps the table's version. `pond/pq` has no
+  `LISTEN/NOTIFY` yet, so the api polls the version, and rereads the table
+  when a claim misses. Notification can replace the polling once pq has it.
+- **Leases.** Every api instance heartbeats a row. When one stops, the
+  brain frees its claimed slots, releases its reservations, and records its
+  in-flight requests as abandoned.
+
+The brain being down does not stop serving. Slots already written can still
+be claimed and are still bounded by each seat's concurrency; they only go
+stale.
 
 ## State
 
@@ -123,50 +162,49 @@ State lives in one of three places, and each piece has exactly one home.
   digest of the enrollment token), and pending policy changes. Every admin
   write is a transaction and appends a row to a change log (who, when, what
   was there before), so configuration has a history.
+- **The route table**, as above.
+- **Counters.** Rate-limit windows, reservations, and each project's spend
+  in its current period. Every api instance updates them with conditional
+  writes, so a limit holds across instances and across restarts.
+- **The fleet as reported.** Api instances' heartbeats, which instance holds
+  each node's connection, each node's declared seats and their health, and
+  each account's quota windows as an engine last reported them.
 - **The ledger.** One usage record per request: project, key, requested and
   served model, node, seat, account, tokens, price, timing, attempts and the
   caller's `metadata`. It is append-only. Usage summaries are queries over
   it, and in a DNA deployment it is the record DNA accounts from.
-- **Declared state.** Each node's seats as it last declared them, and each
-  account's quota windows as an engine last reported them. The admin plane
-  can show them while a node is offline, and routing does not forget an
-  exhausted account on restart.
 
-### Coordinator memory
+### Process memory
 
-- **A projection of the configuration**, loaded at start. Each admin write
-  commits to Postgres first and updates memory after, so a failed commit
-  changes nothing. The request path reads only memory.
-- **Counters.** Rate-limit windows, in-flight reservations, each project's
-  spend in its current period, and each account's headroom. Spend is rebuilt
-  from the ledger at start, so a budget survives a restart; rate-limit
-  windows start fresh.
-- **Live state.** Node connections, seat health and load, and the queue of
-  requests waiting for a seat.
+An api instance holds its open connections (callers' streams and nodes'
+WebSockets) and may cache configuration, keyed by a version it checks.
+Nothing in memory is the only copy of anything, so losing a process loses
+only its own in-flight requests.
 
 ### A node's data directory
 
 The node's seat configuration, written by its admin API. It is small and
 local to the node, so it needs no database.
 
-### Why Postgres
+### Why Postgres, and not also Redis
 
 The ledger grows without end and is read by aggregate queries (usage grouped
-by project, key, account, day), configuration writes need transactions, and
-DNA reads the ledger. SQLite would carry one coordinator, but not a second one
-or DNA reading alongside it. Postgres covers all three, and Hale reaches it
-through [`pond/pq`](https://github.com/hale-lang/pond/tree/main/pq) with
-schema changes through
+by project, key, account, day). Configuration writes need transactions. Api
+instances need shared counters and an atomic claim. DNA reads the ledger.
+Postgres does all of it, including the claim, so a second store would only
+add something to run and keep consistent; there is also no Redis client in
+pond. Hale reaches Postgres through
+[`pond/pq`](https://github.com/hale-lang/pond/tree/main/pq), with schema
+changes through
 [`pond/migrations`](https://github.com/hale-lang/pond/tree/main/migrations).
 
 ### Metering is not optional
 
-The ledger writer flushes usage in batches at most a second apart, off the
-request path. If Postgres is unreachable, records wait in a bounded buffer.
-When the buffer is full, the coordinator refuses new requests with `503`
-rather than serve anything it cannot meter: a budget is a circuit breaker,
-and an unmetered request would go around it. A crash can lose the last
-unflushed batch, which is the one way the ledger can undercount.
+A request reserves in Postgres before it runs and writes its usage in the
+same transaction that settles it. If Postgres is unreachable, nothing is
+served (`503 metering_unavailable`): a budget is a circuit breaker, and an
+unmetered request would go around it. There is no batch to lose; a request
+that dies with its api instance is recorded as abandoned by the brain.
 
 ## Security
 
@@ -181,28 +219,31 @@ unflushed batch, which is the one way the ledger can undercount.
   names its CLI's configuration directory; voice never reads the login.
 - **Content** is never written down. A seat sees only the data classes its
   operator allowed it.
-- **TLS** is terminated in front of the coordinator, for callers and for
-  nodes' `wss`. Hale's TLS reads block their thread and cannot park on an
-  async pool yet, so the coordinator speaks plain HTTP behind the
-  terminator.
+- **TLS** is terminated in front of the api, for callers and for nodes'
+  `wss`. Hale's TLS reads block their thread and cannot park on an async
+  pool yet, so the api speaks plain HTTP behind the terminator, which is
+  also the load balancer.
 
 ## When things fail
 
 | What fails | What happens |
 |---|---|
 | A seat | The request moves to another seat if nothing reached the caller; otherwise the response fails, with the attempt recorded. |
-| A node's connection | Its in-flight requests fail over as above and its seats leave routing. The node reconnects with backoff and declares its seats again. |
-| An account's quota | The account is skipped until its window resets. Requests that named it fail with `503 no_capacity` and `Retry-After`. |
-| The coordinator | In-flight requests fail. On start it loads configuration, rebuilds spend from the ledger, and nodes reconnect on their own. |
-| Postgres | Admin writes fail. Serving continues from memory until the ledger buffer fills, then stops. The coordinator will not start without it. |
+| A node's connection | Its in-flight requests fail over as above and its seats leave the route table. The node reconnects, possibly to another api instance, and declares its seats again. |
+| An account's quota | The account gets no slots until its window resets. Requests that named it fail with `503 no_capacity` and `Retry-After`. |
+| An api instance | Its callers' requests fail and its nodes reconnect elsewhere. The brain frees its slots and reservations when its heartbeat stops. |
+| The brain | Serving continues on the last route table, which goes stale until the brain is back. |
+| Postgres | Nothing is served and nothing is configured until it is back. |
 
 ## In Hale
 
-Voice is two Hale programs, a coordinator and a node, plus a shared seed for
-the protocol's message types. The shapes come from Hale's
+The target is three Hale programs, the api, the brain and the node, plus
+shared seeds for the protocol's message types and for the store (schema and
+queries, used by both the api and the brain). In the MVP the api program
+also runs the brain. The shapes come from Hale's
 [styleguide](https://github.com/hale-lang/hale/blob/main/spec/styleguide.md).
 
-**Coordinator**
+**Api**
 
 - The gateway serves both planes on `std::http`. Each caller request is an
   accepted child with `release`, so its memory is reclaimed when the request
@@ -212,11 +253,22 @@ the protocol's message types. The shapes come from Hale's
   side of `pond/websocket`). It publishes the node's events on a topic keyed
   by `request_id`, and each request child subscribes to its own key, so no
   handler filters traffic.
-- The enforcer and the router are single-writer loci: every counter and the
-  seat table have one owner, and other loci reach them through the bus.
-- The configuration store and the ledger writer own the Postgres
-  connections. Because `pq` blocks, they are pinned, away from the pool that
-  serves requests.
+- The store owns the Postgres connections: a pool for reads and a dedicated
+  connection for transactions, since `pq`'s pool does not do transactions.
+  Because `pq` blocks, the store is pinned, away from the pool that serves
+  requests.
+
+**Brain**
+
+- One locus with its own store and its own Postgres connection. It takes a
+  Postgres advisory lock before doing anything, so there is only ever one
+  brain, even when several api instances each start one.
+- It has no bus edges to the api's loci. That is the seam that makes the
+  split cheap, and it is stated as a claim, so the compiler refuses a
+  shortcut through memory.
+- Splitting it out is a new `main` that instantiates it. Running a second api
+  instance adds one piece of code: forwarding a request to the instance that
+  holds its node's connection.
 
 **Node**
 
@@ -226,19 +278,14 @@ the protocol's message types. The shapes come from Hale's
   process, and CLI engines run their CLI through `pond/subprocess`.
 - The admin API serves `/node/v1` on loopback.
 
-Where the compiler can check the architecture, it will. Two intended claims:
-the request path reaches Postgres only through the ledger writer's queue, and
-only the enforcer writes counters.
-
 ## Deployment
 
-- **MVP:** one machine. Postgres, the coordinator and one node, all on
-  loopback. The node runs a static seat that answers every request with its
-  configured text. Everything is set up through the APIs, in this order: a
-  model, an account, a node (which yields a token), the node started with
-  that token, its seat, a project and a key.
-- **Personal:** the coordinator and Postgres on a machine that stays up,
-  with a node on each machine whose CLIs are logged in, one seat per account.
-- **Later:** nodes running local engines, and more than one coordinator,
-  which means rate-limit state shared through Postgres instead of held in
-  one process's memory.
+- **MVP:** one machine. Postgres, one api with the brain inside it, and one
+  node, all on loopback. The node runs a static seat that answers every
+  request with its configured text. Everything is set up through the APIs,
+  in this order: a model, an account, a node (which yields a token), the
+  node started with that token, its seat, a project and a key.
+- **Personal:** the api and Postgres on a machine that stays up, with a node
+  on each machine whose CLIs are logged in, one seat per account.
+- **Scaled out:** several api instances behind a load balancer that also
+  terminates TLS, the brain as its own process, and nodes anywhere.

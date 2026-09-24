@@ -65,6 +65,18 @@ them. The MVP runs without it, on loopback; OIDC drops in later with no change
 to the endpoints. Project keys and nodes' enrollment tokens are enforced from
 the start, because the MVP exists to prove them.
 
+## Process model
+
+The coordinator is two roles. **Api** instances serve callers, the admin
+plane and nodes' connections; they hold no state of their own and scale out.
+One **brain** turns the fleet's reported state into a route table in
+Postgres, and api instances claim slots from it atomically. Postgres holds
+all shared state: configuration, the route table, counters and the ledger.
+
+The MVP runs the brain inside a single api process. The brain reaches the
+rest only through Postgres, so moving it into its own process later changes
+packaging, not design. The [README](./README.md) documents the architecture.
+
 ## Phases
 
 The API stays the same through every phase. Only what stands behind it

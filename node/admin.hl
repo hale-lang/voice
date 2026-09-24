@@ -1,0 +1,149 @@
+/// The node's admin API (../node.yaml), on loopback. Admin authentication
+/// is middleware that comes later; the skeleton has none.
+locus Admin {
+    params {
+        id: String = "";
+        data: String = "node-data";
+        host: String = "127.0.0.1";
+        port: Int = 8081;
+    }
+    run() {
+        println("node admin API on http://", self.host, ":", self.port);
+        let api = AdminApi { id: self.id, data: self.data, seats: Seats { dir: self.data + "/seats" } };
+        std::http::Server { host: self.host, port: self.port, handler: api };
+    }
+}
+
+/// Every endpoint in ../node.yaml, first match in written order.
+locus AdminApi {
+    params {
+        id: String = "";
+        data: String = "node-data";
+        seats: Seats = Seats { };
+    }
+
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let c = std::http::build_context(req);
+        if std::http::is_route(c, "GET", "/healthz") { return json_response(200, "{\"status\": \"ok\", \"version\": \"" + NODE_VERSION + "\"}"); }
+        if std::http::is_route(c, "GET", "/node/v1/status") { return self.status(); }
+        if std::http::is_route(c, "GET", "/node/v1/engines") { return json_response(200, ENGINES); }
+        if std::http::is_route(c, "GET", "/node/v1/seats") { return self.list_seats(); }
+        if std::http::is_route(c, "POST", "/node/v1/seats") { return self.create_seat(req.body); }
+        if std::http::is_route(c, "GET", "/node/v1/seats/:seat") { return self.get_seat(std::http::path_param(c.params, "seat")); }
+        if std::http::is_route(c, "PATCH", "/node/v1/seats/:seat") { return self.update_seat(std::http::path_param(c.params, "seat"), req.body); }
+        if std::http::is_route(c, "DELETE", "/node/v1/seats/:seat") { return self.remove_seat(std::http::path_param(c.params, "seat")); }
+        return error_response(404, "not_found", "not_found", "no such endpoint: " + req.method + " " + req.path);
+    }
+
+    fn status() -> std::http::Response {
+        let mut session = std::io::fs::read_file(self.data + "/session.json") or "";
+        if len(session) == 0 {
+            session = "{\"url\": \"\", \"state\": \"connecting\", \"connected_at\": null, \"last_error\": null}";
+        }
+        return json_response(200, "{\"id\": \"" + std::json::escape_string(self.id) + "\", \"version\": \"" + NODE_VERSION + "\", \"coordinator\": " + session + "}");
+    }
+
+    fn list_seats() -> std::http::Response {
+        let n = self.seats.count();
+        let mut out = "{\"data\": [";
+        let mut i = 0;
+        while i < n {
+            if i > 0 { out = out + ", "; }
+            out = out + seat_view(self.seats.read(self.seats.id_at(i)));
+            i = i + 1;
+        }
+        return json_response(200, out + "]}");
+    }
+
+    fn create_seat(body: String) -> std::http::Response {
+        let seat = merge_objects(SEAT_DEFAULTS, body);
+        let problem = seat_problem(seat);
+        if len(problem) > 0 { return error_response(400, "invalid_request", "invalid_request", problem); }
+        let id = std::json::find_string_field(seat, "id");
+        if self.seats.has(id) { return error_response(409, "invalid_request", "conflict", "a seat with id " + id + " already exists on this node"); }
+        self.seats.write(id, seat);
+        return json_response(201, seat_view(seat));
+    }
+
+    fn get_seat(id: String) -> std::http::Response {
+        if !self.seats.has(id) { return seat_missing(id); }
+        return json_response(200, seat_view(self.seats.read(id)));
+    }
+
+    fn update_seat(id: String, patch: String) -> std::http::Response {
+        if !self.seats.has(id) { return seat_missing(id); }
+        if len(top_value(patch, "id")) > 0 || len(top_value(patch, "engine")) > 0 {
+            return error_response(400, "invalid_request", "invalid_request", "a seat's id and engine cannot change");
+        }
+        let seat = merge_objects(self.seats.read(id), patch);
+        let problem = seat_problem(seat);
+        if len(problem) > 0 { return error_response(400, "invalid_request", "invalid_request", problem); }
+        self.seats.write(id, seat);
+        return json_response(200, seat_view(seat));
+    }
+
+    fn remove_seat(id: String) -> std::http::Response {
+        if !self.seats.has(id) { return seat_missing(id); }
+        let seat = self.seats.read(id);
+        self.seats.remove(id);
+        return json_response(200, seat_view(seat));
+    }
+}
+
+/// The engines this build can run, each with its seat config's schema.
+const ENGINES: String = "{\"data\": [{\"id\": \"static\", \"description\": \"Answers every request with the seat's configured text.\", \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"], \"properties\": {\"text\": {\"type\": \"string\", \"minLength\": 1}, \"chunk_chars\": {\"type\": \"integer\", \"minimum\": 1, \"default\": 16}, \"first_output_ms\": {\"type\": \"integer\", \"minimum\": 0, \"default\": 0}, \"chunk_interval_ms\": {\"type\": \"integer\", \"minimum\": 0, \"default\": 0}}}}]}";
+
+/// What a seat is created with unless the request says otherwise.
+const SEAT_DEFAULTS: String = "{\"data_classes\": [\"internal\"], \"concurrency\": 1, \"enabled\": true}";
+
+/// Why `seat` is not a valid seat, or "" when it is.
+fn seat_problem(seat: String) -> String {
+    if !std::json::valid_object(seat) { return "the body must be a JSON object"; }
+    let id = std::json::find_string_field(seat, "id");
+    if !is_slug(id) { return "id must match ^[a-z0-9][a-z0-9-]{0,62}$"; }
+    if std::json::find_string_field(seat, "engine") != "static" { return "engine must be one of /node/v1/engines: static"; }
+    if len(std::json::find_string_field(seat, "account")) == 0 { return "account is required"; }
+    if !serves_models(top_value(seat, "serves")) { return "serves must list at least one model, each with a model id"; }
+    if len(std::json::find_string_field(top_value(seat, "config"), "text")) == 0 {
+        return "config.text is required for the static engine";
+    }
+    return "";
+}
+
+/// True when `serves` is a non-empty array whose every entry names a model.
+fn serves_models(serves: String) -> Bool {
+    if !std::str::starts_with(serves, "[") { return false; }
+    let mut it = std::json::array_first_span(serves);
+    if it.done { return false; }
+    while !it.done {
+        if len(std::json::iter_find_string_field(it, serves, "model")) == 0 { return false; }
+        it = std::json::array_next_span(it, serves);
+    }
+    return true;
+}
+
+/// A stored seat as the API shows it, with its state on this node. The
+/// coordinator's verdict arrives with the protocol; until then it is null.
+fn seat_view(seat: String) -> String {
+    let status = if std::json::find_bool_field(seat, "enabled") { "up" } else { "disabled" };
+    return merge_objects(seat, "{\"status\": \"" + status + "\", \"last_error\": null, \"in_flight\": 0, \"coordinator\": null}");
+}
+
+fn seat_missing(id: String) -> std::http::Response {
+    return error_response(404, "not_found", "not_found", "no seat " + id + " on this node");
+}
+
+/// ^[a-z0-9][a-z0-9-]{0,62}$
+fn is_slug(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    let n = len(s);
+    if n == 0 || n > 63 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || (b == 45 && i > 0);
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}

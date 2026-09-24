@@ -33,6 +33,22 @@ hale test api                # every route answers its happy path
 Every canned body validates against the spec. Friction met along the way is
 in [`FRICTION.md`](./FRICTION.md).
 
+## The node (skeleton)
+
+[`node/`](./node/) is the start of the real node, not a stub. Its admin API
+(`node.yaml`) works: seats are created, changed and removed, validated, and
+kept as files in the node's data directory. The session to the coordinator
+retries and reports its state, and the protocol and the static engine come
+next.
+
+```sh
+hale build node
+node/node --id laptop --data node-data --port 8081   # --coordinator URL, --token T
+curl -X POST localhost:8081/node/v1/seats -d '{"id": "static", "engine": "static",
+  "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "hello"}}'
+hale test node
+```
+
 ## The contract
 
 | Document | What it specifies |

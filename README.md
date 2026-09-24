@@ -9,8 +9,29 @@ Voice is written in [Hale](https://github.com/hale-lang/hale). The design is
 in [hale-lang/voice#1](https://github.com/hale-lang/voice/issues/1), and the
 settled direction in [`DIRECTION.md`](./DIRECTION.md).
 
-**Status:** specification only. There is no code yet; the contract comes
-first.
+**Status:** the specification, and a stub of the api that answers every
+endpoint with a canned happy-path response (below). The contract comes first.
+
+## The stub api
+
+[`api/`](./api/) is a Hale program that serves every endpoint in
+`openapi.yaml` and answers each with its happy path: a canned body from
+[`api/canned/`](./api/canned/), one file per `operationId`, all drawn from
+one consistent example (a `work` project, `static` and `claude-work`
+accounts, a `laptop` node). Inference endpoints answer with the event stream
+when the request sets `"stream": true`. Nothing is stored and nothing is
+checked; it is there to build clients and the UI against, and each endpoint
+is replaced by its real handler as the MVP is built.
+
+```sh
+hale build api
+api/api --port 8080          # --host, --canned DIR
+curl localhost:8080/v1/models
+hale test api                # every route answers its happy path
+```
+
+Every canned body validates against the spec. Friction met along the way is
+in [`FRICTION.md`](./FRICTION.md).
 
 ## The contract
 

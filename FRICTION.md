@@ -6,7 +6,8 @@ are the `hale` the entry was found with.
 
 ## A stateful handler literal given to `Router.add` in a builder fn dangles
 
-**hale 0.21.0** (built from hale `3d9ea6ef`).
+**hale 0.21.0**, found at hale `3d9ea6ef`, still there at `bb0a2c55`.
+Filed as [hale-lang/hale#1048](https://github.com/hale-lang/hale/issues/1048).
 
 A route handler locus with a `String` param, constructed inline as the
 argument to `Router.add` inside a function that builds and returns the
@@ -30,6 +31,12 @@ fn build(dir: String) -> std::http::Router {
 }
 // build("some/dir").dispatch(...) answers "[some/dir<garbage>]"
 ```
+
+It is not only builder functions: a `register(r, dir)` helper that fills a
+caller's router dangles the same way, and so does a locus that owns a
+`Router` param and fills it in `birth()`. Only a router filled and used in
+one function is safe, which leaves no place to put a route table that a
+server and its tests share.
 
 **Working shape:** one handler locus for every endpoint, the styleguide's
 one-locus-many-endpoints shape: `std::http::build_context(req)` and an

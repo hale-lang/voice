@@ -197,7 +197,8 @@ State lives in one of three places, and each piece has exactly one home.
   budgets and limits, keys (only a digest of the secret), nodes (only a
   digest of the enrollment token), and pending policy changes. Every admin
   write is a transaction and appends a row to a change log (who, when, what
-  was there before), so configuration has a history.
+  was there before), so configuration has a history
+  (`GET /admin/v1/changes`).
 - **The route table**, as above.
 - **Counters.** Rate-limit windows, reservations, and each project's spend
   in its current period. Every api instance updates them with conditional
@@ -324,5 +325,5 @@ also runs the brain. The shapes come from Hale's
 - **Personal:** the api and Postgres on a machine that stays up, with a node
   on each machine whose CLIs are logged in, one seat per account.
 - **Scaled out:** several api instances behind a load balancer that also
-  terminates TLS, a NATS server carrying the request topics between them,
+  terminates TLS and sends traffic only to instances whose `/readyz` is ok, a NATS server carrying the request topics between them,
   the brain as its own process, and nodes anywhere.

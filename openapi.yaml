@@ -107,6 +107,20 @@ info:
     - Timestamps in voice's own objects are RFC 3339. Timestamps inside
       standard objects stay Unix seconds, as the standard defines them.
     - Errors use the standard's envelope with voice-specific `code` values.
+    - A caller-plane request body is at most 12 MiB; a larger one is refused
+      with `413 request_too_large`. That keeps a request, wrapped for a node,
+      inside the node protocol's 16 MiB message.
+
+    ## What of the standard is served
+
+    `POST /v1/responses`, streaming and not, is the core. Two parts of Open
+    Responses `2026-04-24` are not served yet:
+
+    - `POST /v1/responses/compact` answers `404 not_found`.
+    - The standard's WebSocket mode on `/v1/responses`: an upgrade request
+      answers `400 unsupported`. Stream with server-sent events instead.
+
+    Stored responses are not served either; see `createResponse`.
 
     ## Rate limits, budgets and quota
 
@@ -153,11 +167,54 @@ tags:
     description: Admin plane. Accounts that pay for serving, and their limits.
   - name: nodes
     description: Admin plane. Nodes, their enrollment, and the seats they declare.
+  - name: changes
+    description: Admin plane. The history of every configuration change.
+  - name: health
+    description: Liveness and readiness, for supervisors and load balancers. No credential.
 
 security:
   - projectKey: []
 
 paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: getLiveness
+      summary: Is this api process alive
+      description: Answers `200` while the process can serve HTTP at all. Checks nothing else.
+      security: []
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+  /readyz:
+    get:
+      tags: [health]
+      operationId: getReadiness
+      summary: Should this api process get traffic
+      description: |
+        Ready when Postgres answers and the configuration is loaded. A load
+        balancer sends traffic only to ready instances. Having no seats up is
+        not unreadiness: requests are still admitted and answered.
+      security: []
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: Not ready; `checks` says which failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
   /v1/responses:
     post:
       tags: [inference]
@@ -255,6 +312,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/ModelNotFound'
+        '413':
+          $ref: '#/components/responses/TooLarge'
         '429':
           $ref: '#/components/responses/RateLimited'
         '502':
@@ -309,6 +368,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/ModelNotFound'
+        '413':
+          $ref: '#/components/responses/TooLarge'
         '429':
           $ref: '#/components/responses/RateLimited'
         '502':
@@ -1290,6 +1351,81 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
+  /admin/v1/nodes/{node}/token:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      tags: [nodes]
+      operationId: rotateNodeToken
+      summary: Issue a node a new enrollment token
+      description: |
+        For a lost or leaked token. The old token stops admitting the node at
+        once, and a connection made with it is closed with `4003`. The node
+        connects again once it is restarted with the new token, which is
+        returned once, in this response only.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The node, with its new token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWithToken'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The node is revoked; a revoked node gets no token.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
+  /admin/v1/changes:
+    get:
+      tags: [changes]
+      operationId: listChanges
+      summary: List configuration changes
+      description: |
+        Every applied admin write, newest first: who made it, when, and the
+        resource before and after. Secrets, digests and tokens are never
+        included. Usage is not configuration and is not listed here.
+      security:
+        - principal: []
+      parameters:
+        - name: target
+          in: query
+          description: Only changes to resources under this path, e.g. `projects/work` or `nodes`.
+          schema: { type: string }
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of changes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Change'
+                  next_cursor:
+                    type: [string, 'null']
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
 components:
   securitySchemes:
     projectKey:
@@ -1496,6 +1632,11 @@ components:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     DeadlineExceeded:
       description: The request's `voice.deadline` passed before it was served.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    TooLarge:
+      description: The request body is over 12 MiB.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -2243,7 +2384,12 @@ components:
           enum: [responses, chat.completions]
         status:
           type: string
-          enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled]
+          enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]
+          description: |
+            `abandoned`: the api instance serving it stopped before it
+            settled. The brain records it when the instance's heartbeat
+            stops, with the reservation released and tokens as far as
+            they were known.
         served:
           oneOf:
             - $ref: '#/components/schemas/Served'
@@ -2503,6 +2649,48 @@ components:
               items: { type: string }
             in_flight: { type: integer }
 
+    # ---- admin plane: changes --------------------------------------------
+
+    Change:
+      type: object
+      required: [id, at, action, target]
+      properties:
+        id: { type: string }
+        at: { type: string, format: date-time }
+        principal:
+          type: [string, 'null']
+          description: Who made it. Null while admin authentication is off, as in the MVP.
+        action:
+          type: string
+          enum: [create, update, delete, archive, revoke, rotate]
+        target:
+          type: string
+          description: The resource's path under `/admin/v1`.
+          examples: [projects/work/budget, nodes/laptop, accounts/claude-work]
+        before:
+          type: [object, 'null']
+          description: The resource as it was; null for a create.
+        after:
+          type: [object, 'null']
+          description: The resource as it became; null for a delete.
+
+    # ---- health ---------------------------------------------------------
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, unavailable]
+        version: { type: string }
+        checks:
+          type: object
+          description: Each dependency's state, on readiness.
+          additionalProperties:
+            type: string
+            enum: [ok, unavailable]
+
     # ---- errors ---------------------------------------------------------
 
     ErrorResponse:
@@ -2532,6 +2720,8 @@ components:
               type: string
               enum:
                 - invalid_request
+                - unsupported
+                - request_too_large
                 - invalid_key
                 - model_not_found
                 - model_not_permitted

@@ -60,6 +60,11 @@ and the API is the first-class way to do it; the UI is one client of it.
 Only what a process needs before its API answers is set at boot: addresses,
 the data directory, tokens.
 
+Admin authentication is middleware in front of the admin APIs, not part of
+them. The MVP runs without it, on loopback; OIDC drops in later with no change
+to the endpoints. Project keys and nodes' enrollment tokens are enforced from
+the start, because the MVP exists to prove them.
+
 ## Phases
 
 The API stays the same through every phase. Only what stands behind it
@@ -89,8 +94,6 @@ tooling through voice and see how many tokens each project uses.
 - **Default data class.** Requests default to `internal`. A seat that
   forwards to a hosted provider must be allowed to carry `internal`, or the
   default must change.
-- **Admin authentication in the MVP.** The admin plane declares OIDC; the
-  MVP may start with a bootstrap token set at boot.
 - **Configuring a node through the coordinator.** The UI talks to the
   coordinator. Relaying seat changes to nodes is convenient, but lets the
   coordinator write configuration onto machines. Nodes' own APIs come first.

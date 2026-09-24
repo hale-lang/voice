@@ -2,12 +2,13 @@ openapi: 3.1.0
 info:
   title: voice
   version: 0.1.0-draft
-  summary: One inference endpoint over local hosts and hosted providers.
+  summary: One inference endpoint over local engines and hosted providers.
   description: |
     Voice serves inference over a catalog that holds local models and hosted
     providers' models as peers. A caller names a **model** and presents a
-    **project key**; it never names a host. Which hosts exist and where weights
-    are cached is voice's internal concern (hale-lang/voice#1).
+    **project key**; it never names a node. It may name the **account** that
+    pays. Which nodes exist and which seats they run is voice's internal
+    concern (hale-lang/voice#1).
 
     ## The standard at the core
 
@@ -32,8 +33,8 @@ info:
 
     - **Caller plane** (`/v1/...`): authenticated by a project key.
     - **Admin plane** (`/admin/v1/...`): authenticated as a principal (OIDC).
-      Configures projects, their budgets and limits, and their keys; reads
-      usage and the host registry.
+      Configures the model catalog, accounts, nodes, projects, their budgets
+      and limits, and their keys; reads usage.
 
     Every request is attributed to exactly one project and one key, so usage
     can be tracked and budgeted per project and broken down per key.
@@ -44,22 +45,53 @@ info:
     pending review instead of applying it; a deployment without that
     requirement answers `200` and applies it. The request shape is the same.
 
-    Host agent registration and heartbeat are internal to the coordinator and
-    are not part of this document.
+    ## Nodes, seats and accounts
+
+    Nothing is discovered. Everything that serves is configured by an
+    operator, through an API.
+
+    - A **node** is one machine running voice's node software. The operator
+      creates it here, which issues an enrollment token, then starts the node
+      with that token and the coordinator's address. The node dials out to
+      the coordinator, so a node behind NAT needs no open port.
+    - A **seat** is one engine on one node, configured on the node through
+      its own API (`node.yaml`): the static engine, or a CLI logged in to one
+      account. The node declares its seats when it connects; this plane reads
+      them. A seat names the account it spends and the catalog models it
+      serves.
+    - An **account** is what pays and what has limits: a subscription, a
+      metered API key, or nothing for a local engine. Several seats may share
+      one account (the same login on two machines), and they share its
+      limits.
+    - The **catalog** is configured here: model ids, context, output
+      ceilings and prices. Seats on every node refer to the same ids, so the
+      coordinator can route one model across all of them.
+
+    **Routing.** For a request, the eligible seats are those that serve the
+    model, are enabled on a connected node, carry the request's data class,
+    and spend an account the key permits (narrowed by `voice.account` when
+    the request names one). Accounts with no headroom left are skipped, and
+    seats at their concurrency are skipped. Voice picks the account with the
+    most headroom, then the least loaded of its seats.
+
+    The coordinator talks to nodes over the protocol in `protocol.yaml`. It
+    proxies and never redirects.
 
     ## Phases
 
     The API is the same in every phase; only what stands behind it changes.
 
-    - **MVP: static.** Every request gets a fixed response from a `static`
-      engine. This proves the whole surface end to end: keys, projects,
-      limits, budgets, usage records and both streaming formats. Tokens are
-      counted from the fixed text and the price is 0.
-    - **v1: `claude -p`.** A worker node wraps the Claude Code CLI in print
-      mode. It registers as a host with engine `claude-cli`, provider
-      `anthropic` and the external data class, and reports the usage and cost
-      the CLI returns.
-    - **Later: local engines.** llama.cpp server, MLX and vLLM hosts, with
+    - **MVP: static.** One coordinator and one node on one machine. The node
+      runs a `static` seat that answers every request with its configured
+      text. Everything is set up through the APIs: a model, an account, a
+      node and its seat, a project and a key. This proves the whole surface
+      end to end: configuration, routing, keys, projects, limits, budgets,
+      usage records and both streaming formats. Tokens are counted from the
+      fixed text and priced at the model's configured price.
+    - **v1: agent CLIs.** Seats wrap the CLIs of the operator's own accounts
+      (`claude -p`, `codex exec`), with engines `claude-cli` and `codex-cli`,
+      and report the usage and quota windows the CLIs return.
+    - **Later: local engines.** llama.cpp server, MLX and vLLM seats, with
       routing by memory fit, load and weights on disk.
 
     ## Conventions
@@ -79,8 +111,14 @@ info:
     every applicable limit and the budget before dispatch, using estimated
     input tokens plus the requested maximum output (the model's default maximum
     when the request sets none), and settles on actual usage. A refusal is
-    `429` with `Retry-After`. Host saturation is a routing fact and never
+    `429` with `Retry-After`. Seat saturation is a routing fact and never
     produces a 429; the request queues.
+
+    An account that is out of headroom is not the caller's limit. When every
+    account that could serve a request is exhausted, the answer is `503`
+    with code `no_capacity` and `Retry-After` set to the earliest reset. A
+    request that names an account fails this way at once rather than
+    falling back to another account.
 
     Every caller-plane response carries the remaining-quota headers, so a
     client can pace itself instead of discovering the wall by failing.
@@ -104,8 +142,12 @@ tags:
     description: Admin plane. Keys under a project.
   - name: usage
     description: Admin plane. Per-request usage and summaries from the ledger.
-  - name: hosts
-    description: Admin plane. Read-only view of the host registry.
+  - name: models
+    description: Admin plane. The model catalog.
+  - name: accounts
+    description: Admin plane. Accounts that pay for serving, and their limits.
+  - name: nodes
+    description: Admin plane. Nodes, their enrollment, and the seats they declare.
 
 security:
   - projectKey: []
@@ -121,18 +163,21 @@ paths:
         an optional `voice` object on the request and a required `voice` object
         on the response.
 
-        **Routing.** Voice selects a host among those whose engine supports the
-        model, whose memory fits it, and whose data classes include the
-        request's data class; among those it prefers low load and weights
-        already on disk. The coordinator proxies and never redirects.
+        **Routing.** Voice selects a seat as described under *Nodes, seats
+        and accounts*. With `voice.account` set, only that account's seats are
+        eligible; the key must permit the account (`403
+        account_not_permitted` otherwise), and when the account has no
+        headroom the request fails with `503 no_capacity` rather than moving
+        to another account. The coordinator proxies and never redirects.
 
-        **Retries.** If a host fails before any output has been sent, the
-        request is retried on another eligible host. Each try is listed in
-        `voice.attempts`, and when streaming a `voice:attempt` event marks the
-        switch. If a host fails after output has begun, the response fails with
-        that evidence rather than restarting, because the v1 engine
-        (`claude -p`) cannot resume from partial output. Continuing on another
-        host is a later capability for engines that support it.
+        **Retries.** If a seat fails before any output has been sent, the
+        request is retried on another eligible seat, within the named account
+        when there is one. Each try is listed in `voice.attempts`, and when
+        streaming a `voice:attempt` event marks the switch. If a seat fails
+        after output has begun, the response fails with that evidence rather
+        than restarting, because the v1 engines cannot resume from partial
+        output. Continuing on another seat is a later capability for engines
+        that support it.
 
         **Streaming.** With `stream: true` the response is the standard event
         stream. The terminal `response.completed`, `response.incomplete` or
@@ -210,7 +255,7 @@ paths:
         '502':
           $ref: '#/components/responses/Upstream'
         '503':
-          $ref: '#/components/responses/NoEligibleHost'
+          $ref: '#/components/responses/Unavailable'
         '504':
           $ref: '#/components/responses/DeadlineExceeded'
 
@@ -264,7 +309,7 @@ paths:
         '502':
           $ref: '#/components/responses/Upstream'
         '503':
-          $ref: '#/components/responses/NoEligibleHost'
+          $ref: '#/components/responses/Unavailable'
         '504':
           $ref: '#/components/responses/DeadlineExceeded'
 
@@ -275,8 +320,8 @@ paths:
       summary: List models visible to this key
       description: |
         Local and hosted models appear together; the `voice` extension says
-        which is which, its price, and which data classes it may carry. Hosts
-        are never listed here.
+        which is which, its price, and which data classes it may carry. Nodes,
+        seats and accounts are never listed here.
       responses:
         '200':
           description: The catalog as this key sees it.
@@ -424,7 +469,7 @@ paths:
     patch:
       tags: [projects]
       operationId: updateProject
-      summary: Change a project's name, owners, data classes or catalog
+      summary: Change a project's name, owners, data classes, catalog or accounts
       security:
         - principal: []
       requestBody:
@@ -670,7 +715,7 @@ paths:
     patch:
       tags: [keys]
       operationId: updateKey
-      summary: Change a key's name, models, limits or expiry
+      summary: Change a key's name, models, accounts, limits or expiry
       security:
         - principal: []
       requestBody:
@@ -729,6 +774,7 @@ paths:
         - $ref: '#/components/parameters/ProjectFilter'
         - $ref: '#/components/parameters/KeyFilter'
         - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/AccountFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -761,8 +807,9 @@ paths:
       summary: Summarise usage, grouped
       description: |
         Totals of requests, tokens and spend, grouped by any of project, key,
-        model, host and time bucket. The tracking view: what each project and
-        each of its keys spent over a period.
+        model, account, seat, node and time bucket. The tracking view: what
+        each project and each of its keys spent over a period, and which
+        account paid for it.
       security:
         - principal: []
       parameters:
@@ -776,11 +823,12 @@ paths:
             minItems: 1
             items:
               type: string
-              enum: [project, key, model, host, day, hour]
-          example: [project, key]
+              enum: [project, key, model, account, seat, node, day, hour]
+          example: [project, account]
         - $ref: '#/components/parameters/ProjectFilter'
         - $ref: '#/components/parameters/KeyFilter'
         - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/AccountFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -824,20 +872,17 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
-  /admin/v1/hosts:
+  /admin/v1/models:
     get:
-      tags: [hosts]
-      operationId: listHosts
-      summary: List registered hosts
-      description: |
-        The coordinator's registry: engines, memory, models on disk, queue depth
-        and data classes per host. Hosted providers appear as hosts with
-        unbounded capacity and an external data class.
+      tags: [models]
+      operationId: listCatalogModels
+      summary: List the model catalog
+      description: Every configured model, with the seats that declare it. `/v1/models` is the caller's filtered view of the same list.
       security:
         - principal: []
       responses:
         '200':
-          description: Hosts.
+          description: The catalog.
           content:
             application/json:
               schema:
@@ -847,11 +892,398 @@ paths:
                   data:
                     type: array
                     items:
-                      $ref: '#/components/schemas/Host'
+                      $ref: '#/components/schemas/CatalogModel'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [models]
+      operationId: createCatalogModel
+      summary: Add a model to the catalog
+      description: |
+        A model id is what callers name and what seats declare they serve.
+        Adding it makes no seat serve it; a model with no seat is listed as
+        unavailable.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogModelCreate'
+            examples:
+              static:
+                value:
+                  id: echo-1
+                  context_length: 8192
+                  max_output_tokens: 1024
+                  price:
+                    input_per_mtok_micros: 3000000
+                    output_per_mtok_micros: 15000000
+                    currency: USD
+      responses:
+        '201':
+          description: The model, created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogModel'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/models/{model}:
+    parameters:
+      - $ref: '#/components/parameters/ModelId'
+    get:
+      tags: [models]
+      operationId: getCatalogModel
+      summary: Describe a catalog model
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogModel'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [models]
+      operationId: updateCatalogModel
+      summary: Change a model's context, output ceiling or price
+      description: A price change applies to requests accepted after it; settled usage keeps the price it was served at.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CatalogModelUpdate'
+      responses:
+        '200':
+          description: The model, changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogModel'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [models]
+      operationId: removeCatalogModel
+      summary: Remove a model from the catalog
+      description: |
+        Callers naming it get `model_not_found`. Seats that still declare it
+        keep the declaration and report it as a problem until their node's
+        operator removes it. Usage history keeps the id.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The removed model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CatalogModel'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/accounts:
+    get:
+      tags: [accounts]
+      operationId: listAccounts
+      summary: List accounts
+      security:
+        - principal: []
+      parameters:
+        - name: include_archived
+          in: query
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Accounts, with their seats, limits and headroom.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [accounts]
+      operationId: createAccount
+      summary: Create an account
+      description: |
+        An account is what pays for serving and what has limits. Voice never
+        holds its credential: the engine on each seat logs in on its own
+        node. Seats name the account by id.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountCreate'
+            examples:
+              work:
+                value:
+                  id: claude-work
+                  name: Claude (work)
+                  provider: anthropic
+                  billing: subscription
+              static:
+                value:
+                  id: static
+                  name: Static
+                  billing: none
+      responses:
+        '201':
+          description: The account, created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/accounts/{account}:
+    parameters:
+      - $ref: '#/components/parameters/AccountId'
+    get:
+      tags: [accounts]
+      operationId: getAccount
+      summary: Describe an account
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [accounts]
+      operationId: updateAccount
+      summary: Change an account's name, billing or limits
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountUpdate'
+      responses:
+        '200':
+          description: The account, changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [accounts]
+      operationId: archiveAccount
+      summary: Archive an account
+      description: |
+        Its seats stop serving. Keys and projects that name it keep the name
+        and can no longer spend it. Usage history stays queryable; the id is
+        never reused.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The archived account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/nodes:
+    get:
+      tags: [nodes]
+      operationId: listNodes
+      summary: List nodes and the seats they declare
+      description: |
+        Every node an operator created, whether or not it has connected, with
+        the seats it declared on its last connection. Seats are configured on
+        the node (`node.yaml`) and are read-only here.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: Nodes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [nodes]
+      operationId: createNode
+      summary: Create a node and issue its enrollment token
+      description: |
+        The node is `pending` until it connects with the token. A node that
+        presents no valid token is refused; nothing joins on its own. The
+        token is returned once, in this response only.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeCreate'
+            examples:
+              laptop:
+                value:
+                  id: laptop
+                  name: Laptop
+      responses:
+        '201':
+          description: The node, with its enrollment token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeWithToken'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/nodes/{node}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: getNode
+      summary: Describe a node and its seats
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [nodes]
+      operationId: revokeNode
+      summary: Revoke a node
+      description: |
+        Its connection is closed and its token no longer admits it; its seats
+        stop serving. In-flight requests on it fail over like any seat
+        failure. The id is never reused.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The revoked node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
 components:
   securitySchemes:
@@ -880,6 +1312,25 @@ components:
       in: path
       required: true
       schema: { type: string }
+    AccountId:
+      name: account
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/AccountIdValue' }
+    NodeId:
+      name: node
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/NodeIdValue' }
+    AccountFilter:
+      name: account
+      in: query
+      description: Only requests served on these accounts. Repeatable.
+      style: form
+      explode: true
+      schema:
+        type: array
+        items: { type: string }
     ProjectFilter:
       name: project
       in: query
@@ -1019,14 +1470,20 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     Upstream:
-      description: Every eligible host failed; `voice.attempts` lists them.
+      description: Every eligible seat failed; `voice.attempts` lists them.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
-    NoEligibleHost:
+    Unavailable:
       description: |
-        No registered host can serve this model for this data class right now.
-        Host saturation alone never produces this; it queues.
+        Nothing can serve the request now. `no_eligible_seat`: no enabled
+        seat on a connected node serves this model for this data class and
+        these accounts. `no_capacity`: seats exist, but every account they
+        spend is out of headroom; `Retry-After` is the earliest reset. Seat
+        saturation alone never produces this; it queues.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -1045,6 +1502,18 @@ components:
       description: Chosen at creation, stable forever, never reused.
       examples: [personal, work]
 
+    AccountIdValue:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+      description: Chosen at creation, stable forever, never reused.
+      examples: [claude-work, claude-personal, codex, static]
+
+    NodeIdValue:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+      description: Chosen at creation, stable forever, never reused.
+      examples: [laptop, desktop]
+
     Metadata:
       type: object
       description: |
@@ -1059,7 +1528,7 @@ components:
       type: string
       description: |
         The sensitivity of the request's content. A request is routed only to
-        hosts whose data classes include it. Values are deployment policy;
+        seats whose data classes include it. Values are deployment policy;
         `internal` is the default.
       examples: [public, internal, customer]
 
@@ -1075,11 +1544,17 @@ components:
           type: string
           format: date-time
           description: Absolute time after which the caller no longer wants the answer.
+        account:
+          $ref: '#/components/schemas/AccountIdValue'
+          description: |
+            Serve on this account only, for when who pays matters (client
+            billing). The key must permit it. No fallback to another account:
+            when it has no headroom the request fails with `no_capacity`.
 
     Served:
       type: object
       description: What actually served the request. Evidence, not a choice.
-      required: [model, host]
+      required: [model, node, seat, account]
       properties:
         model:
           type: string
@@ -1088,15 +1563,22 @@ components:
           type: [string, 'null']
           description: Null when the provider does not say.
           examples: [Q4_K_M, bf16, 4bit]
-        host:
+        node:
           type: string
-          description: The host that served. For a hosted provider, its host name in the registry.
+          description: The node the seat runs on.
+        seat:
+          type: string
+          description: The seat that served, written `<node>/<seat>`.
+          examples: [laptop/static, laptop/claude-work]
+        account:
+          type: string
+          description: The account the seat spent.
         engine:
           type: string
           examples: [static, claude-cli, llama.cpp, mlx, vllm]
         provider:
           type: [string, 'null']
-          description: The hosted provider, or null for a local host.
+          description: The hosted provider, or null for a local engine.
 
     Timing:
       type: object
@@ -1107,26 +1589,29 @@ components:
           description: From the coordinator accepting the request to the last byte.
         queue_ms:
           type: integer
-          description: Time waiting for a host slot.
+          description: Time waiting for a seat slot.
         load_ms:
           type: integer
           description: Time spent fetching or loading weights before serving; 0 when warm.
 
     Attempt:
       type: object
-      description: One try on one host. A retry elsewhere is evidence, never hidden.
-      required: [host, outcome]
+      description: One try on one seat. A retry elsewhere is evidence, never hidden.
+      required: [seat, account, outcome]
       properties:
-        host: { type: string }
+        seat:
+          type: string
+          description: Written `<node>/<seat>`.
+        account: { type: string }
         outcome:
           type: string
           enum: [served, failed, abandoned]
         error:
           type: string
-          description: Why the host failed, when it did.
+          description: Why the seat failed, when it did.
         output_tokens_before_failure:
           type: integer
-          description: Tokens already sent to the client when this host failed. Non-zero means the response failed rather than moving hosts.
+          description: Tokens already sent to the client when this seat failed. Non-zero means the response failed rather than moving seats.
         wall_ms: { type: integer }
 
     VoiceResponseExtension:
@@ -1146,7 +1631,7 @@ components:
           $ref: '#/components/schemas/Served'
         price_micros:
           type: integer
-          description: What this request cost, in micros of `currency`. 0 for a local host with no price.
+          description: What this request cost, in micros of `currency`. 0 for a model with no price.
         currency:
           type: string
           default: USD
@@ -1182,8 +1667,8 @@ components:
     VoiceAttemptEvent:
       type: object
       description: |
-        Voice's one extended streaming event: a host failed and the request
-        moved to another. Emitted before the next host's first event.
+        Voice's one extended streaming event: a seat failed and the request
+        moved to another. Emitted before the next seat's first event.
       required: [type, sequence_number, attempt]
       properties:
         type:
@@ -1193,7 +1678,7 @@ components:
           type: integer
         attempt:
           $ref: '#/components/schemas/Attempt'
-        next_host:
+        next_seat:
           type: string
 
     # ---- caller plane: Chat Completions (compatibility) -----------------
@@ -1364,11 +1849,11 @@ components:
               description: Default and maximum output; used for reservation when a request sets none.
             quantizations:
               type: array
-              description: Quantizations available across hosts, for a local model.
+              description: Quantizations available across seats, for a local model.
               items: { type: string }
             data_classes:
               type: array
-              description: Data classes some eligible host may carry for this model.
+              description: Data classes some eligible seat may carry for this model.
               items:
                 $ref: '#/components/schemas/DataClass'
             price:
@@ -1377,7 +1862,7 @@ components:
                 - type: 'null'
             available:
               type: boolean
-              description: True when at least one registered host can serve it now.
+              description: True when at least one enabled seat on a connected node serves it and its account has headroom.
 
     ModelList:
       type: object
@@ -1414,6 +1899,10 @@ components:
           type: array
           description: Model ids this key may name.
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          description: Accounts this key may spend, and so may name in `voice.account`. Null means any.
+          items: { type: string }
         limits:
           type: array
           description: Every limit that applies to this key, at any scope.
@@ -1433,10 +1922,13 @@ components:
       properties:
         scope:
           type: string
-          enum: [project, key, model]
+          enum: [project, key, model, account]
         model:
           type: string
           description: Required when `scope` is `model`.
+        account:
+          type: string
+          description: Required when `scope` is `account`. Set on the account itself; operator policy on top of what the provider allows.
         window_seconds: { type: integer, minimum: 1 }
         requests: { type: [integer, 'null'], minimum: 0 }
         input_tokens: { type: [integer, 'null'], minimum: 0 }
@@ -1523,6 +2015,11 @@ components:
           type: [array, 'null']
           description: Catalog visibility. Null means the whole catalog.
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          description: Accounts the project may spend. Null means any.
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
         budget:
           $ref: '#/components/schemas/BudgetSet'
         limits:
@@ -1545,6 +2042,10 @@ components:
         models:
           type: [array, 'null']
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
 
     Project:
       type: object
@@ -1565,6 +2066,10 @@ components:
         models:
           type: [array, 'null']
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
         budget:
           oneOf:
             - $ref: '#/components/schemas/Budget'
@@ -1614,6 +2119,14 @@ components:
           type: [array, 'null']
           description: Restrict the key to these models. Null means the project's catalog.
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          description: |
+            Restrict the key to these accounts, within the project's. Null
+            means the project's. A key for client work names the work
+            account here, so everything it sends is billed there.
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
         limits:
           type: array
           description: Key-scope limits, on top of the project's.
@@ -1631,6 +2144,10 @@ components:
         models:
           type: [array, 'null']
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
         limits:
           type: array
           items:
@@ -1652,6 +2169,10 @@ components:
         models:
           type: [array, 'null']
           items: { type: string }
+        accounts:
+          type: [array, 'null']
+          items:
+            $ref: '#/components/schemas/AccountIdValue'
         limits:
           type: array
           items:
@@ -1684,8 +2205,8 @@ components:
       description: |
         One request, as the ledger holds it. This is the supplier's fact DNA
         accounts from; it carries every field hale needs back: served model,
-        quantization and host, tokens, price, wall, queue and load time, and
-        the caller's metadata untouched.
+        quantization, node, seat and account, tokens, price, wall, queue and
+        load time, and the caller's metadata untouched.
       required:
         - id
         - created_at
@@ -1707,12 +2228,15 @@ components:
         project: { type: string }
         key: { type: string }
         requested_model: { type: string }
+        requested_account:
+          type: [string, 'null']
+          description: The account the request named in `voice.account`, if any.
         endpoint:
           type: string
           enum: [responses, chat.completions]
         status:
           type: string
-          enum: [served, incomplete, failed, rate_limited, budget_exhausted, deadline_exceeded, cancelled]
+          enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled]
         served:
           oneOf:
             - $ref: '#/components/schemas/Served'
@@ -1721,6 +2245,9 @@ components:
           $ref: '#/components/schemas/DataClass'
         input_tokens: { type: integer }
         cached_input_tokens: { type: integer }
+        cache_write_input_tokens:
+          type: integer
+          description: Input tokens written to the provider's cache, as the engine reported them; counted in `input_tokens`.
         output_tokens: { type: integer }
         reasoning_tokens: { type: integer }
         price_micros: { type: integer }
@@ -1762,41 +2289,212 @@ components:
               price_micros: { type: integer }
               currency: { type: string }
 
-    # ---- admin plane: hosts ---------------------------------------------
+    # ---- admin plane: catalog --------------------------------------------
 
-    Host:
+    CatalogModelCreate:
       type: object
-      required: [id, kind, status, engines, data_classes]
+      required: [id]
       properties:
-        id: { type: string }
+        id:
+          type: string
+          description: What callers name and seats declare. Stable; never reused for a different model.
+          examples: [echo-1, claude-sonnet-5]
+        owned_by:
+          type: string
+          default: local
+          description: The provider, or `local`.
         kind:
           type: string
           enum: [local, hosted]
+          default: local
+        context_length: { type: integer, minimum: 1 }
+        max_output_tokens:
+          type: integer
+          minimum: 1
+          description: Default and maximum output; used for reservation when a request sets none.
+        price:
+          description: What a request costs. For a subscription account this is the list-price equivalent. Null means free.
+          oneOf:
+            - $ref: '#/components/schemas/ModelPrice'
+            - type: 'null'
+
+    CatalogModelUpdate:
+      type: object
+      description: Only the fields present change. The id cannot change.
+      properties:
+        owned_by: { type: string }
+        kind:
+          type: string
+          enum: [local, hosted]
+        context_length: { type: integer, minimum: 1 }
+        max_output_tokens: { type: integer, minimum: 1 }
+        price:
+          oneOf:
+            - $ref: '#/components/schemas/ModelPrice'
+            - type: 'null'
+
+    CatalogModel:
+      allOf:
+        - $ref: '#/components/schemas/CatalogModelCreate'
+        - type: object
+          required: [seats, available, created_at]
+          properties:
+            seats:
+              type: array
+              description: Seats that declare this model, written `<node>/<seat>`.
+              items: { type: string }
+            available:
+              type: boolean
+              description: As on `/v1/models`.
+            created_at: { type: string, format: date-time }
+
+    # ---- admin plane: accounts -------------------------------------------
+
+    AccountCreate:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          $ref: '#/components/schemas/AccountIdValue'
+        name: { type: string, maxLength: 128 }
+        provider:
+          type: [string, 'null']
+          description: Who the account is with; null for a local engine.
+          examples: [anthropic, openai]
+        billing:
+          type: string
+          enum: [subscription, metered, none]
+          default: none
+          description: |
+            `subscription`: a flat plan whose limits are windows the provider
+            reports. `metered`: pay per token. `none`: a local engine.
+        limits:
+          type: array
+          description: Account-scope limits, on top of what the provider allows. `scope` is `account`.
+          items:
+            $ref: '#/components/schemas/Limit'
+
+    AccountUpdate:
+      type: object
+      description: Only the fields present change.
+      properties:
+        name: { type: string, maxLength: 128 }
+        provider: { type: [string, 'null'] }
+        billing:
+          type: string
+          enum: [subscription, metered, none]
+        limits:
+          type: array
+          items:
+            $ref: '#/components/schemas/Limit'
+
+    QuotaWindow:
+      type: object
+      description: A limit the provider enforces on the account, as an engine last reported it.
+      required: [name, used_percent, observed_at]
+      properties:
+        name:
+          type: string
+          examples: [five_hour, seven_day]
+        used_percent: { type: number, minimum: 0, maximum: 100 }
+        resets_at: { type: [string, 'null'], format: date-time }
+        observed_at: { type: string, format: date-time }
+        seat:
+          type: string
+          description: The seat whose engine reported it.
+
+    Account:
+      allOf:
+        - $ref: '#/components/schemas/AccountCreate'
+        - type: object
+          required: [status, seats, windows, created_at]
+          properties:
+            status:
+              type: string
+              enum: [active, archived]
+            seats:
+              type: array
+              description: Seats that declare this account, written `<node>/<seat>`.
+              items: { type: string }
+            windows:
+              type: array
+              description: Provider windows. Empty until an engine reports them; the static engine never does.
+              items:
+                $ref: '#/components/schemas/QuotaWindow'
+            exhausted_until:
+              type: [string, 'null']
+              format: date-time
+              description: Set while a provider window or an account limit is spent; routing skips the account until then.
+            created_at: { type: string, format: date-time }
+            archived_at: { type: [string, 'null'], format: date-time }
+
+    # ---- admin plane: nodes and seats ------------------------------------
+
+    NodeCreate:
+      type: object
+      required: [id]
+      properties:
+        id:
+          $ref: '#/components/schemas/NodeIdValue'
+        name: { type: string, maxLength: 128 }
+
+    Node:
+      type: object
+      required: [id, status, seats, created_at]
+      properties:
+        id: { type: string }
+        name: { type: string }
         status:
           type: string
-          enum: [up, draining, down, asleep]
+          enum: [pending, up, down, revoked]
+          description: '`pending` until it first connects with its token.'
+        version:
+          type: [string, 'null']
+          description: The node software's version, as it reported on connecting.
         engines:
           type: array
+          description: Engines the node's build can run, as it reported on connecting.
           items: { type: string }
-        memory_bytes:
-          type: [integer, 'null']
-          description: Null for a hosted provider (unbounded).
-        models_on_disk:
+        seats:
           type: array
           items:
-            type: object
-            required: [model]
-            properties:
-              model: { type: string }
-              quantization: { type: [string, 'null'] }
-              size_bytes: { type: integer }
-        queue_depth: { type: integer }
-        in_flight: { type: integer }
-        data_classes:
-          type: array
-          items:
-            $ref: '#/components/schemas/DataClass'
+            $ref: '#/components/schemas/DeclaredSeat'
+        connected_at: { type: [string, 'null'], format: date-time }
         last_heartbeat_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        revoked_at: { type: [string, 'null'], format: date-time }
+
+    NodeWithToken:
+      allOf:
+        - $ref: '#/components/schemas/Node'
+        - type: object
+          required: [enrollment_token]
+          properties:
+            enrollment_token:
+              type: string
+              description: Shown once. The node is started with it. Voice stores only a digest.
+
+    DeclaredSeat:
+      description: A seat as its node declared it, with what the coordinator makes of it.
+      allOf:
+        - $ref: './node.yaml#/components/schemas/Seat'
+        - type: object
+          required: [ref, status, problems, in_flight]
+          properties:
+            ref:
+              type: string
+              description: The seat's full name, `<node>/<seat>`.
+            status:
+              type: string
+              enum: [up, down, disabled, unmapped]
+              description: |
+                `unmapped`: the seat names an account that is not configured
+                or is archived, and it serves nothing until that is fixed.
+            problems:
+              type: array
+              description: Why the seat serves less than it declares, e.g. a model not in the catalog.
+              items: { type: string }
+            in_flight: { type: integer }
 
     # ---- errors ---------------------------------------------------------
 
@@ -1830,11 +2528,13 @@ components:
                 - invalid_key
                 - model_not_found
                 - model_not_permitted
+                - account_not_permitted
                 - data_class_refused
                 - previous_response_not_found
                 - rate_limited
                 - budget_exhausted
-                - no_eligible_host
+                - no_eligible_seat
+                - no_capacity
                 - upstream_failed
                 - deadline_exceeded
                 - not_found

@@ -1,0 +1,425 @@
+asyncapi: 3.0.0
+info:
+  title: voice node protocol
+  version: '1'
+  description: |
+    How a node and the coordinator talk: the node enrolls, declares its seats,
+    reports its state, and serves the requests the coordinator routes to it.
+    `openapi.yaml` is the coordinator's API and `node.yaml` the node's; this
+    document is the connection between them. It is written from the node's
+    side: the node sends what it `send`s and receives what it `receive`s.
+
+    Inside the connection the requests and their events are Open Responses
+    (`2026-04-24`), taken by reference from the vendored standard. The
+    standard has a WebSocket mode of its own, one turn at a time from
+    client to server; this protocol runs the other way and carries many
+    requests at once, so it wraps the standard's request body and streaming
+    events in an envelope keyed by `request_id`.
+
+    The standard's shapes are OpenAPI 3.1 schemas, which AsyncAPI's schema
+    formats cannot hold. Where a field carries one, `x-voice-schema` points
+    at it in the vendored document, and both sides validate against that.
+
+    ## Connection
+
+    - The node opens a WebSocket to `/node/v1/connect` on the coordinator:
+      `wss`, or `ws` only to a loopback address.
+    - The upgrade request carries `Authorization: Bearer <enrollment token>`,
+      the token issued when the node was created (`POST /admin/v1/nodes`).
+      It is presented on every connection. A missing, unknown or revoked
+      token is refused with `401` or `403` before the upgrade.
+    - A node has at most one live connection. A newer authenticated
+      connection replaces an older one, which the coordinator closes with
+      code `4009`.
+    - Every message is one text frame holding one JSON object with a `type`.
+      A receiver ignores message types and fields it does not know, so either
+      side can add them without a new protocol version. Both sides accept
+      messages up to 16 MiB.
+    - When the connection drops, the node reconnects with backoff: 1 s,
+      doubling to 60 s, with jitter. It keeps trying at 60 s after a refusal,
+      and its `/node/v1/status` says `refused`.
+
+    ## Session
+
+    1. The node sends `hello`: its id, version, engines and seats. It sends
+       nothing else until it is answered.
+    2. The coordinator answers `welcome`, with how often to heartbeat and what
+       it makes of each seat, or `refused` and closes.
+    3. From then on:
+       - The node sends `seats` with its whole seat list whenever its
+         configuration changes. The coordinator answers `seat_status`, and
+         sends `seat_status` again whenever its view of a seat changes, for
+         example when a model is added to the catalog or an account is
+         archived.
+       - The node sends `heartbeat` every interval, with each seat's state.
+         The coordinator marks a node `down` after three intervals with
+         nothing received, and fails its in-flight requests as seat failures.
+       - The node sends `quota` when an engine reports the provider's
+         windows for an account. The static engine never does.
+       - The node sends `draining` before a deliberate shutdown. The
+         coordinator sends it no new requests, and the node closes once every
+         in-flight request has its `result`.
+
+    ## Serving
+
+    - The coordinator sends `serve`. It never sends a seat more requests than
+      the seat's `concurrency`; it queues the rest itself, so a node never
+      queues.
+    - The node answers with `event` messages, the standard's streaming events
+      in order, and ends every request with exactly one `result`. It uses the
+      `request_id` as the response's `id`. Events for different requests
+      interleave; events for one request never reorder.
+    - Usage is the standard's `usage` on the terminal event's response, where
+      `input_tokens` includes cached input. What the standard does not carry
+      travels in `result`: the model as the engine reported it, cache writes,
+      timing, and quota windows.
+    - A node that cannot start a request (unknown or disabled seat, seat
+      full, engine down) sends a `result` with outcome `failed`, `retryable`
+      true, and no events.
+    - The coordinator sends `cancel` when the caller goes away or the
+      deadline passes. The node stops the engine and sends its `result`,
+      with outcome `cancelled` unless the request finished first.
+    - When the connection drops, the node abandons its in-flight requests.
+      The coordinator treats each as a seat failure: retried elsewhere if
+      nothing had reached the caller, failed otherwise.
+    - The coordinator retries a failed request on another seat only when
+      `retryable` is true and no output has reached the caller. A
+      `quota_exhausted` failure also marks the account exhausted until the
+      reset in the result's quota windows.
+
+    ## Close codes
+
+    `4009` replaced by a newer connection; `4003` node revoked; `4400`
+    protocol version unsupported, after a `refused`.
+  contact:
+    url: https://github.com/hale-lang/voice
+
+defaultContentType: application/json
+
+servers:
+  coordinator:
+    host: voice.example.invalid
+    protocol: wss
+    description: Placeholder; the coordinator's address is part of the node's boot configuration.
+    security:
+      - $ref: '#/components/securitySchemes/enrollmentToken'
+
+channels:
+  connection:
+    address: /node/v1/connect
+    description: The one connection between a node and the coordinator.
+    messages:
+      hello: { $ref: '#/components/messages/hello' }
+      welcome: { $ref: '#/components/messages/welcome' }
+      refused: { $ref: '#/components/messages/refused' }
+      seats: { $ref: '#/components/messages/seats' }
+      seatStatus: { $ref: '#/components/messages/seatStatus' }
+      heartbeat: { $ref: '#/components/messages/heartbeat' }
+      quota: { $ref: '#/components/messages/quota' }
+      draining: { $ref: '#/components/messages/draining' }
+      serve: { $ref: '#/components/messages/serve' }
+      event: { $ref: '#/components/messages/event' }
+      result: { $ref: '#/components/messages/result' }
+      cancel: { $ref: '#/components/messages/cancel' }
+
+operations:
+  nodeSends:
+    action: send
+    channel: { $ref: '#/channels/connection' }
+    summary: What the node sends to the coordinator.
+    messages:
+      - $ref: '#/channels/connection/messages/hello'
+      - $ref: '#/channels/connection/messages/seats'
+      - $ref: '#/channels/connection/messages/heartbeat'
+      - $ref: '#/channels/connection/messages/quota'
+      - $ref: '#/channels/connection/messages/draining'
+      - $ref: '#/channels/connection/messages/event'
+      - $ref: '#/channels/connection/messages/result'
+  nodeReceives:
+    action: receive
+    channel: { $ref: '#/channels/connection' }
+    summary: What the coordinator sends to the node.
+    messages:
+      - $ref: '#/channels/connection/messages/welcome'
+      - $ref: '#/channels/connection/messages/refused'
+      - $ref: '#/channels/connection/messages/seatStatus'
+      - $ref: '#/channels/connection/messages/serve'
+      - $ref: '#/channels/connection/messages/cancel'
+
+components:
+  securitySchemes:
+    enrollmentToken:
+      type: http
+      scheme: bearer
+      description: The node's enrollment token, on the WebSocket upgrade request.
+
+  messages:
+    hello:
+      name: hello
+      summary: The node introduces itself and declares its seats.
+      payload: { $ref: '#/components/schemas/Hello' }
+    welcome:
+      name: welcome
+      summary: The coordinator admits the node.
+      payload: { $ref: '#/components/schemas/Welcome' }
+    refused:
+      name: refused
+      summary: The coordinator will not admit the node; it closes next.
+      payload: { $ref: '#/components/schemas/Refused' }
+    seats:
+      name: seats
+      summary: The node's whole seat list, after any change.
+      payload: { $ref: '#/components/schemas/Seats' }
+    seatStatus:
+      name: seat_status
+      summary: What the coordinator makes of each seat.
+      payload: { $ref: '#/components/schemas/SeatStatusMessage' }
+    heartbeat:
+      name: heartbeat
+      summary: The node's seats' current state.
+      payload: { $ref: '#/components/schemas/Heartbeat' }
+    quota:
+      name: quota
+      summary: Provider windows an engine reported for an account.
+      payload: { $ref: '#/components/schemas/Quota' }
+    draining:
+      name: draining
+      summary: The node takes no new requests and closes once in-flight ones finish.
+      payload: { $ref: '#/components/schemas/Draining' }
+    serve:
+      name: serve
+      summary: Serve one request on one seat.
+      payload: { $ref: '#/components/schemas/Serve' }
+    event:
+      name: event
+      summary: One standard streaming event for a request.
+      payload: { $ref: '#/components/schemas/Event' }
+    result:
+      name: result
+      summary: How a request ended. Exactly one per request, always last.
+      payload: { $ref: '#/components/schemas/Result' }
+    cancel:
+      name: cancel
+      summary: Stop serving a request.
+      payload: { $ref: '#/components/schemas/Cancel' }
+
+  schemas:
+    RequestId:
+      type: string
+      description: The coordinator's request id; the usage record's id and the response's `id`.
+
+    Hello:
+      type: object
+      required: [type, protocol, node, version, engines, seats]
+      properties:
+        type: { type: string, const: hello }
+        protocol:
+          type: integer
+          const: 1
+          description: This document's version.
+        node:
+          type: string
+          description: The node's id. Must be the id the token was issued for, or the node is refused with `node_mismatch`.
+        version:
+          type: string
+          description: The node software's version.
+        engines:
+          type: array
+          description: Engines this build can run.
+          items: { type: string }
+        seats:
+          type: array
+          items: { $ref: './node.yaml#/components/schemas/Seat' }
+
+    Welcome:
+      type: object
+      required: [type, protocol, heartbeat_interval_ms, seats]
+      properties:
+        type: { type: string, const: welcome }
+        protocol: { type: integer, const: 1 }
+        heartbeat_interval_ms: { type: integer, minimum: 1000 }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/SeatStatus' }
+
+    Refused:
+      type: object
+      required: [type, code, message]
+      properties:
+        type: { type: string, const: refused }
+        code:
+          type: string
+          enum: [protocol_unsupported, node_mismatch]
+        message: { type: string }
+        protocol:
+          type: array
+          description: The protocol versions the coordinator speaks, for `protocol_unsupported`.
+          items: { type: integer }
+
+    Seats:
+      type: object
+      required: [type, seats]
+      properties:
+        type: { type: string, const: seats }
+        seats:
+          type: array
+          description: The whole list; a seat left out is removed.
+          items: { $ref: './node.yaml#/components/schemas/Seat' }
+
+    SeatStatus:
+      type: object
+      required: [id, status, problems]
+      properties:
+        id: { type: string }
+        status:
+          type: string
+          enum: [up, down, disabled, unmapped]
+          description: As `DeclaredSeat.status` in `openapi.yaml`.
+        problems:
+          type: array
+          items: { type: string }
+
+    SeatStatusMessage:
+      type: object
+      required: [type, seats]
+      properties:
+        type: { type: string, const: seat_status }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/SeatStatus' }
+
+    Heartbeat:
+      type: object
+      required: [type, seats]
+      properties:
+        type: { type: string, const: heartbeat }
+        seats:
+          type: array
+          items:
+            type: object
+            required: [id, status, in_flight]
+            properties:
+              id: { type: string }
+              status:
+                type: string
+                enum: [up, down, disabled]
+              in_flight: { type: integer }
+              last_error: { type: [string, 'null'] }
+
+    Quota:
+      type: object
+      required: [type, seat, windows]
+      properties:
+        type: { type: string, const: quota }
+        seat: { type: string }
+        windows:
+          type: array
+          items: { $ref: './openapi.yaml#/components/schemas/QuotaWindow' }
+
+    Draining:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string, const: draining }
+        reason: { type: string }
+
+    Serve:
+      type: object
+      required: [type, request_id, seat, model, body]
+      properties:
+        type: { type: string, const: serve }
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        seat:
+          type: string
+          description: The seat's id on this node.
+        model:
+          type: string
+          description: The catalog model id the caller named.
+        engine_model:
+          type: [string, 'null']
+          description: The seat's own name for the model (`as`), when it has one.
+        deadline:
+          type: [string, 'null']
+          format: date-time
+        body:
+          description: |
+            The standard request, as the coordinator will serve it: Chat
+            Completions requests arrive converted, and `voice`, `stream`,
+            `stream_options` and `background` are removed. It is always
+            streamed on this connection.
+          type: object
+          x-voice-schema: './spec/vendor/open-responses/openapi.json#/components/schemas/CreateResponseBody'
+
+    Event:
+      type: object
+      required: [type, request_id, event]
+      properties:
+        type: { type: string, const: event }
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        event:
+          description: Any standard streaming event.
+          type: object
+          required: [type]
+          x-voice-schema: './spec/vendor/open-responses/openapi.json#/paths/~1responses/post/responses/200/content/text~1event-stream/schema'
+
+    Result:
+      type: object
+      required: [type, request_id, outcome]
+      properties:
+        type: { type: string, const: result }
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        outcome:
+          type: string
+          enum: [served, incomplete, failed, cancelled]
+        served:
+          type: object
+          description: What actually ran. Absent when nothing started.
+          required: [model]
+          properties:
+            model:
+              type: string
+              description: The model as the engine reported it.
+            quantization: { type: [string, 'null'] }
+            provider: { type: [string, 'null'] }
+        usage:
+          type: object
+          description: What the standard's `usage` does not carry.
+          properties:
+            cache_write_input_tokens:
+              type: integer
+              description: Input tokens written to the provider's cache, already counted in `input_tokens`.
+        timing:
+          type: object
+          properties:
+            first_output_ms:
+              type: integer
+              description: From `serve` received to the first output event.
+            engine_ms:
+              type: integer
+              description: From `serve` received to the result.
+        quota:
+          type: array
+          description: The account's provider windows as of this request, when the engine reports them.
+          items: { $ref: './openapi.yaml#/components/schemas/QuotaWindow' }
+        error:
+          type: object
+          description: Why, for `failed`.
+          required: [code, message, retryable]
+          properties:
+            code:
+              type: string
+              enum: [seat_unavailable, engine_failed, engine_timeout, quota_exhausted, invalid_request]
+            message: { type: string }
+            retryable:
+              type: boolean
+              description: True when another seat could serve it. `invalid_request` never is.
+
+    Cancel:
+      type: object
+      required: [type, request_id, reason]
+      properties:
+        type: { type: string, const: cancel }
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        reason:
+          type: string
+          enum: [caller_gone, deadline, node_revoked]

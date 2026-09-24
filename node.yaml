@@ -1,0 +1,399 @@
+openapi: 3.1.0
+info:
+  title: voice node
+  version: 0.1.0-draft
+  summary: The API of one node, where its seats are configured.
+  description: |
+    A node is one machine running voice's node software. Its operator
+    configures here which engines it runs, logged in to which accounts,
+    serving which models. The node never looks for engines on its own: it
+    runs exactly the seats configured here and nothing else.
+
+    The caller and admin planes are in `openapi.yaml`. This document is the
+    node's local admin API; the UI uses it as any other client does.
+
+    ## Boot configuration
+
+    Only what the node needs before this API can answer is set at start, as
+    flags or environment variables:
+
+    - the node's id, as created on the coordinator (`POST /admin/v1/nodes`);
+    - the coordinator's address;
+    - the enrollment token the coordinator issued for this node;
+    - the data directory, where the seat configuration is kept;
+    - the address this API listens on (loopback by default), and the token
+      that authenticates to it.
+
+    Everything else is configured through this API and persists in the data
+    directory.
+
+    ## The coordinator
+
+    The node dials out to the coordinator, presents its enrollment token,
+    and declares its seats. It declares them again whenever they change, so
+    a write here takes effect for routing as soon as it is applied. The
+    coordinator sends requests back over the same connection. The protocol
+    is `protocol.yaml`.
+
+    The coordinator owns the catalog and the accounts. A seat refers to
+    them by id; the coordinator reports a seat that names an unknown model or
+    account as a problem (`DeclaredSeat` in `openapi.yaml`) and serves
+    nothing through it that it cannot resolve.
+
+    ## Credentials
+
+    Voice holds no provider credentials. An engine that needs a login uses
+    its own, on this machine: a CLI's configuration directory is named in
+    the seat's `config`. A future engine whose config carries a secret marks
+    that field write-only; it is never returned and never declared to the
+    coordinator.
+  contact:
+    url: https://github.com/hale-lang/voice
+
+servers:
+  - url: http://127.0.0.1
+    description: Placeholder; the node's listen address is set at boot.
+
+tags:
+  - name: node
+    description: The node's own state and its connection to the coordinator.
+  - name: seats
+    description: The engines this node runs and what they serve.
+
+security:
+  - nodeAdmin: []
+
+paths:
+  /node/v1/status:
+    get:
+      tags: [node]
+      operationId: getNodeStatus
+      summary: The node and its connection to the coordinator
+      responses:
+        '200':
+          description: The node's status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/engines:
+    get:
+      tags: [seats]
+      operationId: listEngines
+      summary: Engines this build can run
+      description: |
+        Engines are code, so they are listed, not created. Each carries the
+        JSON Schema of its seat `config`, which a client can render as a form.
+      responses:
+        '200':
+          description: Engines.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Engine'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/seats:
+    get:
+      tags: [seats]
+      operationId: listSeats
+      summary: List this node's seats
+      responses:
+        '200':
+          description: Seats.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SeatView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [seats]
+      operationId: createSeat
+      summary: Configure a seat
+      description: |
+        The config is checked against the engine's schema. The seat is
+        declared to the coordinator as soon as it is created.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Seat'
+            examples:
+              static:
+                value:
+                  id: static
+                  engine: static
+                  account: static
+                  serves:
+                    - model: echo-1
+                  data_classes: [public, internal]
+                  concurrency: 4
+                  config:
+                    text: hello from voice
+                    chunk_chars: 8
+      responses:
+        '201':
+          description: The seat, created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /node/v1/seats/{seat}:
+    parameters:
+      - name: seat
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/SeatIdValue' }
+    get:
+      tags: [seats]
+      operationId: getSeat
+      summary: Describe a seat
+      responses:
+        '200':
+          description: The seat.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [seats]
+      operationId: updateSeat
+      summary: Change a seat
+      description: |
+        Only the fields present change; `id` and `engine` cannot. In-flight
+        requests finish on the configuration they started with. Setting
+        `enabled: false` drains the seat: it takes no new requests.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SeatUpdate'
+      responses:
+        '200':
+          description: The seat, changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [seats]
+      operationId: removeSeat
+      summary: Remove a seat
+      description: It takes no new requests; in-flight requests finish. Usage history keeps its name.
+      responses:
+        '200':
+          description: The removed seat.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    nodeAdmin:
+      type: http
+      scheme: bearer
+      description: The node's admin token, set at boot.
+
+  responses:
+    BadRequest:
+      description: Malformed, or the config does not match the engine's schema.
+      content:
+        application/json:
+          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
+    Unauthorized:
+      description: Missing or wrong admin token.
+      content:
+        application/json:
+          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
+    NotFound:
+      description: No such seat.
+      content:
+        application/json:
+          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
+    Conflict:
+      description: A seat with that id already exists on this node.
+      content:
+        application/json:
+          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
+
+  schemas:
+    SeatIdValue:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+      description: Unique on this node. Its full name is `<node>/<seat>`.
+      examples: [static, claude-work]
+
+    SeatModel:
+      type: object
+      required: [model]
+      properties:
+        model:
+          type: string
+          description: A catalog model id, as configured on the coordinator.
+        as:
+          type: [string, 'null']
+          description: The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`.
+
+    Seat:
+      type: object
+      description: One engine, spending one account, serving some catalog models.
+      required: [id, engine, account, serves]
+      properties:
+        id:
+          $ref: '#/components/schemas/SeatIdValue'
+        engine:
+          type: string
+          description: One of `/node/v1/engines`.
+          examples: [static, claude-cli, codex-cli]
+        account:
+          type: string
+          description: The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits.
+        serves:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SeatModel'
+        data_classes:
+          type: array
+          description: Data classes this seat may carry. Defaults to `[internal]`.
+          items: { type: string }
+        concurrency:
+          type: integer
+          minimum: 1
+          default: 1
+          description: Requests this seat serves at once; more queue.
+        enabled:
+          type: boolean
+          default: true
+        config:
+          type: object
+          description: Engine-specific; its schema is the engine's `config_schema`.
+      allOf:
+        - if:
+            properties: { engine: { const: static } }
+          then:
+            properties:
+              config: { $ref: '#/components/schemas/StaticConfig' }
+
+    SeatUpdate:
+      type: object
+      description: Only the fields present change.
+      properties:
+        account: { type: string }
+        serves:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SeatModel'
+        data_classes:
+          type: array
+          items: { type: string }
+        concurrency: { type: integer, minimum: 1 }
+        enabled: { type: boolean }
+        config: { type: object }
+
+    SeatView:
+      allOf:
+        - $ref: '#/components/schemas/Seat'
+        - type: object
+          required: [status, in_flight]
+          properties:
+            status:
+              type: string
+              enum: [up, down, disabled]
+              description: '`down`: the engine cannot serve, e.g. its CLI is missing or logged out.'
+            last_error: { type: [string, 'null'] }
+            in_flight: { type: integer }
+
+    StaticConfig:
+      type: object
+      description: |
+        The static engine answers every request with `text`. Tokens are
+        counted as one per four characters, rounded up, of the input and of
+        `text`.
+      required: [text]
+      properties:
+        text: { type: string, minLength: 1 }
+        chunk_chars:
+          type: integer
+          minimum: 1
+          default: 16
+          description: Characters per streamed delta.
+        first_output_ms:
+          type: integer
+          minimum: 0
+          default: 0
+          description: Delay before the first output, to exercise timing and deadlines.
+        chunk_interval_ms:
+          type: integer
+          minimum: 0
+          default: 0
+
+    Engine:
+      type: object
+      required: [id, config_schema]
+      properties:
+        id: { type: string, examples: [static] }
+        description: { type: string }
+        config_schema:
+          type: object
+          description: JSON Schema of a seat's `config` for this engine.
+
+    NodeStatus:
+      type: object
+      required: [id, version, coordinator]
+      properties:
+        id: { type: string }
+        version: { type: string }
+        coordinator:
+          type: object
+          required: [url, state]
+          properties:
+            url: { type: string }
+            state:
+              type: string
+              enum: [connecting, connected, refused]
+              description: '`refused`: the coordinator rejected the enrollment token or the node was revoked.'
+            connected_at: { type: [string, 'null'], format: date-time }
+            last_error: { type: [string, 'null'] }

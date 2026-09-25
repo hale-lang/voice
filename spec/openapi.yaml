@@ -35,6 +35,10 @@ info:
     - **Admin plane** (`/admin/v1/...`): authenticated as a principal (OIDC).
       Configures the model catalog, accounts, nodes, projects, their budgets
       and limits, and their keys; reads usage.
+    - **Node plane** (`/node/v1/...`): authenticated by a node's enrollment
+      token. A node registers here, reads its assignment, and reports its
+      state. Requests reach a node over NATS on the private network
+      (`protocol.yaml`); this plane is the node's control plane.
 
     Admin authentication is middleware in front of the admin plane, not part
     of it. The MVP runs without it, listening on loopback; OIDC drops in
@@ -55,10 +59,10 @@ info:
     Nothing is discovered. Everything that serves is configured by an
     operator, through an API.
 
-    - A **node** is one machine running voice's node software. The operator
-      creates it here, which issues an enrollment token, then starts the node
-      with that token and the coordinator's address. The node dials out to
-      the coordinator, so a node behind NAT needs no open port.
+    - A **node** is one machine running voice's node software, on the private
+      network with NATS. The operator creates it here, which issues an
+      enrollment token, then starts the node with that token and the api's
+      address. The node registers itself on start; one live node per id.
     - A node **offers engines**: the static engine, or a CLI logged in to one
       login. Its operator lists them, with the node's hard limits, in a file
       on the machine, and the node declares them when it connects. Logins
@@ -87,8 +91,10 @@ info:
     skipped. Voice picks the account with the
     most headroom, then the least loaded of its seats.
 
-    The coordinator talks to nodes over the protocol in `protocol.yaml`, the
-    seam any node implementation plugs into. It proxies and never redirects.
+    The coordinator reaches nodes over NATS on the private network, and nodes
+    report to it on this plane; `protocol.yaml` and the node plane together
+    are the seam any node implementation plugs into. Only the api is
+    exposed. It proxies and never redirects.
 
     **One admin UI.** The api serves the admin UI itself, from the same
     origin as this plane, and every node is administered through it: seats,
@@ -184,6 +190,8 @@ tags:
     description: Admin plane. The history of every configuration change.
   - name: events
     description: Admin plane. What changes as it happens, for the admin UI.
+  - name: node
+    description: Node plane. A node registers, reads its assignment and reports its state.
   - name: health
     description: Liveness and readiness, for supervisors and load balancers. No credential.
 
@@ -317,7 +325,7 @@ paths:
                   event, or a `voice:attempt` event. The stream ends with
                   `data: [DONE]`.
                 oneOf:
-                  - $ref: './spec/vendor/open-responses/openapi.json#/paths/~1responses/post/responses/200/content/text~1event-stream/schema'
+                  - $ref: './vendor/open-responses/openapi.json#/paths/~1responses/post/responses/200/content/text~1event-stream/schema'
                   - $ref: '#/components/schemas/VoiceAttemptEvent'
         '400':
           $ref: '#/components/responses/BadRequest'
@@ -1643,6 +1651,184 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  /node/v1/register:
+    post:
+      tags: [node]
+      operationId: registerNode
+      summary: A node registers on start
+      description: |
+        The node presents its capabilities and local controls, and gets the
+        heartbeat interval, where NATS is, and its current assignment. One
+        live node per id: registering again replaces the earlier
+        registration, so a restarted node takes over from its own ghost. A
+        node whose token was rotated or revoked is refused.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Registration'
+      responses:
+        '200':
+          description: Registered.
+          content:
+            application/json:
+              schema:
+                $ref: './protocol.yaml#/components/schemas/Registered'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /node/v1/assignment:
+    get:
+      tags: [node]
+      operationId: getAssignment
+      summary: The node's current assignment
+      security:
+        - enrollmentToken: []
+      responses:
+        '200':
+          description: The whole desired state, at its current version.
+          content:
+            application/json:
+              schema:
+                $ref: './protocol.yaml#/components/schemas/Assignment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/heartbeat:
+    post:
+      tags: [node]
+      operationId: nodeHeartbeat
+      summary: The node is alive, and how its seats are
+      description: Every `heartbeat_interval_ms`. Three missed intervals mark the node down.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Heartbeat'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/seats:
+    post:
+      tags: [node]
+      operationId: reportSeatStates
+      summary: Every assigned seat's state, for an assignment version
+      description: Sent after applying an assignment and whenever a seat's state changes.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/SeatStates'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/capabilities:
+    put:
+      tags: [node]
+      operationId: reportCapabilities
+      summary: What the node offers changed
+      description: The coordinator re-checks the node's assignment against the new capabilities.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Capabilities'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/local:
+    put:
+      tags: [node]
+      operationId: reportLocalControls
+      summary: The node's local controls changed
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/LocalControls'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/quota:
+    post:
+      tags: [node]
+      operationId: reportQuota
+      summary: Provider windows an engine reported for a seat's account
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/QuotaReport'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /node/v1/draining:
+    post:
+      tags: [node]
+      operationId: nodeDraining
+      summary: The node is about to stop
+      description: The coordinator sends it no new requests; the node exits once its in-flight requests have their results.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Draining'
+      responses:
+        '204':
+          description: Received.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /admin/v1/changes:
     get:
       tags: [changes]
@@ -1689,6 +1875,10 @@ components:
       type: http
       scheme: bearer
       description: "A project key, presented as `Authorization: Bearer vk-...`."
+    enrollmentToken:
+      type: http
+      scheme: bearer
+      description: "A node's enrollment token, presented as `Authorization: Bearer vn-...` on the node plane."
     principal:
       type: openIdConnect
       openIdConnectUrl: https://voice.example.invalid/.well-known/openid-configuration
@@ -2057,7 +2247,7 @@ components:
     CreateResponseRequest:
       description: The standard `CreateResponseBody` plus an optional `voice` object.
       allOf:
-        - $ref: './spec/vendor/open-responses/openapi.json#/components/schemas/CreateResponseBody'
+        - $ref: './vendor/open-responses/openapi.json#/components/schemas/CreateResponseBody'
         - type: object
           required: [model]
           properties:
@@ -2067,7 +2257,7 @@ components:
     Response:
       description: The standard `ResponseResource` plus the required `voice` object.
       allOf:
-        - $ref: './spec/vendor/open-responses/openapi.json#/components/schemas/ResponseResource'
+        - $ref: './vendor/open-responses/openapi.json#/components/schemas/ResponseResource'
         - type: object
           required: [voice]
           properties:

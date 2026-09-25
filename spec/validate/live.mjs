@@ -15,6 +15,13 @@ for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object
   const code = Object.keys(op.responses).find(c => c.startsWith('2'));
   const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]);
   const content = op.responses[code].content;
+  if (!content) {
+    n++;
+    const body = ['post', 'put'].includes(m) ? JSON.stringify({ in_flight: 0, seats: [], assignment_version: 1, paused: false, paused_seats: [], max_in_flight: 4, engines: [], seat: 's', windows: [] }) : undefined;
+    const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json' } : {} });
+    if (String(r.status) !== code) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${code}`);
+    continue;
+  }
   const variants = content['application/json'] ? (content['text/event-stream'] ? [false, true] : [false]) : [true];
   const inference = !!content['application/json'];
   for (const stream of variants) {

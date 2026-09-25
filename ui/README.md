@@ -7,9 +7,9 @@ Nothing is here yet. This file records the decisions the UI is built on.
 
 ## The seam
 
-The UI talks to voice only through [`../openapi.yaml`](../openapi.yaml):
+The UI talks to voice only through [`../openapi.yaml`](../spec/openapi.yaml):
 `/admin/v1` for administration, `/v1` where it shows what a caller sees.
-It never talks to a node; `../node.yaml` is for the machine a node runs on.
+It never talks to a node; `../spec/node.yaml` is for the machine a node runs on.
 
 **The api is the trust boundary.** Voice's backend is Hale, and the
 compiler proves what it can about the system graph up to the api's edge.

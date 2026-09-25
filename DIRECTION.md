@@ -10,9 +10,9 @@ because the contract comes before the code.
 
 ## The contract
 
-The API is specified in [`openapi.yaml`](./openapi.yaml) (the coordinator) and
-[`node.yaml`](./node.yaml) (voice's own node, locally), and the connection between them in
-[`protocol.yaml`](./protocol.yaml) (AsyncAPI). They are the source of truth;
+The API is specified in [`openapi.yaml`](./spec/openapi.yaml) (the coordinator) and
+[`node.yaml`](./spec/node.yaml) (voice's own node, locally), and the connection between them in
+[`protocol.yaml`](./spec/protocol.yaml) (AsyncAPI). They are the source of truth;
 code conforms to them.
 
 - **The caller API is an open standard.** The core endpoint is
@@ -38,11 +38,11 @@ code conforms to them.
 Nothing is discovered. Everything that serves is configured by an operator,
 and the API is the first-class way to do it; the UI is one client of it.
 
-- **A node** is one machine running voice's node software. An operator
-  creates it on the coordinator, which issues an enrollment token, and starts
-  the node with that token and the coordinator's address. The node dials out
-  over a WebSocket and serves requests over that same connection, so a node
-  behind NAT needs no open port.
+- **A node** is one machine running voice's node software, on the private
+  network with NATS; only the api is exposed. An operator creates it on the
+  coordinator, which issues an enrollment token, and starts the node with
+  that token and the api's address. The node registers itself, subscribes to
+  its own NATS subject, and reports its state to the api.
 - **The node decides what is possible; the coordinator decides what runs.**
   A node's operator lists, in a file on the machine, the engines it offers
   (the static engine, or a CLI with the login it runs under) and its hard
@@ -52,8 +52,9 @@ and the API is the first-class way to do it; the UI is one client of it.
   outside what it offers.
 - **Local controls only restrict.** On the machine, an operator can pause the
   node or a seat, or lower its in-flight cap, and nothing more.
-- **The protocol is the seam.** Any program that speaks `protocol.yaml` can
-  be a node. Voice ships the api, the coordinator and its own node.
+- **The protocol is the seam.** Any program that speaks `protocol.yaml` and
+  the api's node plane can be a node. Voice ships the api, the coordinator
+  and its own node.
 - **One admin UI**, in this repository (`ui/`), served by the api from its
   own origin, administers every node. The backend is Hale; the UI is not, so
   the api is the trust boundary: every rule is enforced there, and the UI is
@@ -90,9 +91,10 @@ the rest only through Postgres, and the process boundary makes that a fact
 rather than a convention.
 
 Requests move between the pieces as Hale bus topics, keyed by node and by
-request, bound to NATS from the MVP on, so the paths between api instances
-run before there is a second instance. State never travels as events; it
-stays in Postgres. The [README](./README.md) documents the architecture.
+request, bound to NATS from the MVP on: an api instance publishes `serve` on
+the node's subject, and the node streams the answer to the reply subject
+that request named. No instance holds a node's connection, so nothing is
+forwarded. State never travels as events; it stays in Postgres. The [README](./README.md) documents the architecture.
 
 ## Phases
 

@@ -62,8 +62,8 @@ curl localhost:8081/node/v1/status # the node's local API
 ```
 
 Today the api is the canned stub and the brain and node are skeletons, so
-nothing reads Postgres yet and the node keeps retrying a coordinator end
-that does not exist.
+nothing reads Postgres or NATS yet, and the node registers with the stub's
+canned answer.
 
 ## The brain (skeleton)
 
@@ -86,9 +86,9 @@ and follows changes through the admin event stream (`GET /admin/v1/events`).
 
 | Document | What it specifies |
 |---|---|
-| [`openapi.yaml`](./openapi.yaml) | The coordinator: the caller plane (`/v1`) and the admin plane (`/admin/v1`). |
-| [`node.yaml`](./node.yaml) | A node's own admin API (`/node/v1`), where its seats are configured. |
-| [`protocol.yaml`](./protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). |
+| [`openapi.yaml`](./spec/openapi.yaml) | The coordinator: the caller plane (`/v1`) and the admin plane (`/admin/v1`). |
+| [`node.yaml`](./spec/node.yaml) | A node's own admin API (`/node/v1`), where its seats are configured. |
+| [`protocol.yaml`](./spec/protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). |
 | [`spec/vendor/open-responses/`](./spec/vendor/open-responses/) | The [Open Responses](https://www.openresponses.org/specification) standard, `2026-04-24`, which the caller plane is. |
 
 The code conforms to these documents, not the other way round.
@@ -100,51 +100,54 @@ The code conforms to these documents, not the other way round.
         |                               +-------------------+
         | /v1                           | /admin/v1         | /node/v1
         v                               v                   |
-  +--------------------- api (x N) ---------------------+   |
-  |  gateway -> admission -> claim -> node sessions     |   |
+  +----------------- api (x N), exposed ----------------+   |
+  |  gateway -> admission -> claim -> serve             |   |
   |                                                     |   |
-  |  settle, ledger                                     |   |
+  |  settle, ledger        node plane: register, reports|   |
   +-----------------------------------------------------+   |
           |                     |           ^               |
-          | SQL                 |           | WebSocket,    |
-          v                     |           | opened by     |
-  +--------- Postgres --------+ |           | the node      v
+          | SQL                 |           | HTTP, from    |
+          v                     |           | the node      |
+  +--------- Postgres --------+ |           |               v
   |  configuration            | | +---------+ node (x N) ---+-----+
   |  route table, counters    | | |  session -> seats -> engines  |
-  |  ledger                   | | |  data directory               |
+  |  ledger                   | | |  capabilities, local          |
   +---------------------------+ | +-------------------------------+
-          ^                     |
-          | SQL                 |
-  +------- brain (x 1) -------+ |
-  |  reads state, writes      | |
-  |  the route table          | |
-  +---------------------------+ |
-          |                     |
-          v                     v
-  ======== nats ====================================================
-  request topics between api instances, from the api;
-  the brain's notice that the route table changed
+          ^                     |                 |
+          | SQL                 |                 |
+  +------- brain (x 1) -------+ |                 |
+  |  reads state, writes      | |                 |
+  |  the route table          | |                 |
+  +---------------------------+ |                 |
+          |                     |                 |
+          v                     v                 ^
+  ======== nats, private network ===================================
+  serve, assign, cancel to each node on its own subject;
+  each request's events and result back on its reply subject
 ```
 
-- **The api** is the endpoint. Every instance serves the caller plane and
-  the admin plane, accepts nodes' connections, admits and routes requests,
-  and settles them. Instances hold no state of their own beyond their open
-  connections, so they scale out behind a load balancer and restart one at a
+- **The api** is the endpoint, and the only exposed process. Every
+  instance serves the caller plane, the admin plane and the node plane,
+  admits and routes requests, and settles them. Instances hold no state of
+  their own beyond their open caller connections, so they scale out behind
+  a load balancer and restart one at a
   time.
 - **The brain** keeps the route table. It reads what the api instances write
   (seat states, heartbeats, quota windows, configuration) and decides
   which seats should take the next requests for each model. There is exactly
   one, it is not on the request path, and it talks to nothing but Postgres.
-- **A node** runs on each machine that has engines. It offers the engines
-  its operator listed on the machine, runs the seats the coordinator assigns
-  it within them, and dials out to the api, so it needs no open port. Any
-  program that speaks [`protocol.yaml`](./protocol.yaml) can be a node; voice
-  ships its own.
+- **A node** runs on each machine that has engines, on the private network.
+  It offers the engines its operator listed on the machine, runs the seats
+  the coordinator assigns it within them, registers and reports over the
+  api's node plane, and takes requests over NATS on its own subject. Any
+  program that speaks [`protocol.yaml`](./spec/protocol.yaml) and the node plane
+  can be a node; voice ships its own.
 - **Postgres** is the shared state: configuration, the route table,
   counters and the ledger. Nodes have no database.
-- **NATS** carries messages between processes: the request topics between
-  api instances, and the brain's notice that the route table changed. It
-  carries no state.
+- **NATS** carries messages between processes on the private network:
+  `serve` from an api instance to a node, each request's events and result
+  back to the instance that asked, assignments and cancels to nodes, and the
+  brain's notice that the route table changed. It carries no state.
 
 What the specs call the **coordinator** is the api and the brain together;
 callers and nodes cannot tell how many api instances stand behind the
@@ -201,13 +204,13 @@ when it cannot reach the coordinator.
    the answer is `503 no_capacity` with the earliest reset. If the seats are
    only busy, the api tries again as slots free or the route table changes,
    until the request's deadline.
-4. **Serve.** The api publishes `serve` on a bus topic keyed by node, and
-   the session holding that node's connection sends it on. The body is the
-   standard Open Responses request; a Chat Completions request is converted
-   first. The node's engine runs, and its standard streaming events come
-   back on a topic keyed by request, to whichever instance holds the
-   caller, and are relayed as they arrive, as server-sent events or
-   collected into one response. See [Events](#events).
+4. **Serve.** The api publishes `serve` on the node's subject, naming a
+   reply subject for this request, and the node accepts or refuses at once.
+   The body is the standard Open Responses request; a Chat Completions
+   request is converted first. The node's engine runs, and its standard
+   streaming events come back on the reply subject, to the instance that
+   asked, and are relayed as they arrive, as server-sent events or collected
+   into one response. See [Events](#events).
 5. **Retry.** If the seat fails before anything reached the caller, the api
    releases the slot and claims another, on a different seat and within the
    named account if there is one. The move is recorded as an attempt. After
@@ -252,22 +255,22 @@ Voice is evented through Hale's bus, with NATS carrying the topics that
 cross processes. Everything that moves between the pieces of a request is a
 typed topic:
 
-- `serve`, keyed by node: from the instance that claimed the slot to the
-  session holding the node's connection.
-- the node's events and its `result`, keyed by request: from that session
-  to the child holding the caller's request.
+- `serve`, `assign` and `cancel`, keyed by node: from an api instance to
+  the node, on the node's own subject.
+- the node's events and its `result`, keyed by request: from the node to
+  the api instance that asked, on the reply subject that request named.
 
 Each subscriber names its own key (`where key == ...`), so nothing filters
-traffic in a handler.
+traffic in a handler, and no api instance holds a node: whichever instance
+claims a slot talks to the node directly, and the answer comes straight
+back to it. Nothing is forwarded between instances.
 
-**The request topics are bound to NATS from the MVP on**, in `main`'s
+**These topics are bound to NATS from the MVP on**, in `main`'s
 `bindings { }` block through pond's NATS adapter
-([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)).
-With several api instances the node's connection and the caller's request
-can be on different instances, and the same publishes and subscriptions
-cross them; with one instance the same path is simply exercised by one
-process. The brain's notice that the route table changed rides the same
-connection, which ends the polling. See Hale's
+([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
+in the api and in the node alike. With one api instance the same path is
+simply exercised by one process. The brain's notice that the route table
+changed rides the same connection, which ends the polling. See Hale's
 [across binaries](https://hale-lang.org/docs/services/multi-binary).
 
 **What does not go on the bus: state.** The claim, the reservation and the
@@ -298,10 +301,10 @@ State lives in one of three places, and each piece has exactly one home.
 - **Counters.** Rate-limit windows, reservations, and each project's spend
   in its current period. Every api instance updates them with conditional
   writes, so a limit holds across instances and across restarts.
-- **The fleet as reported.** Api instances' heartbeats, which instance holds
-  each node's connection, each node's declared capabilities and local
-  controls, its seats' states, and each account's quota windows as an engine
-  last reported them.
+- **The fleet as reported.** Api instances' heartbeats, each node's
+  registration, heartbeats, declared capabilities and local controls, its
+  seats' states, and each account's quota windows as an engine last
+  reported them.
 - **The ledger.** One usage record per request: project, key, requested and
   served model, node, seat, account, tokens, price, timing, attempts and the
   caller's `metadata`. It is append-only. Usage summaries are queries over
@@ -309,8 +312,8 @@ State lives in one of three places, and each piece has exactly one home.
 
 ### Process memory
 
-An api instance holds its open connections (callers' streams and nodes'
-WebSockets) and may cache configuration, keyed by a version it checks.
+An api instance holds its open caller connections and its NATS
+subscriptions, and may cache configuration, keyed by a version it checks.
 Nothing in memory is the only copy of anything, so losing a process loses
 only its own in-flight requests.
 
@@ -355,9 +358,11 @@ that dies with its api instance is recorded as abandoned by the brain.
 
 - **Callers** present project keys. The coordinator stores digests, never
   secrets.
-- **Nodes** present their enrollment token on every connection. The
-  coordinator never connects to a node; revoking a node closes its
-  connection and refuses its token.
+- **Nodes** present their enrollment token on every node-plane call, and
+  connect to NATS with their own credentials, confined to their own subject
+  and the reply subjects they are handed. NATS and the nodes are on the
+  private network; only the api is exposed. Revoking a node refuses its
+  token, and the coordinator publishes nothing further to its subject.
 - **Admins** authenticate through middleware in front of the admin APIs:
   OIDC later, nothing in the MVP, which listens on loopback only.
 - **Provider credentials** stay with the engines on their nodes. A CLI
@@ -369,19 +374,19 @@ that dies with its api instance is recorded as abandoned by the brain.
   did not offer.
 - **Content** is never written down. A seat sees only the data classes its
   operator allowed it.
-- **TLS** is terminated in front of the api, for callers and for nodes'
-  `wss`. Hale's TLS reads block their thread and cannot park on an async
-  pool yet, so the api speaks plain HTTP behind the terminator, which is
-  also the load balancer.
+- **TLS** is terminated in front of the api. Hale's TLS reads block their
+  thread and cannot park on an async pool yet, so the api speaks plain HTTP
+  behind the terminator, which is also the load balancer. NATS is not
+  exposed, so it needs no terminator.
 
 ## When things fail
 
 | What fails | What happens |
 |---|---|
 | A seat | The request moves to another seat if nothing reached the caller; otherwise the response fails, with the attempt recorded. |
-| A node's connection | Its in-flight requests fail over as above and its seats leave the route table. The node reconnects, possibly to another api instance, and declares its seats again. |
+| A node | Missed heartbeats mark it down: its in-flight requests fail over as above and its seats leave the route table. When it is back it registers again and gets its assignment. |
 | An account's quota | The account gets no slots until its window resets. Requests that named it fail with `503 no_capacity` and `Retry-After`. |
-| An api instance | Its callers' requests fail and its nodes reconnect elsewhere. The brain frees its slots and reservations when its heartbeat stops. |
+| An api instance | Its callers' requests fail; nodes are unaffected, since none is bound to it. The brain frees its slots and reservations when its heartbeat stops. |
 | The brain | Serving continues on the last route table, which goes stale until the brain is back. |
 | Postgres | Nothing is served and nothing is configured until it is back. |
 
@@ -399,10 +404,11 @@ from Hale's
   accepted child with `release`, so its memory is reclaimed when the request
   ends. A streaming request takes over its connection to write server-sent
   events itself.
-- Each connected node is an accepted child holding its WebSocket (server
-  side of `pond/websocket`). It subscribes to `serve` for its own node, and
-  publishes the node's events on a topic keyed by `request_id`, to which
-  each request child subscribes with its own key.
+- The node plane is ordinary handlers: register, assignment, heartbeat and
+  the reports, each a write to the store.
+- A request child publishes `serve` on the node's topic and subscribes to
+  the events and result topics with its own request id as the key; the
+  binding to NATS makes the reply subject that request's own.
 - The store owns the Postgres connections: a pool for reads and a dedicated
   connection for transactions, since `pq`'s pool does not do transactions.
   Because `pq` blocks, the store is pinned, away from the pool that serves
@@ -427,11 +433,13 @@ there.
 
 **Node**
 
-- The session holds the WebSocket client and reconnects. It is pinned,
-  because `wss` reads block.
-- The capabilities file is read at start and declared in `hello`; the
-  assignment in `welcome` and every `assign` is reconciled against it, and
-  seat states go back as `seat_status`.
+- The session registers over the node plane, then holds the NATS
+  connection (`pond/realtime/nats`, which reconnects and resubscribes on
+  its own) and posts heartbeats. It is pinned, because the client's reads
+  block.
+- The capabilities file is read at start and declared at registration; the
+  assignment that comes back, and every `assign` after, is reconciled
+  against it, and seat states are posted back.
 - Each seat is a locus running its engine: the static engine answers in
   process, and CLI engines run their CLI as a supervised child process.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local

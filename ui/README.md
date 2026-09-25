@@ -68,8 +68,10 @@ nouns; voice's own state-word mapping lives in `apps/admin/src/tone.ts`),
 
 ## Shipping
 
-`vite build` writes static files; the api serves them at `/`, with the
-single-page fallback, beside `/v1` and `/admin/v1`. One origin, so no CORS.
+`npm run build` writes `apps/admin/dist`; the api serves it at `/` with
+`--ui DIR`, single-page fallback included, beside `/v1` and `/admin/v1`.
+One origin, so no CORS. The image builds it in (`Dockerfile`), and
+`docker compose up` serves it at http://127.0.0.1:8080/.
 
 ## Screens
 

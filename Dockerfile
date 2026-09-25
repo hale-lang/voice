@@ -7,6 +7,15 @@
 
 ARG HALE_VERSION=v0.21.0
 
+# The admin UI, built once and served by the api from its own origin.
+FROM node:22-bookworm-slim AS ui
+WORKDIR /ui
+COPY ui/package.json ui/package-lock.json ui/tsconfig.base.json ./
+COPY ui/packages ./packages
+COPY ui/apps ./apps
+COPY spec /spec
+RUN npm ci && npm run build
+
 FROM ubuntu:24.04 AS build
 ARG HALE_VERSION
 ARG TARGETARCH
@@ -46,3 +55,4 @@ COPY --from=build /src/api/api /usr/local/bin/voice-api
 COPY --from=build /src/brain/brain /usr/local/bin/voice-brain
 COPY --from=build /src/node/node /usr/local/bin/voice-node
 COPY api/canned /usr/share/voice/canned
+COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui

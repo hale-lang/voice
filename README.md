@@ -35,17 +35,33 @@ in [`FRICTION.md`](./FRICTION.md).
 
 ## The node (skeleton)
 
-[`node/`](./node/) is the start of the real node, not a stub: its main
-locus, a local admin API and a session that retries the coordinator. It was
-built before seats moved to the coordinator, so its admin API still manages
-seats locally; the protocol slice brings it in line with `node.yaml`
-(capabilities file, local controls, assignments) and adds the static engine.
+[`node/`](./node/) is the start of the real node, not a stub. It reads
+and checks its capabilities file at start (refusing a kind it cannot run),
+serves its local API from `node.yaml` (status, capabilities, local
+controls) and retries the coordinator. The protocol (assignments, seat
+states, serving) and the static engine come next.
 
 ```sh
 hale build node
-node/node --id laptop --data node-data --port 8081   # --coordinator URL, --token T
+node/node --id laptop --data node-data --capabilities deploy/node/capabilities.json --port 8081
 hale test node
 ```
+
+## Running the process model
+
+[`compose.yaml`](./compose.yaml) runs voice as the MVP will: Postgres, the
+api, the brain and a node, each its own process, from one image built with
+hale's released toolchain ([`Dockerfile`](./Dockerfile)).
+
+```sh
+docker compose up --build
+curl localhost:8080/v1/models      # the api
+curl localhost:8081/node/v1/status # the node's local API
+```
+
+Today the api is the canned stub and the brain and node are skeletons, so
+nothing reads Postgres yet and the node keeps retrying a coordinator end
+that does not exist.
 
 ## The brain (skeleton)
 
@@ -294,6 +310,17 @@ only its own in-flight requests.
 The node's capabilities file, written by its operator, and its local
 controls. Everything else about what it runs comes from the coordinator, so
 it needs no database.
+
+### Migrations
+
+The schema is versioned with
+[`pond/migrations`](https://github.com/hale-lang/pond/tree/main/migrations):
+migrations registered in Hale code, each applied in one transaction under a
+Postgres advisory lock, with golang-migrate's dirty-state repair. They run
+as a one-shot `migrate` step that the api and the brain wait on, never from
+the api or the brain themselves, so neither ever starts against a schema it
+does not expect. The schema and its migrations live in the store seed the
+api and the brain share.
 
 ### Why Postgres, and not also Redis
 

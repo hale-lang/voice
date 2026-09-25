@@ -1,0 +1,91 @@
+# voice's process model on one machine: Postgres, the api, the brain and a
+# node, each its own process, as in the README's MVP.
+#
+#   docker compose up --build
+#
+# The api answers on 127.0.0.1:8080 and the node's local API on
+# 127.0.0.1:8081; nothing else is published.
+#
+# Today the api is the canned stub and the brain and node are skeletons:
+# nothing reads Postgres yet, and the node retries a coordinator end that
+# does not exist. Schema migrations will run as a one-shot `migrate` service
+# that the api and the brain wait on (see README, "State").
+
+name: voice
+
+# The api, the brain and the node are one image, built once.
+x-voice: &voice
+  build: .
+  image: voice:dev
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: voice
+      POSTGRES_PASSWORD: voice
+      POSTGRES_DB: voice
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "voice", "-d", "voice"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  api:
+    <<: *voice
+    command: ["voice-api", "--host", "0.0.0.0", "--port", "8080", "--canned", "/usr/share/voice/canned"]
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  brain:
+    <<: *voice
+    command: ["voice-brain", "--database", "postgres://voice:voice@postgres:5432/voice"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  node:
+    <<: *voice
+    command:
+      - voice-node
+      - --id
+      - local
+      - --coordinator
+      - ws://api:8080/node/v1/connect
+      - --data
+      - /var/lib/voice-node
+      - --capabilities
+      - /etc/voice/capabilities.json
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8081"
+    volumes:
+      - node-data:/var/lib/voice-node
+      - ./deploy/node/capabilities.json:/etc/voice/capabilities.json:ro
+    ports:
+      - "127.0.0.1:8081:8081"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  postgres:
+  node-data:

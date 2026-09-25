@@ -51,9 +51,9 @@ hale test node
 
 ## Running the process model
 
-[`compose.yaml`](./compose.yaml) runs voice as the MVP will: Postgres, the
-api, the brain and a node, each its own process, from one image built with
-hale's released toolchain ([`Dockerfile`](./Dockerfile)).
+[`compose.yaml`](./compose.yaml) runs voice as the MVP will: Postgres, NATS,
+the api, the brain and a node, each its own process, from one image built
+with hale's released toolchain ([`Dockerfile`](./Dockerfile)).
 
 ```sh
 docker compose up --build
@@ -105,20 +105,25 @@ The code conforms to these documents, not the other way round.
   |                                                     |   |
   |  settle, ledger                                     |   |
   +-----------------------------------------------------+   |
-          |                                 ^               |
-          | SQL                             | WebSocket,    |
-          v                                 | opened by     |
-  +--------- Postgres --------+             | the node      v
-  |  configuration            |   +---------+ node (x N) ---+-----+
-  |  route table, counters    |   |  session -> seats -> engines  |
-  |  ledger                   |   |  data directory               |
-  +---------------------------+   +-------------------------------+
-          ^
-          | SQL
-  +------- brain (x 1) -------+
-  |  reads state, writes      |
-  |  the route table          |
-  +---------------------------+
+          |                     |           ^               |
+          | SQL                 |           | WebSocket,    |
+          v                     |           | opened by     |
+  +--------- Postgres --------+ |           | the node      v
+  |  configuration            | | +---------+ node (x N) ---+-----+
+  |  route table, counters    | | |  session -> seats -> engines  |
+  |  ledger                   | | |  data directory               |
+  +---------------------------+ | +-------------------------------+
+          ^                     |
+          | SQL                 |
+  +------- brain (x 1) -------+ |
+  |  reads state, writes      | |
+  |  the route table          | |
+  +---------------------------+ |
+          |                     |
+          v                     v
+  ======== nats ====================================================
+  request topics between api instances, from the api;
+  the brain's notice that the route table changed
 ```
 
 - **The api** is the endpoint. Every instance serves the caller plane and
@@ -137,16 +142,19 @@ The code conforms to these documents, not the other way round.
   ships its own.
 - **Postgres** is the shared state: configuration, the route table,
   counters and the ledger. Nodes have no database.
+- **NATS** carries messages between processes: the request topics between
+  api instances, and the brain's notice that the route table changed. It
+  carries no state.
 
 What the specs call the **coordinator** is the api and the brain together;
 callers and nodes cannot tell how many api instances stand behind the
 address.
 
-**The MVP runs the real process model:** one api instance and one brain, as
-separate processes, beside Postgres and a node. The brain shares state with
-the api only through Postgres, and the process boundary enforces it. What
-scaling out adds later is more api instances and a broker between them, not
-a new split. See [In Hale](#in-hale).
+**The MVP runs the real process model:** one api instance, one brain, one
+node, Postgres and NATS, as five processes. The brain shares state with the
+api only through Postgres, and the process boundary enforces it. Scaling out
+later adds api instances and nothing else: the paths between instances are
+already exercised by the one. See [In Hale](#in-hale).
 
 ### Nouns
 
@@ -228,9 +236,8 @@ The brain turns the state of the fleet into rows the api can claim.
   the next one. That is the compare-and-swap, and Postgres already has it.
 - **Versions.** Each rewrite bumps the table's version. `pond/pq` has no
   `LISTEN/NOTIFY` yet, so the api polls the version, and rereads the table
-  when a claim misses. A change notice from the brain on a bound bus topic
-  can replace the polling: a Unix socket on one machine, NATS across
-  machines (see [Events](#events)).
+  when a claim misses. The brain's notice that the table changed, over
+  NATS, is what ends the polling (see [Events](#events)).
 - **Leases.** Every api instance heartbeats a row. When one stops, the
   brain frees its claimed slots, releases its reservations, and records its
   in-flight requests as abandoned.
@@ -241,8 +248,9 @@ stale.
 
 ## Events
 
-Voice is evented through Hale's bus, and has no message broker. Everything
-that moves between the pieces of a request is a typed topic:
+Voice is evented through Hale's bus, with NATS carrying the topics that
+cross processes. Everything that moves between the pieces of a request is a
+typed topic:
 
 - `serve`, keyed by node: from the instance that claimed the slot to the
   session holding the node's connection.
@@ -250,17 +258,16 @@ that moves between the pieces of a request is a typed topic:
   to the child holding the caller's request.
 
 Each subscriber names its own key (`where key == ...`), so nothing filters
-traffic in a handler. Within one api instance these are in-memory
-dispatches.
+traffic in a handler.
 
-**Scaling out adds no code.** With several api instances, the node's
-connection and the caller's request can be on different instances. The
-request topics are then bound to NATS in `main`'s `bindings { }` block,
-through pond's NATS adapter
-([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
-and the same publishes and subscriptions cross instances. The same
-connection carries the brain's notice that the route table changed, which
-ends the polling. See Hale's
+**The request topics are bound to NATS from the MVP on**, in `main`'s
+`bindings { }` block through pond's NATS adapter
+([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)).
+With several api instances the node's connection and the caller's request
+can be on different instances, and the same publishes and subscriptions
+cross them; with one instance the same path is simply exercised by one
+process. The brain's notice that the route table changed rides the same
+connection, which ends the polling. See Hale's
 [across binaries](https://hale-lang.org/docs/services/multi-binary).
 
 **What does not go on the bus: state.** The claim, the reservation and the
@@ -269,11 +276,11 @@ stay in Postgres. Usage is written once, to the ledger; publishing it to a
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
-**Why not a broker from the start:** with one api instance there is nothing
-for it to carry that the bus does not already deliver (the brain and the api
-share Postgres, not messages), and it would be one more stateful service to
-run. It earns its place with the second api instance,
-and adding it then is a binding, not a redesign.
+**Why the broker is in the MVP:** a single api instance would not need it,
+but the MVP's job is to lay the process model the rest is built on, and a
+path first exercised when the second instance appears is a path that has
+never run. NATS is core NATS, not JetStream: nothing durable travels on it,
+so nothing needs to be retained.
 
 ## State
 
@@ -415,8 +422,8 @@ from Hale's
   what dead api instances held. Per-tick work runs in a method, so each
   tick's memory is reclaimed.
 
-Running a second api instance is a `bindings { }` entry per request topic,
-not new code.
+Running a second api instance is starting one; the bindings are already
+there.
 
 **Node**
 
@@ -432,16 +439,15 @@ not new code.
 
 ## Deployment
 
-- **MVP:** one machine, four processes on loopback: Postgres, one api, one
-  brain and one node. The node offers the static engine, and a seat on
+- **MVP:** one machine, five processes on loopback: Postgres, NATS, one
+  api, one brain and one node. The node offers the static engine, and a seat on
   it answers every request with its configured text. Everything is set up
   through the APIs, in this order: a model, an account, a node (which yields
   a token), the node started with that token and a capabilities file, its
   seat, a project and a key.
-- **Personal:** the api, the brain and Postgres on a machine that stays up,
-  with a node
-  on each machine whose CLIs are logged in, one engine per login and a seat
-  on each.
+- **Personal:** the api, the brain, Postgres and NATS on a machine that
+  stays up, with a node on each machine whose CLIs are logged in, one engine
+  per login and a seat on each.
 - **Scaled out:** several api instances behind a load balancer that also
-  terminates TLS and sends traffic only to instances whose `/readyz` is ok, a NATS server carrying the request topics between them,
+  terminates TLS and sends traffic only to instances whose `/readyz` is ok,
   the brain with a standby on another machine, and nodes anywhere.

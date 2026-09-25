@@ -90,9 +90,9 @@ the rest only through Postgres, and the process boundary makes that a fact
 rather than a convention.
 
 Requests move between the pieces as Hale bus topics, keyed by node and by
-request. There is no message broker: with more than one api instance those
-topics are bound to NATS, which is a binding on `main`, not new code. State
-never travels as events; it stays in Postgres. The [README](./README.md) documents the architecture.
+request, bound to NATS from the MVP on, so the paths between api instances
+run before there is a second instance. State never travels as events; it
+stays in Postgres. The [README](./README.md) documents the architecture.
 
 ## Phases
 

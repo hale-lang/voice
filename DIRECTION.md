@@ -81,9 +81,11 @@ the start, because the MVP exists to prove them.
 
 The coordinator is two roles. **Api** instances serve callers, the admin
 plane and nodes' connections; they hold no state of their own and scale out.
-One **brain** turns the fleet's reported state into a route table in
-Postgres, and api instances claim slots from it atomically. Postgres holds
-all shared state: configuration, the route table, counters and the ledger.
+One **brain** turns the fleet's reported state into a route table and
+publishes it over NATS; api instances route from the latest snapshot, and
+a node accepts or refuses each request, so the table need not be exact.
+Postgres holds all durable state: configuration, reservations and counters,
+the fleet as reported, and the ledger.
 
 The MVP runs them as separate processes from the start (one api, one brain),
 so the process model is the real one from the first slice. The brain reaches

@@ -90,6 +90,8 @@ and follows changes through the admin event stream (`GET /admin/v1/events`).
 | [`node.yaml`](./spec/node.yaml) | A node's own admin API (`/node/v1`), where its seats are configured. |
 | [`protocol.yaml`](./spec/protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). |
 | [`spec/vendor/open-responses/`](./spec/vendor/open-responses/) | The [Open Responses](https://www.openresponses.org/specification) standard, `2026-04-24`, which the caller plane is. |
+| [`spec/store.md`](./spec/store.md) | Postgres: the tables and the transactions, the state laws as SQL. |
+| [`spec/internal.yaml`](./spec/internal.yaml) | Voice's own NATS subjects: the route table from the brain. |
 
 The code conforms to these documents, not the other way round.
 
@@ -194,32 +196,35 @@ when it cannot reach the coordinator.
 1. **Admit.** The api reads the key and finds its project. It checks that
    the model is visible to the key, the data class is one the project may
    send, and the named account, if any, is one the key may spend.
-2. **Claim and reserve,** in one transaction. The api claims the best free
-   slot in the route table for the model, among the permitted accounts, and
-   reserves the estimated input plus the requested maximum output against
-   every limit that applies (project, key, model and account) and against
-   the project's budget, at the model's current price. If a limit does not
-   fit, nothing is held and the answer is `429`.
-3. **Wait, if there is no slot.** If the model's accounts are all exhausted,
-   the answer is `503 no_capacity` with the earliest reset. If the seats are
-   only busy, the api tries again as slots free or the route table changes,
-   until the request's deadline.
-4. **Serve.** The api publishes `serve` on the node's subject, naming a
-   reply subject for this request, and the node accepts or refuses at once.
-   The body is the standard Open Responses request; a Chat Completions
-   request is converted first. The node's engine runs, and its standard
-   streaming events come back on the reply subject, to the instance that
-   asked, and are relayed as they arrive, as server-sent events or collected
-   into one response. See [Events](#events).
+2. **Reserve,** in one transaction. The api reserves the estimated input
+   plus the requested maximum output against every limit that applies
+   (project, key, model and account) and against the project's budget, at
+   the model's current price, and records the request as in flight on this
+   instance. If a limit does not fit, nothing is held and the answer is
+   `429`. The transactions are in [`spec/store.md`](./spec/store.md).
+3. **Pick a seat** from the route table in memory: the best-ranked seat
+   for the model among the permitted accounts, with room by the api's own
+   count. If the model's accounts are all exhausted, the answer is
+   `503 no_capacity` with the earliest reset. If every seat is busy, the api
+   waits for the next snapshot, until the request's deadline.
+4. **Serve.** The api publishes `serve` on the node's subject as a request,
+   naming a reply subject for this one, and the node answers `accepted` or
+   `refused` at once. `refused`, or no answer, means the next candidate;
+   the node, not the table, is the truth about its own capacity. The body
+   is the standard Open Responses request; a Chat Completions request is
+   converted first. The node's engine runs, and its standard streaming
+   events come back on the reply subject, to the instance that asked, and
+   are relayed as they arrive, as server-sent events or collected into one
+   response. See [Events](#events).
 5. **Retry.** If the seat fails before anything reached the caller, the api
-   releases the slot and claims another, on a different seat and within the
-   named account if there is one. The move is recorded as an attempt. After
+   takes the next candidate, on a different seat and within the named
+   account if there is one. The move is recorded as an attempt. After
    output has begun, a failure fails the response.
 6. **Settle,** in one transaction. The node's `result` carries the model
    that actually ran, cache writes, timing and, from the CLI engines, the
-   account's quota windows. The api frees the slot, settles the reservation
-   on actual usage, and writes the usage record. The response's `voice`
-   object reports what served it and what it cost.
+   account's quota windows. The api settles the reservation on actual
+   usage and writes the usage record. The response's `voice` object reports
+   what served it and what it cost.
 
 The coordinator never redirects and never stores prompts or responses. Content
 passes through one api instance and one node in memory; what is kept is the
@@ -227,27 +232,27 @@ numbers and the caller's `metadata`.
 
 ## The route table
 
-The brain turns the state of the fleet into rows the api can claim.
+The brain turns the state of the fleet into a ranked table the api routes
+from. It is a snapshot on NATS, not rows in Postgres.
 
-- **Slots.** Each seat that is up gets one slot per unit of its concurrency,
-  for each model it serves. Slots are ranked: accounts with the most
-  headroom first, then the least loaded seats. Accounts that are exhausted
-  get no slots, and the table records, per model, that they are exhausted
-  and until when.
-- **Claims** use `SELECT ... FOR UPDATE SKIP LOCKED`: two api instances
-  reaching for the same slot never wait on each other, and the loser takes
-  the next one. That is the compare-and-swap, and Postgres already has it.
-- **Versions.** Each rewrite bumps the table's version. `pond/pq` has no
-  `LISTEN/NOTIFY` yet, so the api polls the version, and rereads the table
-  when a claim misses. The brain's notice that the table changed, over
-  NATS, is what ends the polling (see [Events](#events)).
+- **Contents.** Per model, the seats that can serve it (up, on a node that
+  is up, with an account that has headroom), each with its free capacity
+  and a rank: accounts with the most headroom first, then the least loaded
+  seats. Per model, the accounts that are exhausted and until when.
+- **Published** by the brain on `voice.route` whenever it changes and every
+  second regardless, with a version. Api instances keep the latest in
+  memory; a new instance has a table within a second of starting.
+- **Not exact, and it need not be.** Two instances can pick the same last
+  slot; the node accepts one and refuses the other, which moves on. An
+  instance decrements its own copy when it sends, so it does not pick a
+  seat twice before the next snapshot, and ranks carry a little jitter so
+  instances do not all chase the same seat.
 - **Leases.** Every api instance heartbeats a row. When one stops, the
-  brain frees its claimed slots, releases its reservations, and records its
-  in-flight requests as abandoned.
+  brain releases the reservations of its in-flight requests and records
+  them as abandoned.
 
-The brain being down does not stop serving. Slots already written can still
-be claimed and are still bounded by each seat's concurrency; they only go
-stale.
+The brain being down does not stop serving: the last table in memory still
+routes, bounded by each node's own refusals; it only goes stale.
 
 ## Events
 
@@ -262,20 +267,21 @@ typed topic:
 
 Each subscriber names its own key (`where key == ...`), so nothing filters
 traffic in a handler, and no api instance holds a node: whichever instance
-claims a slot talks to the node directly, and the answer comes straight
+routes a request talks to the node directly, and the answer comes straight
 back to it. Nothing is forwarded between instances.
 
 **These topics are bound to NATS from the MVP on**, in `main`'s
 `bindings { }` block through pond's NATS adapter
 ([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
 in the api and in the node alike. With one api instance the same path is
-simply exercised by one process. The brain's notice that the route table
-changed rides the same connection, which ends the polling. See Hale's
+simply exercised by one process. The brain's route table rides the same
+connection (`spec/internal.yaml`). See Hale's
 [across binaries](https://hale-lang.org/docs/services/multi-binary).
 
-**What does not go on the bus: state.** The claim, the reservation and the
-settlement are transactions, and a broker cannot make them atomic, so they
-stay in Postgres. Usage is written once, to the ledger; publishing it to a
+**What does not go on the bus: state.** The reservation and the settlement
+are transactions, and a broker cannot make them atomic, so they stay in
+Postgres. The route table is the one thing published that looks like
+state, and it is a derived snapshot: losing it costs a second. Usage is written once, to the ledger; publishing it to a
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
@@ -297,10 +303,11 @@ State lives in one of three places, and each piece has exactly one home.
   write is a transaction and appends a row to a change log (who, when, what
   was there before), so configuration has a history
   (`GET /admin/v1/changes`).
-- **The route table**, as above.
-- **Counters.** Rate-limit windows, reservations, and each project's spend
-  in its current period. Every api instance updates them with conditional
-  writes, so a limit holds across instances and across restarts.
+- **Counters and reservations.** Rate-limit windows, each project's spend
+  in its current period, and every request in flight with what it holds.
+  Every api instance updates them with conditional writes, so a limit holds
+  across instances and across restarts. The route table is not here; it is
+  a snapshot on NATS.
 - **The fleet as reported.** Api instances' heartbeats, each node's
   registration, heartbeats, declared capabilities and local controls, its
   seats' states, and each account's quota windows as an engine last
@@ -386,8 +393,8 @@ that dies with its api instance is recorded as abandoned by the brain.
 | A seat | The request moves to another seat if nothing reached the caller; otherwise the response fails, with the attempt recorded. |
 | A node | Missed heartbeats mark it down: its in-flight requests fail over as above and its seats leave the route table. When it is back it registers again and gets its assignment. |
 | An account's quota | The account gets no slots until its window resets. Requests that named it fail with `503 no_capacity` and `Retry-After`. |
-| An api instance | Its callers' requests fail; nodes are unaffected, since none is bound to it. The brain frees its slots and reservations when its heartbeat stops. |
-| The brain | Serving continues on the last route table, which goes stale until the brain is back. |
+| An api instance | Its callers' requests fail; nodes are unaffected, since none is bound to it. The brain releases its reservations when its heartbeat stops. |
+| The brain | Serving continues on the last route table in memory, which goes stale until the brain is back; a new api instance has no table until then. |
 | Postgres | Nothing is served and nothing is configured until it is back. |
 
 ## In Hale
@@ -420,13 +427,13 @@ from Hale's
   Postgres advisory lock before doing anything, so only one brain works at a
   time; a second brain process waits on the lock as a standby and takes over
   when the first one's connection drops.
-- It shares nothing with the api except Postgres; the only message it may
-  ever send is the notice that the route table changed. The process boundary
-  enforces that.
+- It shares nothing with the api except Postgres and the route table it
+  publishes. The process boundary enforces that.
 - Each tick it reads the fleet's reported state (seat states, heartbeats,
-  quota windows, configuration), rewrites the route table, and reclaims
-  what dead api instances held. Per-tick work runs in a method, so each
-  tick's memory is reclaimed.
+  quota windows, configuration), computes the route table and publishes it
+  if it changed (and every second regardless), and reclaims what dead api
+  instances held. Per-tick work runs in a method, so each tick's memory is
+  reclaimed.
 
 Running a second api instance is starting one; the bindings are already
 there.

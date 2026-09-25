@@ -435,8 +435,18 @@ from Hale's
   instances held. Per-tick work runs in a method, so each tick's memory is
   reclaimed.
 
-Running a second api instance is starting one; the bindings are already
-there.
+**Which topics bind, and which use the client.** A `keyed_by` topic over
+a binding is one subject that every subscriber receives and filters, so
+`bindings { }` carries only what is truly a broadcast: the route table on
+`voice.route`. The per-node and per-request subjects (`serve`, `assign`,
+`cancel` to a node; a request's events and result back) are published and
+subscribed through the NATS client directly, with the subjects
+`spec/protocol.yaml` names, so a node receives only its own requests and an
+instance only its own answers. That is what the per-node NATS permissions
+rely on.
+
+Running a second api instance is starting one; the subscriptions are
+already there.
 
 **Node**
 

@@ -77,6 +77,16 @@ them. The MVP runs without it, on loopback; OIDC drops in later with no change
 to the endpoints. Project keys and nodes' enrollment tokens are enforced from
 the start, because the MVP exists to prove them.
 
+## Agents
+
+- **No bypass flags.** A seat that runs an agent CLI never passes the flag
+  that skips its permissions. Each CLI runs under its own policy (allow
+  lists, its sandbox mode), inside a container as the outer boundary, with
+  the worktree as the only thing it may write.
+- **Logins stay with the official binaries.** Voice never extracts a
+  token or calls a provider's backend on a subscription's behalf; the CLI
+  holds its login on its node.
+
 ## Process model
 
 The coordinator is two roles. **Api** instances serve callers, the admin
@@ -118,6 +128,16 @@ changes.
 
 The first useful version is the one that lets its operator route their own
 tooling through voice and see how many tokens each project uses.
+
+## Delivery
+
+This repository holds the design and the chalk lines: the contracts, the
+process model running from `docker compose up`, a stub of the api, and
+skeletons of the brain and the node. The MVP itself is delivered by a DNA
+organization built from this repository, with the org chart and the
+process model as two perspectives over one graph ([`GRAPH.md`](./GRAPH.md),
+hale-lang/hale#1092). Until that tooling exists, work here stays at the
+level of contracts, stubs and skeletons.
 
 ## Open questions
 

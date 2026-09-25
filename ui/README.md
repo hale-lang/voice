@@ -3,7 +3,10 @@
 Voice's admin UI: one application that administers all of voice, the
 nodes included. The api serves its built files from its own origin.
 
-Nothing is here yet. This file records the decisions the UI is built on.
+A first slice exists: the tokens, the components, and five screens against
+the stub (Overview, Nodes with a node inspector, Usage with a request
+inspector, Route table, Changes). This file records the decisions it is
+built on.
 
 ## The seam
 
@@ -48,11 +51,20 @@ reusable parts become a library.
 Against the stub, which answers every endpoint with a canned happy path:
 
 ```sh
-hale build api && api/api --port 8080
+hale build api && api/api --port 8080      # in the repository root
+cd ui && nvm use && npm install && npm run dev   # http://127.0.0.1:5173
 ```
 
-The dev server proxies `/v1` and `/admin/v1` to it, so the UI runs on one
-origin in development as it does in production.
+The dev server proxies `/v1` and `/admin/v1` to the api (`VOICE_API` to
+point it elsewhere), so the UI runs on one origin in development as it does
+in production. `npm run gen` regenerates the client from
+`../spec/openapi.yaml`; `npm run typecheck` checks all three packages;
+`npm run build` writes `apps/admin/dist`.
+
+Layout: `packages/tokens` (`@hale/tokens`, JSON to CSS custom properties,
+no framework), `packages/components` (`@hale/components`, React, no voice
+nouns; voice's own state-word mapping lives in `apps/admin/src/tone.ts`),
+`apps/admin` (`@voice/admin`).
 
 ## Shipping
 

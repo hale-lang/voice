@@ -73,8 +73,9 @@ table come with the MVP. `hale build brain && brain/brain --database URL`.
 
 ## The admin UI
 
-[`ui/`](./ui/) will hold voice's own admin UI, one application for all of
-voice, served by the api from its own origin. The backend is Hale; the UI is
+[`ui/`](./ui/) holds voice's own admin UI, one application for all of
+voice, served by the api from its own origin. A first slice runs against
+the stub: tokens, components and five screens. The backend is Hale; the UI is
 not, because Hale's front-end story is not far enough along to build on. So
 **the api is the trust boundary**: the compiler's claims about the system
 graph stop at the api's edge, the UI is an untrusted client like any other,

@@ -54,8 +54,10 @@ and the API is the first-class way to do it; the UI is one client of it.
   node or a seat, or lower its in-flight cap, and nothing more.
 - **The protocol is the seam.** Any program that speaks `protocol.yaml` can
   be a node. Voice ships the api, the coordinator and its own node.
-- **One admin UI**, served by the api from its own origin, administers every
-  node.
+- **One admin UI**, in this repository (`ui/`), served by the api from its
+  own origin, administers every node. The backend is Hale; the UI is not, so
+  the api is the trust boundary: every rule is enforced there, and the UI is
+  an untrusted client.
 - **An account** is what pays and what has limits. Several seats may spend
   one account (the same login on two machines) and share its limits. Voice
   never holds the credential; the engine does, on its node.

@@ -47,6 +47,17 @@ node/node --id laptop --data node-data --port 8081   # --coordinator URL, --toke
 hale test node
 ```
 
+## The admin UI
+
+[`ui/`](./ui/) will hold voice's own admin UI, one application for all of
+voice, served by the api from its own origin. The backend is Hale; the UI is
+not, because Hale's front-end story is not far enough along to build on. So
+**the api is the trust boundary**: the compiler's claims about the system
+graph stop at the api's edge, the UI is an untrusted client like any other,
+and every rule is enforced by the api. The seam, the proposed stack and the
+screens are in [`ui/README.md`](./ui/README.md). It builds against the stub,
+and follows changes through the admin event stream (`GET /admin/v1/events`).
+
 ## The contract
 
 | Document | What it specifies |

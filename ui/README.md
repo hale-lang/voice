@@ -25,9 +25,18 @@ client like any other:
 - Anything the UI can do, a script with the same credentials can do, and
   the api is designed for that.
 
+## Design
+
+[`DESIGN.md`](./DESIGN.md): the visual direction (hale's laboratory
+instrument, adopted from DNA's face), the legibility rules (color is
+earned), the screens as instruments, and the layering that lets the
+reusable parts become a library.
+
 ## Stack (proposed)
 
-- TypeScript, React, Vite.
+- TypeScript, React, Vite, as a workspace: `packages/tokens` (framework-free
+  CSS custom properties), `packages/components` (React), `apps/admin`
+  (voice's screens). Nothing in `packages/` knows voice's nouns.
 - Types and client generated from `openapi.yaml` (`openapi-typescript`,
   `openapi-fetch`), so a contract change is a type error rather than a
   runtime surprise.
@@ -54,7 +63,9 @@ single-page fallback, beside `/v1` and `/admin/v1`. One origin, so no CORS.
 
 One per part of the admin API:
 
-- **Overview:** quota headroom per account, node health, recent usage.
+- **Overview:** quota headroom per account, node health, spend against
+  budget, recent usage.
+- **Route table:** per model, the ranked slots and why.
 - **Usage:** summaries by project, account, model and day; the records.
 - **Accounts:** quota windows, limits.
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token

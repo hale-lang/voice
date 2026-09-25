@@ -47,6 +47,12 @@ node/node --id laptop --data node-data --port 8081   # --coordinator URL, --toke
 hale test node
 ```
 
+## The brain (skeleton)
+
+[`brain/`](./brain/) is its own program from the MVP on. The skeleton ticks
+and names what each tick will do; the store, the advisory lock and the route
+table come with the MVP. `hale build brain && brain/brain --database URL`.
+
 ## The admin UI
 
 [`ui/`](./ui/) will hold voice's own admin UI, one application for all of
@@ -118,10 +124,11 @@ What the specs call the **coordinator** is the api and the brain together;
 callers and nodes cannot tell how many api instances stand behind the
 address.
 
-**In the MVP there is one process.** The brain runs inside the api, and there
-is one api instance. The brain still shares state with the rest only through
-Postgres, never through memory or the bus, so moving it into its own program
-later is a change of packaging, not of design. See [In Hale](#in-hale).
+**The MVP runs the real process model:** one api instance and one brain, as
+separate processes, beside Postgres and a node. The brain shares state with
+the api only through Postgres, and the process boundary enforces it. What
+scaling out adds later is more api instances and a broker between them, not
+a new split. See [In Hale](#in-hale).
 
 ### Nouns
 
@@ -203,8 +210,9 @@ The brain turns the state of the fleet into rows the api can claim.
   the next one. That is the compare-and-swap, and Postgres already has it.
 - **Versions.** Each rewrite bumps the table's version. `pond/pq` has no
   `LISTEN/NOTIFY` yet, so the api polls the version, and rereads the table
-  when a claim misses. A change notice on the bus replaces the polling once
-  there is more than one process (see [Events](#events)).
+  when a claim misses. A change notice from the brain on a bound bus topic
+  can replace the polling: a Unix socket on one machine, NATS across
+  machines (see [Events](#events)).
 - **Leases.** Every api instance heartbeats a row. When one stops, the
   brain frees its claimed slots, releases its reservations, and records its
   in-flight requests as abandoned.
@@ -224,7 +232,8 @@ that moves between the pieces of a request is a typed topic:
   to the child holding the caller's request.
 
 Each subscriber names its own key (`where key == ...`), so nothing filters
-traffic in a handler. In one process these are in-memory dispatches.
+traffic in a handler. Within one api instance these are in-memory
+dispatches.
 
 **Scaling out adds no code.** With several api instances, the node's
 connection and the caller's request can be on different instances. The
@@ -242,9 +251,10 @@ stay in Postgres. Usage is written once, to the ledger; publishing it to a
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
-**Why not a broker from the start:** in one process there is nothing for it
-to carry that the bus does not already deliver, and it would be one more
-stateful service to run. It earns its place with the second api instance,
+**Why not a broker from the start:** with one api instance there is nothing
+for it to carry that the bus does not already deliver (the brain and the api
+share Postgres, not messages), and it would be one more stateful service to
+run. It earns its place with the second api instance,
 and adding it then is a binding, not a redesign.
 
 ## State
@@ -341,10 +351,10 @@ that dies with its api instance is recorded as abandoned by the brain.
 
 ## In Hale
 
-The target is three Hale programs, the api, the brain and the node, plus
-shared seeds for the protocol's message types and for the store (schema and
-queries, used by both the api and the brain). In the MVP the api program
-also runs the brain. The shapes come from Hale's
+Voice is three Hale programs, the api, the brain and the node, from the MVP
+on, plus shared seeds for the protocol's message types and for the store
+(schema and queries, used by both the api and the brain). The shapes come
+from Hale's
 [styleguide](https://github.com/hale-lang/hale/blob/main/spec/styleguide.md).
 
 **Api**
@@ -364,15 +374,20 @@ also runs the brain. The shapes come from Hale's
 
 **Brain**
 
-- One locus with its own store and its own Postgres connection. It takes a
-  Postgres advisory lock before doing anything, so there is only ever one
-  brain, even when several api instances each start one.
-- It shares no state with the api's loci except through Postgres; the only
-  thing it may publish is the notice that the route table changed. That is
-  the seam that makes the split cheap, and it is stated as a claim, so the
-  compiler refuses a shortcut through memory.
-- Splitting it out is a new `main` that instantiates it. Running a second api
-  instance is a `bindings { }` entry per request topic, not new code.
+- Its own program, with its own store and Postgres connection. It takes a
+  Postgres advisory lock before doing anything, so only one brain works at a
+  time; a second brain process waits on the lock as a standby and takes over
+  when the first one's connection drops.
+- It shares nothing with the api except Postgres; the only message it may
+  ever send is the notice that the route table changed. The process boundary
+  enforces that.
+- Each tick it reads the fleet's reported state (seat states, heartbeats,
+  quota windows, configuration), rewrites the route table, and reclaims
+  what dead api instances held. Per-tick work runs in a method, so each
+  tick's memory is reclaimed.
+
+Running a second api instance is a `bindings { }` entry per request topic,
+not new code.
 
 **Node**
 
@@ -388,15 +403,16 @@ also runs the brain. The shapes come from Hale's
 
 ## Deployment
 
-- **MVP:** one machine. Postgres, one api with the brain inside it, and one
-  node, all on loopback. The node offers the static engine, and a seat on
+- **MVP:** one machine, four processes on loopback: Postgres, one api, one
+  brain and one node. The node offers the static engine, and a seat on
   it answers every request with its configured text. Everything is set up
   through the APIs, in this order: a model, an account, a node (which yields
   a token), the node started with that token and a capabilities file, its
   seat, a project and a key.
-- **Personal:** the api and Postgres on a machine that stays up, with a node
+- **Personal:** the api, the brain and Postgres on a machine that stays up,
+  with a node
   on each machine whose CLIs are logged in, one engine per login and a seat
   on each.
 - **Scaled out:** several api instances behind a load balancer that also
   terminates TLS and sends traffic only to instances whose `/readyz` is ok, a NATS server carrying the request topics between them,
-  the brain as its own process, and nodes anywhere.
+  the brain with a standby on another machine, and nodes anywhere.

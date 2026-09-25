@@ -84,9 +84,10 @@ One **brain** turns the fleet's reported state into a route table in
 Postgres, and api instances claim slots from it atomically. Postgres holds
 all shared state: configuration, the route table, counters and the ledger.
 
-The MVP runs the brain inside a single api process. The brain reaches the
-rest only through Postgres, so moving it into its own process later changes
-packaging, not design.
+The MVP runs them as separate processes from the start (one api, one brain),
+so the process model is the real one from the first slice. The brain reaches
+the rest only through Postgres, and the process boundary makes that a fact
+rather than a convention.
 
 Requests move between the pieces as Hale bus topics, keyed by node and by
 request. There is no message broker: with more than one api instance those

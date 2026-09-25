@@ -1,5 +1,7 @@
 # voice
 
+[![ci](https://github.com/hale-lang/voice/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/hale-lang/voice/actions/workflows/ci.yml)
+
 One inference endpoint in front of many model backends. A caller names a
 model and presents a project key. Voice picks a seat that can serve it,
 enforces the project's limits and budget, and records what the request used,

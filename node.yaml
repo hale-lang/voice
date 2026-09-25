@@ -2,54 +2,68 @@ openapi: 3.1.0
 info:
   title: voice node
   version: 0.1.0-draft
-  summary: The API of one node, where its seats are configured.
+  summary: The local API of voice's own node.
   description: |
-    A node is one machine running voice's node software. Its operator
-    configures here which engines it runs, logged in to which accounts,
-    serving which models. The node never looks for engines on its own: it
-    runs exactly the seats configured here and nothing else.
+    A node is one machine running voice's node software. What it runs is
+    configured on the coordinator (`openapi.yaml`, `/admin/v1/nodes/{node}/seats`)
+    and reaches it as an assignment over the protocol (`protocol.yaml`). That
+    protocol is the seam other node implementations plug into; this document
+    is only voice's own node, and a node written elsewhere need not serve it.
 
-    The caller and admin planes are in `openapi.yaml`. This document is the
-    node's local admin API; the UI uses it as any other client does.
+    What stays on the machine is what only the machine can decide: which
+    engines it offers, with which logins, and its hard limits (the
+    capabilities file), and local controls that pause it or lower its cap.
+    This API reads them, sets the local controls, and reports the node's
+    state, including when it cannot reach the coordinator.
 
     ## Boot configuration
 
-    Only what the node needs before this API can answer is set at start, as
-    flags or environment variables:
+    Set at start, as flags or environment variables:
 
     - the node's id, as created on the coordinator (`POST /admin/v1/nodes`);
     - the coordinator's address;
     - the enrollment token the coordinator issued for this node;
-    - the data directory, where the seat configuration is kept;
+    - the data directory, where local controls are kept;
+    - the capabilities file, `capabilities.json` in the data directory unless
+      given;
     - the address this API listens on (loopback by default).
 
     Admin authentication is middleware in front of this API, as on the
     coordinator's admin plane: the MVP runs without it, on loopback, and
     OIDC drops in later with no change to these endpoints.
 
-    Everything else is configured through this API and persists in the data
-    directory.
+    ## The capabilities file
 
-    ## The coordinator
+    Written by the node's operator, and the only configuration edited on the
+    machine besides local controls. Nothing is discovered: the node offers
+    exactly the engines listed, each with the login it runs under. It is
+    `Capabilities` from the protocol plus, per engine, a `local` object the
+    node never declares (where the login is kept, and similar). Each CLI
+    keeps several logins apart in its own way; hale-lang/voice#2 settles
+    that per engine.
 
-    The node dials out to the coordinator, presents its enrollment token,
-    and declares its seats. It declares them again whenever they change, so
-    a write here takes effect for routing as soon as it is applied. The
-    coordinator sends requests back over the same connection. The protocol
-    is `protocol.yaml`.
+    ```json
+    {
+      "max_in_flight": 4,
+      "engines": [
+        { "id": "static", "kind": "static" },
+        { "id": "claude-work", "kind": "claude-cli",
+          "local": { "config_dir": "~/.claude-work" } },
+        { "id": "claude-personal", "kind": "claude-cli",
+          "local": { "config_dir": "~/.claude-personal" } }
+      ]
+    }
+    ```
 
-    The coordinator owns the catalog and the accounts. A seat refers to
-    them by id; the coordinator reports a seat that names an unknown model or
-    account as a problem (`DeclaredSeat` in `openapi.yaml`) and serves
-    nothing through it that it cannot resolve.
+    The node fills in each engine's `config_schema` and `models` from its
+    kind. When the file changes, the node declares its capabilities again,
+    and the coordinator re-checks the assignment against them.
 
     ## Credentials
 
     Voice holds no provider credentials. An engine that needs a login uses
-    its own, on this machine: a CLI's configuration directory is named in
-    the seat's `config`. A future engine whose config carries a secret marks
-    that field write-only; it is never returned and never declared to the
-    coordinator.
+    its own, on this machine, named in the engine's `local` object. It is
+    never declared to the coordinator and never returned by this API.
   contact:
     url: https://github.com/hale-lang/voice
 
@@ -59,9 +73,7 @@ servers:
 
 tags:
   - name: node
-    description: The node's own state and its connection to the coordinator.
-  - name: seats
-    description: The engines this node runs and what they serve.
+    description: The node's state, what it offers, and its local controls.
   - name: health
     description: Liveness, for a supervisor. No credential.
 
@@ -90,7 +102,11 @@ paths:
     get:
       tags: [node]
       operationId: getNodeStatus
-      summary: The node and its connection to the coordinator
+      summary: The node, its connection, and its assigned seats
+      description: |
+        What the node is running and how it is going, as the node sees it.
+        Useful when the coordinator cannot be reached; otherwise the same is
+        visible in the coordinator's admin UI.
       responses:
         '200':
           description: The node's status.
@@ -101,154 +117,68 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  /node/v1/engines:
+  /node/v1/capabilities:
     get:
-      tags: [seats]
-      operationId: listEngines
-      summary: Engines this build can run
-      description: |
-        Engines are code, so they are listed, not created. Each carries the
-        JSON Schema of its seat `config`, which a client can render as a form.
+      tags: [node]
+      operationId: getCapabilities
+      summary: What the node offers, as loaded from its capabilities file
+      description: The declared capabilities, without the engines' `local` objects.
       responses:
         '200':
-          description: Engines.
+          description: The capabilities.
           content:
             application/json:
               schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/Engine'
+                $ref: './protocol.yaml#/components/schemas/Capabilities'
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  /node/v1/seats:
+  /node/v1/local:
     get:
-      tags: [seats]
-      operationId: listSeats
-      summary: List this node's seats
+      tags: [node]
+      operationId: getLocalControls
+      summary: Read the local controls
       responses:
         '200':
-          description: Seats.
+          description: The local controls.
           content:
             application/json:
               schema:
-                type: object
-                required: [data]
-                properties:
-                  data:
-                    type: array
-                    items:
-                      $ref: '#/components/schemas/SeatView'
+                $ref: './protocol.yaml#/components/schemas/LocalControls'
         '401':
           $ref: '#/components/responses/Unauthorized'
-    post:
-      tags: [seats]
-      operationId: createSeat
-      summary: Configure a seat
+    put:
+      tags: [node]
+      operationId: setLocalControls
+      summary: Pause the node or seats, or lower its cap
       description: |
-        The config is checked against the engine's schema. The seat is
-        declared to the coordinator as soon as it is created.
+        Replaces the local controls. They only restrict: pausing takes no
+        new requests (in-flight ones finish), and a local cap only lowers the
+        effective one. The node tells the coordinator at once.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/Seat'
+              $ref: './protocol.yaml#/components/schemas/LocalControls'
             examples:
-              static:
+              pause:
                 value:
-                  id: static
-                  engine: static
-                  account: static
-                  serves:
-                    - model: echo-1
-                  data_classes: [public, internal]
-                  concurrency: 4
-                  config:
-                    text: hello from voice
-                    chunk_chars: 8
+                  paused: false
+                  paused_seats: [claude-work]
+                  max_in_flight: 2
+                  reason: on battery
       responses:
-        '201':
-          description: The seat, created.
+        '200':
+          description: The local controls, applied.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SeatView'
+                $ref: './protocol.yaml#/components/schemas/LocalControls'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
-        '409':
-          $ref: '#/components/responses/Conflict'
-
-  /node/v1/seats/{seat}:
-    parameters:
-      - name: seat
-        in: path
-        required: true
-        schema: { $ref: '#/components/schemas/SeatIdValue' }
-    get:
-      tags: [seats]
-      operationId: getSeat
-      summary: Describe a seat
-      responses:
-        '200':
-          description: The seat.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SeatView'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-    patch:
-      tags: [seats]
-      operationId: updateSeat
-      summary: Change a seat
-      description: |
-        Only the fields present change; `id` and `engine` cannot. In-flight
-        requests finish on the configuration they started with. Setting
-        `enabled: false` drains the seat: it takes no new requests.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/SeatUpdate'
-      responses:
-        '200':
-          description: The seat, changed.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SeatView'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-    delete:
-      tags: [seats]
-      operationId: removeSeat
-      summary: Remove a seat
-      description: It takes no new requests; in-flight requests finish. Usage history keeps its name.
-      responses:
-        '200':
-          description: The removed seat.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SeatView'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
 
 components:
   securitySchemes:
@@ -259,7 +189,7 @@ components:
 
   responses:
     BadRequest:
-      description: Malformed, or the config does not match the engine's schema.
+      description: Malformed.
       content:
         application/json:
           schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
@@ -268,162 +198,11 @@ components:
       content:
         application/json:
           schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
-    NotFound:
-      description: No such seat.
-      content:
-        application/json:
-          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
-    Conflict:
-      description: A seat with that id already exists on this node.
-      content:
-        application/json:
-          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
 
   schemas:
-    SeatIdValue:
-      type: string
-      pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
-      description: Unique on this node. Its full name is `<node>/<seat>`.
-      examples: [static, claude-work]
-
-    SeatModel:
-      type: object
-      required: [model]
-      properties:
-        model:
-          type: string
-          description: A catalog model id, as configured on the coordinator.
-        as:
-          type: [string, 'null']
-          description: The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`.
-
-    Seat:
-      type: object
-      description: One engine, spending one account, serving some catalog models.
-      required: [id, engine, account, serves]
-      properties:
-        id:
-          $ref: '#/components/schemas/SeatIdValue'
-        engine:
-          type: string
-          description: One of `/node/v1/engines`.
-          examples: [static, claude-cli, codex-cli]
-        account:
-          type: string
-          description: The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits.
-        serves:
-          type: array
-          minItems: 1
-          items:
-            $ref: '#/components/schemas/SeatModel'
-        data_classes:
-          type: array
-          description: Data classes this seat may carry. Defaults to `[internal]`.
-          items: { type: string }
-        concurrency:
-          type: integer
-          minimum: 1
-          default: 1
-          description: Requests this seat serves at once; more queue.
-        enabled:
-          type: boolean
-          default: true
-        config:
-          type: object
-          description: Engine-specific; its schema is the engine's `config_schema`.
-      allOf:
-        - if:
-            properties: { engine: { const: static } }
-          then:
-            properties:
-              config: { $ref: '#/components/schemas/StaticConfig' }
-
-    SeatUpdate:
-      type: object
-      description: Only the fields present change.
-      properties:
-        account: { type: string }
-        serves:
-          type: array
-          minItems: 1
-          items:
-            $ref: '#/components/schemas/SeatModel'
-        data_classes:
-          type: array
-          items: { type: string }
-        concurrency: { type: integer, minimum: 1 }
-        enabled: { type: boolean }
-        config: { type: object }
-
-    SeatView:
-      allOf:
-        - $ref: '#/components/schemas/Seat'
-        - type: object
-          required: [status, in_flight]
-          properties:
-            status:
-              type: string
-              enum: [up, down, disabled]
-              description: '`down`: the engine cannot serve, e.g. its CLI is missing or logged out.'
-            last_error: { type: [string, 'null'] }
-            in_flight: { type: integer }
-            coordinator:
-              description: |
-                What the coordinator made of this seat, from its last
-                `seat_status`: whether it can serve, and why not. Null until
-                the coordinator has answered for this version of the seat.
-              oneOf:
-                - type: object
-                  required: [status, problems, as_of]
-                  properties:
-                    status:
-                      type: string
-                      enum: [up, down, disabled, unmapped]
-                      description: '`unmapped`: the seat names an account the coordinator does not have.'
-                    problems:
-                      type: array
-                      description: E.g. a model that is not in the catalog.
-                      items: { type: string }
-                    as_of: { type: string, format: date-time }
-                - type: 'null'
-
-    StaticConfig:
-      type: object
-      description: |
-        The static engine answers every request with `text`. Tokens are
-        counted as one per four characters, rounded up, of the input and of
-        `text`.
-      required: [text]
-      properties:
-        text: { type: string, minLength: 1 }
-        chunk_chars:
-          type: integer
-          minimum: 1
-          default: 16
-          description: Characters per streamed delta.
-        first_output_ms:
-          type: integer
-          minimum: 0
-          default: 0
-          description: Delay before the first output, to exercise timing and deadlines.
-        chunk_interval_ms:
-          type: integer
-          minimum: 0
-          default: 0
-
-    Engine:
-      type: object
-      required: [id, config_schema]
-      properties:
-        id: { type: string, examples: [static] }
-        description: { type: string }
-        config_schema:
-          type: object
-          description: JSON Schema of a seat's `config` for this engine.
-
     NodeStatus:
       type: object
-      required: [id, version, coordinator]
+      required: [id, version, coordinator, assignment_version, max_in_flight, in_flight, local, seats]
       properties:
         id: { type: string }
         version: { type: string }
@@ -438,3 +217,19 @@ components:
               description: '`refused`: the coordinator rejected the enrollment token or the node was revoked.'
             connected_at: { type: [string, 'null'], format: date-time }
             last_error: { type: [string, 'null'] }
+        assignment_version:
+          type: [integer, 'null']
+          description: The assignment applied, or null before the first one.
+        max_in_flight:
+          type: integer
+          description: The effective cap, the smallest of the declared, assigned and local caps.
+        in_flight: { type: integer }
+        local:
+          $ref: './protocol.yaml#/components/schemas/LocalControls'
+        seats:
+          type: array
+          description: The assigned seats, each with its state on this node.
+          items:
+            allOf:
+              - $ref: './protocol.yaml#/components/schemas/Seat'
+              - $ref: './protocol.yaml#/components/schemas/SeatState'

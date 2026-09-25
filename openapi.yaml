@@ -59,11 +59,18 @@ info:
       creates it here, which issues an enrollment token, then starts the node
       with that token and the coordinator's address. The node dials out to
       the coordinator, so a node behind NAT needs no open port.
-    - A **seat** is one engine on one node, configured on the node through
-      its own API (`node.yaml`): the static engine, or a CLI logged in to one
-      account. The node declares its seats when it connects; this plane reads
-      them. A seat names the account it spends and the catalog models it
-      serves.
+    - A node **offers engines**: the static engine, or a CLI logged in to one
+      login. Its operator lists them, with the node's hard limits, in a file
+      on the machine, and the node declares them when it connects. Logins
+      never leave the machine.
+    - A **seat** is configured here, on a node: one of the node's engines,
+      spending one account, serving some catalog models. The coordinator
+      sends every node its seats as an assignment; the node runs them,
+      refuses any outside what it offers, and reports their state. A node
+      that is offline gets its seats when it returns.
+    - A node's operator can **pause** the node or a seat, or lower its
+      in-flight cap, on the machine. Local controls only restrict, and the
+      node reports them.
     - An **account** is what pays and what has limits: a subscription, a
       metered API key, or nothing for a local engine. Several seats may share
       one account (the same login on two machines), and they share its
@@ -73,23 +80,29 @@ info:
       coordinator can route one model across all of them.
 
     **Routing.** For a request, the eligible seats are those that serve the
-    model, are enabled on a connected node, carry the request's data class,
-    and spend an account the key permits (narrowed by `voice.account` when
-    the request names one). Accounts with no headroom left are skipped, and
-    seats at their concurrency are skipped. Voice picks the account with the
+    model, are up on a connected node, carry the request's data class, and
+    spend an account the key permits (narrowed by `voice.account` when the
+    request names one). Accounts with no headroom left are skipped, and
+    seats at their concurrency, or on a node at its in-flight cap, are
+    skipped. Voice picks the account with the
     most headroom, then the least loaded of its seats.
 
-    The coordinator talks to nodes over the protocol in `protocol.yaml`. It
-    proxies and never redirects.
+    The coordinator talks to nodes over the protocol in `protocol.yaml`, the
+    seam any node implementation plugs into. It proxies and never redirects.
+
+    **One admin UI.** The api serves the admin UI itself, from the same
+    origin as this plane, and every node is administered through it: seats,
+    caps and state all live here. A node's own API (`node.yaml`) is only for
+    the machine it runs on.
 
     ## Phases
 
     The API is the same in every phase; only what stands behind it changes.
 
     - **MVP: static.** One coordinator and one node on one machine. The node
-      runs a `static` seat that answers every request with its configured
-      text. Everything is set up through the APIs: a model, an account, a
-      node and its seat, a project and a key. This proves the whole surface
+      offers the `static` engine, and a seat on it answers every request with
+      its configured text. Everything is set up through the APIs: a model, an
+      account, a node and its seat, a project and a key. This proves the whole surface
       end to end: configuration, routing, keys, projects, limits, budgets,
       usage records and both streaming formats. Tokens are counted from the
       fixed text and priced at the model's configured price.
@@ -166,7 +179,7 @@ tags:
   - name: accounts
     description: Admin plane. Accounts that pay for serving, and their limits.
   - name: nodes
-    description: Admin plane. Nodes, their enrollment, and the seats they declare.
+    description: Admin plane. Nodes, their enrollment, what they offer, and their seats.
   - name: changes
     description: Admin plane. The history of every configuration change.
   - name: health
@@ -943,7 +956,7 @@ paths:
       tags: [models]
       operationId: listCatalogModels
       summary: List the model catalog
-      description: Every configured model, with the seats that declare it. `/v1/models` is the caller's filtered view of the same list.
+      description: Every configured model, with the seats that serve it. `/v1/models` is the caller's filtered view of the same list.
       security:
         - principal: []
       responses:
@@ -968,7 +981,7 @@ paths:
       operationId: createCatalogModel
       summary: Add a model to the catalog
       description: |
-        A model id is what callers name and what seats declare they serve.
+        A model id is what callers name and what seats serve.
         Adding it makes no seat serve it; a model with no seat is listed as
         unavailable.
       security:
@@ -1064,9 +1077,9 @@ paths:
       operationId: removeCatalogModel
       summary: Remove a model from the catalog
       description: |
-        Callers naming it get `model_not_found`. Seats that still declare it
-        keep the declaration and report it as a problem until their node's
-        operator removes it. Usage history keeps the id.
+        Callers naming it get `model_not_found`. Seats that still serve it
+        keep the entry and show it as a problem until it is removed from
+        them. Usage history keeps the id.
       security:
         - principal: []
       responses:
@@ -1240,11 +1253,11 @@ paths:
     get:
       tags: [nodes]
       operationId: listNodes
-      summary: List nodes and the seats they declare
+      summary: List nodes, what they offer, and their seats
       description: |
         Every node an operator created, whether or not it has connected, with
-        the seats it declared on its last connection. Seats are configured on
-        the node (`node.yaml`) and are read-only here.
+        the capabilities and local controls it last declared and the state of
+        its seats.
       security:
         - principal: []
       responses:
@@ -1325,6 +1338,43 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [nodes]
+      operationId: updateNode
+      summary: Rename a node or set its in-flight cap
+      description: |
+        The cap cannot exceed the node's declared `max_in_flight`; the node's
+        effective cap is the smallest of the declared, this, and any local
+        cap. The change reaches the node as a new assignment.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NodeUpdate'
+            examples:
+              cap:
+                value:
+                  max_in_flight: 4
+      responses:
+        '200':
+          description: The node, changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
     delete:
       tags: [nodes]
       operationId: revokeNode
@@ -1342,6 +1392,164 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Node'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/nodes/{node}/seats:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: listSeats
+      summary: List a node's seats
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The node's seats, each with its state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SeatView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [nodes]
+      operationId: createSeat
+      summary: Add a seat to a node
+      description: |
+        The seat names one of the engines the node declared, and its `config`
+        must be valid against that engine's `config_schema`. A node that has
+        not connected yet has declared nothing; the seat is accepted and
+        reported with a problem until the node connects and takes it or
+        refuses it. The seat reaches the node as a new assignment.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Seat'
+            examples:
+              static:
+                value:
+                  id: static
+                  engine: static
+                  account: static
+                  serves:
+                    - model: echo-1
+                  data_classes: [public, internal]
+                  concurrency: 4
+                  config:
+                    text: hello from voice
+                    chunk_chars: 8
+      responses:
+        '201':
+          description: The seat, created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /admin/v1/nodes/{node}/seats/{seat}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - $ref: '#/components/parameters/SeatId'
+    get:
+      tags: [nodes]
+      operationId: getSeat
+      summary: Describe a seat and its state
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The seat.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [nodes]
+      operationId: updateSeat
+      summary: Change a seat
+      description: |
+        Only the fields present change; `id` cannot. In-flight requests finish
+        on the configuration they started with. `enabled: false` drains the
+        seat: it takes no new requests.
+      security:
+        - principal: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SeatUpdate'
+      responses:
+        '200':
+          description: The seat, changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
+        '202':
+          $ref: '#/components/responses/PendingReview'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [nodes]
+      operationId: removeSeat
+      summary: Remove a seat from a node
+      description: It takes no new requests; in-flight requests finish. Usage history keeps its name.
+      security:
+        - principal: []
+      responses:
+        '200':
+          description: The removed seat.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SeatView'
         '202':
           $ref: '#/components/responses/PendingReview'
         '401':
@@ -1463,6 +1671,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/NodeIdValue' }
+    SeatId:
+      name: seat
+      in: path
+      required: true
+      schema: { $ref: './protocol.yaml#/components/schemas/Slug' }
     AccountFilter:
       name: account
       in: query
@@ -2450,7 +2663,7 @@ components:
       properties:
         id:
           type: string
-          description: What callers name and seats declare. Stable; never reused for a different model.
+          description: What callers name and seats serve. Stable; never reused for a different model.
           examples: [echo-1, claude-sonnet-5]
         owned_by:
           type: string
@@ -2494,7 +2707,7 @@ components:
           properties:
             seats:
               type: array
-              description: Seats that declare this model, written `<node>/<seat>`.
+              description: Seats that serve this model, written `<node>/<seat>`.
               items: { type: string }
             available:
               type: boolean
@@ -2567,7 +2780,7 @@ components:
               enum: [active, archived]
             seats:
               type: array
-              description: Seats that declare this account, written `<node>/<seat>`.
+              description: Seats that spend this account, written `<node>/<seat>`.
               items: { type: string }
             windows:
               type: array
@@ -2590,6 +2803,19 @@ components:
         id:
           $ref: '#/components/schemas/NodeIdValue'
         name: { type: string, maxLength: 128 }
+        max_in_flight:
+          type: [integer, 'null']
+          minimum: 1
+          description: The coordinator's cap for the node. Null leaves the node's declared cap in charge.
+
+    NodeUpdate:
+      type: object
+      description: Only the fields present change.
+      properties:
+        name: { type: string, maxLength: 128 }
+        max_in_flight:
+          type: [integer, 'null']
+          minimum: 1
 
     Node:
       type: object
@@ -2604,14 +2830,33 @@ components:
         version:
           type: [string, 'null']
           description: The node software's version, as it reported on connecting.
-        engines:
-          type: array
-          description: Engines the node's build can run, as it reported on connecting.
-          items: { type: string }
+        capabilities:
+          description: What the node offers, as it last declared. Null until it first connects.
+          oneOf:
+            - $ref: './protocol.yaml#/components/schemas/Capabilities'
+            - type: 'null'
+        local:
+          description: Its local controls, as it last reported. Null until it first connects.
+          oneOf:
+            - $ref: './protocol.yaml#/components/schemas/LocalControls'
+            - type: 'null'
+        max_in_flight:
+          type: [integer, 'null']
+          description: The coordinator's cap for the node, or null for none.
+        effective_max_in_flight:
+          type: [integer, 'null']
+          description: The smallest of the declared, coordinator and local caps. Null until it first connects.
+        in_flight: { type: integer }
+        assignment_version:
+          type: integer
+          description: The latest assignment for this node.
+        applied_version:
+          type: [integer, 'null']
+          description: The assignment the node last reported applying.
         seats:
           type: array
           items:
-            $ref: '#/components/schemas/DeclaredSeat'
+            $ref: '#/components/schemas/SeatView'
         connected_at: { type: [string, 'null'], format: date-time }
         last_heartbeat_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
@@ -2627,27 +2872,51 @@ components:
               type: string
               description: Shown once. The node is started with it. Voice stores only a digest.
 
-    DeclaredSeat:
-      description: A seat as its node declared it, with what the coordinator makes of it.
+    SeatUpdate:
+      type: object
+      description: Only the fields present change. The id cannot.
+      properties:
+        engine: { type: string }
+        account: { type: string }
+        serves:
+          type: array
+          minItems: 1
+          items:
+            $ref: './protocol.yaml#/components/schemas/SeatModel'
+        data_classes:
+          type: array
+          items: { type: string }
+        concurrency: { type: integer, minimum: 1 }
+        enabled: { type: boolean }
+        config: { type: object }
+
+    SeatView:
+      description: A seat as configured here, with its state on its node.
       allOf:
-        - $ref: './node.yaml#/components/schemas/Seat'
+        - $ref: './protocol.yaml#/components/schemas/Seat'
         - type: object
-          required: [ref, status, problems, in_flight]
+          required: [ref, node, status, in_flight, problems]
           properties:
             ref:
               type: string
               description: The seat's full name, `<node>/<seat>`.
+            node: { type: string }
             status:
               type: string
-              enum: [up, down, disabled, unmapped]
+              enum: [pending, offline, starting, up, down, disabled, paused, refused]
               description: |
-                `unmapped`: the seat names an account that is not configured
-                or is archived, and it serves nothing until that is fixed.
+                `pending`: the node has not yet reported on the assignment
+                that carries this version of the seat. `offline`: its node is
+                not connected. The rest are as the node reported them
+                (`SeatState` in the protocol).
+            reason:
+              type: [string, 'null']
+              description: The node's reason, for `down`, `paused` and `refused`.
+            in_flight: { type: integer }
             problems:
               type: array
-              description: Why the seat serves less than it declares, e.g. a model not in the catalog.
+              description: What the coordinator sees wrong with it, e.g. a model not in the catalog or an archived account.
               items: { type: string }
-            in_flight: { type: integer }
 
     # ---- admin plane: changes --------------------------------------------
 

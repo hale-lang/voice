@@ -35,17 +35,15 @@ in [`FRICTION.md`](./FRICTION.md).
 
 ## The node (skeleton)
 
-[`node/`](./node/) is the start of the real node, not a stub. Its admin API
-(`node.yaml`) works: seats are created, changed and removed, validated, and
-kept as files in the node's data directory. The session to the coordinator
-retries and reports its state, and the protocol and the static engine come
-next.
+[`node/`](./node/) is the start of the real node, not a stub: its main
+locus, a local admin API and a session that retries the coordinator. It was
+built before seats moved to the coordinator, so its admin API still manages
+seats locally; the protocol slice brings it in line with `node.yaml`
+(capabilities file, local controls, assignments) and adds the static engine.
 
 ```sh
 hale build node
 node/node --id laptop --data node-data --port 8081   # --coordinator URL, --token T
-curl -X POST localhost:8081/node/v1/seats -d '{"id": "static", "engine": "static",
-  "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "hello"}}'
 hale test node
 ```
 
@@ -94,12 +92,14 @@ The code conforms to these documents, not the other way round.
   connections, so they scale out behind a load balancer and restart one at a
   time.
 - **The brain** keeps the route table. It reads what the api instances write
-  (seat declarations, heartbeats, quota windows, configuration) and decides
+  (seat states, heartbeats, quota windows, configuration) and decides
   which seats should take the next requests for each model. There is exactly
   one, it is not on the request path, and it talks to nothing but Postgres.
-- **A node** runs on each machine that has engines. It runs the seats its
-  operator configured and nothing else, and dials out to the api, so it needs
-  no open port.
+- **A node** runs on each machine that has engines. It offers the engines
+  its operator listed on the machine, runs the seats the coordinator assigns
+  it within them, and dials out to the api, so it needs no open port. Any
+  program that speaks [`protocol.yaml`](./protocol.yaml) can be a node; voice
+  ships its own.
 - **Postgres** is the shared state: configuration, the route table,
   counters and the ledger. Nodes have no database.
 
@@ -121,14 +121,26 @@ later is a change of packaging, not of design. See [In Hale](#in-hale).
   never holds the credential.
 - **Node:** one machine running voice's node software. Created on the
   coordinator, which issues its enrollment token.
-- **Seat:** one engine on one node, spending one account, serving some
-  models. Configured on the node, because the engine and its login live
-  there. Several seats may spend one account and share its limits.
+- **Engine:** what a node offers: a kind (`static`, `claude-cli`, ...) with
+  the login it runs under. Listed by the node's operator in a capabilities
+  file on the machine, with the node's hard limits, because only the
+  machine holds the login. Two logins for one CLI are two engines.
+- **Seat:** one of a node's engines, spending one account, serving some
+  models. Configured on the coordinator and sent to the node as its
+  assignment; the node refuses a seat outside what it offers. Several seats
+  may spend one account and share its limits.
 - **Project and key:** who is asking. Every request belongs to one project
   and one key, and keys name the accounts they may spend.
 
-Nothing is discovered. A node runs exactly the seats configured on it, and
-the coordinator admits only nodes it issued a token to.
+Nothing is discovered. A node offers exactly the engines listed on it and
+runs exactly the seats assigned to it, and the coordinator admits only nodes
+it issued a token to. A node's operator can pause it or a seat, or lower its
+in-flight cap, on the machine; local controls only restrict.
+
+**One admin UI.** The api serves the admin UI from its own origin, and every
+node is administered through it: seats, caps and state live on the
+coordinator. A node's own API is only for the machine it runs on, and for
+when it cannot reach the coordinator.
 
 ## A request, end to end
 
@@ -241,8 +253,9 @@ State lives in one of three places, and each piece has exactly one home.
   in its current period. Every api instance updates them with conditional
   writes, so a limit holds across instances and across restarts.
 - **The fleet as reported.** Api instances' heartbeats, which instance holds
-  each node's connection, each node's declared seats and their health, and
-  each account's quota windows as an engine last reported them.
+  each node's connection, each node's declared capabilities and local
+  controls, its seats' states, and each account's quota windows as an engine
+  last reported them.
 - **The ledger.** One usage record per request: project, key, requested and
   served model, node, seat, account, tokens, price, timing, attempts and the
   caller's `metadata`. It is append-only. Usage summaries are queries over
@@ -257,8 +270,9 @@ only its own in-flight requests.
 
 ### A node's data directory
 
-The node's seat configuration, written by its admin API. It is small and
-local to the node, so it needs no database.
+The node's capabilities file, written by its operator, and its local
+controls. Everything else about what it runs comes from the coordinator, so
+it needs no database.
 
 ### Why Postgres, and not also Redis
 
@@ -289,8 +303,13 @@ that dies with its api instance is recorded as abandoned by the brain.
   connection and refuses its token.
 - **Admins** authenticate through middleware in front of the admin APIs:
   OIDC later, nothing in the MVP, which listens on loopback only.
-- **Provider credentials** stay with the engines on their nodes. A CLI seat
-  names its CLI's configuration directory; voice never reads the login.
+- **Provider credentials** stay with the engines on their nodes. A CLI
+  engine's login is named in the node's capabilities file and never
+  declared; voice never reads it.
+- **The coordinator cannot widen a node.** It assigns seats only within the
+  engines and limits the node declared, and the node refuses anything else,
+  so a compromised coordinator cannot make a machine run what its operator
+  did not offer.
 - **Content** is never written down. A seat sees only the data classes its
   operator allowed it.
 - **TLS** is terminated in front of the api, for callers and for nodes'
@@ -348,19 +367,25 @@ also runs the brain. The shapes come from Hale's
 
 - The session holds the WebSocket client and reconnects. It is pinned,
   because `wss` reads block.
+- The capabilities file is read at start and declared in `hello`; the
+  assignment in `welcome` and every `assign` is reconciled against it, and
+  seat states go back as `seat_status`.
 - Each seat is a locus running its engine: the static engine answers in
-  process, and CLI engines run their CLI through `pond/subprocess`.
-- The admin API serves `/node/v1` on loopback.
+  process, and CLI engines run their CLI as a supervised child process.
+- The admin API serves `/node/v1` on loopback: status, capabilities, local
+  controls.
 
 ## Deployment
 
 - **MVP:** one machine. Postgres, one api with the brain inside it, and one
-  node, all on loopback. The node runs a static seat that answers every
-  request with its configured text. Everything is set up through the APIs,
-  in this order: a model, an account, a node (which yields a token), the
-  node started with that token, its seat, a project and a key.
+  node, all on loopback. The node offers the static engine, and a seat on
+  it answers every request with its configured text. Everything is set up
+  through the APIs, in this order: a model, an account, a node (which yields
+  a token), the node started with that token and a capabilities file, its
+  seat, a project and a key.
 - **Personal:** the api and Postgres on a machine that stays up, with a node
-  on each machine whose CLIs are logged in, one seat per account.
+  on each machine whose CLIs are logged in, one engine per login and a seat
+  on each.
 - **Scaled out:** several api instances behind a load balancer that also
   terminates TLS and sends traffic only to instances whose `/readyz` is ok, a NATS server carrying the request topics between them,
   the brain as its own process, and nodes anywhere.

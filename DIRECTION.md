@@ -11,7 +11,7 @@ because the contract comes before the code.
 ## The contract
 
 The API is specified in [`openapi.yaml`](./openapi.yaml) (the coordinator) and
-[`node.yaml`](./node.yaml) (a node), and the connection between them in
+[`node.yaml`](./node.yaml) (voice's own node, locally), and the connection between them in
 [`protocol.yaml`](./protocol.yaml) (AsyncAPI). They are the source of truth;
 code conforms to them.
 
@@ -43,10 +43,19 @@ and the API is the first-class way to do it; the UI is one client of it.
   the node with that token and the coordinator's address. The node dials out
   over a WebSocket and serves requests over that same connection, so a node
   behind NAT needs no open port.
-- **A seat** is one engine on one node: the static engine, or a CLI logged
-  in to one account. Seats are configured on the node, through the node's
-  API, because the engines and their logins live there. The node declares its
-  seats to the coordinator.
+- **The node decides what is possible; the coordinator decides what runs.**
+  A node's operator lists, in a file on the machine, the engines it offers
+  (the static engine, or a CLI with the login it runs under) and its hard
+  limits. The node declares them when it connects. **A seat** is one of
+  those engines, spending one account, and is configured on the coordinator,
+  which sends each node its seats as an assignment. The node refuses a seat
+  outside what it offers.
+- **Local controls only restrict.** On the machine, an operator can pause the
+  node or a seat, or lower its in-flight cap, and nothing more.
+- **The protocol is the seam.** Any program that speaks `protocol.yaml` can
+  be a node. Voice ships the api, the coordinator and its own node.
+- **One admin UI**, served by the api from its own origin, administers every
+  node.
 - **An account** is what pays and what has limits. Several seats may spend
   one account (the same login on two machines) and share its limits. Voice
   never holds the credential; the engine does, on its node.
@@ -111,9 +120,8 @@ tooling through voice and see how many tokens each project uses.
 - **Default data class.** Requests default to `internal`. A seat that
   forwards to a hosted provider must be allowed to carry `internal`, or the
   default must change.
-- **Configuring a node through the coordinator.** The UI talks to the
-  coordinator. Relaying seat changes to nodes is convenient, but lets the
-  coordinator write configuration onto machines. Nodes' own APIs come first.
+- **Several logins per CLI on one node.** How each CLI keeps them apart:
+  [hale-lang/voice#2](https://github.com/hale-lang/voice/issues/2).
 - **Caller-defined tools.** A backend that cannot return tool calls should
   refuse caller tools with a clear error.
 - **License.** Not chosen yet.

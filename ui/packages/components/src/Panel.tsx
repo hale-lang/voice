@@ -1,15 +1,20 @@
 import type { ReactNode } from 'react';
 import s from './Panel.module.css';
 
-/** A bounded region of the canvas with a heading: a membrane. */
-export function Panel(props: { title: ReactNode; aside?: ReactNode; children: ReactNode }) {
+/**
+ * A bounded region of the canvas: a hairline plate with cut corners, a
+ * heading, and a readout of what it counts and how fresh it is.
+ */
+export function Panel(props: { title: ReactNode; readout?: ReactNode; children: ReactNode }) {
   return (
     <section className={s.panel}>
-      <div className={s.head}>
-        <h3>{props.title}</h3>
-        {props.aside && <span className="muted">{props.aside}</span>}
+      <div className={s.inner}>
+        <div className={s.head}>
+          <h3>{props.title}</h3>
+          {props.readout && <span className="readout">{props.readout}</span>}
+        </div>
+        {props.children}
       </div>
-      {props.children}
     </section>
   );
 }

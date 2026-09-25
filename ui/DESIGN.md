@@ -70,6 +70,43 @@ first one: *structure is slate and quiet; color is earned by activity.*
   route table's rank beside where requests actually went; a budget beside
   what was spent. The difference is the information.
 
+## Personality
+
+The rules above are the grammar. These are the decisions that make the
+look recognizable at a glance, and the ones a contributor is most tempted
+to soften. Call it **the readout**: a surface that reads like an
+instrument's display, not like a dashboard.
+
+- **Type is the identity.** IBM Plex Sans for reading, IBM Plex Mono for
+  identifiers, values and readouts, both shipped with the tokens package
+  (Open Font License) and loaded from the same origin, never a font
+  service. Two weights each, 400 and 500; no bold. Mono is not an accent,
+  it is most of what is on screen, because ids and numbers are the content.
+- **Edges are cut, not rounded.** No border radius anywhere. A panel is a
+  hairline rule and a chamfer: its top-right and bottom-left corners cut at
+  45°, six pixels, the way a machined plate is relieved. Buttons and inputs
+  are square. Separation is a rule, not a box, wherever a rule will do.
+- **Every panel carries a readout.** Beside its title, in mono, small,
+  tracked caps and faint: what it counts and how fresh it is (`2 SEATS ·
+  3S`). The evidence strip is the global readout; panels have their own.
+  A reading with no readout is decoration.
+- **Selection is a hairline, not a fill.** The selected row gets a
+  two-pixel cyan rule on its leading edge and nothing else. Hover is one
+  step of surface. Focus is a square outline in the focus color.
+- **Motion is one indulgence.** Afterglow, and a slow pulse on the word
+  *fetching* in the evidence strip. Nothing else moves: no transitions on
+  layout, no hover animation, no skeleton shimmer, no easing on numbers.
+  Reduced motion gets stillness, fully informative.
+- **Five glyphs, no icons.** `·` quiet, `●` active, `◐` waiting, `✕`
+  failed, `✓` confirmed. Always with a word. No icon font, no icon set.
+- **The grid is the field.** The canvas shows a faint 32px rule grid, the
+  paper the readings sit on. Panels sit on it; they do not float over it,
+  so no shadows.
+- **What it refuses:** drop shadows, gradients, rounded pills, badges with
+  colored fills, toasts, modals (the inspector is the second surface and
+  the only one), decorative charts, loading spinners, and any color that
+  is not earned.
+
 ## The screens, as instruments
 
 Every number the API returns is the content; the UI's job is to make the

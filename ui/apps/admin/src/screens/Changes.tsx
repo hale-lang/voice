@@ -3,6 +3,7 @@ import { Panel, Table, Loading, Unavailable, Kv, Mono, when, ago } from '@hale/c
 import { useGet, type Change } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
+import { readout } from '../readout';
 
 /** The audit log: every applied admin write, before and after. */
 export function Changes({ route, setInspector }: ScreenProps) {
@@ -18,7 +19,7 @@ export function Changes({ route, setInspector }: ScreenProps) {
   return (
     <>
       <h1>Changes</h1>
-      <Panel title="Applied" aside={`${q.data.data.length}`}>
+      <Panel title="Applied" readout={readout(q, `${q.data.data.length} changes`)}>
         <Table<Change>
           rows={q.data.data}
           rowKey={(c) => c.id}

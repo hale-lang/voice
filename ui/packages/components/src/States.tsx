@@ -9,8 +9,7 @@ function State(props: { tone: 'quiet' | 'wait' | 'fail'; children: ReactNode }) 
       role="status"
       style={{
         padding: 'var(--space-4)',
-        border: '1px dashed var(--color-rule-strong)',
-        borderRadius: 'var(--radius-panel)',
+        border: 'var(--line-hair) dashed var(--color-rule-strong)',
         fontSize: 'var(--size-sm)',
       }}
     >

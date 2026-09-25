@@ -65,7 +65,7 @@ function EvidenceStrip() {
         { label: 'source', value: 'voice api, same origin' },
         { label: 'api', value: <span className={health.isError ? 'c-fail' : undefined}>{state} {version}</span> },
         { label: 'refreshed', value: newest ? `${ago(new Date(newest).toISOString(), now)} ago` : '–' },
-        { label: '', value: fetching ? <span className="c-active">fetching</span> : <span className="faint">idle</span> },
+        { label: '', value: fetching ? <span className="c-active pulse">fetching</span> : <span className="faint">idle</span> },
       ]}
     />
   );

@@ -1,6 +1,7 @@
 import { Panel, Table, Status, Loading, Unavailable, Empty, Mono, until, when } from '@hale/components';
 import { useGet } from '../api/client';
 import type { ScreenProps } from '../App';
+import { readout } from '../readout';
 
 /** Per model, where the next request would go and why. */
 export function Routes(_: ScreenProps) {
@@ -16,7 +17,7 @@ export function Routes(_: ScreenProps) {
       </p>
       {t.models.length === 0 && <Empty>No models route anywhere: no seat is up, or the catalog is empty.</Empty>}
       {t.models.map((m) => (
-        <Panel key={m.model} title={<Mono>{m.model}</Mono>} aside={`${m.seats.length} seats · ${m.exhausted.length} exhausted`}>
+        <Panel key={m.model} title={<Mono>{m.model}</Mono>} readout={readout(q, `${m.seats.length} seats`, `${m.exhausted.length} exhausted`, `v${t.version}`)}>
           <Table
             rows={m.seats}
             rowKey={(s) => s.seat}

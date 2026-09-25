@@ -3,6 +3,7 @@ import { toneOf } from '../tone';
 import { useGet, type Account, type Node, type SeatView, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href } from '../route';
+import { readout } from '../readout';
 
 /** Headroom, health, spend, recent requests: the glance. */
 export function Overview(_: ScreenProps) {
@@ -25,7 +26,7 @@ function Accounts() {
   if (q.isError) return <Unavailable what="Accounts" detail={q.error.message} />;
   const accounts = q.data.data.filter((a) => a.status === 'active');
   return (
-    <Panel title="Headroom" aside={`${accounts.length} accounts`}>
+    <Panel title="Headroom" readout={readout(q, `${accounts.length} accounts`)}>
       <PanelGrid>
         {accounts.map((a) => (
           <AccountGauges key={a.id} account={a} />
@@ -65,7 +66,7 @@ function Fleet() {
   const rows: SeatRow[] = q.data.data.flatMap((n) => n.seats.map((s) => ({ ...s, nodeStatus: n.status })));
   const nodes = q.data.data;
   return (
-    <Panel title="Fleet" aside={`${nodes.length} nodes · ${rows.length} seats · ${nodes.reduce((a, n) => a + (n.in_flight ?? 0), 0)} in flight`}>
+    <Panel title="Fleet" readout={readout(q, `${nodes.length} nodes`, `${rows.length} seats`, `${nodes.reduce((a, n) => a + (n.in_flight ?? 0), 0)} in flight`)}>
       <Table<SeatRow>
         rows={rows}
         rowKey={(r) => r.ref}
@@ -89,7 +90,7 @@ function Spend() {
   if (q.isPending) return <Loading what="projects" />;
   if (q.isError) return <Unavailable what="Projects" detail={q.error.message} />;
   return (
-    <Panel title="Spend this period">
+    <Panel title="Spend this period" readout={readout(q, `${q.data.data.length} projects`)}>
       <Table
         rows={q.data.data}
         rowKey={(p) => p.id}
@@ -120,7 +121,7 @@ function Recent() {
   if (q.isError) return <Unavailable what="Usage" detail={q.error.message} />;
   const fresh = (r: UsageRecord) => Date.now() - Date.parse(r.created_at) < 60_000;
   return (
-    <Panel title="Recent requests">
+    <Panel title="Recent requests" readout={readout(q, `${q.data.data.length}`)}>
       <Table<UsageRecord>
         rows={q.data.data}
         rowKey={(r) => r.id}

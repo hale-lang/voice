@@ -4,6 +4,7 @@ import { toneOf } from '../tone';
 import { useGet, type Node, type SeatView } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href, go } from '../route';
+import { readout } from '../readout';
 
 /** Nodes, and one node's seats with assigned beside reported. */
 export function Nodes({ route, setInspector }: ScreenProps) {
@@ -22,7 +23,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   return (
     <>
       <h1>Nodes</h1>
-      <Panel title="Nodes" aside={`${q.data.data.length}`}>
+      <Panel title="Nodes" readout={readout(q, `${q.data.data.length} nodes`)}>
         <Table<Node>
           rows={q.data.data}
           rowKey={(n) => n.id}
@@ -40,7 +41,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
           empty="No nodes. Create one to get its enrollment token."
         />
       </Panel>
-      {node && <Seats node={node} />}
+      {node && <Seats node={node} fresh={readout(q)} />}
     </>
   );
 }
@@ -64,9 +65,9 @@ function AssignmentCell({ node }: { node: Node }) {
   );
 }
 
-function Seats({ node }: { node: Node }) {
+function Seats({ node, fresh }: { node: Node; fresh: string }) {
   return (
-    <Panel title={`Seats on ${node.id}`} aside={`${node.seats.length}`}>
+    <Panel title={`Seats on ${node.id}`} readout={`${node.seats.length} seats · ${fresh}`}>
       <Table<SeatView>
         rows={node.seats}
         rowKey={(s) => s.ref}

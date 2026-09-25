@@ -16,7 +16,7 @@ themes.forEach(([name, colors], i) => {
   lines.push('}');
 });
 lines.push(':root {');
-for (const group of ['font', 'size', 'space', 'radius', 'motion', 'layer']) {
+for (const group of ['font', 'size', 'space', 'radius', 'cut', 'line', 'motion', 'layer']) {
   for (const [k, v] of Object.entries(tokens[group])) lines.push(`  --${group}-${k}: ${v};`);
 }
 lines.push('}');

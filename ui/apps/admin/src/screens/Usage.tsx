@@ -4,6 +4,7 @@ import { toneOf } from '../tone';
 import { useGet, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
+import { readout } from '../readout';
 
 /** Summaries first, then the records behind them. */
 export function Usage({ route, setInspector }: ScreenProps) {
@@ -21,7 +22,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         <Summary group="project" />
         <Summary group="account" />
       </PanelGrid>
-      <Panel title="Requests" aside={records.data ? `${records.data.data.length}` : ''}>
+      <Panel title="Requests" readout={readout(records, records.data ? `${records.data.data.length}` : null)}>
         {records.isPending ? (
           <Loading what="usage" />
         ) : records.isError ? (
@@ -55,7 +56,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
 function Summary({ group }: { group: 'project' | 'account' }) {
   const q = useGet('/admin/v1/usage/summary', { params: { query: { group_by: [group] } } });
   return (
-    <Panel title={`By ${group}`} aside={q.data ? <span className="faint">{when(q.data.from)} → {when(q.data.to)}</span> : ''}>
+    <Panel title={`By ${group}`} readout={readout(q, q.data ? `${when(q.data.from)} → ${when(q.data.to)}` : null)}>
       {q.isPending ? (
         <Loading />
       ) : q.isError ? (

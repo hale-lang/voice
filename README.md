@@ -85,16 +85,20 @@ and follows changes through the admin event stream (`GET /admin/v1/events`).
 
 ## The contract
 
-| Document | What it specifies |
-|---|---|
-| [`openapi.yaml`](./spec/openapi.yaml) | The coordinator: the caller plane (`/v1`) and the admin plane (`/admin/v1`). |
-| [`node.yaml`](./spec/node.yaml) | A node's own admin API (`/node/v1`), where its seats are configured. |
-| [`protocol.yaml`](./spec/protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). |
-| [`spec/vendor/open-responses/`](./spec/vendor/open-responses/) | The [Open Responses](https://www.openresponses.org/specification) standard, `2026-04-24`, which the caller plane is. |
-| [`spec/store.md`](./spec/store.md) | Postgres: the tables and the transactions, the state laws as SQL. |
-| [`spec/internal.yaml`](./spec/internal.yaml) | Voice's own NATS subjects: the route table from the brain. |
+| Document | What it specifies | Served by | Consumed by | Over |
+|---|---|---|---|---|
+| [`openapi.yaml`](./spec/openapi.yaml) | The coordinator: the caller plane (`/v1`), the admin plane (`/admin/v1`) and the node plane. | `api` | callers, `ui`, `node` | HTTP |
+| [`node.yaml`](./spec/node.yaml) | A node's own admin API (`/node/v1`), where its seats are configured. | `node` | the machine's operator | HTTP |
+| [`protocol.yaml`](./spec/protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). | `node` | `api` | NATS |
+| [`spec/vendor/open-responses/`](./spec/vendor/open-responses/) | The [Open Responses](https://www.openresponses.org/specification) standard, `2026-04-24`, which the caller plane is. | | [`openapi.yaml`](./spec/openapi.yaml), [`protocol.yaml`](./spec/protocol.yaml) | |
+| [`spec/store.md`](./spec/store.md) | Postgres: the tables and the transactions, the state laws as SQL. | `postgres` | `api`, `brain` | SQL |
+| [`spec/internal.yaml`](./spec/internal.yaml) | Voice's own NATS subjects: the route table from the brain. | `brain` | `api` | NATS |
 
-The code conforms to these documents, not the other way round.
+The code conforms to these documents, not the other way round. The last
+three columns are where the processes meet: the process that serves the
+contract, the ones that consume it (a name in code is a process or a seed of
+this repository, a link another contract, plain words a party outside it),
+and what it travels over. A tool reads the table as it is written.
 
 ## The pieces
 
@@ -477,3 +481,9 @@ already there.
 - **Scaled out:** several api instances behind a load balancer that also
   terminates TLS and sends traffic only to instances whose `/readyz` is ok,
   the brain with a standby on another machine, and nodes anywhere.
+
+| Deployment | Runs |
+|---|---|
+| MVP ([`compose.yaml`](./compose.yaml)) | `postgres`, `nats`, `api`, `brain`, `node` |
+| Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine with logins |
+| Scaled out | `api` behind a load balancer, `brain` with a standby, `postgres`, `nats`, and `node` anywhere |

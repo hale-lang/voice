@@ -126,7 +126,7 @@ keep a `FRICTION.md`.
 `ci/store`, `ci/image`.
 
 **document**: `README.md`, `DIRECTION.md`, `FRICTION.md`, `GRAPH.md`,
-`ui/README.md`, `ui/DESIGN.md`, `spec/store.md`.
+`ui/README.md`, `ui/DESIGN.md`, `spec/store.md`, `api/lib/pond/README.md`.
 
 **witness**: the three `FRICTION.md` entries (a `Router.add` handler
 dangles; no triple-quoted strings; no reason phrases) and the issue the
@@ -295,7 +295,7 @@ moves through `constrains` and may reshape either.
 
 `hale dna init` on this repository, at this commit, should yield: 1
 purpose, 17 axioms, 5 processes, 5 seeds, 6 contracts, 3 deployments (1
-built), 7 gates, 7 documents, 4 witnesses, 0 positions, 0 work; the edges
+built), 7 gates, 8 documents, 4 witnesses, 0 positions, 0 work; the edges
 above; and the 25 proposals for the holes listed. A later commit that adds a
 contract, a seed or a decision changes those counts, and the diff between
 two ingests is the review.

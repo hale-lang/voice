@@ -93,8 +93,9 @@ instrument's display, not like a dashboard.
 - **Selection is a hairline, not a fill.** The selected row gets a
   two-pixel cyan rule on its leading edge and nothing else. Hover is one
   step of surface. Focus is a square outline in the focus color.
-- **Motion is one indulgence.** Afterglow, and a slow pulse on the word
-  *fetching* in the evidence strip. Nothing else moves: no transitions on
+- **Motion follows evidence.** Afterglow, completed-request traces in the
+  Network view, and a slow pulse on the word *fetching* in the evidence
+  strip. Nothing else moves: no transitions on
   layout, no hover animation, no skeleton shimmer, no easing on numbers.
   Reduced motion gets stillness, fully informative.
 - **Five glyphs, no icons.** `·` quiet, `●` active, `◐` waiting, `✕`
@@ -135,10 +136,18 @@ right ones comparable.
 Live state comes from the admin event stream (`GET /admin/v1/events`); the
 UI never polls for what the stream carries.
 
-A drawn topology, the fleet as a picture with requests flowing through it,
-is deliberately not in the MVP or 1.0. It is the most expensive thing to
-build and the least often looked at; the questions above are numeric. It may
-earn a place later on an infrastructure dashboard, as its own package.
+The Network screen shows the fleet as a stable constellation of projects,
+models, seats, nodes and accounts. Configuration draws solid links; recent
+usage draws dotted project/model links. Completed usage events briefly trace
+their recorded path; reported in-flight counts mark occupied entities. Neither
+is token streaming or a hardware measurement. Selection isolates a neighborhood
+and opens its evidence. Reduced motion keeps a still highlight.
+
+A separate, labeled demo fleet exercises synthetic traffic while the backend
+is a stub. It never sends inference or configuration requests. API mode clears
+the view on failed reads and does not animate historical SSE replays as live
+traffic. The graph is bounded to 160 visible entities, with truncation stated.
+This network activity is a second permitted form of motion beside afterglow.
 
 ## Layers, so the reusable parts rip out
 
@@ -176,3 +185,44 @@ unclipped, dense data and long identifiers unbroken, every state (loading,
 stale, unavailable, missing, empty, error) reachable and designed, and every
 drawn value traceable to a field the API returned. Screenshots against the
 stub are the evidence.
+
+### Unified network observatory
+
+The Network canvas uses lime projects, magenta models, cyan seats, blue hosts,
+violet accounts, orange repositories, mint API instances and lavender optional
+context. Shape and labels duplicate category color; halos show activity, amber
+and coral retain state meaning.
+
+There is one shared field with aligned neural layers leading toward models.
+Model labels sit to the right of a compact terminal stack; hosts connect to seats
+through orthogonal branches. Only present stages take space; repositories and arbitrary context sit
+near projects, and accounts attach below execution. Directed springs preserve
+their horizontal span, while label-aware collision forces separate neighborhoods.
+Layer alignment survives viewport changes; selection never reheats the layout. Search and additive selection compose any set of entities, intersecting
+complete request membership by default; an explicit Any selected mode unions it.
+Resource filters and present-only layers live behind Refine network.
+
+Every usage ID owns its participants, context links and directed execution links.
+Execution ends at the actual served model, separately from the requested model
+constraint when those differ. Project → API is the ingress hop. Repository/account/metadata correlations
+light alongside execution; requested-model constraints never create shortcut edges. Unattributed requests
+have no fabricated execution chain. Historical evidence survives configuration
+changes. A bounded 160-entity view declares truncation.
+
+Optional metadata dimensions are discovered from returned fields, with labels
+and markers that need no registry entry. `metadata.repository` remains an optional
+caller-supplied label; other keys are explicitly context, never trusted runtime
+identity. UsageRecord still lacks the API instance from `spec/store.md`'s ledger.
+Demo-only observation context supplies it until backend work exposes the field.
+The demo includes missing repositories, missing API identity and refusals without
+seats. It contacts no homelab hosts or providers.
+
+Dragging or arrow keys pin entities; Escape releases a focused pin, Reset layout
+clears pins. Reduced motion keeps static evidence. Narrow screens scroll the
+shared graph horizontally.
+
+The synthetic demo exposes seven projects, three repository labels and 24 model
+aliases. Up to three distinct projects run concurrently, each with a stable path
+color and an in-flight selector. Seat and host occupancy derive from that schedule;
+completed usage is emitted only when a worker finishes. Demo controls freeze both
+the schedule and animation, and the chosen data source survives page reloads.

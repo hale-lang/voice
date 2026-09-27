@@ -4,21 +4,22 @@ import s from './Shell.module.css';
 /** The instrument's frame: context rail, canvas, inspector, evidence strip. */
 export function Shell(props: {
   rail: ReactNode;
+  wide?: boolean;
   inspector?: ReactNode;
   evidence: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <div className={s.shell}>
+    <div className={`${s.shell} ${props.wide ? s.wide : ''}`}>
       <nav className={s.rail} aria-label="Context">
         {props.rail}
       </nav>
       <main className={s.canvas}>
         <div className={s.canvasInner}>{props.children}</div>
       </main>
-      <aside className={s.inspector} aria-label="Inspector">
+      {!props.wide && <aside className={s.inspector} aria-label="Inspector">
         {props.inspector ?? <span className="faint">Select something to inspect it.</span>}
-      </aside>
+      </aside>}
       <footer className={s.evidence} aria-label="Evidence">
         {props.evidence}
       </footer>

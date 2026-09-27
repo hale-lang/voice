@@ -3,6 +3,7 @@ import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago } from '@hale/
 import { useRoute, href } from './route';
 import { useGet } from './api/client';
 import { Overview } from './screens/Overview';
+import { Network } from './screens/Network';
 import { Nodes } from './screens/Nodes';
 import { Usage } from './screens/Usage';
 import { Routes } from './screens/Routes';
@@ -15,6 +16,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 
 const NAV = [
   { href: href(), label: 'Overview', key: '' },
+  { href: href('network'), label: 'Network', key: 'network' },
   { href: href('usage'), label: 'Usage', key: 'usage' },
   { href: href('routes'), label: 'Route table', key: 'routes' },
   { href: href('nodes'), label: 'Nodes', key: 'nodes' },
@@ -28,7 +30,7 @@ export function App() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, projects: Projects }[section];
+  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, projects: Projects }[section];
   const Screen = screen ?? Overview;
 
   // The inspector belongs to the screen; a new screen starts it empty.
@@ -36,6 +38,7 @@ export function App() {
 
   return (
     <Shell
+      wide={section === 'network'}
       rail={
         <>
           <RailHeader app="voice" sub="admin" />

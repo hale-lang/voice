@@ -73,6 +73,39 @@ nouns; voice's own state-word mapping lives in `apps/admin/src/tone.ts`),
 One origin, so no CORS. The image builds it in (`Dockerfile`), and
 `docker compose up` serves it at http://127.0.0.1:8080/.
 
+## Network
+
+`#/network` is one shared force-directed field. Execution flows left to right
+toward models, with optional context alongside it. Only present stages occupy
+space; label collisions and directed springs keep neighborhoods spread out. Search or click to combine any reported context,
+using All selected (intersection) or Any selected (union). Selection highlights
+complete matching requests without rearranging the field. Refine network holds
+resource filters and layers; both adapt to the data present.
+
+Execution arrows follow project → API instance → execution host → seat → served model,
+where those participants are known. The requested model remains a routing constraint in the inspector, without a project-to-model shortcut;
+repository, project, account and other context light alongside execution. Requests
+without a serving seat do not acquire downstream execution arrows. Metadata beyond repository
+becomes labeled context automatically, without pretending it is infrastructure.
+
+The labeled homelab-inspired demo runs seven projects over three repository labels,
+24 illustrative model aliases, and claude-personal, claude-work, openai, agy, vibe
+plus local accounts. h1/h2 carry the CLI accounts and small local models; Macs
+carry MLX model tiers shaped by the 64/128/256/512 GB homelab profiles. These
+are illustrative serving alternatives, not simultaneous loaded-weight claims.
+Three staggered workers simulate up to three distinct projects
+in flight. Their colored paths stay lit until completion; occupancy is derived
+from those same requests. In-flight records appear separately from completed usage.
+The neural layout aligns model glyphs with labels on their right and places seats
+on orthogonal host branches. Accounts wrap into rows when space is tight. API mode reads
+the shared admin event stream and existing endpoints; it cannot currently see API
+instance identity. No caller metadata supplies trusted API identity. Drag/arrow
+keys pin entities; Escape releases a pin, Reset layout clears them. New context
+settles near neighbors, and selected traces survive incoming events.
+
+`npm run test -w @voice/admin` checks provenance, request correlation, optional
+context, execution direction, selection composition and layout continuity.
+
 ## Screens
 
 One per part of the admin API:

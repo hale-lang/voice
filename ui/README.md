@@ -82,9 +82,9 @@ using All selected (intersection) or Any selected (union). Selection highlights
 complete matching requests without rearranging the field. Refine network holds
 resource filters and layers; both adapt to the data present.
 
-Execution arrows follow project → API instance → execution host → seat → served model,
+Execution arrows follow project → API instance → execution host → seat → account → served model,
 where those participants are known. The requested model remains a routing constraint in the inspector, without a project-to-model shortcut;
-repository, project, account and other context light alongside execution. Requests
+repository, project and other context light alongside execution. Requests
 without a serving seat do not acquire downstream execution arrows. Metadata beyond repository
 becomes labeled context automatically, without pretending it is infrastructure.
 

@@ -7,9 +7,9 @@ test('graph relationships come from configuration or usage, never all-to-all gue
   const fleet = demoFleet(0, 1_800_000_000_000);
   const graph = buildGraph(fleet);
   const model = entityId('model', 'sonnet');
-  const seat = entityId('seat', 'h1/seat-1');
-  assert(graph.edges.some((e) => e.id === edgeId(model, seat) && e.kind === 'offers'));
-  assert(!graph.edges.some((e) => e.id === edgeId(model, entityId('seat', 'studio1/seat-1'))));
+  const account = entityId('account', fleet.nodes.find(n => n.id === 'h1').seats.find(s => s.ref === 'h1/seat-1').account);
+  assert(graph.edges.some((e) => e.id === edgeId(model, account) && e.kind === 'offers'));
+  assert(!graph.edges.some((e) => e.id === edgeId(model, entityId('account', 'local'))));
   const noUsage = buildGraph({ ...fleet, usage: [] });
   assert(!noUsage.edges.some((e) => e.kind === 'observed'));
   assert.equal(noUsage.vertices.filter((v) => v.kind === 'project').length, fleet.projects.length);
@@ -160,14 +160,14 @@ test('optional metadata dimensions emerge without a type registry entry', () => 
   const bare = buildGraph({ ...fleet, usage: [{ ...a, metadata: {} }] });
   assert(!bare.vertices.some(v => v.kind.startsWith('context:') || v.kind === 'repository'));
 });
-test('execution ends at the served model, while requested model and account remain context', () => {
+test('execution ends at the served model, through its account, while requested model remains context', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
   const record = { ...fleet.usage[1], served: { ...fleet.usage[1].served, model: 'provider-specific-model' } };
   const graph = buildGraph({ ...fleet, usage: [record], contexts: { [record.id]: { apiInstance: 'api-1' } } });
   const flow = graph.edges.filter(e => requestFlowEdges(record,graph).has(e.id));
-  assert.equal(flow.length,4);
-  assert(flow.some(e => e.source === `seat:${record.served.seat}` && e.target === 'model:provider-specific-model'));
-  assert(!flow.some(e => e.source.startsWith('model:') || e.source.startsWith('account:') || e.target.startsWith('account:')));
+  assert.equal(flow.length,5);
+  assert(flow.some(e => e.source === `account:${record.served.account}` && e.target === 'model:provider-specific-model'));
+  assert(!flow.some(e => e.source.startsWith('model:')));
   assert(requestVertices(record,graph).has(`model:${record.requested_model}`));
   const refused = { ...record, served: null };
   assert.equal(requestFlowEdges(refused,buildGraph({ ...fleet, usage: [refused] })).size,0);
@@ -233,12 +233,12 @@ test('simulated work never exceeds three distinct projects and occupancy matches
   assert.deepEqual([...accounts].sort(),['agy','claude-personal','claude-work','local','openai','vibe']);
   assert.equal(models.size,24);
 });
-test('a routed request follows one project-to-API-to-host-to-seat-to-model branch', () => {
+test('a routed request follows one project-to-API-to-host-to-seat-to-account-to-model branch', () => {
   const fleet = demoFleet(0,1_800_000_000_000), record = fleet.usage[1];
   const graph = buildGraph({...fleet,usage:[record],contexts:{[record.id]:{apiInstance:'api-1'}}});
   const flow = graph.edges.filter(e => requestFlowEdges(record,graph).has(e.id));
-  const participants = [`project:${record.project}`,'api:api-1',`node:${record.served.node}`,`seat:${record.served.seat}`,`model:${record.served.model}`];
-  assert.equal(flow.length,4);
+  const participants = [`project:${record.project}`,'api:api-1',`node:${record.served.node}`,`seat:${record.served.seat}`,`account:${record.served.account}`,`model:${record.served.model}`];
+  assert.equal(flow.length,5);
   for (let i=1;i<participants.length;i++) assert(flow.some(e=>e.source===participants[i-1] && e.target===participants[i]));
   assert(!graph.edges.some(e=>e.source.startsWith('project:') && e.target.startsWith('model:')));
 });

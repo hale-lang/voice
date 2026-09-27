@@ -196,7 +196,7 @@ and coral retain state meaning.
 There is one shared field with aligned neural layers leading toward models.
 Model labels sit to the right of a compact terminal stack; hosts connect to seats
 through orthogonal branches. Only present stages take space; repositories and arbitrary context sit
-near projects, and accounts attach below execution. Directed springs preserve
+near projects, and accounts form a vertical layer between seats and models. Directed springs preserve
 their horizontal span, while label-aware collision forces separate neighborhoods.
 Layer alignment survives viewport changes; selection never reheats the layout. Search and additive selection compose any set of entities, intersecting
 complete request membership by default; an explicit Any selected mode unions it.
@@ -204,7 +204,7 @@ Resource filters and present-only layers live behind Refine network.
 
 Every usage ID owns its participants, context links and directed execution links.
 Execution ends at the actual served model, separately from the requested model
-constraint when those differ. Project → API is the ingress hop. Repository/account/metadata correlations
+constraint when those differ. Project → API is the ingress hop. The account layer represents budget attribution, not an extra network hop. Repository/metadata correlations
 light alongside execution; requested-model constraints never create shortcut edges. Unattributed requests
 have no fabricated execution chain. Historical evidence survives configuration
 changes. A bounded 160-entity view declares truncation.

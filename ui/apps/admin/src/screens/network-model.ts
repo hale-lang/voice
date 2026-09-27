@@ -47,7 +47,8 @@ export function buildGraph(fleet: Fleet): Graph {
       for (const m of s.serves) {
         const id = entityId('model', m.model);
         if (!vertices.has(id)) add({ id, name: m.model, kind: 'model', state: 'configured', active: 0, href: link('catalog', m.model), details: [['Catalog model', m.model], ['Meaning', 'Configured on a seat; not evidence of loaded weights.']] });
-        connect(entityId('seat', s.ref), id, 'offers');
+        // Account/model links summarize the models offered by its seats.
+        connect(vertices.has(entityId('account', s.account)) ? entityId('account', s.account) : entityId('seat', s.ref), id, 'offers');
       }
       connect(entityId('node', n.id), entityId('seat', s.ref), 'hosts');
       connect(entityId('seat', s.ref), entityId('account', s.account), 'pays');
@@ -79,7 +80,7 @@ export function buildGraph(fleet: Fleet): Graph {
       const host = member('node', r.served.node);
       const account = member('account', r.served.account);
       const servedModel = member('model', r.served.model, 'Model reported by the serving engine; the terminal inference target.');
-      join(host, seat, true); join(seat, servedModel, true); join(seat, account);
+      join(host, seat, true); join(seat, account, true); join(account, servedModel, true);
       if (api) join(api, host, true);
     }
     requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context });
@@ -125,28 +126,25 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
   for (const e of edges) { neighbors.get(e.source)?.push(e.target); neighbors.get(e.target)?.push(e.source); }
   const constrain = (p: Point) => ({ x: Math.max(65, Math.min(width - 65, p.x)), y: Math.max(55, Math.min(height - 65, p.y)) });
   const context = vertices.filter(v => v.kind === 'repository' || v.kind.startsWith('context:'));
-  const accounts = vertices.filter(v => v.kind === 'account');
-  const stages = (['project', 'api', 'node', 'seat', 'model'] as Kind[]).filter(kind => vertices.some(v => v.kind === kind));
+  const stages = (['project', 'api', 'node', 'seat', 'account', 'model'] as Kind[]).filter(kind => vertices.some(v => v.kind === kind));
   const anchors = new Map<string, Point>();
   const span = width - 170;
   const start = 85 + (context.length ? span * .17 : 0);
-  const accountSpan = Math.max(175, width - 465);
-  const accountColumns = Math.max(1, Math.floor(accountSpan / 175));
-  const accountRows = Math.ceil(accounts.length / accountColumns);
   const modelStart = width - 190;
-  const top = 95, bottom = Math.max(top, height - (accountRows ? 100 + accountRows * 90 : 90));
+  const top = 95, bottom = Math.max(top, height - 90);
   const spreadY = (index: number, length: number) => length === 1 ? (top + bottom) / 2 : top + index * (bottom - top) / (length - 1);
   // Shared model neighborhoods order hosts before their seats, reducing crossings.
   const modelIds = vertices.filter(v => v.kind === 'model').map(v => v.id);
   const modelOrder = (v: Vertex): number => {
     const seats = neighbors.get(v.id)!.filter(id => byId.get(id)?.kind === 'seat');
-    const models = seats.flatMap(id => neighbors.get(id)!).filter(id => byId.get(id)?.kind === 'model');
+    const accounts = seats.flatMap(id => neighbors.get(id)!).filter(id => byId.get(id)?.kind === 'account');
+    const models = [...new Set([...seats, ...accounts].flatMap(id => neighbors.get(id)!).filter(id => byId.get(id)?.kind === 'model'))];
     return models.length ? models.reduce((sum, id) => sum + modelIds.indexOf(id), 0) / models.length : modelIds.length;
   };
   for (const [stage, kind] of stages.entries()) {
     const group = vertices.filter(v => v.kind === kind);
     if (kind === 'node') group.sort((a,b) => modelOrder(a) - modelOrder(b) || a.id.localeCompare(b.id));
-    if (kind === 'model') {
+    if (kind === 'model' || kind === 'account') {
       const meanY = (v: Vertex) => {
         const related = neighbors.get(v.id)!.flatMap(id => anchors.has(id) ? [anchors.get(id)!.y] : []);
         return related.length ? related.reduce((sum,y) => sum+y,0)/related.length : height/2;
@@ -171,11 +169,6 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
   };
   context.sort((a,b) => contextY(a)-contextY(b) || a.id.localeCompare(b.id));
   context.forEach((v,index) => anchors.set(v.id, { x: 85, y: spreadY(index, context.length) }));
-  accounts.forEach((v,index) => {
-    const row = Math.floor(index / accountColumns), column = index % accountColumns;
-    const count = Math.min(accountColumns, accounts.length - row * accountColumns);
-    anchors.set(v.id, { x: count === 1 ? 85 + accountSpan / 2 : 85 + column * accountSpan / (count - 1), y: height - 85 - (accountRows - row - 1) * 90 });
-  });
   const points = new Map(vertices.map(v => {
     const anchor = anchors.get(v.id)!, saved = previous?.get(v.id);
     const initial = saved ? { x: saved.x * .1 + anchor.x * .9, y: saved.y * .1 + anchor.y * .9 } : anchor;

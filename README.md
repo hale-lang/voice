@@ -27,7 +27,7 @@ is replaced by its real handler as the MVP is built.
 
 ```sh
 hale build api
-api/api --port 8080          # --host, --canned DIR
+api/api --port 8080          # --host, --canned DIR, --nats URL --pulse PREFIX
 curl localhost:8080/v1/models
 hale test api                # every route answers its happy path
 ```
@@ -289,6 +289,20 @@ Postgres. The route table is the one thing published that looks like
 state, and it is a derived snapshot: losing it costs a second. Usage is written once, to the ledger; publishing it to a
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
+
+**The organization's events are not usage's second write.** When voice
+runs under an organization (Hale's DNA), the api tells it each settled
+request as an event, `UsageRecorded` on `app.voice.usage.recorded`
+([`api/events.hl`](./api/events.hl)), and only then: `--pulse PREFIX` names
+the prefix the organization reads voice's subjects under, and `--nats` its
+server. The ledger row is written first and stays the only record of
+usage; the event is a signal that one settled, carrying its request id,
+which the organization records once and never treats as the fact — what it
+wants to know about usage it reads through the admin API. Those subjects
+are the organization's JetStream stream, not voice's traffic between its
+own pieces. The api carries pond's NATS client pinned under
+[`api/lib/pond/`](./api/lib/pond/). Today the stub's usage is its canned
+record.
 
 **Why the broker is in the MVP:** a single api instance would not need it,
 but the MVP's job is to lay the process model the rest is built on, and a

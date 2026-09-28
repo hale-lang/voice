@@ -35,6 +35,44 @@ hale test api                # every route answers its happy path
 Every canned body validates against the spec. Friction met along the way is
 in [`FRICTION.md`](./FRICTION.md).
 
+### Rate limits, as the organization ratified them
+
+The first real handler is a project's rate limit
+([`api/limits.hl`](./api/limits.hl), hale-lang/voice#1). A limit is an
+operating practice of the DNA organization that runs voice,
+`operating/limits/<project>`. An admin proposes it, the Board ratifies it,
+and a superseding practice, ratified the same way, is the only way it
+changes. Its text states its grammar: one `name: value` per line, the names
+those of the contract's `Limit` (`window_seconds`, `requests`,
+`input_tokens`, `output_tokens`, `concurrent`), each a whole number alone
+after its name.
+
+```text
+The rate limit for the project personal: one name: value per line, ...
+window_seconds: 60
+requests: 600
+```
+
+The api reads the ratified limits through the organization's head, and
+nowhere else, as a service: `--client` is its client id at the issuer the
+head trusts (`--issuer`), and it presents that issuer's
+`client_credentials` token as a bearer. `--keys` names each project key's
+project, `<key>=<project>` per line. A request past its project's
+`requests` in the window is `429 rate_limited` with `Retry-After`. The
+limits fail closed: until the first read lands, a keyed request is `503
+metering_unavailable`; after it, the last limits read stand while the head
+does not answer, and each refusal is logged. `--head` without `--issuer`,
+`--client`, the secret or a readable `--keys` does not start.
+
+```sh
+VOICE_SERVICE_SECRET=... api/api --head http://127.0.0.1:8792 \
+  --issuer http://127.0.0.1:8794 --client voice-api --keys keys.txt
+```
+
+[`api/tests/admin_limits.sh`](./api/tests/admin_limits.sh) runs it end to end,
+from the admin's proposal to the caller's 429, against a hale checkout
+(`HALE_SOURCE`) until a hale release carries the head's service principal.
+
 ## The node (skeleton)
 
 [`node/`](./node/) is the start of the real node, not a stub. It reads

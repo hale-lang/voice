@@ -1,0 +1,65 @@
+// A project's rate limit, as the organization ratified it, in process:
+// the practice's own grammar, a window of requests, `429 rate_limited`
+// with `Retry-After` past it, and a superseding limit taking over. The
+// read through the head is admin_limits_test's.
+import ".." as api;
+
+const TEXT: String = "The rate limit for the project personal: one name: value per line, from window_seconds (the window, in seconds), requests, input_tokens, output_tokens and concurrent, each a whole number alone after its name; a name left out is unlimited.\nwindow_seconds: 60\nrequests: 2";
+
+fn canned_dir() -> String {
+    if std::io::fs::file_exists("api/canned/getLiveness.json") { return "api/canned"; }
+    return "canned";
+}
+
+fn ask(e: api::Endpoints, key: String) -> std::http::Response {
+    return e.handle(std::http::Request { method: "POST", path: "/v1/responses", headers: "Authorization: Bearer " + key, body: "{\"model\": \"echo-1\", \"input\": \"hi\"}" });
+}
+
+fn main() {
+    // ---- the grammar the practice states: the contract's names, prose around them
+    let l = api::parse_limit("personal", TEXT);
+    std::test::assert(l.project == "personal" && l.window_seconds == 60 && l.requests == 2, "the limit read from its text");
+    std::test::assert(l.input_tokens == -1 && l.output_tokens == -1 && l.concurrent == -1, "a name left out is unlimited");
+    let odd = api::parse_limit("p", "requests: two\nrequests: -3\nwindow_seconds: 0\nconcurrent: 4");
+    std::test::assert(odd.requests == -1 && odd.window_seconds == 60 && odd.concurrent == 4, "only whole numbers count, and a window is at least a second");
+
+    // ---- a window of two, keyed by the project's key
+    let e = api::Endpoints { canned: canned_dir(), limits: api::Limits { keys: "vk-personal=personal\nvk-work=work" } };
+    e.limits.limits.push(l);
+    let one = ask(e, "vk-personal");
+    std::test::assert(one.status == 200 && std::str::contains(one.headers, "x-ratelimit-remaining-requests: 1"), "the first is served, one left: " + one.headers);
+    std::test::assert_eq_int(ask(e, "vk-personal").status, 200, "the second is served");
+    let third = ask(e, "vk-personal");
+    std::test::assert_eq_int(third.status, 429, "the third is past the limit");
+    std::test::assert(std::str::contains(third.headers, "Retry-After: ") && std::str::contains(third.body, "\"code\": \"rate_limited\"") && std::str::contains(third.body, "\"requests\": 2"), "with Retry-After and the limit that refused it: " + third.headers + " " + third.body);
+    std::test::assert_eq_int(ask(e, "vk-work").status, 200, "another project is not limited by it");
+    std::test::assert_eq_int(ask(e, "vk-unknown").status, 200, "nor is a key no project names");
+
+    // ---- a superseding limit takes over, in the same window
+    while e.limits.limits.len() > 0 { let gone = e.limits.limits.pop() or api::ProjectLimit { }; }
+    e.limits.limits.push(api::parse_limit("personal", std::str::replace(TEXT, "requests: 2", "requests: 5")));
+    std::test::assert_eq_int(ask(e, "vk-personal").status, 200, "under the new limit the third is served");
+    std::test::assert_eq_int(ask(e, "vk-personal").status, 200, "and the fourth");
+    std::test::assert_eq_int(ask(e, "vk-personal").status, 200, "and the fifth");
+    std::test::assert_eq_int(ask(e, "vk-personal").status, 429, "and the sixth is past it");
+
+    // ---- two ratified practices of one project (a superseding one, its
+    // predecessor's retirement not landed yet): the later one is in force
+    let folded = api::ProjectLimits { };
+    api::fold_limit(folded, api::parse_limit("personal", "requests: 2"));
+    api::fold_limit(folded, api::parse_limit("work", "requests: 9"));
+    api::fold_limit(folded, api::parse_limit("personal", "requests: 5"));
+    let first = folded.get(0) or api::ProjectLimit { };
+    std::test::assert(folded.len() == 2 && first.project == "personal" && first.requests == 5, "the later practice of a project replaces the earlier");
+
+    // ---- no limits read yet: a keyed request is refused, fail closed
+    let closed = api::Endpoints { canned: canned_dir(), limits: api::Limits { head: "http://127.0.0.1:1", issuer: "http://127.0.0.1:1", client: "voice-api", keys: "vk-personal=personal", http: std::http::Client { timeout_ms: 500 } } };
+    let refused = ask(closed, "vk-personal");
+    std::test::assert(refused.status == 503 && std::str::contains(refused.body, "metering_unavailable") && std::str::contains(refused.headers, "Retry-After: "), "before any limits are read, a keyed request is refused: " + refused.body);
+    std::test::assert(!std::str::contains(refused.headers, "x-ratelimit"), "and states no limit");
+
+    // ---- a credential in a form, and a reset as the contract writes it
+    std::test::assert_eq_str(api::form_encode("a&b+c%d e"), "a%26b%2Bc%25d%20e", "a secret is percent-encoded in the form");
+    std::test::assert_eq_str(api::duration(1), "1s", "one second");
+    std::test::assert_eq_str(api::duration(360), "6m0s", "six minutes");
+}

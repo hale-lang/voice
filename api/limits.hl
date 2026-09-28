@@ -1,0 +1,310 @@
+/// Rate limits, as the organization ratified them (hale-lang/voice#1).
+///
+/// A project's limit is a practice the organization adopted, not a
+/// configuration value: `operating/limits/<project>`, proposed like any
+/// practice, decided by the Board, and changed only by a superseding
+/// practice the Board ratifies. The practice's text states its own
+/// grammar, one `name: value` per line, the names those of the
+/// contract's `Limit` (`window_seconds`, `requests`, `input_tokens`,
+/// `output_tokens`, `concurrent`), each a whole number alone after its
+/// name; a name left out is unlimited, and every other line — a value
+/// with words after it included — is prose.
+///
+/// The api reads them through the organization's head and nowhere else,
+/// as a service: a token of the issuer's `client_credentials` grant under
+/// its own client id, presented as a bearer on the head's API routes. It
+/// reads again at most once per `every` seconds, when a request arrives,
+/// never on every request, each call bounded (`http`'s 2 s). Until a
+/// read lands, a keyed request is refused (`503 metering_unavailable`):
+/// the limits fail closed. Once one has, what it read last stands while
+/// the head does not answer, and each refusal is logged once. A project
+/// the organization ratified no limit for is not limited. Where several
+/// ratified practices name one project (a superseding one, before the
+/// old one's retirement lands), the last proposed is the one in force.
+///
+/// This slice enforces `requests` per `window_seconds`: a request past it
+/// is `429 rate_limited` with `Retry-After`, the seconds until the window
+/// resets. The token and concurrency limits are read and not yet
+/// enforced.
+
+const LIMIT_PREFIX: String = "operating/limits/";
+
+type ProjectLimit {
+    project: String = "";
+    window_seconds: Int = 60;
+    requests: Int = -1; // -1 = unlimited
+    input_tokens: Int = -1;
+    output_tokens: Int = -1;
+    concurrent: Int = -1;
+}
+
+type Window {
+    project: String = "";
+    start: Int = 0;
+    used: Int = 0;
+}
+
+/// The answer for one request: admitted, or refused until `reset`.
+type Admission {
+    ok: Bool = true;
+    unavailable: Bool = false; // no limits read yet: refused, fail closed
+    limited: Bool = false; // a limit applies to the project
+    limit: ProjectLimit = ProjectLimit { };
+    remaining: Int = -1;
+    reset: Int = 0; // seconds until the window resets
+}
+
+@form(vec)
+locus ProjectLimits { capacity { heap rows of ProjectLimit; } }
+
+@form(vec)
+locus Windows { capacity { heap rows of Window; } }
+
+/// A whole number, -1 when `text` is not one.
+fn whole(text: String) -> Int {
+    let t = std::str::trim(text);
+    if len(t) == 0 { return -1; }
+    let mut i = 0;
+    while i < len(t) {
+        let c = std::str::byte_at_unchecked(t, i);
+        if c < 48 || c > 57 { return -1; }
+        i = i + 1;
+    }
+    return std::str::parse_int(t) or - 1;
+}
+
+/// A practice's text as a limit for `project`: its `name: value` lines,
+/// the rest prose.
+@unbounded
+fn parse_limit(project: String, text: String) -> ProjectLimit {
+    let mut l = ProjectLimit { project: project };
+    let mut rest = text + "\n";
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = std::str::trim(rest[0..nl]);
+        rest = rest[(nl + 1)..len(rest)];
+        let colon = std::str::index_of(line, ":");
+        if colon <= 0 { continue; }
+        let name = std::str::trim(line[0..colon]);
+        let value = whole(line[(colon + 1)..len(line)]);
+        if value < 0 { continue; }
+        if name == "window_seconds" && value > 0 { l.window_seconds = value; }
+        if name == "requests" { l.requests = value; }
+        if name == "input_tokens" { l.input_tokens = value; }
+        if name == "output_tokens" { l.output_tokens = value; }
+        if name == "concurrent" { l.concurrent = value; }
+    }
+    return l;
+}
+
+/// `l` into `read`, in the order the head lists practices (the order they
+/// were proposed): a later ratified practice of the same project replaces
+/// an earlier one, so a superseding limit is in force even before the
+/// retirement of the one it supersedes lands.
+@unbounded
+fn fold_limit(read: ProjectLimits, l: ProjectLimit) {
+    let mut k = 0;
+    while k < read.len() {
+        let have = read.get(k) or ProjectLimit { };
+        if have.project == l.project { read.set(k, l) or discard; return; }
+        k = k + 1;
+    }
+    read.push(l);
+}
+
+fn no_answer(e: std::http::HttpError) -> std::http::ClientResponse {
+    return std::http::ClientResponse { status: 0, headers: "", body: b"" };
+}
+
+/// `text` percent-encoded for a form body: unreserved characters kept.
+@unbounded
+fn form_encode(text: String) -> String {
+    let hex = "0123456789ABCDEF";
+    let mut out = "";
+    let mut i = 0;
+    while i < len(text) {
+        let c = std::str::byte_at_unchecked(text, i);
+        let keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+        out = out + (if keep { text[i..(i + 1)] } else { "%" + hex[(c / 16)..(c / 16 + 1)] + hex[(c % 16)..(c % 16 + 1)] });
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Seconds as the contract writes a reset: `1s`, `6m0s`.
+fn duration(seconds: Int) -> String {
+    if seconds < 60 { return to_string(seconds) + "s"; }
+    return to_string(seconds / 60) + "m" + to_string(seconds % 60) + "s";
+}
+
+/// Seconds on the monotonic clock: a window never runs backwards.
+fn mono_now() -> Int { return std::time::monotonic_ns() / 1000000000; }
+
+locus Limits {
+    params {
+        head: String = ""; // the organization's head ("" = no limits are read)
+        issuer: String = ""; // the identity provider the head trusts
+        client: String = ""; // this service's client id there
+        secret_env: String = "VOICE_SERVICE_SECRET"; // where its secret is
+        keys: String = ""; // `<key>=<project>` per line
+        every: Int = 30; // seconds between reads
+        http: std::http::Client = std::http::Client { timeout_ms: 2000 }; // each call to the issuer or the head is bounded
+        read_at: Int = -1;
+        landed: Bool = false; // a read has landed: the limits are known
+        token: String = "";
+        token_until: Int = 0;
+        refused: String = ""; // why the last read did not land ("" when it did)
+        token_refused: String = ""; // why the last token was not issued
+        limits: ProjectLimits = ProjectLimits { };
+        windows: Windows = Windows { };
+    }
+    /// The project a request's key names ("" for none).
+    @unbounded
+    fn project_of(authorization: String) -> String {
+        let h = std::str::trim(authorization);
+        if len(h) < 7 || (h[0..7] != "Bearer " && h[0..7] != "bearer ") { return ""; }
+        let key = std::str::trim(h[7..len(h)]);
+        let mut rest = self.keys + "\n";
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let line = std::str::trim(rest[0..nl]);
+            rest = rest[(nl + 1)..len(rest)];
+            let eq = std::str::index_of(line, "=");
+            if eq > 0 && std::str::trim(line[0..eq]) == key { return std::str::trim(line[(eq + 1)..len(line)]); }
+        }
+        return "";
+    }
+    /// Admit one request of `project` at `now` (monotonic seconds),
+    /// counting it.
+    @unbounded
+    fn admit(project: String, now: Int) -> Admission {
+        if len(self.head) > 0 && (self.read_at < 0 || now - self.read_at >= self.every) {
+            self.read_at = now;
+            self.read(now);
+        }
+        if len(self.head) > 0 && !self.landed { return Admission { ok: false, unavailable: true, reset: self.every }; }
+        let l = self.limit_of(project);
+        if len(l.project) == 0 || l.requests < 0 { return Admission { }; }
+        let mut i = 0;
+        let mut w = Window { project: project, start: now };
+        let mut at = -1;
+        while i < self.windows.len() {
+            let have = self.windows.get(i) or Window { };
+            if have.project == project { w = have; at = i; }
+            i = i + 1;
+        }
+        if now - w.start >= l.window_seconds { w = Window { project: project, start: now }; }
+        let reset = w.start + l.window_seconds - now;
+        if w.used >= l.requests {
+            return Admission { ok: false, limited: true, limit: l, remaining: 0, reset: if reset > 0 { reset } else { 1 } };
+        }
+        w.used = w.used + 1;
+        if at >= 0 { self.windows.set(at, w) or discard; } else { self.windows.push(w); }
+        return Admission { limited: true, limit: l, remaining: l.requests - w.used, reset: reset };
+    }
+    @unbounded
+    fn limit_of(project: String) -> ProjectLimit {
+        let mut i = 0;
+        while i < self.limits.len() {
+            let l = self.limits.get(i) or ProjectLimit { };
+            if l.project == project { return l; }
+            i = i + 1;
+        }
+        return ProjectLimit { };
+    }
+    /// A token for this service, from the issuer's token endpoint, kept
+    /// until a minute before it expires. "" when the issuer refuses.
+    fn service_token(now: Int) -> String {
+        if len(self.token) > 0 && now < self.token_until - 60 { return self.token; }
+        let found = self.http.get(self.issuer + "/.well-known/openid-configuration") or no_answer(err);
+        let endpoint = std::json::find_string_field(std::str::from_bytes(found.body), "token_endpoint");
+        if found.status != 200 || len(endpoint) == 0 { self.token_refused = "the issuer's discovery document did not answer"; return ""; }
+        // the toolchain voice builds with (v0.21.0) has no `Credential`
+        // that hands a secret on; the release this waits for reads it from
+        // the vault instead (`std::secret::Credential { vault: … }`)
+        let secret = if len(self.secret_env) > 0 { std::env::var(self.secret_env) } else { "" };
+        if len(secret) == 0 { self.token_refused = "no secret for this service (" + self.secret_env + ")"; return ""; }
+        let form = "grant_type=client_credentials&client_id=" + form_encode(self.client) + "&client_secret=" + form_encode(secret);
+        let answered = self.http.post(endpoint, std::bytes::from_string(form), "application/x-www-form-urlencoded") or no_answer(err);
+        let body = std::str::from_bytes(answered.body);
+        let token = std::json::find_string_field(body, "access_token");
+        if answered.status != 200 || len(token) == 0 { self.token_refused = "the issuer refused this service (" + to_string(answered.status) + ")"; return ""; }
+        self.token = token;
+        self.token_until = now + std::json::find_int_field(body, "expires_in");
+        return token;
+    }
+    /// A GET on the head's API as this service.
+    fn head_get(path: String, token: String) -> std::http::ClientResponse {
+        let empty = std::http::Url { };
+        let url = std::http::parse_url(self.head + path) or empty;
+        let answered = self.http.request(std::http::ClientRequest { method: "GET", url: url, headers: "Authorization: Bearer " + token, body: b"" }) or no_answer(err);
+        // a token the head no longer takes is asked for again next time
+        if answered.status == 401 { self.token = ""; }
+        return answered;
+    }
+    /// Log why a read did not land, once for each new reason.
+    fn refuse(why: String) {
+        if why != self.refused { eprintln("voice api: the rate limits were not read: ", why, if self.landed { "; the last ones read stand" } else { "; keyed requests are refused until they are" }); }
+        self.refused = why;
+    }
+    /// Read the ratified limits through the head, every page of one
+    /// snapshot. What was read last stands when the head does not answer.
+    @unbounded
+    fn read(now: Int) {
+        let token = self.service_token(now);
+        if len(token) == 0 { self.refuse(self.token_refused); return; }
+        let apps = self.head_get("/api/hale/v1/applications", token);
+        let first = std::json::array_first(std::json::find_field_raw(std::json::find_field_raw(std::str::from_bytes(apps.body), "data"), "items"));
+        let app = if first.done { "" } else { std::json::find_string_field(first.element, "id") };
+        if apps.status != 200 || len(app) == 0 { self.refuse("the head names no application (" + to_string(apps.status) + ")"); return; }
+        let read = ProjectLimits { };
+        let mut offset = 0;
+        let mut snapshot = "";
+        let mut pages = 0;
+        while offset >= 0 && pages < 40 {
+            let at = if offset > 0 { "&offset=" + to_string(offset) + "&snapshot=" + snapshot } else { "" };
+            let page = self.head_get("/api/hale/v1/applications/" + app + "/dna/practices?limit=100" + at, token);
+            // the record moved between pages: read it whole next time
+            if page.status == 409 { self.refuse("the record moved while it was read"); return; }
+            if page.status != 200 { self.refuse("the head did not answer the practices (" + to_string(page.status) + ")"); return; }
+            let data = std::json::find_field_raw(std::str::from_bytes(page.body), "data");
+            let mut it = std::json::array_first(std::json::find_field_raw(data, "items"));
+            while !it.done {
+                let name = std::json::find_string_field(it.element, "name");
+                if std::str::starts_with(name, LIMIT_PREFIX) && len(name) > len(LIMIT_PREFIX) && std::json::find_string_field(it.element, "state") == "ratified" {
+                    fold_limit(read, parse_limit(name[len(LIMIT_PREFIX)..len(name)], std::json::find_string_field(it.element, "text")));
+                }
+                it = std::json::array_next(it);
+            }
+            let p = std::json::find_field_raw(data, "page");
+            if len(snapshot) == 0 { snapshot = std::json::find_string_field(p, "snapshot"); }
+            offset = if len(std::json::find_field_raw(p, "next_offset")) > 0 { std::json::find_int_field(p, "next_offset") } else { -1 };
+            pages = pages + 1;
+        }
+        while self.limits.len() > 0 { let gone = self.limits.pop() or ProjectLimit { }; }
+        let mut i = 0;
+        while i < read.len() { self.limits.push(read.get(i) or ProjectLimit { }); i = i + 1; }
+        if len(self.refused) > 0 || !self.landed { eprintln("voice api: the rate limits are read: ", read.len(), " project(s) limited"); }
+        self.refused = "";
+        self.landed = true;
+    }
+}
+
+/// The caller headers for an admitted request under a limit.
+fn limited_headers(a: Admission) -> String {
+    return "x-ratelimit-limit-requests: " + to_string(a.limit.requests) + "\r\nx-ratelimit-remaining-requests: " + to_string(a.remaining) + "\r\nx-ratelimit-reset-requests: " + duration(a.reset);
+}
+
+/// A keyed request before any limits were read: refused, since the
+/// limits fail closed — `503 metering_unavailable`, with `Retry-After`.
+fn limits_unavailable(a: Admission) -> std::http::Response {
+    let body = "{\"error\": {\"message\": \"the project's rate limits are not read yet\", \"type\": \"server_error\", \"code\": \"metering_unavailable\"}}";
+    return std::http::Response { status: 503, content_type: "application/json", headers: "Retry-After: " + to_string(a.reset), body: body };
+}
+
+/// A request past its project's limit: `429 rate_limited`, with
+/// `Retry-After` and the limit that refused it.
+fn rate_limited(a: Admission) -> std::http::Response {
+    let body = "{\"error\": {\"message\": \"project " + std::json::escape_string(a.limit.project) + " is past its limit of " + to_string(a.limit.requests) + " requests per " + to_string(a.limit.window_seconds) + "s\", \"type\": \"too_many_requests\", \"code\": \"rate_limited\", \"voice\": {\"limit\": {\"scope\": \"project\", \"window_seconds\": " + to_string(a.limit.window_seconds) + ", \"requests\": " + to_string(a.limit.requests) + ", \"remaining\": {\"requests\": 0}}}}}";
+    return std::http::Response { status: 429, content_type: "application/json", headers: "Retry-After: " + to_string(a.reset) + "\r\n" + limited_headers(a), body: body };
+}

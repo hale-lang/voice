@@ -84,6 +84,11 @@ code conforms to them.
   never holds the credential; the engine does, on its node.
 - `derived` **The catalog** of models is configured on the coordinator. Seats refer to
   its ids, so one model routes across every seat that serves it.
+- `derived` **A project's rate limit is a practice the organization
+  ratified,** `operating/limits/<project>`, and changes only by a
+  superseding practice the Board ratifies. The api reads the ratified
+  limits through the organization's head as a service, never from its own
+  configuration ([`api/limits.hl`](./api/limits.hl)).
 - `derived` **Projects and keys** name the accounts they may spend. A request may name
   one account; it is then served on that account or refused, never moved to
   another. A key for client work names the work account, so everything it

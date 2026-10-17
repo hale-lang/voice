@@ -131,7 +131,7 @@ locus Nodes {
         let mut row = NodeRow { id: c.id, name: c.name, token_digest: secret_digest(token), max_in_flight: c.max_in_flight, created_at: now_seconds() };
         row.assignment_version = 1;
         let mut v = self.view(row) or raise;
-        let added = self.store.insert_node(row, change("create", "nodes/" + c.id, "", node_json(v))) or fail store_failed(err);
+        let added = self.store.insert_node(row, change("create", "nodes/" + c.id, "", node_change_json(v))) or fail store_failed(err);
         if !added { fail conflict("node " + c.id + " exists; a node id is never reused"); }
         v.enrollment_token = token;
         return v;
@@ -157,7 +157,7 @@ locus Nodes {
         }
         row.assignment_version = row.assignment_version + 1;
         let after = self.view(row) or raise;
-        self.store.update_node(row, change("update", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        self.store.update_node(row, change("update", "nodes/" + row.id, node_change_json(before), node_change_json(after))) or fail store_failed(err);
         return after;
     }
 
@@ -171,7 +171,7 @@ locus Nodes {
         row.revoked_at = now_seconds();
         row.assignment_version = row.assignment_version + 1;
         let after = self.view(row) or raise;
-        self.store.update_node(row, change("revoke", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        self.store.update_node(row, change("revoke", "nodes/" + row.id, node_change_json(before), node_change_json(after))) or fail store_failed(err);
         return after;
     }
 
@@ -185,7 +185,7 @@ locus Nodes {
         row.token_digest = secret_digest(token);
         row.assignment_version = row.assignment_version + 1;
         let mut after = self.view(row) or raise;
-        self.store.update_node(row, change("rotate", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        self.store.update_node(row, change("rotate", "nodes/" + row.id, node_change_json(before), node_change_json(after))) or fail store_failed(err);
         after.enrollment_token = token;
         return after;
     }
@@ -471,14 +471,16 @@ fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fall
 }
 
 fn seat_json(s: SeatView) -> String {
-    let mut serves = "";
+    let serves_list = JsonList { };
     for m in s.serves.items {
-        serves = join(serves, "{\"model\": " + jq(m.model) + ", \"as\": " + (if len(m.engine_name) > 0 { jq(m.engine_name) } else { "null" }) + "}");
+        serves_list.add("{\"model\": " + jq(m.model) + ", \"as\": " + (if len(m.engine_name) > 0 { jq(m.engine_name) } else { "null" }) + "}");
     }
-    let mut problems = "";
+    let serves = serves_list.text();
+    let problems_list = JsonList { };
     for p in s.problems.items {
-        problems = join(problems, jq(p));
+        problems_list.add(jq(p));
     }
+    let problems = problems_list.text();
     return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": [" + serves + "]"
         + ", \"data_classes\": " + jnames(s.data_classes) + ", \"concurrency\": " + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
         + ", \"config\": " + s.config + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(s.status)
@@ -486,19 +488,21 @@ fn seat_json(s: SeatView) -> String {
 }
 
 fn seat_list_json(l: SeatList) -> String {
-    let mut entries = "";
+    let entries_list = JsonList { };
     for s in l.data {
-        entries = join(entries, seat_json(s));
+        entries_list.add(seat_json(s));
     }
+    let entries = entries_list.text();
     return jdata(entries);
 }
 
 /// `Node`, or `NodeWithToken` when it carries its token.
 fn node_json(n: Node) -> String {
-    let mut seats = "";
+    let seats_list = JsonList { };
     for s in n.seats.items {
-        seats = join(seats, seat_json(s));
+        seats_list.add(seat_json(s));
     }
+    let seats = seats_list.text();
     let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(n.status)
         + ", \"version\": null, \"capabilities\": null, \"local\": null, \"max_in_flight\": " + jnullable(n.max_in_flight)
         + ", \"effective_max_in_flight\": null, \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
@@ -508,11 +512,21 @@ fn node_json(n: Node) -> String {
     return out + "}";
 }
 
+/// A node as its change records hold it: its own fields, not its seats.
+/// A seat's change records the seat; repeating every seat in every node
+/// change would make the log grow with the fleet on each node edit.
+fn node_change_json(n: Node) -> String {
+    return "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(n.status)
+        + ", \"max_in_flight\": " + jnullable(n.max_in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
+        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.revoked, n.revoked_at) + "}";
+}
+
 fn node_list_json(l: NodeList) -> String {
-    let mut entries = "";
+    let entries_list = JsonList { };
     for n in l.data {
-        entries = join(entries, node_json(n));
+        entries_list.add(node_json(n));
     }
+    let entries = entries_list.text();
     return jdata(entries);
 }
 

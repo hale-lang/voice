@@ -148,24 +148,28 @@ fn pad(n: Int, width: Int) -> String {
     return s;
 }
 
-/// The budget in the window `now` is in. Nothing is spent or reserved
-/// yet: no request is served until a seat can serve it.
+/// The budget in the window `now` is in, or, before the anchor, the first
+/// window. Nothing is spent or reserved yet: no request is served until a
+/// seat can serve it.
 fn budget_view(b: BudgetSet, now: Time) -> Budget {
     let anchor = std::time::unix(b.period_anchor);
     let at = std::time::unix(now);
     let mut out = Budget { set: b, remaining_micros: b.allowance_micros, window_start: b.period_anchor };
-    if b.period == "none" || at < anchor { return out; }
+    if b.period == "none" { return out; }
     if b.period == "day" || b.period == "week" {
         let span = if b.period == "day" { 86400 } else { 7 * 86400 };
-        let start = anchor + ((at - anchor) / span) * span;
+        let start = if at < anchor { anchor } else { anchor + ((at - anchor) / span) * span };
         out.window_start = std::time::time_from_unix(start);
         out.ends = true;
         out.window_end = std::time::time_from_unix(start + span);
         return out;
     }
     // month: the window starts the k-th month after the anchor
-    let mut k = months_between(b.period_anchor, now);
-    if std::time::unix(add_months(b.period_anchor, k)) > at { k = k - 1; }
+    let mut k = 0;
+    if at >= anchor {
+        k = months_between(b.period_anchor, now);
+        if std::time::unix(add_months(b.period_anchor, k)) > at { k = k - 1; }
+    }
     let start = add_months(b.period_anchor, k);
     let end = add_months(b.period_anchor, k + 1);
     out.window_start = start;
@@ -182,7 +186,7 @@ fn nullable_count(obj: String, name: String) -> Int fallible(ApiError) {
     if kind == "missing" || kind == "null" { return -1; }
     let raw = std::str::trim(std::json::find_field_raw(obj, name));
     if kind != "number" || !is_integer(raw) { fail invalid("`" + name + "` is an integer or null", name); }
-    let n = std::str::parse_int(raw) or 0;
+    let n = std::str::parse_int(raw) or fail invalid("`" + name + "` is out of range", name);
     if n < 0 { fail invalid("`" + name + "` is at least 0", name); }
     return n;
 }
@@ -193,11 +197,12 @@ fn read_limit(obj: String) -> Limit fallible(ApiError) {
     let scope = required_string(obj, "scope") or raise;
     let raw = std::str::trim(std::json::find_field_raw(obj, "window_seconds"));
     if kind_of(obj, "window_seconds") != "number" || !is_integer(raw) { fail invalid("a limit's `window_seconds` is a required integer", "window_seconds"); }
+    let window = std::str::parse_int(raw) or fail invalid("a limit's `window_seconds` is out of range", "window_seconds");
     return Limit {
         scope: scope,
         model: string_or(obj, "model", "") or raise,
         account: string_or(obj, "account", "") or raise,
-        window_seconds: std::str::parse_int(raw) or 0,
+        window_seconds: window,
         requests: nullable_count(obj, "requests") or raise,
         input_tokens: nullable_count(obj, "input_tokens") or raise,
         output_tokens: nullable_count(obj, "output_tokens") or raise,
@@ -264,10 +269,11 @@ fn limit_json(l: Limit) -> String {
 }
 
 fn limits_json(ls: Limits) -> String {
-    let mut entries = "";
+    let entries_list = JsonList { };
     for l in ls.items {
-        entries = join(entries, limit_json(l));
+        entries_list.add(limit_json(l));
     }
+    let entries = entries_list.text();
     return "[" + entries + "]";
 }
 

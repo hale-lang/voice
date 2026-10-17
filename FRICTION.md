@@ -134,3 +134,16 @@ not an offset.
 the date first (the month 1 to 12, the day within the month, leap years
 counted) and takes an offset off by hand, with exactly two digits for its
 hours and its minutes.
+
+## `std::http::Server` refuses a body over 1 MiB before the handler sees it
+
+**hale 0.24.0.** A request whose body is over 1 MiB is answered by the
+server itself: `413 Content Too Large`, `Content-Type: text/plain`, body
+`payload too large`. The handler never runs, so the answer is neither the
+contract's limit (a request body may be up to 12 MiB) nor its shape (an
+`ErrorResponse` with `code`). The cap is not a knob of `std::http::Server`.
+
+**Working shape:** none in voice; the contract stays at 12 MiB and the
+JSON error. A request between 1 and 12 MiB (a long conversation, an
+attached file) is refused with plain text until the server's cap can be
+set (`TODO` in `api/inference.hl`, a line in the README).

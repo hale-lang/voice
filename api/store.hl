@@ -152,6 +152,9 @@ type ProjectRows { rows: bounded[ProjectRow; 64]; }
 /// One project's key rows, revoked ones included, in the order they were added.
 type KeyRows { rows: bounded[KeyRow; 64]; }
 
+/// The keys an archive revokes, revoked, and a change for each.
+type Revocations { keys: bounded[KeyRow; 64]; changes: bounded[ChangeRow; 64]; }
+
 /// Every account row, archived ones included, in the order they were added.
 type AccountRows { rows: bounded[AccountRow; 64]; }
 
@@ -162,7 +165,9 @@ type NodeRows { rows: bounded[NodeRow; 64]; }
 type SeatRows { rows: bounded[SeatRow; 256]; }
 
 /// A page of changes; `more` when older ones match too.
-type ChangeRows { rows: bounded[ChangeRow; 1000]; more: Bool = false; }
+/// A page of the log. `cursor_known` is false when the query's cursor
+/// names no change, and the page is then empty.
+type ChangeRows { rows: bounded[ChangeRow; 1000]; more: Bool = false; cursor_known: Bool = true; }
 
 interface Store {
     /// What answers: `memory`, `postgres`. Readiness names it.
@@ -182,9 +187,10 @@ interface Store {
     fn projects() -> ProjectRows fallible(StoreError);
     fn insert_project(row: ProjectRow, change: ChangeRow) -> Bool fallible(StoreError);
     fn update_project(row: ProjectRow, change: ChangeRow) fallible(StoreError);
-    /// Replace the row, archived, and revoke every key of the project that
-    /// is not revoked yet, at `row.archived_at`.
-    fn archive_project(row: ProjectRow, change: ChangeRow) fallible(StoreError);
+    /// Replace the row, archived, and write the keys it revokes, each with
+    /// its own change, all in one write: the keys' changes first, then the
+    /// project's.
+    fn archive_project(row: ProjectRow, change: ChangeRow, revoked: Revocations) fallible(StoreError);
 
     fn key(id: String) -> KeyRow fallible(StoreError);
     /// The key whose secret has this digest; `present` false for none.
@@ -358,15 +364,14 @@ locus MemoryStore {
     }
 
     @unbounded
-    fn archive_project(row: ProjectRow, change: ChangeRow) fallible(StoreError) {
-        let keys = self.keys(row.id) or KeyRows { };
-        for k in keys.rows {
-            if !k.revoked {
-                let mut gone = k;
-                gone.revoked = true;
-                gone.revoked_at = row.archived_at;
-                self.key_rows.set(gone);
-            }
+    fn archive_project(row: ProjectRow, change: ChangeRow, revoked: Revocations) fallible(StoreError) {
+        for k in revoked.keys {
+            let mut gone = k;
+            gone.present = true;
+            self.key_rows.set(gone);
+        }
+        for c in revoked.changes {
+            self.append(c);
         }
         let mut r = row;
         r.present = true;
@@ -608,6 +613,7 @@ locus MemoryStore {
             }
             i = i - 1;
         }
+        if !started { out.cursor_known = false; }
         return out;
     }
 }

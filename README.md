@@ -52,6 +52,9 @@ see, and every model is unavailable. An inference request is admitted (its
 key, model, account and data class) and then answered `503
 no_eligible_seat`. A request with `"stream": true` is answered `400
 unsupported`: hale's `std::http::Server` cannot stream a response body yet.
+A request body over 1 MiB is refused by the server before voice reads it,
+`413` in plain text, though the contract allows 12 MiB and a JSON error
+(see [`FRICTION.md`](./FRICTION.md)).
 
 The node plane, usage, the route table and the admin event stream answer
 their happy path: a canned body from [`api/canned/`](./api/canned/), one

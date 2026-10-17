@@ -117,9 +117,11 @@ with what closes it, and `spec/validate/bundle.mjs` (`npm run bundle`)
 fails when the gaps found and the gaps committed differ either way. It
 fails closed: every exported component is mapped to the contract, reached
 inside a mapped one, or listed as not compared with why (path and query
-records, hale's own refusal, the node's whole-body report); a scalar of
-another type, a field the row requires and the contract does not, and enum
-values that differ are never classed away; and
+records, hale's own refusal, the node's whole-body report), and holds no
+field its reason does not name; a scalar of another type, a narrowing (an
+enum on a plain string, an integer where the contract says number), a
+field the row requires and the contract does not, and enum values that
+differ are never classed away; and
 `spec/validate/negative/` (`npm run bundle-negative`) holds changes it must
 refuse:
 

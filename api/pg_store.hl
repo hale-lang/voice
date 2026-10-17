@@ -104,6 +104,24 @@ locus PgStore {
         return r.rows_affected;
     }
 
+    /// Inside the open transaction: refuse a row past `bound`, the bound
+    /// the memory store and every read of these rows hold, so a read never
+    /// drops a row. The inserts that count share one advisory lock, so two
+    /// api instances cannot both add the last row.
+    fn room(count_sql: String, a: db::Args, bound: Int, message: String) fallible(StoreError) {
+        self.step("SELECT pg_advisory_xact_lock(7203)", db::Args { }) or raise;
+        let r = self.conn.query_params(count_sql, a);
+        if !r.ok {
+            self.conn.rollback();
+            fail StoreError { message: r.err.kind + ": " + r.err.detail };
+        }
+        let n = std::str::parse_int(std::str::trim(r.csv)) or bound;
+        if n >= bound {
+            self.conn.rollback();
+            fail StoreError { kind: "full", message: message };
+        }
+    }
+
     /// Record the change and commit.
     fn commit_with(change: ChangeRow) fallible(StoreError) {
         self.record(change) or raise;
@@ -140,11 +158,12 @@ locus PgStore {
         let a = db::Args { };
         let all = self.rows("SELECT row_to_json(t) FROM (" + MODEL_COLUMNS + " ORDER BY created_at, id) t", a) or raise;
         let mut out = ModelRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, model_row(line)) or discard; }
         }
         return out;
@@ -152,6 +171,7 @@ locus PgStore {
 
     fn insert_model(row: ModelRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM catalog_model", db::Args { }, 256, "the catalog holds at most 256 models") or raise;
         let a = model_args(row);
         let n = self.step("INSERT INTO catalog_model (id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at) VALUES ($1, $2, $3, $4::int, $5::int, $6::jsonb, $7::timestamptz, $8::timestamptz) ON CONFLICT (id) DO NOTHING", a) or raise;
         if n == 0 {
@@ -182,11 +202,12 @@ locus PgStore {
         let a = db::Args { };
         let all = self.rows("SELECT row_to_json(t) FROM (" + PROJECT_COLUMNS + " ORDER BY p.created_at, p.id) t", a) or raise;
         let mut out = ProjectRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, project_row(line)) or discard; }
         }
         return out;
@@ -194,6 +215,7 @@ locus PgStore {
 
     fn insert_project(row: ProjectRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM project", db::Args { }, 64, "voice holds at most 64 projects") or raise;
         let n = self.step("INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at) VALUES ($1, $2, $3, " + names_param(4) + ", " + names_param(5) + ", " + restriction_param(6) + ", " + restriction_param(7) + ", $8, $9::timestamptz, $10::timestamptz) ON CONFLICT (id) DO NOTHING", project_args(row)) or raise;
         if n == 0 {
             self.rollback();
@@ -270,11 +292,12 @@ locus PgStore {
         a.add(project);
         let all = self.rows("SELECT row_to_json(t) FROM (" + KEY_COLUMNS + " WHERE k.project = $1 ORDER BY k.created_at, k.id) t", a) or raise;
         let mut out = KeyRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, key_row(line)) or discard; }
         }
         return out;
@@ -282,6 +305,7 @@ locus PgStore {
 
     fn insert_key(row: KeyRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM api_key WHERE project = $1", one_arg(row.project), 64, "a project holds at most 64 keys") or raise;
         let n = self.step("INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at) VALUES ($1, $2, $3, $4, decode($5, 'hex'), " + restriction_param(6) + ", " + restriction_param(7) + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz) ON CONFLICT (id) DO NOTHING", key_args(row)) or raise;
         if n == 0 {
             self.rollback();
@@ -328,11 +352,12 @@ locus PgStore {
         let a = db::Args { };
         let all = self.rows("SELECT row_to_json(t) FROM (" + ACCOUNT_COLUMNS + " ORDER BY a.created_at, a.id) t", a) or raise;
         let mut out = AccountRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, account_row(line)) or discard; }
         }
         return out;
@@ -340,6 +365,7 @@ locus PgStore {
 
     fn insert_account(row: AccountRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM account", db::Args { }, 64, "voice holds at most 64 accounts") or raise;
         let n = self.step("INSERT INTO account (id, name, provider, billing, status, created_at, archived_at) VALUES ($1, $2, $3, $4, $5, $6::timestamptz, $7::timestamptz) ON CONFLICT (id) DO NOTHING", account_args(row)) or raise;
         if n == 0 {
             self.rollback();
@@ -379,11 +405,12 @@ locus PgStore {
         let a = db::Args { };
         let all = self.rows("SELECT row_to_json(t) FROM (" + NODE_COLUMNS + " ORDER BY created_at, id) t", a) or raise;
         let mut out = NodeRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, node_row(line)) or discard; }
         }
         return out;
@@ -391,6 +418,7 @@ locus PgStore {
 
     fn insert_node(row: NodeRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM node", db::Args { }, 64, "voice holds at most 64 nodes") or raise;
         let mut r = row;
         r.assignment_version = 1;
         let n = self.step("INSERT INTO node (id, name, token_digest, max_in_flight, status, assignment_version, created_at, revoked_at) VALUES ($1, $2, decode($3, 'hex'), $4::int, $5, $6::int, $7::timestamptz, $8::timestamptz) ON CONFLICT (id) DO NOTHING", node_args(r)) or raise;
@@ -420,11 +448,12 @@ locus PgStore {
         let a = db::Args { };
         let all = self.rows("SELECT row_to_json(t) FROM (" + SEAT_COLUMNS + " ORDER BY node, id) t", a) or raise;
         let mut out = SeatRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) > 0 { push(out.rows, seat_row(line)) or discard; }
         }
         return out;
@@ -432,6 +461,7 @@ locus PgStore {
 
     fn insert_seat(row: SeatRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
+        self.room("SELECT count(*) FROM seat", db::Args { }, 256, "voice holds at most 256 seats") or raise;
         let n = self.step("INSERT INTO seat (node, id, engine, account, serves, data_classes, concurrency, enabled, config) VALUES ($1, $2, $3, $4, $5::jsonb, " + names_param(6) + ", $7::int, $8::boolean, $9::jsonb) ON CONFLICT (node, id) DO NOTHING", seat_args(row)) or raise;
         if n == 0 {
             self.rollback();
@@ -487,11 +517,12 @@ locus PgStore {
         a.add(to_string(limit + 1));
         let all = self.rows("SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE ($1 = '' OR target = $1 OR target LIKE $1 || '/%') AND ($2::timestamptz IS NULL OR at >= $2::timestamptz) AND ($3::timestamptz IS NULL OR at <= $3::timestamptz) AND ($4::bigint = 0 OR id < $4::bigint) ORDER BY id DESC LIMIT $5::int) t", a) or raise;
         let mut out = ChangeRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) == 0 { continue; }
             if count(out.rows) >= limit {
                 out.more = true;
@@ -563,11 +594,12 @@ locus PgStore {
         a.add(node);
         let all = self.rows("SELECT row_to_json(t) FROM (SELECT node, seat, status, reason, in_flight FROM seat_state WHERE node = $1 ORDER BY seat) t", a) or raise;
         let mut out = SeatStateRows { };
-        let mut rest = all;
-        while len(rest) > 0 {
-            let nl = std::str::index_of(rest, "\n");
-            let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
             if len(line) == 0 { continue; }
             let seat = pg_text(line, "seat");
             push(out.rows, SeatStateRow {
@@ -628,8 +660,8 @@ locus PgStore {
 
 // ---- rows and their columns ----------------------------------------------
 
-/// A DSN's parts.
-type Dsn { host: String = "127.0.0.1"; port: Int = 5432; user: String = "postgres"; password: String = ""; database: String = "postgres"; sslmode: String = "prefer"; }
+/// A DSN's parts; `problem` says what is wrong with it, "" when nothing is.
+type Dsn { host: String = "127.0.0.1"; port: Int = 5432; user: String = "postgres"; password: String = ""; database: String = "postgres"; sslmode: String = "prefer"; problem: String = ""; }
 
 /// `postgres://user[:password]@host[:port]/database[?sslmode=MODE]`.
 fn parse_dsn(url: String) -> Dsn {
@@ -664,11 +696,19 @@ fn parse_dsn(url: String) -> Dsn {
     let pc = std::str::index_of(rest, ":");
     if pc >= 0 {
         d.host = rest[0..pc];
-        d.port = std::str::parse_int(rest[(pc + 1)..len(rest)]) or 5432;
+        d.port = std::str::parse_int(rest[(pc + 1)..len(rest)]) or - 1;
+        if d.port < 1 || d.port > 65535 { d.problem = "the database URL's port is not a port number: " + rest[(pc + 1)..len(rest)]; }
     } else if len(rest) > 0 {
         d.host = rest;
     }
     return d;
+}
+
+/// Arguments of one value.
+fn one_arg(v: String) -> db::Args {
+    let a = db::Args { };
+    a.add(v);
+    return a;
 }
 
 /// A `text[]` from the JSON array in parameter `$n`; `{}` for none.

@@ -624,9 +624,13 @@ locus PgConn {
 
     // __pump — read + parse backend messages until ReadyForQuery
     // ('Z'). Accumulates DataRows into csv. Captures ErrorResponse.
+    // voice: DataRows go into one buffer, not `res.csv + row` per row,
+    // which kept every prefix of the result until the caller returned
+    // (a 1000-row result of 700 bytes a row grew the peak by 700 MB).
     fn __pump() -> __PgResult {
         let mut res = __PgResult { ok: true };
         let mut done = false;
+        let rows = std::bytes::BytesBuilder { initial_cap: 4096 };
 
         while !done {
             let m = self.__read_one_msg();
@@ -635,12 +639,20 @@ locus PgConn {
                 res.err_detail = m.err;
                 return res;
             }
-            __handle_msg(m.mtype, m.body, m.total, res);
+            if m.mtype == 68 { // 'D' DataRow
+                if res.n > 0 { rows.append_str("\n"); }
+                __append_row(m.body, rows);
+                res.n = res.n + 1;
+            } else {
+                __handle_msg(m.mtype, m.body, m.total, res);
+            }
             if m.mtype == 90 { // 'Z' ReadyForQuery
                 done = true;
                 self.txn_state = __zstatus(byte_at(m.body, 5));
             }
         }
+        let csv = rows.snapshot() or b"";
+        res.csv = std::str::from_bytes(csv);
         return res;
     }
 }
@@ -727,6 +739,24 @@ fn build_extended(sql: String, args: db::Args) -> Bytes {
     be32_append(out, 4);
 
     return out.finish() or raise;
+}
+
+// __append_row — one DataRow's cells, tab-separated, onto `rows` (voice:
+// written in place of the per-row concatenation in __handle_msg).
+fn __append_row(msg: Bytes, rows: std::bytes::BytesBuilder) {
+    let ncols = read_be16(msg, 5);
+    let mut off = 7;
+    let mut c = 0;
+    while c < ncols {
+        let collen = read_be32(msg, off);
+        off = off + 4;
+        if c > 0 { rows.append_str("\t"); }
+        if collen != 4294967295 {
+            rows.append(std::bytes::slice(msg, off, off + collen));
+            off = off + collen;
+        }
+        c = c + 1;
+    }
 }
 
 // __handle_msg — dispatch one complete backend message. Mutates

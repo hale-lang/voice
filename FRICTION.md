@@ -201,3 +201,19 @@ prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
 JSON object a line, since JSON escapes every tab and newline
 (`api/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
 the tests and compose use `sslmode=disable` on the private network.
+
+## A text built or read a line at a time is quadratic in memory
+
+**hale 0.24.0.** Two shapes that read naturally both copy the whole text
+per line, and every copy stays in the arena until the handler returns:
+growing a result with `out = out + row`, and walking lines with
+`rest = rest[(nl + 1)..len(rest)]` (a slice copies, and measures the
+string first). pond's `pq` grew a query's rows the first way, and the
+Postgres store read them the second: a 1000-row change page grew the
+api's peak by 715 MB. `hale verify` says nothing about either.
+
+**Working shape:** rows go into one `std::bytes::BytesBuilder` (voice's
+change to `lib/pond/pq`, `JsonList` for list bodies), and lines are read by
+index over one `std::str::bytes_view`, slicing only the line (`line_end`
+in `api/wire.hl`). The same page now grows the peak by 8 MB, and
+`api/tests/pg_page_memory_test.hl` holds it under 32 MB.

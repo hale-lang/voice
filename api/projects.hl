@@ -1,0 +1,315 @@
+// Projects and their keys, configured on the admin plane, and the
+// caller plane's bearer: the project key a request presents.
+//
+// Budgets and limits are not served yet (their endpoints are canned), so a
+// project's `budget` is `null` and its `limits` and every key's are empty;
+// a body that sets either is refused as unsupported (wire.hl).
+
+locus Projects {
+    params { store: Store; }
+
+    /// `listProjects`.
+    fn list(q: ProjectQuery) -> ProjectList fallible(ApiError) {
+        let rows = self.store.projects() or fail store_failed(err);
+        let mut out = ProjectList { };
+        for r in rows.rows {
+            if q.include_archived || !r.archived {
+                let v = self.view(r) or raise;
+                push(out.data, v) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// `createProject`.
+    fn create(c: ProjectCreate) -> Project fallible(ApiError) {
+        if !is_slug(c.id) { fail invalid("`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63", "id"); }
+        check_name(c.name) or raise;
+        let mut row = ProjectRow {
+            id: c.id,
+            name: c.name,
+            owners: c.owners,
+            data_classes: c.data_classes,
+            models: c.models,
+            accounts: c.accounts,
+            created_at: now_seconds()
+        };
+        if count(row.data_classes.items) == 0 { push(row.data_classes.items, "internal") or discard; }
+        let added = self.store.insert_project(row) or fail store_failed(err);
+        if !added { fail conflict("project " + c.id + " exists; a project id is never reused"); }
+        return self.view(row) or raise;
+    }
+
+    /// `getProject`.
+    fn get(r: ProjectRef) -> Project fallible(ApiError) {
+        let row = self.known(r.project) or raise;
+        return self.view(row) or raise;
+    }
+
+    /// `updateProject`: the fields the request sets.
+    fn update(u: ProjectUpdate) -> Project fallible(ApiError) {
+        let mut row = self.known(u.project) or raise;
+        if u.set_name {
+            check_name(u.name) or raise;
+            row.name = u.name;
+        }
+        if u.set_owners { row.owners = u.owners; }
+        if u.set_data_classes { row.data_classes = u.data_classes; }
+        if u.set_models { row.models = u.models; }
+        if u.set_accounts { row.accounts = u.accounts; }
+        self.store.update_project(row) or fail store_failed(err);
+        return self.view(row) or raise;
+    }
+
+    /// `archiveProject`: its keys are revoked and it refuses new requests;
+    /// the id stays taken. Archiving an archived project changes nothing.
+    fn archive(r: ProjectRef) -> Project fallible(ApiError) {
+        let mut row = self.known(r.project) or raise;
+        if !row.archived {
+            let at = now_seconds();
+            let keys = self.store.keys(row.id) or fail store_failed(err);
+            for k in keys.rows {
+                if !k.revoked {
+                    let mut gone = k;
+                    gone.revoked = true;
+                    gone.revoked_at = at;
+                    self.store.update_key(gone) or fail store_failed(err);
+                }
+            }
+            row.archived = true;
+            row.archived_at = at;
+            self.store.update_project(row) or fail store_failed(err);
+        }
+        return self.view(row) or raise;
+    }
+
+    fn known(id: String) -> ProjectRow fallible(ApiError) {
+        let row = self.store.project(id) or fail store_failed(err);
+        if !row.present { fail not_found("no project " + id); }
+        return row;
+    }
+
+    fn view(r: ProjectRow) -> Project fallible(ApiError) {
+        let keys = self.store.keys(r.id) or fail store_failed(err);
+        return Project {
+            id: r.id,
+            name: r.name,
+            status: if r.archived { "archived" } else { "active" },
+            owners: r.owners,
+            data_classes: r.data_classes,
+            models: r.models,
+            accounts: r.accounts,
+            key_count: count(keys.rows),
+            position: r.position,
+            created_at: r.created_at,
+            archived: r.archived,
+            archived_at: r.archived_at
+        };
+    }
+}
+
+locus Keys {
+    params { store: Store; }
+
+    /// `listKeys`. Secrets are never returned after creation.
+    fn list(r: ProjectRef) -> KeyList fallible(ApiError) {
+        self.project_of(r.project) or raise;
+        let rows = self.store.keys(r.project) or fail store_failed(err);
+        let now = now_seconds();
+        let mut out = KeyList { };
+        for k in rows.rows {
+            push(out.data, key_view(k, now)) or discard;
+        }
+        return out;
+    }
+
+    /// `createKey`: the secret is in this answer and nowhere else; the
+    /// store keeps its digest.
+    fn create(c: KeyCreate) -> Key fallible(ApiError) {
+        let p = self.project_of(c.project) or raise;
+        if p.archived { fail conflict("project " + c.project + " is archived"); }
+        check_name(c.name) or raise;
+        within(p.models, c.models, "models") or raise;
+        within(p.accounts, c.accounts, "accounts") or raise;
+        let now = now_seconds();
+        if c.expires && std::time::unix(c.expires_at) <= std::time::unix(now) { fail invalid("`expires_at` is in the past", "expires_at"); }
+        let secret_hex = random_hex(20) or fail entropy_failed(err.message);
+        let id_hex = random_hex(8) or fail entropy_failed(err.message);
+        let secret = "vk-" + secret_hex;
+        let id = "k_" + id_hex;
+        let row = KeyRow {
+            id: id,
+            project: c.project,
+            name: c.name,
+            prefix: secret[0..7],
+            digest: secret_digest(secret),
+            models: c.models,
+            accounts: c.accounts,
+            created_at: now,
+            expires: c.expires,
+            expires_at: c.expires_at
+        };
+        let added = self.store.insert_key(row) or fail store_failed(err);
+        if !added { fail conflict("key id " + id + " was drawn twice; ask again"); }
+        let mut v = key_view(row, now);
+        v.secret = secret;
+        return v;
+    }
+
+    /// `getKey`.
+    fn get(r: KeyRef) -> Key fallible(ApiError) {
+        let k = self.known(r.project, r.key) or raise;
+        return key_view(k, now_seconds());
+    }
+
+    /// `updateKey`: the fields the request sets.
+    fn update(u: KeyUpdate) -> Key fallible(ApiError) {
+        let mut k = self.known(u.project, u.key) or raise;
+        let p = self.project_of(u.project) or raise;
+        if u.set_name {
+            check_name(u.name) or raise;
+            k.name = u.name;
+        }
+        if u.set_models {
+            within(p.models, u.models, "models") or raise;
+            k.models = u.models;
+        }
+        if u.set_accounts {
+            within(p.accounts, u.accounts, "accounts") or raise;
+            k.accounts = u.accounts;
+        }
+        if u.set_expires {
+            k.expires = u.expires;
+            k.expires_at = u.expires_at;
+        }
+        self.store.update_key(k) or fail store_failed(err);
+        return key_view(k, now_seconds());
+    }
+
+    /// `revokeKey`: at once; revoking a revoked key changes nothing.
+    fn revoke(r: KeyRef) -> Key fallible(ApiError) {
+        let mut k = self.known(r.project, r.key) or raise;
+        let now = now_seconds();
+        if !k.revoked {
+            k.revoked = true;
+            k.revoked_at = now;
+            self.store.update_key(k) or fail store_failed(err);
+        }
+        return key_view(k, now);
+    }
+
+    fn project_of(id: String) -> ProjectRow fallible(ApiError) {
+        let p = self.store.project(id) or fail store_failed(err);
+        if !p.present { fail not_found("no project " + id); }
+        return p;
+    }
+
+    /// The key `id` under `project`; a key of another project is not found.
+    fn known(project: String, id: String) -> KeyRow fallible(ApiError) {
+        self.project_of(project) or raise;
+        let k = self.store.key(id) or fail store_failed(err);
+        if !k.present || k.project != project { fail not_found("no key " + id + " in project " + project); }
+        return k;
+    }
+}
+
+/// The caller plane's bearer: an `Authorization: Bearer vk-...` header
+/// names a key, which is the caller. A key that is revoked or expired, or
+/// whose project is archived, names nobody.
+locus KeyBearer {
+    params { store: Store; }
+
+    /// The caller a request's `Authorization` header names, as the
+    /// handlers of the caller rows receive it. Reading is not using: a
+    /// key's `last_used_at` is written when a request it made settles.
+    fn context(authorization: String) -> std::api::Context fallible(ApiError) {
+        if !std::str::starts_with(authorization, "Bearer ") { fail invalid_key(); }
+        let token = std::str::trim(authorization[7..len(authorization)]);
+        if len(token) == 0 { fail invalid_key(); }
+        let k = self.store.key_by_digest(secret_digest(token)) or fail store_failed(err);
+        if !k.present { fail invalid_key(); }
+        if key_status(k, now_seconds()) != "active" { fail invalid_key(); }
+        let p = self.store.project(k.project) or fail store_failed(err);
+        if !p.present || p.archived { fail invalid_key(); }
+        let who = std::api::Principal { mode: "bearer", name: k.id, via: "http" };
+        return std::api::Context { caller: who, role: "caller", via: "http" };
+    }
+}
+
+fn key_status(k: KeyRow, now: Time) -> String {
+    if k.revoked { return "revoked"; }
+    if k.expires && std::time::unix(k.expires_at) <= std::time::unix(now) { return "expired"; }
+    return "active";
+}
+
+fn key_view(k: KeyRow, now: Time) -> Key {
+    return Key {
+        id: k.id,
+        project: k.project,
+        name: k.name,
+        prefix: k.prefix,
+        models: k.models,
+        accounts: k.accounts,
+        created_at: k.created_at,
+        expires: k.expires,
+        expires_at: k.expires_at,
+        used: k.used,
+        last_used_at: k.last_used_at,
+        status: key_status(k, now),
+        revoked: k.revoked,
+        revoked_at: k.revoked_at
+    };
+}
+
+/// A key's restriction must sit within its project's: a project that is
+/// restricted to some names admits a key that names only those.
+fn within(project: Restriction, key: Restriction, field: String) -> Bool fallible(ApiError) {
+    if project.any { return true; }
+    if key.any { return true; }
+    for n in key.names.items {
+        if !has_name(project.names, n) {
+            fail invalid("`" + field + "` names " + n + ", which the project does not allow", field);
+        }
+    }
+    return true;
+}
+
+fn check_name(name: String) -> Bool fallible(ApiError) {
+    if len(name) == 0 || len(name) > 128 { fail invalid("`name` is 1 to 128 characters", "name"); }
+    return true;
+}
+
+/// `^[a-z0-9][a-z0-9-]{0,62}$`: a project, account or node id.
+fn is_slug(s: String) -> Bool {
+    let n = len(s);
+    if n == 0 || n > 63 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let lower = b >= 97 && b <= 122;
+        let digit = b >= 48 && b <= 57;
+        if !(lower || digit || (b == 45 && i > 0)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The digest a key's secret is kept as: SHA-256, in hex.
+fn secret_digest(secret: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(secret)));
+}
+
+type EntropyError { message: String = ""; }
+
+/// `n` random bytes from the kernel, in hex.
+fn random_hex(n: Int) -> String fallible(EntropyError) {
+    let b = std::os::getrandom(n) or fail EntropyError { message: "no randomness from the kernel" };
+    return std::hex::encode(b);
+}
+
+/// The contract has no code for a failure inside the api itself;
+/// `upstream_failed` is the nearest.
+fn entropy_failed(message: String) -> ApiError {
+    return ApiError { status: 500, kind: "server_error", code: "upstream_failed", message: message };
+}

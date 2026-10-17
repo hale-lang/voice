@@ -48,7 +48,9 @@ reusable parts become a library.
 
 ## Developing
 
-Against the stub, which answers every endpoint with a canned happy path:
+Against the api, which serves the catalog, projects and keys for real (in
+memory, starting empty) and answers every other endpoint with a canned
+happy path:
 
 ```sh
 hale build api && api/api --port 8080      # in the repository root

@@ -206,6 +206,13 @@ new migration" to `store.md`.
   `is_route` ladder in `api/endpoints.hl`).
 - the triple-quoted strings entry to seed `api` (canned bodies live in
   files).
+- the `is_route` captures entry to seed `api` (`api/endpoints.hl` reads
+  `c.params` in the branch that matched).
+- the surface codec entry to seed `api` (`api/surface.hl`, `api/wire.hl`)
+  and seed `spec/validate` (`live.mjs`).
+- the `bounded` assignment entry to seed `api` (`Names`, `Restriction`).
+- the hashmap row entry to seed `api` (`MemoryStore`'s `@unbounded`
+  writes).
 
 `holds`, `reviews`: none. These are the holes.
 

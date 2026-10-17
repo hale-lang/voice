@@ -1,9 +1,12 @@
-/// Every endpoint in ../spec/openapi.yaml, in the order it has there, each
-/// answered by its canned happy path. Implementing an endpoint means
-/// replacing its line with a call to a real method.
+/// Every endpoint in ../spec/openapi.yaml, in the order it has there. An
+/// endpoint with a row in the surface (surface.hl) is routed to its
+/// handler: the router matches method and path, decodes the request
+/// (wire.hl), calls the row's handler on its receiver and encodes what it
+/// answers or fails with. The rest still answer their canned happy path;
+/// each is replaced by a row as it is made real.
 ///
 /// One locus serves them all (the styleguide's one-locus-many-endpoints
-/// shape), so real handlers share its state as plain `self` calls.
+/// shape) and holds the store and the receivers, which borrow it.
 /// `is_route` takes the first match in written order, so a literal
 /// segment comes before a capture in the same position (`usage/summary`
 /// before `usage/:request_id`).
@@ -11,37 +14,94 @@ locus Endpoints {
     params {
         canned: String = "canned";
         ui: String = "";
+        store: MemoryStore = MemoryStore { };
+        probes: Probes = Probes { store: self.store };
+        bearer: KeyBearer = KeyBearer { store: self.store };
+        models: Models = Models { store: self.store };
+        catalog: Catalog = Catalog { store: self.store };
+        projects: Projects = Projects { store: self.store };
+        keys: Keys = Keys { store: self.store };
     }
 
     fn handle(req: std::http::Request) -> std::http::Response {
+        return self.route(req) or failed(err);
+    }
+
+    fn route(req: std::http::Request) -> std::http::Response fallible(ApiError) {
         let c = std::http::build_context(req);
 
         // health
-        if std::http::is_route(c, "GET", "/healthz") { return self.json("getLiveness", 200); }
-        if std::http::is_route(c, "GET", "/readyz") { return self.json("getReadiness", 200); }
+        if std::http::is_route(c, "GET", "/healthz") { return json_answer(200, health_json(self.probes.liveness(), false)); }
+        if std::http::is_route(c, "GET", "/readyz") {
+            let h = self.probes.readiness();
+            return json_answer(if h.status == "ok" { 200 } else { 503 }, health_json(h, true));
+        }
 
         // caller plane
         if std::http::is_route(c, "POST", "/v1/responses") { return self.inference(req, "createResponse"); }
         if std::http::is_route(c, "POST", "/v1/chat/completions") { return self.inference(req, "createChatCompletion"); }
-        if std::http::is_route(c, "GET", "/v1/models") { return self.caller("listModels"); }
-        if std::http::is_route(c, "GET", "/v1/models/:model") { return self.caller("getModel"); }
+        if std::http::is_route(c, "GET", "/v1/models") {
+            let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+            let l = self.models.list(ctx) or raise;
+            return caller_json(model_list_json(l));
+        }
+        if std::http::is_route(c, "GET", "/v1/models/:model") {
+            let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+            let m = self.models.get(ModelRef { model: std::http::path_param(c.params, "model") }, ctx) or raise;
+            return caller_json(model_json(m));
+        }
         if std::http::is_route(c, "GET", "/v1/capabilities") { return self.caller("getCapabilities"); }
 
         // projects, budgets, limits, keys
-        if std::http::is_route(c, "GET", "/admin/v1/projects") { return self.json("listProjects", 200); }
-        if std::http::is_route(c, "POST", "/admin/v1/projects") { return self.json("createProject", 201); }
-        if std::http::is_route(c, "GET", "/admin/v1/projects/:project") { return self.json("getProject", 200); }
-        if std::http::is_route(c, "PATCH", "/admin/v1/projects/:project") { return self.json("updateProject", 200); }
-        if std::http::is_route(c, "DELETE", "/admin/v1/projects/:project") { return self.json("archiveProject", 200); }
+        if std::http::is_route(c, "GET", "/admin/v1/projects") {
+            let q = ProjectQuery { include_archived: std::http::query_param(c.params, "include_archived") == "true" };
+            let l = self.projects.list(q) or raise;
+            return json_answer(200, project_list_json(l));
+        }
+        if std::http::is_route(c, "POST", "/admin/v1/projects") {
+            let r = read_project_create(req.body) or raise;
+            let v = self.projects.create(r) or raise;
+            return json_answer(201, project_json(v));
+        }
+        if std::http::is_route(c, "GET", "/admin/v1/projects/:project") {
+            let v = self.projects.get(ProjectRef { project: std::http::path_param(c.params, "project") }) or raise;
+            return json_answer(200, project_json(v));
+        }
+        if std::http::is_route(c, "PATCH", "/admin/v1/projects/:project") {
+            let r = read_project_update(req.body, std::http::path_param(c.params, "project")) or raise;
+            let v = self.projects.update(r) or raise;
+            return json_answer(200, project_json(v));
+        }
+        if std::http::is_route(c, "DELETE", "/admin/v1/projects/:project") {
+            let v = self.projects.archive(ProjectRef { project: std::http::path_param(c.params, "project") }) or raise;
+            return json_answer(200, project_json(v));
+        }
         if std::http::is_route(c, "GET", "/admin/v1/projects/:project/budget") { return self.json("getBudget", 200); }
         if std::http::is_route(c, "PUT", "/admin/v1/projects/:project/budget") { return self.json("setBudget", 200); }
         if std::http::is_route(c, "GET", "/admin/v1/projects/:project/limits") { return self.json("getLimits", 200); }
         if std::http::is_route(c, "PUT", "/admin/v1/projects/:project/limits") { return self.json("setLimits", 200); }
-        if std::http::is_route(c, "GET", "/admin/v1/projects/:project/keys") { return self.json("listKeys", 200); }
-        if std::http::is_route(c, "POST", "/admin/v1/projects/:project/keys") { return self.json("createKey", 201); }
-        if std::http::is_route(c, "GET", "/admin/v1/projects/:project/keys/:key") { return self.json("getKey", 200); }
-        if std::http::is_route(c, "PATCH", "/admin/v1/projects/:project/keys/:key") { return self.json("updateKey", 200); }
-        if std::http::is_route(c, "DELETE", "/admin/v1/projects/:project/keys/:key") { return self.json("revokeKey", 200); }
+        if std::http::is_route(c, "GET", "/admin/v1/projects/:project/keys") {
+            let l = self.keys.list(ProjectRef { project: std::http::path_param(c.params, "project") }) or raise;
+            return json_answer(200, key_list_json(l));
+        }
+        if std::http::is_route(c, "POST", "/admin/v1/projects/:project/keys") {
+            let r = read_key_create(req.body, std::http::path_param(c.params, "project")) or raise;
+            let v = self.keys.create(r) or raise;
+            return json_answer(201, key_json(v));
+        }
+        if std::http::is_route(c, "GET", "/admin/v1/projects/:project/keys/:key") {
+            let v = self.keys.get(KeyRef { project: std::http::path_param(c.params, "project"), key: std::http::path_param(c.params, "key") }) or raise;
+            return json_answer(200, key_json(v));
+        }
+        if std::http::is_route(c, "PATCH", "/admin/v1/projects/:project/keys/:key") {
+            let r = read_key_update(req.body, std::http::path_param(c.params, "project"), std::http::path_param(c.params, "key")) or raise;
+            let v = self.keys.update(r) or raise;
+            return json_answer(200, key_json(v));
+        }
+        if std::http::is_route(c, "DELETE", "/admin/v1/projects/:project/keys/:key") {
+            let v = self.keys.revoke(KeyRef { project: std::http::path_param(c.params, "project"), key: std::http::path_param(c.params, "key") }) or raise;
+            return json_answer(200, key_json(v));
+        }
 
         // usage
         if std::http::is_route(c, "GET", "/admin/v1/usage") { return self.json("listUsage", 200); }
@@ -49,11 +109,28 @@ locus Endpoints {
         if std::http::is_route(c, "GET", "/admin/v1/usage/:request_id") { return self.json("getUsage", 200); }
 
         // the catalog
-        if std::http::is_route(c, "GET", "/admin/v1/models") { return self.json("listCatalogModels", 200); }
-        if std::http::is_route(c, "POST", "/admin/v1/models") { return self.json("createCatalogModel", 201); }
-        if std::http::is_route(c, "GET", "/admin/v1/models/:model") { return self.json("getCatalogModel", 200); }
-        if std::http::is_route(c, "PATCH", "/admin/v1/models/:model") { return self.json("updateCatalogModel", 200); }
-        if std::http::is_route(c, "DELETE", "/admin/v1/models/:model") { return self.json("removeCatalogModel", 200); }
+        if std::http::is_route(c, "GET", "/admin/v1/models") {
+            let l = self.catalog.list() or raise;
+            return json_answer(200, catalog_list_json(l));
+        }
+        if std::http::is_route(c, "POST", "/admin/v1/models") {
+            let r = read_model_create(req.body) or raise;
+            let m = self.catalog.create(r) or raise;
+            return json_answer(201, catalog_model_json(m));
+        }
+        if std::http::is_route(c, "GET", "/admin/v1/models/:model") {
+            let m = self.catalog.get(ModelRef { model: std::http::path_param(c.params, "model") }) or raise;
+            return json_answer(200, catalog_model_json(m));
+        }
+        if std::http::is_route(c, "PATCH", "/admin/v1/models/:model") {
+            let r = read_model_update(req.body, std::http::path_param(c.params, "model")) or raise;
+            let m = self.catalog.update(r) or raise;
+            return json_answer(200, catalog_model_json(m));
+        }
+        if std::http::is_route(c, "DELETE", "/admin/v1/models/:model") {
+            let m = self.catalog.remove(ModelRef { model: std::http::path_param(c.params, "model") }) or raise;
+            return json_answer(200, catalog_model_json(m));
+        }
 
         // accounts
         if std::http::is_route(c, "GET", "/admin/v1/accounts") { return self.json("listAccounts", 200); }
@@ -97,7 +174,7 @@ locus Endpoints {
         if len(self.ui) > 0 && req.method == "GET" && is_ui_path(req.path) {
             return serve_static(self.ui, req);
         }
-        return not_found(req);
+        return no_route(req);
     }
 
     /// `<name>.json` with `status`.
@@ -118,4 +195,21 @@ locus Endpoints {
         }
         return canned_body(self.canned, name + ".json", 200, "application/json", CALLER_HEADERS);
     }
+}
+
+/// A JSON answer.
+fn json_answer(status: Int, body: String) -> std::http::Response {
+    return std::http::Response { status: status, content_type: "application/json", body: body };
+}
+
+/// A caller-plane answer: JSON with the request's id. The rate-limit and
+/// budget headers come with limits and budgets.
+fn caller_json(body: String) -> std::http::Response {
+    let id = random_hex(12) or "unnumbered";
+    return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: req_" + id, body: body };
+}
+
+/// A row's failure, in the contract's envelope.
+fn failed(e: ApiError) -> std::http::Response {
+    return json_answer(e.status, error_json(e));
 }

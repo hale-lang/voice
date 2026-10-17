@@ -10,6 +10,10 @@ What is *not* here: prompts and responses (never stored), and anything a
 node keeps locally. The route table is here (migration 5); NATS carries
 only the notice of its new version (`internal.yaml`).
 
+Postgres 14 or newer: the brain's session relies on
+`idle_session_timeout` to end when a brain stops (Reclaim, The route
+table), and the brain refuses an older server.
+
 Conventions: ids are the API's slugs and opaque strings (`text`); money is
 integer micros; times are `timestamptz`; JSON the API defines is stored as
 `jsonb` in the API's own shape, so a row reads back as the resource.

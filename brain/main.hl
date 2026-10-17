@@ -12,14 +12,16 @@
 /// held (each instance in a transaction of its own, a failure logged and
 /// left for the next tick), then, in one transaction, writes each node's
 /// liveness and the route table (`route_table`, store.md), and publishes
-/// the table's new version on `voice.route` (internal.yaml), so an api
-/// instance can tell a newer table is there. Per-tick work runs in a
-/// method, so each tick's memory is reclaimed.
+/// the table's new version to the notifier (notifier.hl), which tells
+/// `voice.route` (internal.yaml) on a thread of its own, so an api
+/// instance can tell a newer table is there and the tick never waits on
+/// NATS. Per-tick work runs in a method, so each tick's memory is
+/// reclaimed. It needs Postgres 14 or newer (`idle_session_timeout`), and
+/// says so and stops on an older one.
 
 import "../store" as st;
 import "../lib/pond/pq" as pq;
 import "../lib/pond/db" as db;
-import "../lib/pond/realtime/nats" as nats;
 
 /// The lock every brain asks for: one key for voice's one brain.
 const BRAIN_LOCK: String = "SELECT pg_try_advisory_lock(hashtext('voice.brain'))";
@@ -35,8 +37,18 @@ main locus Brain {
         holding: Bool = false;
         // standby | working | unreachable: said once each time it changes
         said: String = "";
-        // the last trouble writing the table or telling NATS, said once
+        // the last trouble writing the table, said once
         trouble: String = "";
+        // tells NATS each version, on its own thread
+        notifier: Notifier = Notifier { };
+    }
+
+    placement {
+        notifier: pinned;
+    }
+
+    bus {
+        publish RouteWritten;
     }
 
     birth() {
@@ -66,6 +78,12 @@ main locus Brain {
             if !st.ok {
                 self.say("unreachable", "voice brain: Postgres unreachable: " + st.err.detail);
                 return;
+            }
+            let v = self.conn.query_one("SHOW server_version_num");
+            let num = std::str::parse_int(std::str::trim(v.data)) or 0;
+            if v.ok && num < 140000 {
+                eprintln("voice brain: Postgres 14 or newer is required (idle_session_timeout frees a stopped brain's lock); this server is ", std::str::trim(v.data));
+                std::process::exit(1);
             }
             let mut i = 0;
             while i < 6 {
@@ -99,8 +117,9 @@ main locus Brain {
         if reclaimed > 0 { println("voice brain: reclaimed ", reclaimed, " dead api instance(s)"); }
         let version = self.written();
         if version < 0 { return; }
-        let told = notice(self.nats, version);
-        self.trouble_is(told);
+        // the notifier tells NATS; the tick never waits on it
+        RouteWritten <- Version { version: version };
+        self.trouble_is("");
     }
 
     /// Node liveness and the route table; the table's new version, or -1
@@ -120,7 +139,7 @@ main locus Brain {
     /// Say trouble, or its end, once each time it changes.
     fn trouble_is(what: String) {
         if what == self.trouble { return; }
-        if len(what) > 0 { eprintln("voice brain: ", what); } else { println("voice brain: the route table is written and told again"); }
+        if len(what) > 0 { eprintln("voice brain: ", what); } else { println("voice brain: the route table is written again"); }
         self.trouble = what;
     }
 
@@ -206,19 +225,6 @@ fn judged(csv: String) -> Ranked {
         if len(line) > 0 { push(seats.items, judge(line, Float(std::rand::next_int(1000)) / 1000.0)) or discard; }
     }
     return seats;
-}
-
-/// The table's new version on `voice.route` (internal.yaml `RouteNotice`),
-/// over a connection of its own; "" when it went, or why not.
-fn notice(url: String, version: Int) -> String {
-    if len(url) == 0 { return ""; }
-    let c = nats::NatsClient { url: url, name: "voice-brain" };
-    if !c.open() { return "the version's notice: NATS unreachable at " + url + ": " + c.last_error; }
-    let mut why = "";
-    c.pub_msg("voice.route", "", std::bytes::from_string("{\"version\": " + to_string(version) + "}")) or { why = "the version's notice: " + c.last_error; };
-    c.flush() or { why = "the version's notice: " + c.last_error; };
-    c.close();
-    return why;
 }
 
 /// The api instances to reclaim: a heartbeat older than three of their
@@ -326,5 +332,5 @@ fn main() {
         eprintln("usage: brain --database postgres://user:password@host:port/database [--nats URL]");
         std::process::exit(2);
     }
-    Brain { database: database, nats: nats };
+    Brain { database: database, nats: nats, notifier: Notifier { url: nats } };
 }

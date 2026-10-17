@@ -114,6 +114,20 @@ if [ -n "${DATABASE_URL:-}" ]; then
   after=$(curl -fsS "$api/admin/v1/routes" | field version)
   [ "$after" -gt "$before" ] || { echo "the route table's version went from $before to $after"; exit 1; }
   (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  # a NATS address that never answers holds no tick: the table goes on
+  # every second and one brain keeps the lock
+  for p in "${pids[@]}"; do case "$(ps -o comm= -p "$p" 2>/dev/null)" in brain*) kill "$p" 2>/dev/null || true ;; esac; done
+  brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 100); do grep -q 'working' "$work/brain4.log" && break; sleep 0.2; done
+  grep -q 'working' "$work/brain4.log" || { echo "a brain with an unanswering NATS did not work"; cat "$work/brain4.log"; exit 1; }
+  sleep 1
+  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  sleep 5
+  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  [ $(( after - before )) -ge 3000 ] || { echo "with NATS not answering the table went from $before to $after in 5 s"; cat "$work/brain4.log"; exit 1; }
+  ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
+  echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
 fi
 
 # a change on the coordinator reaches the node over NATS

@@ -164,7 +164,10 @@ Postgres every second and tells NATS its new version.
 holds a Postgres advisory lock, and a second brain stands by, trying the
 lock every second, and takes over when the first one's session ends: its
 connection drops, its host stops answering TCP keepalives (about 11 s), or
-it says nothing for 10 s, as a stopped process does (`idle_session_timeout`).
+it says nothing for 10 s, as a stopped process does (`idle_session_timeout`,
+so voice needs Postgres 14 or newer; the brain says so and stops on an
+older one). The brain's NATS notice runs on a thread of its own, so an
+address that never answers costs the tick nothing.
 Each second the one that works:
 
 - reclaims what dead api instances held (an instance whose heartbeat is

@@ -73,6 +73,8 @@ const nodeBodies = {
 const refusals = {
   createResponse: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
   createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
+  // no brain works here, so no route table reaches the api
+  getRoutes: { json: [503, 'route_table_unavailable'] },
 };
 
 const calls = [], last = [];

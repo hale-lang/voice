@@ -8,7 +8,7 @@
 
 import "../lib/pond/pq" as pq;
 import "../lib/pond/migrations" as migs;
-locus Api {
+main locus Api {
     params {
         host: String = "127.0.0.1";
         port: Int = 8080;
@@ -17,7 +17,10 @@ locus Api {
         node_nats: String = "";
         ui: String = "";
         database: String = "";
+        instance: String = "";
+        pulse: Pulse = Pulse { database: self.database, instance: self.instance };
     }
+    placement { pulse: pinned; }
     run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database); }
 }
 
@@ -26,9 +29,9 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
     println("voice api: nodes over NATS at ", nats, if len(node_nats) > 0 { " (" + node_nats + " from the nodes' side)" } else { "" });
     if len(ui) > 0 { println("voice api: serving the admin ui from ", ui); }
     if len(database) > 0 {
-        let d = parse_dsn(database);
+        let d = st::parse_dsn(database);
         println("voice api: the store is Postgres at ", d.host, ":", d.port);
-        let endpoints = Endpoints { canned: canned, ui: ui, store: PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
+        let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
         std::http::Server { host: host, port: port, handler: endpoints };
     } else {
         println("voice api: the store is in memory (lost on restart)");
@@ -38,7 +41,7 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
 }
 
 /// The migrations, in order: each a file of `dir`, store.md's SQL.
-const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n";
+const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n";
 
 /// `api migrate --database URL [--migrations DIR]`: every migration not yet
 /// applied, each in its own transaction under Postgres's advisory lock
@@ -50,11 +53,11 @@ fn migrate(database: String, dir: String) -> Int {
         eprintln("voice migrate: --database (or VOICE_DATABASE_URL) is required");
         return 2;
     }
-    let d = parse_dsn(database);
+    let d = st::parse_dsn(database);
     let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, database: d.database, sslmode: d.sslmode };
     let st = conn.open();
     if !st.ok {
-        eprintln("voice migrate: Postgres at ", d.host, ":", d.port, ": ", st.err.kind, " ", redact(st.err.detail, d));
+        eprintln("voice migrate: Postgres at ", d.host, ":", d.port, ": ", st.err.kind, " ", st::redact(st.err.detail, d));
         return 1;
     }
     // pond's migrator creates its tracking table before it takes its own
@@ -62,7 +65,7 @@ fn migrate(database: String, dir: String) -> Int {
     // a lock of voice's first (lib/pond/README.md)
     let held = conn.query_one("SELECT pg_advisory_lock(7205)");
     if !held.ok {
-        eprintln("voice migrate: could not take the migration lock: ", held.err.kind, " ", redact(held.err.detail, d));
+        eprintln("voice migrate: could not take the migration lock: ", held.err.kind, " ", st::redact(held.err.detail, d));
         conn.close();
         return 1;
     }
@@ -93,8 +96,8 @@ fn migrate(database: String, dir: String) -> Int {
     return 0;
 }
 
-fn migration_failed(e: migs::MigrationError, d: Dsn) -> Int {
-    eprintln("voice migrate: ", e.kind, " at version ", e.version, " (", e.name, "): ", redact(e.detail, d));
+fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
+    eprintln("voice migrate: ", e.kind, " at version ", e.version, " (", e.name, "): ", st::redact(e.detail, d));
     return -1;
 }
 
@@ -144,14 +147,15 @@ fn main() {
         i = i + 2;
     }
     if len(database) > 0 {
-        let d = parse_dsn(database);
+        let d = st::parse_dsn(database);
         if len(d.problem) > 0 {
             eprintln("voice api: ", d.problem);
             std::process::exit(2);
         }
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database };
+    let id = st::random_id(6);
+    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, instance: "api-" + id };
 }
 
 /// `name` in the directory holding the running binary, or `name` as given

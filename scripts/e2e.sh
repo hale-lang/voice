@@ -7,9 +7,10 @@
 #   scripts/e2e.sh            # starts NATS in a container of its own
 #   NATS_URL=nats://127.0.0.1:4222 scripts/e2e.sh   # uses that NATS
 #   DATABASE_URL=postgres://... scripts/e2e.sh      # the store in that
-#                                                   # database, migrated first
+#                                                   # database, migrated first,
+#                                                   # and two brains over it
 #
-# Needs api/api and node/node built, build/openapi.bundled.json,
+# Needs api/api, node/node and brain/brain built, build/openapi.bundled.json,
 # build/node.bundled.json and spec/validate's packages (see
 # .github/workflows/ci.yml).
 set -euo pipefail
@@ -39,7 +40,7 @@ for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NATS_URL##*:}") 2>/dev/n
 api=http://127.0.0.1:${API_PORT}
 store=()
 if [ -n "${DATABASE_URL:-}" ]; then
-  api/api migrate --database "$DATABASE_URL" --migrations api/migrations
+  api/api migrate --database "$DATABASE_URL" --migrations store/migrations
   store=(--database "$DATABASE_URL")
 fi
 api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" "${store[@]}" >"$work/api.log" 2>&1 &
@@ -77,6 +78,57 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "au
 [ "$code" = "503" ] || { echo "a paused seat served: $code"; exit 1; }
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "max_in_flight": null, "reason": null}' >/dev/null
 wait_for up
+
+# with a database: the brain's route table, and a standby that takes over
+if [ -n "${DATABASE_URL:-}" ]; then
+  brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain1.log" 2>&1 &
+  first=$!
+  pids+=($first)
+  for i in $(seq 1 50); do grep -q 'working' "$work/brain1.log" && break; sleep 0.2; done
+  brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain2.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 50); do grep -q 'standing by' "$work/brain2.log" && break; sleep 0.2; done
+  grep -q 'standing by' "$work/brain2.log" || { echo "the second brain did not stand by"; cat "$work/brain2.log"; exit 1; }
+  echo "one brain works, the other stands by"
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  kill "$first"
+  for i in $(seq 1 50); do grep -q 'working' "$work/brain2.log" && break; sleep 0.2; done
+  grep -q 'working' "$work/brain2.log" || { echo "the standby did not take over"; cat "$work/brain2.log"; exit 1; }
+  echo "the standby took over"
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  # a brain that stops without its connection dropping (SIGSTOP stands in
+  # for a host gone silent) loses the lock: Postgres ends its idle session
+  # after 10 s, and the standby takes over
+  second=${pids[${#pids[@]}-1]}
+  brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain3.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 50); do grep -q 'standing by' "$work/brain3.log" && break; sleep 0.2; done
+  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  kill -STOP "$second"
+  t0=$(date +%s)
+  for i in $(seq 1 150); do grep -q 'working' "$work/brain3.log" && break; sleep 0.2; done
+  kill -CONT "$second"
+  grep -q 'working' "$work/brain3.log" || { echo "the standby did not take over from a stopped brain"; cat "$work/brain3.log"; exit 1; }
+  echo "the standby took over from a stopped brain in $(( $(date +%s) - t0 )) s"
+  sleep 1.5
+  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  [ "$after" -gt "$before" ] || { echo "the route table's version went from $before to $after"; exit 1; }
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  # a NATS address that never answers holds no tick: the table goes on
+  # every second and one brain keeps the lock
+  for p in "${pids[@]}"; do case "$(ps -o comm= -p "$p" 2>/dev/null)" in brain*) kill "$p" 2>/dev/null || true ;; esac; done
+  brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 100); do grep -q 'working' "$work/brain4.log" && break; sleep 0.2; done
+  grep -q 'working' "$work/brain4.log" || { echo "a brain with an unanswering NATS did not work"; cat "$work/brain4.log"; exit 1; }
+  sleep 1
+  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  sleep 5
+  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  [ $(( after - before )) -ge 3000 ] || { echo "with NATS not answering the table went from $before to $after in 5 s"; cat "$work/brain4.log"; exit 1; }
+  ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
+  echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
+fi
 
 # a change on the coordinator reaches the node over NATS
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello again"}}' >/dev/null

@@ -42,12 +42,12 @@ body into the row's request and writes the contract's JSON
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
 
 Everything above reaches the configuration and the fleet's reports through
-the `Store` interface ([`api/store.hl`](./api/store.hl)). Given
+the `Store` interface ([`store/store.hl`](./store/store.hl)). Given
 `--database postgres://...` (or `VOICE_DATABASE_URL`), the api keeps them
-in Postgres (`PgStore`, [`api/pg_store.hl`](./api/pg_store.hl)), in the
+in Postgres (`PgStore`, [`store/pg_store.hl`](./store/pg_store.hl)), in the
 tables of [`spec/store.md`](./spec/store.md), each admin write and the
 change it records in one transaction; `api migrate` brings the schema up to
-date first ([`api/migrations/`](./api/migrations/), store.md's SQL in
+date first ([`store/migrations/`](./store/migrations/), store.md's SQL in
 order). Several api instances may share one database: a write that reads
 a resource first holds it (a Postgres advisory lock on its path, in the
 write's transaction) from the read to the commit, and a node's assignment
@@ -155,13 +155,47 @@ token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
 seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
 -d node`. The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
-so it survives a restart of the api. The brain is a skeleton.
+so it survives a restart of the api. The brain writes the route table to
+Postgres every second and tells NATS its new version.
 
-## The brain (skeleton)
+## The brain
 
-[`brain/`](./brain/) is its own program from the MVP on. The skeleton ticks
-and names what each tick will do; the store, the advisory lock and the route
-table come with the MVP. `hale build brain && brain/brain --database URL`.
+[`brain/`](./brain/) is its own program, and only one works at a time: it
+holds a Postgres advisory lock, and a second brain stands by, trying the
+lock every second, and takes over when the first one's session ends: its
+connection drops, its host stops answering TCP keepalives (about 11 s), or
+it says nothing for 10 s, as a stopped process does (`idle_session_timeout`,
+so voice needs Postgres 14 or newer; the brain says so and stops on an
+older one). The brain's NATS notice runs on a thread of its own, so an
+address that never answers costs the tick nothing.
+Each second the one that works:
+
+- reclaims what dead api instances held (an instance whose heartbeat is
+  three intervals old, checked again inside its transaction): their
+  requests in flight are settled as `abandoned`, their reservations
+  released, and the instance is marked reclaimed (spec/store.md,
+  "Reclaim"); an instance whose reclaim fails is left for the next tick;
+- in one transaction, writes each node's `up` or `down` from its heartbeat
+  and the route table (`route_table`, spec/store.md, "The route table"),
+  its version from Postgres's clock and never below the one before it;
+- publishes that version on `voice.route`
+  ([`internal.yaml`](./spec/internal.yaml)), saying once if it cannot.
+
+A tick at the bounds (256 seats each serving 16 of 256 models) computes the
+table in milliseconds. `GET /admin/v1/routes` reads the table from Postgres. The api does
+not route from the table yet: it picks a seat from the fleet's state in the
+store, the same state the brain reads, until it serves requests
+concurrently. Each api instance heartbeats its row in `api_instance` when
+it has a database.
+
+The store, its rows and its migrations are the seed
+[`store/`](./store/), which the api and the brain both import.
+
+```sh
+hale build brain
+brain/brain --database postgres://voice:voice@127.0.0.1:5432/voice --nats nats://127.0.0.1:4222
+hale test brain     # VOICE_TEST_DATABASE_URL=... for the Postgres half
+```
 
 ## The admin UI
 
@@ -184,7 +218,7 @@ and follows changes through the admin event stream (`GET /admin/v1/events`).
 | [`protocol.yaml`](./spec/protocol.yaml) | The connection between a node and the coordinator (AsyncAPI). | `node` | `api` | NATS |
 | [`spec/vendor/open-responses/`](./spec/vendor/open-responses/) | The [Open Responses](https://www.openresponses.org/specification) standard, `2026-04-24`, which the caller plane is. | | [`openapi.yaml`](./spec/openapi.yaml), [`protocol.yaml`](./spec/protocol.yaml) | |
 | [`spec/store.md`](./spec/store.md) | Postgres: the tables and the transactions, the state laws as SQL. | `postgres` | `api`, `brain` | SQL |
-| [`spec/internal.yaml`](./spec/internal.yaml) | Voice's own NATS subjects: the route table from the brain. | `brain` | `api` | NATS |
+| [`spec/internal.yaml`](./spec/internal.yaml) | Voice's own NATS subjects: the route table's version from the brain. | `brain` | `api` | NATS |
 
 The code conforms to these documents, not the other way round. The last
 three columns are where the processes meet: the process that serves the
@@ -330,15 +364,17 @@ numbers and the caller's `metadata`.
 ## The route table
 
 The brain turns the state of the fleet into a ranked table the api routes
-from. It is a snapshot on NATS, not rows in Postgres.
+from. It is one row in Postgres, rewritten every second; NATS carries only
+the notice of its new version.
 
 - **Contents.** Per model, the seats that can serve it (up, on a node that
   is up, with an account that has headroom), each with its free capacity
   and a rank: accounts with the most headroom first, then the least loaded
   seats. Per model, the accounts that are exhausted and until when.
-- **Published** by the brain on `voice.route` whenever it changes and every
-  second regardless, with a version. Api instances keep the latest in
-  memory; a new instance has a table within a second of starting.
+- **Written** by the brain to Postgres every second, with a version that
+  only grows, and its version **published** on `voice.route`. Api
+  instances read the table when a newer version is announced and keep it
+  in memory; a new instance reads it when it starts.
 - **Not exact, and it need not be.** Two instances can pick the same last
   slot; the node accepts one and refuses the other, which moves on. An
   instance decrements its own copy when it sends, so it does not pick a
@@ -371,14 +407,14 @@ back to it. Nothing is forwarded between instances.
 `bindings { }` block through pond's NATS adapter
 ([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
 in the api and in the node alike. With one api instance the same path is
-simply exercised by one process. The brain's route table rides the same
-connection (`spec/internal.yaml`). See Hale's
+simply exercised by one process. The brain's notice of a new route table
+rides the same connection (`spec/internal.yaml`). See Hale's
 [across binaries](https://hale-lang.org/docs/services/multi-binary).
 
 **What does not go on the bus: state.** The reservation and the settlement
 are transactions, and a broker cannot make them atomic, so they stay in
-Postgres. The route table is the one thing published that looks like
-state, and it is a derived snapshot: losing it costs a second. Usage is written once, to the ledger; publishing it to a
+Postgres. The route table is state too, so it is a row in Postgres; what
+is published is only its version, and losing a notice costs a second. Usage is written once, to the ledger; publishing it to a
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
@@ -403,8 +439,8 @@ State lives in one of three places, and each piece has exactly one home.
 - **Counters and reservations.** Rate-limit windows, each project's spend
   in its current period, and every request in flight with what it holds.
   Every api instance updates them with conditional writes, so a limit holds
-  across instances and across restarts. The route table is not here; it is
-  a snapshot on NATS.
+  across instances and across restarts.
+- **The route table.** One row the brain rewrites every second.
 - **The fleet as reported.** Api instances' heartbeats, each node's
   registration, heartbeats, declared capabilities and local controls, its
   seats' states, and each account's quota windows as an engine last
@@ -494,7 +530,7 @@ that dies with its api instance is recorded as abandoned by the brain.
 | A node | Missed heartbeats mark it down: its in-flight requests fail over as above and its seats leave the route table. When it is back it registers again and gets its assignment. |
 | An account's quota | The account gets no slots until its window resets. Requests that named it fail with `503 no_capacity` and `Retry-After`. |
 | An api instance | Its callers' requests fail; nodes are unaffected, since none is bound to it. The brain releases its reservations when its heartbeat stops. |
-| The brain | Serving continues on the last route table in memory, which goes stale until the brain is back; a new api instance has no table until then. |
+| The brain | Serving continues on the last route table, which goes stale until a brain works again; a standby takes over within about 11 s. |
 | Postgres | Nothing is served and nothing is configured until it is back. |
 
 ## In Hale
@@ -527,18 +563,17 @@ from Hale's
   Postgres advisory lock before doing anything, so only one brain works at a
   time; a second brain process waits on the lock as a standby and takes over
   when the first one's connection drops.
-- It shares nothing with the api except Postgres and the route table it
-  publishes. The process boundary enforces that.
+- It shares nothing with the api except Postgres. The process boundary
+  enforces that.
 - Each tick it reads the fleet's reported state (seat states, heartbeats,
-  quota windows, configuration), computes the route table and publishes it
-  if it changed (and every second regardless), and reclaims what dead api
-  instances held. Per-tick work runs in a method, so each tick's memory is
+  quota windows, configuration), writes the route table to Postgres and
+  publishes its version, and reclaims what dead api instances held. Per-tick work runs in a method, so each tick's memory is
   reclaimed.
 
 **Which topics bind, and which use the client.** A `keyed_by` topic over
 a binding is one subject that every subscriber receives and filters, so
-`bindings { }` carries only what is truly a broadcast: the route table on
-`voice.route`. The per-node and per-request subjects (`serve`, `assign`,
+`bindings { }` carries only what is truly a broadcast: the route table's
+version on `voice.route`. The per-node and per-request subjects (`serve`, `assign`,
 `cancel` to a node; a request's events and result back) are published and
 subscribed through the NATS client directly, with the subjects
 `spec/protocol.yaml` names, so a node receives only its own requests and an

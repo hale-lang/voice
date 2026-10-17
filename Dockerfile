@@ -42,10 +42,11 @@ RUN set -eu; \
 
 WORKDIR /src
 COPY lib lib
+COPY store store
 COPY api api
 COPY brain brain
 COPY node node
-RUN hale test api && hale test node \
+RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build api && hale build brain && hale build node
 
 FROM ubuntu:24.04
@@ -56,5 +57,5 @@ COPY --from=build /src/api/api /usr/local/bin/voice-api
 COPY --from=build /src/brain/brain /usr/local/bin/voice-brain
 COPY --from=build /src/node/node /usr/local/bin/voice-node
 COPY api/canned /usr/share/voice/canned
-COPY api/migrations /usr/share/voice/migrations
+COPY store/migrations /usr/share/voice/migrations
 COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui

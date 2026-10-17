@@ -7,12 +7,16 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   `hale-lang/pond`'s `realtime/nats` at `697852f` (2026-09-24): the core
   NATS client (`NatsClient`) and what it needs; the bus adapter, JetStream
   and the test fake are not taken. The api (`api/link.hl`) and the node
-  (`node/session.hl`) import it.
+  (`node/session.hl`) import it. A pond issue the brain works around
+  without changing it: `NatsClient.open` dials with `std::io::tcp::connect`,
+  which waits about two minutes on an address that never answers; the
+  brain's notifier probes the address with `std::io::tcp::connect_within`
+  first.
 - `pq/` and `db/`: taken from hale v0.24.0's `dna/core/pond/`, which is
   pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
   with hale's changes since (among them a password from a `std::secret`
   vault entry, hale-lang/hale#989), so they build clean on that toolchain. The api's Postgres store
-  (`api/pg_store.hl`) and `api migrate` import them. One change of
+  (`store/pg_store.hl`) and `api migrate` import them. One change of
   voice's own, marked `voice:` in `pq/pq.hl`: a result's rows are written
   into one buffer (`__pump`, `__append_row`) instead of growing the result
   text by `+` per row, which kept every prefix until the caller returned.

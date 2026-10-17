@@ -30,17 +30,19 @@ trap cleanup EXIT
 psql -q "$DATABASE_URL" -c 'SET client_min_messages = warning' -c 'DROP SCHEMA public CASCADE' -c 'CREATE SCHEMA public' >/dev/null
 
 # two migrations at once
-api/api migrate --database "$DATABASE_URL" --migrations api/migrations >"$work/m1.log" 2>&1 &
+api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/m1.log" 2>&1 &
 m1=$!
-api/api migrate --database "$DATABASE_URL" --migrations api/migrations >"$work/m2.log" 2>&1 &
+api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/m2.log" 2>&1 &
 m2=$!
 wait $m1 || { echo "the first migrate failed:"; cat "$work/m1.log"; exit 1; }
 wait $m2 || { echo "the second migrate failed:"; cat "$work/m2.log"; exit 1; }
 echo "two migrations at once: $(tail -1 "$work/m1.log"); $(tail -1 "$work/m2.log")"
 
-api/api --port "$A_PORT" --canned api/canned --database "$DATABASE_URL" >"$work/a.log" 2>&1 &
+# no NATS: the default address may be someone else's, and nothing here
+# needs a node told anything
+api/api --port "$A_PORT" --canned api/canned --nats "" --database "$DATABASE_URL" >"$work/a.log" 2>&1 &
 pids+=($!)
-api/api --port "$B_PORT" --canned api/canned --database "$DATABASE_URL" >"$work/b.log" 2>&1 &
+api/api --port "$B_PORT" --canned api/canned --nats "" --database "$DATABASE_URL" >"$work/b.log" 2>&1 &
 pids+=($!)
 for port in "$A_PORT" "$B_PORT"; do
   for i in $(seq 1 50); do curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && break; sleep 0.2; done

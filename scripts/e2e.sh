@@ -19,6 +19,7 @@ cd "$(dirname "$0")/.."
 API_PORT=${API_PORT:-18090}
 NODE_PORT=${NODE_PORT:-18091}
 NODE2_PORT=${NODE2_PORT:-18092}
+SILENT_PORT=${SILENT_PORT:-14299}
 NATS_PORT=${NATS_PORT:-14222}
 work=$(mktemp -d)
 container=""
@@ -128,6 +129,19 @@ if [ -n "${DATABASE_URL:-}" ]; then
   [ $(( after - before )) -ge 3000 ] || { echo "with NATS not answering the table went from $before to $after in 5 s"; cat "$work/brain4.log"; exit 1; }
   ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
   echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
+  # a NATS that takes the connection and then never answers a PING: the
+  # notifier backs off (1, 2, 4, 8 s), a dial alone does not reset it
+  kill "${pids[${#pids[@]}-1]}" 2>/dev/null || true
+  : >"$work/silent.log"
+  python3 scripts/silent-nats.py "$SILENT_PORT" "$work/silent.log" &
+  pids+=($!)
+  sleep 0.5
+  brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
+  pids+=($!)
+  sleep 20
+  dials=$(wc -l <"$work/silent.log")
+  [ "$dials" -le 5 ] || { echo "the notifier dialled a silent NATS $dials times in 20 s, not backing off"; cat "$work/brain5.log"; exit 1; }
+  echo "a NATS that handshakes and goes silent was dialled $dials times in 20 s"
 fi
 
 # a change on the coordinator reaches the node over NATS

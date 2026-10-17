@@ -12,8 +12,10 @@ in [hale-lang/voice#1](https://github.com/hale-lang/voice/issues/1), and the
 settled direction in [`DIRECTION.md`](./DIRECTION.md).
 
 **Status:** the specification, and the api on its way from a stub to the
-real thing: the catalog, projects, keys, the caller's view of the catalog
-and health are served for real; every other endpoint still answers a
+real thing: configuration (the catalog, accounts, nodes and seats,
+projects, budgets, limits and keys, with the change log), the caller's
+view of it and the admission of inference are served for real; the node
+plane, usage, the route table and the admin event stream still answer a
 canned happy path (below). The contract comes first.
 
 ## The api
@@ -28,33 +30,45 @@ body into the row's request and writes the contract's JSON
 | Served for real | Endpoints |
 |---|---|
 | health | `GET /healthz`, `GET /readyz` |
-| the catalog, as a key sees it | `GET /v1/models`, `GET /v1/models/{model}` (a project key required) |
+| the caller plane | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1/capabilities` (a project key required) |
+| inference | `POST /v1/responses`, `POST /v1/chat/completions`: admitted, then `503 no_eligible_seat` (below) |
 | the catalog | `GET`, `POST /admin/v1/models`; `GET`, `PATCH`, `DELETE /admin/v1/models/{model}` |
-| projects | `GET`, `POST /admin/v1/projects`; `GET`, `PATCH`, `DELETE /admin/v1/projects/{project}` |
+| projects, budgets, limits | `/admin/v1/projects`, `.../{project}`, `.../{project}/budget`, `.../{project}/limits` |
 | keys | `GET`, `POST .../keys`; `GET`, `PATCH`, `DELETE .../keys/{key}` |
+| accounts | `GET`, `POST /admin/v1/accounts`; `GET`, `PATCH`, `DELETE /admin/v1/accounts/{account}` |
+| nodes and seats | `/admin/v1/nodes`, `.../{node}`, `.../{node}/token`, `.../{node}/seats`, `.../{node}/seats/{seat}` |
+| the change log | `GET /admin/v1/changes`, written by every admin write above |
 
 The configuration lives in memory for now (`MemoryStore`, behind the
 `Store` interface in [`api/store.hl`](./api/store.hl)), so it is lost when
 the api restarts; the Postgres store of [`spec/store.md`](./spec/store.md) is
-the next implementation of the same interface. No seat can be configured
-yet, so every model is listed as unavailable. Budgets and limits are not
-served yet: a project or key body that sets them is refused as
-`unsupported`, a project's `budget` is `null` and its `limits` are empty.
+the next implementation of the same interface, and the in-memory one stays
+as the tests' double. Budgets and limits are configuration: nothing is
+counted against them until requests are served.
 
-Every other endpoint answers its happy path: a canned body from
-[`api/canned/`](./api/canned/), one file per `operationId`, all drawn from
-one consistent example (a `work` project, `static` and `claude-work`
-accounts, a `laptop` node). Inference endpoints answer with the event stream
-when the request sets `"stream": true`. Each is replaced by a row as it is
-made real.
+No node can connect yet (the node plane is still canned), so a node stays
+`pending`, every seat is `offline` with the problems the coordinator can
+see, and every model is unavailable. An inference request is admitted (its
+key, model, account and data class) and then answered `503
+no_eligible_seat`. A request with `"stream": true` is answered `400
+unsupported`: hale's `std::http::Server` cannot stream a response body yet.
+A request body over 1 MiB is refused by the server before voice reads it,
+`413` in plain text, though the contract allows 12 MiB and a JSON error
+(see [`FRICTION.md`](./FRICTION.md)).
+
+The node plane, usage, the route table and the admin event stream answer
+their happy path: a canned body from [`api/canned/`](./api/canned/), one
+file per `operationId`, drawn from one example (a `laptop` node with a
+`static` seat). Each is replaced by a row as it is made real.
 
 ```sh
 hale build api
 api/api --port 8080          # --host, --canned DIR
-curl -X POST localhost:8080/admin/v1/models -d '{"id": "echo-1"}'
-curl -X POST localhost:8080/admin/v1/projects -d '{"id": "work", "name": "Work"}'
-curl -X POST localhost:8080/admin/v1/projects/work/keys -d '{"name": "laptop"}'   # its "secret"
+curl -X POST localhost:8080/admin/v1/models -H 'content-type: application/json' -d '{"id": "echo-1"}'
+curl -X POST localhost:8080/admin/v1/projects -H 'content-type: application/json' -d '{"id": "work", "name": "Work"}'
+curl -X POST localhost:8080/admin/v1/projects/work/keys -H 'content-type: application/json' -d '{"name": "laptop"}'   # its "secret"
 curl localhost:8080/v1/models -H 'Authorization: Bearer vk-...'
+curl localhost:8080/admin/v1/changes
 hale test api
 ```
 

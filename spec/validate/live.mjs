@@ -16,7 +16,8 @@ let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
 
-// the sample world: a model, a project and a key under it
+// the sample world: a model, an account, a project with its budget and a
+// key under it, and a node with a seat
 const setup = async (path, body) => {
   const r = await fetch(base + path, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
   const text = await r.text();
@@ -24,8 +25,11 @@ const setup = async (path, body) => {
   return JSON.parse(text);
 };
 await setup('/admin/v1/models', { id: 'echo-1', context_length: 8192, max_output_tokens: 1024, price: { input_per_mtok_micros: 3000000, output_per_mtok_micros: 15000000, currency: 'USD' } });
-await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'] });
+await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
+await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
+await setup('/admin/v1/nodes', { id: 'laptop', name: 'Laptop' });
+await setup('/admin/v1/nodes/laptop/seats', { id: 'static', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1' }], config: { text: 'hello from voice' } });
 sample.key = key.id;
 const auth = { authorization: `Bearer ${key.secret}` };
 
@@ -37,6 +41,23 @@ const bodies = {
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },
   updateKey: { name: 'ci' },
+  setBudget: { allowance_micros: 75000000, period: 'month' },
+  setLimits: { limits: [{ scope: 'project', window_seconds: 60, requests: 600 }, { scope: 'model', model: 'echo-1', window_seconds: 3600, requests: 200 }] },
+  createAccount: { id: 'static', name: 'Static' },
+  updateAccount: { name: 'Claude (work)', billing: 'subscription' },
+  createNode: { id: 'desktop', max_in_flight: 4 },
+  updateNode: { max_in_flight: 8 },
+  createSeat: { id: 'live', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1', as: null }], data_classes: ['public', 'internal'], concurrency: 2, config: { text: 'hi', chunk_chars: 4 } },
+  updateSeat: { concurrency: 4 },
+  createChatCompletion: { model: 'echo-1', messages: [{ role: 'user', content: 'hi' }] },
+};
+
+// what an endpoint answers instead of its success, while it cannot succeed:
+// inference needs a node to serve it (no node can connect yet), and a
+// streamed answer needs a response body the api can stream
+const refusals = {
+  createResponse: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
+  createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
 };
 
 const calls = [], last = [];
@@ -61,9 +82,21 @@ for (const [p, m, op] of [...calls, ...last]) {
     n++;
     const label = `${op.operationId}${stream ? ' (stream)' : ''} ${m.toUpperCase()} ${url.slice(base.length)}`;
     const generic = stream ? { model: 'echo-1', input: 'hi', stream: true } : { model: 'echo-1', input: 'hi' };
-    const body = ['post', 'put', 'patch'].includes(m) ? JSON.stringify(bodies[op.operationId] ?? generic) : undefined;
+    const own = bodies[op.operationId];
+    const payload = own ? (stream ? { ...own, stream: true } : own) : generic;
+    const body = ['post', 'put', 'patch'].includes(m) ? JSON.stringify(payload) : undefined;
     const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...auth } : auth });
     const text = await r.text();
+    const refusal = refusals[op.operationId]?.[stream ? 'stream' : 'json'];
+    if (refusal) {
+      const [status, errCode] = refusal;
+      if (r.status !== status) { fail(label, `status ${r.status} != ${status}: ${text.slice(0, 120)}`); continue; }
+      const f = ajv.compile(strip(op.responses[String(status)].content['application/json'].schema));
+      const j = JSON.parse(text);
+      if (!f(j)) fail(label, JSON.stringify(f.errors.slice(0, 3)));
+      if (j?.error?.code !== errCode) fail(label, `code ${j?.error?.code} != ${errCode}`);
+      continue;
+    }
     if (String(r.status) !== code) { fail(label, `status ${r.status} != ${code}: ${text.slice(0, 120)}`); continue; }
     const ct = r.headers.get('content-type') || '';
     const want = stream ? 'text/event-stream' : 'application/json';

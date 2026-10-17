@@ -1,0 +1,133 @@
+// Inference: POST /v1/responses and POST /v1/chat/completions.
+//
+// A request is admitted as the contract says (its key, its model, the
+// account it names, its data class) and then needs a seat: an enabled seat
+// serving the model, on a node that is connected, spending an account the
+// key may spend, carrying the request's data class. No node can connect
+// yet (the node protocol is step 2), so no seat is eligible and every
+// admitted request is answered `503 no_eligible_seat`. Budgets and limits
+// are configuration only: they are reserved against when requests are
+// served, in the store's reservation transaction.
+//
+// A streamed request is refused `400 unsupported`: `std::http::Server`
+// cannot stream a response body in hale 0.24.0.
+// TODO(stdlib chunked transfer + SSE writer): serve `stream: true` as the
+// standard event stream once std::http::Server's response path has chunked
+// transfer encoding and an SSE writer over it (hale's streaming item, ruled
+// 2026-10-17); tests/inference_test.hl's `streamed_with_sse` is the test to
+// switch on.
+//
+// TODO(std::http::Server body cap): the server answers a body over 1 MiB
+// itself, `413` in plain text, before this handler runs; the contract allows
+// 12 MiB and answers `413` as an `ErrorResponse` (`TooLarge`). Set the cap
+// to 12 MiB, and answer past it as the contract says, once the server takes
+// a body limit (FRICTION.md).
+
+/// What admission reads of an inference request. `account` "" names none;
+/// `data_class` defaults to `internal`.
+type InferenceRequest {
+    // responses | chat
+    endpoint: String = "responses";
+    model: String = "";
+    stream: Bool = false;
+    previous_response_id: String = "";
+    account: String = "";
+    data_class: String = "internal";
+}
+
+/// An admitted request: who asked, and the seats that could serve it.
+type Admitted {
+    key: String = "";
+    project: String = "";
+    model: String = "";
+    seats: Names = Names { };
+}
+
+locus Inference {
+    params { store: Store; }
+
+    /// Admit `r` for the caller `ctx` names, then find it a seat.
+    fn admit(r: InferenceRequest, ctx: std::api::Context) -> Admitted fallible(ApiError) {
+        if r.stream {
+            fail unsupported("`stream: true` is not served yet: this api cannot stream a response body; ask without `stream`", "stream");
+        }
+        if len(r.previous_response_id) > 0 {
+            fail ApiError { status: 400, kind: "invalid_request", code: "previous_response_not_found", message: "responses are not stored, so no previous response can be continued", param: "previous_response_id" };
+        }
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        if !k.present { fail invalid_key(); }
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        let m = self.store.model(r.model) or fail metering_failed(err);
+        if !m.present || m.removed {
+            fail ApiError { status: 404, kind: "not_found", code: "model_not_found", message: "no model " + r.model + " in the catalog", param: "model" };
+        }
+        if !visible(p, k, r.model) {
+            fail ApiError { status: 403, kind: "permission_error", code: "model_not_permitted", message: "this key may not use model " + r.model, param: "model" };
+        }
+        if len(r.account) > 0 {
+            let a = self.store.account(r.account) or fail metering_failed(err);
+            if !a.present || a.archived || !allows(p.accounts, r.account) || !allows(k.accounts, r.account) {
+                fail ApiError { status: 403, kind: "permission_error", code: "account_not_permitted", message: "this key may not spend account " + r.account, param: "voice.account" };
+            }
+        }
+        if !has_name(p.data_classes, r.data_class) {
+            fail ApiError { status: 403, kind: "permission_error", code: "data_class_refused", message: "project " + p.id + " may not send data of class " + r.data_class, param: "voice.data_class" };
+        }
+
+        let seats = self.store.seats() or fail metering_failed(err);
+        let mut out = Admitted { key: k.id, project: p.id, model: r.model };
+        let mut serving = 0;
+        for s in seats.rows {
+            if seat_serves(s, r.model) {
+                serving = serving + 1;
+                let eligible = self.eligible(s, p, k, r) or raise;
+                if eligible { push(out.seats.items, s.ref) or discard; }
+            }
+        }
+        if count(out.seats.items) == 0 {
+            let why = if serving == 0 { "no seat serves model " + r.model } else { to_string(serving) + " seat(s) serve model " + r.model + ", none on a connected node with an account this key may spend and data class " + r.data_class };
+            fail ApiError { status: 503, kind: "server_error", code: "no_eligible_seat", message: why };
+        }
+        return out;
+    }
+
+    /// True when `s` could take the request: enabled, carrying its data
+    /// class, spending an account the key may spend (the one it names, if
+    /// it names one) that is not archived, on a node that is connected. No
+    /// node is connected until the node protocol (step 2).
+    fn eligible(s: SeatRow, p: ProjectRow, k: KeyRow, r: InferenceRequest) -> Bool fallible(ApiError) {
+        if !s.enabled || !has_name(s.data_classes, r.data_class) { return false; }
+        if len(r.account) > 0 && s.account != r.account { return false; }
+        if !allows(p.accounts, s.account) || !allows(k.accounts, s.account) { return false; }
+        let a = self.store.account(s.account) or fail metering_failed(err);
+        if !a.present || a.archived { return false; }
+        let n = self.store.node(s.node) or fail metering_failed(err);
+        let connected = false;
+        return n.present && !n.revoked && connected;
+    }
+}
+
+// ---- the wire ----------------------------------------------------------
+
+/// What admission reads of a `CreateResponseRequest` or a
+/// `ChatCompletionRequest`; the rest of the body goes to the engine.
+fn read_inference(body: String, endpoint: String) -> InferenceRequest fallible(ApiError) {
+    object_body(body) or raise;
+    let model = required_string(body, "model") or raise;
+    if endpoint == "chat" {
+        if kind_of(body, "messages") != "array" { fail invalid("`messages` is a required list", "messages"); }
+        let first = std::json::array_first(std::json::find_field_raw(body, "messages"));
+        if first.done { fail invalid("`messages` holds at least one message", "messages"); }
+        if sets(body, "n") && std::json::find_int_field(body, "n") != 1 { fail unsupported("`n` greater than 1 is not supported", "n"); }
+    }
+    let voice = std::json::find_field_raw(body, "voice");
+    let has_voice = kind_of(body, "voice") == "object";
+    return InferenceRequest {
+        endpoint: endpoint,
+        model: model,
+        stream: bool_or(body, "stream", false) or raise,
+        previous_response_id: if endpoint == "responses" { nullable_string(body, "previous_response_id") or raise } else { "" },
+        account: if has_voice { nullable_string(voice, "account") or raise } else { "" },
+        data_class: if has_voice { string_or(voice, "data_class", "internal") or raise } else { "internal" }
+    };
+}

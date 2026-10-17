@@ -48,9 +48,9 @@ reusable parts become a library.
 
 ## Developing
 
-Against the api, which serves the catalog, projects and keys for real (in
-memory, starting empty) and answers every other endpoint with a canned
-happy path:
+Against the api, which serves configuration for real (in memory, starting
+empty) and answers the node plane, usage, routes and the event stream with
+a canned happy path:
 
 ```sh
 hale build api && api/api --port 8080      # in the repository root

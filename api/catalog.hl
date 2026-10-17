@@ -1,9 +1,9 @@
 // The catalog: configured on the admin plane (`Catalog`), read by callers
 // through their key (`Models`).
 //
-// No seat can be configured yet (the seat endpoints are still canned), so
-// a model has no seats, is not available, and carries no data class: the
-// answers say what is configured, and nothing more.
+// A model lists the seats configured to serve it. No node can connect yet
+// (the node plane is still canned), so no seat is up: every model is
+// unavailable and carries no data class an eligible seat could carry.
 
 locus Catalog {
     params { store: Store; }
@@ -13,7 +13,10 @@ locus Catalog {
         let rows = self.store.models() or fail store_failed(err);
         let mut out = CatalogList { };
         for r in rows.rows {
-            if !r.removed { push(out.data, catalog_view(r)) or discard; }
+            if !r.removed {
+                let v = self.view(r) or raise;
+                push(out.data, v) or discard;
+            }
         }
         return out;
     }
@@ -32,20 +35,22 @@ locus Catalog {
             price: m.price,
             created_at: now_seconds()
         };
-        let added = self.store.insert_model(row) or fail store_failed(err);
+        let v = self.view(row) or raise;
+        let added = self.store.insert_model(row, change("create", "models/" + m.id, "", catalog_model_json(v))) or fail store_failed(err);
         if !added { fail conflict("model " + m.id + " exists; a model id is never reused"); }
-        return catalog_view(row);
+        return v;
     }
 
     /// `getCatalogModel`.
     fn get(r: ModelRef) -> CatalogModel fallible(ApiError) {
         let row = self.live(r.model) or raise;
-        return catalog_view(row);
+        return self.view(row) or raise;
     }
 
     /// `updateCatalogModel`: the fields the request sets.
     fn update(u: CatalogModelUpdate) -> CatalogModel fallible(ApiError) {
         let mut row = self.live(u.model) or raise;
+        let before = self.view(row) or raise;
         if u.set_owned_by { row.owned_by = u.owned_by; }
         if u.set_kind { row.kind = u.kind; }
         if u.set_context_length { row.context_length = u.context_length; }
@@ -55,18 +60,20 @@ locus Catalog {
             row.price = u.price;
         }
         check_model_fields(row.kind, row.context_length, row.max_output_tokens) or raise;
-        self.store.update_model(row) or fail store_failed(err);
-        return catalog_view(row);
+        let after = self.view(row) or raise;
+        self.store.update_model(row, change("update", "models/" + row.id, catalog_model_json(before), catalog_model_json(after))) or fail store_failed(err);
+        return after;
     }
 
     /// `removeCatalogModel`: callers naming it get `model_not_found`; the
     /// id stays taken.
     fn remove(r: ModelRef) -> CatalogModel fallible(ApiError) {
         let mut row = self.live(r.model) or raise;
+        let before = self.view(row) or raise;
         row.removed = true;
         row.removed_at = now_seconds();
-        self.store.update_model(row) or fail store_failed(err);
-        return catalog_view(row);
+        self.store.update_model(row, change("delete", "models/" + row.id, catalog_model_json(before), "")) or fail store_failed(err);
+        return before;
     }
 
     /// The model `id`, unless it is absent or removed.
@@ -74,6 +81,16 @@ locus Catalog {
         let row = self.store.model(id) or fail store_failed(err);
         if !row.present || row.removed { fail not_found("no model " + id + " in the catalog"); }
         return row;
+    }
+
+    /// The row with the seats that serve it.
+    fn view(r: ModelRow) -> CatalogModel fallible(ApiError) {
+        let seats = self.store.seats() or fail store_failed(err);
+        let mut v = catalog_view(r);
+        for s in seats.rows {
+            if seat_serves(s, r.id) { push(v.seats.items, s.ref) or discard; }
+        }
+        return v;
     }
 }
 
@@ -85,8 +102,8 @@ locus Models {
     /// `listModels`.
     fn list(ctx: std::api::Context) -> ModelList fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail store_failed(err);
-        let rows = self.store.models() or fail store_failed(err);
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        let rows = self.store.models() or fail metering_failed(err);
         let mut out = ModelList { };
         for r in rows.rows {
             if !r.removed && visible(p, k, r.id) { push(out.data, model_view(r)) or discard; }
@@ -98,17 +115,53 @@ locus Models {
     /// does not exist.
     fn get(r: ModelRef, ctx: std::api::Context) -> Model fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail store_failed(err);
-        let row = self.store.model(r.model) or fail store_failed(err);
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        let row = self.store.model(r.model) or fail metering_failed(err);
         if !row.present || row.removed || !visible(p, k, r.model) {
             fail ApiError { status: 404, kind: "not_found", code: "model_not_found", message: "no model " + r.model, param: "model" };
         }
         return model_view(row);
     }
 
+    /// `getCapabilities`: the project and key, the models the key may
+    /// name, the accounts it may spend, every limit that applies to it at
+    /// any scope, and the project's budget.
+    fn capabilities(ctx: std::api::Context) -> Capabilities fallible(ApiError) {
+        let k = self.caller_key(ctx) or raise;
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        let rows = self.store.models() or fail metering_failed(err);
+        let mut out = Capabilities {
+            project_id: p.id,
+            project_name: p.name,
+            key_id: k.id,
+            key_name: k.name,
+            data_classes: p.data_classes,
+            accounts: if k.accounts.any { p.accounts } else { k.accounts },
+            budget: if p.budgeted { MaybeBudget { present: true, budget: budget_view(p.budget, now_seconds()) } } else { MaybeBudget { } }
+        };
+        for r in rows.rows {
+            if !r.removed && visible(p, k, r.id) { push(out.models.items, r.id) or discard; }
+        }
+        for l in p.limits.items {
+            push(out.limits.items, l) or discard;
+        }
+        for l in k.limits.items {
+            push(out.limits.items, l) or discard;
+        }
+        let accounts = self.store.accounts() or fail metering_failed(err);
+        for a in accounts.rows {
+            if !a.archived && allows(out.accounts, a.id) {
+                for l in a.limits.items {
+                    push(out.limits.items, l) or discard;
+                }
+            }
+        }
+        return out;
+    }
+
     /// The key the caller is, as the bearer source named it.
     fn caller_key(ctx: std::api::Context) -> KeyRow fallible(ApiError) {
-        let k = self.store.key(ctx.caller.name) or fail store_failed(err);
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         if !k.present { fail invalid_key(); }
         return k;
     }
@@ -138,7 +191,7 @@ fn check_model_fields(kind: String, context_length: Int, max_output_tokens: Int)
     return true;
 }
 
-/// The seats that serve a model: none yet, since no seat can be configured.
+/// The row alone; `Catalog.view` adds its seats.
 fn catalog_view(r: ModelRow) -> CatalogModel {
     return CatalogModel {
         id: r.id,
@@ -189,14 +242,59 @@ fn invalid_key() -> ApiError {
     return ApiError { status: 401, kind: "authentication_error", code: "invalid_key", message: "a valid project key is required: Authorization: Bearer vk-..." };
 }
 
-/// A store that could not answer. A full list is the caller's to fix; a
-/// store that is down is nobody's, and nothing is served until it is back.
+/// A store that could not answer an admin request. A full list is the
+/// caller's to fix; a store that is down is a failure inside the api.
 fn store_failed(e: StoreError) -> ApiError {
     if e.kind == "full" { return invalid(e.message, ""); }
+    return ApiError { status: 500, kind: "server_error", code: "internal_error", message: "the store is unavailable: " + e.message };
+}
+
+/// A store that could not answer a caller: nothing is served while the
+/// store is down (README, "Metering is not optional").
+fn metering_failed(e: StoreError) -> ApiError {
     return ApiError { status: 503, kind: "server_error", code: "metering_unavailable", message: "the store is unavailable: " + e.message };
 }
 
 /// Now, to the second: what every timestamp voice writes is.
 fn now_seconds() -> Time {
     return std::time::time_from_unix(std::time::unix(std::time::current()));
+}
+
+// ---- capabilities ------------------------------------------------------
+
+/// Model ids, as many as the catalog holds (`ModelRows`).
+type ModelIds { items: bounded[String; 256]; }
+
+/// Limits at every scope that applies to one key: the project's (16), the
+/// key's (16) and each of at most 64 accounts' (16 each), so the bound
+/// holds them all and nothing is dropped.
+type AppliedLimits { items: bounded[Limit; 1056]; }
+
+/// `Capabilities`. `budget` is `null` for a project with none.
+type Capabilities {
+    project_id: String = "";
+    project_name: String = "";
+    key_id: String = "";
+    key_name: String = "";
+    data_classes: Names = Names { };
+    models: ModelIds = ModelIds { };
+    accounts: Restriction = Restriction { };
+    limits: AppliedLimits = AppliedLimits { };
+    budget: MaybeBudget = MaybeBudget { };
+}
+
+fn capabilities_json(c: Capabilities) -> String {
+    let models_list = JsonList { };
+    for m in c.models.items {
+        models_list.add(jq(m));
+    }
+    let models = models_list.text();
+    let limits_list = JsonList { };
+    for l in c.limits.items {
+        limits_list.add(limit_json(l));
+    }
+    let limits = limits_list.text();
+    return "{\"project\": {\"id\": " + jq(c.project_id) + ", \"name\": " + jq(c.project_name) + "}, \"key\": {\"id\": " + jq(c.key_id) + ", \"name\": " + jq(c.key_name) + "}"
+        + ", \"data_classes\": " + jnames(c.data_classes) + ", \"models\": [" + models + "], \"accounts\": " + jrestriction(c.accounts)
+        + ", \"limits\": [" + limits + "], \"budget\": " + maybe_budget_json(c.budget) + "}";
 }

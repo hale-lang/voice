@@ -263,5 +263,5 @@ have defaults requires nothing.
 **Working shape:** the bundle is committed as exported, and its drift is
 checked with `hale api export --check`. Its fit to the contract is checked
 field by field instead of by linting (`spec/validate/bundle.mjs`), with
-each gap classed in `api/bundle/gaps.json`; the `name` gaps wait on stable
+each gap classed in `api/gaps.json`; the `name` gaps wait on stable
 names for imported types.

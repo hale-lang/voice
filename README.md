@@ -103,16 +103,25 @@ spec (`spec/validate`).
 
 [`api/bundle/`](./api/bundle/) is `hale api export --surface Voice` of the
 api, committed: the surface's description, its OpenAPI, JSON Schema, MCP
-and protobuf forms, and its contract digest. CI exports it again and fails
-on any drift (`hale api export --surface Voice --check api/bundle api`).
+and protobuf forms, and its contract digest, and nothing else. CI exports
+it again and fails on any drift (`hale api export --surface Voice --check
+api/bundle api`), and on any file in `api/bundle/` the export does not
+write.
 After a change to a row, export it again and commit the result.
 
 The bundle is the surface's own shape, not the REST wire's: a row is
 `POST /call/<member>`, and its types say what the codec of hale 0.24.0 can
-carry. [`api/bundle/gaps.json`](./api/bundle/gaps.json) lists every place
+carry. [`api/gaps.json`](./api/gaps.json) lists every place
 where a row's type differs from the contract schema it stands for, each
 with what closes it, and `spec/validate/bundle.mjs` (`npm run bundle`)
-fails when the gaps found and the gaps committed differ either way:
+fails when the gaps found and the gaps committed differ either way. It
+fails closed: every exported component is mapped to the contract, reached
+inside a mapped one, or listed as not compared with why (path and query
+records, hale's own refusal, the node's whole-body report); a scalar of
+another type, a field the row requires and the contract does not, and enum
+values that differ are never classed away; and
+`spec/validate/negative/` (`npm run bundle-negative`) holds changes it must
+refuse:
 
 | Kind | Closed by |
 |---|---|
@@ -125,6 +134,7 @@ fails when the gaps found and the gaps committed differ either way:
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |
 | `wire` | voice: the REST wire's shape differs from the row (`api/wire.hl` writes it) |
+| `open` | voice: the contract admits several shapes there (`oneOf`/`anyOf`); the row carries one, as the reader does |
 
 After a change, `npm run bundle -- --write` writes the gaps again; the diff
 is what to review. Friction met along the way is in

@@ -191,7 +191,8 @@ process model):
   `postgres`, `nats`, `node` anywhere.
 
 `gates` (what each job's steps name):
-- `ci/api` to seed `api`, `openapi.yaml` (live), seed `spec/validate`.
+- `ci/api` to seed `api`, `openapi.yaml` (live, and the exported surface's
+  gaps from it), the bundle `api/bundle` (its drift), seed `spec/validate`.
 - `ci/brain` to seed `brain`.
 - `ci/node` to seed `node`, `node.yaml` (live), seed `spec/validate`.
 - `ci/e2e` to seeds `api`, `node`, `brain`, `store`, `lib/pond`, `nats`, `postgres`,
@@ -228,6 +229,8 @@ new migration" to `store.md`.
 - the reserved `draining` entry to seed `api` (`NodePlane::going_away`).
 - the `count`/`at` on a call entry to seed `store` (`tests/store_test.hl`).
 - the qualified imports entry to seeds `api` and `store`.
+- the export lint entry to `api/bundle` and seed `spec/validate`
+  (`bundle.mjs`).
 - the pq rows entry to seed `store` (`PgStore` reads `row_to_json`) and
   seed `lib/pond`.
 

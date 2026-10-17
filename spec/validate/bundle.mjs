@@ -92,21 +92,21 @@ const MAP = {
   LimitsRequest: 'LimitSet',
 };
 
-// Exported components compared with nothing, each with why. Anything
-// exported that is neither mapped, reached inside a mapped component, nor
-// here fails the run.
+// Exported components compared with nothing, each with why, and the only
+// fields its reason allows it: a component that grows a field its reason
+// does not cover (a body field on a path record) fails the run.
 const NOT_COMPARED = {
-  AccountRef: 'the path parameter `account`; no body',
-  KeyRef: 'the path parameters `project` and `key`; no body',
-  ModelRef: 'the path parameter `model`; no body',
-  NodeRef: 'the path parameter `node`; no body',
-  ProjectRef: 'the path parameter `project`; no body',
-  SeatRef: 'the path parameters `node` and `seat`; no body',
-  AccountQuery: 'the query parameter `include_archived`; no body',
-  ProjectQuery: 'the query parameter `include_archived`; no body',
-  'st::ChangeQuery': 'the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`); no body',
-  NodeReport: 'one row for two bodies, the node\'s `Capabilities` (PUT /node/v1/capabilities) and `LocalControls` (PUT /node/v1/local), each carried whole as JSON text and checked by the reader (api/fleet.hl)',
-  'hale.Refusal': 'hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract',
+  AccountRef: ['the path parameter `account`; no body', ['account']],
+  KeyRef: ['the path parameters `project` and `key`; no body', ['project', 'key']],
+  ModelRef: ['the path parameter `model`; no body', ['model']],
+  NodeRef: ['the path parameter `node`; no body', ['node']],
+  ProjectRef: ['the path parameter `project`; no body', ['project']],
+  SeatRef: ['the path parameters `node` and `seat`; no body', ['node', 'seat']],
+  AccountQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
+  ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
+  'st::ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
+  NodeReport: ['one row for two bodies, the node\'s `Capabilities` (PUT /node/v1/capabilities) and `LocalControls` (PUT /node/v1/local), each carried whole as JSON text and checked by the reader (api/fleet.hl)', ['json']],
+  'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 
 // Fields of a row's request that are the path's or the query's.
@@ -172,6 +172,8 @@ function compare(at, c, b) {
     const a = [...cs.enum].sort().join(','), z = [...bs.enum].sort().join(',');
     if (a !== z) gap(at + ' (enum values)', 'enum-values');
   } else if (cs.enum && bt === 'string') { gap(at + ' (enum)', 'enum'); return; }
+  // a narrowing: the row refuses values the contract allows
+  else if (bs.enum && !cs.enum) { gap(at + ' (narrowed to an enum)', 'type'); return; }
   // a contract shape with no single type: several, or none named
   if (ct === undefined) { gap(at, 'open'); return; }
   if (ct === 'object' && bt === 'string') {
@@ -182,8 +184,9 @@ function compare(at, c, b) {
   if (ct === 'array' && bt === 'string') { gap(at, 'json-text'); return; }
   if (ct === 'object' && bt === 'object') { fields(at, cs, bs); return; }
   if (ct === 'array' && bt === 'array') { compare(at + '[]', cs.items, bs.items); return; }
-  const same = ct === bt || (ct === 'number' && bt === 'integer');
-  if (!same) gap(at, 'type');
+  // an integer where the contract says number is a narrowing too
+  if (ct === 'number' && bt === 'integer') { gap(at + ' (narrowed to an integer)', 'type'); return; }
+  if (ct !== bt) gap(at, 'type');
 }
 
 function fields(at, cs, bs) {
@@ -227,6 +230,9 @@ for (const n of Object.keys(bschemas)) if (n.includes('::')) gap('component ' + 
 // every exported component is compared, or says why not
 const unaccounted = Object.keys(bschemas).filter(n => !(n in MAP) && !reached.has(n) && !(n in NOT_COMPARED) && !WRAPPERS.has(n) && !NULLABLES.has(n));
 const stale = Object.keys(NOT_COMPARED).filter(n => !(n in bschemas) || n in MAP || reached.has(n));
+// held to its reason: no field beyond the ones it names
+const beyond = Object.entries(NOT_COMPARED).flatMap(([n, [, only]]) =>
+  n in bschemas ? Object.keys(bresolve(bschemas[n]).properties || {}).filter(k => !only.includes(k)).map(k => `${n}.${k}`) : []);
 
 // A field the row has and the contract does not, or the reverse, classed
 // by why: the first rule whose pattern the gap's place matches.
@@ -241,6 +247,7 @@ const RULES = [
   [/(VoiceExtension|Served\.voice)\.(wall_ms|timing)$/, 'wire', 'the timing is an object of wall, queue and load on the wire'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
   [/^Capabilities\.(project_id|project_name|key_id|key_name|project|key)$/, 'wire', 'the project and the key are objects of id and name on the wire'],
+  [/^InferenceRequest\.(model|previous_response_id)$/, 'open', 'the standard\'s `anyOf` of a string and `null`; the row reads a string, and the reader takes `null` and absent alike (no model named is refused, no previous response is none)', 'open'],
   [/^ApiError\.(kind|type)$/, 'wire', 'the row\'s `kind` is the envelope\'s `type`, renamed by the wire (error_json)'],
   [/^ApiError\.status$/, 'wire', 'the HTTP status the error answers with, not a field of the envelope'],
   [/^BudgetRequest\.(set|allowance_micros|currency|period|period_anchor)$/, 'wire', 'the body is the BudgetSet, which the row carries under `set`'],
@@ -254,6 +261,11 @@ const WHOLE = [
 // Kinds a rule may class; any other that no rule classes fails.
 const RULED = new Set(['missing', 'extra', 'type', 'over-required']);
 function reclass(at, kind) {
+  // a shape the contract leaves open says why, wherever it is
+  if (kind === 'open') {
+    for (const [re, k, why, only] of RULES) if (only === 'open' && re.test(at)) return { kind: k, why };
+    return { kind };
+  }
   for (const [re, why] of WHOLE) if (re.test(at)) return { kind: 'wire', why };
   if (!RULED.has(kind)) return { kind };
   for (const [re, k, why, only] of RULES) if ((!only || only === kind) && re.test(at)) return { kind: k, why };
@@ -285,6 +297,7 @@ for (const g of committed.gaps) if (!foundAt.has(g.at)) { fails++; console.log('
 for (const g of found) if (!(g.kind in WAITS_ON)) { fails++; console.log('UNCLASSED', g.at, g.kind); }
 for (const n of unaccounted) { fails++; console.log('NOT COMPARED, and no reason given', n); }
 for (const n of stale) { fails++; console.log('NOT_COMPARED lists what is compared or gone', n); }
+for (const f of beyond) { fails++; console.log('NOT_COMPARED, but a field its reason does not cover', f); }
 const counts = {};
 for (const g of found) counts[g.kind] = (counts[g.kind] || 0) + 1;
 console.log(`${found.length} gaps, all committed and classed:`, fails === 0, counts);

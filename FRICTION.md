@@ -250,3 +250,18 @@ the api's while the same function lived in the api seed.
 method name, as `draining` and `drain` are.
 
 **Working shape:** `Store::let_go`.
+
+## `hale api export`'s OpenAPI form does not lint
+
+**hale 0.24.0.** The exported `Voice.openapi.json` fails `redocly lint`
+with ten errors. Nine are component names: a type from an imported seed is
+named by its alias (`st::Names`), and `::` is not allowed in an OpenAPI
+component key. The tenth is the missing `servers`. Every field of a row
+that has a default is optional in the export, so a type whose fields all
+have defaults requires nothing.
+
+**Working shape:** the bundle is committed as exported, and its drift is
+checked with `hale api export --check`. Its fit to the contract is checked
+field by field instead of by linting (`spec/validate/bundle.mjs`), with
+each gap classed in `api/bundle/gaps.json`; the `name` gaps wait on stable
+names for imported types.

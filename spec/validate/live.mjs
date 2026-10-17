@@ -28,7 +28,7 @@ await setup('/admin/v1/models', { id: 'echo-1', context_length: 8192, max_output
 await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
 await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
-await setup('/admin/v1/nodes', { id: 'laptop', name: 'Laptop' });
+const nodeToken = (await setup('/admin/v1/nodes', { id: 'laptop', name: 'Laptop' })).enrollment_token;
 await setup('/admin/v1/nodes/laptop/seats', { id: 'static', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1' }], config: { text: 'hello from voice' } });
 sample.key = key.id;
 const auth = { authorization: `Bearer ${key.secret}` };
@@ -52,6 +52,21 @@ const bodies = {
   createChatCompletion: { model: 'echo-1', messages: [{ role: 'user', content: 'hi' }] },
 };
 
+// the node plane: the node's enrollment token, and the bodies it sends
+// (it registers first, as the spec lists it)
+let nodeAuth = { authorization: `Bearer ${nodeToken}` };
+const capabilities = { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object', required: ['text'] } }] };
+const local = { paused: false, paused_seats: [], max_in_flight: null, reason: null };
+const nodeBodies = {
+  registerNode: { protocol: 2, version: 'live', capabilities, local },
+  nodeHeartbeat: { in_flight: 0, seats: [{ id: 'static', status: 'up', in_flight: 0 }] },
+  reportSeatStates: { assignment_version: 1, seats: [{ id: 'static', status: 'up', in_flight: 0 }] },
+  reportCapabilities: capabilities,
+  reportLocalControls: local,
+  reportQuota: { seat: 'static', windows: [] },
+  nodeDraining: { reason: 'live check' },
+};
+
 // what an endpoint answers instead of its success, while it cannot succeed:
 // inference needs a node to serve it (no node can connect yet), and a
 // streamed answer needs a response body the api can stream
@@ -69,10 +84,11 @@ for (const [p, m, op] of [...calls, ...last]) {
   const code = Object.keys(op.responses).find(c => c.startsWith('2'));
   const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]);
   const content = op.responses[code].content;
+  const who = p.startsWith('/node/') ? nodeAuth : auth;
   if (!content) {
     n++;
-    const body = ['post', 'put'].includes(m) ? JSON.stringify({ in_flight: 0, seats: [], assignment_version: 1, paused: false, paused_seats: [], max_in_flight: 4, engines: [], seat: 's', windows: [] }) : undefined;
-    const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...auth } : auth });
+    const body = ['post', 'put'].includes(m) ? JSON.stringify(nodeBodies[op.operationId] ?? {}) : undefined;
+    const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...who } : who });
     if (String(r.status) !== code) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${code}`);
     continue;
   }
@@ -82,10 +98,10 @@ for (const [p, m, op] of [...calls, ...last]) {
     n++;
     const label = `${op.operationId}${stream ? ' (stream)' : ''} ${m.toUpperCase()} ${url.slice(base.length)}`;
     const generic = stream ? { model: 'echo-1', input: 'hi', stream: true } : { model: 'echo-1', input: 'hi' };
-    const own = bodies[op.operationId];
+    const own = bodies[op.operationId] ?? nodeBodies[op.operationId];
     const payload = own ? (stream ? { ...own, stream: true } : own) : generic;
     const body = ['post', 'put', 'patch'].includes(m) ? JSON.stringify(payload) : undefined;
-    const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...auth } : auth });
+    const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...who } : who });
     const text = await r.text();
     const refusal = refusals[op.operationId]?.[stream ? 'stream' : 'json'];
     if (refusal) {
@@ -104,7 +120,10 @@ for (const [p, m, op] of [...calls, ...last]) {
     if (p.startsWith('/v1/') && !r.headers.get('x-request-id')) fail(label, 'no X-Request-Id');
     if (!stream) {
       const f = ajv.compile(strip(content[want].schema));
-      if (!f(JSON.parse(text))) fail(label, JSON.stringify(f.errors.slice(0, 3)));
+      const j = JSON.parse(text);
+      if (!f(j)) fail(label, JSON.stringify(f.errors.slice(0, 3)));
+      // a rotation retires the token the node plane presents
+      if (op.operationId === 'rotateNodeToken') nodeAuth = { authorization: `Bearer ${j.enrollment_token}` };
     } else {
       const f = ajv.compile(strip(content[want].schema));
       const datas = text.split('\n\n').map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(Boolean).map(l => l.slice(6));

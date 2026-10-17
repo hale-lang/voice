@@ -41,6 +41,7 @@ RUN set -eu; \
     hale --version
 
 WORKDIR /src
+COPY lib lib
 COPY api api
 COPY brain brain
 COPY node node

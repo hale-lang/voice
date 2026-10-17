@@ -11,12 +11,13 @@ Voice is written in [Hale](https://github.com/hale-lang/hale). The design is
 in [hale-lang/voice#1](https://github.com/hale-lang/voice/issues/1), and the
 settled direction in [`DIRECTION.md`](./DIRECTION.md).
 
-**Status:** the specification, and the api on its way from a stub to the
-real thing: configuration (the catalog, accounts, nodes and seats,
-projects, budgets, limits and keys, with the change log), the caller's
-view of it and the admission of inference are served for real; the node
-plane, usage, the route table and the admin event stream still answer a
-canned happy path (below). The contract comes first.
+**Status:** the specification, and the api and the node on their way
+from a stub to the real thing: configuration (the catalog, accounts, nodes
+and seats, projects, budgets, limits and keys, with the change log), the
+caller's view of it, the node plane, and inference served by a node's
+static seat over NATS are real; usage, the route table and the admin event
+stream still answer a canned happy path (below), and streamed responses
+wait on hale's streaming. The contract comes first.
 
 ## The api
 
@@ -31,13 +32,14 @@ body into the row's request and writes the contract's JSON
 |---|---|
 | health | `GET /healthz`, `GET /readyz` |
 | the caller plane | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1/capabilities` (a project key required) |
-| inference | `POST /v1/responses`, `POST /v1/chat/completions`: admitted, then `503 no_eligible_seat` (below) |
+| inference | `POST /v1/responses`, `POST /v1/chat/completions`, served by a node's seat over NATS (not streamed yet) |
 | the catalog | `GET`, `POST /admin/v1/models`; `GET`, `PATCH`, `DELETE /admin/v1/models/{model}` |
 | projects, budgets, limits | `/admin/v1/projects`, `.../{project}`, `.../{project}/budget`, `.../{project}/limits` |
 | keys | `GET`, `POST .../keys`; `GET`, `PATCH`, `DELETE .../keys/{key}` |
 | accounts | `GET`, `POST /admin/v1/accounts`; `GET`, `PATCH`, `DELETE /admin/v1/accounts/{account}` |
 | nodes and seats | `/admin/v1/nodes`, `.../{node}`, `.../{node}/token`, `.../{node}/seats`, `.../{node}/seats/{seat}` |
 | the change log | `GET /admin/v1/changes`, written by every admin write above |
+| the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
 
 The configuration lives in memory for now (`MemoryStore`, behind the
 `Store` interface in [`api/store.hl`](./api/store.hl)), so it is lost when
@@ -46,20 +48,30 @@ the next implementation of the same interface, and the in-memory one stays
 as the tests' double. Budgets and limits are configuration: nothing is
 counted against them until requests are served.
 
-No node can connect yet (the node plane is still canned), so a node stays
-`pending`, every seat is `offline` with the problems the coordinator can
-see, and every model is unavailable. An inference request is admitted (its
-key, model, account and data class) and then answered `503
-no_eligible_seat`. A request with `"stream": true` is answered `400
-unsupported`: hale's `std::http::Server` cannot stream a response body yet.
+A node is `pending` until it registers, then `up` while it heartbeats and
+`down` after three missed intervals; each seat shows the state its node
+reported, and the problems the coordinator sees (an engine the node does
+not offer, a config its engine requires, an archived account, a model not
+in the catalog). A change to a node or its seats is a new assignment,
+published to the node on NATS. An inference request is admitted (its key,
+model, account and data class), then offered to each seat that could take
+it in turn: a seat that refuses, does not answer, or fails before output is
+an attempt in `voice.attempts`, and the next is offered the request. Each
+attempt answers on a reply subject of its own, and a seat the api stops
+waiting for is sent `cancel`. When every seat fails, the `502` carries the
+request id and the attempts in `error.voice`. A seat whose node holds a
+local cap of 0 is not offered. Chat Completions messages are converted to
+the standard's input items (content parts, tool calls and tool results),
+and what has no standard form is refused `400 unsupported`. The api serves
+its callers one at a time, and opens a NATS connection for each attempt. A request with `"stream": true` is answered `400 unsupported`:
+hale's `std::http::Server` cannot stream a response body yet.
 A request body over 1 MiB is refused by the server before voice reads it,
 `413` in plain text, though the contract allows 12 MiB and a JSON error
 (see [`FRICTION.md`](./FRICTION.md)).
 
-The node plane, usage, the route table and the admin event stream answer
-their happy path: a canned body from [`api/canned/`](./api/canned/), one
-file per `operationId`, drawn from one example (a `laptop` node with a
-`static` seat). Each is replaced by a row as it is made real.
+Usage, the route table and the admin event stream answer their happy path:
+a canned body from [`api/canned/`](./api/canned/), one file per
+`operationId`. Each is replaced by a row as it is made real.
 
 ```sh
 hale build api
@@ -76,19 +88,43 @@ Every canned body, and a live call to every endpoint, validates against the
 spec (`spec/validate`). Friction met along the way is in
 [`FRICTION.md`](./FRICTION.md).
 
-## The node (skeleton)
+## The node
 
-[`node/`](./node/) is the start of the real node, not a stub. It reads
-and checks its capabilities file at start (refusing a kind it cannot run),
-serves its local API from `node.yaml` (status, capabilities, local
-controls) and retries the coordinator. The protocol (assignments, seat
-states, serving) and the static engine come next.
+[`node/`](./node/) is voice's own node. It reads and checks its
+capabilities file at start (refusing a kind it cannot run) and serves its
+local API from `node.yaml` (status, capabilities, local controls). It
+registers on the api's node plane with its enrollment token, applies the
+assignment that comes back (refusing a seat outside what it offers, and
+holding one its local controls pause), reports every seat's state and
+heartbeats with the assignment version it applied. On NATS it takes
+`assign`, and answers `serve` at once with `accepted` or `refused`, then
+serves the request on its seat with the static engine, streaming the
+standard's events and the result to the reply subject the request named
+(`protocol.yaml`); a `cancel` stops it. It serves one request at a time,
+and refuses a `serve` that arrives meanwhile, so the request goes to
+another seat. Core NATS delivers an `assign` at most once, so a node reads
+its assignment each time it is on NATS again, and the api sends the
+assignment again to a node whose heartbeat says it is behind.
+
+The node's calls to the api's node plane run on a thread of their own
+(`Plane`), apart from the NATS session (`Session`): the api serves one
+caller at a time, so a heartbeat can wait for as long as a request holds
+the api, and a session waiting there could not answer the `serve` that
+fails that request over to it. The static engine's `fail_after_ms` makes a
+seat fail every request after that long, for drills.
 
 ```sh
 hale build node
-node/node --id laptop --data node-data --capabilities deploy/node/capabilities.json --port 8081
+node/node --id laptop --api http://127.0.0.1:8080 --token vn-... --data node-data --capabilities deploy/node/capabilities.json --port 8081
 hale test node
 ```
+
+[`scripts/e2e.sh`](./scripts/e2e.sh) runs the whole path on one machine:
+NATS (in a container of its own, or the one `NATS_URL` names), the api and
+a node, the node created and its seat configured through the admin plane,
+a response and a chat completion served and validated against the spec,
+a local pause that takes the seat out of service, and a seat change that
+reaches the node over NATS. CI runs it (`end to end`).
 
 ## Running the process model
 
@@ -102,9 +138,11 @@ curl localhost:8080/healthz        # the api; see "The api" for a key
 curl localhost:8081/node/v1/status # the node's local API
 ```
 
-Today the api keeps its configuration in memory and answers the node plane
-with canned bodies, and the brain and node are skeletons, so nothing reads
-Postgres or NATS yet, and the node registers with the stub's canned answer.
+The node `local` serves once it exists on the api and is started with its
+token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
+seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
+-d node`. The api keeps its configuration in memory, so nothing reads
+Postgres yet, and the brain is a skeleton.
 
 ## The brain (skeleton)
 
@@ -496,10 +534,11 @@ already there.
 
 **Node**
 
-- The session registers over the node plane, then holds the NATS
-  connection (`pond/realtime/nats`, which reconnects and resubscribes on
-  its own) and posts heartbeats. It is pinned, because the client's reads
-  block.
+- The plane registers over the node plane, posts seat states and
+  heartbeats, and reads the assignment when the session asks; the session
+  holds the NATS connection (`pond/realtime/nats`) and serves. Each is
+  pinned to its own thread, because the client's reads and the node
+  plane's calls block, and they talk over the bus.
 - The capabilities file is read at start and declared at registration; the
   assignment that comes back, and every `assign` after, is reconciled
   against it, and seat states are posted back.

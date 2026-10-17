@@ -1,9 +1,9 @@
 // The catalog: configured on the admin plane (`Catalog`), read by callers
 // through their key (`Models`).
 //
-// A model lists the seats configured to serve it. No node can connect yet
-// (the node plane is still canned), so no seat is up: every model is
-// unavailable and carries no data class an eligible seat could carry.
+// A model lists the seats configured to serve it, and is available while
+// one of them could take a request (inference.hl, `seat_ready`); the data
+// classes a caller sees are those such seats carry.
 
 locus Catalog {
     params { store: Store; }
@@ -87,6 +87,8 @@ locus Catalog {
     fn view(r: ModelRow) -> CatalogModel fallible(ApiError) {
         let seats = self.store.seats() or fail store_failed(err);
         let mut v = catalog_view(r);
+        let a = availability(self.store, r.id) or raise;
+        v.available = a.available;
         for s in seats.rows {
             if seat_serves(s, r.id) { push(v.seats.items, s.ref) or discard; }
         }
@@ -106,7 +108,10 @@ locus Models {
         let rows = self.store.models() or fail metering_failed(err);
         let mut out = ModelList { };
         for r in rows.rows {
-            if !r.removed && visible(p, k, r.id) { push(out.data, model_view(r)) or discard; }
+            if !r.removed && visible(p, k, r.id) {
+                let v = model_with_seats(self.store, r) or raise;
+                push(out.data, v) or discard;
+            }
         }
         return out;
     }
@@ -120,7 +125,7 @@ locus Models {
         if !row.present || row.removed || !visible(p, k, r.model) {
             fail ApiError { status: 404, kind: "not_found", code: "model_not_found", message: "no model " + r.model, param: "model" };
         }
-        return model_view(row);
+        return model_with_seats(self.store, row) or raise;
     }
 
     /// `getCapabilities`: the project and key, the models the key may
@@ -297,4 +302,36 @@ fn capabilities_json(c: Capabilities) -> String {
     return "{\"project\": {\"id\": " + jq(c.project_id) + ", \"name\": " + jq(c.project_name) + "}, \"key\": {\"id\": " + jq(c.key_id) + ", \"name\": " + jq(c.key_name) + "}"
         + ", \"data_classes\": " + jnames(c.data_classes) + ", \"models\": [" + models + "], \"accounts\": " + jrestriction(c.accounts)
         + ", \"limits\": [" + limits + "], \"budget\": " + maybe_budget_json(c.budget) + "}";
+}
+
+/// Whether a model can be served now, and the data classes the seats that
+/// could serve it carry.
+type Availability { available: Bool = false; data_classes: Names = Names { }; }
+
+/// A seat could serve `model` when it is enabled, spends an account that
+/// is not archived, and its node is up, not draining, has applied its
+/// assignment, reports it `up` and holds it by no local control.
+fn availability(store: Store, model: String) -> Availability fallible(ApiError) {
+    let seats = store.seats() or fail store_failed(err);
+    let mut out = Availability { };
+    for s in seats.rows {
+        if seat_serves(s, model) && s.enabled {
+            let ready = seat_ready(store, s) or raise;
+            if ready {
+                out.available = true;
+                for dc in s.data_classes.items {
+                    if !has_name(out.data_classes, dc) { push(out.data_classes.items, dc) or discard; }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+fn model_with_seats(store: Store, r: ModelRow) -> Model fallible(ApiError) {
+    let mut v = model_view(r);
+    let a = availability(store, r.id) or raise;
+    v.available = a.available;
+    v.data_classes = a.data_classes;
+    return v;
 }

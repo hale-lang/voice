@@ -147,3 +147,32 @@ contract's limit (a request body may be up to 12 MiB) nor its shape (an
 JSON error. A request between 1 and 12 MiB (a long conversation, an
 attached file) is refused with plain text until the server's cap can be
 set (`TODO` in `api/inference.hl`, a line in the README).
+
+## A NATS client held for the api's life grows with every served request
+
+**hale 0.24.0, pond `realtime/nats` at `697852f`.** The api first held one
+`NatsClient` for its life and served every request over it: subscribe to
+the request's reply subject, `request` the node's `serve`, `read_msg` a
+dozen events and the result, unsubscribe. Its `NatsFramer` region grew by
+about 700 bytes a request (`LOTUS_ARENA_RESIDENCY=1`, two dumps 2000
+requests apart: the framer's `used=` from 312 to 1.4 MB; every other
+arena flat), and `hale verify` said nothing. A program that publishes and
+reads on a long-lived client in a loop, with subjects and payloads of
+varying length, in bursts, or around a `request` nobody answers, stays
+flat, so the shape that grows is narrower than "a long-lived client"; the
+node's long-lived client, which receives one `serve` a request, stayed
+flat over 3000.
+
+**Working shape:** the api opens a connection for each use and closes it
+after (`NatsLink` in `api/link.hl`), so the client and its framer are
+reclaimed with the call. A connection to NATS on the private network
+costs about a millisecond, against a request that waits for its seat.
+
+## `draining` and `drain` cannot name a method
+
+**hale 0.24.0.** The node plane's last report is `POST /node/v1/draining`,
+and its handler is naturally `NodePlane::draining`. `draining` is the drain
+flag every locus carries (`self.draining`) and `drain` is a lifecycle hook,
+so both are refused as method names, and so as rpc members.
+
+**Working shape:** `NodePlane::going_away`.

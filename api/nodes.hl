@@ -2,9 +2,11 @@
 // here, which issues its enrollment token; a seat is one of the node's
 // engines, spending one account, serving some catalog models.
 //
-// No node can connect yet (the node plane is still canned, step 2), so a
-// node is `pending` until it is revoked, has declared no capabilities, and
-// every seat is `offline`, with the problems the coordinator can see.
+// A node is `pending` until it first registers on the node plane
+// (fleet.hl), then `up` or `down` by its heartbeat; a seat shows the state
+// its node reported for it, and the problems the coordinator can see.
+// A change to a node or its seats is a new assignment, published to the
+// node over the link.
 
 type NodeRef { node: String; }
 
@@ -79,6 +81,8 @@ type SeatView {
     config: String = "{}";
     // pending | offline | starting | up | down | disabled | paused | refused
     status: String = "offline";
+    // the node's reason, "" for `null`
+    reason: String = "";
     in_flight: Int = 0;
     problems: Problems = Problems { };
 }
@@ -94,10 +98,23 @@ type Node {
     name: String = "";
     // pending | up | down | revoked
     status: String = "pending";
+    // the node software's version, its capabilities and local controls as
+    // it last declared them: "" for `null` until it first registers
+    version: String = "";
+    capabilities: String = "";
+    local: String = "";
     max_in_flight: Int = -1;
+    // -1 for `null` until it first registers
+    effective_max_in_flight: Int = -1;
     in_flight: Int = 0;
     assignment_version: Int = 0;
+    // -1 for `null`
+    applied_version: Int = -1;
     seats: SeatViews = SeatViews { };
+    connected: Bool = false;
+    connected_at: Time = `1970-01-01T00:00:00Z`;
+    beating: Bool = false;
+    last_heartbeat_at: Time = `1970-01-01T00:00:00Z`;
     created_at: Time = `1970-01-01T00:00:00Z`;
     revoked: Bool = false;
     revoked_at: Time = `1970-01-01T00:00:00Z`;
@@ -107,7 +124,10 @@ type Node {
 type NodeList { data: bounded[Node; 64]; }
 
 locus Nodes {
-    params { store: Store; }
+    params {
+        store: Store;
+        link: Link;
+    }
 
     /// `listNodes`.
     fn list() -> NodeList fallible(ApiError) {
@@ -158,6 +178,7 @@ locus Nodes {
         row.assignment_version = row.assignment_version + 1;
         let after = self.view(row) or raise;
         self.store.update_node(row, change("update", "nodes/" + row.id, node_change_json(before), node_change_json(after))) or fail store_failed(err);
+        tell_assignment(self.store, self.link, row.id) or raise;
         return after;
     }
 
@@ -199,12 +220,24 @@ locus Nodes {
     /// The row with its seats.
     fn view(r: NodeRow) -> Node fallible(ApiError) {
         let seats = self.store.seats() or fail store_failed(err);
+        let f = self.store.fleet(r.id) or fail store_failed(err);
+        let b = self.store.beat(r.id) or fail store_failed(err);
         let mut v = Node {
             id: r.id,
             name: r.name,
-            status: if r.revoked { "revoked" } else { "pending" },
+            status: node_status(self.store, r, now_seconds()) or raise,
+            version: f.version,
+            capabilities: f.capabilities,
+            local: f.local,
             max_in_flight: r.max_in_flight,
+            effective_max_in_flight: effective_cap(self.store, r) or raise,
+            in_flight: b.in_flight,
             assignment_version: r.assignment_version,
+            applied_version: f.applied_version,
+            connected: f.present,
+            connected_at: f.registered_at,
+            beating: b.present,
+            last_heartbeat_at: b.at,
             created_at: r.created_at,
             revoked: r.revoked,
             revoked_at: r.revoked_at
@@ -220,7 +253,10 @@ locus Nodes {
 }
 
 locus Seats {
-    params { store: Store; }
+    params {
+        store: Store;
+        link: Link;
+    }
 
     /// `listSeats`.
     fn list(r: NodeRef) -> SeatList fallible(ApiError) {
@@ -266,7 +302,8 @@ locus Seats {
         let v = seat_view(self.store, row, n) or raise;
         let added = self.store.insert_seat(row, change("create", seat_target(row), "", seat_json(v))) or fail store_failed(err);
         if !added { fail conflict("node " + c.node + " has a seat " + c.id); }
-        return v;
+        tell_assignment(self.store, self.link, c.node) or raise;
+        return seat_view(self.store, row, n) or raise;
     }
 
     /// `getSeat`.
@@ -291,7 +328,8 @@ locus Seats {
         self.check(row) or raise;
         let after = seat_view(self.store, row, n) or raise;
         self.store.update_seat(row, change("update", seat_target(row), seat_json(before), seat_json(after))) or fail store_failed(err);
-        return after;
+        tell_assignment(self.store, self.link, row.node) or raise;
+        return seat_view(self.store, row, n) or raise;
     }
 
     /// `removeSeat`: it takes no new requests.
@@ -300,6 +338,7 @@ locus Seats {
         let row = self.known(r.node, r.seat) or raise;
         let before = seat_view(self.store, row, n) or raise;
         self.store.delete_seat(row, change("delete", seat_target(row), seat_json(before), "")) or fail store_failed(err);
+        tell_assignment(self.store, self.link, row.node) or raise;
         return before;
     }
 
@@ -327,8 +366,9 @@ locus Seats {
     }
 }
 
-/// A seat with its state and its problems. Its node has not connected, so
-/// it is `offline`.
+/// A seat with its state and its problems: `offline` while its node is
+/// not up, `pending` until the node reports on the assignment that
+/// carries it, then what the node reported.
 fn seat_view(store: Store, s: SeatRow, n: NodeRow) -> SeatView fallible(ApiError) {
     let mut v = SeatView {
         ref: s.node + "/" + s.id,
@@ -342,10 +382,37 @@ fn seat_view(store: Store, s: SeatRow, n: NodeRow) -> SeatView fallible(ApiError
         enabled: s.enabled,
         config: s.config
     };
+    let f = store.fleet(n.id) or fail store_failed(err);
+    let status = node_status(store, n, now_seconds()) or raise;
+    if status == "up" {
+        v.status = "pending";
+        if f.applied_version >= n.assignment_version {
+            let states = store.seat_states(n.id) or fail store_failed(err);
+            for st in states.rows {
+                if st.seat == s.id {
+                    v.status = st.status;
+                    v.reason = st.reason;
+                    v.in_flight = st.in_flight;
+                }
+            }
+        }
+    }
     if n.revoked {
         push(v.problems.items, "node " + n.id + " is revoked") or discard;
-    } else {
+    } else if !f.present {
         push(v.problems.items, "node " + n.id + " has not connected, so it has declared no engines to check engine " + s.engine + " against") or discard;
+    } else {
+        let engines = declared_engines(f.capabilities) or DeclaredEngines { };
+        let mut offered = false;
+        for e in engines.items {
+            if e.id == s.engine {
+                offered = true;
+                for field in e.required.items {
+                    if kind_of(s.config, field) == "missing" { push(v.problems.items, "config has no " + field + ", which engine " + s.engine + " requires") or discard; }
+                }
+            }
+        }
+        if !offered { push(v.problems.items, "node " + n.id + " does not offer engine " + s.engine) or discard; }
     }
     let a = store.account(s.account) or fail store_failed(err);
     if !a.present {
@@ -471,20 +538,15 @@ fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fall
 }
 
 fn seat_json(s: SeatView) -> String {
-    let serves_list = JsonList { };
-    for m in s.serves.items {
-        serves_list.add("{\"model\": " + jq(m.model) + ", \"as\": " + (if len(m.engine_name) > 0 { jq(m.engine_name) } else { "null" }) + "}");
-    }
-    let serves = serves_list.text();
     let problems_list = JsonList { };
     for p in s.problems.items {
         problems_list.add(jq(p));
     }
     let problems = problems_list.text();
-    return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": [" + serves + "]"
+    return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": " + serves_json(s.serves)
         + ", \"data_classes\": " + jnames(s.data_classes) + ", \"concurrency\": " + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
         + ", \"config\": " + s.config + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(s.status)
-        + ", \"reason\": null, \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
+        + ", \"reason\": " + (if len(s.reason) > 0 { jq(s.reason) } else { "null" }) + ", \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
 }
 
 fn seat_list_json(l: SeatList) -> String {
@@ -504,9 +566,11 @@ fn node_json(n: Node) -> String {
     }
     let seats = seats_list.text();
     let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(n.status)
-        + ", \"version\": null, \"capabilities\": null, \"local\": null, \"max_in_flight\": " + jnullable(n.max_in_flight)
-        + ", \"effective_max_in_flight\": null, \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
-        + ", \"applied_version\": null, \"seats\": [" + seats + "], \"connected_at\": null, \"last_heartbeat_at\": null"
+        + ", \"version\": " + (if len(n.version) > 0 { jq(n.version) } else { "null" }) + ", \"capabilities\": " + jraw_or_null(n.capabilities)
+        + ", \"local\": " + jraw_or_null(n.local) + ", \"max_in_flight\": " + jnullable(n.max_in_flight)
+        + ", \"effective_max_in_flight\": " + jnullable(n.effective_max_in_flight) + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
+        + ", \"applied_version\": " + jnullable(n.applied_version) + ", \"seats\": [" + seats + "], \"connected_at\": " + jtime_or_null(n.connected, n.connected_at)
+        + ", \"last_heartbeat_at\": " + jtime_or_null(n.beating, n.last_heartbeat_at)
         + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.revoked, n.revoked_at);
     if len(n.enrollment_token) > 0 { out = out + ", \"enrollment_token\": " + jq(n.enrollment_token); }
     return out + "}";

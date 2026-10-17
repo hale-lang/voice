@@ -1,0 +1,406 @@
+// The REST wire of ../spec/openapi.yaml for the rows of surface.hl: a
+// request body decoded into a row's request, a row's answer encoded as the
+// contract's JSON. The surface's own codec speaks its own wire, so the
+// contract's (a `null` list, a `null` price, `checks` as a map) is written
+// here by hand.
+
+// ---- reading ---------------------------------------------------------
+
+/// A body that is one JSON object, or a 400.
+fn object_body(body: String) -> Bool fallible(ApiError) {
+    if !std::json::valid_object(body) { fail invalid("the body is one JSON object", ""); }
+    return true;
+}
+
+/// The JSON kind of `name` in `body`: string, number, bool, null, array,
+/// object, missing or invalid.
+fn kind_of(body: String, name: String) -> String {
+    return std::json::string_field(body, name).kind;
+}
+
+/// True when the body sets `name` at all, `null` included.
+fn sets(body: String, name: String) -> Bool {
+    return kind_of(body, name) != "missing";
+}
+
+/// A string field; `otherwise` when it is absent.
+fn string_or(body: String, name: String, otherwise: String) -> String fallible(ApiError) {
+    let f = std::json::string_field(body, name);
+    if f.kind == "missing" { return otherwise; }
+    if f.kind != "string" { fail invalid("`" + name + "` is a string", name); }
+    return f.text;
+}
+
+/// A string field the body must set.
+fn required_string(body: String, name: String) -> String fallible(ApiError) {
+    let f = std::json::string_field(body, name);
+    if f.kind != "string" { fail invalid("`" + name + "` is a required string", name); }
+    return f.text;
+}
+
+/// An integer field of at least 1; `otherwise` when it is absent.
+fn count_or(body: String, name: String, otherwise: Int) -> Int fallible(ApiError) {
+    let kind = kind_of(body, name);
+    if kind == "missing" { return otherwise; }
+    let raw = std::str::trim(std::json::find_field_raw(body, name));
+    if kind != "number" || !is_integer(raw) { fail invalid("`" + name + "` is an integer", name); }
+    let n = std::str::parse_int(raw) or fail invalid("`" + name + "` is out of range", name);
+    if n < 1 { fail invalid("`" + name + "` is at least 1", name); }
+    return n;
+}
+
+/// An integer field of at least 0, which the body must set.
+fn required_amount(obj: String, name: String) -> Int fallible(ApiError) {
+    let raw = std::str::trim(std::json::find_field_raw(obj, name));
+    if kind_of(obj, name) != "number" || !is_integer(raw) { fail invalid("`" + name + "` is a required integer", name); }
+    let n = std::str::parse_int(raw) or fail invalid("`" + name + "` is out of range", name);
+    if n < 0 { fail invalid("`" + name + "` is at least 0", name); }
+    return n;
+}
+
+/// Digits, with an optional leading minus: a JSON integer.
+fn is_integer(raw: String) -> Bool {
+    let n = len(raw);
+    if n == 0 { return false; }
+    let v = std::str::bytes_view(raw);
+    let mut i = 0;
+    if std::str::byte_at(v, 0) == 45 { i = 1; }
+    if i >= n { return false; }
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        if b < 48 || b > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A JSON array of strings, as `Names`.
+fn names_of(raw: String, name: String) -> Names fallible(ApiError) {
+    let mut out = Names { };
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if len(e) < 2 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+            fail invalid("`" + name + "` is a list of strings", name);
+        }
+        let s = std::json::unescape_string(e[1..(len(e) - 1)]);
+        push(out.items, s) or fail invalid("`" + name + "` holds at most 32 names", name);
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// A list of names that is never `null`; empty when it is absent.
+fn names_field(body: String, name: String) -> Names fallible(ApiError) {
+    let kind = kind_of(body, name);
+    if kind == "missing" { return Names { }; }
+    if kind != "array" { fail invalid("`" + name + "` is a list of strings", name); }
+    return names_of(std::json::find_field_raw(body, name), name) or raise;
+}
+
+/// A list of names that may be `null`, which is no restriction; no
+/// restriction when it is absent.
+fn restriction_field(body: String, name: String) -> Restriction fallible(ApiError) {
+    let kind = kind_of(body, name);
+    if kind == "missing" || kind == "null" { return Restriction { }; }
+    if kind != "array" { fail invalid("`" + name + "` is a list of strings or null", name); }
+    let ns = names_of(std::json::find_field_raw(body, name), name) or raise;
+    return Restriction { any: false, names: ns };
+}
+
+/// An `accounts` restriction: its names are account ids
+/// (`^[a-z0-9][a-z0-9-]{0,62}$`).
+fn accounts_field(body: String) -> Restriction fallible(ApiError) {
+    let r = restriction_field(body, "accounts") or raise;
+    for n in r.names.items {
+        if !is_slug(n) { fail invalid("`accounts` names account ids, and " + n + " is not one", "accounts"); }
+    }
+    return r;
+}
+
+/// A `price` field: a `ModelPrice`, or `null` (`priced` false).
+type PriceField { priced: Bool = false; price: ModelPrice = ModelPrice { }; }
+
+fn price_field(body: String) -> PriceField fallible(ApiError) {
+    let kind = kind_of(body, "price");
+    if kind == "missing" || kind == "null" { return PriceField { }; }
+    if kind != "object" { fail invalid("`price` is a price or null", "price"); }
+    let p = std::json::find_field_raw(body, "price");
+    let price = ModelPrice {
+        input_per_mtok_micros: required_amount(p, "input_per_mtok_micros") or raise,
+        output_per_mtok_micros: required_amount(p, "output_per_mtok_micros") or raise,
+        currency: string_or(p, "currency", "USD") or raise
+    };
+    return PriceField { priced: true, price: price };
+}
+
+/// An RFC 3339 instant in UTC.
+fn time_field(body: String, name: String) -> Time fallible(ApiError) {
+    let f = std::json::string_field(body, name);
+    if f.kind != "string" { fail invalid("`" + name + "` is an RFC 3339 time", name); }
+    return rfc3339(f.text) or fail invalid("`" + name + "` is an RFC 3339 time (2026-10-17T12:00:00Z, or with an offset)", name);
+}
+
+type TimeError { text: String = ""; }
+
+/// An RFC 3339 instant, in UTC: `Z` or an offset (`+02:00`, `-05:30`),
+/// `T` and `Z` in either case. `std::time::parse_time` reads only the
+/// `Z` form, so an offset is taken off by hand.
+fn rfc3339(text: String) -> Time fallible(TimeError) {
+    let t = std::str::upper(std::str::trim(text));
+    if std::str::ends_with(t, "Z") { return std::time::parse_time(t) or fail TimeError { text: text }; }
+    let n = len(t);
+    if n < 6 { fail TimeError { text: text }; }
+    let sign = t[(n - 6)..(n - 5)];
+    if (sign != "+" && sign != "-") || t[(n - 3)..(n - 2)] != ":" { fail TimeError { text: text }; }
+    let hh = std::str::parse_int(t[(n - 5)..(n - 3)]) or fail TimeError { text: text };
+    let mm = std::str::parse_int(t[(n - 2)..n]) or fail TimeError { text: text };
+    if hh > 23 || mm > 59 { fail TimeError { text: text }; }
+    let local = std::time::parse_time(t[0..(n - 6)] + "Z") or fail TimeError { text: text };
+    let offset = (hh * 60 + mm) * 60 * 1000000000;
+    return std::time::from_nanos(if sign == "+" { std::time::nanos(local) - offset } else { std::time::nanos(local) + offset });
+}
+
+/// A field the contract has and this build does not serve yet.
+fn refuse_field(body: String, name: String, why: String) -> Bool fallible(ApiError) {
+    if sets(body, name) { fail unsupported("`" + name + "` is not served yet: " + why, name); }
+    return true;
+}
+
+/// `CatalogModelCreate`.
+fn read_model_create(body: String) -> CatalogModelCreate fallible(ApiError) {
+    object_body(body) or raise;
+    let price = price_field(body) or raise;
+    return CatalogModelCreate {
+        id: required_string(body, "id") or raise,
+        owned_by: string_or(body, "owned_by", "local") or raise,
+        kind: string_or(body, "kind", "local") or raise,
+        context_length: count_or(body, "context_length", 0) or raise,
+        max_output_tokens: count_or(body, "max_output_tokens", 0) or raise,
+        priced: price.priced,
+        price: price.price
+    };
+}
+
+/// `CatalogModelUpdate` for `model`. The id cannot change.
+fn read_model_update(body: String, model: String) -> CatalogModelUpdate fallible(ApiError) {
+    object_body(body) or raise;
+    if sets(body, "id") { fail invalid("a model's `id` cannot change", "id"); }
+    let price = price_field(body) or raise;
+    return CatalogModelUpdate {
+        model: model,
+        set_owned_by: sets(body, "owned_by"),
+        owned_by: string_or(body, "owned_by", "") or raise,
+        set_kind: sets(body, "kind"),
+        kind: string_or(body, "kind", "") or raise,
+        set_context_length: sets(body, "context_length"),
+        context_length: count_or(body, "context_length", 0) or raise,
+        set_max_output_tokens: sets(body, "max_output_tokens"),
+        max_output_tokens: count_or(body, "max_output_tokens", 0) or raise,
+        set_price: sets(body, "price"),
+        priced: price.priced,
+        price: price.price
+    };
+}
+
+/// `ProjectCreate`.
+fn read_project_create(body: String) -> ProjectCreate fallible(ApiError) {
+    object_body(body) or raise;
+    refuse_field(body, "budget", "set it with PUT /admin/v1/projects/{project}/budget once budgets are served") or raise;
+    refuse_field(body, "limits", "set them with PUT /admin/v1/projects/{project}/limits once limits are served") or raise;
+    return ProjectCreate {
+        id: required_string(body, "id") or raise,
+        name: required_string(body, "name") or raise,
+        owners: names_field(body, "owners") or raise,
+        data_classes: names_field(body, "data_classes") or raise,
+        models: restriction_field(body, "models") or raise,
+        accounts: accounts_field(body) or raise
+    };
+}
+
+/// `ProjectUpdate` for `project`.
+fn read_project_update(body: String, project: String) -> ProjectUpdate fallible(ApiError) {
+    object_body(body) or raise;
+    if sets(body, "id") { fail invalid("a project's `id` cannot change", "id"); }
+    return ProjectUpdate {
+        project: project,
+        set_name: sets(body, "name"),
+        name: string_or(body, "name", "") or raise,
+        set_owners: sets(body, "owners"),
+        owners: names_field(body, "owners") or raise,
+        set_data_classes: sets(body, "data_classes"),
+        data_classes: names_field(body, "data_classes") or raise,
+        set_models: sets(body, "models"),
+        models: restriction_field(body, "models") or raise,
+        set_accounts: sets(body, "accounts"),
+        accounts: accounts_field(body) or raise
+    };
+}
+
+/// `KeyCreate` under `project`.
+fn read_key_create(body: String, project: String) -> KeyCreate fallible(ApiError) {
+    object_body(body) or raise;
+    refuse_field(body, "limits", "key limits are served with the project's") or raise;
+    let expires = sets(body, "expires_at");
+    return KeyCreate {
+        project: project,
+        name: required_string(body, "name") or raise,
+        models: restriction_field(body, "models") or raise,
+        accounts: accounts_field(body) or raise,
+        expires: expires,
+        expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }
+    };
+}
+
+/// `KeyUpdate` for `key` under `project`. `expires_at: null` removes the
+/// expiry.
+fn read_key_update(body: String, project: String, key: String) -> KeyUpdate fallible(ApiError) {
+    object_body(body) or raise;
+    refuse_field(body, "limits", "key limits are served with the project's") or raise;
+    let expiry = kind_of(body, "expires_at");
+    let expires = expiry != "missing" && expiry != "null";
+    return KeyUpdate {
+        project: project,
+        key: key,
+        set_name: sets(body, "name"),
+        name: string_or(body, "name", "") or raise,
+        set_models: sets(body, "models"),
+        models: restriction_field(body, "models") or raise,
+        set_accounts: sets(body, "accounts"),
+        accounts: accounts_field(body) or raise,
+        set_expires: expiry != "missing",
+        expires: expires,
+        expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }
+    };
+}
+
+// ---- writing ---------------------------------------------------------
+
+/// A JSON string literal.
+fn jq(s: String) -> String {
+    return "\"" + std::json::escape_string(s) + "\"";
+}
+
+fn jbool(b: Bool) -> String {
+    return if b { "true" } else { "false" };
+}
+
+fn jnames(ns: Names) -> String {
+    let mut out = "[";
+    let mut first = true;
+    for n in ns.items {
+        if !first { out = out + ", "; }
+        out = out + jq(n);
+        first = false;
+    }
+    return out + "]";
+}
+
+fn jrestriction(r: Restriction) -> String {
+    return if r.any { "null" } else { jnames(r.names) };
+}
+
+fn jtime(t: Time) -> String {
+    return jq(std::time::iso8601(t));
+}
+
+/// A time that is `null` unless `set`.
+fn jtime_or_null(set: Bool, t: Time) -> String {
+    return if set { jtime(t) } else { "null" };
+}
+
+fn jprice(priced: Bool, p: ModelPrice) -> String {
+    if !priced { return "null"; }
+    return "{\"input_per_mtok_micros\": " + to_string(p.input_per_mtok_micros) + ", \"output_per_mtok_micros\": " + to_string(p.output_per_mtok_micros) + ", \"currency\": " + jq(p.currency) + "}";
+}
+
+/// `, "name": n` when the count is set (at least 1), nothing otherwise.
+fn jcount_field(name: String, n: Int) -> String {
+    return if n > 0 { ", \"" + name + "\": " + to_string(n) } else { "" };
+}
+
+/// `{"data": [...]}` around entries already encoded.
+fn jdata(entries: String) -> String {
+    return "{\"data\": [" + entries + "]}";
+}
+
+fn join(acc: String, entry: String) -> String {
+    return if len(acc) == 0 { entry } else { acc + ", " + entry };
+}
+
+fn health_json(h: Health, checks: Bool) -> String {
+    let mut out = "{\"status\": " + jq(h.status) + ", \"version\": " + jq(h.version);
+    if checks { out = out + ", \"checks\": {\"store\": " + jq(h.store) + "}"; }
+    return out + "}";
+}
+
+fn catalog_model_json(m: CatalogModel) -> String {
+    return "{\"id\": " + jq(m.id) + ", \"owned_by\": " + jq(m.owned_by) + ", \"kind\": " + jq(m.kind)
+        + jcount_field("context_length", m.context_length) + jcount_field("max_output_tokens", m.max_output_tokens)
+        + ", \"price\": " + jprice(m.priced, m.price) + ", \"seats\": " + jnames(m.seats) + ", \"available\": " + jbool(m.available)
+        + ", \"created_at\": " + jtime(m.created_at) + "}";
+}
+
+fn catalog_list_json(l: CatalogList) -> String {
+    let mut entries = "";
+    for m in l.data {
+        entries = join(entries, catalog_model_json(m));
+    }
+    return jdata(entries);
+}
+
+fn model_json(m: Model) -> String {
+    return "{\"id\": " + jq(m.id) + ", \"object\": \"model\", \"created\": " + to_string(m.created) + ", \"owned_by\": " + jq(m.owned_by)
+        + ", \"voice\": {\"kind\": " + jq(m.kind) + jcount_field("context_length", m.context_length) + jcount_field("max_output_tokens", m.max_output_tokens)
+        + ", \"data_classes\": " + jnames(m.data_classes) + ", \"price\": " + jprice(m.priced, m.price) + ", \"available\": " + jbool(m.available) + "}}";
+}
+
+fn model_list_json(l: ModelList) -> String {
+    let mut entries = "";
+    for m in l.data {
+        entries = join(entries, model_json(m));
+    }
+    return "{\"object\": \"list\", \"data\": [" + entries + "]}";
+}
+
+fn project_json(p: Project) -> String {
+    return "{\"id\": " + jq(p.id) + ", \"name\": " + jq(p.name) + ", \"status\": " + jq(p.status)
+        + ", \"owners\": " + jnames(p.owners) + ", \"data_classes\": " + jnames(p.data_classes)
+        + ", \"models\": " + jrestriction(p.models) + ", \"accounts\": " + jrestriction(p.accounts)
+        + ", \"budget\": null, \"limits\": [], \"key_count\": " + to_string(p.key_count)
+        + ", \"position\": " + (if len(p.position) > 0 { jq(p.position) } else { "null" })
+        + ", \"created_at\": " + jtime(p.created_at) + ", \"archived_at\": " + jtime_or_null(p.archived, p.archived_at) + "}";
+}
+
+fn project_list_json(l: ProjectList) -> String {
+    let mut entries = "";
+    for p in l.data {
+        entries = join(entries, project_json(p));
+    }
+    return jdata(entries);
+}
+
+/// `Key`, or `KeyWithSecret` when the key carries its secret.
+fn key_json(k: Key) -> String {
+    let mut out = "{\"id\": " + jq(k.id) + ", \"project\": " + jq(k.project) + ", \"name\": " + jq(k.name) + ", \"prefix\": " + jq(k.prefix)
+        + ", \"models\": " + jrestriction(k.models) + ", \"accounts\": " + jrestriction(k.accounts) + ", \"limits\": []"
+        + ", \"created_at\": " + jtime(k.created_at) + ", \"expires_at\": " + jtime_or_null(k.expires, k.expires_at)
+        + ", \"last_used_at\": " + jtime_or_null(k.used, k.last_used_at) + ", \"status\": " + jq(k.status)
+        + ", \"revoked_at\": " + jtime_or_null(k.revoked, k.revoked_at);
+    if len(k.secret) > 0 { out = out + ", \"secret\": " + jq(k.secret); }
+    return out + "}";
+}
+
+fn key_list_json(l: KeyList) -> String {
+    let mut entries = "";
+    for k in l.data {
+        entries = join(entries, key_json(k));
+    }
+    return jdata(entries);
+}
+
+/// The contract's error envelope.
+fn error_json(e: ApiError) -> String {
+    return "{\"error\": {\"message\": " + jq(e.message) + ", \"type\": " + jq(e.kind) + ", \"code\": " + jq(e.code)
+        + ", \"param\": " + (if len(e.param) > 0 { jq(e.param) } else { "null" }) + "}}";
+}

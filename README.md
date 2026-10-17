@@ -11,29 +11,56 @@ Voice is written in [Hale](https://github.com/hale-lang/hale). The design is
 in [hale-lang/voice#1](https://github.com/hale-lang/voice/issues/1), and the
 settled direction in [`DIRECTION.md`](./DIRECTION.md).
 
-**Status:** the specification, and a stub of the api that answers every
-endpoint with a canned happy-path response (below). The contract comes first.
+**Status:** the specification, and the api on its way from a stub to the
+real thing: the catalog, projects, keys, the caller's view of the catalog
+and health are served for real; every other endpoint still answers a
+canned happy path (below). The contract comes first.
 
-## The stub api
+## The api
 
 [`api/`](./api/) is a Hale program that serves every endpoint in
-`openapi.yaml` and answers each with its happy path: a canned body from
+`openapi.yaml`. The ones made real are rows of an `api` surface
+([`api/surface.hl`](./api/surface.hl)), each a handler on a receiver over
+the configuration store; a thin router matches method and path, decodes the
+body into the row's request and writes the contract's JSON
+([`api/endpoints.hl`](./api/endpoints.hl), [`api/wire.hl`](./api/wire.hl)).
+
+| Served for real | Endpoints |
+|---|---|
+| health | `GET /healthz`, `GET /readyz` |
+| the catalog, as a key sees it | `GET /v1/models`, `GET /v1/models/{model}` (a project key required) |
+| the catalog | `GET`, `POST /admin/v1/models`; `GET`, `PATCH`, `DELETE /admin/v1/models/{model}` |
+| projects | `GET`, `POST /admin/v1/projects`; `GET`, `PATCH`, `DELETE /admin/v1/projects/{project}` |
+| keys | `GET`, `POST .../keys`; `GET`, `PATCH`, `DELETE .../keys/{key}` |
+
+The configuration lives in memory for now (`MemoryStore`, behind the
+`Store` interface in [`api/store.hl`](./api/store.hl)), so it is lost when
+the api restarts; the Postgres store of [`spec/store.md`](./spec/store.md) is
+the next implementation of the same interface. No seat can be configured
+yet, so every model is listed as unavailable. Budgets and limits are not
+served yet: a project or key body that sets them is refused as
+`unsupported`, a project's `budget` is `null` and its `limits` are empty.
+
+Every other endpoint answers its happy path: a canned body from
 [`api/canned/`](./api/canned/), one file per `operationId`, all drawn from
 one consistent example (a `work` project, `static` and `claude-work`
 accounts, a `laptop` node). Inference endpoints answer with the event stream
-when the request sets `"stream": true`. Nothing is stored and nothing is
-checked; it is there to build clients and the UI against, and each endpoint
-is replaced by its real handler as the MVP is built.
+when the request sets `"stream": true`. Each is replaced by a row as it is
+made real.
 
 ```sh
 hale build api
 api/api --port 8080          # --host, --canned DIR
-curl localhost:8080/v1/models
-hale test api                # every route answers its happy path
+curl -X POST localhost:8080/admin/v1/models -d '{"id": "echo-1"}'
+curl -X POST localhost:8080/admin/v1/projects -d '{"id": "work", "name": "Work"}'
+curl -X POST localhost:8080/admin/v1/projects/work/keys -d '{"name": "laptop"}'   # its "secret"
+curl localhost:8080/v1/models -H 'Authorization: Bearer vk-...'
+hale test api
 ```
 
-Every canned body validates against the spec. Friction met along the way is
-in [`FRICTION.md`](./FRICTION.md).
+Every canned body, and a live call to every endpoint, validates against the
+spec (`spec/validate`). Friction met along the way is in
+[`FRICTION.md`](./FRICTION.md).
 
 ## The node (skeleton)
 
@@ -57,13 +84,13 @@ with hale's released toolchain ([`Dockerfile`](./Dockerfile)).
 
 ```sh
 docker compose up --build
-curl localhost:8080/v1/models      # the api
+curl localhost:8080/healthz        # the api; see "The api" for a key
 curl localhost:8081/node/v1/status # the node's local API
 ```
 
-Today the api is the canned stub and the brain and node are skeletons, so
-nothing reads Postgres or NATS yet, and the node registers with the stub's
-canned answer.
+Today the api keeps its configuration in memory and answers the node plane
+with canned bodies, and the brain and node are skeletons, so nothing reads
+Postgres or NATS yet, and the node registers with the stub's canned answer.
 
 ## The brain (skeleton)
 

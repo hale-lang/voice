@@ -4,7 +4,7 @@ Voice's admin UI: one application that administers all of voice, the
 nodes included. The api serves its built files from its own origin.
 
 A first slice exists: the tokens, the components, and five screens against
-the stub (Overview, Nodes with a node inspector, Usage with a request
+the api (Overview, Nodes with a node inspector, Usage with a request
 inspector, Route table, Changes). This file records the decisions it is
 built on.
 
@@ -48,7 +48,9 @@ reusable parts become a library.
 
 ## Developing
 
-Against the stub, which answers every endpoint with a canned happy path:
+Against the api, which serves the catalog, projects and keys for real (in
+memory, starting empty) and answers every other endpoint with a canned
+happy path:
 
 ```sh
 hale build api && api/api --port 8080      # in the repository root

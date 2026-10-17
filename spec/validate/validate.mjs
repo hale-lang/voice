@@ -55,6 +55,8 @@ function checkSse(label, schema, text, chat) {
 const load = name => fs.readFileSync(path.join(dir, name), 'utf8');
 for (const o of ops()) {
   const ct = o.resp.content || {};
+  // an endpoint with a real handler has no canned body; live.mjs checks it
+  if (!fs.existsSync(path.join(dir, `${o.id}.json`)) && !fs.existsSync(path.join(dir, `${o.id}.stream.sse`))) continue;
   if (ct['application/json']) checkJson(`${o.id} (${o.method} ${o.path})`, ct['application/json'].schema, load(`${o.id}.json`));
   if (ct['text/event-stream']) {
     const chat = o.id === 'createChatCompletion';

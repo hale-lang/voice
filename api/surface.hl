@@ -1,0 +1,251 @@
+// The api's surface: every operation of ../spec/openapi.yaml that has a
+// real handler, one row each, with the shapes it takes and answers.
+//
+// The rows are the contract the program states about itself. The wire is
+// the contract's own REST shape, which no surface transport renders, so a
+// thin router (endpoints.hl) matches method and path, decodes the body
+// into a row's request (wire.hl), calls the row's handler on its receiver
+// and encodes the answer. The operations still answered by a canned body
+// have no row yet; each gets one as it is made real.
+//
+// Where the contract has a shape the JSON codec does not carry (a list
+// that may be `null`, a map, an enum), the type says it with a field the
+// codec does carry (`Restriction.any`, `Health.store`, a `String` for an
+// enum) and the router writes the contract's form. FRICTION.md lists them.
+
+/// A caller holding a project key (the caller plane).
+role caller;
+/// An administrator (the admin plane). Admin authentication is middleware
+/// that comes later; until then the api listens on loopback and every
+/// admin request holds it.
+role admin;
+
+api Voice {
+    // health
+    rpc Probes::liveness;
+    rpc Probes::readiness;
+
+    // caller plane: the catalog as a key sees it
+    rpc Models::list requires: [caller];
+    rpc Models::get requires: [caller];
+
+    // admin plane: the catalog
+    rpc Catalog::list requires: [admin];
+    rpc Catalog::create requires: [admin];
+    rpc Catalog::get requires: [admin];
+    rpc Catalog::update requires: [admin];
+    rpc Catalog::remove requires: [admin];
+
+    // admin plane: projects
+    rpc Projects::list requires: [admin];
+    rpc Projects::create requires: [admin];
+    rpc Projects::get requires: [admin];
+    rpc Projects::update requires: [admin];
+    rpc Projects::archive requires: [admin];
+
+    // admin plane: keys
+    rpc Keys::list requires: [admin];
+    rpc Keys::create requires: [admin];
+    rpc Keys::get requires: [admin];
+    rpc Keys::update requires: [admin];
+    rpc Keys::revoke requires: [admin];
+}
+
+/// A list of names that is never `null`: owners, data classes, seats. At
+/// most 32, as every list of names here.
+type Names { items: bounded[String; 32]; }
+
+/// A list of names that may be `null` on the wire, where `null` means no
+/// restriction (the whole catalog, any account): `any` is that `null`.
+type Restriction { any: Bool = true; names: Names = Names { }; }
+
+/// The contract's error envelope, with the HTTP status it goes out with.
+/// `kind` is the envelope's `type`.
+type ApiError {
+    status: Int = 500;
+    kind: String = "server_error";
+    code: String = "invalid_request";
+    message: String = "";
+    // the request field at fault, empty for none
+    param: String = "";
+}
+
+// ---- health ----------------------------------------------------------
+
+/// `Health`. `store` is the one check the readiness has (`checks.store`).
+type Health { status: String = "ok"; version: String = ""; store: String = ""; }
+
+// ---- the catalog -----------------------------------------------------
+
+type ModelPrice { input_per_mtok_micros: Int = 0; output_per_mtok_micros: Int = 0; currency: String = "USD"; }
+
+/// Which model: the `{model}` of the path.
+type ModelRef { model: String; }
+
+/// `CatalogModelCreate`. A count of 0 is not set; `priced` false is a
+/// `null` price, which is free.
+type CatalogModelCreate {
+    id: String;
+    owned_by: String = "local";
+    kind: String = "local";
+    context_length: Int = 0;
+    max_output_tokens: Int = 0;
+    priced: Bool = false;
+    price: ModelPrice = ModelPrice { };
+}
+
+/// `CatalogModelUpdate`, for the model the path names: only the fields
+/// whose `set_` flag is true change.
+type CatalogModelUpdate {
+    model: String;
+    set_owned_by: Bool = false;
+    owned_by: String = "";
+    set_kind: Bool = false;
+    kind: String = "";
+    set_context_length: Bool = false;
+    context_length: Int = 0;
+    set_max_output_tokens: Bool = false;
+    max_output_tokens: Int = 0;
+    set_price: Bool = false;
+    priced: Bool = false;
+    price: ModelPrice = ModelPrice { };
+}
+
+/// `CatalogModel`: the admin plane's view.
+type CatalogModel {
+    id: String = "";
+    owned_by: String = "local";
+    kind: String = "local";
+    context_length: Int = 0;
+    max_output_tokens: Int = 0;
+    priced: Bool = false;
+    price: ModelPrice = ModelPrice { };
+    // `<node>/<seat>` of each seat that serves it
+    seats: Names = Names { };
+    available: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type CatalogList { data: bounded[CatalogModel; 256]; }
+
+/// `Model`: the caller plane's view of a catalog model.
+type Model {
+    id: String = "";
+    created: Int = 0;
+    owned_by: String = "local";
+    kind: String = "local";
+    context_length: Int = 0;
+    max_output_tokens: Int = 0;
+    // data classes some eligible seat may carry
+    data_classes: Names = Names { };
+    priced: Bool = false;
+    price: ModelPrice = ModelPrice { };
+    available: Bool = false;
+}
+
+type ModelList { data: bounded[Model; 256]; }
+
+// ---- projects --------------------------------------------------------
+
+type ProjectRef { project: String; }
+
+type ProjectQuery { include_archived: Bool = false; }
+
+/// `ProjectCreate`, without `budget` and `limits`: the router refuses a
+/// body that sets them until budgets and limits are served.
+type ProjectCreate {
+    id: String;
+    name: String;
+    owners: Names = Names { };
+    // empty is the default, `[internal]`
+    data_classes: Names = Names { };
+    models: Restriction = Restriction { };
+    accounts: Restriction = Restriction { };
+}
+
+/// `ProjectUpdate`, for the project the path names.
+type ProjectUpdate {
+    project: String;
+    set_name: Bool = false;
+    name: String = "";
+    set_owners: Bool = false;
+    owners: Names = Names { };
+    set_data_classes: Bool = false;
+    data_classes: Names = Names { };
+    set_models: Bool = false;
+    models: Restriction = Restriction { };
+    set_accounts: Bool = false;
+    accounts: Restriction = Restriction { };
+}
+
+/// `Project`. Its `budget` is `null` and its `limits` empty until budgets
+/// and limits are served.
+type Project {
+    id: String = "";
+    name: String = "";
+    // active | archived
+    status: String = "active";
+    owners: Names = Names { };
+    data_classes: Names = Names { };
+    models: Restriction = Restriction { };
+    accounts: Restriction = Restriction { };
+    key_count: Int = 0;
+    position: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    archived: Bool = false;
+    archived_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type ProjectList { data: bounded[Project; 64]; }
+
+// ---- keys ------------------------------------------------------------
+
+type KeyRef { project: String; key: String; }
+
+/// `KeyCreate` under the project the path names, without `limits`.
+type KeyCreate {
+    project: String;
+    name: String;
+    models: Restriction = Restriction { };
+    accounts: Restriction = Restriction { };
+    expires: Bool = false;
+    expires_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// `KeyUpdate`, for the key the path names.
+type KeyUpdate {
+    project: String;
+    key: String;
+    set_name: Bool = false;
+    name: String = "";
+    set_models: Bool = false;
+    models: Restriction = Restriction { };
+    set_accounts: Bool = false;
+    accounts: Restriction = Restriction { };
+    set_expires: Bool = false;
+    expires: Bool = false;
+    expires_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// `Key`, and `KeyWithSecret` when `secret` is set (only the answer to
+/// its creation). A time whose flag is false is `null`.
+type Key {
+    id: String = "";
+    project: String = "";
+    name: String = "";
+    prefix: String = "";
+    models: Restriction = Restriction { };
+    accounts: Restriction = Restriction { };
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    expires: Bool = false;
+    expires_at: Time = `1970-01-01T00:00:00Z`;
+    used: Bool = false;
+    last_used_at: Time = `1970-01-01T00:00:00Z`;
+    // active | revoked | expired
+    status: String = "active";
+    revoked: Bool = false;
+    revoked_at: Time = `1970-01-01T00:00:00Z`;
+    secret: String = "";
+}
+
+type KeyList { data: bounded[Key; 64]; }

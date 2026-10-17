@@ -62,3 +62,60 @@ trace.
 
 **Working shape:** none needed. Worth adding 201, 202, 204, 401, 403, 409,
 429, 502, 503 and 504 upstream.
+
+## `is_route` writes its captures into the context, not into a copy of it
+
+**hale 0.24.0.** `std::http::is_route(c, method, pattern)` puts the
+pattern's `:name` captures in `c.params` when it matches. A router that
+reads `let p = c.params;` once, before the ladder, holds a copy taken
+before any match, so `std::http::path_param(p, "model")` is `""` for every
+route, and nothing says so: the handler runs with an empty id and answers
+404.
+
+**Working shape:** read `c.params` after the match, in the branch that
+matched (`std::http::path_param(c.params, "model")`, `api/endpoints.hl`).
+
+## A surface's JSON codec has no `null`, enum or map, and code cannot call it
+
+**hale 0.24.0.** The contract has lists that may be `null` (a project's
+`models`: `null` is the whole catalog), a price that may be `null`, enums
+(`kind`, `status`) and a map (`Health.checks`). The codec a surface's rows
+are held to carries none of them, so a row's type says each with a shape
+it does carry: `Restriction { any: Bool; names: Names; }` for the
+nullable list, `priced: Bool` beside the price, a `String` for the enum.
+The description `hale api export` would print is then not the contract's
+shape. And a program cannot run that codec itself (encode a typed value,
+decode a body into a row's request), while `Type::from_json` carries no
+list, so a router that speaks the contract's REST wire over the rows
+writes every decoder and encoder by hand.
+
+**Working shape:** the rows' types as close to the contract as the codec
+allows (`api/surface.hl`), and the contract's JSON in one file of
+hand-written readers and writers (`api/wire.hl`), checked against
+`openapi.yaml` live in CI (`spec/validate/live.mjs`).
+
+## A `bounded` field is never assigned whole
+
+**hale 0.24.0.** `row.models = req.models;` between two records'
+`bounded[String; 32]` fields is refused: the intrinsics are the only way
+to change a bounded field, so copying one list into another record means
+a `push` loop. A whole record copies its bounded fields with it.
+
+**Working shape:** wrap the list in a record (`type Names { items:
+bounded[String; 32]; }`) and assign the record.
+
+## `hale verify` calls a hashmap row write in a long-lived locus unbounded
+
+**hale 0.24.0.** `MemoryStore` keeps rows in `@form(hashmap)` loci for the
+life of the process. `hale verify` warns that every `set` there grows the
+store's region without bound, as a write in a per-message handler. The
+first version of this entry took the warning at its word. Measured, it
+does not hold here: 15,000 `PATCH`es of a key and 5,000 of a project,
+each with a 120-character name, left the api's RSS flat (5224 to 5092 kB,
+then 5096), and an outside review saw the same over 10,000. Nothing
+measured grows.
+
+**Working shape:** the in-memory store's writes carry `@unbounded`, which
+is what `hale verify` needs; the warning is a check that does not see the
+replaced row's text reclaimed. Whether a key's `last_used_at` can now be
+written on every caller request is decided with the next part of the api.

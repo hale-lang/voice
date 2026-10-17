@@ -42,6 +42,8 @@ locus Session {
         subscribed: Bool = false;
         // the request being served, and whether it was cancelled
         serving: String = "";
+        // the seat it is served on
+        busy: String = "";
         cancelled: Bool = false;
         // monotonic ns of the last look at NATS while serving
         looked: Int = 0;
@@ -55,6 +57,7 @@ locus Session {
         subscribe PlaneReport as on_plane;
         publish SeatsApplied;
         publish NatsConnected;
+        publish LoadChanged;
     }
 
     run() {
@@ -152,7 +155,7 @@ locus Session {
     }
 
     fn applied() {
-        SeatsApplied <- AppliedSeats { version: self.seats.version, states: states_json(self.seats) };
+        SeatsApplied <- AppliedSeats { version: self.seats.version, states: states_json(self.seats, self.busy) };
         self.report();
     }
 
@@ -219,7 +222,9 @@ locus Session {
         if len(refusal) > 0 { return; }
 
         self.serving = id;
+        self.busy = seat.id;
         self.cancelled = false;
+        self.loaded();
         self.looked = std::time::monotonic_ns();
         let t0 = std::time::monotonic_ns();
         let model = std::json::find_string_field(msg, "model");
@@ -246,7 +251,16 @@ locus Session {
         let result = if self.cancelled { cancelled_result(id) } else if run.outcome == "failed" { failed_result(id, "engine_failed", run.failure, true) } else { result_message(id, run, if first < 0 { 0 } else { first }, elapsed) };
         self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
         self.serving = "";
+        self.busy = "";
         self.cancelled = false;
+        self.loaded();
+    }
+
+    /// A request began or ended: the plane's next heartbeat, and the
+    /// status, say so.
+    fn loaded() {
+        LoadChanged <- Load { in_flight: if len(self.busy) > 0 { 1 } else { 0 }, states: states_json(self.seats, self.busy) };
+        self.report();
     }
 
     /// What the admin API shows: the connection, the assignment applied,
@@ -257,14 +271,14 @@ locus Session {
         let coordinator = "{\"url\": " + q(self.api) + ", \"state\": " + q(state) + ", \"connected_at\": " + (if len(self.connected_at) > 0 { q(self.connected_at) } else { "null" })
             + ", \"last_error\": " + (if len(self.last_error) > 0 { q(self.last_error) } else { "null" }) + "}";
         let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": " + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
-            + ", \"max_in_flight\": " + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local)) + ", \"seats\": " + status_seats(self.assignment, self.seats) + "}";
+            + ", \"max_in_flight\": " + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local)) + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": " + status_seats(self.assignment, self.seats, self.busy) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
     }
 }
 
 /// The assigned seats, each with its state on this node (node.yaml
 /// `NodeStatus.seats`).
-fn status_seats(assignment: String, seats: NodeSeats) -> String {
+fn status_seats(assignment: String, seats: NodeSeats, busy: String) -> String {
     let out = std::bytes::BytesBuilder { initial_cap: 1024 };
     let mut any = false;
     let mut it = std::json::array_first(std::json::find_field_raw(assignment, "seats"));
@@ -273,7 +287,7 @@ fn status_seats(assignment: String, seats: NodeSeats) -> String {
         let st = seat_of(seats, std::json::find_string_field(s, "id"));
         if any { out.append_str(", "); }
         any = true;
-        out.append_str(s[0..(len(s) - 1)] + ", \"status\": " + q(st.status) + ", \"reason\": " + (if len(st.reason) > 0 { q(st.reason) } else { "null" }) + ", \"in_flight\": " + to_string(st.in_flight) + "}");
+        out.append_str(s[0..(len(s) - 1)] + ", \"status\": " + q(st.status) + ", \"reason\": " + (if len(st.reason) > 0 { q(st.reason) } else { "null" }) + ", \"in_flight\": " + (if st.id == busy { "1" } else { "0" }) + "}");
         it = std::json::array_next(it);
     }
     let b = out.snapshot() or b"";

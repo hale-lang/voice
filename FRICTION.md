@@ -176,3 +176,52 @@ flag every locus carries (`self.draining`) and `drain` is a lifecycle hook,
 so both are refused as method names, and so as rpc members.
 
 **Working shape:** `NodePlane::going_away`.
+
+## `count` and `at` on a call's result pass the check and fail the build
+
+**hale 0.24.0.** `count((s.keys("work") or KeyRows { }).rows)` typechecks,
+and then the build refuses it: "unsupported in codegen v0: call to `count`:
+no free fn / generic fn / fn-pointer binding with that name is in scope —
+did you mean `t`?". The intrinsic needs a place (a local or a field), and
+the message points at an unrelated fn.
+
+**Working shape:** bind the result first (`let ks = s.keys("work") or
+KeyRows { }; count(ks.rows)`).
+
+## pond's pq: tab-separated rows, and a line on stdout
+
+**pond `pq` as hale 0.24.0 carries it.** A query's rows come back as one
+string, rows by newline and columns by tab, with no escaping, so a column
+holding a tab or a newline (a JSON document, a name) cannot be split
+back. And a connection with `sslmode=prefer` to a server without TLS
+prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
+`hale test` (a passing test is silent).
+
+**Working shape:** every read is `SELECT row_to_json(t) FROM (...) t`, one
+JSON object a line, since JSON escapes every tab and newline
+(`api/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
+the tests and compose use `sslmode=disable` on the private network.
+
+## A text built or read a line at a time is quadratic in memory
+
+**hale 0.24.0.** Two shapes that read naturally both copy the whole text
+per line, and every copy stays in the arena until the handler returns:
+growing a result with `out = out + row`, and walking lines with
+`rest = rest[(nl + 1)..len(rest)]` (a slice copies, and measures the
+string first). pond's `pq` grew a query's rows the first way, and the
+Postgres store read them the second: a 1000-row change page grew the
+api's peak by 715 MB. `hale verify` says nothing about either.
+
+**Working shape:** rows go into one `std::bytes::BytesBuilder` (voice's
+change to `lib/pond/pq`, `JsonList` for list bodies), and lines are read by
+index over one `std::str::bytes_view`, slicing only the line (`line_end`
+in `api/wire.hl`). The same page now grows the peak by 8 MB, and
+`api/tests/pg_page_memory_test.hl` holds it under 32 MB.
+
+## `release` cannot name a method either
+
+**hale 0.24.0.** The store's "end the hold that wrote nothing" is naturally
+`Store::release`, and `release` is a lifecycle hook, so it is refused as a
+method name, as `draining` and `drain` are.
+
+**Working shape:** `Store::let_go`.

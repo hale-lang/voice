@@ -49,6 +49,17 @@ locus Catalog {
 
     /// `updateCatalogModel`: the fields the request sets.
     fn update(u: CatalogModelUpdate) -> CatalogModel fallible(ApiError) {
+        self.store.hold("models/" + u.model) or fail store_failed(err);
+        let out = self.update_held(u) or {
+            self.store.let_go();
+            fail err;
+        };
+        self.store.let_go();
+        return out;
+    }
+
+    /// `update`, holding the resource from its read to its write.
+    fn update_held(u: CatalogModelUpdate) -> CatalogModel fallible(ApiError) {
         let mut row = self.live(u.model) or raise;
         let before = self.view(row) or raise;
         if u.set_owned_by { row.owned_by = u.owned_by; }
@@ -68,6 +79,17 @@ locus Catalog {
     /// `removeCatalogModel`: callers naming it get `model_not_found`; the
     /// id stays taken.
     fn remove(r: ModelRef) -> CatalogModel fallible(ApiError) {
+        self.store.hold("models/" + r.model) or fail store_failed(err);
+        let out = self.remove_held(r) or {
+            self.store.let_go();
+            fail err;
+        };
+        self.store.let_go();
+        return out;
+    }
+
+    /// `remove`, holding the resource from its read to its write.
+    fn remove_held(r: ModelRef) -> CatalogModel fallible(ApiError) {
         let mut row = self.live(r.model) or raise;
         let before = self.view(row) or raise;
         row.removed = true;
@@ -251,13 +273,24 @@ fn invalid_key() -> ApiError {
 /// caller's to fix; a store that is down is a failure inside the api.
 fn store_failed(e: StoreError) -> ApiError {
     if e.kind == "full" { return invalid(e.message, ""); }
-    return ApiError { status: 500, kind: "server_error", code: "internal_error", message: "the store is unavailable: " + e.message };
+    let id = store_incident(e);
+    return ApiError { status: 500, kind: "server_error", code: "internal_error", message: "the store could not complete the request (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
 }
 
-/// A store that could not answer a caller: nothing is served while the
-/// store is down (README, "Metering is not optional").
+/// The caller plane's store failure: nothing is served while the store
+/// cannot record usage.
 fn metering_failed(e: StoreError) -> ApiError {
-    return ApiError { status: 503, kind: "server_error", code: "metering_unavailable", message: "the store is unavailable: " + e.message };
+    let id = store_incident(e);
+    return ApiError { status: 503, kind: "server_error", code: "metering_unavailable", message: "the store is unavailable; nothing is served until it is back (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
+}
+
+/// A store failure, on the api's stderr with an id the answer quotes. What
+/// the store said (Postgres's own text, which can name constraints and
+/// the values they refused) stays here and never reaches a response.
+fn store_incident(e: StoreError) -> String {
+    let id = "err_" + (random_hex(8) or "0");
+    eprintln("voice api: ", id, ": store ", e.kind, ": ", e.message);
+    return id;
 }
 
 /// Now, to the second: what every timestamp voice writes is.

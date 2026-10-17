@@ -415,4 +415,32 @@ The schema above is migration 1 of the shared store seed, registered with
 [`pond/migrations`](https://github.com/hale-lang/pond/tree/main/migrations)
 and run as the one-shot `migrate` step the api and the brain wait on. A
 change to this document is a new migration, never an edit to an applied
-one.
+one. Each migration's SQL is a file in [`api/migrations/`](../api/migrations/),
+and together, in order, they are this document's SQL, block for block (CI's
+`store` job checks it).
+
+### Migration 2: a draining node
+
+A node that posts `draining` is offered no new request until it registers
+again; the flag is part of what it reported, so it lives in `node_state`.
+
+```sql
+alter table node_state add column draining boolean not null default false;
+```
+
+### Migration 3: what a limit belongs to
+
+A limit belongs to a project, a key or an account, as its `scope` says, and
+a model-scope limit is a project's limit on one model: `project` and
+`model_id` together. Migration 1's comment on `"limit"` ("exactly one of
+project, key, model_id, account is set") is wrong for that scope; this
+constraint replaces it as the rule.
+
+```sql
+alter table "limit" add constraint limit_holder check (
+  (scope = 'project' and project is not null and key is null and model_id is null and account is null)
+  or (scope = 'key' and key is not null and project is null and model_id is null and account is null)
+  or (scope = 'account' and account is not null and project is null and key is null and model_id is null)
+  or (scope = 'model' and project is not null and model_id is not null and key is null and account is null)
+);
+```

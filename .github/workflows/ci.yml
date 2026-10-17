@@ -85,6 +85,20 @@ jobs:
   e2e:
     name: end to end
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: voice
+          POSTGRES_PASSWORD: voice
+          POSTGRES_DB: voice
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U voice -d voice"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/hale
@@ -101,8 +115,18 @@ jobs:
           cd spec/validate && npm ci
       # the script runs NATS in a container of its own, so it can stop it
       # and check that a node recovers the assignment it missed meanwhile
-      - name: A node enrolls and serves, recovers an assignment lost while NATS is down, and fails over after a slow failure
+      - name: A node enrolls and serves, recovers an assignment lost while NATS is down, and fails over after a slow failure, over the Postgres store
+        env:
+          DATABASE_URL: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
         run: scripts/e2e.sh
+      - name: The Postgres store answers as the memory store does, and reads a full page in linear memory
+        env:
+          VOICE_TEST_DATABASE_URL: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
+        run: hale test api/tests/store_test.hl && hale test api/tests/pg_page_memory_test.hl
+      - name: Two api instances on one Postgres lose no write, and two migrations at once both succeed
+        env:
+          DATABASE_URL: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
+        run: scripts/race.sh
 
   ui:
     name: ui
@@ -172,6 +196,8 @@ jobs:
           awk '/^```sql/{b="";f=1;next} /^```/{if(f && b !~ /\$/) printf "%s", b; f=0; next} f{b=b $0 "\n"}' spec/store.md > store.sql
           test -s store.sql
           psql -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -f store.sql
+      - name: The api's migrations are that schema, in order
+        run: cat api/migrations/*.sql | cmp - store.sql
 
   image:
     name: image

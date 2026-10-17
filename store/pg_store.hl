@@ -343,7 +343,7 @@ locus PgStore {
 
     fn insert_key(row: KeyRow, change: ChangeRow) -> Bool fallible(StoreError) {
         self.begin() or raise;
-        self.room("SELECT count(*) FROM api_key WHERE project = $1", one_arg(row.project), 64, "a project holds at most 64 keys") or raise;
+        self.room("SELECT count(*) FROM api_key WHERE project = $1", single_value(row.project), 64, "a project holds at most 64 keys") or raise;
         let n = self.step("INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at) VALUES ($1, $2, $3, $4, decode($5, 'hex'), " + restriction_param(6) + ", " + restriction_param(7) + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz) ON CONFLICT (id) DO NOTHING", key_args(row)) or raise;
         if n == 0 {
             self.rollback();
@@ -470,8 +470,9 @@ locus PgStore {
 
     fn update_node(row: NodeRow, change: ChangeRow) fallible(StoreError) {
         self.begin() or raise;
-        // the version moves on in SQL: a seat written meanwhile moved it too
-        self.step("UPDATE node SET name = $2, token_digest = decode($3, 'hex'), max_in_flight = $4::int, status = $5, assignment_version = assignment_version + 1, created_at = $6::timestamptz, revoked_at = $7::timestamptz WHERE id = $1", node_update_args(row)) or raise;
+        // the version moves on in SQL: a seat written meanwhile moved it too;
+        // the brain's up and down stay as they are
+        self.step("UPDATE node SET name = $2, token_digest = decode($3, 'hex'), max_in_flight = $4::int, status = CASE WHEN $5 = 'revoked' OR status = 'revoked' THEN 'revoked' ELSE status END, assignment_version = assignment_version + 1, created_at = $6::timestamptz, revoked_at = $7::timestamptz WHERE id = $1", node_update_args(row)) or raise;
         self.commit_with(change) or raise;
     }
 
@@ -800,7 +801,7 @@ fn hex_value(b: Int) -> Int {
 }
 
 /// Arguments of one value.
-fn one_arg(v: String) -> db::Args {
+fn single_value(v: String) -> db::Args {
     let a = db::Args { };
     a.add(v);
     return a;
@@ -1064,8 +1065,6 @@ fn node_row(j: String) -> NodeRow {
     };
 }
 
-/// A node's `status` column: `revoked`, else `pending`; up and down are
-/// judged from its heartbeat as it is read (fleet.hl).
 /// `node_args` but the version, which an update moves on in SQL.
 fn node_update_args(r: NodeRow) -> db::Args {
     let a = db::Args { };
@@ -1079,6 +1078,10 @@ fn node_update_args(r: NodeRow) -> db::Args {
     return a;
 }
 
+/// A node's `status` column as the admin plane writes it: `revoked`, or
+/// `pending` for a new node. The brain writes `up` and `down` from the
+/// heartbeat; an update leaves them be. The api judges liveness from the
+/// heartbeat itself, as the memory store has no brain.
 fn node_args(r: NodeRow) -> db::Args {
     let a = db::Args { };
     a.add(r.id);

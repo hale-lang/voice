@@ -1,48 +1,233 @@
 /// The brain: keeps the route table (../README.md, "The route table").
 ///
-/// It shares nothing with the api but Postgres. Only one brain works at a
-/// time: it holds a Postgres advisory lock, and a second brain process waits
-/// on the lock as a standby and takes over when the first one's connection
-/// drops.
+/// It shares nothing with the api but Postgres and the table it publishes.
+/// Only one brain works at a time: it holds a Postgres advisory lock on
+/// its connection, and a second brain process is a standby that tries the
+/// lock every tick and takes over when the first one's connection drops
+/// (the lock goes with the session).
 ///
-/// Skeleton: it ticks and names what each tick will do. The store (Postgres
-/// through pond/pq), the lock and the route table come with the MVP.
-locus Brain {
+/// Each tick, while it holds the lock, it reclaims what dead api instances
+/// held, writes each node's liveness, reads the fleet as reported and
+/// publishes the route table on `voice.route` (internal.yaml), every tick,
+/// so a new api instance has a table within a second. Per-tick work runs
+/// in a method, so each tick's memory is reclaimed.
+
+import "../store" as st;
+import "../lib/pond/pq" as pq;
+import "../lib/pond/db" as db;
+import "../lib/pond/realtime/nats" as nats;
+
+/// The lock every brain asks for: one key for voice's one brain.
+const BRAIN_LOCK: String = "SELECT pg_try_advisory_lock(hashtext('voice.brain'))";
+
+main locus Brain {
     params {
-        database: String = "postgres://127.0.0.1:5432/voice";
+        database: String = "";
         nats: String = "nats://127.0.0.1:4222";
         interval: Duration = 1s;
-        ticks: Int = 0;
+        conn: pq::PgConn = pq::PgConn { sslmode: "prefer" };
+        opened: Bool = false;
+        // holding the lock: the one brain that works
+        holding: Bool = false;
+        // standby | working | unreachable: said once each time it changes
+        said: String = "";
     }
+
+    birth() {
+        let d = st::parse_dsn(self.database);
+        self.conn.host = d.host;
+        self.conn.port = d.port;
+        self.conn.user = d.user;
+        self.conn.password = d.password;
+        self.conn.database = d.database;
+        self.conn.sslmode = d.sslmode;
+    }
+
     run() {
-        println("voice brain: route table in ", self.database);
-        println("voice brain: route-table notices on ", self.nats, " (skeleton; not connected)");
+        println("voice brain: the store at ", self.conn.host, ":", self.conn.port, "/", self.conn.database, "; the route table on ", self.nats);
         while true {
             self.tick();
             std::time::sleep(self.interval);
         }
     }
-    /// One pass. A method, so each tick's memory is reclaimed.
+
+    dissolve() { self.conn.close(); }
+
+    /// One pass.
     fn tick() {
-        self.ticks = self.ticks + 1;
-        // 1. Read the fleet as reported: seat states, api and node
-        //    heartbeats, quota windows, configuration.
-        // 2. Rewrite the route table: one slot per unit of each up seat's
-        //    concurrency, ranked by account headroom, then seat load;
-        //    exhausted accounts get none. Bump its version.
-        // 3. Reclaim what dead api instances held: free their slots,
-        //    release their reservations, record their requests abandoned.
-        // 4. Publish that the route table changed, over NATS, so the api
-        //    rereads it instead of polling.
-        if self.ticks == 1 {
-            println("brain: skeleton; no store yet, so ticks do nothing");
+        if !self.opened {
+            let st = self.conn.open();
+            if !st.ok {
+                self.say("unreachable", "voice brain: Postgres unreachable: " + st.err.detail);
+                return;
+            }
+            let tz = self.conn.exec("SET TIME ZONE 'UTC'");
+            self.opened = tz.ok;
+            if !tz.ok { return; }
         }
+        if !self.holding {
+            let lock = self.conn.query_one(BRAIN_LOCK);
+            if !lock.ok {
+                self.drop("the lock: " + lock.err.detail);
+                return;
+            }
+            if std::str::trim(lock.data) != "t" {
+                self.say("standby", "voice brain: another brain holds the lock; standing by");
+                return;
+            }
+            self.holding = true;
+            self.say("working", "voice brain: holding the lock; working");
+        }
+        let reclaimed = reclaim(self.conn);
+        if reclaimed < 0 {
+            self.drop("reclaim failed");
+            return;
+        }
+        if reclaimed > 0 { println("voice brain: reclaimed ", reclaimed, " dead api instance(s)"); }
+        let live = self.conn.exec(LIVENESS);
+        if !live.ok {
+            self.drop("node liveness: " + live.err.detail);
+            return;
+        }
+        let table = read_table(self.conn);
+        if len(table) == 0 {
+            self.drop("the fleet read failed");
+            return;
+        }
+        publish(self.nats, table);
+    }
+
+    /// The connection failed: the lock went with it. Stand by until it is
+    /// back and the lock is ours again.
+    fn drop(why: String) {
+        eprintln("voice brain: ", why, "; dropping the connection and the lock");
+        self.conn.close();
+        self.opened = false;
+        self.holding = false;
+        self.said = "";
+    }
+
+    /// Say a change of state once.
+    fn say(state: String, line: String) {
+        if self.said == state { return; }
+        self.said = state;
+        println(line);
     }
 }
 
-/// `brain [--database URL] [--nats URL]`
+/// Each registered node's liveness (store.md, "Reclaim"): `up` while its
+/// heartbeat is younger than three intervals, `down` after; written only
+/// where it changed, and never over `revoked`.
+const LIVENESS: String = "UPDATE node n SET status = CASE WHEN ns.last_heartbeat_at > now() - interval '15 seconds' THEN 'up' ELSE 'down' END FROM node_state ns WHERE ns.node = n.id AND n.status <> 'revoked' AND n.status <> CASE WHEN ns.last_heartbeat_at > now() - interval '15 seconds' THEN 'up' ELSE 'down' END";
+
+/// The route table, read and ranked now; "" when the read failed.
+fn read_table(conn: pq::PgConn) -> String {
+    let none = db::Args { };
+    let rows = conn.query_params(SEAT_READ, none);
+    if !rows.ok { return ""; }
+    let models = conn.query_params(MODEL_READ, none);
+    if !models.ok { return ""; }
+    let mut seats = Ranked { };
+    let lines = std::str::bytes_view(rows.csv);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let line = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(line) > 0 { push(seats.items, judge(line, Float(std::rand::next_int(1000)) / 1000.0)) or discard; }
+    }
+    let now = std::time::current();
+    // the version is the time, in milliseconds: a brain that takes over
+    // goes on past the one before it
+    return route_table(seats, models.csv, std::time::nanos(now) / 1000000, now);
+}
+
+/// Publish the table on `voice.route`, over a connection of its own.
+fn publish(url: String, table: String) {
+    let c = nats::NatsClient { url: url, name: "voice-brain" };
+    if !c.open() { return; }
+    c.pub_msg("voice.route", "", std::bytes::from_string(table)) or discard;
+    c.flush() or discard;
+    c.close();
+}
+
+/// The api instances to reclaim: a heartbeat older than three of their
+/// five-second intervals, and not reclaimed yet.
+const DEAD_INSTANCES: String = "SELECT id FROM api_instance WHERE last_heartbeat_at < now() - interval '15 seconds' AND reclaimed_at IS NULL ORDER BY id";
+
+/// Reclaim every dead api instance (store.md, "Reclaim"): each request it
+/// held in flight is settled with nothing used, as `abandoned`, its
+/// reservations released and its usage recorded, in one transaction per
+/// instance; then the instance row is marked reclaimed, and goes when no
+/// request names it. The number reclaimed, or -1 when the store failed.
+fn reclaim(conn: pq::PgConn) -> Int {
+    let none = db::Args { };
+    let dead = conn.query_params(DEAD_INSTANCES, none);
+    if !dead.ok { return -1; }
+    let mut n = 0;
+    let lines = std::str::bytes_view(dead.csv);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let id = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(id) > 0 {
+            if !reclaim_one(conn, id) { return -1; }
+            n = n + 1;
+        }
+    }
+    return n;
+}
+
+fn reclaim_one(conn: pq::PgConn, instance: String) -> Bool {
+    let begun = conn.begin();
+    if !begun.ok { return false; }
+    let mut ok = true;
+    let mut i = 0;
+    while ok && i < 6 {
+        let a = db::Args { };
+        a.add(instance);
+        let r = conn.exec_params(reclaim_step(i), a);
+        if !r.ok {
+            eprintln("voice brain: reclaiming ", instance, ": ", r.err.detail);
+            ok = false;
+        }
+        i = i + 1;
+    }
+    if !ok {
+        conn.rollback();
+        return false;
+    }
+    let done = conn.commit();
+    return done.ok;
+}
+
+/// The reclaim transaction, a statement at a time, for the instance `$1`.
+/// The window and period rows are released by the sums of what its
+/// requests reserved, since several may share one.
+fn reclaim_step(i: Int) -> String {
+    if i == 0 {
+        return "UPDATE limit_state s SET concurrent = s.concurrent - x.n, input_tokens = s.input_tokens - x.inp, output_tokens = s.output_tokens - x.outp FROM (SELECT l.id AS limit_id, date_bin(make_interval(secs => l.window_seconds), r.created_at, 'epoch') AS window_start, count(*) AS n, sum(r.reserved_input) AS inp, sum(r.reserved_output) AS outp FROM request r JOIN \"limit\" l ON l.id = ANY(r.limits) WHERE r.instance = $1 AND r.status = 'in_flight' GROUP BY 1, 2) x WHERE s.limit_id = x.limit_id AND s.window_start = x.window_start";
+    }
+    if i == 1 {
+        return "UPDATE budget_state s SET reserved_micros = s.reserved_micros - x.micros FROM (SELECT project, period_start, sum(reserved_micros) AS micros FROM request WHERE instance = $1 AND status = 'in_flight' GROUP BY 1, 2) x WHERE s.project = x.project AND s.period_start = x.period_start";
+    }
+    if i == 2 {
+        return "INSERT INTO usage (id, created_at, project, key, account, requested_model, status, served, input_tokens, cached_input_tokens, cache_write_input_tokens, output_tokens, reasoning_tokens, price_micros, currency, record) SELECT r.id, r.created_at, r.project, r.key, NULL, r.requested_model, 'abandoned', NULL, 0, 0, 0, 0, 0, 0, coalesce(r.price->>'currency', 'USD'), jsonb_build_object('id', r.id, 'created_at', r.created_at, 'project', r.project, 'key', r.key, 'requested_model', r.requested_model, 'requested_account', r.requested_account, 'endpoint', r.endpoint, 'status', 'abandoned', 'served', NULL, 'data_class', r.data_class, 'input_tokens', 0, 'output_tokens', 0, 'price_micros', 0, 'currency', coalesce(r.price->>'currency', 'USD'), 'timing', jsonb_build_object('wall_ms', 0, 'queue_ms', 0, 'load_ms', 0), 'metadata', r.metadata) FROM request r WHERE r.instance = $1 AND r.status = 'in_flight' ON CONFLICT (id) DO NOTHING";
+    }
+    if i == 3 {
+        return "UPDATE request SET status = 'abandoned' WHERE instance = $1 AND status = 'in_flight'";
+    }
+    if i == 4 {
+        return "UPDATE api_instance SET reclaimed_at = now() WHERE id = $1";
+    }
+    return "DELETE FROM api_instance WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM request WHERE instance = $1)";
+}
+
+/// `brain --database URL [--nats URL]`; `--database` may come as
+/// VOICE_DATABASE_URL.
 fn main() {
-    let mut database = "postgres://127.0.0.1:5432/voice";
+    let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
     let mut nats = "nats://127.0.0.1:4222";
     let mut i = 1;
     while i + 1 < std::env::args_count() {
@@ -54,6 +239,10 @@ fn main() {
             nats = value;
         }
         i = i + 2;
+    }
+    if len(database) == 0 {
+        eprintln("usage: brain --database postgres://user:password@host:port/database [--nats URL]");
+        std::process::exit(2);
     }
     Brain { database: database, nats: nats };
 }

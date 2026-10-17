@@ -94,7 +94,9 @@ are practices):
 
 **process**: `postgres`, `nats`, `api`, `brain`, `node`.
 
-**seed**: `api`, `brain`, `node` (each a `hale.toml`), `lib/pond` (copies
+**seed**: `api`, `brain`, `node`, `store` (each a `hale.toml`; `store` is
+the store, its rows and its migrations, which `api` and `brain` import),
+`lib/pond` (copies
 of pond's NATS client, `pq`, `db` and `migrations`, which `api` and `node`
 import), `spec/validate`,
 `ui` (each a `package.json`; `ui/apps/*` and `ui/packages/*` are members of
@@ -191,7 +193,7 @@ process model):
 - `ci/api` to seed `api`, `openapi.yaml` (live), seed `spec/validate`.
 - `ci/brain` to seed `brain`.
 - `ci/node` to seed `node`, `node.yaml` (live), seed `spec/validate`.
-- `ci/e2e` to seeds `api`, `node`, `lib/pond`, `nats`, `postgres`,
+- `ci/e2e` to seeds `api`, `node`, `brain`, `store`, `lib/pond`, `nats`, `postgres`,
   `openapi.yaml` (served), `node.yaml` (live), `protocol.yaml` (a node
   enrolled and serving over NATS), `store.md` (the api's store in it),
   seed `spec/validate`.
@@ -218,13 +220,14 @@ new migration" to `store.md`.
 - the surface codec entry to seed `api` (`api/surface.hl`, `api/wire.hl`)
   and seed `spec/validate` (`live.mjs`).
 - the `bounded` assignment entry to seed `api` (`Names`, `Restriction`).
-- the hashmap row warning entry to seed `api` (`MemoryStore`'s `@unbounded`
+- the hashmap row warning entry to seed `store` (`MemoryStore`'s `@unbounded`
   writes).
 - the long-lived NATS client entry to seed `api` (`NatsLink` connects per
   use) and seed `lib/pond`.
 - the reserved `draining` entry to seed `api` (`NodePlane::going_away`).
-- the `count`/`at` on a call entry to seed `api` (`tests/store_test.hl`).
-- the pq rows entry to seed `api` (`PgStore` reads `row_to_json`) and
+- the `count`/`at` on a call entry to seed `store` (`tests/store_test.hl`).
+- the qualified imports entry to seeds `api` and `store`.
+- the pq rows entry to seed `store` (`PgStore` reads `row_to_json`) and
   seed `lib/pond`.
 
 `holds`, `reviews`: none. These are the holes.

@@ -30,9 +30,9 @@ trap cleanup EXIT
 psql -q "$DATABASE_URL" -c 'SET client_min_messages = warning' -c 'DROP SCHEMA public CASCADE' -c 'CREATE SCHEMA public' >/dev/null
 
 # two migrations at once
-api/api migrate --database "$DATABASE_URL" --migrations api/migrations >"$work/m1.log" 2>&1 &
+api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/m1.log" 2>&1 &
 m1=$!
-api/api migrate --database "$DATABASE_URL" --migrations api/migrations >"$work/m2.log" 2>&1 &
+api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/m2.log" 2>&1 &
 m2=$!
 wait $m1 || { echo "the first migrate failed:"; cat "$work/m1.log"; exit 1; }
 wait $m2 || { echo "the second migrate failed:"; cat "$work/m2.log"; exit 1; }

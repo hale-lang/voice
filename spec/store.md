@@ -376,8 +376,12 @@ and `quota_window` with plain upserts, each its own small transaction.
 ### Reclaim
 
 The brain, each tick. An instance whose heartbeat is older than three
-intervals is dead; every request it held is settled with zero usage as
-`abandoned`, and the instance row goes.
+intervals, and not reclaimed yet, is dead; every request it held is
+settled with zero usage as `abandoned`, and the instance row is marked
+reclaimed. The row stays while a request names it (`request.instance`
+references it) and goes when none does. Purging reclaimed rows once their
+requests are gone is not done yet. An instance that heartbeats again is
+alive again.
 
 ```sql
 begin;
@@ -386,7 +390,9 @@ begin;
 --   usage.status = 'abandoned', then
 update request set status = 'abandoned' where id = $id;
 -- then
-delete from api_instance where id = $dead;
+update api_instance set reclaimed_at = now() where id = $dead;
+delete from api_instance where id = $dead
+  and not exists (select 1 from request where instance = $dead);
 commit;
 ```
 
@@ -415,7 +421,7 @@ The schema above is migration 1 of the shared store seed, registered with
 [`pond/migrations`](https://github.com/hale-lang/pond/tree/main/migrations)
 and run as the one-shot `migrate` step the api and the brain wait on. A
 change to this document is a new migration, never an edit to an applied
-one. Each migration's SQL is a file in [`api/migrations/`](../api/migrations/),
+one. Each migration's SQL is a file in [`store/migrations/`](../store/migrations/),
 and together, in order, they are this document's SQL, block for block (CI's
 `store` job checks it).
 
@@ -443,4 +449,14 @@ alter table "limit" add constraint limit_holder check (
   or (scope = 'account' and account is not null and project is null and key is null and model_id is null)
   or (scope = 'model' and project is not null and model_id is not null and key is null and account is null)
 );
+```
+
+### Migration 4: a reclaimed api instance
+
+A dead instance's row stays while its requests name it, so the brain marks
+it reclaimed rather than deleting it (Reclaim, above), and does not reclaim
+it again.
+
+```sql
+alter table api_instance add column reclaimed_at timestamptz;
 ```

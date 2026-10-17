@@ -42,12 +42,12 @@ body into the row's request and writes the contract's JSON
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
 
 Everything above reaches the configuration and the fleet's reports through
-the `Store` interface ([`api/store.hl`](./api/store.hl)). Given
+the `Store` interface ([`store/store.hl`](./store/store.hl)). Given
 `--database postgres://...` (or `VOICE_DATABASE_URL`), the api keeps them
-in Postgres (`PgStore`, [`api/pg_store.hl`](./api/pg_store.hl)), in the
+in Postgres (`PgStore`, [`store/pg_store.hl`](./store/pg_store.hl)), in the
 tables of [`spec/store.md`](./spec/store.md), each admin write and the
 change it records in one transaction; `api migrate` brings the schema up to
-date first ([`api/migrations/`](./api/migrations/), store.md's SQL in
+date first ([`store/migrations/`](./store/migrations/), store.md's SQL in
 order). Several api instances may share one database: a write that reads
 a resource first holds it (a Postgres advisory lock on its path, in the
 write's transaction) from the read to the commit, and a node's assignment
@@ -155,13 +155,40 @@ token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
 seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
 -d node`. The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
-so it survives a restart of the api. The brain is a skeleton.
+so it survives a restart of the api. The brain publishes the route table
+on NATS every second.
 
-## The brain (skeleton)
+## The brain
 
-[`brain/`](./brain/) is its own program from the MVP on. The skeleton ticks
-and names what each tick will do; the store, the advisory lock and the route
-table come with the MVP. `hale build brain && brain/brain --database URL`.
+[`brain/`](./brain/) is its own program, and only one works at a time: it
+holds a Postgres advisory lock, and a second brain stands by, trying the
+lock every second, and takes over when the first one's connection drops.
+Each second the one that works:
+
+- reclaims what dead api instances held (an instance whose heartbeat is
+  three intervals old): their requests in flight are settled as
+  `abandoned`, their reservations released, and the instance is marked
+  reclaimed (spec/store.md, "Reclaim");
+- writes each node's `up` or `down` from its heartbeat;
+- reads the fleet as reported and publishes the route table on
+  `voice.route` ([`internal.yaml`](./spec/internal.yaml)), its version the
+  time in milliseconds, so a brain that takes over goes on past the one
+  before it.
+
+`GET /admin/v1/routes` answers the next table the api sees. The api does
+not route from the table yet: it picks a seat from the fleet's state in the
+store, the same state the brain reads, until it serves requests
+concurrently. Each api instance heartbeats its row in `api_instance` when
+it has a database.
+
+The store, its rows and its migrations are the seed
+[`store/`](./store/), which the api and the brain both import.
+
+```sh
+hale build brain
+brain/brain --database postgres://voice:voice@127.0.0.1:5432/voice --nats nats://127.0.0.1:4222
+hale test brain     # VOICE_TEST_DATABASE_URL=... for the Postgres half
+```
 
 ## The admin UI
 

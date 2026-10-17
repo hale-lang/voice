@@ -12,7 +12,7 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
   with hale's changes since (among them a password from a `std::secret`
   vault entry, hale-lang/hale#989), so they build clean on that toolchain. The api's Postgres store
-  (`api/pg_store.hl`) and `api migrate` import them. One change of
+  (`store/pg_store.hl`) and `api migrate` import them. One change of
   voice's own, marked `voice:` in `pq/pq.hl`: a result's rows are written
   into one buffer (`__pump`, `__append_row`) instead of growing the result
   text by `+` per row, which kept every prefix until the caller returned.

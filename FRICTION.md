@@ -199,7 +199,7 @@ prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
 
 **Working shape:** every read is `SELECT row_to_json(t) FROM (...) t`, one
 JSON object a line, since JSON escapes every tab and newline
-(`api/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
+(`store/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
 the tests and compose use `sslmode=disable` on the private network.
 
 ## A text built or read a line at a time is quadratic in memory
@@ -215,8 +215,33 @@ api's peak by 715 MB. `hale verify` says nothing about either.
 **Working shape:** rows go into one `std::bytes::BytesBuilder` (voice's
 change to `lib/pond/pq`, `JsonList` for list bodies), and lines are read by
 index over one `std::str::bytes_view`, slicing only the line (`line_end`
-in `api/wire.hl`). The same page now grows the peak by 8 MB, and
-`api/tests/pg_page_memory_test.hl` holds it under 32 MB.
+in `store/types.hl`). The same page now grows the peak by 8 MB, and
+`store/tests/pg_page_memory_test.hl` holds it under 32 MB.
+
+## A shared seed's names are reached only through its alias
+
+**hale 0.24.0.** An import binds one alias (`import "../store" as st;`),
+and every name of the seed is reached through it (`st::ModelRow`); there is
+no importing a name unqualified, and an alias binds in the seed that
+declares it only, not in the seeds that import that one. Moving the store
+out of the api into a seed the brain shares rewrote about 160 references
+across the api's files by hand, and a test that reached a store type
+through the api (`api::BudgetSet`) has to import the store itself.
+
+**Working shape:** the api imports the store once, as `st`, in
+`surface.hl`, and its files write `st::`; each test imports the seeds it
+names. The surface's descriptions name the store's shapes `st::Names` and
+so on, which is the open point on stable names for imported types.
+
+## `hale verify` took `std::env::arg` for a seed's `one_arg`
+
+**hale 0.24.0.** With the store seed declaring `fn one_arg(v: String) ->
+db::Args`, `hale verify api` and `hale verify brain` flagged each
+`std::env::arg(i)` in their argument loops as a hot-path allocation of
+"the locus `db::Args`". The seed's own `hale verify` was clean, and so was
+the api's while the same function lived in the api seed.
+
+**Working shape:** the store's helper is named `single_value`.
 
 ## `release` cannot name a method either
 

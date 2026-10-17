@@ -1,8 +1,22 @@
 /// The node's session with the coordinator (../spec/protocol.yaml).
 ///
-/// It registers over the api's node plane, then would hold the NATS
-/// connection and post heartbeats. Skeleton: it registers, and reports
-/// what came back; NATS and the heartbeats land with the protocol work.
+/// It registers over the api's node plane with its enrollment token, its
+/// capabilities and its local controls, and applies the assignment that
+/// comes back, reporting every seat's state. Then it holds NATS on its own
+/// subject: an `assign` replaces the assignment, a `serve` is answered at
+/// once (accepted or refused) and then served on its seat, the events and
+/// the result on the reply subject the request named. It heartbeats every
+/// interval, tells the coordinator when its local controls change, and
+/// registers again when the coordinator stops taking its token (a rotation
+/// or a revocation).
+///
+/// It serves one request at a time, so a request is never in flight when
+/// the next arrives and a `cancel` finds nothing to stop.
+///
+/// What the admin API shows of it is in `<data>/session.json`.
+
+import "../lib/pond/realtime/nats" as nats;
+
 locus Session {
     params {
         id: String = "";
@@ -11,53 +25,243 @@ locus Session {
         token: String = "";
         capabilities: String = "";
         registered: Bool = false;
+        // connecting | connected | refused
+        state: String = "connecting";
+        connected_at: String = "";
+        interval_ms: Int = 5000;
+        nats_url: String = "";
+        subject: String = "";
+        // the assignment as received, and as applied
+        assignment: String = "";
+        seats: NodeSeats = NodeSeats { };
+        // the local controls the coordinator was last told
+        local: String = "";
+        subscribed: Bool = false;
+        // monotonic ns
+        next_beat: Int = 0;
+        retry_at: Int = 0;
+        client: nats::NatsClient = nats::NatsClient { name: "voice-node" };
     }
+
     run() {
         while true {
-            self.attempt();
-            std::time::sleep(5s);
+            self.step();
         }
     }
-    /// One try. A method, so each iteration's memory is reclaimed.
-    fn attempt() {
-        let url = std::http::parse_url(self.api + "/node/v1/register") or std::http::Url { };
-        if len(url.host) == 0 {
-            self.report("refused", "bad api address: " + self.api, "null");
+
+    /// One turn of the loop. A method, so each turn's memory is reclaimed.
+    fn step() {
+        if !self.registered {
+            if std::time::monotonic_ns() < self.retry_at {
+                std::time::sleep(200ms);
+                return;
+            }
+            self.register();
+            if !self.registered { self.retry_at = std::time::monotonic_ns() + 5000000000; }
             return;
         }
-        let body = "{\"protocol\": 2, \"version\": \"" + NODE_VERSION + "\", \"capabilities\": " + self.capabilities + ", \"local\": " + read_local(self.data) + "}";
+        if !self.client.connected || !self.subscribed { self.connect(); }
+        if self.client.connected {
+            if self.client.read_msg(500ms) { self.on_message(); }
+        } else {
+            std::time::sleep(500ms);
+        }
+        self.check_local();
+        if std::time::monotonic_ns() >= self.next_beat { self.heartbeat(); }
+    }
+
+    /// `POST /node/v1/register`, and the assignment it answers with.
+    @unbounded
+    fn register() {
+        let local = read_local(self.data);
+        let body = "{\"protocol\": 2, \"version\": " + q(NODE_VERSION) + ", \"capabilities\": " + self.capabilities + ", \"local\": " + local + "}";
+        let resp = self.call("POST", "/node/v1/register", body);
+        if resp.status == 0 { return; }
+        if resp.status == 401 || resp.status == 403 {
+            self.state = "refused";
+            self.report("the coordinator refused this node's enrollment token (" + to_string(resp.status) + ")");
+            return;
+        }
+        if resp.status != 200 {
+            self.state = "connecting";
+            self.report("registration answered " + to_string(resp.status) + ": " + std::str::from_bytes(resp.body));
+            return;
+        }
+        let answer = std::str::from_bytes(resp.body);
+        let nats_place = std::json::find_field_raw(answer, "nats");
+        self.interval_ms = std::json::find_int_field(answer, "heartbeat_interval_ms");
+        if self.interval_ms < 1000 { self.interval_ms = 5000; }
+        let url = std::json::find_string_field(nats_place, "url");
+        if url != self.nats_url {
+            self.nats_url = url;
+            self.client.close();
+            self.client.url = url;
+        }
+        self.subject = std::json::find_string_field(nats_place, "subject");
+        self.subscribed = false;
+        self.local = local;
+        self.registered = true;
+        self.state = "connecting";
+        self.next_beat = std::time::monotonic_ns() + self.interval_ms * 1000000;
+        self.adopt(std::str::trim(std::json::find_field_raw(answer, "assignment")));
+    }
+
+    /// NATS, and the node's subject on it.
+    @unbounded
+    fn connect() {
+        if len(self.nats_url) == 0 { return; }
+        if !self.client.connected {
+            self.subscribed = false;
+            if !self.client.open() {
+                self.state = "connecting";
+                self.report("NATS unreachable at " + self.nats_url + ": " + self.client.last_error);
+                std::time::sleep(1s);
+                return;
+            }
+        }
+        let sid = self.client.sub_to(self.subject + ".>", "") or - 1;
+        if sid < 0 {
+            self.report("could not subscribe to " + self.subject + ": " + self.client.last_error);
+            return;
+        }
+        self.subscribed = true;
+        self.state = "connected";
+        self.connected_at = std::time::iso8601(std::time::time_from_unix(std::time::unix(std::time::current())));
+        self.report("");
+    }
+
+    /// Apply an assignment and report every seat's state for it.
+    @unbounded
+    fn adopt(assignment: String) {
+        self.assignment = assignment;
+        self.seats = apply_assignment(assignment, self.capabilities, self.local);
+        self.report_seats();
+    }
+
+    fn report_seats() {
+        let body = "{\"assignment_version\": " + to_string(self.seats.version) + ", \"seats\": " + states_json(self.seats) + "}";
+        let resp = self.call("POST", "/node/v1/seats", body);
+        if resp.status == 401 || resp.status == 403 { self.registered = false; }
+        self.report("");
+    }
+
+    /// One message on the node's subject.
+    fn on_message() {
+        let subject = self.client.last.subject;
+        let body = std::str::from_bytes(self.client.last.data);
+        if subject == self.subject + ".assign" {
+            let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
+            if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
+        } else if subject == self.subject + ".serve" {
+            self.serve(body, self.client.last.reply);
+        }
+    }
+
+    /// Answer a `serve` at once, then serve it on its seat.
+    fn serve(msg: String, inbox: String) {
+        let id = std::json::find_string_field(msg, "request_id");
+        let reply_to = std::json::find_string_field(msg, "reply_to");
+        let seat = seat_of(self.seats, std::json::find_string_field(msg, "seat"));
+        let mut refusal = "";
+        if len(seat.id) == 0 {
+            refusal = "no seat " + std::json::find_string_field(msg, "seat") + " is assigned to this node";
+        } else if seat.status != "up" {
+            refusal = "seat " + seat.id + " is " + seat.status + (if len(seat.reason) > 0 { ": " + seat.reason } else { "" });
+        } else if node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data)) < 1 {
+            refusal = "the node takes no requests: its cap is 0";
+        }
+        let ack = "{\"request_id\": " + q(id) + ", \"outcome\": " + (if len(refusal) > 0 { "\"refused\", \"reason\": " + q(refusal) } else { "\"accepted\", \"reason\": null" }) + "}";
+        self.client.pub_msg(inbox, "", std::bytes::from_string(ack)) or discard;
+        if len(refusal) > 0 { return; }
+
+        let t0 = std::time::monotonic_ns();
+        let model = std::json::find_string_field(msg, "model");
+        let engine_model = std::json::string_field(msg, "engine_model");
+        let run = run_static(id, model, if engine_model.kind == "string" { engine_model.text } else { model }, std::str::trim(std::json::find_field_raw(msg, "body")), static_config(seat.config));
+        let mut first = -1;
+        let mut rest = run.script;
+        let mut at = std::str::index_of(rest, "\n");
+        while at >= 0 {
+            let line = rest[0..at];
+            rest = rest[(at + 1)..len(rest)];
+            if std::str::starts_with(line, "pause ") {
+                let ms = std::str::parse_int(line[6..len(line)]) or 0;
+                std::time::sleep(ms * 1ms);
+            } else {
+                if first < 0 && std::str::contains(line, "response.output_text.delta") { first = (std::time::monotonic_ns() - t0) / 1000000; }
+                self.client.pub_msg(reply_to + ".event", "", std::bytes::from_string("{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}")) or discard;
+            }
+            at = std::str::index_of(rest, "\n");
+        }
+        let result = result_message(id, run, if first < 0 { 0 } else { first }, (std::time::monotonic_ns() - t0) / 1000000);
+        self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
+    }
+
+    /// Tell the coordinator when the local controls changed, and apply them.
+    @unbounded
+    fn check_local() {
+        let local = read_local(self.data);
+        if local == self.local { return; }
+        let resp = self.call("PUT", "/node/v1/local", local);
+        if resp.status == 0 { return; }
+        self.local = local;
+        self.seats = apply_assignment(self.assignment, self.capabilities, local);
+        self.report_seats();
+    }
+
+    /// `POST /node/v1/heartbeat`; a coordinator that no longer takes the
+    /// token is registered with again.
+    fn heartbeat() {
+        self.next_beat = std::time::monotonic_ns() + self.interval_ms * 1000000;
+        let resp = self.call("POST", "/node/v1/heartbeat", "{\"in_flight\": 0, \"seats\": " + states_json(self.seats) + "}");
+        if resp.status == 401 || resp.status == 403 || resp.status == 400 { self.registered = false; }
+    }
+
+    /// One node-plane call; a status of 0 when the api cannot be reached.
+    fn call(method: String, path: String, body: String) -> std::http::ClientResponse {
+        let url = std::http::parse_url(self.api + path) or std::http::Url { };
+        if len(url.host) == 0 {
+            self.report("bad api address: " + self.api);
+            return std::http::ClientResponse { status: 0, body: b"" };
+        }
         let req = std::http::ClientRequest {
-            method: "POST",
+            method: method,
             url: url,
             headers: "Authorization: Bearer " + self.token + "\r\nContent-Type: application/json",
             body: std::bytes::from_string(body)
         };
-        let resp = std::http::request(req) or self.unreachable(err);
-        if resp.status == 0 {
-            return;
-        }
-        if resp.status == 401 || resp.status == 403 {
-            self.report("refused", "the coordinator refused this node's enrollment token", "null");
-            return;
-        }
-        if resp.status != 200 {
-            self.report("connecting", "registration answered " + to_string(resp.status), "null");
-            return;
-        }
-        let answer = std::str::from_bytes(resp.body);
-        let version = top_value(top_value(answer, "assignment"), "version");
-        let nats = std::json::find_string_field(top_value(answer, "nats"), "url");
-        self.registered = true;
-        self.report("connected", "registered; assignment " + version + "; NATS at " + nats + " (skeleton: not subscribed yet)", version);
+        return std::http::request(req) or self.unreachable(err);
     }
-    /// The api could not be reached: report it and hand back a zero status
-    /// so `attempt` returns.
+
+    /// The api could not be reached: report it and hand back a zero status.
     fn unreachable(e: std::http::HttpError) -> std::http::ClientResponse {
-        self.report("connecting", "api unreachable at " + self.api + " (" + e.kind + ")", "null");
+        self.report("api unreachable at " + self.api + " (" + e.kind + ")");
         return std::http::ClientResponse { status: 0, body: b"" };
     }
-    fn report(state: String, detail: String, assignment_version: String) {
-        let body = "{\"url\": \"" + std::json::escape_string(self.api) + "\", \"state\": \"" + state + "\", \"connected_at\": null, \"last_error\": \"" + std::json::escape_string(detail) + "\", \"assignment_version\": " + assignment_version + "}";
+
+    /// What the admin API shows: the connection, the assignment applied,
+    /// the effective cap and every seat with its state.
+    fn report(detail: String) {
+        let local = read_local(self.data);
+        let coordinator = "{\"url\": " + q(self.api) + ", \"state\": " + q(self.state) + ", \"connected_at\": " + (if len(self.connected_at) > 0 { q(self.connected_at) } else { "null" })
+            + ", \"last_error\": " + (if len(detail) > 0 { q(detail) } else { "null" }) + "}";
+        let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": " + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
+            + ", \"max_in_flight\": " + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local)) + ", \"seats\": " + status_seats(self.assignment, self.seats) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
     }
+}
+
+/// The assigned seats, each with its state on this node (node.yaml
+/// `NodeStatus.seats`).
+fn status_seats(assignment: String, seats: NodeSeats) -> String {
+    let mut out = "";
+    let mut it = std::json::array_first(std::json::find_field_raw(assignment, "seats"));
+    while !it.done {
+        let s = std::str::trim(it.element);
+        let st = seat_of(seats, std::json::find_string_field(s, "id"));
+        if len(out) > 0 { out = out + ", "; }
+        out = out + s[0..(len(s) - 1)] + ", \"status\": " + q(st.status) + ", \"reason\": " + (if len(st.reason) > 0 { q(st.reason) } else { "null" }) + ", \"in_flight\": " + to_string(st.in_flight) + "}";
+        it = std::json::array_next(it);
+    }
+    return "[" + out + "]";
 }

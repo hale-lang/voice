@@ -15,17 +15,21 @@ locus Endpoints {
         canned: String = "canned";
         ui: String = "";
         store: MemoryStore = MemoryStore { };
+        // the nodes, over NATS
+        link: Link = NatsLink { };
         probes: Probes = Probes { store: self.store };
         bearer: KeyBearer = KeyBearer { store: self.store };
+        node_bearer: NodeBearer = NodeBearer { store: self.store };
         models: Models = Models { store: self.store };
-        inference: Inference = Inference { store: self.store };
+        inference: Inference = Inference { store: self.store, link: self.link };
         catalog: Catalog = Catalog { store: self.store };
         projects: Projects = Projects { store: self.store };
         keys: Keys = Keys { store: self.store };
         accounts: Accounts = Accounts { store: self.store };
-        nodes: Nodes = Nodes { store: self.store };
-        seats: Seats = Seats { store: self.store };
+        nodes: Nodes = Nodes { store: self.store, link: self.link };
+        seats: Seats = Seats { store: self.store, link: self.link };
         changes: Changes = Changes { store: self.store };
+        node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
     }
 
     fn handle(req: std::http::Request) -> std::http::Response {
@@ -234,14 +238,53 @@ locus Endpoints {
         if std::http::is_route(c, "GET", "/admin/v1/routes") { return self.json("getRoutes", 200); }
 
         // node plane
-        if std::http::is_route(c, "POST", "/node/v1/register") { return self.json("registerNode", 200); }
-        if std::http::is_route(c, "GET", "/node/v1/assignment") { return self.json("getAssignment", 200); }
-        if std::http::is_route(c, "POST", "/node/v1/heartbeat") { return no_content(); }
-        if std::http::is_route(c, "POST", "/node/v1/seats") { return no_content(); }
-        if std::http::is_route(c, "PUT", "/node/v1/capabilities") { return no_content(); }
-        if std::http::is_route(c, "PUT", "/node/v1/local") { return no_content(); }
-        if std::http::is_route(c, "POST", "/node/v1/quota") { return no_content(); }
-        if std::http::is_route(c, "POST", "/node/v1/draining") { return no_content(); }
+        if std::http::is_route(c, "POST", "/node/v1/register") {
+            let ctx = self.node_ctx(req) or raise;
+            let r = read_registration(req.body) or raise;
+            let answer = self.node_plane.register(r, ctx) or raise;
+            return json_answer(200, registered_json(answer));
+        }
+        if std::http::is_route(c, "GET", "/node/v1/assignment") {
+            let ctx = self.node_ctx(req) or raise;
+            let a = self.node_plane.assignment(ctx) or raise;
+            return json_answer(200, assignment_json(a));
+        }
+        if std::http::is_route(c, "POST", "/node/v1/heartbeat") {
+            let ctx = self.node_ctx(req) or raise;
+            let h = read_heartbeat(req.body) or raise;
+            self.node_plane.heartbeat(h, ctx) or raise;
+            return no_content();
+        }
+        if std::http::is_route(c, "POST", "/node/v1/seats") {
+            let ctx = self.node_ctx(req) or raise;
+            let st = read_seat_states(req.body) or raise;
+            self.node_plane.seat_states(st, ctx) or raise;
+            return no_content();
+        }
+        if std::http::is_route(c, "PUT", "/node/v1/capabilities") {
+            let ctx = self.node_ctx(req) or raise;
+            let r = read_node_report(req.body) or raise;
+            self.node_plane.capabilities(r, ctx) or raise;
+            return no_content();
+        }
+        if std::http::is_route(c, "PUT", "/node/v1/local") {
+            let ctx = self.node_ctx(req) or raise;
+            let r = read_node_report(req.body) or raise;
+            self.node_plane.local(r, ctx) or raise;
+            return no_content();
+        }
+        if std::http::is_route(c, "POST", "/node/v1/quota") {
+            let ctx = self.node_ctx(req) or raise;
+            let q = read_quota(req.body) or raise;
+            self.node_plane.quota(q, ctx) or raise;
+            return no_content();
+        }
+        if std::http::is_route(c, "POST", "/node/v1/draining") {
+            let ctx = self.node_ctx(req) or raise;
+            let d = read_draining(req.body) or raise;
+            self.node_plane.going_away(d, ctx) or raise;
+            return no_content();
+        }
 
         // events
         if std::http::is_route(c, "GET", "/admin/v1/events") { return canned_body(self.canned, "streamAdminEvents.stream.sse", 200, "text/event-stream", ""); }
@@ -264,15 +307,22 @@ locus Endpoints {
         return canned_body(self.canned, name + ".json", status, "application/json", "");
     }
 
-    /// An inference request: the caller's key, then admission. An admitted
-    /// request goes to one of its seats over NATS, which comes with the
-    /// node protocol (step 2); until then no seat is eligible, so admission
-    /// itself answers `no_eligible_seat`.
+    /// An inference request: the caller's key, then the row's handler,
+    /// which admits it and has a seat serve it.
     fn infer(req: std::http::Request, endpoint: String) -> std::http::Response fallible(ApiError) {
         let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
         let r = read_inference(req.body, endpoint) or raise;
-        let a = self.inference.admit(r, ctx) or raise;
-        fail ApiError { status: 503, kind: "server_error", code: "no_eligible_seat", message: "seat " + (a.seats.items.get(0) or "") + " is eligible, but this api cannot reach a node yet" };
+        if endpoint == "chat" {
+            let s = self.inference.chat(r, ctx) or raise;
+            return served_answer(s.request_id, chat_completion_json(s));
+        }
+        let s = self.inference.respond(r, ctx) or raise;
+        return served_answer(s.request_id, response_json(s));
+    }
+
+    /// The node an enrollment token names.
+    fn node_ctx(req: std::http::Request) -> std::api::Context fallible(ApiError) {
+        return self.node_bearer.context(std::http::header(req, "Authorization")) or raise;
     }
 }
 
@@ -286,6 +336,11 @@ fn json_answer(status: Int, body: String) -> std::http::Response {
 fn caller_json(body: String) -> std::http::Response {
     let id = random_hex(12) or "unnumbered";
     return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: req_" + id, body: body };
+}
+
+/// A served inference request, under its request id.
+fn served_answer(request_id: String, body: String) -> std::http::Response {
+    return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: " + request_id, body: body };
 }
 
 /// A row's failure, in the contract's envelope.

@@ -94,7 +94,8 @@ are practices):
 
 **process**: `postgres`, `nats`, `api`, `brain`, `node`.
 
-**seed**: `api`, `brain`, `node` (each a `hale.toml`), `spec/validate`,
+**seed**: `api`, `brain`, `node` (each a `hale.toml`), `lib/pond` (a copy
+of pond's NATS client that `api` and `node` import), `spec/validate`,
 `ui` (each a `package.json`; `ui/apps/*` and `ui/packages/*` are members of
 `ui`'s workspace, under its one gate).
 
@@ -122,8 +123,8 @@ framework-free and components know none of voice's nouns; the hale
 toolchain version is pinned in the action and the Dockerfile together;
 keep a `FRICTION.md`.
 
-**gate**: `ci/api`, `ci/brain`, `ci/node`, `ci/ui`, `ci/contracts`,
-`ci/store`, `ci/image`.
+**gate**: `ci/api`, `ci/brain`, `ci/node`, `ci/e2e`, `ci/ui`,
+`ci/contracts`, `ci/store`, `ci/image`.
 
 **document**: `README.md`, `DIRECTION.md`, `FRICTION.md`, `GRAPH.md`,
 `ui/README.md`, `ui/DESIGN.md`, `spec/store.md`.
@@ -189,6 +190,9 @@ process model):
 - `ci/api` to seed `api`, `openapi.yaml` (live), seed `spec/validate`.
 - `ci/brain` to seed `brain`.
 - `ci/node` to seed `node`, `node.yaml` (live), seed `spec/validate`.
+- `ci/e2e` to seeds `api`, `node`, `lib/pond`, `nats`, `openapi.yaml`
+  (served), `node.yaml` (live), `protocol.yaml` (a node enrolled and
+  serving over NATS), seed `spec/validate`.
 - `ci/ui` to seed `ui`.
 - `ci/contracts` to `openapi.yaml`, `node.yaml`, `protocol.yaml`,
   `internal.yaml`, seed `spec/validate` (the canned bodies against
@@ -213,6 +217,9 @@ new migration" to `store.md`.
 - the `bounded` assignment entry to seed `api` (`Names`, `Restriction`).
 - the hashmap row warning entry to seed `api` (`MemoryStore`'s `@unbounded`
   writes).
+- the long-lived NATS client entry to seed `api` (`NatsLink` connects per
+  use) and seed `lib/pond`.
+- the reserved `draining` entry to seed `api` (`NodePlane::going_away`).
 
 `holds`, `reviews`: none. These are the holes.
 

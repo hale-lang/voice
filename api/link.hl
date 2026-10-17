@@ -1,0 +1,136 @@
+// The api's link to the nodes: NATS, as ../spec/protocol.yaml says. The
+// api publishes `assign` on a node's subject, and `serve` as a request
+// whose answer is the node's ack; the node then streams the request's
+// events and its result to the reply subject the api named.
+//
+// Everything above reaches it through `Link`, so the tests serve through
+// a node of their own, in process.
+
+import "../lib/pond/realtime/nats" as nats;
+
+/// How one `serve` went. `ack` is `accepted`, `refused` (with `reason`),
+/// `unanswered` (no ack in time: a seat failure) or `lost` (the link is
+/// down). For an accepted request, `outcome` is the result's (`served`,
+/// `incomplete`, `failed`, `cancelled`), or `unfinished` when no result
+/// came before the wait ran out; `response` is the response object the
+/// terminal event carried, as JSON.
+type ServeOutcome {
+    ack: String = "";
+    reason: String = "";
+    outcome: String = "unfinished";
+    // the result's `served.model`, and its timing
+    model: String = "";
+    first_output_ms: Int = 0;
+    engine_ms: Int = 0;
+    // for `failed`: the result's error
+    error_code: String = "";
+    error_message: String = "";
+    retryable: Bool = false;
+    response: String = "";
+    // whether output reached the api before the seat failed
+    output: Bool = false;
+}
+
+interface Link {
+    /// Where NATS is, from a node's side: what registration tells it.
+    fn place() -> String;
+    /// Publish `body` on `voice.node.<node>.assign`; false when it could
+    /// not be sent.
+    fn assign(node: String, body: String) -> Bool;
+    /// Offer `body` (a `serve` message naming `reply_to`) to the node and
+    /// read its answer, waiting at most `wait` for the result.
+    fn serve(node: String, reply_to: String, body: String, wait: Duration) -> ServeOutcome;
+}
+
+/// The link over core NATS. Each use opens a connection of its own and
+/// closes it after: a client held for the api's life keeps part of every
+/// message it frames (FRICTION.md), and a connection to NATS on the
+/// private network costs a millisecond, against a request that holds the
+/// api for as long as its seat takes.
+locus NatsLink {
+    params {
+        // the address the api dials; "" for no NATS (nothing is sent)
+        url: String = "";
+        // the address nodes dial, when theirs differs
+        node_url: String = "";
+    }
+
+    fn place() -> String { return if len(self.node_url) > 0 { self.node_url } else { self.url }; }
+
+    fn assign(node: String, body: String) -> Bool {
+        if len(self.url) == 0 { return false; }
+        let c = nats::NatsClient { url: self.url, name: "voice-api" };
+        if !c.open() {
+            eprintln("voice api: NATS unreachable at ", self.url, ": ", c.last_error);
+            return false;
+        }
+        let mut sent = true;
+        c.pub_msg("voice.node." + node + ".assign", "", std::bytes::from_string(body)) or { sent = false; };
+        c.flush() or { sent = false; };
+        c.close();
+        return sent;
+    }
+
+    /// Subscribe to the request's replies first, then offer it, so no
+    /// event can arrive before the api listens.
+    fn serve(node: String, reply_to: String, body: String, wait: Duration) -> ServeOutcome {
+        if len(self.url) == 0 { return ServeOutcome { ack: "lost", reason: "no NATS is configured" }; }
+        let c = nats::NatsClient { url: self.url, name: "voice-api" };
+        if !c.open() { return ServeOutcome { ack: "lost", reason: "NATS unreachable at " + self.url + ": " + c.last_error }; }
+        let sid = c.sub_to(reply_to + ".>", "") or - 1;
+        if sid < 0 { return ServeOutcome { ack: "lost", reason: c.last_error }; }
+        let reply = c.request("voice.node." + node + ".serve", std::bytes::from_string(body), 5s) or nats::NatsMsg { };
+        let ack = std::str::from_bytes(reply.data);
+        let mut out = ServeOutcome { ack: std::json::find_string_field(ack, "outcome") };
+        if out.ack != "accepted" {
+            c.close();
+            if len(ack) == 0 { return ServeOutcome { ack: "unanswered", reason: "node " + node + " did not answer: " + c.last_error }; }
+            out.ack = "refused";
+            out.reason = std::json::find_string_field(ack, "reason");
+            return out;
+        }
+        let deadline = std::time::monotonic() + wait;
+        let mut done = false;
+        while !done && std::time::monotonic() < deadline {
+            if c.read_msg(1s) {
+                let msg = std::str::from_bytes(c.last.data);
+                if c.last.subject == reply_to + ".event" {
+                    out = take_event(out, std::json::find_field_raw(msg, "event"));
+                } else if c.last.subject == reply_to + ".result" {
+                    out = take_result(out, msg);
+                    done = true;
+                }
+            } else if !c.connected {
+                done = true;
+            }
+        }
+        c.close();
+        return out;
+    }
+}
+
+/// What an event tells the api: that output began, and the response the
+/// terminal event carries.
+fn take_event(o: ServeOutcome, event: String) -> ServeOutcome {
+    let mut out = o;
+    let kind = std::json::find_string_field(event, "type");
+    if kind == "response.output_text.delta" { out.output = true; }
+    if kind == "response.completed" || kind == "response.incomplete" || kind == "response.failed" {
+        out.response = std::str::trim(std::json::find_field_raw(event, "response"));
+    }
+    return out;
+}
+
+fn take_result(o: ServeOutcome, result: String) -> ServeOutcome {
+    let mut out = o;
+    out.outcome = std::json::find_string_field(result, "outcome");
+    out.model = std::json::find_string_field(std::json::find_field_raw(result, "served"), "model");
+    let timing = std::json::find_field_raw(result, "timing");
+    out.first_output_ms = std::json::find_int_field(timing, "first_output_ms");
+    out.engine_ms = std::json::find_int_field(timing, "engine_ms");
+    let e = std::json::find_field_raw(result, "error");
+    out.error_code = std::json::find_string_field(e, "code");
+    out.error_message = std::json::find_string_field(e, "message");
+    out.retryable = std::json::find_bool_field(e, "retryable");
+    return out;
+}

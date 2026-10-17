@@ -1,13 +1,18 @@
 // Inference: POST /v1/responses and POST /v1/chat/completions.
 //
 // A request is admitted as the contract says (its key, its model, the
-// account it names, its data class) and then needs a seat: an enabled seat
-// serving the model, on a node that is connected, spending an account the
-// key may spend, carrying the request's data class. No node can connect
-// yet (the node protocol is step 2), so no seat is eligible and every
-// admitted request is answered `503 no_eligible_seat`. Budgets and limits
-// are configuration only: they are reserved against when requests are
-// served, in the store's reservation transaction.
+// account it names, its data class), then offered to its eligible seats in
+// turn over the link (protocol.yaml): an enabled seat serving the model,
+// up on a node that is up and not draining and not held by a local
+// control, spending an account the key may spend, carrying the request's
+// data class. A seat that refuses, does not answer, or fails before any
+// output is an attempt, and the next seat is offered the request; every
+// attempt is in the answer's `voice.attempts`. Budgets and limits are
+// configuration only: they are reserved against in the store's
+// reservation transaction, which comes with the Postgres store.
+//
+// The api serves its callers in turn, one request at a time: a request
+// holds the api until its seat answers.
 //
 // A streamed request is refused `400 unsupported`: `std::http::Server`
 // cannot stream a response body in hale 0.24.0.
@@ -23,8 +28,9 @@
 // to 12 MiB, and answer past it as the contract says, once the server takes
 // a body limit (FRICTION.md).
 
-/// What admission reads of an inference request. `account` "" names none;
-/// `data_class` defaults to `internal`.
+/// An inference request: what admission reads, and `body`, the standard
+/// request a node is sent (a Chat Completions request converted).
+/// `account` "" names none; `data_class` defaults to `internal`.
 type InferenceRequest {
     // responses | chat
     endpoint: String = "responses";
@@ -33,21 +39,111 @@ type InferenceRequest {
     previous_response_id: String = "";
     account: String = "";
     data_class: String = "internal";
+    // the voice.deadline as written, "" for none
+    deadline: String = "";
+    body: String = "{}";
 }
 
-/// An admitted request: who asked, and the seats that could serve it.
-type Admitted {
-    key: String = "";
-    project: String = "";
+/// `Served`: what actually served a request. `provider` "" is `null`.
+type ServedBy {
     model: String = "";
-    seats: Names = Names { };
+    node: String = "";
+    seat: String = "";
+    account: String = "";
+    engine: String = "";
+    provider: String = "";
 }
+
+/// `Attempt`. `error` "" when it served.
+type Attempt { seat: String = ""; account: String = ""; outcome: String = ""; error: String = ""; wall_ms: Int = 0; }
+
+type Attempts { items: bounded[Attempt; 8]; }
+
+/// `VoiceResponseExtension`; its timing is the wall time, since nothing
+/// queues or loads yet.
+type VoiceExtension {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    served: ServedBy = ServedBy { };
+    price_micros: Int = 0;
+    currency: String = "USD";
+    wall_ms: Int = 0;
+    attempts: Attempts = Attempts { };
+}
+
+/// A served request. `response` is the standard response object the node
+/// produced, as JSON (the codec carries no free-form object); the rest is
+/// what a Chat Completion is written from.
+type Served {
+    request_id: String = "";
+    // the model the caller named
+    model: String = "";
+    // completed | incomplete
+    status: String = "completed";
+    text: String = "";
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    response: String = "{}";
+    voice: VoiceExtension = VoiceExtension { };
+}
+
+/// One seat a request could be offered, and its own name for the model.
+type Candidate { seat: SeatRow = SeatRow { }; engine_name: String = ""; }
+
+type Candidates { items: bounded[Candidate; 8]; serving: Int = 0; }
 
 locus Inference {
-    params { store: Store; }
+    params {
+        store: Store;
+        link: Link;
+        // how long a seat may take to answer
+        wait: Duration = 120s;
+    }
 
-    /// Admit `r` for the caller `ctx` names, then find it a seat.
-    fn admit(r: InferenceRequest, ctx: std::api::Context) -> Admitted fallible(ApiError) {
+    /// `createResponse`.
+    fn respond(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+        return self.serve(r, ctx) or raise;
+    }
+
+    /// `createChatCompletion`: the same request, converted.
+    fn chat(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+        return self.serve(r, ctx) or raise;
+    }
+
+    /// Admit, then offer the request to each eligible seat in turn until
+    /// one serves it.
+    fn serve(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+        let started = std::time::monotonic_ns();
+        let candidates = self.admit(r, ctx) or raise;
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        let m = self.store.model(r.model) or fail metering_failed(err);
+        let id_hex = random_hex(12) or fail entropy_failed(err.message);
+        let request_id = "resp_" + id_hex;
+        let reply_to = "voice.reply." + request_id;
+        let mut attempts = Attempts { };
+        let mut why = "";
+        for c in candidates.items {
+            let t0 = std::time::monotonic_ns();
+            let o = self.link.serve(c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.wait);
+            let ms = (std::time::monotonic_ns() - t0) / 1000000;
+            if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
+                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
+                return served(request_id, r.model, k, m, c, o, attempts, (std::time::monotonic_ns() - started) / 1000000);
+            }
+            let reason = failure_of(o);
+            why = c.seat.ref + ": " + reason;
+            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "failed", error: reason, wall_ms: ms }) or discard;
+            if o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
+                fail ApiError { status: 502, kind: "model_error", code: "upstream_failed", message: "seat " + why };
+            }
+        }
+        fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why };
+    }
+
+    /// Admit `r` for the caller `ctx` names: the seats it may be offered,
+    /// or the refusal.
+    fn admit(r: InferenceRequest, ctx: std::api::Context) -> Candidates fallible(ApiError) {
         if r.stream {
             fail unsupported("`stream: true` is not served yet: this api cannot stream a response body; ask without `stream`", "stream");
         }
@@ -75,17 +171,18 @@ locus Inference {
         }
 
         let seats = self.store.seats() or fail metering_failed(err);
-        let mut out = Admitted { key: k.id, project: p.id, model: r.model };
-        let mut serving = 0;
+        let mut out = Candidates { };
         for s in seats.rows {
-            if seat_serves(s, r.model) {
-                serving = serving + 1;
-                let eligible = self.eligible(s, p, k, r) or raise;
-                if eligible { push(out.seats.items, s.ref) or discard; }
+            for sm in s.serves.items {
+                if sm.model == r.model {
+                    out.serving = out.serving + 1;
+                    let eligible = self.eligible(s, p, k, r) or raise;
+                    if eligible { push(out.items, Candidate { seat: s, engine_name: sm.engine_name }) or discard; }
+                }
             }
         }
-        if count(out.seats.items) == 0 {
-            let why = if serving == 0 { "no seat serves model " + r.model } else { to_string(serving) + " seat(s) serve model " + r.model + ", none on a connected node with an account this key may spend and data class " + r.data_class };
+        if count(out.items) == 0 {
+            let why = if out.serving == 0 { "no seat serves model " + r.model } else { to_string(out.serving) + " seat(s) serve model " + r.model + ", none up on a node that is up, with an account this key may spend and data class " + r.data_class };
             fail ApiError { status: 503, kind: "server_error", code: "no_eligible_seat", message: why };
         }
         return out;
@@ -93,24 +190,119 @@ locus Inference {
 
     /// True when `s` could take the request: enabled, carrying its data
     /// class, spending an account the key may spend (the one it names, if
-    /// it names one) that is not archived, on a node that is connected. No
-    /// node is connected until the node protocol (step 2).
+    /// it names one) that is not archived, reported `up` by its node for
+    /// the node's current assignment, on a node that is up, not draining
+    /// and not holding the seat by a local control.
     fn eligible(s: SeatRow, p: ProjectRow, k: KeyRow, r: InferenceRequest) -> Bool fallible(ApiError) {
         if !s.enabled || !has_name(s.data_classes, r.data_class) { return false; }
         if len(r.account) > 0 && s.account != r.account { return false; }
         if !allows(p.accounts, s.account) || !allows(k.accounts, s.account) { return false; }
-        let a = self.store.account(s.account) or fail metering_failed(err);
-        if !a.present || a.archived { return false; }
-        let n = self.store.node(s.node) or fail metering_failed(err);
-        let connected = false;
-        return n.present && !n.revoked && connected;
+        return seat_ready(self.store, s) or raise;
     }
+}
+
+/// Why an offer did not serve, in a line.
+fn failure_of(o: ServeOutcome) -> String {
+    if o.ack == "refused" { return "refused: " + o.reason; }
+    if o.ack != "accepted" { return o.ack + ": " + o.reason; }
+    if o.outcome == "failed" { return "failed (" + o.error_code + "): " + o.error_message; }
+    if o.outcome == "unfinished" { return "no result within the wait"; }
+    return o.outcome;
+}
+
+/// The answer: the node's response, its text and usage, and the voice
+/// object that says what served it and what it cost.
+fn served(request_id: String, model: String, k: KeyRow, m: ModelRow, c: Candidate, o: ServeOutcome, attempts: Attempts, wall_ms: Int) -> Served {
+    let usage = std::json::find_field_raw(o.response, "usage");
+    let input = std::json::find_int_field(usage, "input_tokens");
+    let output = std::json::find_int_field(usage, "output_tokens");
+    let price = if m.priced { (input * m.price.input_per_mtok_micros + output * m.price.output_per_mtok_micros + 999999) / 1000000 } else { 0 };
+    return Served {
+        request_id: request_id,
+        model: model,
+        status: if o.outcome == "incomplete" { "incomplete" } else { "completed" },
+        text: output_text(o.response),
+        input_tokens: input,
+        output_tokens: output,
+        response: o.response,
+        voice: VoiceExtension {
+            request_id: request_id,
+            project: k.project,
+            key: k.id,
+            served: ServedBy { model: if len(o.model) > 0 { o.model } else { model }, node: c.seat.node, seat: c.seat.ref, account: c.seat.account, engine: c.seat.engine },
+            price_micros: price,
+            currency: if m.priced { m.price.currency } else { "USD" },
+            wall_ms: wall_ms,
+            attempts: attempts
+        }
+    };
+}
+
+/// The text of a response's output messages, joined.
+fn output_text(response: String) -> String {
+    let mut text = "";
+    let mut items = std::json::array_first(std::json::find_field_raw(response, "output"));
+    while !items.done {
+        let mut parts = std::json::array_first(std::json::find_field_raw(items.element, "content"));
+        while !parts.done {
+            if std::json::find_string_field(parts.element, "type") == "output_text" {
+                text = text + std::json::find_string_field(parts.element, "text");
+            }
+            parts = std::json::array_next(parts);
+        }
+        items = std::json::array_next(items);
+    }
+    return text;
+}
+
+/// The `serve` message (protocol.yaml `Serve`).
+fn serve_message(request_id: String, reply_to: String, c: Candidate, r: InferenceRequest) -> String {
+    return "{\"type\": \"serve\", \"request_id\": " + jq(request_id) + ", \"reply_to\": " + jq(reply_to) + ", \"seat\": " + jq(c.seat.id)
+        + ", \"model\": " + jq(r.model) + ", \"engine_model\": " + (if len(c.engine_name) > 0 { jq(c.engine_name) } else { "null" })
+        + ", \"deadline\": " + (if len(r.deadline) > 0 { jq(r.deadline) } else { "null" }) + ", \"body\": " + r.body + "}";
 }
 
 // ---- the wire ----------------------------------------------------------
 
+/// The body's members but `voice`, `stream`, `stream_options` and
+/// `background`, which the coordinator keeps (protocol.yaml `Serve.body`).
+fn standard_body(body: String) -> String {
+    let out_list = JsonList { };
+    let mut it = std::json::object_first(body);
+    while !it.done {
+        let key = std::json::obj_key_string(it, body);
+        if key != "voice" && key != "stream" && key != "stream_options" && key != "background" {
+            out_list.add(jq(key) + ": " + std::str::trim(std::json::obj_value_raw(it, body)));
+        }
+        it = std::json::object_next(it, body);
+    }
+    let out = out_list.text();
+    return "{" + out + "}";
+}
+
+/// A Chat Completions request as the standard request: its messages as
+/// input messages, its output cap, its sampling and its metadata.
+fn chat_body(body: String) -> String {
+    let input_list = JsonList { };
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "messages"));
+    while !it.done {
+        let msg = std::str::trim(it.element);
+        let content = std::str::trim(std::json::find_field_raw(msg, "content"));
+        input_list.add("{\"type\": \"message\", \"role\": " + jq(std::json::find_string_field(msg, "role")) + ", \"content\": " + (if len(content) == 0 || content == "null" { "\"\"" } else { content }) + "}");
+        it = std::json::array_next(it);
+    }
+    let input = input_list.text();
+    let mut out = "{\"model\": " + jq(std::json::find_string_field(body, "model")) + ", \"input\": [" + input + "]";
+    let cap = std::str::trim(if sets(body, "max_completion_tokens") { std::json::find_field_raw(body, "max_completion_tokens") } else { std::json::find_field_raw(body, "max_tokens") });
+    if len(cap) > 0 { out = out + ", \"max_output_tokens\": " + cap; }
+    if sets(body, "temperature") { out = out + ", \"temperature\": " + std::str::trim(std::json::find_field_raw(body, "temperature")); }
+    if sets(body, "top_p") { out = out + ", \"top_p\": " + std::str::trim(std::json::find_field_raw(body, "top_p")); }
+    if kind_of(body, "metadata") == "object" { out = out + ", \"metadata\": " + std::str::trim(std::json::find_field_raw(body, "metadata")); }
+    return out + "}";
+}
+
 /// What admission reads of a `CreateResponseRequest` or a
-/// `ChatCompletionRequest`; the rest of the body goes to the engine.
+/// `ChatCompletionRequest`, and the standard request a node is sent.
 fn read_inference(body: String, endpoint: String) -> InferenceRequest fallible(ApiError) {
     object_body(body) or raise;
     let model = required_string(body, "model") or raise;
@@ -128,6 +320,58 @@ fn read_inference(body: String, endpoint: String) -> InferenceRequest fallible(A
         stream: bool_or(body, "stream", false) or raise,
         previous_response_id: if endpoint == "responses" { nullable_string(body, "previous_response_id") or raise } else { "" },
         account: if has_voice { nullable_string(voice, "account") or raise } else { "" },
-        data_class: if has_voice { string_or(voice, "data_class", "internal") or raise } else { "internal" }
+        data_class: if has_voice { string_or(voice, "data_class", "internal") or raise } else { "internal" },
+        deadline: if has_voice { nullable_string(voice, "deadline") or raise } else { "" },
+        body: if endpoint == "chat" { chat_body(body) } else { standard_body(body) }
     };
+}
+
+fn voice_json(v: VoiceExtension) -> String {
+    let attempts_list = JsonList { };
+    for a in v.attempts.items {
+        let mut one = "{\"seat\": " + jq(a.seat) + ", \"account\": " + jq(a.account) + ", \"outcome\": " + jq(a.outcome);
+        if len(a.error) > 0 { one = one + ", \"error\": " + jq(a.error); }
+        attempts_list.add(one + ", \"wall_ms\": " + to_string(a.wall_ms) + "}");
+    }
+    let attempts = attempts_list.text();
+    let s = v.served;
+    return "{\"request_id\": " + jq(v.request_id) + ", \"project\": " + jq(v.project) + ", \"key\": " + jq(v.key)
+        + ", \"served\": {\"model\": " + jq(s.model) + ", \"quantization\": null, \"node\": " + jq(s.node) + ", \"seat\": " + jq(s.seat)
+        + ", \"account\": " + jq(s.account) + ", \"engine\": " + jq(s.engine) + ", \"provider\": " + (if len(s.provider) > 0 { jq(s.provider) } else { "null" }) + "}"
+        + ", \"price_micros\": " + to_string(v.price_micros) + ", \"currency\": " + jq(v.currency)
+        + ", \"timing\": {\"wall_ms\": " + to_string(v.wall_ms) + ", \"queue_ms\": 0, \"load_ms\": 0}, \"attempts\": [" + attempts + "]}";
+}
+
+/// The node's response object with voice's `voice` object in it.
+fn response_json(s: Served) -> String {
+    let body = std::str::trim(s.response);
+    return body[0..(len(body) - 1)] + ", \"voice\": " + voice_json(s.voice) + "}";
+}
+
+/// The served request as a Chat Completion.
+fn chat_completion_json(s: Served) -> String {
+    let finish = if s.status == "incomplete" { "length" } else { "stop" };
+    return "{\"id\": " + jq(s.request_id) + ", \"object\": \"chat.completion\", \"created\": " + to_string(std::time::unix(now_seconds()))
+        + ", \"model\": " + jq(s.model) + ", \"choices\": [{\"index\": 0, \"message\": {\"role\": \"assistant\", \"content\": " + jq(s.text) + "}, \"finish_reason\": " + jq(finish) + "}]"
+        + ", \"usage\": {\"prompt_tokens\": " + to_string(s.input_tokens) + ", \"completion_tokens\": " + to_string(s.output_tokens) + ", \"total_tokens\": " + to_string(s.input_tokens + s.output_tokens) + "}"
+        + ", \"voice\": " + voice_json(s.voice) + "}";
+}
+
+/// True when the seat could take a request now: its account is not
+/// archived, and its node is up, not draining, has applied its assignment,
+/// reports the seat `up` and holds it by no local control.
+fn seat_ready(store: Store, s: SeatRow) -> Bool fallible(ApiError) {
+    let a = store.account(s.account) or fail metering_failed(err);
+    if !a.present || a.archived { return false; }
+    let n = store.node(s.node) or fail metering_failed(err);
+    if !n.present { return false; }
+    let status = node_status(store, n, now_seconds()) or raise;
+    if status != "up" { return false; }
+    let f = store.fleet(n.id) or fail metering_failed(err);
+    if f.draining || f.applied_version < n.assignment_version || locally_paused(f.local, s.id) { return false; }
+    let states = store.seat_states(n.id) or fail metering_failed(err);
+    for st in states.rows {
+        if st.seat == s.id { return st.status == "up"; }
+    }
+    return false;
 }

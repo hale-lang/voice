@@ -130,6 +130,37 @@ type ChangeRow {
     after: String = "";
 }
 
+/// A `node_state` row: what a node declared and reported, written by the
+/// node plane. `capabilities` and `local` are the node's JSON as it sent
+/// them. The node's last heartbeat and load are `Store.beat`'s, apart.
+type FleetRow {
+    node: String = "";
+    version: String = "";
+    capabilities: String = "";
+    local: String = "";
+    registered_at: Time = `1970-01-01T00:00:00Z`;
+    // the assignment the node last reported on; -1 for none
+    applied_version: Int = -1;
+    draining: Bool = false;
+    present: Bool = false;
+}
+
+/// A node's last sign of life: its heartbeat (or registration) and the
+/// requests it had in flight then.
+type Beat { at: Time = `1970-01-01T00:00:00Z`; in_flight: Int = 0; present: Bool = false; }
+
+/// A `seat_state` row, keyed by `ref`.
+type SeatStateRow {
+    ref: String = "";
+    node: String = "";
+    seat: String = "";
+    // starting | up | down | disabled | paused | refused
+    status: String = "";
+    reason: String = "";
+    in_flight: Int = 0;
+    present: Bool = false;
+}
+
 /// Which changes, newest first: under `target` (all when ""), in
 /// [from, to] where set, at most `limit`, older than `cursor` (a change id)
 /// when set.
@@ -163,6 +194,9 @@ type NodeRows { rows: bounded[NodeRow; 64]; }
 
 /// Every seat row, on every node, in the order they were added.
 type SeatRows { rows: bounded[SeatRow; 256]; }
+
+/// One node's seat states.
+type SeatStateRows { rows: bounded[SeatStateRow; 16]; }
 
 /// A page of changes; `more` when older ones match too.
 /// A page of the log. `cursor_known` is false when the query's cursor
@@ -226,9 +260,40 @@ interface Store {
     /// The change log, as `q` asks; the store numbers each change it
     /// appends.
     fn changes(q: ChangeQuery) -> ChangeRows fallible(StoreError);
+
+    // ---- the fleet as reported (the node plane's writes; no change log)
+
+    /// The node's state; `present` false until it first registers.
+    fn fleet(node: String) -> FleetRow fallible(StoreError);
+    /// Replace it: a registration, or what the node reported since.
+    fn put_fleet(row: FleetRow) fallible(StoreError);
+    /// The node's last sign of life.
+    fn beat(node: String) -> Beat fallible(StoreError);
+    /// A sign of life now, with its load. Written on every heartbeat, so
+    /// it keeps no text of its own.
+    fn put_beat(node: String, when: Time, in_flight: Int) fallible(StoreError);
+    fn seat_states(node: String) -> SeatStateRows fallible(StoreError);
+    /// Replace one seat's state; a store writes it only when it changed.
+    fn put_seat_state(row: SeatStateRow) fallible(StoreError);
+    /// An account's provider windows, the JSON array an engine last
+    /// reported, "" for none.
+    fn windows(account: String) -> String fallible(StoreError);
+    fn put_windows(account: String, json: String) fallible(StoreError);
 }
 
 // ---- in memory -------------------------------------------------------
+
+@form(hashmap)
+locus FleetTable { capacity { pool rows of FleetRow indexed_by node; } }
+
+@form(hashmap)
+locus SeatStateTable { capacity { pool rows of SeatStateRow indexed_by ref; } }
+
+/// An account's windows, as JSON.
+type WindowRow { account: String = ""; json: String = ""; present: Bool = false; }
+
+@form(hashmap)
+locus WindowTable { capacity { pool rows of WindowRow indexed_by account; } }
 
 @form(hashmap)
 locus ModelTable { capacity { pool rows of ModelRow indexed_by id; } }
@@ -282,6 +347,13 @@ locus MemoryStore {
         seat_rows: SeatTable = SeatTable { };
         seat_order: IdOrder = IdOrder { };
         log: ChangeLog = ChangeLog { };
+        fleet_rows: FleetTable = FleetTable { };
+        // a node's last beat, by its place in `node_order`: scalars set in
+        // place, so a heartbeat allocates nothing
+        beat_ns: bounded[Int; 64];
+        beat_load: bounded[Int; 64];
+        seat_state_rows: SeatStateTable = SeatStateTable { };
+        window_rows: WindowTable = WindowTable { };
     }
 
     fn kind() -> String { return "memory"; }
@@ -615,6 +687,81 @@ locus MemoryStore {
         }
         if !started { out.cursor_known = false; }
         return out;
+    }
+
+    // ---- the fleet as reported
+
+    fn fleet(node: String) -> FleetRow fallible(StoreError) {
+        return self.fleet_rows.get(node) or FleetRow { };
+    }
+
+    @unbounded
+    fn put_fleet(row: FleetRow) fallible(StoreError) {
+        let mut r = row;
+        r.present = true;
+        self.fleet_rows.set(r);
+    }
+
+    fn beat(node: String) -> Beat fallible(StoreError) {
+        let i = self.node_index(node);
+        if i < 0 || i >= count(self.beat_ns) { return Beat { }; }
+        let ns = at(self.beat_ns, i) or 0;
+        if ns == 0 { return Beat { }; }
+        return Beat { at: std::time::from_nanos(ns), in_flight: at(self.beat_load, i) or 0, present: true };
+    }
+
+    fn put_beat(node: String, when: Time, in_flight: Int) fallible(StoreError) {
+        let i = self.node_index(node);
+        if i < 0 { return; }
+        while count(self.beat_ns) <= i {
+            push(self.beat_ns, 0) or discard;
+            push(self.beat_load, 0) or discard;
+        }
+        set(self.beat_ns, i, std::time::nanos(when)) or discard;
+        set(self.beat_load, i, in_flight) or discard;
+    }
+
+    /// A node's place in the order it was added, -1 for none.
+    fn node_index(node: String) -> Int {
+        let mut i = 0;
+        while i < self.node_order.len() {
+            if (self.node_order.get(i) or "") == node { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    fn seat_states(node: String) -> SeatStateRows fallible(StoreError) {
+        let mut out = SeatStateRows { };
+        let mut i = 0;
+        while i < self.seat_order.len() {
+            let ref = self.seat_order.get(i) or "";
+            let st = self.seat_state_rows.get(ref) or SeatStateRow { };
+            if st.present && st.node == node { push(out.rows, st) or discard; }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    @unbounded
+    fn put_seat_state(row: SeatStateRow) fallible(StoreError) {
+        let cur = self.seat_state_rows.get(row.ref) or SeatStateRow { };
+        if cur.present && cur.status == row.status && cur.reason == row.reason && cur.in_flight == row.in_flight { return; }
+        let mut r = row;
+        r.present = true;
+        self.seat_state_rows.set(r);
+    }
+
+    fn windows(account: String) -> String fallible(StoreError) {
+        let w = self.window_rows.get(account) or WindowRow { };
+        return w.json;
+    }
+
+    @unbounded
+    fn put_windows(account: String, json: String) fallible(StoreError) {
+        let cur = self.window_rows.get(account) or WindowRow { };
+        if cur.present && cur.json == json { return; }
+        self.window_rows.set(WindowRow { account: account, json: json, present: true });
     }
 }
 

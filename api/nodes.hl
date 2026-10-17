@@ -1,0 +1,522 @@
+// Nodes and their seats, configured on the admin plane. A node is created
+// here, which issues its enrollment token; a seat is one of the node's
+// engines, spending one account, serving some catalog models.
+//
+// No node can connect yet (the node plane is still canned, step 2), so a
+// node is `pending` until it is revoked, has declared no capabilities, and
+// every seat is `offline`, with the problems the coordinator can see.
+
+type NodeRef { node: String; }
+
+/// `NodeCreate`. `max_in_flight` -1 is `null`.
+type NodeCreate { id: String; name: String = ""; max_in_flight: Int = -1; }
+
+/// `NodeUpdate`, for the node the path names.
+type NodeUpdate {
+    node: String;
+    set_name: Bool = false;
+    name: String = "";
+    set_max_in_flight: Bool = false;
+    max_in_flight: Int = -1;
+}
+
+/// `SeatModel`. `engine_name` is its `as`, "" for `null`.
+type SeatModel { model: String = ""; engine_name: String = ""; }
+
+type SeatModels { items: bounded[SeatModel; 16]; }
+
+/// What the coordinator sees wrong with a seat.
+type Problems { items: bounded[String; 8]; }
+
+type SeatRef { node: String; seat: String; }
+
+/// `Seat`, as created on the node the path names. `config` is the engine's
+/// JSON object, as text: the codec carries no free-form object.
+type SeatCreate {
+    node: String;
+    id: String;
+    engine: String;
+    account: String;
+    serves: SeatModels = SeatModels { };
+    // empty is the default, `[internal]`
+    data_classes: Names = Names { };
+    concurrency: Int = 1;
+    enabled: Bool = true;
+    config: String = "{}";
+}
+
+/// `SeatUpdate`, for the seat the path names.
+type SeatUpdate {
+    node: String;
+    seat: String;
+    set_engine: Bool = false;
+    engine: String = "";
+    set_account: Bool = false;
+    account: String = "";
+    set_serves: Bool = false;
+    serves: SeatModels = SeatModels { };
+    set_data_classes: Bool = false;
+    data_classes: Names = Names { };
+    set_concurrency: Bool = false;
+    concurrency: Int = 1;
+    set_enabled: Bool = false;
+    enabled: Bool = true;
+    set_config: Bool = false;
+    config: String = "{}";
+}
+
+/// `SeatView`.
+type SeatView {
+    ref: String = "";
+    node: String = "";
+    id: String = "";
+    engine: String = "";
+    account: String = "";
+    serves: SeatModels = SeatModels { };
+    data_classes: Names = Names { };
+    concurrency: Int = 1;
+    enabled: Bool = true;
+    config: String = "{}";
+    // pending | offline | starting | up | down | disabled | paused | refused
+    status: String = "offline";
+    in_flight: Int = 0;
+    problems: Problems = Problems { };
+}
+
+type SeatViews { items: bounded[SeatView; 16]; }
+
+type SeatList { data: bounded[SeatView; 16]; }
+
+/// `Node`, and `NodeWithToken` when `enrollment_token` is set (only the
+/// answers to its creation and to a rotation). `max_in_flight` -1 is `null`.
+type Node {
+    id: String = "";
+    name: String = "";
+    // pending | up | down | revoked
+    status: String = "pending";
+    max_in_flight: Int = -1;
+    in_flight: Int = 0;
+    assignment_version: Int = 0;
+    seats: SeatViews = SeatViews { };
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    revoked: Bool = false;
+    revoked_at: Time = `1970-01-01T00:00:00Z`;
+    enrollment_token: String = "";
+}
+
+type NodeList { data: bounded[Node; 64]; }
+
+locus Nodes {
+    params { store: Store; }
+
+    /// `listNodes`.
+    fn list() -> NodeList fallible(ApiError) {
+        let rows = self.store.nodes() or fail store_failed(err);
+        let mut out = NodeList { };
+        for r in rows.rows {
+            let v = self.view(r) or raise;
+            push(out.data, v) or discard;
+        }
+        return out;
+    }
+
+    /// `createNode`: the token is in this answer and nowhere else; the
+    /// store keeps its digest.
+    fn create(c: NodeCreate) -> Node fallible(ApiError) {
+        if !is_slug(c.id) { fail invalid("`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63", "id"); }
+        if len(c.name) > 128 { fail invalid("`name` is at most 128 characters", "name"); }
+        check_cap(c.max_in_flight) or raise;
+        let token_hex = random_hex(20) or fail entropy_failed(err.message);
+        let token = "vn-" + token_hex;
+        let mut row = NodeRow { id: c.id, name: c.name, token_digest: secret_digest(token), max_in_flight: c.max_in_flight, created_at: now_seconds() };
+        row.assignment_version = 1;
+        let mut v = self.view(row) or raise;
+        let added = self.store.insert_node(row, change("create", "nodes/" + c.id, "", node_json(v))) or fail store_failed(err);
+        if !added { fail conflict("node " + c.id + " exists; a node id is never reused"); }
+        v.enrollment_token = token;
+        return v;
+    }
+
+    /// `getNode`.
+    fn get(r: NodeRef) -> Node fallible(ApiError) {
+        let row = self.known(r.node) or raise;
+        return self.view(row) or raise;
+    }
+
+    /// `updateNode`: the fields the request sets; a new assignment.
+    fn update(u: NodeUpdate) -> Node fallible(ApiError) {
+        let mut row = self.known(u.node) or raise;
+        let before = self.view(row) or raise;
+        if u.set_name {
+            if len(u.name) > 128 { fail invalid("`name` is at most 128 characters", "name"); }
+            row.name = u.name;
+        }
+        if u.set_max_in_flight {
+            check_cap(u.max_in_flight) or raise;
+            row.max_in_flight = u.max_in_flight;
+        }
+        row.assignment_version = row.assignment_version + 1;
+        let after = self.view(row) or raise;
+        self.store.update_node(row, change("update", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        return after;
+    }
+
+    /// `revokeNode`: its token no longer admits it and its seats stop
+    /// serving. The id stays taken; revoking a revoked node changes nothing.
+    fn revoke(r: NodeRef) -> Node fallible(ApiError) {
+        let mut row = self.known(r.node) or raise;
+        if row.revoked { return self.view(row) or raise; }
+        let before = self.view(row) or raise;
+        row.revoked = true;
+        row.revoked_at = now_seconds();
+        row.assignment_version = row.assignment_version + 1;
+        let after = self.view(row) or raise;
+        self.store.update_node(row, change("revoke", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        return after;
+    }
+
+    /// `rotateNodeToken`: the old token stops admitting the node at once.
+    fn rotate_token(r: NodeRef) -> Node fallible(ApiError) {
+        let mut row = self.known(r.node) or raise;
+        if row.revoked { fail conflict("node " + r.node + " is revoked; a revoked node gets no token"); }
+        let token_hex = random_hex(20) or fail entropy_failed(err.message);
+        let token = "vn-" + token_hex;
+        let before = self.view(row) or raise;
+        row.token_digest = secret_digest(token);
+        row.assignment_version = row.assignment_version + 1;
+        let mut after = self.view(row) or raise;
+        self.store.update_node(row, change("rotate", "nodes/" + row.id, node_json(before), node_json(after))) or fail store_failed(err);
+        after.enrollment_token = token;
+        return after;
+    }
+
+    fn known(id: String) -> NodeRow fallible(ApiError) {
+        let row = self.store.node(id) or fail store_failed(err);
+        if !row.present { fail not_found("no node " + id); }
+        return row;
+    }
+
+    /// The row with its seats.
+    fn view(r: NodeRow) -> Node fallible(ApiError) {
+        let seats = self.store.seats() or fail store_failed(err);
+        let mut v = Node {
+            id: r.id,
+            name: r.name,
+            status: if r.revoked { "revoked" } else { "pending" },
+            max_in_flight: r.max_in_flight,
+            assignment_version: r.assignment_version,
+            created_at: r.created_at,
+            revoked: r.revoked,
+            revoked_at: r.revoked_at
+        };
+        for s in seats.rows {
+            if s.node == r.id {
+                let sv = seat_view(self.store, s, r) or raise;
+                push(v.seats.items, sv) or discard;
+            }
+        }
+        return v;
+    }
+}
+
+locus Seats {
+    params { store: Store; }
+
+    /// `listSeats`.
+    fn list(r: NodeRef) -> SeatList fallible(ApiError) {
+        let n = self.node_of(r.node) or raise;
+        let seats = self.store.seats() or fail store_failed(err);
+        let mut out = SeatList { };
+        for s in seats.rows {
+            if s.node == r.node {
+                let v = seat_view(self.store, s, n) or raise;
+                push(out.data, v) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// `createSeat`. The node has declared no engines yet, so the engine
+    /// and the config are taken as written and the seat carries the problem
+    /// until the node connects and takes it or refuses it.
+    fn create(c: SeatCreate) -> SeatView fallible(ApiError) {
+        let n = self.node_of(c.node) or raise;
+        if n.revoked { fail conflict("node " + c.node + " is revoked"); }
+        if !is_slug(c.id) { fail invalid("`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63", "id"); }
+        let mut row = SeatRow {
+            node: c.node,
+            id: c.id,
+            engine: c.engine,
+            account: c.account,
+            serves: c.serves,
+            data_classes: c.data_classes,
+            concurrency: c.concurrency,
+            enabled: c.enabled,
+            config: c.config
+        };
+        if count(row.data_classes.items) == 0 { push(row.data_classes.items, "internal") or discard; }
+        self.check(row) or raise;
+        let held = self.store.seats() or fail store_failed(err);
+        let mut on_node = 0;
+        for s in held.rows {
+            if s.node == c.node { on_node = on_node + 1; }
+        }
+        if on_node >= 16 { fail invalid("a node holds at most 16 seats", ""); }
+        row.ref = c.node + "/" + c.id;
+        let v = seat_view(self.store, row, n) or raise;
+        let added = self.store.insert_seat(row, change("create", seat_target(row), "", seat_json(v))) or fail store_failed(err);
+        if !added { fail conflict("node " + c.node + " has a seat " + c.id); }
+        return v;
+    }
+
+    /// `getSeat`.
+    fn get(r: SeatRef) -> SeatView fallible(ApiError) {
+        let n = self.node_of(r.node) or raise;
+        let s = self.known(r.node, r.seat) or raise;
+        return seat_view(self.store, s, n) or raise;
+    }
+
+    /// `updateSeat`: the fields the request sets; a new assignment.
+    fn update(u: SeatUpdate) -> SeatView fallible(ApiError) {
+        let n = self.node_of(u.node) or raise;
+        let mut row = self.known(u.node, u.seat) or raise;
+        let before = seat_view(self.store, row, n) or raise;
+        if u.set_engine { row.engine = u.engine; }
+        if u.set_account { row.account = u.account; }
+        if u.set_serves { row.serves = u.serves; }
+        if u.set_data_classes { row.data_classes = u.data_classes; }
+        if u.set_concurrency { row.concurrency = u.concurrency; }
+        if u.set_enabled { row.enabled = u.enabled; }
+        if u.set_config { row.config = u.config; }
+        self.check(row) or raise;
+        let after = seat_view(self.store, row, n) or raise;
+        self.store.update_seat(row, change("update", seat_target(row), seat_json(before), seat_json(after))) or fail store_failed(err);
+        return after;
+    }
+
+    /// `removeSeat`: it takes no new requests.
+    fn remove(r: SeatRef) -> SeatView fallible(ApiError) {
+        let n = self.node_of(r.node) or raise;
+        let row = self.known(r.node, r.seat) or raise;
+        let before = seat_view(self.store, row, n) or raise;
+        self.store.delete_seat(row, change("delete", seat_target(row), seat_json(before), "")) or fail store_failed(err);
+        return before;
+    }
+
+    /// A seat names an engine and an account that exists, serves at least
+    /// one model, and serves at least one request at once.
+    fn check(s: SeatRow) -> Bool fallible(ApiError) {
+        if len(s.engine) == 0 { fail invalid("`engine` names one of the node's engines", "engine"); }
+        if count(s.serves.items) == 0 { fail invalid("`serves` names at least one model", "serves"); }
+        if s.concurrency < 1 { fail invalid("`concurrency` is at least 1", "concurrency"); }
+        let a = self.store.account(s.account) or fail store_failed(err);
+        if !a.present { fail invalid("no account " + s.account, "account"); }
+        return true;
+    }
+
+    fn node_of(id: String) -> NodeRow fallible(ApiError) {
+        let n = self.store.node(id) or fail store_failed(err);
+        if !n.present { fail not_found("no node " + id); }
+        return n;
+    }
+
+    fn known(node: String, id: String) -> SeatRow fallible(ApiError) {
+        let s = self.store.seat(node, id) or fail store_failed(err);
+        if !s.present { fail not_found("no seat " + id + " on node " + node); }
+        return s;
+    }
+}
+
+/// A seat with its state and its problems. Its node has not connected, so
+/// it is `offline`.
+fn seat_view(store: Store, s: SeatRow, n: NodeRow) -> SeatView fallible(ApiError) {
+    let mut v = SeatView {
+        ref: s.node + "/" + s.id,
+        node: s.node,
+        id: s.id,
+        engine: s.engine,
+        account: s.account,
+        serves: s.serves,
+        data_classes: s.data_classes,
+        concurrency: s.concurrency,
+        enabled: s.enabled,
+        config: s.config
+    };
+    if n.revoked {
+        push(v.problems.items, "node " + n.id + " is revoked") or discard;
+    } else {
+        push(v.problems.items, "node " + n.id + " has not connected, so it has declared no engines to check engine " + s.engine + " against") or discard;
+    }
+    let a = store.account(s.account) or fail store_failed(err);
+    if !a.present {
+        push(v.problems.items, "no account " + s.account) or discard;
+    } else if a.archived {
+        push(v.problems.items, "account " + s.account + " is archived") or discard;
+    }
+    for m in s.serves.items {
+        let row = store.model(m.model) or fail store_failed(err);
+        if !row.present || row.removed { push(v.problems.items, "model " + m.model + " is not in the catalog") or discard; }
+    }
+    return v;
+}
+
+/// True when the seat serves `model`.
+fn seat_serves(s: SeatRow, model: String) -> Bool {
+    for m in s.serves.items {
+        if m.model == model { return true; }
+    }
+    return false;
+}
+
+fn check_cap(n: Int) -> Bool fallible(ApiError) {
+    if n != -1 && n < 1 { fail invalid("`max_in_flight` is at least 1, or null", "max_in_flight"); }
+    return true;
+}
+
+// ---- the wire ----------------------------------------------------------
+
+/// A count of at least 1, or `null` (-1); -1 when absent.
+fn cap_field(body: String, name: String) -> Int fallible(ApiError) {
+    let kind = kind_of(body, name);
+    if kind == "missing" || kind == "null" { return -1; }
+    return count_or(body, name, -1) or raise;
+}
+
+/// `serves`: a list of `SeatModel` objects.
+fn serves_field(body: String) -> SeatModels fallible(ApiError) {
+    let kind = kind_of(body, "serves");
+    if kind == "missing" { return SeatModels { }; }
+    if kind != "array" { fail invalid("`serves` is a list of models", "serves"); }
+    let mut out = SeatModels { };
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "serves"));
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if !std::json::valid_object(e) { fail invalid("each of `serves` is an object naming its `model`", "serves"); }
+        let m = SeatModel { model: required_string(e, "model") or raise, engine_name: nullable_string(e, "as") or raise };
+        push(out.items, m) or fail invalid("`serves` holds at most 16 models", "serves");
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// `config`: a JSON object, kept as written; `{}` when absent.
+fn config_field(body: String) -> String fallible(ApiError) {
+    let kind = kind_of(body, "config");
+    if kind == "missing" { return "{}"; }
+    if kind != "object" { fail invalid("`config` is an object", "config"); }
+    return std::str::trim(std::json::find_field_raw(body, "config"));
+}
+
+fn bool_or(body: String, name: String, otherwise: Bool) -> Bool fallible(ApiError) {
+    let kind = kind_of(body, name);
+    if kind == "missing" { return otherwise; }
+    if kind != "bool" { fail invalid("`" + name + "` is true or false", name); }
+    return std::json::find_bool_field(body, name);
+}
+
+fn read_node_create(body: String) -> NodeCreate fallible(ApiError) {
+    object_body(body) or raise;
+    return NodeCreate { id: required_string(body, "id") or raise, name: string_or(body, "name", "") or raise, max_in_flight: cap_field(body, "max_in_flight") or raise };
+}
+
+fn read_node_update(body: String, node: String) -> NodeUpdate fallible(ApiError) {
+    object_body(body) or raise;
+    if sets(body, "id") { fail invalid("a node's `id` cannot change", "id"); }
+    return NodeUpdate {
+        node: node,
+        set_name: sets(body, "name"),
+        name: string_or(body, "name", "") or raise,
+        set_max_in_flight: sets(body, "max_in_flight"),
+        max_in_flight: cap_field(body, "max_in_flight") or raise
+    };
+}
+
+fn read_seat_create(body: String, node: String) -> SeatCreate fallible(ApiError) {
+    object_body(body) or raise;
+    if kind_of(body, "serves") != "array" { fail invalid("`serves` is a required list of models", "serves"); }
+    return SeatCreate {
+        node: node,
+        id: required_string(body, "id") or raise,
+        engine: required_string(body, "engine") or raise,
+        account: required_string(body, "account") or raise,
+        serves: serves_field(body) or raise,
+        data_classes: names_field(body, "data_classes") or raise,
+        concurrency: count_or(body, "concurrency", 1) or raise,
+        enabled: bool_or(body, "enabled", true) or raise,
+        config: config_field(body) or raise
+    };
+}
+
+fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fallible(ApiError) {
+    object_body(body) or raise;
+    if sets(body, "id") { fail invalid("a seat's `id` cannot change", "id"); }
+    return SeatUpdate {
+        node: node,
+        seat: seat,
+        set_engine: sets(body, "engine"),
+        engine: string_or(body, "engine", "") or raise,
+        set_account: sets(body, "account"),
+        account: string_or(body, "account", "") or raise,
+        set_serves: sets(body, "serves"),
+        serves: serves_field(body) or raise,
+        set_data_classes: sets(body, "data_classes"),
+        data_classes: names_field(body, "data_classes") or raise,
+        set_concurrency: sets(body, "concurrency"),
+        concurrency: count_or(body, "concurrency", 1) or raise,
+        set_enabled: sets(body, "enabled"),
+        enabled: bool_or(body, "enabled", true) or raise,
+        set_config: sets(body, "config"),
+        config: config_field(body) or raise
+    };
+}
+
+fn seat_json(s: SeatView) -> String {
+    let mut serves = "";
+    for m in s.serves.items {
+        serves = join(serves, "{\"model\": " + jq(m.model) + ", \"as\": " + (if len(m.engine_name) > 0 { jq(m.engine_name) } else { "null" }) + "}");
+    }
+    let mut problems = "";
+    for p in s.problems.items {
+        problems = join(problems, jq(p));
+    }
+    return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": [" + serves + "]"
+        + ", \"data_classes\": " + jnames(s.data_classes) + ", \"concurrency\": " + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
+        + ", \"config\": " + s.config + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(s.status)
+        + ", \"reason\": null, \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
+}
+
+fn seat_list_json(l: SeatList) -> String {
+    let mut entries = "";
+    for s in l.data {
+        entries = join(entries, seat_json(s));
+    }
+    return jdata(entries);
+}
+
+/// `Node`, or `NodeWithToken` when it carries its token.
+fn node_json(n: Node) -> String {
+    let mut seats = "";
+    for s in n.seats.items {
+        seats = join(seats, seat_json(s));
+    }
+    let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(n.status)
+        + ", \"version\": null, \"capabilities\": null, \"local\": null, \"max_in_flight\": " + jnullable(n.max_in_flight)
+        + ", \"effective_max_in_flight\": null, \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
+        + ", \"applied_version\": null, \"seats\": [" + seats + "], \"connected_at\": null, \"last_heartbeat_at\": null"
+        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.revoked, n.revoked_at);
+    if len(n.enrollment_token) > 0 { out = out + ", \"enrollment_token\": " + jq(n.enrollment_token); }
+    return out + "}";
+}
+
+fn node_list_json(l: NodeList) -> String {
+    let mut entries = "";
+    for n in l.data {
+        entries = join(entries, node_json(n));
+    }
+    return jdata(entries);
+}
+
+/// Where a seat is, under /admin/v1.
+fn seat_target(s: SeatRow) -> String {
+    return "nodes/" + s.node + "/seats/" + s.id;
+}

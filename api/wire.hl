@@ -145,25 +145,54 @@ type TimeError { text: String = ""; }
 
 /// An RFC 3339 instant, in UTC: `Z` or an offset (`+02:00`, `-05:30`),
 /// `T` and `Z` in either case. `std::time::parse_time` reads only the
-/// `Z` form, so an offset is taken off by hand.
+/// `Z` form, so an offset is taken off by hand; and it rolls a day past
+/// the month's end into the next month (`2099-02-30` is 2 March), so the
+/// date is checked here first.
 fn rfc3339(text: String) -> Time fallible(TimeError) {
     let t = std::str::upper(std::str::trim(text));
+    if !real_date(t) { fail TimeError { text: text }; }
     if std::str::ends_with(t, "Z") { return std::time::parse_time(t) or fail TimeError { text: text }; }
     let n = len(t);
     if n < 6 { fail TimeError { text: text }; }
     let sign = t[(n - 6)..(n - 5)];
-    if (sign != "+" && sign != "-") || t[(n - 3)..(n - 2)] != ":" { fail TimeError { text: text }; }
-    let hh = std::str::parse_int(t[(n - 5)..(n - 3)]) or fail TimeError { text: text };
-    let mm = std::str::parse_int(t[(n - 2)..n]) or fail TimeError { text: text };
+    let hours = t[(n - 5)..(n - 3)];
+    let minutes = t[(n - 2)..n];
+    if (sign != "+" && sign != "-") || t[(n - 3)..(n - 2)] != ":" || !digits(hours) || !digits(minutes) { fail TimeError { text: text }; }
+    let hh = std::str::parse_int(hours) or fail TimeError { text: text };
+    let mm = std::str::parse_int(minutes) or fail TimeError { text: text };
     if hh > 23 || mm > 59 { fail TimeError { text: text }; }
     let local = std::time::parse_time(t[0..(n - 6)] + "Z") or fail TimeError { text: text };
     let offset = (hh * 60 + mm) * 60 * 1000000000;
     return std::time::from_nanos(if sign == "+" { std::time::nanos(local) - offset } else { std::time::nanos(local) + offset });
 }
 
-/// A field the contract has and this build does not serve yet.
+/// True when `s` is ASCII digits only, and not empty.
+fn digits(s: String) -> Bool {
+    if len(s) == 0 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        if b < 48 || b > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// True when `t` opens with a date that exists: `YYYY-MM-DD`, its month
+/// 1 to 12 and its day within the month.
+fn real_date(t: String) -> Bool {
+    if len(t) < 10 || t[4..5] != "-" || t[7..8] != "-" { return false; }
+    if !digits(t[0..4]) || !digits(t[5..7]) || !digits(t[8..10]) { return false; }
+    let year = std::str::parse_int(t[0..4]) or 0;
+    let month = std::str::parse_int(t[5..7]) or 0;
+    let day = std::str::parse_int(t[8..10]) or 0;
+    return month >= 1 && month <= 12 && day >= 1 && day <= days_in(year, month);
+}
+
+/// A field this request does not take, though another does.
 fn refuse_field(body: String, name: String, why: String) -> Bool fallible(ApiError) {
-    if sets(body, name) { fail unsupported("`" + name + "` is not served yet: " + why, name); }
+    if sets(body, name) { fail unsupported("`" + name + "` is not taken here: " + why, name); }
     return true;
 }
 
@@ -206,15 +235,18 @@ fn read_model_update(body: String, model: String) -> CatalogModelUpdate fallible
 /// `ProjectCreate`.
 fn read_project_create(body: String) -> ProjectCreate fallible(ApiError) {
     object_body(body) or raise;
-    refuse_field(body, "budget", "set it with PUT /admin/v1/projects/{project}/budget once budgets are served") or raise;
-    refuse_field(body, "limits", "set them with PUT /admin/v1/projects/{project}/limits once limits are served") or raise;
+    let budget_kind = kind_of(body, "budget");
+    let budgeted = budget_kind != "missing" && budget_kind != "null";
     return ProjectCreate {
         id: required_string(body, "id") or raise,
         name: required_string(body, "name") or raise,
         owners: names_field(body, "owners") or raise,
         data_classes: names_field(body, "data_classes") or raise,
         models: restriction_field(body, "models") or raise,
-        accounts: accounts_field(body) or raise
+        accounts: accounts_field(body) or raise,
+        budgeted: budgeted,
+        budget: if budgeted { read_budget_set(std::json::find_field_raw(body, "budget")) or raise } else { BudgetRequest { project: "" } },
+        limits: limits_field(body, "limits") or raise
     };
 }
 
@@ -222,6 +254,8 @@ fn read_project_create(body: String) -> ProjectCreate fallible(ApiError) {
 fn read_project_update(body: String, project: String) -> ProjectUpdate fallible(ApiError) {
     object_body(body) or raise;
     if sets(body, "id") { fail invalid("a project's `id` cannot change", "id"); }
+    refuse_field(body, "budget", "a budget has its own endpoint, PUT /admin/v1/projects/{project}/budget") or raise;
+    refuse_field(body, "limits", "limits have their own endpoint, PUT /admin/v1/projects/{project}/limits") or raise;
     return ProjectUpdate {
         project: project,
         set_name: sets(body, "name"),
@@ -240,13 +274,13 @@ fn read_project_update(body: String, project: String) -> ProjectUpdate fallible(
 /// `KeyCreate` under `project`.
 fn read_key_create(body: String, project: String) -> KeyCreate fallible(ApiError) {
     object_body(body) or raise;
-    refuse_field(body, "limits", "key limits are served with the project's") or raise;
     let expires = sets(body, "expires_at");
     return KeyCreate {
         project: project,
         name: required_string(body, "name") or raise,
         models: restriction_field(body, "models") or raise,
         accounts: accounts_field(body) or raise,
+        limits: limits_field(body, "limits") or raise,
         expires: expires,
         expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }
     };
@@ -256,7 +290,6 @@ fn read_key_create(body: String, project: String) -> KeyCreate fallible(ApiError
 /// expiry.
 fn read_key_update(body: String, project: String, key: String) -> KeyUpdate fallible(ApiError) {
     object_body(body) or raise;
-    refuse_field(body, "limits", "key limits are served with the project's") or raise;
     let expiry = kind_of(body, "expires_at");
     let expires = expiry != "missing" && expiry != "null";
     return KeyUpdate {
@@ -268,6 +301,8 @@ fn read_key_update(body: String, project: String, key: String) -> KeyUpdate fall
         models: restriction_field(body, "models") or raise,
         set_accounts: sets(body, "accounts"),
         accounts: accounts_field(body) or raise,
+        set_limits: sets(body, "limits"),
+        limits: limits_field(body, "limits") or raise,
         set_expires: expiry != "missing",
         expires: expires,
         expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }
@@ -367,7 +402,7 @@ fn project_json(p: Project) -> String {
     return "{\"id\": " + jq(p.id) + ", \"name\": " + jq(p.name) + ", \"status\": " + jq(p.status)
         + ", \"owners\": " + jnames(p.owners) + ", \"data_classes\": " + jnames(p.data_classes)
         + ", \"models\": " + jrestriction(p.models) + ", \"accounts\": " + jrestriction(p.accounts)
-        + ", \"budget\": null, \"limits\": [], \"key_count\": " + to_string(p.key_count)
+        + ", \"budget\": " + maybe_budget_json(p.budget) + ", \"limits\": " + limits_json(p.limits) + ", \"key_count\": " + to_string(p.key_count)
         + ", \"position\": " + (if len(p.position) > 0 { jq(p.position) } else { "null" })
         + ", \"created_at\": " + jtime(p.created_at) + ", \"archived_at\": " + jtime_or_null(p.archived, p.archived_at) + "}";
 }
@@ -383,7 +418,7 @@ fn project_list_json(l: ProjectList) -> String {
 /// `Key`, or `KeyWithSecret` when the key carries its secret.
 fn key_json(k: Key) -> String {
     let mut out = "{\"id\": " + jq(k.id) + ", \"project\": " + jq(k.project) + ", \"name\": " + jq(k.name) + ", \"prefix\": " + jq(k.prefix)
-        + ", \"models\": " + jrestriction(k.models) + ", \"accounts\": " + jrestriction(k.accounts) + ", \"limits\": []"
+        + ", \"models\": " + jrestriction(k.models) + ", \"accounts\": " + jrestriction(k.accounts) + ", \"limits\": " + limits_json(k.limits)
         + ", \"created_at\": " + jtime(k.created_at) + ", \"expires_at\": " + jtime_or_null(k.expires, k.expires_at)
         + ", \"last_used_at\": " + jtime_or_null(k.used, k.last_used_at) + ", \"status\": " + jq(k.status)
         + ", \"revoked_at\": " + jtime_or_null(k.revoked, k.revoked_at);

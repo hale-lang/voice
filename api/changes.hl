@@ -1,0 +1,79 @@
+// The change log: every applied admin write, who made it (nobody yet:
+// admin authentication is off), when, and the resource before and after.
+
+/// `Change`. `before` and `after` are the resource's JSON, "" for `null`:
+/// the codec carries no free-form object, so the text crosses as a string.
+type Change {
+    id: String = "";
+    at: Time = `1970-01-01T00:00:00Z`;
+    action: String = "";
+    target: String = "";
+    before: String = "";
+    after: String = "";
+}
+
+/// A page of changes; `next_cursor` "" is `null`.
+type ChangeList { data: bounded[Change; 1000]; next_cursor: String = ""; }
+
+locus Changes {
+    params { store: Store; }
+
+    /// `listChanges`: newest first.
+    fn list(q: ChangeQuery) -> ChangeList fallible(ApiError) {
+        let rows = self.store.changes(q) or fail store_failed(err);
+        let mut out = ChangeList { };
+        let mut last = "";
+        for c in rows.rows {
+            push(out.data, Change { id: c.id, at: c.at, action: c.action, target: c.target, before: c.before, after: c.after }) or discard;
+            last = c.id;
+        }
+        if rows.more { out.next_cursor = last; }
+        return out;
+    }
+}
+
+/// A change made now. `before` and `after` are JSON, "" for `null`.
+fn change(action: String, target: String, before: String, after: String) -> ChangeRow {
+    return ChangeRow { at: now_seconds(), action: action, target: target, before: before, after: after };
+}
+
+// ---- the wire ----------------------------------------------------------
+
+/// `GET /admin/v1/changes`'s query.
+fn read_change_query(p: std::http::RouteParams) -> ChangeQuery fallible(ApiError) {
+    let mut q = ChangeQuery { target: std::http::query_param(p, "target"), cursor: std::http::query_param(p, "cursor") };
+    let from = std::http::query_param(p, "from");
+    if len(from) > 0 {
+        q.has_from = true;
+        q.from = std::time::parse_time(from) or fail invalid("`from` is an RFC 3339 time in UTC", "from");
+    }
+    let to = std::http::query_param(p, "to");
+    if len(to) > 0 {
+        q.has_to = true;
+        q.to = std::time::parse_time(to) or fail invalid("`to` is an RFC 3339 time in UTC", "to");
+    }
+    let limit = std::http::query_param(p, "limit");
+    if len(limit) > 0 {
+        let n = std::str::parse_int(limit) or 0;
+        if !is_integer(limit) || n < 1 || n > 1000 { fail invalid("`limit` is 1 to 1000", "limit"); }
+        q.limit = n;
+    }
+    return q;
+}
+
+fn jraw_or_null(json: String) -> String {
+    return if len(json) > 0 { json } else { "null" };
+}
+
+fn change_json(c: Change) -> String {
+    return "{\"id\": " + jq(c.id) + ", \"at\": " + jtime(c.at) + ", \"principal\": null, \"action\": " + jq(c.action)
+        + ", \"target\": " + jq(c.target) + ", \"before\": " + jraw_or_null(c.before) + ", \"after\": " + jraw_or_null(c.after) + "}";
+}
+
+fn change_list_json(l: ChangeList) -> String {
+    let mut entries = "";
+    for c in l.data {
+        entries = join(entries, change_json(c));
+    }
+    return "{\"data\": [" + entries + "], \"next_cursor\": " + (if len(l.next_cursor) > 0 { jq(l.next_cursor) } else { "null" }) + "}";
+}

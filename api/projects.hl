@@ -1,9 +1,6 @@
-// Projects and their keys, configured on the admin plane, and the
-// caller plane's bearer: the project key a request presents.
-//
-// Budgets and limits are not served yet (their endpoints are canned), so a
-// project's `budget` is `null` and its `limits` and every key's are empty;
-// a body that sets either is refused as unsupported (wire.hl).
+// Projects and their keys, with their budgets and limits, configured on
+// the admin plane, and the caller plane's bearer: the project key a
+// request presents. Every write records its change.
 
 locus Projects {
     params { store: Store; }
@@ -21,10 +18,11 @@ locus Projects {
         return out;
     }
 
-    /// `createProject`.
+    /// `createProject`, with its budget and limits when the body sets them.
     fn create(c: ProjectCreate) -> Project fallible(ApiError) {
         if !is_slug(c.id) { fail invalid("`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63", "id"); }
         check_name(c.name) or raise;
+        check_limits(c.limits, "project,model", "limits") or raise;
         let mut row = ProjectRow {
             id: c.id,
             name: c.name,
@@ -32,12 +30,19 @@ locus Projects {
             data_classes: c.data_classes,
             models: c.models,
             accounts: c.accounts,
+            limits: c.limits,
             created_at: now_seconds()
         };
+        if c.budgeted {
+            check_budget(c.budget.set) or raise;
+            row.budgeted = true;
+            row.budget = anchored(c.budget);
+        }
         if count(row.data_classes.items) == 0 { push(row.data_classes.items, "internal") or discard; }
-        let added = self.store.insert_project(row) or fail store_failed(err);
+        let v = self.view(row) or raise;
+        let added = self.store.insert_project(row, change("create", "projects/" + c.id, "", project_json(v))) or fail store_failed(err);
         if !added { fail conflict("project " + c.id + " exists; a project id is never reused"); }
-        return self.view(row) or raise;
+        return v;
     }
 
     /// `getProject`.
@@ -49,6 +54,7 @@ locus Projects {
     /// `updateProject`: the fields the request sets.
     fn update(u: ProjectUpdate) -> Project fallible(ApiError) {
         let mut row = self.known(u.project) or raise;
+        let before = self.view(row) or raise;
         if u.set_name {
             check_name(u.name) or raise;
             row.name = u.name;
@@ -58,30 +64,59 @@ locus Projects {
         if u.set_models { row.models = u.models; }
         if u.set_accounts { row.accounts = u.accounts; }
         self.keys_within(row) or raise;
-        self.store.update_project(row) or fail store_failed(err);
-        return self.view(row) or raise;
+        let after = self.view(row) or raise;
+        self.store.update_project(row, change("update", "projects/" + row.id, project_json(before), project_json(after))) or fail store_failed(err);
+        return after;
     }
 
     /// `archiveProject`: its keys are revoked and it refuses new requests;
     /// the id stays taken. Archiving an archived project changes nothing.
     fn archive(r: ProjectRef) -> Project fallible(ApiError) {
         let mut row = self.known(r.project) or raise;
-        if !row.archived {
-            let at = now_seconds();
-            let keys = self.store.keys(row.id) or fail store_failed(err);
-            for k in keys.rows {
-                if !k.revoked {
-                    let mut gone = k;
-                    gone.revoked = true;
-                    gone.revoked_at = at;
-                    self.store.update_key(gone) or fail store_failed(err);
-                }
-            }
-            row.archived = true;
-            row.archived_at = at;
-            self.store.update_project(row) or fail store_failed(err);
-        }
-        return self.view(row) or raise;
+        if row.archived { return self.view(row) or raise; }
+        let before = self.view(row) or raise;
+        row.archived = true;
+        row.archived_at = now_seconds();
+        let mut after = self.view(row) or raise;
+        self.store.archive_project(row, change("archive", "projects/" + row.id, project_json(before), project_json(after))) or fail store_failed(err);
+        return after;
+    }
+
+    /// `getBudget`: the budget in its current window; 404 when the project
+    /// has none.
+    fn budget(r: ProjectRef) -> Budget fallible(ApiError) {
+        let row = self.known(r.project) or raise;
+        if !row.budgeted { fail not_found("project " + r.project + " has no budget"); }
+        return budget_view(row.budget, now_seconds());
+    }
+
+    /// `setBudget`: replaces the allowance and the period.
+    fn set_budget(b: BudgetRequest) -> Budget fallible(ApiError) {
+        let mut row = self.known(b.project) or raise;
+        check_budget(b.set) or raise;
+        let now = now_seconds();
+        let before = if row.budgeted { budget_json(budget_view(row.budget, now)) } else { "" };
+        row.budgeted = true;
+        row.budget = anchored(b);
+        let after = budget_view(row.budget, now);
+        self.store.update_project(row, change(if len(before) > 0 { "update" } else { "create" }, "projects/" + row.id + "/budget", before, budget_json(after))) or fail store_failed(err);
+        return after;
+    }
+
+    /// `getLimits`: the project- and model-scope limits.
+    fn limits(r: ProjectRef) -> LimitSet fallible(ApiError) {
+        let row = self.known(r.project) or raise;
+        return LimitSet { limits: row.limits };
+    }
+
+    /// `setLimits`: replaces them.
+    fn set_limits(l: LimitsRequest) -> LimitSet fallible(ApiError) {
+        let mut row = self.known(l.project) or raise;
+        check_limits(l.limits, "project,model", "limits") or raise;
+        let before = limits_json(row.limits);
+        row.limits = l.limits;
+        self.store.update_project(row, change("update", "projects/" + row.id + "/limits", "{\"limits\": " + before + "}", "{\"limits\": " + limits_json(row.limits) + "}")) or fail store_failed(err);
+        return LimitSet { limits: row.limits };
     }
 
     fn known(id: String) -> ProjectRow fallible(ApiError) {
@@ -120,6 +155,8 @@ locus Projects {
             data_classes: r.data_classes,
             models: r.models,
             accounts: r.accounts,
+            budget: if r.budgeted { MaybeBudget { present: true, budget: budget_view(r.budget, now_seconds()) } } else { MaybeBudget { } },
+            limits: r.limits,
             key_count: count(keys.rows),
             position: r.position,
             created_at: r.created_at,
@@ -127,6 +164,14 @@ locus Projects {
             archived_at: r.archived_at
         };
     }
+}
+
+/// A budget as set: one that names no anchor counts from the start of the
+/// current calendar period.
+fn anchored(b: BudgetRequest) -> BudgetSet {
+    let mut set = b.set;
+    if !b.anchored { set.period_anchor = period_start(set.period, now_seconds()); }
+    return set;
 }
 
 locus Keys {
@@ -152,6 +197,7 @@ locus Keys {
         check_name(c.name) or raise;
         within(p.models, c.models, "models") or raise;
         within(p.accounts, c.accounts, "accounts") or raise;
+        check_limits(c.limits, "key", "limits") or raise;
         let now = now_seconds();
         if c.expires && std::time::unix(c.expires_at) <= std::time::unix(now) { fail invalid("`expires_at` is in the past", "expires_at"); }
         let secret_hex = random_hex(20) or fail entropy_failed(err.message);
@@ -166,13 +212,14 @@ locus Keys {
             digest: secret_digest(secret),
             models: c.models,
             accounts: c.accounts,
+            limits: c.limits,
             created_at: now,
             expires: c.expires,
             expires_at: c.expires_at
         };
-        let added = self.store.insert_key(row) or fail store_failed(err);
-        if !added { fail entropy_failed("key id " + id + " was drawn twice; ask again"); }
         let mut v = key_view(row, now);
+        let added = self.store.insert_key(row, change("create", key_target(row), "", key_json(v))) or fail store_failed(err);
+        if !added { fail entropy_failed("key id " + id + " was drawn twice; ask again"); }
         v.secret = secret;
         return v;
     }
@@ -187,6 +234,8 @@ locus Keys {
     fn update(u: KeyUpdate) -> Key fallible(ApiError) {
         let mut k = self.known(u.project, u.key) or raise;
         let p = self.project_of(u.project) or raise;
+        let now = now_seconds();
+        let before = key_view(k, now);
         if u.set_name {
             check_name(u.name) or raise;
             k.name = u.name;
@@ -199,24 +248,30 @@ locus Keys {
             within(p.accounts, u.accounts, "accounts") or raise;
             k.accounts = u.accounts;
         }
+        if u.set_limits {
+            check_limits(u.limits, "key", "limits") or raise;
+            k.limits = u.limits;
+        }
         if u.set_expires {
             k.expires = u.expires;
             k.expires_at = u.expires_at;
         }
-        self.store.update_key(k) or fail store_failed(err);
-        return key_view(k, now_seconds());
+        let after = key_view(k, now);
+        self.store.update_key(k, change("update", key_target(k), key_json(before), key_json(after))) or fail store_failed(err);
+        return after;
     }
 
     /// `revokeKey`: at once; revoking a revoked key changes nothing.
     fn revoke(r: KeyRef) -> Key fallible(ApiError) {
         let mut k = self.known(r.project, r.key) or raise;
         let now = now_seconds();
-        if !k.revoked {
-            k.revoked = true;
-            k.revoked_at = now;
-            self.store.update_key(k) or fail store_failed(err);
-        }
-        return key_view(k, now);
+        if k.revoked { return key_view(k, now); }
+        let before = key_view(k, now);
+        k.revoked = true;
+        k.revoked_at = now;
+        let after = key_view(k, now);
+        self.store.update_key(k, change("revoke", key_target(k), key_json(before), key_json(after))) or fail store_failed(err);
+        return after;
     }
 
     fn project_of(id: String) -> ProjectRow fallible(ApiError) {
@@ -241,20 +296,30 @@ locus KeyBearer {
     params { store: Store; }
 
     /// The caller a request's `Authorization` header names, as the
-    /// handlers of the caller rows receive it. Reading is not using: a
-    /// key's `last_used_at` is written when a request it made settles.
+    /// handlers of the caller rows receive it. The key's `last_used_at` is
+    /// written as it is used, at most once a minute, so a key making many
+    /// requests does not write on each.
     fn context(authorization: String) -> std::api::Context fallible(ApiError) {
         if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { fail invalid_key(); }
         let token = std::str::trim(authorization[7..len(authorization)]);
         if len(token) == 0 { fail invalid_key(); }
-        let k = self.store.key_by_digest(secret_digest(token)) or fail store_failed(err);
+        let k = self.store.key_by_digest(secret_digest(token)) or fail metering_failed(err);
         if !k.present { fail invalid_key(); }
         if key_status(k, now_seconds()) != "active" { fail invalid_key(); }
-        let p = self.store.project(k.project) or fail store_failed(err);
+        let p = self.store.project(k.project) or fail metering_failed(err);
         if !p.present || p.archived { fail invalid_key(); }
+        let now = now_seconds();
+        if !k.used || std::time::unix(now) - std::time::unix(k.last_used_at) >= 60 {
+            self.store.touch_key(k.id, now) or fail metering_failed(err);
+        }
         let who = std::api::Principal { mode: "bearer", name: k.id, via: "http" };
         return std::api::Context { caller: who, role: "caller", via: "http" };
     }
+}
+
+/// Where a key is, under /admin/v1.
+fn key_target(k: KeyRow) -> String {
+    return "projects/" + k.project + "/keys/" + k.id;
 }
 
 fn key_status(k: KeyRow, now: Time) -> String {
@@ -271,6 +336,7 @@ fn key_view(k: KeyRow, now: Time) -> Key {
         prefix: k.prefix,
         models: k.models,
         accounts: k.accounts,
+        limits: k.limits,
         created_at: k.created_at,
         expires: k.expires,
         expires_at: k.expires_at,
@@ -329,8 +395,7 @@ fn random_hex(n: Int) -> String fallible(EntropyError) {
     return std::hex::encode(b);
 }
 
-/// The contract has no code for a failure inside the api itself;
-/// `upstream_failed` is the nearest.
+/// A failure inside the api itself.
 fn entropy_failed(message: String) -> ApiError {
-    return ApiError { status: 500, kind: "server_error", code: "upstream_failed", message: message };
+    return ApiError { status: 500, kind: "server_error", code: "internal_error", message: message };
 }

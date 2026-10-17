@@ -82,7 +82,10 @@ matched (`std::http::path_param(c.params, "model")`, `api/endpoints.hl`).
 (`kind`, `status`) and a map (`Health.checks`). The codec a surface's rows
 are held to carries none of them, so a row's type says each with a shape
 it does carry: `Restriction { any: Bool; names: Names; }` for the
-nullable list, `priced: Bool` beside the price, a `String` for the enum.
+nullable list, `priced: Bool` beside the price, a `String` for the enum,
+-1 for a count that may be `null` (a limit's `requests`, a node's
+`max_in_flight`), and JSON text in a `String` for a free-form object (a
+seat's `config`, a change's `before` and `after`).
 The description `hale api export` would print is then not the contract's
 shape. And a program cannot run that codec itself (encode a typed value,
 decode a body into a row's request), while `Type::from_json` carries no
@@ -117,5 +120,17 @@ measured grows.
 
 **Working shape:** the in-memory store's writes carry `@unbounded`, which
 is what `hale verify` needs; the warning is a check that does not see the
-replaced row's text reclaimed. Whether a key's `last_used_at` can now be
-written on every caller request is decided with the next part of the api.
+replaced row's text reclaimed. So a key's `last_used_at` is written as it
+is used, at most once a minute per key (`KeyBearer`, `Store.touch_key`).
+
+## `std::time::parse_time` rolls an impossible day into the next month
+
+**hale 0.24.0.** `std::time::parse_time("2099-02-30T00:00:00Z")` answers
+2 March 2099 instead of refusing it, so a reader that relies on it takes
+a date that does not exist. It also reads only the `Z` form of RFC 3339,
+not an offset.
+
+**Working shape:** voice's own reader (`rfc3339` in `api/wire.hl`) checks
+the date first (the month 1 to 12, the day within the month, leap years
+counted) and takes an offset off by hand, with exactly two digits for its
+hours and its minutes.

@@ -57,6 +57,7 @@ locus Projects {
         if u.set_data_classes { row.data_classes = u.data_classes; }
         if u.set_models { row.models = u.models; }
         if u.set_accounts { row.accounts = u.accounts; }
+        self.keys_within(row) or raise;
         self.store.update_project(row) or fail store_failed(err);
         return self.view(row) or raise;
     }
@@ -87,6 +88,26 @@ locus Projects {
         let row = self.store.project(id) or fail store_failed(err);
         if !row.present { fail not_found("no project " + id); }
         return row;
+    }
+
+    /// A project's restrictions hold every key it has that is not revoked:
+    /// narrowing them below what a key names is refused, naming the keys,
+    /// so a key is never left wider than its project.
+    fn keys_within(p: ProjectRow) -> Bool fallible(ApiError) {
+        let keys = self.store.keys(p.id) or fail store_failed(err);
+        let mut models = "";
+        let mut accounts = "";
+        for k in keys.rows {
+            if !k.revoked {
+                let m = within(p.models, k.models, "models") or false;
+                if !m { models = if len(models) == 0 { k.id } else { models + ", " + k.id }; }
+                let a = within(p.accounts, k.accounts, "accounts") or false;
+                if !a { accounts = if len(accounts) == 0 { k.id } else { accounts + ", " + k.id }; }
+            }
+        }
+        if len(models) > 0 { fail invalid("`models` would leave out models that keys " + models + " name; narrow those keys first", "models"); }
+        if len(accounts) > 0 { fail invalid("`accounts` would leave out accounts that keys " + accounts + " name; narrow those keys first", "accounts"); }
+        return true;
     }
 
     fn view(r: ProjectRow) -> Project fallible(ApiError) {
@@ -127,7 +148,7 @@ locus Keys {
     /// store keeps its digest.
     fn create(c: KeyCreate) -> Key fallible(ApiError) {
         let p = self.project_of(c.project) or raise;
-        if p.archived { fail conflict("project " + c.project + " is archived"); }
+        if p.archived { fail invalid("project " + c.project + " is archived, and an archived project takes no key", ""); }
         check_name(c.name) or raise;
         within(p.models, c.models, "models") or raise;
         within(p.accounts, c.accounts, "accounts") or raise;
@@ -150,7 +171,7 @@ locus Keys {
             expires_at: c.expires_at
         };
         let added = self.store.insert_key(row) or fail store_failed(err);
-        if !added { fail conflict("key id " + id + " was drawn twice; ask again"); }
+        if !added { fail entropy_failed("key id " + id + " was drawn twice; ask again"); }
         let mut v = key_view(row, now);
         v.secret = secret;
         return v;
@@ -223,7 +244,7 @@ locus KeyBearer {
     /// handlers of the caller rows receive it. Reading is not using: a
     /// key's `last_used_at` is written when a request it made settles.
     fn context(authorization: String) -> std::api::Context fallible(ApiError) {
-        if !std::str::starts_with(authorization, "Bearer ") { fail invalid_key(); }
+        if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { fail invalid_key(); }
         let token = std::str::trim(authorization[7..len(authorization)]);
         if len(token) == 0 { fail invalid_key(); }
         let k = self.store.key_by_digest(secret_digest(token)) or fail store_failed(err);

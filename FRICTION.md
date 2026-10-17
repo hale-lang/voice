@@ -104,15 +104,18 @@ a `push` loop. A whole record copies its bounded fields with it.
 **Working shape:** wrap the list in a record (`type Names { items:
 bounded[String; 32]; }`) and assign the record.
 
-## A hashmap row replaced in a long-lived locus is never reclaimed
+## `hale verify` calls a hashmap row write in a long-lived locus unbounded
 
 **hale 0.24.0.** `MemoryStore` keeps rows in `@form(hashmap)` loci for the
-life of the process. `set` on a row that is already there replaces it, but
-the old row's text stays in the store's region, so `hale verify` warns that
-every write grows without bound. It is right: a write per caller request
-(a key's `last_used_at`) would grow the api forever.
+life of the process. `hale verify` warns that every `set` there grows the
+store's region without bound, as a write in a per-message handler. The
+first version of this entry took the warning at its word. Measured, it
+does not hold here: 15,000 `PATCH`es of a key and 5,000 of a project,
+each with a 120-character name, left the api's RSS flat (5224 to 5092 kB,
+then 5096), and an outside review saw the same over 10,000. Nothing
+measured grows.
 
-**Working shape:** the in-memory store's writes are `@unbounded`, since
-they are the admin plane's, an operator's few; nothing writes per caller
-request (a key's last use is written when a request settles, with the
-ledger). The Postgres store keeps nothing in the process.
+**Working shape:** the in-memory store's writes carry `@unbounded`, which
+is what `hale verify` needs; the warning is a check that does not see the
+replaced row's text reclaimed. Whether a key's `last_used_at` can now be
+written on every caller request is decided with the next part of the api.

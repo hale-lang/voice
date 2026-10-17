@@ -211,7 +211,7 @@ new migration" to `store.md`.
 - the surface codec entry to seed `api` (`api/surface.hl`, `api/wire.hl`)
   and seed `spec/validate` (`live.mjs`).
 - the `bounded` assignment entry to seed `api` (`Names`, `Restriction`).
-- the hashmap row entry to seed `api` (`MemoryStore`'s `@unbounded`
+- the hashmap row warning entry to seed `api` (`MemoryStore`'s `@unbounded`
   writes).
 
 `holds`, `reviews`: none. These are the holes.

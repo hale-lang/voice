@@ -3,7 +3,7 @@
 import ".." as api;
 
 fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(std::http::Request { method: method, path: path, body: body });
+    return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
 }
 
 fn expect(r: std::http::Response, status: Int, what: String) {
@@ -58,6 +58,22 @@ fn main() {
     std::test::assert_eq_str(raw(renamed, "models"), "null", "the restriction lifted");
     std::test::assert_eq_str(raw(renamed, "data_classes"), "[\"internal\"]", "a field not set stays");
     expect(call(e, "PATCH", "/admin/v1/projects/lab", "{\"name\": \"\"}"), 400, "a name is not empty");
+    expect(call(e, "POST", "/admin/v1/projects", "{\"id\": \"acct\", \"name\": \"A\", \"accounts\": [\"Not An Id!\"]}"), 400, "accounts are account ids");
+    let plain = e.handle(std::http::Request { method: "POST", path: "/admin/v1/projects", headers: "Content-Type: text/plain", body: "{\"id\": \"csrf\", \"name\": \"C\"}" });
+    expect(plain, 400, "an admin write is JSON");
+    expect(call(e, "GET", "/admin/v1/projects/csrf", ""), 404, "and a refused one made nothing");
+    expect(e.handle(std::http::Request { method: "POST", path: "/admin/v1/projects", headers: "content-type: Application/JSON; charset=utf-8", body: "{\"id\": \"cased\", \"name\": \"C\"}" }), 201, "in any case, with parameters");
+
+    // narrowing a project below what its keys name is refused, naming them
+    expect(call(e, "POST", "/admin/v1/projects", "{\"id\": \"nar\", \"name\": \"N\", \"models\": [\"echo-1\", \"live-1\"]}"), 201, "a project with two models");
+    let narrow_key = call(e, "POST", "/admin/v1/projects/nar/keys", "{\"name\": \"k\", \"models\": [\"live-1\"]}");
+    let narrow_id = std::json::find_string_field(narrow_key.body, "id");
+    let narrowed = call(e, "PATCH", "/admin/v1/projects/nar", "{\"models\": [\"echo-1\"]}");
+    expect(narrowed, 400, "narrowing below a key");
+    std::test::assert(std::str::contains(narrowed.body, narrow_id), "names the key");
+    expect(call(e, "PATCH", "/admin/v1/projects/nar", "{\"models\": [\"echo-1\", \"live-1\", \"more-1\"]}"), 200, "widening is fine");
+    expect(call(e, "DELETE", "/admin/v1/projects/nar/keys/" + narrow_id, ""), 200, "once the key is revoked");
+    expect(call(e, "PATCH", "/admin/v1/projects/nar", "{\"models\": [\"echo-1\"]}"), 200, "the project narrows");
 
     // archiving revokes the project's keys and takes it out of the list
     let key = call(e, "POST", "/admin/v1/projects/lab/keys", "{\"name\": \"ci\"}");
@@ -70,7 +86,9 @@ fn main() {
     let revoked = call(e, "GET", "/admin/v1/projects/lab/keys/" + key_id, "");
     std::test::assert_eq_str(std::json::find_string_field(revoked.body, "status"), "revoked", "its key is revoked");
     expect(call(e, "DELETE", "/admin/v1/projects/lab", ""), 200, "archiving again changes nothing");
-    expect(call(e, "POST", "/admin/v1/projects/lab/keys", "{\"name\": \"late\"}"), 409, "an archived project takes no key");
+    let late = call(e, "POST", "/admin/v1/projects/lab/keys", "{\"name\": \"late\"}");
+    expect(late, 400, "an archived project takes no key");
+    std::test::assert_eq_str(code(late), "invalid_request", "as an invalid request, not a conflict");
     expect(call(e, "POST", "/admin/v1/projects", "{\"id\": \"lab\", \"name\": \"Lab\"}"), 409, "its id is never reused");
 
     let active = call(e, "GET", "/admin/v1/projects", "");

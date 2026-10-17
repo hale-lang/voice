@@ -44,7 +44,7 @@ fn count_or(body: String, name: String, otherwise: Int) -> Int fallible(ApiError
     if kind == "missing" { return otherwise; }
     let raw = std::str::trim(std::json::find_field_raw(body, name));
     if kind != "number" || !is_integer(raw) { fail invalid("`" + name + "` is an integer", name); }
-    let n = std::str::parse_int(raw) or 0;
+    let n = std::str::parse_int(raw) or fail invalid("`" + name + "` is out of range", name);
     if n < 1 { fail invalid("`" + name + "` is at least 1", name); }
     return n;
 }
@@ -53,7 +53,7 @@ fn count_or(body: String, name: String, otherwise: Int) -> Int fallible(ApiError
 fn required_amount(obj: String, name: String) -> Int fallible(ApiError) {
     let raw = std::str::trim(std::json::find_field_raw(obj, name));
     if kind_of(obj, name) != "number" || !is_integer(raw) { fail invalid("`" + name + "` is a required integer", name); }
-    let n = std::str::parse_int(raw) or 0;
+    let n = std::str::parse_int(raw) or fail invalid("`" + name + "` is out of range", name);
     if n < 0 { fail invalid("`" + name + "` is at least 0", name); }
     return n;
 }
@@ -108,6 +108,16 @@ fn restriction_field(body: String, name: String) -> Restriction fallible(ApiErro
     return Restriction { any: false, names: ns };
 }
 
+/// An `accounts` restriction: its names are account ids
+/// (`^[a-z0-9][a-z0-9-]{0,62}$`).
+fn accounts_field(body: String) -> Restriction fallible(ApiError) {
+    let r = restriction_field(body, "accounts") or raise;
+    for n in r.names.items {
+        if !is_slug(n) { fail invalid("`accounts` names account ids, and " + n + " is not one", "accounts"); }
+    }
+    return r;
+}
+
 /// A `price` field: a `ModelPrice`, or `null` (`priced` false).
 type PriceField { priced: Bool = false; price: ModelPrice = ModelPrice { }; }
 
@@ -128,7 +138,27 @@ fn price_field(body: String) -> PriceField fallible(ApiError) {
 fn time_field(body: String, name: String) -> Time fallible(ApiError) {
     let f = std::json::string_field(body, name);
     if f.kind != "string" { fail invalid("`" + name + "` is an RFC 3339 time", name); }
-    return std::time::parse_time(f.text) or fail invalid("`" + name + "` is an RFC 3339 time in UTC, ending in Z", name);
+    return rfc3339(f.text) or fail invalid("`" + name + "` is an RFC 3339 time (2026-10-17T12:00:00Z, or with an offset)", name);
+}
+
+type TimeError { text: String = ""; }
+
+/// An RFC 3339 instant, in UTC: `Z` or an offset (`+02:00`, `-05:30`),
+/// `T` and `Z` in either case. `std::time::parse_time` reads only the
+/// `Z` form, so an offset is taken off by hand.
+fn rfc3339(text: String) -> Time fallible(TimeError) {
+    let t = std::str::upper(std::str::trim(text));
+    if std::str::ends_with(t, "Z") { return std::time::parse_time(t) or fail TimeError { text: text }; }
+    let n = len(t);
+    if n < 6 { fail TimeError { text: text }; }
+    let sign = t[(n - 6)..(n - 5)];
+    if (sign != "+" && sign != "-") || t[(n - 3)..(n - 2)] != ":" { fail TimeError { text: text }; }
+    let hh = std::str::parse_int(t[(n - 5)..(n - 3)]) or fail TimeError { text: text };
+    let mm = std::str::parse_int(t[(n - 2)..n]) or fail TimeError { text: text };
+    if hh > 23 || mm > 59 { fail TimeError { text: text }; }
+    let local = std::time::parse_time(t[0..(n - 6)] + "Z") or fail TimeError { text: text };
+    let offset = (hh * 60 + mm) * 60 * 1000000000;
+    return std::time::from_nanos(if sign == "+" { std::time::nanos(local) - offset } else { std::time::nanos(local) + offset });
 }
 
 /// A field the contract has and this build does not serve yet.
@@ -184,7 +214,7 @@ fn read_project_create(body: String) -> ProjectCreate fallible(ApiError) {
         owners: names_field(body, "owners") or raise,
         data_classes: names_field(body, "data_classes") or raise,
         models: restriction_field(body, "models") or raise,
-        accounts: restriction_field(body, "accounts") or raise
+        accounts: accounts_field(body) or raise
     };
 }
 
@@ -203,7 +233,7 @@ fn read_project_update(body: String, project: String) -> ProjectUpdate fallible(
         set_models: sets(body, "models"),
         models: restriction_field(body, "models") or raise,
         set_accounts: sets(body, "accounts"),
-        accounts: restriction_field(body, "accounts") or raise
+        accounts: accounts_field(body) or raise
     };
 }
 
@@ -216,7 +246,7 @@ fn read_key_create(body: String, project: String) -> KeyCreate fallible(ApiError
         project: project,
         name: required_string(body, "name") or raise,
         models: restriction_field(body, "models") or raise,
-        accounts: restriction_field(body, "accounts") or raise,
+        accounts: accounts_field(body) or raise,
         expires: expires,
         expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }
     };
@@ -237,7 +267,7 @@ fn read_key_update(body: String, project: String, key: String) -> KeyUpdate fall
         set_models: sets(body, "models"),
         models: restriction_field(body, "models") or raise,
         set_accounts: sets(body, "accounts"),
-        accounts: restriction_field(body, "accounts") or raise,
+        accounts: accounts_field(body) or raise,
         set_expires: expiry != "missing",
         expires: expires,
         expires_at: if expires { time_field(body, "expires_at") or raise } else { `1970-01-01T00:00:00Z` }

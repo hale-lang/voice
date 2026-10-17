@@ -84,7 +84,7 @@ with hale's released toolchain ([`Dockerfile`](./Dockerfile)).
 
 ```sh
 docker compose up --build
-curl localhost:8080/v1/models      # the api
+curl localhost:8080/healthz        # the api; see "The api" for a key
 curl localhost:8081/node/v1/status # the node's local API
 ```
 

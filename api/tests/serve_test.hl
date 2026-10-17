@@ -7,11 +7,13 @@ import "../../node" as node;
 
 /// A link to nodes that answer with the static engine, in process. A node
 /// named in `refusing` refuses every request; one in `failing` fails it
-/// before any output, as a retryable seat failure.
+/// before any output, as a retryable seat failure. With `tool` set, every
+/// seat answers by calling that tool (the static engine's drill).
 locus Nodes {
     params {
         refusing: String = "";
         failing: String = "";
+        tool: String = "";
         offers: Int = 0;
         last_body: String = "";
     }
@@ -26,7 +28,7 @@ locus Nodes {
         let id = std::json::find_string_field(body, "request_id");
         let model = std::json::find_string_field(body, "model");
         let named = std::json::string_field(body, "engine_model");
-        let run = node::run_static(id, model, if named.kind == "string" { named.text } else { model }, std::str::trim(std::json::find_field_raw(body, "body")), node::static_config("{\"text\": \"hello from voice\", \"chunk_chars\": 8}"));
+        let run = node::run_static(id, model, if named.kind == "string" { named.text } else { model }, std::str::trim(std::json::find_field_raw(body, "body")), node::static_config(if len(self.tool) > 0 { "{\"text\": \"hello from voice\", \"tool_call\": {\"name\": \"" + self.tool + "\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}}" } else { "{\"text\": \"hello from voice\", \"chunk_chars\": 8}" }));
         let mut out = api::ServeOutcome { ack: "accepted", outcome: run.outcome, model: run.model };
         let mut rest = run.script;
         let mut at = std::str::index_of(rest, "\n");
@@ -127,6 +129,22 @@ fn main() {
     expect(audio, 400, "a part with no standard form is refused");
     std::test::assert_eq_str(std::json::find_string_field(std::json::find_field_raw(audio.body, "error"), "code"), "unsupported", "as unsupported");
     expect(ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"tool\", \"content\": \"42\"}]}"), 400, "a tool message names its call");
+    nodes.tool = "weather";
+    let asked = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"weather?\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"weather\"}}]}");
+    expect(asked, 200, "a seat that answers with a tool call");
+    let call_choice = std::json::array_first(std::json::find_field_raw(asked.body, "choices")).element;
+    std::test::assert_eq_str(std::json::find_string_field(call_choice, "finish_reason"), "tool_calls", "stopped for its tool calls");
+    let call_message = std::json::find_field_raw(call_choice, "message");
+    std::test::assert_eq_str(std::str::trim(std::json::find_field_raw(call_message, "content")), "null", "with no text");
+    let call = std::json::array_first(std::json::find_field_raw(call_message, "tool_calls")).element;
+    std::test::assert(std::str::starts_with(std::json::find_string_field(call, "id"), "call_"), "the call's id");
+    std::test::assert_eq_str(std::json::find_string_field(call, "type"), "function", "a function call");
+    let f = std::json::find_field_raw(call, "function");
+    std::test::assert_eq_str(std::json::find_string_field(f, "name"), "weather", "its name");
+    std::test::assert_eq_str(std::json::find_string_field(f, "arguments"), "{\"city\": \"Oslo\"}", "and its arguments, as text");
+    let responded = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"weather?\"}");
+    std::test::assert(std::str::contains(responded.body, "\"type\":\"function_call\""), "a response carries the function_call item as it is");
+    nodes.tool = "";
     let cut = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"max_tokens\": 2}");
     let cut_choice = std::json::array_first(std::json::find_field_raw(cut.body, "choices")).element;
     std::test::assert_eq_str(std::json::find_string_field(cut_choice, "finish_reason"), "length", "a cut answer stopped for length");

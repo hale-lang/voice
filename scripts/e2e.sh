@@ -137,6 +137,18 @@ echo "failed over from laptop/static to mini/steady in $ms ms"
 curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 100}}' >/dev/null
 for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" 502)
+# a seat that answers with a tool call (the static engine's drill), as a
+# chat completion's tool_calls; the node says what it has in flight
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "unused", "tool_call": {"name": "weather", "arguments": "{\"city\": \"Oslo\"}"}, "first_output_ms": 3000}}' >/dev/null
+wait_for up
+curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"enabled": false}' >/dev/null
+(cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" tool) &
+asked=$!
+sleep 1.5
+busy=$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')
+wait $asked
+[ "$busy" = "1" ] || { echo "the node did not count the request it was serving: in_flight $busy"; exit 1; }
+echo "the node counted its request in flight"
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 

@@ -13,6 +13,10 @@ type StaticConfig {
     // fail every request this long after it is accepted, before any
     // output, as a retryable engine failure; 0 for never (a drill)
     fail_after_ms: Int = 0;
+    // answer every request by calling this tool with these arguments (a
+    // JSON text), instead of with `text`; "" for no tool (a drill)
+    tool_name: String = "";
+    tool_arguments: String = "{}";
     problem: String = "";
 }
 
@@ -39,6 +43,15 @@ fn static_config(config: String) -> StaticConfig {
     if std::json::string_field(config, "first_output_ms").kind == "number" { c.first_output_ms = std::json::find_int_field(config, "first_output_ms"); }
     if std::json::string_field(config, "chunk_interval_ms").kind == "number" { c.chunk_interval_ms = std::json::find_int_field(config, "chunk_interval_ms"); }
     if std::json::string_field(config, "fail_after_ms").kind == "number" { c.fail_after_ms = std::json::find_int_field(config, "fail_after_ms"); }
+    let tool = std::json::string_field(config, "tool_call").kind;
+    if tool != "missing" && tool != "null" {
+        let call = std::str::trim(std::json::find_field_raw(config, "tool_call"));
+        let name = std::json::string_field(call, "name");
+        if tool != "object" || name.kind != "string" || len(name.text) == 0 { return StaticConfig { problem: "config tool_call has a name" }; }
+        c.tool_name = name.text;
+        let args = std::json::string_field(call, "arguments");
+        if args.kind == "string" { c.tool_arguments = args.text; } else if args.kind != "missing" { return StaticConfig { problem: "config tool_call arguments are a JSON text" }; }
+    }
     if c.chunk_chars < 1 { return StaticConfig { problem: "config chunk_chars is at least 1" }; }
     if c.first_output_ms < 0 || c.chunk_interval_ms < 0 || c.fail_after_ms < 0 { return StaticConfig { problem: "config delays are at least 0" }; }
     return c;
@@ -83,6 +96,11 @@ fn member_or(body: String, name: String, otherwise: String) -> String {
 fn message_item(item_id: String, status: String, text: String, done: Bool) -> String {
     let content = if done { "[{\"type\":\"output_text\",\"text\":" + q(text) + ",\"annotations\":[]}]" } else { "[]" };
     return "{\"type\":\"message\",\"id\":" + q(item_id) + ",\"status\":" + q(status) + ",\"role\":\"assistant\",\"content\":" + content + "}";
+}
+
+/// A `function_call` output item.
+fn function_call_item(id: String, call_id: String, name: String, arguments: String, status: String) -> String {
+    return "{\"type\":\"function_call\",\"id\":" + q(id) + ",\"call_id\":" + q(call_id) + ",\"name\":" + q(name) + ",\"arguments\":" + q(arguments) + ",\"status\":" + q(status) + "}";
 }
 
 /// The standard response object for the request, as it stands.
@@ -134,6 +152,26 @@ fn run_static(id: String, model: String, served: String, body: String, c: Static
         script.append_str("pause " + to_string(c.fail_after_ms) + "\n");
         let failed = script.snapshot() or b"";
         return StaticRun { script: std::str::from_bytes(failed), outcome: "failed", failure: "the seat is configured to fail (fail_after_ms)", model: served, input_tokens: input };
+    }
+    if len(c.tool_name) > 0 {
+        // a drill: the answer is a call to the configured tool
+        let call_id = "call_" + (if std::str::starts_with(id, "resp_") { id[5..len(id)] } else { id });
+        let fc_id = "fc_" + (if std::str::starts_with(id, "resp_") { id[5..len(id)] } else { id });
+        let pending_call = function_call_item(fc_id, call_id, c.tool_name, "", "in_progress");
+        script.append_str(line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + pending_call + ",\"sequence_number\":" + to_string(seq) + "}"));
+        seq = seq + 1;
+        if c.first_output_ms > 0 { script.append_str("pause " + to_string(c.first_output_ms) + "\n"); }
+        script.append_str(line("{\"type\":\"response.function_call_arguments.delta\",\"item_id\":" + q(fc_id) + ",\"output_index\":0,\"delta\":" + q(c.tool_arguments) + ",\"sequence_number\":" + to_string(seq) + "}"));
+        seq = seq + 1;
+        script.append_str(line("{\"type\":\"response.function_call_arguments.done\",\"item_id\":" + q(fc_id) + ",\"output_index\":0,\"arguments\":" + q(c.tool_arguments) + ",\"sequence_number\":" + to_string(seq) + "}"));
+        seq = seq + 1;
+        let call = function_call_item(fc_id, call_id, c.tool_name, c.tool_arguments, "completed");
+        script.append_str(line("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + call + ",\"sequence_number\":" + to_string(seq) + "}"));
+        seq = seq + 1;
+        let called = tokens_of(len(c.tool_arguments));
+        script.append_str(line("{\"type\":\"response.completed\",\"response\":" + response_object(id, created, "completed", model, body, call, usage_object(input, called)) + ",\"sequence_number\":" + to_string(seq) + "}"));
+        let answered = script.snapshot() or b"";
+        return StaticRun { script: std::str::from_bytes(answered), outcome: "served", model: served, input_tokens: input, output_tokens: called };
     }
     script.append_str(line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(seq) + "}"));
     seq = seq + 1;

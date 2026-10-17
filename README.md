@@ -61,9 +61,9 @@ file per `operationId`, drawn from one example (a `laptop` node with a
 ```sh
 hale build api
 api/api --port 8080          # --host, --canned DIR
-curl -X POST localhost:8080/admin/v1/models -d '{"id": "echo-1"}'
-curl -X POST localhost:8080/admin/v1/projects -d '{"id": "work", "name": "Work"}'
-curl -X POST localhost:8080/admin/v1/projects/work/keys -d '{"name": "laptop"}'   # its "secret"
+curl -X POST localhost:8080/admin/v1/models -H 'content-type: application/json' -d '{"id": "echo-1"}'
+curl -X POST localhost:8080/admin/v1/projects -H 'content-type: application/json' -d '{"id": "work", "name": "Work"}'
+curl -X POST localhost:8080/admin/v1/projects/work/keys -H 'content-type: application/json' -d '{"name": "laptop"}'   # its "secret"
 curl localhost:8080/v1/models -H 'Authorization: Bearer vk-...'
 curl localhost:8080/admin/v1/changes
 hale test api

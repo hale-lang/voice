@@ -41,12 +41,17 @@ body into the row's request and writes the contract's JSON
 | the change log | `GET /admin/v1/changes`, written by every admin write above |
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
 
-The configuration lives in memory for now (`MemoryStore`, behind the
-`Store` interface in [`api/store.hl`](./api/store.hl)), so it is lost when
-the api restarts; the Postgres store of [`spec/store.md`](./spec/store.md) is
-the next implementation of the same interface, and the in-memory one stays
-as the tests' double. Budgets and limits are configuration: nothing is
-counted against them until requests are served.
+Everything above reaches the configuration and the fleet's reports through
+the `Store` interface ([`api/store.hl`](./api/store.hl)). Given
+`--database postgres://...` (or `VOICE_DATABASE_URL`), the api keeps them
+in Postgres (`PgStore`, [`api/pg_store.hl`](./api/pg_store.hl)), in the
+tables of [`spec/store.md`](./spec/store.md), each admin write and the
+change it records in one transaction; `api migrate` brings the schema up to
+date first ([`api/migrations/`](./api/migrations/), store.md's SQL in
+order). Without a database the store is in the process (`MemoryStore`),
+lost on restart, which is what `hale test api` runs on. Budgets and limits
+are configuration: nothing is counted against them until requests are
+served.
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node
@@ -141,8 +146,9 @@ curl localhost:8081/node/v1/status # the node's local API
 The node `local` serves once it exists on the api and is started with its
 token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
 seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
--d node`. The api keeps its configuration in memory, so nothing reads
-Postgres yet, and the brain is a skeleton.
+-d node`. The `migrate` service brings the schema up to date before the
+api and the brain start, and the api keeps its configuration in Postgres,
+so it survives a restart of the api. The brain is a skeleton.
 
 ## The brain (skeleton)
 
@@ -422,8 +428,9 @@ migrations registered in Hale code, each applied in one transaction under a
 Postgres advisory lock, with golang-migrate's dirty-state repair. They run
 as a one-shot `migrate` step that the api and the brain wait on, never from
 the api or the brain themselves, so neither ever starts against a schema it
-does not expect. The schema and its migrations live in the store seed the
-api and the brain share.
+does not expect. Today the store and its migrations live in the api
+(`api migrate`); they move to a store seed the api and the brain share when
+the brain reads the store.
 
 ### Why Postgres, and not also Redis
 

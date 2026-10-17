@@ -6,6 +6,8 @@
 #
 #   scripts/e2e.sh            # starts NATS in a container of its own
 #   NATS_URL=nats://127.0.0.1:4222 scripts/e2e.sh   # uses that NATS
+#   DATABASE_URL=postgres://... scripts/e2e.sh      # the store in that
+#                                                   # database, migrated first
 #
 # Needs api/api and node/node built, build/openapi.bundled.json,
 # build/node.bundled.json and spec/validate's packages (see
@@ -35,7 +37,12 @@ fi
 for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NATS_URL##*:}") 2>/dev/null && break; sleep 0.2; done
 
 api=http://127.0.0.1:${API_PORT}
-api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" >"$work/api.log" 2>&1 &
+store=()
+if [ -n "${DATABASE_URL:-}" ]; then
+  api/api migrate --database "$DATABASE_URL" --migrations api/migrations
+  store=(--database "$DATABASE_URL")
+fi
+api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" "${store[@]}" >"$work/api.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 

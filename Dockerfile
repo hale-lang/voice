@@ -56,4 +56,5 @@ COPY --from=build /src/api/api /usr/local/bin/voice-api
 COPY --from=build /src/brain/brain /usr/local/bin/voice-brain
 COPY --from=build /src/node/node /usr/local/bin/voice-node
 COPY api/canned /usr/share/voice/canned
+COPY api/migrations /usr/share/voice/migrations
 COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui

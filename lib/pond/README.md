@@ -1,15 +1,24 @@
-# lib/pond: a pinned copy of pond's NATS client
+# lib/pond: pinned copies of pond libraries
 
-`realtime/nats/` holds four source files of `hale-lang/pond`'s
-`realtime/nats` at `697852f` (2026-09-24): `client.hl`, `proto.hl`,
-`types.hl` and `log.hl`, copied verbatim. They are the core NATS client
-(`NatsClient`) and what it needs; the bus adapter, JetStream and the test
-fake are not taken. Pond is Apache-2.0 (`LICENSE`, beside this file).
+Copied verbatim from where each says, sources only (not tests or examples). Pond is Apache-2.0
+(`LICENSE`, beside this file).
 
-The api (`api/link.hl`) and the node (`node/session.hl`) import it as
-`import "../lib/pond/realtime/nats" as nats;`. It lives under `lib/`, a
-directory vendored by hand, not `vendor/`, which `hale fetch` owns; nothing
-is fetched at build.
+- `realtime/nats/`: `client.hl`, `proto.hl`, `types.hl` and `log.hl` of
+  `hale-lang/pond`'s `realtime/nats` at `697852f` (2026-09-24): the core
+  NATS client (`NatsClient`) and what it needs; the bus adapter, JetStream
+  and the test fake are not taken. The api (`api/link.hl`) and the node
+  (`node/session.hl`) import it.
+- `pq/` and `db/`: taken from hale v0.24.0's `dna/core/pond/`, which is
+  pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
+  with hale's changes since (among them a password from a `std::secret`
+  vault entry, hale-lang/hale#989), so they build clean on that toolchain. The api's Postgres store
+  (`api/pg_store.hl`) and `api migrate` import them.
+- `migrations/`: pond's `migrations` at `e2dfe4e`, which `api migrate`
+  runs.
 
-Refresh it by copying the four files from pond again and updating the
-commit here; `hale verify api` and `hale verify node` must stay clean.
+Each is imported as `import "../lib/pond/<path>" as <alias>;`. They live
+under `lib/`, a directory vendored by hand, not `vendor/`, which
+`hale fetch` owns; nothing is fetched at build.
+
+Refresh one by copying its files again and updating the commit here;
+`hale verify api` and `hale verify node` must stay clean.

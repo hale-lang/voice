@@ -176,3 +176,28 @@ flag every locus carries (`self.draining`) and `drain` is a lifecycle hook,
 so both are refused as method names, and so as rpc members.
 
 **Working shape:** `NodePlane::going_away`.
+
+## `count` and `at` on a call's result pass the check and fail the build
+
+**hale 0.24.0.** `count((s.keys("work") or KeyRows { }).rows)` typechecks,
+and then the build refuses it: "unsupported in codegen v0: call to `count`:
+no free fn / generic fn / fn-pointer binding with that name is in scope —
+did you mean `t`?". The intrinsic needs a place (a local or a field), and
+the message points at an unrelated fn.
+
+**Working shape:** bind the result first (`let ks = s.keys("work") or
+KeyRows { }; count(ks.rows)`).
+
+## pond's pq: tab-separated rows, and a line on stdout
+
+**pond `pq` as hale 0.24.0 carries it.** A query's rows come back as one
+string, rows by newline and columns by tab, with no escaping, so a column
+holding a tab or a newline (a JSON document, a name) cannot be split
+back. And a connection with `sslmode=prefer` to a server without TLS
+prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
+`hale test` (a passing test is silent).
+
+**Working shape:** every read is `SELECT row_to_json(t) FROM (...) t`, one
+JSON object a line, since JSON escapes every tab and newline
+(`api/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
+the tests and compose use `sslmode=disable` on the private network.

@@ -415,4 +415,15 @@ The schema above is migration 1 of the shared store seed, registered with
 [`pond/migrations`](https://github.com/hale-lang/pond/tree/main/migrations)
 and run as the one-shot `migrate` step the api and the brain wait on. A
 change to this document is a new migration, never an edit to an applied
-one.
+one. Each migration's SQL is a file in [`api/migrations/`](../api/migrations/),
+and together, in order, they are this document's SQL, block for block (CI's
+`store` job checks it).
+
+### Migration 2: a draining node
+
+A node that posts `draining` is offered no new request until it registers
+again; the flag is part of what it reported, so it lives in `node_state`.
+
+```sql
+alter table node_state add column draining boolean not null default false;
+```

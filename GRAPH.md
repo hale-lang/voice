@@ -94,8 +94,9 @@ are practices):
 
 **process**: `postgres`, `nats`, `api`, `brain`, `node`.
 
-**seed**: `api`, `brain`, `node` (each a `hale.toml`), `lib/pond` (a copy
-of pond's NATS client that `api` and `node` import), `spec/validate`,
+**seed**: `api`, `brain`, `node` (each a `hale.toml`), `lib/pond` (copies
+of pond's NATS client, `pq`, `db` and `migrations`, which `api` and `node`
+import), `spec/validate`,
 `ui` (each a `package.json`; `ui/apps/*` and `ui/packages/*` are members of
 `ui`'s workspace, under its one gate).
 
@@ -190,14 +191,16 @@ process model):
 - `ci/api` to seed `api`, `openapi.yaml` (live), seed `spec/validate`.
 - `ci/brain` to seed `brain`.
 - `ci/node` to seed `node`, `node.yaml` (live), seed `spec/validate`.
-- `ci/e2e` to seeds `api`, `node`, `lib/pond`, `nats`, `openapi.yaml`
-  (served), `node.yaml` (live), `protocol.yaml` (a node enrolled and
-  serving over NATS), seed `spec/validate`.
+- `ci/e2e` to seeds `api`, `node`, `lib/pond`, `nats`, `postgres`,
+  `openapi.yaml` (served), `node.yaml` (live), `protocol.yaml` (a node
+  enrolled and serving over NATS), `store.md` (the api's store in it),
+  seed `spec/validate`.
 - `ci/ui` to seed `ui`.
 - `ci/contracts` to `openapi.yaml`, `node.yaml`, `protocol.yaml`,
   `internal.yaml`, seed `spec/validate` (the canned bodies against
   `openapi.yaml`).
-- `ci/store` to `store.md` (its schema, applied to Postgres).
+- `ci/store` to `store.md` (its schema, applied to Postgres, and the
+  api's migrations against it).
 - `ci/image` to `compose`.
 
 `binds`: none until a practice is ratified; each then binds the seeds or
@@ -220,6 +223,9 @@ new migration" to `store.md`.
 - the long-lived NATS client entry to seed `api` (`NatsLink` connects per
   use) and seed `lib/pond`.
 - the reserved `draining` entry to seed `api` (`NodePlane::going_away`).
+- the `count`/`at` on a call entry to seed `api` (`tests/store_test.hl`).
+- the pq rows entry to seed `api` (`PgStore` reads `row_to_json`) and
+  seed `lib/pond`.
 
 `holds`, `reviews`: none. These are the holes.
 

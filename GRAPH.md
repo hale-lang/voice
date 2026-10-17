@@ -119,7 +119,7 @@ account, the catalog, projects and keys). The other rule-shaped bullets in
 `DIRECTION.md`, `ui/DESIGN.md`, `README.md` and `ui/README.md` are
 practices once marked: the contract comes before the code; a change to a
 contract is a new migration, never an edit; the brain talks to nothing but
-Postgres and the route table it publishes; per-node and per-request
+Postgres and the version of the route table it publishes; per-node and per-request
 subjects use the NATS client, only broadcasts bind; color is earned by
 activity; volume is logarithmic; ground truth beside intent; tokens are
 framework-free and components know none of voice's nouns; the hale
@@ -178,8 +178,9 @@ process model):
 - 13 and 14 (no bypass flags; logins stay with the binaries), each to seed
   `node`.
 - 15 (the MVP runs the real process model) to seed `brain`, `compose`.
-- 16 (state never travels as events) to `internal.yaml` (the route table is
-  a snapshot), `store.md` (reservation and settlement are transactions).
+- 16 (state never travels as events) to `internal.yaml` (only the route
+  table's version travels; the table is a row), `store.md` (the route table,
+  reservation and settlement are in Postgres).
 - 17 (delivered through DNA) to this document.
 
 `runs`:

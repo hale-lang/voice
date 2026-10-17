@@ -6,9 +6,9 @@ between them. This document is that contract: the state laws the README
 states in prose, written as SQL. The migrations in the shared store seed
 are its executable form and must match it.
 
-What is *not* here: the route table (a snapshot the brain publishes on
-NATS, `internal.yaml`), prompts and responses (never stored), and anything
-a node keeps locally.
+What is *not* here: prompts and responses (never stored), and anything a
+node keeps locally. The route table is here (migration 5); NATS carries
+only the notice of its new version (`internal.yaml`).
 
 Conventions: ids are the API's slugs and opaque strings (`text`); money is
 integer micros; times are `timestamptz`; JSON the API defines is stored as
@@ -371,7 +371,9 @@ update api_instance set last_heartbeat_at = now() where id = $instance;
 ```
 
 The node plane's heartbeat and reports write `node_state`, `seat_state`
-and `quota_window` with plain upserts, each its own small transaction.
+and `quota_window` with plain upserts, each its own small transaction. A
+node's heartbeat is written with Postgres's `now()`, the clock the brain
+judges it by, never the api host's.
 
 ### Reclaim
 
@@ -385,16 +387,23 @@ alive again.
 
 ```sql
 begin;
+-- first, and only while it is still dead: an instance that beat again
+-- since it was read keeps what it holds (no row: roll back)
+update api_instance set reclaimed_at = now() where id = $dead
+  and reclaimed_at is null
+  and last_heartbeat_at < now() - interval '15 seconds';
 -- for each request r where r.instance = $dead and r.status = 'in_flight':
 --   the Settle transaction with $in = $out = $micros = 0 and
 --   usage.status = 'abandoned', then
 update request set status = 'abandoned' where id = $id;
 -- then
-update api_instance set reclaimed_at = now() where id = $dead;
 delete from api_instance where id = $dead
   and not exists (select 1 from request where instance = $dead);
 commit;
 ```
+
+Each dead instance is its own transaction. One whose reclaim fails is
+rolled back and left for the next tick; the tick goes on.
 
 Node liveness is the same rule applied to `node_state.last_heartbeat_at`,
 and the brain writes `node.status`.
@@ -413,7 +422,25 @@ Each tick, the brain computes the route table from `seat`, `seat_state`,
 `limit_state` (account-scope limits), and `catalog_model`: a seat routes
 when it is enabled, reported `up`, on a node that is `up`, for an account
 that is active and has headroom under its windows and limits. It writes
-nothing back for this; the table goes to NATS. Its one write is reclaim.
+the table, with node liveness, in one transaction (The route table,
+below), and reclaims dead api instances (Reclaim, above).
+
+### The route table
+
+One row, written by the working brain each tick in the same transaction
+as node liveness. Its version is milliseconds of Postgres's clock, and
+never below the version before it, so it only grows across a takeover or
+a clock step; `body` is the table's `models`. The brain then publishes
+`{"version"}` on `voice.route`, and `GET /admin/v1/routes` reads the row.
+
+```sql
+insert into route_table (id, version, at, body)
+values (true, (extract(epoch from now()) * 1000)::bigint, now(), $models)
+on conflict (id) do update
+  set version = greatest(route_table.version + 1, (extract(epoch from now()) * 1000)::bigint),
+      at = now(), body = excluded.body
+returning version;
+```
 
 ## Migrations
 
@@ -459,4 +486,20 @@ it again.
 
 ```sql
 alter table api_instance add column reclaimed_at timestamptz;
+```
+
+### Migration 5: the route table, in Postgres
+
+The route table moves from NATS into one row the brain writes and the
+api reads (The route table, above): NATS's `max_payload` bounded what the
+table could hold, and a version from the brain host's clock could go
+backwards across a takeover.
+
+```sql
+create table route_table (
+  id      boolean primary key default true check (id),
+  version bigint not null,
+  at      timestamptz not null,
+  body    jsonb not null
+);
 ```

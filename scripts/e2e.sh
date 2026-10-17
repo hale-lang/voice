@@ -96,6 +96,24 @@ if [ -n "${DATABASE_URL:-}" ]; then
   grep -q 'working' "$work/brain2.log" || { echo "the standby did not take over"; cat "$work/brain2.log"; exit 1; }
   echo "the standby took over"
   (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  # a brain that stops without its connection dropping (SIGSTOP stands in
+  # for a host gone silent) loses the lock: Postgres ends its idle session
+  # after 10 s, and the standby takes over
+  second=${pids[${#pids[@]}-1]}
+  brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain3.log" 2>&1 &
+  pids+=($!)
+  for i in $(seq 1 50); do grep -q 'standing by' "$work/brain3.log" && break; sleep 0.2; done
+  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  kill -STOP "$second"
+  t0=$(date +%s)
+  for i in $(seq 1 150); do grep -q 'working' "$work/brain3.log" && break; sleep 0.2; done
+  kill -CONT "$second"
+  grep -q 'working' "$work/brain3.log" || { echo "the standby did not take over from a stopped brain"; cat "$work/brain3.log"; exit 1; }
+  echo "the standby took over from a stopped brain in $(( $(date +%s) - t0 )) s"
+  sleep 1.5
+  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  [ "$after" -gt "$before" ] || { echo "the route table's version went from $before to $after"; exit 1; }
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
 fi
 
 # a change on the coordinator reaches the node over NATS

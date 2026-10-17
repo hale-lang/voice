@@ -46,8 +46,9 @@ type SeatStateList { items: bounded[SeatState; 16]; }
 /// `SeatStates`.
 type SeatStates { assignment_version: Int = 0; seats: SeatStateList = SeatStateList { }; }
 
-/// `Heartbeat`.
-type Heartbeat { in_flight: Int = 0; seats: SeatStateList = SeatStateList { }; }
+/// `Heartbeat`. `assignment_version` is the version the node has applied,
+/// -1 when it does not say.
+type Heartbeat { in_flight: Int = 0; seats: SeatStateList = SeatStateList { }; assignment_version: Int = -1; }
 
 /// A JSON object the node reports whole: its `Capabilities` or its
 /// `LocalControls`.
@@ -74,7 +75,7 @@ locus NodeBearer {
     params { store: Store; }
 
     fn context(authorization: String) -> std::api::Context fallible(ApiError) {
-        if !std::str::starts_with(authorization, "Bearer ") { fail node_token_refused(); }
+        if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { fail node_token_refused(); }
         let token = std::str::trim(authorization[7..len(authorization)]);
         let digest = secret_digest(token);
         let nodes = self.store.nodes() or fail store_failed(err);
@@ -123,11 +124,14 @@ locus NodePlane {
         return assignment_of(self.store, n) or raise;
     }
 
-    /// `nodeHeartbeat`: alive, its load, and its seats.
+    /// `nodeHeartbeat`: alive, its load, and its seats. A node that says
+    /// it applied an older assignment than the current one missed an
+    /// `assign` (core NATS delivers at most once), so it is sent again.
     fn heartbeat(h: Heartbeat, ctx: std::api::Context) fallible(ApiError) {
         let n = self.registered(ctx) or raise;
         self.store.put_beat(n.id, now_seconds(), h.in_flight) or fail store_failed(err);
         self.put_states(n.id, h.seats) or raise;
+        if h.assignment_version >= 0 && h.assignment_version < n.assignment_version { tell_assignment(self.store, self.link, n.id) or raise; }
     }
 
     /// `reportSeatStates`: the seats as the node applied an assignment.
@@ -140,6 +144,7 @@ locus NodePlane {
         }
         self.store.put_beat(n.id, now_seconds(), (self.store.beat(n.id) or Beat { }).in_flight) or fail store_failed(err);
         self.put_states(n.id, s.seats) or raise;
+        if s.assignment_version < n.assignment_version { tell_assignment(self.store, self.link, n.id) or raise; }
     }
 
     /// `reportCapabilities`: what the node offers changed.
@@ -191,9 +196,16 @@ locus NodePlane {
         return n;
     }
 
+    /// The states of the seats configured on the node. A state for a seat
+    /// that is not (one deleted while the node still runs it, or an id the
+    /// node made up) is refused: no row is kept for it.
     fn put_states(node: String, seats: SeatStateList) -> Bool fallible(ApiError) {
         for st in seats.items {
             if !is_seat_status(st.status) { fail invalid("a seat's status is starting, up, down, disabled, paused or refused", "seats"); }
+        }
+        for st in seats.items {
+            let configured = self.store.seat(node, st.id) or fail store_failed(err);
+            if !configured.present { continue; }
             let row = SeatStateRow { ref: node + "/" + st.id, node: node, seat: st.id, status: st.status, reason: st.reason, in_flight: st.in_flight };
             self.store.put_seat_state(row) or fail store_failed(err);
         }
@@ -330,7 +342,8 @@ fn read_registration(body: String) -> Registration fallible(ApiError) {
 
 fn read_heartbeat(body: String) -> Heartbeat fallible(ApiError) {
     object_body(body) or raise;
-    return Heartbeat { in_flight: required_amount(body, "in_flight") or raise, seats: seat_state_list(body, "seats") or raise };
+    let applied = if kind_of(body, "assignment_version") == "missing" { -1 } else { required_amount(body, "assignment_version") or raise };
+    return Heartbeat { in_flight: required_amount(body, "in_flight") or raise, seats: seat_state_list(body, "seats") or raise, assignment_version: applied };
 }
 
 fn read_seat_states(body: String) -> SeatStates fallible(ApiError) {
@@ -349,12 +362,32 @@ fn read_quota(body: String) -> QuotaReport fallible(ApiError) {
     let mut it = std::json::array_first(std::json::find_field_raw(body, "windows"));
     let mut n = 0;
     while !it.done {
-        if !std::json::valid_object(std::str::trim(it.element)) { fail invalid("a quota window is an object", "windows"); }
+        check_window(std::str::trim(it.element)) or raise;
         n = n + 1;
         if n > 16 { fail invalid("at most 16 quota windows", "windows"); }
         it = std::json::array_next(it);
     }
     return QuotaReport { seat: required_string(body, "seat") or raise, windows: std::str::trim(std::json::find_field_raw(body, "windows")) };
+}
+
+/// One `QuotaWindow`, as the admin plane will show it: a `name`, a
+/// `used_percent` from 0 to 100 and an `observed_at`, with `resets_at` a
+/// time or null and `seat` text when they are set.
+fn check_window(w: String) -> Bool fallible(ApiError) {
+    if !std::json::valid_object(w) { fail invalid("a quota window is an object", "windows"); }
+    if kind_of(w, "name") != "string" || len(std::json::find_string_field(w, "name")) == 0 { fail invalid("a quota window has a `name`", "windows"); }
+    let used = std::str::parse_float(std::str::trim(std::json::find_field_raw(w, "used_percent"))) or - 1.0;
+    if kind_of(w, "used_percent") != "number" || used < 0.0 || used > 100.0 { fail invalid("a quota window's `used_percent` is a number from 0 to 100", "windows"); }
+    if kind_of(w, "observed_at") != "string" { fail invalid("a quota window has an `observed_at` time", "windows"); }
+    rfc3339(std::json::find_string_field(w, "observed_at")) or fail invalid("a quota window's `observed_at` is an RFC 3339 time", "windows");
+    let resets = kind_of(w, "resets_at");
+    if resets != "missing" && resets != "null" {
+        if resets != "string" { fail invalid("a quota window's `resets_at` is a time or null", "windows"); }
+        rfc3339(std::json::find_string_field(w, "resets_at")) or fail invalid("a quota window's `resets_at` is an RFC 3339 time", "windows");
+    }
+    let seat = kind_of(w, "seat");
+    if seat != "missing" && seat != "string" { fail invalid("a quota window's `seat` is a seat id", "windows"); }
+    return true;
 }
 
 fn read_draining(body: String) -> Draining fallible(ApiError) {
@@ -398,8 +431,10 @@ fn assign_message(a: Assignment) -> String {
 }
 
 /// The node's new assignment, to it over the link, once it has
-/// registered. A node that misses it (not yet registered, not connected,
-/// NATS down) gets it when it registers again.
+/// registered. Core NATS delivers it at most once: a node that misses it
+/// reads its assignment when it next connects to NATS, and says the
+/// version it applied in every heartbeat, which sends it again when it is
+/// behind.
 fn tell_assignment(store: Store, link: Link, node: String) fallible(ApiError) {
     let n = store.node(node) or fail store_failed(err);
     if !n.present || n.revoked { return; }

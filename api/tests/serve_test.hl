@@ -116,12 +116,23 @@ fn main() {
     std::test::assert_eq_int(std::json::find_int_field(std::json::find_field_raw(c.body, "usage"), "completion_tokens"), 4, "its usage");
     std::test::assert(std::str::contains(nodes.last_body, "\"input\": [{\"type\": \"message\", \"role\": \"system\""), "sent as input messages");
     std::test::assert(std::str::contains(nodes.last_body, "\"max_output_tokens\": 64"), "its cap converted");
+    let tools = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"look\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"https://example.test/a.png\"}}]}, {\"role\": \"assistant\", \"content\": null, \"tool_calls\": [{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"lookup\", \"arguments\": \"{}\"}}]}, {\"role\": \"tool\", \"tool_call_id\": \"call_1\", \"content\": \"42\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"lookup\", \"parameters\": {\"type\": \"object\"}}}], \"tool_choice\": {\"type\": \"function\", \"function\": {\"name\": \"lookup\"}}}");
+    expect(tools, 200, "a chat completion with parts and tools");
+    std::test::assert(std::str::contains(nodes.last_body, "{\"type\": \"input_text\", \"text\": \"look\"}"), "a text part as input_text");
+    std::test::assert(std::str::contains(nodes.last_body, "{\"type\": \"input_image\", \"image_url\": \"https://example.test/a.png\", \"detail\": \"auto\"}"), "an image part as input_image");
+    std::test::assert(std::str::contains(nodes.last_body, "{\"type\": \"function_call\", \"call_id\": \"call_1\", \"name\": \"lookup\", \"arguments\": \"{}\"}"), "a tool call as a function_call");
+    std::test::assert(std::str::contains(nodes.last_body, "{\"type\": \"function_call_output\", \"call_id\": \"call_1\", \"output\": \"42\"}"), "a tool message as its output");
+    std::test::assert(std::str::contains(nodes.last_body, "\"tools\": [{\"type\": \"function\", \"name\": \"lookup\", \"parameters\": {\"type\": \"object\"}}]") && std::str::contains(nodes.last_body, "\"tool_choice\": {\"type\": \"function\", \"name\": \"lookup\"}"), "the tools and the choice as the standard names them");
+    let audio = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": [{\"type\": \"input_audio\", \"input_audio\": {}}]}]}");
+    expect(audio, 400, "a part with no standard form is refused");
+    std::test::assert_eq_str(std::json::find_string_field(std::json::find_field_raw(audio.body, "error"), "code"), "unsupported", "as unsupported");
+    expect(ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"tool\", \"content\": \"42\"}]}"), 400, "a tool message names its call");
     let cut = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"max_tokens\": 2}");
     let cut_choice = std::json::array_first(std::json::find_field_raw(cut.body, "choices")).element;
     std::test::assert_eq_str(std::json::find_string_field(cut_choice, "finish_reason"), "length", "a cut answer stopped for length");
 
     // a seat that refuses: the request moves to another
-    bring_up(e, "desktop");
+    let desktop = bring_up(e, "desktop");
     nodes.refusing = "laptop";
     let moved = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
     expect(moved, 200, "served elsewhere");
@@ -135,12 +146,31 @@ fn main() {
     nodes.failing = "desktop";
     let failed = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
     expect(failed, 502, "every eligible seat failed");
-    std::test::assert_eq_str(std::json::find_string_field(std::json::find_field_raw(failed.body, "error"), "code"), "upstream_failed", "upstream_failed");
+    let failure = std::json::find_field_raw(failed.body, "error");
+    std::test::assert_eq_str(std::json::find_string_field(failure, "code"), "upstream_failed", "upstream_failed");
+    let fv = std::json::find_field_raw(failure, "voice");
+    std::test::assert(std::str::starts_with(std::json::find_string_field(fv, "request_id"), "resp_"), "the error names the request");
+    let tried = std::json::array_first(std::json::find_field_raw(fv, "attempts"));
+    std::test::assert_eq_str(std::json::find_string_field(tried.element, "seat"), "laptop/static", "and every seat it tried");
+    std::test::assert_eq_str(std::json::find_string_field(std::json::array_next(tried).element, "seat"), "desktop/static", "in turn");
+    std::test::assert(std::str::contains(nodes.last_body, "\"reply_to\": \"voice.reply." + std::json::find_string_field(fv, "request_id") + ".2\""), "each attempt answering on a subject of its own");
     nodes.refusing = "";
     nodes.failing = "";
 
-    // seats that are not eligible are not offered
+    // a node whose local cap is 0 is at its cap: its seats are not offered
     let before = nodes.offers;
+    for t in [laptop, desktop] {
+        expect(e.handle(std::http::Request { method: "PUT", path: "/node/v1/local", headers: "Authorization: Bearer " + t, body: "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 0, \"reason\": null}" }), 204, "a local cap of 0");
+    }
+    let capped = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    expect(capped, 503, "no seat is eligible");
+    std::test::assert_eq_str(std::json::find_string_field(std::json::find_field_raw(capped.body, "error"), "code"), "no_eligible_seat", "no_eligible_seat, not a seat failure");
+    std::test::assert_eq_int(nodes.offers, before, "nothing was offered");
+    for t in [laptop, desktop] {
+        expect(e.handle(std::http::Request { method: "PUT", path: "/node/v1/local", headers: "Authorization: Bearer " + t, body: "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}" }), 204, "the cap lifted");
+    }
+
+    // seats that are not eligible are not offered
     plane(e, "/node/v1/draining", laptop, "");
     admin(e, "PATCH", "/admin/v1/nodes/desktop/seats/static", "{\"enabled\": false}");
     let none = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");

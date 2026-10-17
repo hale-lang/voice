@@ -56,9 +56,14 @@ in the catalog). A change to a node or its seats is a new assignment,
 published to the node on NATS. An inference request is admitted (its key,
 model, account and data class), then offered to each seat that could take
 it in turn: a seat that refuses, does not answer, or fails before output is
-an attempt in `voice.attempts`, and the next is offered the request. The
-api serves its callers one at a time, and opens a NATS connection for each
-request. A request with `"stream": true` is answered `400 unsupported`:
+an attempt in `voice.attempts`, and the next is offered the request. Each
+attempt answers on a reply subject of its own, and a seat the api stops
+waiting for is sent `cancel`. When every seat fails, the `502` carries the
+request id and the attempts in `error.voice`. A seat whose node holds a
+local cap of 0 is not offered. Chat Completions messages are converted to
+the standard's input items (content parts, tool calls and tool results),
+and what has no standard form is refused `400 unsupported`. The api serves
+its callers one at a time, and opens a NATS connection for each attempt. A request with `"stream": true` is answered `400 unsupported`:
 hale's `std::http::Server` cannot stream a response body yet.
 A request body over 1 MiB is refused by the server before voice reads it,
 `413` in plain text, though the contract allows 12 MiB and a JSON error
@@ -91,11 +96,22 @@ local API from `node.yaml` (status, capabilities, local controls). It
 registers on the api's node plane with its enrollment token, applies the
 assignment that comes back (refusing a seat outside what it offers, and
 holding one its local controls pause), reports every seat's state and
-heartbeats. On NATS it takes `assign`, and answers `serve` at once with
-`accepted` or `refused`, then serves the request on its seat with the
-static engine, streaming the standard's events and the result to the
-reply subject the request named (`protocol.yaml`). It serves one request
-at a time.
+heartbeats with the assignment version it applied. On NATS it takes
+`assign`, and answers `serve` at once with `accepted` or `refused`, then
+serves the request on its seat with the static engine, streaming the
+standard's events and the result to the reply subject the request named
+(`protocol.yaml`); a `cancel` stops it. It serves one request at a time,
+and refuses a `serve` that arrives meanwhile, so the request goes to
+another seat. Core NATS delivers an `assign` at most once, so a node reads
+its assignment each time it is on NATS again, and the api sends the
+assignment again to a node whose heartbeat says it is behind.
+
+The node's calls to the api's node plane run on a thread of their own
+(`Plane`), apart from the NATS session (`Session`): the api serves one
+caller at a time, so a heartbeat can wait for as long as a request holds
+the api, and a session waiting there could not answer the `serve` that
+fails that request over to it. The static engine's `fail_after_ms` makes a
+seat fail every request after that long, for drills.
 
 ```sh
 hale build node
@@ -518,10 +534,11 @@ already there.
 
 **Node**
 
-- The session registers over the node plane, then holds the NATS
-  connection (`pond/realtime/nats`, which reconnects and resubscribes on
-  its own) and posts heartbeats. It is pinned, because the client's reads
-  block.
+- The plane registers over the node plane, posts seat states and
+  heartbeats, and reads the assignment when the session asks; the session
+  holds the NATS connection (`pond/realtime/nats`) and serves. Each is
+  pinned to its own thread, because the client's reads and the node
+  plane's calls block, and they talk over the bus.
 - The capabilities file is read at start and declared at registration; the
   assignment that comes back, and every `assign` after, is reconciled
   against it, and seat states are posted back.

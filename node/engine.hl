@@ -10,6 +10,9 @@ type StaticConfig {
     chunk_chars: Int = 16;
     first_output_ms: Int = 0;
     chunk_interval_ms: Int = 0;
+    // fail every request this long after it is accepted, before any
+    // output, as a retryable engine failure; 0 for never (a drill)
+    fail_after_ms: Int = 0;
     problem: String = "";
 }
 
@@ -18,8 +21,10 @@ type StaticConfig {
 /// result reports.
 type StaticRun {
     script: String = "";
-    // served | incomplete
+    // served | incomplete | failed
     outcome: String = "served";
+    // why, for failed
+    failure: String = "";
     model: String = "";
     input_tokens: Int = 0;
     output_tokens: Int = 0;
@@ -33,8 +38,9 @@ fn static_config(config: String) -> StaticConfig {
     if std::json::string_field(config, "chunk_chars").kind == "number" { c.chunk_chars = std::json::find_int_field(config, "chunk_chars"); }
     if std::json::string_field(config, "first_output_ms").kind == "number" { c.first_output_ms = std::json::find_int_field(config, "first_output_ms"); }
     if std::json::string_field(config, "chunk_interval_ms").kind == "number" { c.chunk_interval_ms = std::json::find_int_field(config, "chunk_interval_ms"); }
+    if std::json::string_field(config, "fail_after_ms").kind == "number" { c.fail_after_ms = std::json::find_int_field(config, "fail_after_ms"); }
     if c.chunk_chars < 1 { return StaticConfig { problem: "config chunk_chars is at least 1" }; }
-    if c.first_output_ms < 0 || c.chunk_interval_ms < 0 { return StaticConfig { problem: "config delays are at least 0" }; }
+    if c.first_output_ms < 0 || c.chunk_interval_ms < 0 || c.fail_after_ms < 0 { return StaticConfig { problem: "config delays are at least 0" }; }
     return c;
 }
 
@@ -123,6 +129,12 @@ fn run_static(id: String, model: String, served: String, body: String, c: Static
     seq = seq + 1;
     script.append_str(line("{\"type\":\"response.in_progress\",\"response\":" + pending + ",\"sequence_number\":" + to_string(seq) + "}"));
     seq = seq + 1;
+    if c.fail_after_ms > 0 {
+        // a drill: the engine fails before any output
+        script.append_str("pause " + to_string(c.fail_after_ms) + "\n");
+        let failed = script.snapshot() or b"";
+        return StaticRun { script: std::str::from_bytes(failed), outcome: "failed", failure: "the seat is configured to fail (fail_after_ms)", model: served, input_tokens: input };
+    }
     script.append_str(line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(seq) + "}"));
     seq = seq + 1;
     script.append_str(line("{\"type\":\"response.content_part.added\",\"item_id\":" + q(item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":" + to_string(seq) + "}"));
@@ -178,6 +190,11 @@ fn line(event: String) -> String {
 fn result_message(id: String, r: StaticRun, first_output_ms: Int, engine_ms: Int) -> String {
     return "{\"type\":\"result\",\"request_id\":" + q(id) + ",\"outcome\":" + q(r.outcome) + ",\"served\":{\"model\":" + q(r.model)
         + ",\"quantization\":null,\"provider\":null},\"timing\":{\"first_output_ms\":" + to_string(first_output_ms) + ",\"engine_ms\":" + to_string(engine_ms) + "}}";
+}
+
+/// The `result` of a request the coordinator cancelled.
+fn cancelled_result(id: String) -> String {
+    return "{\"type\":\"result\",\"request_id\":" + q(id) + ",\"outcome\":\"cancelled\"}";
 }
 
 /// A `result` for a request that failed before it ran.

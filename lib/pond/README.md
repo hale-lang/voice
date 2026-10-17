@@ -17,7 +17,10 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   into one buffer (`__pump`, `__append_row`) instead of growing the result
   text by `+` per row, which kept every prefix until the caller returned.
 - `migrations/`: pond's `migrations` at `e2dfe4e`, which `api migrate`
-  runs.
+  runs. A pond issue it works around without changing it: `Migrator`
+  creates `schema_migrations` before it takes its advisory lock, so two
+  runs at once on a fresh database could both create it and one fail;
+  `api migrate` takes an advisory lock of its own around the whole run.
 
 Each is imported as `import "../lib/pond/<path>" as <alias>;`. They live
 under `lib/`, a directory vendored by hand, not `vendor/`, which

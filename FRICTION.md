@@ -217,3 +217,11 @@ change to `lib/pond/pq`, `JsonList` for list bodies), and lines are read by
 index over one `std::str::bytes_view`, slicing only the line (`line_end`
 in `api/wire.hl`). The same page now grows the peak by 8 MB, and
 `api/tests/pg_page_memory_test.hl` holds it under 32 MB.
+
+## `release` cannot name a method either
+
+**hale 0.24.0.** The store's "end the hold that wrote nothing" is naturally
+`Store::release`, and `release` is a lifecycle hook, so it is refused as a
+method name, as `draining` and `drain` are.
+
+**Working shape:** `Store::let_go`.

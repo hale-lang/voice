@@ -18,6 +18,8 @@ locus PgStore {
         conn: pq::PgConn = pq::PgConn { sslmode: "prefer" };
         opened: Bool = false;
         dialling: Bool = false;
+        // a transaction `hold` opened, which the next write continues
+        held: Bool = false;
     }
 
     birth() {
@@ -63,17 +65,23 @@ locus PgStore {
         self.dialling = true;
         self.conn.close();
         self.opened = false;
+        self.held = false;
         let ok = self.open();
         self.dialling = false;
         return ok;
     }
 
     /// Rows of one JSON object each, over a fresh connection once when
-    /// the first one is gone. Outside a transaction only: a retry in one
-    /// would run outside it.
+    /// the first one is gone; inside a `hold`, no retry (it would run
+    /// outside the transaction), and a failure ends the hold.
     fn rows(sql: String, a: db::Args) -> String fallible(StoreError) {
         if !self.open() { fail StoreError { message: "Postgres unreachable at " + self.conn.host + ":" + to_string(self.conn.port) }; }
         let mut r = self.conn.query_params(sql, a);
+        if !r.ok && self.held {
+            self.held = false;
+            self.conn.rollback();
+            fail StoreError { message: r.err.kind + ": " + r.err.detail };
+        }
         if !r.ok && r.err.kind == "io" && self.redial() { r = self.conn.query_params(sql, a); }
         if !r.ok { fail StoreError { message: r.err.kind + ": " + r.err.detail }; }
         return r.csv;
@@ -86,7 +94,30 @@ locus PgStore {
         return std::str::trim(if nl < 0 { all } else { all[0..nl] });
     }
 
+    /// Open a transaction holding `target` (an advisory lock on its
+    /// hash): every reader-then-writer of that resource holds it, so on
+    /// any api instance the read sees the last committed write and the
+    /// write lands on it. The next write continues this transaction;
+    /// `let_go` ends it when no write did.
+    fn hold(target: String) fallible(StoreError) {
+        self.let_go();
+        self.begin() or raise;
+        self.held = true;
+        let a = db::Args { };
+        a.add(target);
+        self.step("SELECT pg_advisory_xact_lock(7204, hashtext($1))", a) or raise;
+    }
+
+    fn let_go() {
+        if self.held {
+            self.held = false;
+            self.conn.rollback();
+        }
+    }
+
     fn begin() fallible(StoreError) {
+        // a write after `hold` goes on in its transaction
+        if self.held { return; }
         if !self.open() { fail StoreError { message: "Postgres unreachable at " + self.conn.host + ":" + to_string(self.conn.port) }; }
         let mut st = self.conn.begin();
         if !st.ok && st.err.kind == "io" && self.redial() { st = self.conn.begin(); }
@@ -97,6 +128,7 @@ locus PgStore {
     fn step(sql: String, a: db::Args) -> Int fallible(StoreError) {
         let r = self.conn.exec_params(sql, a);
         if !r.ok {
+            self.held = false;
             self.conn.rollback();
             if r.err.kind == "io" { self.redial(); }
             fail StoreError { message: r.err.kind + ": " + r.err.detail };
@@ -112,11 +144,13 @@ locus PgStore {
         self.step("SELECT pg_advisory_xact_lock(7203)", db::Args { }) or raise;
         let r = self.conn.query_params(count_sql, a);
         if !r.ok {
+            self.held = false;
             self.conn.rollback();
             fail StoreError { message: r.err.kind + ": " + r.err.detail };
         }
         let n = std::str::parse_int(std::str::trim(r.csv)) or bound;
         if n >= bound {
+            self.held = false;
             self.conn.rollback();
             fail StoreError { kind: "full", message: message };
         }
@@ -125,6 +159,7 @@ locus PgStore {
     /// Record the change and commit.
     fn commit_with(change: ChangeRow) fallible(StoreError) {
         self.record(change) or raise;
+        self.held = false;
         let st = self.conn.commit();
         if !st.ok {
             self.conn.rollback();
@@ -143,7 +178,10 @@ locus PgStore {
         self.step("INSERT INTO change (at, principal, action, target, before, after) VALUES ($1::timestamptz, NULL, $2, $3, $4::jsonb, $5::jsonb)", a) or raise;
     }
 
-    fn rollback() { self.conn.rollback(); }
+    fn rollback() {
+        self.held = false;
+        self.conn.rollback();
+    }
 
     // ---- the catalog
 
@@ -432,7 +470,8 @@ locus PgStore {
 
     fn update_node(row: NodeRow, change: ChangeRow) fallible(StoreError) {
         self.begin() or raise;
-        self.step("UPDATE node SET name = $2, token_digest = decode($3, 'hex'), max_in_flight = $4::int, status = $5, assignment_version = $6::int, created_at = $7::timestamptz, revoked_at = $8::timestamptz WHERE id = $1", node_args(row)) or raise;
+        // the version moves on in SQL: a seat written meanwhile moved it too
+        self.step("UPDATE node SET name = $2, token_digest = decode($3, 'hex'), max_in_flight = $4::int, status = $5, assignment_version = assignment_version + 1, created_at = $6::timestamptz, revoked_at = $7::timestamptz WHERE id = $1", node_update_args(row)) or raise;
         self.commit_with(change) or raise;
     }
 
@@ -515,7 +554,7 @@ locus PgStore {
         }
         a.add(to_string(cursor));
         a.add(to_string(limit + 1));
-        let all = self.rows("SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE ($1 = '' OR target = $1 OR target LIKE $1 || '/%') AND ($2::timestamptz IS NULL OR at >= $2::timestamptz) AND ($3::timestamptz IS NULL OR at <= $3::timestamptz) AND ($4::bigint = 0 OR id < $4::bigint) ORDER BY id DESC LIMIT $5::int) t", a) or raise;
+        let all = self.rows("SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE ($1 = '' OR target = $1 OR starts_with(target, $1 || '/')) AND ($2::timestamptz IS NULL OR at >= $2::timestamptz) AND ($3::timestamptz IS NULL OR at <= $3::timestamptz) AND ($4::bigint = 0 OR id < $4::bigint) ORDER BY id DESC LIMIT $5::int) t", a) or raise;
         let mut out = ChangeRows { };
         let v = std::str::bytes_view(all);
         let mut start = 0;
@@ -628,7 +667,7 @@ locus PgStore {
     fn windows(account: String) -> String fallible(StoreError) {
         let a = db::Args { };
         a.add(account);
-        let j = self.row("SELECT json_agg(json_build_object('name', name, 'used_percent', used_percent, 'resets_at', resets_at, 'observed_at', observed_at, 'seat', seat) ORDER BY name) FROM quota_window WHERE account = $1", a) or raise;
+        let j = self.row("SELECT jsonb_agg(jsonb_build_object('name', name, 'used_percent', used_percent, 'resets_at', resets_at, 'observed_at', observed_at) || CASE WHEN seat IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('seat', seat) END ORDER BY name) FROM quota_window WHERE account = $1", a) or raise;
         return if std::str::starts_with(j, "[") { j } else { "" };
     }
 
@@ -663,45 +702,101 @@ locus PgStore {
 /// A DSN's parts; `problem` says what is wrong with it, "" when nothing is.
 type Dsn { host: String = "127.0.0.1"; port: Int = 5432; user: String = "postgres"; password: String = ""; database: String = "postgres"; sslmode: String = "prefer"; problem: String = ""; }
 
-/// `postgres://user[:password]@host[:port]/database[?sslmode=MODE]`.
+/// `postgres://user[:password]@host[:port]/database[?sslmode=MODE]`. The
+/// credentials end at the last `@`, so a password may hold one, and the
+/// user, the password and the database are percent-decoded. Nothing of a
+/// DSN is ever printed but the host and the port.
 fn parse_dsn(url: String) -> Dsn {
     let mut d = Dsn { };
     let sep = std::str::index_of(url, "://");
     let mut rest = if sep >= 0 { url[(sep + 3)..len(url)] } else { url };
-    let slash = std::str::index_of(rest, "/");
-    if slash >= 0 {
-        let db_name = rest[(slash + 1)..len(rest)];
-        let q = std::str::index_of(db_name, "?");
-        d.database = if q >= 0 { db_name[0..q] } else { db_name };
-        let mode = std::str::index_of(db_name, "sslmode=");
+    let q = std::str::index_of(rest, "?");
+    if q >= 0 {
+        let query = rest[(q + 1)..len(rest)];
+        let mode = std::str::index_of(query, "sslmode=");
         if mode >= 0 {
-            let v = db_name[(mode + 8)..len(db_name)];
+            let v = query[(mode + 8)..len(query)];
             let amp = std::str::index_of(v, "&");
             d.sslmode = if amp >= 0 { v[0..amp] } else { v };
         }
-        rest = rest[0..slash];
+        rest = rest[0..q];
     }
-    let at = std::str::index_of(rest, "@");
+    let at = last_index(rest, "@");
     if at >= 0 {
         let cred = rest[0..at];
         rest = rest[(at + 1)..len(rest)];
         let colon = std::str::index_of(cred, ":");
         if colon >= 0 {
-            d.user = cred[0..colon];
-            d.password = cred[(colon + 1)..len(cred)];
+            d.user = pct_decode(cred[0..colon]);
+            d.password = pct_decode(cred[(colon + 1)..len(cred)]);
         } else {
-            d.user = cred;
+            d.user = pct_decode(cred);
         }
     }
-    let pc = std::str::index_of(rest, ":");
+    let slash = std::str::index_of(rest, "/");
+    if slash >= 0 {
+        d.database = pct_decode(rest[(slash + 1)..len(rest)]);
+        rest = rest[0..slash];
+    }
+    let pc = last_index(rest, ":");
     if pc >= 0 {
         d.host = rest[0..pc];
         d.port = std::str::parse_int(rest[(pc + 1)..len(rest)]) or - 1;
-        if d.port < 1 || d.port > 65535 { d.problem = "the database URL's port is not a port number: " + rest[(pc + 1)..len(rest)]; }
+        if d.port < 1 || d.port > 65535 { d.problem = "the database URL's port is not a port number"; }
     } else if len(rest) > 0 {
         d.host = rest;
     }
     return d;
+}
+
+/// `text` with the DSN's password, user and database taken out, for a
+/// message that may quote what the driver was given.
+fn redact(text: String, d: Dsn) -> String {
+    let mut out = text;
+    if len(d.password) > 0 { out = std::str::replace(out, d.password, "[password]"); }
+    if len(d.user) > 0 { out = std::str::replace(out, d.user, "[user]"); }
+    if len(d.database) > 0 { out = std::str::replace(out, d.database, "[database]"); }
+    return out;
+}
+
+/// The index of the last `sub` in `s`, or -1.
+fn last_index(s: String, sub: String) -> Int {
+    let mut found = -1;
+    let mut at = std::str::index_of(s, sub);
+    while at >= 0 {
+        found = at;
+        at = std::str::index_of_from(s, sub, at + 1);
+    }
+    return found;
+}
+
+/// `%XX` escapes decoded; one that is not two hex digits is kept as it is.
+fn pct_decode(s: String) -> String {
+    if std::str::index_of(s, "%") < 0 { return s; }
+    let v = std::str::bytes_view(s);
+    let out = std::bytes::BytesBuilder { initial_cap: 64 };
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        let hi = hex_value(std::str::byte_at(v, i + 1));
+        let lo = hex_value(std::str::byte_at(v, i + 2));
+        if b == 37 && hi >= 0 && lo >= 0 {
+            out.append(std::bytes::from_int(hi * 16 + lo));
+            i = i + 3;
+        } else {
+            out.append(std::bytes::from_int(b));
+            i = i + 1;
+        }
+    }
+    let decoded = out.snapshot() or b"";
+    return std::str::from_bytes(decoded);
+}
+
+fn hex_value(b: Int) -> Int {
+    if b >= 48 && b <= 57 { return b - 48; }
+    if b >= 65 && b <= 70 { return b - 55; }
+    if b >= 97 && b <= 102 { return b - 87; }
+    return -1;
 }
 
 /// Arguments of one value.
@@ -971,6 +1066,19 @@ fn node_row(j: String) -> NodeRow {
 
 /// A node's `status` column: `revoked`, else `pending`; up and down are
 /// judged from its heartbeat as it is read (fleet.hl).
+/// `node_args` but the version, which an update moves on in SQL.
+fn node_update_args(r: NodeRow) -> db::Args {
+    let a = db::Args { };
+    a.add(r.id);
+    a.add(r.name);
+    a.add(r.token_digest);
+    add_count(a, r.max_in_flight);
+    a.add(if r.revoked { "revoked" } else { "pending" });
+    a.add(std::time::iso8601(r.created_at));
+    add_time(a, r.revoked, r.revoked_at);
+    return a;
+}
+
 fn node_args(r: NodeRow) -> db::Args {
     let a = db::Args { };
     a.add(r.id);

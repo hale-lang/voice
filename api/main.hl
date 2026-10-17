@@ -27,7 +27,7 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
     if len(ui) > 0 { println("voice api: serving the admin ui from ", ui); }
     if len(database) > 0 {
         let d = parse_dsn(database);
-        println("voice api: the store is Postgres at ", d.host, ":", d.port, "/", d.database);
+        println("voice api: the store is Postgres at ", d.host, ":", d.port);
         let endpoints = Endpoints { canned: canned, ui: ui, store: PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
         std::http::Server { host: host, port: port, handler: endpoints };
     } else {
@@ -54,7 +54,16 @@ fn migrate(database: String, dir: String) -> Int {
     let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, database: d.database, sslmode: d.sslmode };
     let st = conn.open();
     if !st.ok {
-        eprintln("voice migrate: Postgres at ", d.host, ":", d.port, ": ", st.err.kind, " ", st.err.detail);
+        eprintln("voice migrate: Postgres at ", d.host, ":", d.port, ": ", st.err.kind, " ", redact(st.err.detail, d));
+        return 1;
+    }
+    // pond's migrator creates its tracking table before it takes its own
+    // lock, so two runs at once could both create it: the whole run holds
+    // a lock of voice's first (lib/pond/README.md)
+    let held = conn.query_one("SELECT pg_advisory_lock(7205)");
+    if !held.ok {
+        eprintln("voice migrate: could not take the migration lock: ", held.err.kind, " ", redact(held.err.detail, d));
+        conn.close();
         return 1;
     }
     let set = migs::Migrations { };
@@ -76,15 +85,16 @@ fn migrate(database: String, dir: String) -> Int {
         at = std::str::index_of(rest, "\n");
     }
     let m = migs::Migrator { driver: conn, set: set };
-    let applied = m.up() or migration_failed(err);
+    let applied = m.up() or migration_failed(err, d);
+    conn.query_one("SELECT pg_advisory_unlock(7205)");
     conn.close();
     if applied < 0 { return 1; }
     println("voice migrate: ", applied, " applied; the schema is at version ", set.count());
     return 0;
 }
 
-fn migration_failed(e: migs::MigrationError) -> Int {
-    eprintln("voice migrate: ", e.kind, " at version ", e.version, " (", e.name, "): ", e.detail);
+fn migration_failed(e: migs::MigrationError, d: Dsn) -> Int {
+    eprintln("voice migrate: ", e.kind, " at version ", e.version, " (", e.name, "): ", redact(e.detail, d));
     return -1;
 }
 

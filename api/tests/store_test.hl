@@ -137,6 +137,9 @@ fn exercise(s: api::Store, label: String) {
     std::test::assert(st.status == "refused" && st.reason == "no engine", label + ": a seat's state");
     s.put_windows("static", "[{\"name\": \"five_hour\", \"used_percent\": 12.5, \"observed_at\": \"2026-10-17T00:00:00Z\", \"seat\": \"laptop/static\"}]") or discard;
     std::test::assert(std::str::contains(s.windows("static") or "", "five_hour"), label + ": an account's windows");
+    s.put_windows("static", "[{\"name\": \"day\", \"used_percent\": 1, \"observed_at\": \"2026-10-17T00:00:00Z\"}]") or discard;
+    let seatless = s.windows("static") or "";
+    std::test::assert(std::str::contains(seatless, "\"day\"") && !std::str::contains(seatless, "seat"), label + ": a window reported without a seat has no seat key: " + seatless);
 
     // the change log
     let all = s.changes(api::ChangeQuery { }) or api::ChangeRows { };
@@ -155,6 +158,12 @@ fn exercise(s: api::Store, label: String) {
     let n1 = at(next.rows, 1) or api::ChangeRow { };
     std::test::assert_eq_str(n1.target, "nodes/laptop", label + ": the next page goes on from the cursor");
     std::test::assert(next.cursor_known, label + ": a page's own cursor is known");
+    let pattern = s.changes(api::ChangeQuery { target: "%" }) or api::ChangeRows { };
+    std::test::assert_eq_int(count(pattern.rows), 0, label + ": a target is a path, not a pattern");
+    let underscore = s.changes(api::ChangeQuery { target: "projects/work/keys/k_" }) or api::ChangeRows { };
+    std::test::assert_eq_int(count(underscore.rows), 0, label + ": `_` matches only itself");
+    let own = s.changes(api::ChangeQuery { target: "projects/work/keys/k_1" }) or api::ChangeRows { };
+    std::test::assert_eq_int(count(own.rows), 2, label + ": a key's own changes");
     let under = s.changes(api::ChangeQuery { target: "projects/work" }) or api::ChangeRows { };
     std::test::assert_eq_int(count(under.rows), 5, label + ": under a target");
 }
@@ -182,6 +191,17 @@ fn bounded(s: api::Store, label: String) {
 fn main() {
     std::test::assert_eq_str(api::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem, "", "a database URL");
     std::test::assert(len(api::parse_dsn("postgres://u:p@db:54x3/v").problem) > 0, "a port that is not one is refused, not read as 5432");
+    std::test::assert(!std::str::contains(api::parse_dsn("postgres://u:p@db:54x3/v").problem, "54x3"), "without quoting the URL");
+    let at = api::parse_dsn("postgres://voice:p@ss@db:5433/voice");
+    std::test::assert(at.host == "db" && at.port == 5433 && at.password == "p@ss" && at.user == "voice", "the credentials end at the last @");
+    let enc = api::parse_dsn("postgres://vo%69ce:p%40ss%2F1@db/my%20db?sslmode=disable");
+    std::test::assert(enc.user == "voice" && enc.password == "p@ss/1" && enc.database == "my db" && enc.sslmode == "disable" && enc.port == 5432, "and are percent-decoded");
+    std::test::assert(!std::str::contains(api::redact("auth failed for voice with p@ss", at), "p@ss"), "an error never quotes the password");
+    let failed = api::store_failed(api::StoreError { kind: "unavailable", message: "query_failed: duplicate key value violates unique constraint \"secret_idx\"" });
+    std::test::assert(failed.status == 500 && failed.code == "internal_error" && !std::str::contains(failed.message, "secret_idx"), "a store failure answers without what the store said: " + failed.message);
+    std::test::assert(std::str::contains(failed.message, "err_") && std::str::contains(failed.voice, "err_"), "and with an id the api's log has");
+    let metering = api::metering_failed(api::StoreError { kind: "unavailable", message: "query_failed: secret_idx" });
+    std::test::assert(metering.status == 503 && !std::str::contains(metering.message, "secret_idx"), "on the caller plane too");
     exercise(api::MemoryStore { }, "memory");
     bounded(api::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }

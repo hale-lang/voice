@@ -252,3 +252,9 @@ all have defaults requires nothing.
 checked with `hale api export --check`. Its fit to the contract is checked
 field by field instead of by linting (`spec/validate/bundle.mjs`), with
 each gap classed in `api/gaps.json`.
+
+## A bounded list can't be returned by value from a fn
+
+**hale 0.25.0.** `fn names() -> bounded[String; 4] { let mut r = Row { }; push(r.names, "a") or discard; return r.names; }` (with `type Row { names: bounded[String; 4]; }`) typechecks, then fails the build: "codegen error: unsupported in codegen v0: bounded[T; N] cannot be returned by value — it lives inline in its containing type".
+
+**Working shape:** a function returns a record that holds the list (`Names { items }`), and since 0.25.0 a caller assigns the field whole (`row.owners = names_of(x).items`).

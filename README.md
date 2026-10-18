@@ -151,7 +151,6 @@ refuse:
 | `optional` | hale-lang/hale#1600, optional fields: a `null` today rides as a flag (`priced`, `any`, `set_*`) or an empty value |
 | `enum` | hale's step 0, enums: an enum is a `String` today |
 | `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
-| `wrapper` | hale: a `bounded` field assigned whole; a list rides in a record (`Names { items }`) |
 | `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |

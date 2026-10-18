@@ -34,9 +34,9 @@ type SeatCreate {
     id: String;
     engine: String;
     account: String;
-    serves: st::SeatModels = st::SeatModels { };
+    serves: bounded[st::SeatModel; 16];
     // empty is the default, `[internal]`
-    data_classes: st::Names = st::Names { };
+    data_classes: bounded[String; 32];
     concurrency: Int = 1;
     enabled: Bool = true;
     config: String = "{}";
@@ -51,9 +51,9 @@ type SeatUpdate {
     set_account: Bool = false;
     account: String = "";
     set_serves: Bool = false;
-    serves: st::SeatModels = st::SeatModels { };
+    serves: bounded[st::SeatModel; 16];
     set_data_classes: Bool = false;
-    data_classes: st::Names = st::Names { };
+    data_classes: bounded[String; 32];
     set_concurrency: Bool = false;
     concurrency: Int = 1;
     set_enabled: Bool = false;
@@ -69,8 +69,8 @@ type SeatView {
     id: String = "";
     engine: String = "";
     account: String = "";
-    serves: st::SeatModels = st::SeatModels { };
-    data_classes: st::Names = st::Names { };
+    serves: bounded[st::SeatModel; 16];
+    data_classes: bounded[String; 32];
     concurrency: Int = 1;
     enabled: Bool = true;
     config: String = "{}";
@@ -79,7 +79,7 @@ type SeatView {
     // the node's reason, "" for `null`
     reason: String = "";
     in_flight: Int = 0;
-    problems: Problems = Problems { };
+    problems: bounded[String; 8];
 }
 
 type SeatViews { items: bounded[SeatView; 16]; }
@@ -105,7 +105,7 @@ type Node {
     assignment_version: Int = 0;
     // -1 for `null`
     applied_version: Int = -1;
-    seats: SeatViews = SeatViews { };
+    seats: bounded[SeatView; 16];
     connected: Bool = false;
     connected_at: Time = `1970-01-01T00:00:00Z`;
     beating: Bool = false;
@@ -273,7 +273,7 @@ locus Nodes {
         for s in seats.rows {
             if s.node == r.id {
                 let sv = seat_view(self.store, s, r) or raise;
-                push(v.seats.items, sv) or discard;
+                push(v.seats, sv) or discard;
             }
         }
         return v;
@@ -323,12 +323,12 @@ locus Seats {
             id: c.id,
             engine: c.engine,
             account: c.account,
-            serves: c.serves,
-            data_classes: c.data_classes,
             concurrency: c.concurrency,
             enabled: c.enabled,
             config: c.config
         };
+        row.serves.items = c.serves;
+        row.data_classes.items = c.data_classes;
         if count(row.data_classes.items) == 0 { push(row.data_classes.items, "internal") or discard; }
         self.check(row) or raise;
         let held = self.store.seats() or fail store_failed(err);
@@ -370,8 +370,8 @@ locus Seats {
         let before = seat_view(self.store, row, n) or raise;
         if u.set_engine { row.engine = u.engine; }
         if u.set_account { row.account = u.account; }
-        if u.set_serves { row.serves = u.serves; }
-        if u.set_data_classes { row.data_classes = u.data_classes; }
+        if u.set_serves { row.serves.items = u.serves; }
+        if u.set_data_classes { row.data_classes.items = u.data_classes; }
         if u.set_concurrency { row.concurrency = u.concurrency; }
         if u.set_enabled { row.enabled = u.enabled; }
         if u.set_config { row.config = u.config; }
@@ -437,12 +437,12 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatView falli
         id: s.id,
         engine: s.engine,
         account: s.account,
-        serves: s.serves,
-        data_classes: s.data_classes,
         concurrency: s.concurrency,
         enabled: s.enabled,
         config: s.config
     };
+    v.serves = s.serves.items;
+    v.data_classes = s.data_classes.items;
     let f = store.fleet(n.id) or fail store_failed(err);
     let status = node_status(store, n, now_seconds()) or raise;
     if status == "up" {
@@ -459,9 +459,9 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatView falli
         }
     }
     if n.revoked {
-        push(v.problems.items, "node " + n.id + " is revoked") or discard;
+        push(v.problems, "node " + n.id + " is revoked") or discard;
     } else if !f.present {
-        push(v.problems.items, "node " + n.id + " has not connected, so it has declared no engines to check engine " + s.engine + " against") or discard;
+        push(v.problems, "node " + n.id + " has not connected, so it has declared no engines to check engine " + s.engine + " against") or discard;
     } else {
         let engines = declared_engines(f.capabilities) or DeclaredEngines { };
         let mut offered = false;
@@ -469,21 +469,21 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatView falli
             if e.id == s.engine {
                 offered = true;
                 for field in e.required.items {
-                    if kind_of(s.config, field) == "missing" { push(v.problems.items, "config has no " + field + ", which engine " + s.engine + " requires") or discard; }
+                    if kind_of(s.config, field) == "missing" { push(v.problems, "config has no " + field + ", which engine " + s.engine + " requires") or discard; }
                 }
             }
         }
-        if !offered { push(v.problems.items, "node " + n.id + " does not offer engine " + s.engine) or discard; }
+        if !offered { push(v.problems, "node " + n.id + " does not offer engine " + s.engine) or discard; }
     }
     let a = store.account(s.account) or fail store_failed(err);
     if !a.present {
-        push(v.problems.items, "no account " + s.account) or discard;
+        push(v.problems, "no account " + s.account) or discard;
     } else if a.archived {
-        push(v.problems.items, "account " + s.account + " is archived") or discard;
+        push(v.problems, "account " + s.account + " is archived") or discard;
     }
     for m in s.serves.items {
         let row = store.model(m.model) or fail store_failed(err);
-        if !row.present || row.removed { push(v.problems.items, "model " + m.model + " is not in the catalog") or discard; }
+        if !row.present || row.removed { push(v.problems, "model " + m.model + " is not in the catalog") or discard; }
     }
     return v;
 }
@@ -562,23 +562,28 @@ fn read_node_update(body: String, node: String) -> NodeUpdate fallible(ApiError)
 fn read_seat_create(body: String, node: String) -> SeatCreate fallible(ApiError) {
     object_body(body) or raise;
     if kind_of(body, "serves") != "array" { fail invalid("`serves` is a required list of models", "serves"); }
-    return SeatCreate {
+    let serves = serves_field(body) or raise;
+    let data_classes = names_field(body, "data_classes") or raise;
+    let mut c = SeatCreate {
         node: node,
         id: required_string(body, "id") or raise,
         engine: required_string(body, "engine") or raise,
         account: required_string(body, "account") or raise,
-        serves: serves_field(body) or raise,
-        data_classes: names_field(body, "data_classes") or raise,
         concurrency: count_or(body, "concurrency", 1) or raise,
         enabled: bool_or(body, "enabled", true) or raise,
         config: config_field(body) or raise
     };
+    c.serves = serves.items;
+    c.data_classes = data_classes.items;
+    return c;
 }
 
 fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fallible(ApiError) {
     object_body(body) or raise;
     if sets(body, "id") { fail invalid("a seat's `id` cannot change", "id"); }
-    return SeatUpdate {
+    let serves = serves_field(body) or raise;
+    let data_classes = names_field(body, "data_classes") or raise;
+    let mut u = SeatUpdate {
         node: node,
         seat: seat,
         set_engine: sets(body, "engine"),
@@ -586,9 +591,7 @@ fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fall
         set_account: sets(body, "account"),
         account: string_or(body, "account", "") or raise,
         set_serves: sets(body, "serves"),
-        serves: serves_field(body) or raise,
         set_data_classes: sets(body, "data_classes"),
-        data_classes: names_field(body, "data_classes") or raise,
         set_concurrency: sets(body, "concurrency"),
         concurrency: count_or(body, "concurrency", 1) or raise,
         set_enabled: sets(body, "enabled"),
@@ -596,11 +599,14 @@ fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fall
         set_config: sets(body, "config"),
         config: config_field(body) or raise
     };
+    u.serves = serves.items;
+    u.data_classes = data_classes.items;
+    return u;
 }
 
 fn seat_json(s: SeatView) -> String {
     let problems_list = st::JsonList { };
-    for p in s.problems.items {
+    for p in s.problems {
         problems_list.add(jq(p));
     }
     let problems = problems_list.text();
@@ -622,7 +628,7 @@ fn seat_list_json(l: SeatList) -> String {
 /// `Node`, or `NodeWithToken` when it carries its token.
 fn node_json(n: Node) -> String {
     let seats_list = st::JsonList { };
-    for s in n.seats.items {
+    for s in n.seats {
         seats_list.add(seat_json(s));
     }
     let seats = seats_list.text();

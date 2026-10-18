@@ -110,7 +110,9 @@ const NOT_COMPARED = {
 
 // Fields of a row's request that are the path's or the query's.
 const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'include_archived']);
-// Records that stand for a list: the list rides in `items`.
+// Records that stand for a list: the list rides in `items`. A row's list
+// is a `bounded` field of its own; these are left only inside a record
+// that stands for a value or null (`Restriction.names`).
 const WRAPPERS = new Set(['Names', 'Limits', 'SeatModels', 'SeatViews', 'ModelIds', 'AppliedLimits', 'Problems', 'Attempts', 'AssignedSeats', 'SeatStateList']);
 // Records that stand for a value or null.
 const NULLABLES = new Set(['Restriction', 'MaybeBudget']);

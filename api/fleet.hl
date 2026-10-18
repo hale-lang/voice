@@ -13,8 +13,8 @@ type AssignedSeat {
     id: String = "";
     engine: String = "";
     account: String = "";
-    serves: st::SeatModels = st::SeatModels { };
-    data_classes: st::Names = st::Names { };
+    serves: bounded[st::SeatModel; 16];
+    data_classes: bounded[String; 32];
     concurrency: Int = 1;
     enabled: Bool = true;
     // the engine's JSON object, as text
@@ -24,7 +24,7 @@ type AssignedSeat {
 type AssignedSeats { items: bounded[AssignedSeat; 16]; }
 
 /// `Assignment`: the node's whole desired state.
-type Assignment { version: Int = 0; max_in_flight: Int = 1; seats: AssignedSeats = AssignedSeats { }; }
+type Assignment { version: Int = 0; max_in_flight: Int = 1; seats: bounded[AssignedSeat; 16]; }
 
 /// `Registration`. `capabilities` and `local` are the node's JSON objects.
 type Registration { protocol: Int = 0; version: String = ""; capabilities: String = ""; local: String = ""; }
@@ -44,11 +44,11 @@ type SeatState { id: String = ""; status: String = ""; reason: String = ""; in_f
 type SeatStateList { items: bounded[SeatState; 16]; }
 
 /// `SeatStates`.
-type SeatStates { assignment_version: Int = 0; seats: SeatStateList = SeatStateList { }; }
+type SeatStates { assignment_version: Int = 0; seats: bounded[SeatState; 16]; }
 
 /// `Heartbeat`. `assignment_version` is the version the node has applied,
 /// -1 when it does not say.
-type Heartbeat { in_flight: Int = 0; seats: SeatStateList = SeatStateList { }; assignment_version: Int = -1; }
+type Heartbeat { in_flight: Int = 0; seats: bounded[SeatState; 16]; assignment_version: Int = -1; }
 
 /// A JSON object the node reports whole: its `Capabilities` or its
 /// `LocalControls`.
@@ -199,11 +199,11 @@ locus NodePlane {
     /// The states of the seats configured on the node. A state for a seat
     /// that is not (one deleted while the node still runs it, or an id the
     /// node made up) is refused: no row is kept for it.
-    fn put_states(node: String, seats: SeatStateList) -> Bool fallible(ApiError) {
-        for st in seats.items {
+    fn put_states(node: String, seats: bounded[SeatState; 16]) -> Bool fallible(ApiError) {
+        for st in seats {
             if !is_seat_status(st.status) { fail invalid("a seat's status is starting, up, down, disabled, paused or refused", "seats"); }
         }
-        for st in seats.items {
+        for st in seats {
             let configured = self.store.seat(node, st.id) or fail store_failed(err);
             if !configured.present { continue; }
             let row = st::SeatStateRow { ref: node + "/" + st.id, node: node, seat: st.id, status: st.status, reason: st.reason, in_flight: st.in_flight };
@@ -232,7 +232,10 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> Assignment fallible(ApiErr
     let seats = store.seats() or fail store_failed(err);
     for s in seats.rows {
         if s.node == n.id {
-            push(out.seats.items, AssignedSeat { id: s.id, engine: s.engine, account: s.account, serves: s.serves, data_classes: s.data_classes, concurrency: s.concurrency, enabled: s.enabled, config: s.config }) or discard;
+            let mut a = AssignedSeat { id: s.id, engine: s.engine, account: s.account, concurrency: s.concurrency, enabled: s.enabled, config: s.config };
+            a.serves = s.serves.items;
+            a.data_classes = s.data_classes.items;
+            push(out.seats, a) or discard;
         }
     }
     return out;
@@ -289,7 +292,7 @@ fn locally_paused(local: String, seat: String) -> Bool {
     if len(local) == 0 { return false; }
     if std::json::find_bool_field(local, "paused") { return true; }
     let held = names_of(std::json::find_field_raw(local, "paused_seats"), "paused_seats") or st::Names { };
-    return has_name(held, seat);
+    return has_name(held.items, seat);
 }
 
 /// The node's effective cap: the smallest of its declared, the
@@ -343,12 +346,18 @@ fn read_registration(body: String) -> Registration fallible(ApiError) {
 fn read_heartbeat(body: String) -> Heartbeat fallible(ApiError) {
     object_body(body) or raise;
     let applied = if kind_of(body, "assignment_version") == "missing" { -1 } else { required_amount(body, "assignment_version") or raise };
-    return Heartbeat { in_flight: required_amount(body, "in_flight") or raise, seats: seat_state_list(body, "seats") or raise, assignment_version: applied };
+    let seats = seat_state_list(body, "seats") or raise;
+    let mut h = Heartbeat { in_flight: required_amount(body, "in_flight") or raise, assignment_version: applied };
+    h.seats = seats.items;
+    return h;
 }
 
 fn read_seat_states(body: String) -> SeatStates fallible(ApiError) {
     object_body(body) or raise;
-    return SeatStates { assignment_version: required_amount(body, "assignment_version") or raise, seats: seat_state_list(body, "seats") or raise };
+    let seats = seat_state_list(body, "seats") or raise;
+    let mut s = SeatStates { assignment_version: required_amount(body, "assignment_version") or raise };
+    s.seats = seats.items;
+    return s;
 }
 
 fn read_node_report(body: String) -> NodeReport fallible(ApiError) {
@@ -404,7 +413,7 @@ fn assigned_seat_json(s: AssignedSeat) -> String {
 
 fn assignment_json(a: Assignment) -> String {
     let seats_list = st::JsonList { };
-    for s in a.seats.items {
+    for s in a.seats {
         seats_list.add(assigned_seat_json(s));
     }
     let seats = seats_list.text();

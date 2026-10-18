@@ -44,10 +44,10 @@ if [ -n "${DATABASE_URL:-}" ]; then
   api/api migrate --database "$DATABASE_URL" --migrations store/migrations
   store=(--database "$DATABASE_URL")
 fi
-# a seat has 20 s to its first output (120 s by default), then may be silent
+# a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
-api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 20 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
+api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 
@@ -121,6 +121,27 @@ r = json.load(sys.stdin)
 assert r["status"] == "completed" and r["voice"]["served"]["seat"] == "laptop/static", r
 ' || { echo "a seat 12 s to its first output was not waited for: $late"; exit 1; }
 echo "a seat 12 s to its first output, past the 10 s idle span, served in $ms ms"
+
+# a caller that leaves while its seat is quiet is found at the next
+# keep-alive (15 s after the stream's last event): the empty comment a second
+# after it is the write that fails, since a closed caller takes the first and
+# answers it with a reset. That is before the first-output span (30 s) ends:
+# the seat is cancelled, and /healthz, waiting behind the stream, answers by
+# then
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never sent", "first_output_ms": 60000}}' >/dev/null
+wait_for up
+curl -s -N --max-time 2 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/quiet.sse" || true
+t0=$(date +%s%N)
+grep -q '^event: response.created' "$work/quiet.sse" || { echo "the quiet seat's stream did not open: $(head -c 300 "$work/quiet.sse")"; exit 1; }
+health_s=$(curl -fsS -o /dev/null -w '%{time_total}' --max-time 40 "$api/healthz")
+for i in $(seq 1 300); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+stopped_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$stopped_ms" -lt 20000 ] || { echo "the quiet seat served on $stopped_ms ms after its caller left: the keep-alive did not find it gone"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 20 else 1)' "$health_s" || { echo "/healthz waited $health_s s behind a caller that left a quiet seat"; exit 1; }
+echo "a caller that left a quiet seat after 2 s: found by its keep-alive, the seat stopped within $stopped_ms ms, /healthz answered in $health_s s"
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 

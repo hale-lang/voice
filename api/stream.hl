@@ -26,8 +26,11 @@
 // while a seat that accepted is waited for, the api sends an SSE comment
 // (`: keep-alive`), opening the stream if no event has, so a proxy does not
 // cut a quiet connection. A caller that goes away is found by the write that
-// fails, an event's or a keep-alive's, so within 15 s; the stream ends then,
-// and the seat is sent `cancel`.
+// fails, an event's or a keep-alive's. The first write after a caller closes
+// is taken, and only answered with a reset, so a keep-alive is followed a
+// second later by an empty comment (`:`), the write that fails: a caller gone
+// during a quiet gap is found within about 16 s. The stream ends then, and
+// the seat is sent `cancel`.
 
 /// The caller's end of a stream. It opens its writer at the first event or
 /// keep-alive, so nothing is sent while seats are still refusing. In process (a
@@ -46,6 +49,8 @@ locus EventStream {
         // monotonic ns of the last thing sent (before the first, of the
         // stream's start)
         sent_ns: Int = 0;
+        // monotonic ns of the comment due after a keep-alive (0: none)
+        probe_ns: Int = 0;
         // the last response object an event carried, and the text sent so
         // far: what a `response.failed` carries
         snapshot: String = "";
@@ -72,17 +77,27 @@ locus EventStream {
     }
 
     /// An SSE comment when nothing was sent for `every`, opening the stream
-    /// if nothing has, so an idle connection is not cut. A write that fails
-    /// marks the caller `gone`.
+    /// if nothing has, so an idle connection is not cut; on a connection, an
+    /// empty comment a second after it. A write that fails marks the caller
+    /// `gone`: a caller that closed takes the first write after it and
+    /// answers it with a reset, so it is the second that fails.
     fn keep_alive(every: Duration) {
-        if self.gone || std::time::monotonic_ns() - self.sent_ns < every / 1ns { return; }
+        if self.gone { return; }
+        let now = std::time::monotonic_ns();
+        if self.probe_ns > 0 && now >= self.probe_ns {
+            self.probe_ns = 0;
+            self.w.body.chunk(":\n\n") or { self.gone = true; };
+            return;
+        }
+        if now - self.sent_ns < every / 1ns { return; }
         self.open();
-        self.sent_ns = std::time::monotonic_ns();
+        self.sent_ns = now;
         if self.conn_fd < 0 {
             self.kept.append_str(": keep-alive\n\n");
             return;
         }
         self.w.body.chunk(": keep-alive\n\n") or { self.gone = true; };
+        self.probe_ns = now + 1000000000;
     }
 
     /// What a seat's events said: the last response object, and the text.

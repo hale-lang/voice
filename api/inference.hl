@@ -14,19 +14,9 @@
 // The api serves its callers in turn, one request at a time: a request
 // holds the api until its seat answers.
 //
-// A streamed request is refused `400 unsupported`: `std::http::Server`
-// cannot stream a response body in hale 0.24.0.
-// TODO(stdlib chunked transfer + SSE writer): serve `stream: true` as the
-// standard event stream once std::http::Server's response path has chunked
-// transfer encoding and an SSE writer over it (hale's streaming item, ruled
-// 2026-10-17); tests/inference_test.hl's `streamed_with_sse` is the test to
-// switch on.
-//
-// TODO(std::http::Server body cap): the server answers a body over 1 MiB
-// itself, `413` in plain text, before this handler runs; the contract allows
-// 12 MiB and answers `413` as an `ErrorResponse` (`TooLarge`). Set the cap
-// to 12 MiB, and answer past it as the contract says, once the server takes
-// a body limit (FRICTION.md).
+// With `"stream": true` the answer is the standard event stream, sent as
+// it comes (stream.hl). A request body is at most 12 MiB, and a larger one
+// is answered `413 request_too_large` by the Server (main.hl).
 
 /// An inference request: what admission reads, and `body`, the standard
 /// request a node is sent (a Chat Completions request converted).
@@ -129,7 +119,7 @@ locus Inference {
             n = n + 1;
             let reply_to = "voice.reply." + request_id + "." + to_string(n);
             let t0 = std::time::monotonic_ns();
-            let o = self.link.serve(c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.wait);
+            let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.wait);
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
                 push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
@@ -145,12 +135,89 @@ locus Inference {
         fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts) };
     }
 
+    /// A streamed answer (stream.hl): admitted as any request, then
+    /// offered seat by seat, each event sent to `out` as it comes. Until a
+    /// seat accepts and sends its first event nothing is sent, so a request
+    /// every seat refuses is answered whole, as a `502`.
+    fn stream(r: InferenceRequest, ctx: std::api::Context, out: EventStream) -> std::http::Response fallible(ApiError) {
+        let started = std::time::monotonic_ns();
+        let candidates = self.admit(r, ctx) or raise;
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        let m = self.store.model(r.model) or fail metering_failed(err);
+        let id_hex = random_hex(12) or fail entropy_failed(err.message);
+        let request_id = "resp_" + id_hex;
+        out.headers = "X-Request-Id: " + request_id;
+        let mut st = StreamState { endpoint: r.endpoint, request_id: request_id, model: r.model, created: std::time::unix(now_seconds()) };
+        let mut attempts = Attempts { };
+        // attempts already told the caller (`voice:attempt`)
+        let mut told = 0;
+        let mut why = "";
+        let mut n = 0;
+        for c in candidates.items {
+            n = n + 1;
+            let reply_to = "voice.reply." + request_id + "." + to_string(n);
+            let t0 = std::time::monotonic_ns();
+            let mut o = self.link.offer(c.seat.node, reply_to, serve_message(request_id, reply_to, c, r));
+            let mut ending = "";
+            if o.ack == "accepted" {
+                st.output = false;
+                let deadline = std::time::monotonic() + self.wait;
+                let mut done = false;
+                while !done && std::time::monotonic() < deadline {
+                    let msg = self.link.next(1s);
+                    if msg.kind == "event" {
+                        o = take_event(o, msg.json);
+                        if terminal(std::json::find_string_field(msg.json, "type")) {
+                            ending = msg.json;
+                        } else {
+                            while told < count(attempts.items) {
+                                let a = at(attempts.items, told) or Attempt { };
+                                st = attempt_event(out, st, a, c.seat.ref);
+                                told = told + 1;
+                            }
+                            st = forward(out, st, msg.json);
+                        }
+                    } else if msg.kind == "result" {
+                        o = take_result(o, msg.json);
+                        done = true;
+                    } else if msg.kind == "lost" {
+                        done = true;
+                    }
+                }
+                self.link.finish();
+            }
+            let ms = (std::time::monotonic_ns() - t0) / 1000000;
+            if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
+                while told < count(attempts.items) {
+                    let a = at(attempts.items, told) or Attempt { };
+                    st = attempt_event(out, st, a, c.seat.ref);
+                    told = told + 1;
+                }
+                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
+                finish_stream(out, st, ending, served(request_id, r.model, k, m, c, o, attempts, (std::time::monotonic_ns() - started) / 1000000));
+                return out.end();
+            }
+            let reason = failure_of(o);
+            why = c.seat.ref + ": " + reason;
+            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "failed", error: reason, wall_ms: ms }) or discard;
+            if st.output || o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
+                if out.opened {
+                    fail_stream(out, st, "upstream_failed", "seat " + why);
+                    return out.end();
+                }
+                fail ApiError { status: 502, kind: "model_error", code: "upstream_failed", message: "seat " + why, voice: attempts_voice(request_id, attempts) };
+            }
+        }
+        if out.opened {
+            fail_stream(out, st, "upstream_failed", "every eligible seat failed; the last, " + why);
+            return out.end();
+        }
+        fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts) };
+    }
+
     /// Admit `r` for the caller `ctx` names: the seats it may be offered,
     /// or the refusal.
     fn admit(r: InferenceRequest, ctx: std::api::Context) -> Candidates fallible(ApiError) {
-        if r.stream {
-            fail unsupported("`stream: true` is not served yet: this api cannot stream a response body; ask without `stream`", "stream");
-        }
         if len(r.previous_response_id) > 0 {
             fail ApiError { status: 400, kind: "invalid_request", code: "previous_response_not_found", message: "responses are not stored, so no previous response can be continued", param: "previous_response_id" };
         }

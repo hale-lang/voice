@@ -135,19 +135,6 @@ the date first (the month 1 to 12, the day within the month, leap years
 counted) and takes an offset off by hand, with exactly two digits for its
 hours and its minutes.
 
-## `std::http::Server` refuses a body over 1 MiB before the handler sees it
-
-**hale 0.24.0.** A request whose body is over 1 MiB is answered by the
-server itself: `413 Content Too Large`, `Content-Type: text/plain`, body
-`payload too large`. The handler never runs, so the answer is neither the
-contract's limit (a request body may be up to 12 MiB) nor its shape (an
-`ErrorResponse` with `code`). The cap is not a knob of `std::http::Server`.
-
-**Working shape:** none in voice; the contract stays at 12 MiB and the
-JSON error. A request between 1 and 12 MiB (a long conversation, an
-attached file) is refused with plain text until the server's cap can be
-set (`TODO` in `api/inference.hl`, a line in the README).
-
 ## A NATS client held for the api's life grows with every served request
 
 **hale 0.24.0, pond `realtime/nats` at `697852f`.** The api first held one
@@ -253,15 +240,15 @@ method name, as `draining` and `drain` are.
 
 ## `hale api export`'s OpenAPI form does not lint
 
-**hale 0.24.0.** The exported `Voice.openapi.json` fails `redocly lint`
-with ten errors. Nine are component names: a type from an imported seed is
-named by its alias (`st::Names`), and `::` is not allowed in an OpenAPI
-component key. The tenth is the missing `servers`. Every field of a row
-that has a default is optional in the export, so a type whose fields all
-have defaults requires nothing.
+**hale 0.24.0; narrowed in 0.25.0.** The exported `Voice.openapi.json`
+failed `redocly lint` with ten errors: nine component names (a type from an
+imported seed was named by its alias, `st::Names`, and `::` is not allowed
+in an OpenAPI component key) and the missing `servers`. hale 0.25.0 names
+imported types plainly, so one error is left: no `servers`. Every field of
+a row that has a default is optional in the export, so a type whose fields
+all have defaults requires nothing.
 
 **Working shape:** the bundle is committed as exported, and its drift is
 checked with `hale api export --check`. Its fit to the contract is checked
 field by field instead of by linting (`spec/validate/bundle.mjs`), with
-each gap classed in `api/gaps.json`; the `name` gaps wait on stable
-names for imported types.
+each gap classed in `api/gaps.json`.

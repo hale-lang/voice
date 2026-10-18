@@ -33,7 +33,7 @@ trap cleanup EXIT
 
 if [ -z "${NATS_URL:-}" ]; then
   container="voice-e2e-nats-$$"
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" nats:2.11-alpine >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 fi
 for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NATS_URL##*:}") 2>/dev/null && break; sleep 0.2; done
@@ -71,6 +71,17 @@ wait_for up
 echo "laptop/static is up"
 
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
+(cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
+
+# a body over 12 MiB is answered 413 in the contract's envelope, unread;
+# one just under it is served (deploy/nats/nats.conf allows 16 MiB)
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (11 * 1024 * 1024)}))' >"$work/near.json"
+big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json")
+case "$big" in *'"code": "request_too_large"'*413) echo "a 13 MiB body is refused 413 request_too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
+near=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json")
+[ "$near" = "200" ] || { echo "an 11 MiB body was answered $near"; exit 1; }
+echo "an 11 MiB body is served, through a 16 MiB NATS message"
 
 # a local pause only restricts: the seat is held, and nothing serves
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "max_in_flight": null, "reason": "e2e"}' >/dev/null
@@ -163,7 +174,7 @@ responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key"
 if [ -n "$container" ]; then
   docker rm -f "$container" >/dev/null
   curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "after the blip"}}' >/dev/null
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" nats:2.11-alpine >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   t0=$(date +%s)
   for i in $(seq 1 100); do
     out=$(responds)

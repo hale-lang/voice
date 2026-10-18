@@ -25,7 +25,6 @@ const WAITS_ON = {
   optional: 'hale-lang/hale#1600: optional fields (a value or null)',
   enum: 'hale step 0: enums',
   map: 'hale step 0: maps, as bounded[S; N] indexed_by <field>',
-  name: 'hale: stable, valid schema names for imported types (st::X is no OpenAPI component name)',
   wrapper: 'hale: a bounded field assigned whole (FRICTION.md); the list rides in a record',
   'json-text': 'voice: a structured object carried as JSON text, typed once it may be null (#1600)',
   path: 'voice: a path or query parameter carried in the row\'s request',
@@ -54,10 +53,10 @@ const MAP = {
   KeyUpdate: 'KeyUpdate',
   KeyList: 'GET /admin/v1/projects/{project}/keys',
   Budget: 'Budget',
-  'st::BudgetSet': 'BudgetSet',
+  'BudgetSet': 'BudgetSet',
   LimitSet: 'LimitSet',
-  'st::Limit': 'Limit',
-  'st::ModelPrice': 'ModelPrice',
+  'Limit': 'Limit',
+  'ModelPrice': 'ModelPrice',
   Account: 'Account',
   AccountCreate: 'AccountCreate',
   AccountUpdate: 'AccountUpdate',
@@ -70,7 +69,7 @@ const MAP = {
   SeatCreate: 'Seat',
   SeatUpdate: 'SeatUpdate',
   SeatList: 'GET /admin/v1/nodes/{node}/seats',
-  'st::SeatModel': 'SeatModel',
+  'SeatModel': 'SeatModel',
   Change: 'Change',
   ChangeList: 'GET /admin/v1/changes',
   Attempt: 'Attempt',
@@ -104,7 +103,7 @@ const NOT_COMPARED = {
   SeatRef: ['the path parameters `node` and `seat`; no body', ['node', 'seat']],
   AccountQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
-  'st::ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
+  'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
   NodeReport: ['one row for two bodies, the node\'s `Capabilities` (PUT /node/v1/capabilities) and `LocalControls` (PUT /node/v1/local), each carried whole as JSON text and checked by the reader (api/fleet.hl)', ['json']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
@@ -112,9 +111,9 @@ const NOT_COMPARED = {
 // Fields of a row's request that are the path's or the query's.
 const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'include_archived']);
 // Records that stand for a list: the list rides in `items`.
-const WRAPPERS = new Set(['st::Names', 'st::Limits', 'st::SeatModels', 'SeatViews', 'ModelIds', 'AppliedLimits', 'Problems', 'Attempts', 'AssignedSeats', 'SeatStateList']);
+const WRAPPERS = new Set(['Names', 'Limits', 'SeatModels', 'SeatViews', 'ModelIds', 'AppliedLimits', 'Problems', 'Attempts', 'AssignedSeats', 'SeatStateList']);
 // Records that stand for a value or null.
-const NULLABLES = new Set(['st::Restriction', 'MaybeBudget']);
+const NULLABLES = new Set(['Restriction', 'MaybeBudget']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;
@@ -138,9 +137,11 @@ function cflat(s) {
   if (!s) return { s: {}, nullable: false };
   let nullable = false;
   if (Array.isArray(s.type) && s.type.includes('null')) { nullable = true; s = { ...s, type: s.type.filter(t => t !== 'null')[0] }; }
-  if (s.oneOf) {
-    const rest = s.oneOf.filter(o => o.type !== 'null');
-    if (rest.length < s.oneOf.length) nullable = true;
+  // `oneOf` or `anyOf` of one shape and `null` is that shape, nullable
+  for (const key of ['oneOf', 'anyOf']) {
+    if (!s[key]) continue;
+    const rest = s[key].filter(o => o.type !== 'null');
+    if (rest.length < s[key].length) nullable = true;
     if (rest.length === 1) { const r = cflat(rest[0]); return { s: r.s, nullable: nullable || r.nullable }; }
   }
   if (s.allOf) {
@@ -247,7 +248,6 @@ const RULES = [
   [/(VoiceExtension|Served\.voice)\.(wall_ms|timing)$/, 'wire', 'the timing is an object of wall, queue and load on the wire'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
   [/^Capabilities\.(project_id|project_name|key_id|key_name|project|key)$/, 'wire', 'the project and the key are objects of id and name on the wire'],
-  [/^InferenceRequest\.(model|previous_response_id)$/, 'open', 'the standard\'s `anyOf` of a string and `null`; the row reads a string, and the reader takes `null` and absent alike (no model named is refused, no previous response is none)', 'open'],
   [/^ApiError\.(kind|type)$/, 'wire', 'the row\'s `kind` is the envelope\'s `type`, renamed by the wire (error_json)'],
   [/^ApiError\.status$/, 'wire', 'the HTTP status the error answers with, not a field of the envelope'],
   [/^BudgetRequest\.(set|allowance_micros|currency|period|period_anchor)$/, 'wire', 'the body is the BudgetSet, which the row carries under `set`'],
@@ -266,6 +266,8 @@ function reclass(at, kind) {
     for (const [re, k, why, only] of RULES) if (only === 'open' && re.test(at)) return { kind: k, why };
     return { kind };
   }
+  // a value or null is the optional gap wherever it is
+  if (kind === 'optional') return { kind };
   for (const [re, why] of WHOLE) if (re.test(at)) return { kind: 'wire', why };
   if (!RULED.has(kind)) return { kind };
   for (const [re, k, why, only] of RULES) if ((!only || only === kind) && re.test(at)) return { kind: k, why };

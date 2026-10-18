@@ -16,6 +16,12 @@ locus Nodes {
         // a node that goes silent after its first text delta, as one killed
         // mid-answer does
         dying: String = "";
+        // a node quiet for `slow_waits` waits before its first output, as
+        // a slow model or an engine that answers at the end is
+        slow: String = "";
+        slow_waits: Int = 0;
+        // a node that accepts and then sends nothing at all
+        mute: String = "";
         tool: String = "";
         // offers finished before their result came (the link sends cancel)
         cancelled: Int = 0;
@@ -27,6 +33,8 @@ locus Nodes {
         at: Int = 0;
         result: String = "";
         ended: Bool = true;
+        // quiet waits left before the open offer's first output
+        hold: Int = 0;
     }
     fn place() -> String { return "nats://nats.test:4222"; }
     fn assign(node: String, body: String) -> Bool { return true; }
@@ -38,6 +46,12 @@ locus Nodes {
         let id = std::json::find_string_field(body, "request_id");
         self.at = 0;
         self.ended = false;
+        self.hold = if to == self.slow { self.slow_waits } else { 0 };
+        if to == self.mute {
+            self.script = "";
+            self.result = "";
+            return api::ServeOutcome { ack: "accepted" };
+        }
         if to == self.failing {
             self.script = "";
             self.result = "{\"type\": \"result\", \"request_id\": \"" + id + "\", \"outcome\": \"failed\", \"error\": {\"code\": \"engine_failed\", \"message\": \"the engine exited\", \"retryable\": true}}";
@@ -64,6 +78,11 @@ locus Nodes {
             let rest = self.script[self.at..len(self.script)];
             let nl = std::str::index_of(rest, "\n");
             let line = if nl < 0 { rest } else { rest[0..nl] };
+            if self.hold > 0 && std::str::contains(line, "\"type\":\"response.output_text.delta\"") {
+                self.hold = self.hold - 1;
+                std::time::sleep(wait);
+                return api::LinkMsg { kind: "none" };
+            }
             self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
             if !std::str::starts_with(line, "pause ") && len(line) > 0 { return api::LinkMsg { kind: "event", json: line }; }
         }
@@ -137,6 +156,49 @@ fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes) {
     let gone = e.inference.stream(req, ctx, api::EventStream { gone: true }) or std::http::Response { status: 0, body: "" };
     std::test::assert(std::str::starts_with(gone.body, "event: response.created") && !std::str::contains(gone.body, "response.in_progress"), "a gone caller is sent nothing more");
     std::test::assert_eq_int(nodes.cancelled, before + 1, "and its seat is cancelled");
+    e.inference.idle = 30s;
+    e.inference.keep_alive = 15s;
+}
+
+/// A seat has the first-output span to its first output, then the idle
+/// span between events; a stream a seat that accepted keeps quiet is opened
+/// by its keep-alive, which finds a caller that has gone.
+fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes) {
+    e.inference.first = 6s;
+    e.inference.idle = 1s;
+    e.inference.keep_alive = 1s;
+    nodes.slow = "laptop";
+    nodes.slow_waits = 3;
+    let r = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    std::test::assert(std::str::contains(r.body, "\n: keep-alive\n") && std::str::contains(r.body, "event: response.completed\n"), "a seat quiet 3 s before its first output, past the idle span, is waited for: " + r.body);
+    let whole = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    expect(whole, 200, "and an unstreamed answer too");
+    nodes.slow = "";
+
+    e.inference.first = 2s;
+    nodes.mute = "laptop";
+    let m = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    std::test::assert_eq_int(m.status, 200, "a seat that accepts and stays quiet: " + m.body);
+    std::test::assert(std::str::starts_with(m.body, ": keep-alive\n\n"), "its stream opened by a keep-alive");
+    std::test::assert(std::str::contains(m.body, "event: error\n") && std::str::contains(m.body, "no output within the first-output span"), "failed at the first-output span");
+    std::test::assert(std::str::contains(m.body, "event: response.failed\ndata: {\"type\": \"response.failed\", \"response\": {\"id\": \"resp_") && std::str::contains(m.body, "\"attempts\": [{\"seat\": \"laptop/static\""), "with a response.failed carrying voice, though no seat sent a response");
+    std::test::assert(std::str::ends_with(std::str::trim(m.body), "data: [DONE]"), "then [DONE]");
+    let quiet = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    expect(quiet, 502, "unstreamed, the same seat fails at the first-output span");
+
+    // the caller went away while the seat was quiet: found at the next
+    // keep-alive, not at the first-output span
+    let before = nodes.cancelled;
+    e.inference.first = 30s;
+    let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
+    let req = api::read_inference("{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}", "responses") or api::InferenceRequest { };
+    let t0 = std::time::monotonic();
+    let gone = e.inference.stream(req, ctx, api::EventStream { gone: true }) or std::http::Response { status: 0, body: "" };
+    std::test::assert(std::time::monotonic() - t0 < 5s, "a caller gone during a quiet gap ends the wait");
+    std::test::assert(!std::str::contains(gone.body, "event: "), "and is sent nothing");
+    std::test::assert_eq_int(nodes.cancelled, before + 1, "its seat cancelled");
+    nodes.mute = "";
+    e.inference.first = 120s;
     e.inference.idle = 30s;
     e.inference.keep_alive = 15s;
 }
@@ -250,6 +312,7 @@ fn main() {
 
     streamed_with_sse(e, key, nodes);
     streamed_failures(e, key, nodes);
+    first_output_span(e, key, nodes);
 
     // a seat that refuses: the request moves to another
     let desktop = bring_up(e, "desktop");

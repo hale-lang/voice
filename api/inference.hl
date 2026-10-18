@@ -88,8 +88,10 @@ locus Inference {
     params {
         store: st::Store;
         link: Link;
-        // how long a seat may go without sending anything before it has
-        // failed: a wait between events, not for the whole answer
+        // how long a seat may take to its first output (a slow model, or an
+        // engine that answers at the end), then how long it may go without
+        // sending anything: waits between events, not for the whole answer
+        first: Duration = 120s;
         idle: Duration = 30s;
         // how often an open stream that is waiting gets a keep-alive comment
         keep_alive: Duration = 15s;
@@ -123,7 +125,7 @@ locus Inference {
             n = n + 1;
             let reply_to = "voice.reply." + request_id + "." + to_string(n);
             let t0 = std::time::monotonic_ns();
-            let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.idle);
+            let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.first, self.idle);
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
                 push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
@@ -141,8 +143,9 @@ locus Inference {
 
     /// A streamed answer (stream.hl): admitted as any request, then
     /// offered seat by seat, each event sent to `out` as it comes. Until a
-    /// seat accepts and sends its first event nothing is sent, so a request
-    /// every seat refuses is answered whole, as a `502`.
+    /// seat sends its first event, or one that accepted stays quiet for the
+    /// keep-alive span, nothing is sent, so a request every seat refuses is
+    /// answered whole, as a `502`.
     fn stream(r: InferenceRequest, ctx: std::api::Context, out: EventStream) -> std::http::Response fallible(ApiError) {
         let started = std::time::monotonic_ns();
         let candidates = self.admit(r, ctx) or raise;
@@ -151,6 +154,8 @@ locus Inference {
         let id_hex = random_hex(12) or fail entropy_failed(err.message);
         let request_id = "resp_" + id_hex;
         out.headers = "X-Request-Id: " + request_id;
+        // the keep-alive span runs from here until something is sent
+        out.sent_ns = std::time::monotonic_ns();
         let mut st = StreamState { endpoint: r.endpoint, request_id: request_id, model: r.model, created: std::time::unix(now_seconds()) };
         let mut attempts = Attempts { };
         // attempts already told the caller (`voice:attempt`)
@@ -165,12 +170,12 @@ locus Inference {
             let mut ending = "";
             if o.ack == "accepted" {
                 st.output = false;
-                // the seat has `idle` from its last message to its next
-                let mut deadline = std::time::monotonic() + self.idle;
+                // the seat has `first` from one message to the next until
+                // its first output, then `idle`
+                let mut deadline = std::time::monotonic() + self.first;
                 let mut done = false;
                 while !done && std::time::monotonic() < deadline {
                     let msg = self.link.next(1s);
-                    if msg.kind == "event" || msg.kind == "result" { deadline = std::time::monotonic() + self.idle; }
                     if msg.kind == "event" {
                         o = take_event(o, msg.json);
                         if terminal(std::json::find_string_field(msg.json, "type")) {
@@ -189,8 +194,11 @@ locus Inference {
                     } else if msg.kind == "lost" {
                         done = true;
                     } else {
+                        // a quiet gap: a comment, which opens the stream if
+                        // nothing has, and finds a caller that has gone
                         out.keep_alive(self.keep_alive);
                     }
+                    if msg.kind == "event" || msg.kind == "result" { deadline = std::time::monotonic() + (if o.output { self.idle } else { self.first }); }
                     if out.gone {
                         // the caller went away: the seat is told to stop
                         self.link.finish();
@@ -291,7 +299,7 @@ fn failure_of(o: ServeOutcome) -> String {
     if o.ack == "refused" { return "refused: " + o.reason; }
     if o.ack != "accepted" { return o.ack + ": " + o.reason; }
     if o.outcome == "failed" { return "failed (" + o.error_code + "): " + o.error_message; }
-    if o.outcome == "unfinished" { return "the seat sent nothing within the idle span"; }
+    if o.outcome == "unfinished" { return if o.output { "the seat sent nothing within the idle span" } else { "the seat sent no output within the first-output span" }; }
     return o.outcome;
 }
 

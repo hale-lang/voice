@@ -82,14 +82,19 @@ event stream, a `voice:attempt` event before the next seat's first when a
 seat fails before output, the terminal event with `voice`, then `data:
 [DONE]`; `/v1/chat/completions` sends `chat.completion.chunk`s, the last
 with `usage` and `voice`, then `data: [DONE]`. The stream opens at the
-first event a seat sends, so a request every seat refuses is still answered
-whole. A seat that fails once the stream has begun ends it with the
-evidence: an `error` event and `response.failed` carrying the response so
-far with `voice`, or a last chunk finished `error` with an `error` object
-and `voice`; a truncated answer never ends as a complete one. A seat is
-waited for between events (30 s, `--seat-idle-s`), and a waiting stream
-gets an SSE comment every 15 s; a caller that goes away ends the stream at
-once and its seat is sent `cancel`. A request body is at most 2 MiB for
+first event a seat sends, or at the first keep-alive (below), so a request
+every seat refuses is still answered whole. A seat that fails once the
+stream has begun ends it with the evidence: an `error` event and
+`response.failed` carrying the response so far with `voice`, or a last
+chunk finished `error` with an `error` object and `voice`; a truncated
+answer never ends as a complete one. A seat is waited for between messages,
+not for the whole answer: 120 s until its first output (`--seat-first-s`; a
+slow model, or an engine that answers at the end), then 30 s between events
+(`--seat-idle-s`). While a seat that accepted is waited for, the stream gets
+an SSE comment (`: keep-alive`) whenever 15 s pass with nothing sent, so a
+proxy does not cut it. A caller that goes away is found by the next write
+that fails, an event's or a keep-alive's, so within 15 s even while the seat
+is quiet: the stream ends there and the seat is sent `cancel`. A request body is at most 2 MiB for
 now (the contract's 12 MiB returns once hale's Server reads a body in linear
 memory; FRICTION.md); a larger one is answered `413 request_too_large` in
 the contract's envelope before it is read, and a chunked one (hale's Server reads `Content-Length`

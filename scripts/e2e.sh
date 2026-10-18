@@ -44,9 +44,10 @@ if [ -n "${DATABASE_URL:-}" ]; then
   api/api migrate --database "$DATABASE_URL" --migrations store/migrations
   store=(--database "$DATABASE_URL")
 fi
-# a seat silent for 10 s has failed (30 s by default), so the steps that kill
-# a node mid-stream end in seconds
-api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
+# a seat has 20 s to its first output (120 s by default), then may be silent
+# 10 s (30 s by default), so the steps that kill a node mid-stream end in
+# seconds
+api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 20 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 
@@ -104,6 +105,22 @@ stopped_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 [ "$stopped_ms" -lt 2000 ] || { echo "the seat served on $stopped_ms ms after its caller left"; cat "$work/node.log"; exit 1; }
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)' "$health_ms" || { echo "/healthz waited $health_ms s behind a caller that left"; exit 1; }
 echo "a caller that left after 2 s of a 20 s stream: the seat stopped within $stopped_ms ms, /healthz answered in $health_ms s"
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+wait_for up
+
+# a seat slower to its first output than the idle span is waited for: it has
+# the first-output span until then
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "slow to start", "first_output_ms": 12000}}' >/dev/null
+wait_for up
+t0=$(date +%s%N)
+late=$(curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true)
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+echo "$late" | python3 -c '
+import json, sys
+r = json.load(sys.stdin)
+assert r["status"] == "completed" and r["voice"]["served"]["seat"] == "laptop/static", r
+' || { echo "a seat 12 s to its first output was not waited for: $late"; exit 1; }
+echo "a seat 12 s to its first output, past the 10 s idle span, served in $ms ms"
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 

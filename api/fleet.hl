@@ -39,7 +39,7 @@ type Registered {
 }
 
 /// `SeatState`. `reason` "" is `null`.
-type SeatState { id: String = ""; status: String = ""; reason: String = ""; in_flight: Int = 0; }
+type SeatState { id: String = ""; status: SeatStateStatus; reason: String = ""; in_flight: Int = 0; }
 
 type SeatStateList { items: bounded[SeatState; 16]; }
 
@@ -81,7 +81,7 @@ locus NodeBearer {
         let nodes = self.store.nodes() or fail store_failed(err);
         for n in nodes.rows {
             if n.token_digest == digest {
-                if n.revoked { fail ApiError { status: 403, kind: "permission_error", code: "invalid_key", message: "node " + n.id + " is revoked" }; }
+                if n.revoked { fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::invalid_key, message: "node " + n.id + " is revoked" }; }
                 let who = std::api::Principal { mode: "bearer", name: n.id, via: "http" };
                 return std::api::Context { caller: who, role: "node", via: "http" };
             }
@@ -91,7 +91,7 @@ locus NodeBearer {
 }
 
 fn node_token_refused() -> ApiError {
-    return ApiError { status: 401, kind: "authentication_error", code: "invalid_key", message: "a valid enrollment token is required: Authorization: Bearer vn-..." };
+    return ApiError { status: 401, kind: "authentication_error", code: ErrorCode::invalid_key, message: "a valid enrollment token is required: Authorization: Bearer vn-..." };
 }
 
 locus NodePlane {
@@ -201,12 +201,9 @@ locus NodePlane {
     /// node made up) is refused: no row is kept for it.
     fn put_states(node: String, seats: bounded[SeatState; 16]) -> Bool fallible(ApiError) {
         for st in seats {
-            if !is_seat_status(st.status) { fail invalid("a seat's status is starting, up, down, disabled, paused or refused", "seats"); }
-        }
-        for st in seats {
             let configured = self.store.seat(node, st.id) or fail store_failed(err);
             if !configured.present { continue; }
-            let row = st::SeatStateRow { ref: node + "/" + st.id, node: node, seat: st.id, status: st.status, reason: st.reason, in_flight: st.in_flight };
+            let row = st::SeatStateRow { ref: node + "/" + st.id, node: node, seat: st.id, status: seat_state_name(st.status), reason: st.reason, in_flight: st.in_flight };
             self.store.put_seat_state(row) or fail store_failed(err);
         }
         return true;
@@ -318,9 +315,11 @@ fn seat_state_list(body: String, name: String) -> SeatStateList fallible(ApiErro
     while !it.done {
         let e = std::str::trim(it.element);
         if !std::json::valid_object(e) { fail invalid("a seat state is an object", name); }
+        let status = required_string(e, "status") or raise;
+        if !is_seat_status(status) { fail invalid("a seat's status is starting, up, down, disabled, paused or refused", name); }
         let st = SeatState {
             id: required_string(e, "id") or raise,
-            status: required_string(e, "status") or raise,
+            status: seat_state_of(status),
             reason: nullable_string(e, "reason") or raise,
             in_flight: required_amount(e, "in_flight") or raise
         };

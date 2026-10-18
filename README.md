@@ -141,15 +141,16 @@ inside a mapped one, or listed as not compared with why (path and query
 records, hale's own refusal, the node's whole-body report), and holds no
 field its reason does not name; a scalar of another type, a narrowing (an
 enum on a plain string, an integer where the contract says number), a
-field the row requires and the contract does not, and enum values that
-differ are never classed away; and
+field a request row requires and the contract does not, and enum values
+that differ are never classed away (a field an answer always sends is
+what the contract allows; a row's optional field, a presence pair, may
+be left out or `null` where the contract's may be left out); and
 `spec/validate/negative/` (`npm run bundle-negative`) holds changes it must
 refuse:
 
 | Kind | Closed by |
 |---|---|
 | `optional` | hale-lang/hale#1600, optional fields: a `null` today rides as a flag (`priced`, `any`, `set_*`) or an empty value |
-| `enum` | hale's step 0, enums: an enum is a `String` today |
 | `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
 | `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
 | `path` | voice: a path or query parameter carried in the row's request |

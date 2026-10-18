@@ -11,7 +11,9 @@
 // a contract shape with no single type is a gap of its own (`open`); a
 // scalar of another type is classed only by a reviewed rule; enum values
 // are compared when both sides have them; and `required` is checked both
-// ways.
+// ways (a field an answer requires is one voice always sends). A row's
+// optional field (a presence pair, `anyOf` of its schema and null) is the
+// contract's nullable field, or one it may leave out.
 //
 //   usage: node bundle.mjs <bundled-contract.json> <Voice.openapi.json> <gaps.json> [--write]
 import fs from 'fs';
@@ -116,6 +118,10 @@ const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'i
 const WRAPPERS = new Set(['Names', 'Limits', 'SeatModels', 'SeatViews', 'ModelIds', 'AppliedLimits', 'Problems', 'Attempts', 'AssignedSeats', 'SeatStateList']);
 // Records that stand for a value or null.
 const NULLABLES = new Set(['Restriction', 'MaybeBudget']);
+// Rows only voice writes: answers. A field such a row requires and the
+// contract does not is one voice always sends, which the contract allows;
+// on a request it would be one the row refuses to go without.
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'Served', 'Registered', 'Assignment', 'AssignedSeat', 'ApiError']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;
@@ -159,8 +165,21 @@ function cflat(s) {
 }
 const ctype = s => s.type || (s.properties ? 'object' : s.items ? 'array' : undefined);
 
-function compare(at, c, b) {
+// A row's optional field (a presence pair): its value's schema, or null.
+function bflat(b) {
+  const s = b && b.$ref ? b : b || {};
+  if (Array.isArray(s.anyOf)) {
+    const rest = s.anyOf.filter(o => o.type !== 'null');
+    if (rest.length === 1 && rest.length < s.anyOf.length) return { b: rest[0], nullable: true };
+  }
+  return { b, nullable: false };
+}
+
+function compare(at, c, bIn) {
   const { s: cs, nullable } = cflat(c);
+  // a row's field may be left out or null when the contract's may not be
+  // null: absence is what the contract allows there, and a null reads as it
+  const { b, nullable: bnullable } = bflat(bIn);
   const name = bname(b);
   if (name) reached.add(name);
   if (NULLABLES.has(name)) { gap(at, 'optional'); return; }
@@ -169,7 +188,7 @@ function compare(at, c, b) {
     return;
   }
   const bs = bresolve(b);
-  if (nullable) gap(at, 'optional');
+  if (nullable && !bnullable) gap(at, 'optional');
   const ct = ctype(cs), bt = bs.type;
   if (cs.enum && bs.enum) {
     const a = [...cs.enum].sort().join(','), z = [...bs.enum].sort().join(',');
@@ -203,7 +222,7 @@ function fields(at, cs, bs) {
       if (creq.has(k) && !breq.has(k)) gap(`${at}.${k} (required)`, 'required');
       // a field the row requires and the contract does not: the row
       // would refuse what the contract allows
-      if (breq.has(k) && !creq.has(k)) gap(`${at}.${k} (required by the row)`, 'over-required');
+      if (breq.has(k) && !creq.has(k) && !ANSWERS.has(at.split(/[.[ ]/)[0])) gap(`${at}.${k} (required by the row)`, 'over-required');
       compare(`${at}.${k}`, cp[k], bp[k]);
     }
   }

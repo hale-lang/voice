@@ -24,11 +24,11 @@ locus Catalog {
     /// `createCatalogModel`.
     fn create(m: CatalogModelCreate) -> CatalogModel fallible(ApiError) {
         if len(m.id) == 0 || len(m.id) > 128 { fail invalid("`id` is 1 to 128 characters", "id"); }
-        check_model_fields(m.kind, m.context_length, m.max_output_tokens) or raise;
+        check_model_fields(m.context_length, m.max_output_tokens) or raise;
         let row = st::ModelRow {
             id: m.id,
             owned_by: if len(m.owned_by) > 0 { m.owned_by } else { "local" },
-            kind: m.kind,
+            kind: if m.has_kind { model_kind_name(m.kind) } else { "local" },
             context_length: m.context_length,
             max_output_tokens: m.max_output_tokens,
             priced: m.priced,
@@ -63,14 +63,14 @@ locus Catalog {
         let mut row = self.live(u.model) or raise;
         let before = self.view(row) or raise;
         if u.set_owned_by { row.owned_by = u.owned_by; }
-        if u.set_kind { row.kind = u.kind; }
+        if u.has_kind { row.kind = model_kind_name(u.kind); }
         if u.set_context_length { row.context_length = u.context_length; }
         if u.set_max_output_tokens { row.max_output_tokens = u.max_output_tokens; }
         if u.set_price {
             row.priced = u.priced;
             row.price = u.price;
         }
-        check_model_fields(row.kind, row.context_length, row.max_output_tokens) or raise;
+        check_model_fields(row.context_length, row.max_output_tokens) or raise;
         let after = self.view(row) or raise;
         self.store.update_model(row, change("update", "models/" + row.id, catalog_model_json(before), catalog_model_json(after))) or fail store_failed(err);
         return after;
@@ -145,7 +145,7 @@ locus Models {
         let p = self.store.project(k.project) or fail metering_failed(err);
         let row = self.store.model(r.model) or fail metering_failed(err);
         if !row.present || row.removed || !visible(p, k, r.model) {
-            fail ApiError { status: 404, kind: "not_found", code: "model_not_found", message: "no model " + r.model, param: "model" };
+            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model, param: "model" };
         }
         return model_with_seats(self.store, row) or raise;
     }
@@ -211,8 +211,7 @@ fn has_name(ns: bounded[String; 32], name: String) -> Bool {
     return false;
 }
 
-fn check_model_fields(kind: String, context_length: Int, max_output_tokens: Int) -> Bool fallible(ApiError) {
-    if kind != "local" && kind != "hosted" { fail invalid("`kind` is local or hosted", "kind"); }
+fn check_model_fields(context_length: Int, max_output_tokens: Int) -> Bool fallible(ApiError) {
     if context_length < 0 { fail invalid("`context_length` is at least 1", "context_length"); }
     if max_output_tokens < 0 { fail invalid("`max_output_tokens` is at least 1", "max_output_tokens"); }
     return true;
@@ -223,7 +222,7 @@ fn catalog_view(r: st::ModelRow) -> CatalogModel {
     return CatalogModel {
         id: r.id,
         owned_by: r.owned_by,
-        kind: r.kind,
+        kind: model_kind_of(r.kind),
         context_length: r.context_length,
         max_output_tokens: r.max_output_tokens,
         priced: r.priced,
@@ -250,23 +249,23 @@ fn model_view(r: st::ModelRow) -> Model {
 // ---- errors ----------------------------------------------------------
 
 fn invalid(message: String, param: String) -> ApiError {
-    return ApiError { status: 400, kind: "invalid_request", code: "invalid_request", message: message, param: param };
+    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::invalid_request, message: message, param: param };
 }
 
 fn unsupported(message: String, param: String) -> ApiError {
-    return ApiError { status: 400, kind: "invalid_request", code: "unsupported", message: message, param: param };
+    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::unsupported, message: message, param: param };
 }
 
 fn not_found(message: String) -> ApiError {
-    return ApiError { status: 404, kind: "not_found", code: "not_found", message: message };
+    return ApiError { status: 404, kind: "not_found", code: ErrorCode::not_found, message: message };
 }
 
 fn conflict(message: String) -> ApiError {
-    return ApiError { status: 409, kind: "invalid_request", code: "conflict", message: message };
+    return ApiError { status: 409, kind: "invalid_request", code: ErrorCode::conflict, message: message };
 }
 
 fn invalid_key() -> ApiError {
-    return ApiError { status: 401, kind: "authentication_error", code: "invalid_key", message: "a valid project key is required: Authorization: Bearer vk-..." };
+    return ApiError { status: 401, kind: "authentication_error", code: ErrorCode::invalid_key, message: "a valid project key is required: Authorization: Bearer vk-..." };
 }
 
 /// A store that could not answer an admin request. A full list is the
@@ -274,14 +273,14 @@ fn invalid_key() -> ApiError {
 fn store_failed(e: st::StoreError) -> ApiError {
     if e.kind == "full" { return invalid(e.message, ""); }
     let id = store_incident(e);
-    return ApiError { status: 500, kind: "server_error", code: "internal_error", message: "the store could not complete the request (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
+    return ApiError { status: 500, kind: "server_error", code: ErrorCode::internal_error, message: "the store could not complete the request (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
 }
 
 /// The caller plane's store failure: nothing is served while the store
 /// cannot record usage.
 fn metering_failed(e: st::StoreError) -> ApiError {
     let id = store_incident(e);
-    return ApiError { status: 503, kind: "server_error", code: "metering_unavailable", message: "the store is unavailable; nothing is served until it is back (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
+    return ApiError { status: 503, kind: "server_error", code: ErrorCode::metering_unavailable, message: "the store is unavailable; nothing is served until it is back (" + id + ")", voice: "{\"request_id\": " + jq(id) + "}" };
 }
 
 /// A store failure, on the api's stderr with an id the answer quotes. What

@@ -270,3 +270,16 @@ each gap classed in `api/gaps.json`.
 **hale 0.25.0.** The connection loop (`__http_handle_one_conn`, io_tcp_serve.hl) grows the request with `raw = raw + chunk` per 8 KiB `recv`, and every prefix stays until the connection is served. A handler that only answers `len(req.body)` peaks at 74 MB for a 1 MiB body, 274 MB for 2 MiB, 1.07 GB for 4 MiB and 4.2 GB for 8 MiB; an 11 MiB body took the api to 7.7 GB, before its handler ran (so before any key is checked). It stayed hidden under the 1 MiB default cap; `max_request_bytes` at the contract's 12 MiB makes a 12 MiB body cost about 9.5 GB.
 
 **Resolved in hale 0.25.1** (hale-lang/hale#1628): the Server reads a body in linear memory, about 75 MB of peak for 12 MiB. The api's cap is back at the contract's 12 MiB; a request just under it peaks the api at about 160 MB, streamed about 210 MB, and e2e holds them under 200 and 256 MB. Until then the cap was 2 MiB (about 274 MB worst case), still answered `413 request_too_large` in the contract's envelope.
+
+## An enum field's literal default is described as optional, but the codec requires the field
+
+**hale 0.25.1.** With `type Scope = enum { project, key };` and `type L { scope: Scope = Scope::key; }`, `hale api export` leaves `scope` out of `L`'s `required`, but `L::api_decode("{}")` refuses the payload with `missing_field`. That matches the spec: an enum field has no default the codec reads (spec/api.md, Codecs). The description and the codec disagree, and a client built from the description would leave the field out.
+
+**Working shape:** an enum field the contract requires has no declaration default (`Limit.scope`, `Key.status`, `Attempt.outcome`, ...), so the description lists it as required, as the codec reads it. An enum the contract leaves optional is a presence pair (`has_billing` with `billing`), and its handler reads `has_billing` rather than the field's zero, which the codec makes the first variant.
+
+## A record literal in a field default is not checked for a field with no default
+
+**hale 0.25.1.** `type Row { budget: BudgetSet = BudgetSet { }; }`, where `BudgetSet` has a field with no default (here an enum, `period: Period;`), passes `hale check`; the build then fails: "codegen error: unsupported in codegen v0: type `st::BudgetSet` literal missing field `period`". The same literal in a function body is refused by the checker ("missing field `period`").
+
+**Working shape:** a field default names every field without a default (`BudgetSet { period: Period::month }`).
+

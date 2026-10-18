@@ -46,7 +46,7 @@ type ServedBy {
 }
 
 /// `Attempt`. `error` "" when it served.
-type Attempt { seat: String = ""; account: String = ""; outcome: String = ""; error: String = ""; wall_ms: Int = 0; }
+type Attempt { seat: String = ""; account: String = ""; outcome: AttemptOutcome; error: String = ""; wall_ms: Int = 0; }
 
 type Attempts { items: bounded[Attempt; 8]; }
 
@@ -128,17 +128,17 @@ locus Inference {
             let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.first, self.idle);
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
-                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
+                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::served, wall_ms: ms }) or discard;
                 return served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000);
             }
             let reason = failure_of(o);
             why = c.seat.ref + ": " + reason;
-            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "failed", error: reason, wall_ms: ms }) or discard;
+            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::failed, error: reason, wall_ms: ms }) or discard;
             if o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
-                fail ApiError { status: 502, kind: "model_error", code: "upstream_failed", message: "seat " + why, voice: attempts_voice(request_id, attempts.items) };
+                fail ApiError { status: 502, kind: "model_error", code: ErrorCode::upstream_failed, message: "seat " + why, voice: attempts_voice(request_id, attempts.items) };
             }
         }
-        fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts.items) };
+        fail ApiError { status: 502, kind: "server_error", code: ErrorCode::upstream_failed, message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts.items) };
     }
 
     /// A streamed answer (stream.hl): admitted as any request, then
@@ -182,7 +182,7 @@ locus Inference {
                             ending = msg.json;
                         } else {
                             while told < count(attempts.items) {
-                                let a = at(attempts.items, told) or Attempt { };
+                                let a = at(attempts.items, told) or Attempt { outcome: AttemptOutcome::failed };
                                 st = attempt_event(out, st, a, c.seat.ref);
                                 told = told + 1;
                             }
@@ -210,23 +210,23 @@ locus Inference {
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
                 while told < count(attempts.items) {
-                    let a = at(attempts.items, told) or Attempt { };
+                    let a = at(attempts.items, told) or Attempt { outcome: AttemptOutcome::failed };
                     st = attempt_event(out, st, a, c.seat.ref);
                     told = told + 1;
                 }
-                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
+                push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::served, wall_ms: ms }) or discard;
                 finish_stream(out, st, ending, served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000));
                 return out.end();
             }
             let reason = failure_of(o);
             why = c.seat.ref + ": " + reason;
-            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "failed", error: reason, wall_ms: ms }) or discard;
+            push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::failed, error: reason, wall_ms: ms }) or discard;
             if st.output || o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
                 if out.opened {
                     fail_stream(out, st, "upstream_failed", "seat " + why, failed_voice(request_id, k, m, c, attempts.items, (std::time::monotonic_ns() - started) / 1000000));
                     return out.end();
                 }
-                fail ApiError { status: 502, kind: "model_error", code: "upstream_failed", message: "seat " + why, voice: attempts_voice(request_id, attempts.items) };
+                fail ApiError { status: 502, kind: "model_error", code: ErrorCode::upstream_failed, message: "seat " + why, voice: attempts_voice(request_id, attempts.items) };
             }
         }
         if out.opened {
@@ -234,33 +234,33 @@ locus Inference {
             fail_stream(out, st, "upstream_failed", "every eligible seat failed; the last, " + why, failed_voice(request_id, k, m, last, attempts.items, (std::time::monotonic_ns() - started) / 1000000));
             return out.end();
         }
-        fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts.items) };
+        fail ApiError { status: 502, kind: "server_error", code: ErrorCode::upstream_failed, message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts.items) };
     }
 
     /// Admit `r` for the caller `ctx` names: the seats it may be offered,
     /// or the refusal.
     fn admit(r: InferenceRequest, ctx: std::api::Context) -> Candidates fallible(ApiError) {
         if len(r.previous_response_id) > 0 {
-            fail ApiError { status: 400, kind: "invalid_request", code: "previous_response_not_found", message: "responses are not stored, so no previous response can be continued", param: "previous_response_id" };
+            fail ApiError { status: 400, kind: "invalid_request", code: ErrorCode::previous_response_not_found, message: "responses are not stored, so no previous response can be continued", param: "previous_response_id" };
         }
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         if !k.present { fail invalid_key(); }
         let p = self.store.project(k.project) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
         if !m.present || m.removed {
-            fail ApiError { status: 404, kind: "not_found", code: "model_not_found", message: "no model " + r.model + " in the catalog", param: "model" };
+            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model + " in the catalog", param: "model" };
         }
         if !visible(p, k, r.model) {
-            fail ApiError { status: 403, kind: "permission_error", code: "model_not_permitted", message: "this key may not use model " + r.model, param: "model" };
+            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::model_not_permitted, message: "this key may not use model " + r.model, param: "model" };
         }
         if len(r.account) > 0 {
             let a = self.store.account(r.account) or fail metering_failed(err);
             if !a.present || a.archived || !allows(p.accounts, r.account) || !allows(k.accounts, r.account) {
-                fail ApiError { status: 403, kind: "permission_error", code: "account_not_permitted", message: "this key may not spend account " + r.account, param: "voice.account" };
+                fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::account_not_permitted, message: "this key may not spend account " + r.account, param: "voice.account" };
             }
         }
         if !has_name(p.data_classes.items, r.data_class) {
-            fail ApiError { status: 403, kind: "permission_error", code: "data_class_refused", message: "project " + p.id + " may not send data of class " + r.data_class, param: "voice.data_class" };
+            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::data_class_refused, message: "project " + p.id + " may not send data of class " + r.data_class, param: "voice.data_class" };
         }
 
         let seats = self.store.seats() or fail metering_failed(err);
@@ -276,7 +276,7 @@ locus Inference {
         }
         if count(out.items) == 0 {
             let why = if out.serving == 0 { "no seat serves model " + r.model } else { to_string(out.serving) + " seat(s) serve model " + r.model + ", none up on a node that is up, with an account this key may spend and data class " + r.data_class };
-            fail ApiError { status: 503, kind: "server_error", code: "no_eligible_seat", message: why };
+            fail ApiError { status: 503, kind: "server_error", code: ErrorCode::no_eligible_seat, message: why };
         }
         return out;
     }
@@ -587,7 +587,7 @@ fn read_inference(body: String, endpoint: String) -> InferenceRequest fallible(A
 fn attempts_json(attempts: bounded[Attempt; 8]) -> String {
     let attempts_list = st::JsonList { };
     for a in attempts {
-        let mut one = "{\"seat\": " + jq(a.seat) + ", \"account\": " + jq(a.account) + ", \"outcome\": " + jq(a.outcome);
+        let mut one = "{\"seat\": " + jq(a.seat) + ", \"account\": " + jq(a.account) + ", \"outcome\": " + jq(outcome_name(a.outcome));
         if len(a.error) > 0 { one = one + ", \"error\": " + jq(a.error); }
         attempts_list.add(one + ", \"wall_ms\": " + to_string(a.wall_ms) + "}");
     }

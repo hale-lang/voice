@@ -7,7 +7,7 @@
 /// `Budget`: the allowance in its current window. `window_end` is `null`
 /// (`ends` false) for a lifetime cap.
 type Budget {
-    set: st::BudgetSet = st::BudgetSet { };
+    set: st::BudgetSet = st::BudgetSet { period: st::Period::month };
     spent_micros: Int = 0;
     reserved_micros: Int = 0;
     remaining_micros: Int = 0;
@@ -20,7 +20,7 @@ type Budget {
 type MaybeBudget { present: Bool = false; budget: Budget = Budget { }; }
 
 /// `PUT .../budget` for the project the path names.
-type BudgetRequest { project: String; set: st::BudgetSet = st::BudgetSet { }; anchored: Bool = false; }
+type BudgetRequest { project: String; set: st::BudgetSet = st::BudgetSet { period: st::Period::month }; anchored: Bool = false; }
 
 /// `LimitSet`, for the project the path names.
 type LimitsRequest { project: String; limits: bounded[st::Limit; 16]; }
@@ -34,13 +34,14 @@ type LimitSet { limits: bounded[st::Limit; 16]; }
 /// its scope needs.
 fn check_limits(ls: bounded[st::Limit; 16], scopes: String, field: String) -> Bool fallible(ApiError) {
     for l in ls {
-        if !std::str::contains("," + scopes + ",", "," + l.scope + ",") {
-            fail invalid("`" + field + "` holds limits of scope " + scopes + ", not " + l.scope, field);
+        let scope = st::scope_name(l.scope);
+        if !std::str::contains("," + scopes + ",", "," + scope + ",") {
+            fail invalid("`" + field + "` holds limits of scope " + scopes + ", not " + scope, field);
         }
-        if l.scope == "model" && len(l.model) == 0 { fail invalid("a model limit names its `model`", field); }
-        if l.scope != "model" && len(l.model) > 0 { fail invalid("only a model limit names a `model`", field); }
-        if l.scope == "account" && len(l.account) == 0 { fail invalid("an account limit names its `account`", field); }
-        if l.scope != "account" && len(l.account) > 0 { fail invalid("only an account limit names an `account`", field); }
+        if scope == "model" && len(l.model) == 0 { fail invalid("a model limit names its `model`", field); }
+        if scope != "model" && len(l.model) > 0 { fail invalid("only a model limit names a `model`", field); }
+        if scope == "account" && len(l.account) == 0 { fail invalid("an account limit names its `account`", field); }
+        if scope != "account" && len(l.account) > 0 { fail invalid("only an account limit names an `account`", field); }
         if l.window_seconds < 1 { fail invalid("`window_seconds` is at least 1", field); }
     }
     return true;
@@ -60,23 +61,20 @@ fn own_account_limits(ls: bounded[st::Limit; 16], account: String) -> st::Limits
 
 fn check_budget(b: st::BudgetSet) -> Bool fallible(ApiError) {
     if b.allowance_micros < 0 { fail invalid("`allowance_micros` is at least 0", "allowance_micros"); }
-    if b.period != "day" && b.period != "week" && b.period != "month" && b.period != "none" {
-        fail invalid("`period` is day, week, month or none", "period");
-    }
     return true;
 }
 
 /// When periods count from by default: the start of the current UTC
 /// calendar period (a week starts on Monday). A lifetime cap counts from now.
-fn period_start(period: String, now: Time) -> Time {
+fn period_start(period: st::Period, now: Time) -> Time {
     let day = std::time::time_from_unix((std::time::unix(now) / 86400) * 86400);
-    if period == "day" { return day; }
-    if period == "week" {
+    if period == st::Period::day { return day; }
+    if period == st::Period::week {
         // 1970-01-01 was a Thursday: three days after a Monday
         let days = std::time::unix(day) / 86400;
         return std::time::time_from_unix((days - (days + 3) % 7) * 86400);
     }
-    if period == "month" {
+    if period == st::Period::month {
         let text = std::time::iso8601(now);
         return std::time::parse_time(text[0..8] + "01T00:00:00Z") or day;
     }
@@ -122,9 +120,9 @@ fn budget_view(b: st::BudgetSet, now: Time) -> Budget {
     let anchor = std::time::unix(b.period_anchor);
     let at = std::time::unix(now);
     let mut out = Budget { set: b, remaining_micros: b.allowance_micros, window_start: b.period_anchor };
-    if b.period == "none" { return out; }
-    if b.period == "day" || b.period == "week" {
-        let span = if b.period == "day" { 86400 } else { 7 * 86400 };
+    if b.period == st::Period::none { return out; }
+    if b.period == st::Period::day || b.period == st::Period::week {
+        let span = if b.period == st::Period::day { 86400 } else { 7 * 86400 };
         let start = if at < anchor { anchor } else { anchor + ((at - anchor) / span) * span };
         out.window_start = std::time::time_from_unix(start);
         out.ends = true;
@@ -162,11 +160,12 @@ fn nullable_count(obj: String, name: String) -> Int fallible(ApiError) {
 fn read_limit(obj: String) -> st::Limit fallible(ApiError) {
     if !std::json::valid_object(obj) { fail invalid("a limit is an object", "limits"); }
     let scope = required_string(obj, "scope") or raise;
+    if scope != "project" && scope != "key" && scope != "model" && scope != "account" { fail invalid("a limit's `scope` is project, key, model or account", "limits"); }
     let raw = std::str::trim(std::json::find_field_raw(obj, "window_seconds"));
     if kind_of(obj, "window_seconds") != "number" || !is_integer(raw) { fail invalid("a limit's `window_seconds` is a required integer", "window_seconds"); }
     let window = std::str::parse_int(raw) or fail invalid("a limit's `window_seconds` is out of range", "window_seconds");
     return st::Limit {
-        scope: scope,
+        scope: st::scope_of(scope),
         model: string_or(obj, "model", "") or raise,
         account: string_or(obj, "account", "") or raise,
         window_seconds: window,
@@ -196,12 +195,14 @@ fn limits_field(body: String, name: String) -> st::Limits fallible(ApiError) {
 fn read_budget_set(obj: String) -> BudgetRequest fallible(ApiError) {
     if !std::json::valid_object(obj) { fail invalid("a budget is an object", "budget"); }
     let anchored = sets(obj, "period_anchor");
+    let period = required_string(obj, "period") or raise;
+    if period != "day" && period != "week" && period != "month" && period != "none" { fail invalid("`period` is day, week, month or none", "period"); }
     return BudgetRequest {
         project: "",
         set: st::BudgetSet {
             allowance_micros: required_amount(obj, "allowance_micros") or raise,
             currency: string_or(obj, "currency", "USD") or raise,
-            period: required_string(obj, "period") or raise,
+            period: st::period_of(period),
             period_anchor: if anchored { time_field(obj, "period_anchor") or raise } else { `1970-01-01T00:00:00Z` }
         },
         anchored: anchored
@@ -230,7 +231,7 @@ fn jnullable(n: Int) -> String {
 }
 
 fn limit_json(l: st::Limit) -> String {
-    let mut out = "{\"scope\": " + jq(l.scope);
+    let mut out = "{\"scope\": " + jq(st::scope_name(l.scope));
     if len(l.model) > 0 { out = out + ", \"model\": " + jq(l.model); }
     if len(l.account) > 0 { out = out + ", \"account\": " + jq(l.account); }
     return out + ", \"window_seconds\": " + to_string(l.window_seconds) + ", \"requests\": " + jnullable(l.requests)
@@ -248,12 +249,12 @@ fn limits_json(ls: bounded[st::Limit; 16]) -> String {
 }
 
 fn budget_set_json(b: st::BudgetSet) -> String {
-    return "{\"allowance_micros\": " + to_string(b.allowance_micros) + ", \"currency\": " + jq(b.currency) + ", \"period\": " + jq(b.period)
+    return "{\"allowance_micros\": " + to_string(b.allowance_micros) + ", \"currency\": " + jq(b.currency) + ", \"period\": " + jq(st::period_name(b.period))
         + ", \"period_anchor\": " + jtime(b.period_anchor) + "}";
 }
 
 fn budget_json(b: Budget) -> String {
-    return "{\"allowance_micros\": " + to_string(b.set.allowance_micros) + ", \"currency\": " + jq(b.set.currency) + ", \"period\": " + jq(b.set.period)
+    return "{\"allowance_micros\": " + to_string(b.set.allowance_micros) + ", \"currency\": " + jq(b.set.currency) + ", \"period\": " + jq(st::period_name(b.set.period))
         + ", \"period_anchor\": " + jtime(b.set.period_anchor) + ", \"spent_micros\": " + to_string(b.spent_micros)
         + ", \"reserved_micros\": " + to_string(b.reserved_micros) + ", \"remaining_micros\": " + to_string(b.remaining_micros)
         + ", \"window_start\": " + jtime(b.window_start) + ", \"window_end\": " + jtime_or_null(b.ends, b.window_end) + "}";

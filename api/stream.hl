@@ -20,14 +20,17 @@
 // `voice`. Either way `data: [DONE]` follows, and a truncated answer never
 // ends as a complete one does.
 //
-// A seat is waited for between events, not for the whole answer: one that
-// sends nothing for the idle span (30 s) has failed. While waiting on an open
-// stream the api sends an SSE comment (`: keep-alive`) every 15 s, so a proxy
-// does not cut a quiet connection. A caller that goes away ends the stream at
-// once, and the seat is sent `cancel`.
+// A seat is waited for between events, not for the whole answer: it has the
+// first-output span (120 s) from one message to the next until its first
+// output, then the idle span (30 s). Whenever nothing has been sent for 15 s
+// while a seat that accepted is waited for, the api sends an SSE comment
+// (`: keep-alive`), opening the stream if no event has, so a proxy does not
+// cut a quiet connection. A caller that goes away is found by the write that
+// fails, an event's or a keep-alive's, so within 15 s; the stream ends then,
+// and the seat is sent `cancel`.
 
-/// The caller's end of a stream. It opens its writer at the first event,
-/// so nothing is sent while seats are still refusing. In process (a
+/// The caller's end of a stream. It opens its writer at the first event or
+/// keep-alive, so nothing is sent while seats are still refusing. In process (a
 /// request with no connection, `conn_fd` -1, as the tests hand it) the
 /// events are kept and answered as the body.
 locus EventStream {
@@ -40,7 +43,8 @@ locus EventStream {
         gone: Bool = false;
         w: std::http::SseWriter = std::http::SseWriter { conn_fd: -1 };
         kept: std::bytes::BytesBuilder = std::bytes::BytesBuilder { initial_cap: 4096 };
-        // monotonic ns of the last thing sent
+        // monotonic ns of the last thing sent (before the first, of the
+        // stream's start)
         sent_ns: Int = 0;
         // the last response object an event carried, and the text sent so
         // far: what a `response.failed` carries
@@ -48,12 +52,16 @@ locus EventStream {
         text: std::bytes::BytesBuilder = std::bytes::BytesBuilder { initial_cap: 1024 };
     }
 
+    /// The stream's head, once.
+    fn open() {
+        if self.opened { return; }
+        self.opened = true;
+        if self.conn_fd >= 0 { self.w = std::http::SseWriter { conn_fd: self.conn_fd, headers: self.headers }; }
+    }
+
     /// One event: `name` "" for an unnamed one (`data:` alone).
     fn send(name: String, data: String) {
-        if !self.opened {
-            self.opened = true;
-            if self.conn_fd >= 0 { self.w = std::http::SseWriter { conn_fd: self.conn_fd, headers: self.headers }; }
-        }
+        self.open();
         self.sent_ns = std::time::monotonic_ns();
         if self.conn_fd < 0 {
             self.kept.append_str((if len(name) > 0 { "event: " + name + "\n" } else { "" }) + "data: " + data + "\n\n");
@@ -63,10 +71,12 @@ locus EventStream {
         self.w.event(std::http::SseEvent { event: name, data: data }) or { self.gone = true; };
     }
 
-    /// An SSE comment when nothing was sent for `every`, on an open stream,
-    /// so an idle connection is not cut.
+    /// An SSE comment when nothing was sent for `every`, opening the stream
+    /// if nothing has, so an idle connection is not cut. A write that fails
+    /// marks the caller `gone`.
     fn keep_alive(every: Duration) {
-        if !self.opened || self.gone || std::time::monotonic_ns() - self.sent_ns < every / 1ns { return; }
+        if self.gone || std::time::monotonic_ns() - self.sent_ns < every / 1ns { return; }
+        self.open();
         self.sent_ns = std::time::monotonic_ns();
         if self.conn_fd < 0 {
             self.kept.append_str(": keep-alive\n\n");
@@ -217,13 +227,24 @@ fn fail_stream(out: EventStream, s: StreamState, code: String, message: String, 
     let error = "{\"code\": " + jq(code) + ", \"message\": " + jq(message) + "}";
     if s.endpoint == "responses" {
         out.send("error", "{\"type\": \"error\", \"sequence_number\": " + to_string(s.seq) + ", \"error\": {\"type\": \"server_error\", \"code\": " + jq(code) + ", \"message\": " + jq(message) + ", \"param\": null}}");
-        if len(out.snapshot) > 0 {
-            out.send("response.failed", "{\"type\": \"response.failed\", \"response\": " + failed_response(out.snapshot, out.text_so_far(), error, voice) + ", \"sequence_number\": " + to_string(s.seq + 1) + "}");
-        }
+        // a stream a keep-alive opened may have no response yet
+        let snapshot = if len(out.snapshot) > 0 { out.snapshot } else { pending_response(s) };
+        out.send("response.failed", "{\"type\": \"response.failed\", \"response\": " + failed_response(snapshot, out.text_so_far(), error, voice) + ", \"sequence_number\": " + to_string(s.seq + 1) + "}");
     } else {
         out.send("", chat_chunk(s, "{}", "error", ", \"error\": {\"message\": " + jq(message) + ", \"type\": \"server_error\", \"code\": " + jq(code) + "}, \"usage\": null, \"voice\": " + voice_json(voice)));
     }
     out.send("", "[DONE]");
+}
+
+/// A response object for a stream no seat sent one on: the standard's
+/// defaults, as a node's engine would have begun it.
+fn pending_response(s: StreamState) -> String {
+    return "{\"id\": " + jq(s.request_id) + ", \"object\": \"response\", \"created_at\": " + to_string(s.created) + ", \"completed_at\": null, \"status\": \"in_progress\""
+        + ", \"incomplete_details\": null, \"model\": " + jq(s.model) + ", \"previous_response_id\": null, \"instructions\": null, \"output\": [], \"error\": null"
+        + ", \"tools\": [], \"tool_choice\": \"auto\", \"truncation\": \"disabled\", \"parallel_tool_calls\": false, \"text\": {\"format\": {\"type\": \"text\"}}"
+        + ", \"top_p\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0, \"top_logprobs\": 0, \"temperature\": 1, \"reasoning\": null, \"usage\": null"
+        + ", \"max_output_tokens\": null, \"max_tool_calls\": null, \"store\": false, \"background\": false, \"service_tier\": \"default\", \"metadata\": {}"
+        + ", \"safety_identifier\": null, \"prompt_cache_key\": null}";
 }
 
 /// The last response object a seat sent, failed: its status `failed`, its

@@ -89,9 +89,10 @@ far with `voice`, or a last chunk finished `error` with an `error` object
 and `voice`; a truncated answer never ends as a complete one. A seat is
 waited for between events (30 s, `--seat-idle-s`), and a waiting stream
 gets an SSE comment every 15 s; a caller that goes away ends the stream at
-once and its seat is sent `cancel`. A request body is at most 12 MiB; a
-larger one is answered `413 request_too_large` in the contract's envelope
-before it is read, and a chunked one (hale's Server reads `Content-Length`
+once and its seat is sent `cancel`. A request body is at most 2 MiB for
+now (the contract's 12 MiB returns once hale's Server reads a body in linear
+memory; FRICTION.md); a larger one is answered `413 request_too_large` in
+the contract's envelope before it is read, and a chunked one (hale's Server reads `Content-Length`
 bodies only) is refused `400`.
 
 Usage and the admin event stream answer their happy path:

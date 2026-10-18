@@ -76,18 +76,17 @@ echo "laptop/static is up"
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
 
-# a body over 12 MiB is answered 413 in the contract's envelope, unread;
-# one over the Server's old 1 MiB default is served (deploy/nats/nats.conf
-# allows 16 MiB). 3 MiB, not just under the cap: hale's Server reassembles a
-# body in memory quadratic in its size (FRICTION.md), 11 MiB costing ~8 GB.
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (3 * 1024 * 1024)}))' >"$work/near.json"
+# a body over the cap is answered 413 in the contract's envelope, unread; one
+# under it is served. The cap is 2 MiB until hale reads a body in linear
+# memory (FRICTION.md); the contract's 12 MiB returns then.
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (3 * 1024 * 1024)}))' >"$work/big.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * int(1.9 * 1024 * 1024)}))' >"$work/near.json"
 # (the api answers before reading, so curl may fail sending the rest)
 big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
-case "$big" in *'"code": "request_too_large"'*413) echo "a 13 MiB body is refused 413 request_too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
+case "$big" in *'"code": "request_too_large"'*413) echo "a 3 MiB body is refused 413 request_too_large" ;; *) echo "a 3 MiB body: $big" | tail -c 300; exit 1 ;; esac
 near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
-[ "$near" = "200" ] || { echo "a 3 MiB body was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
-echo "a 3 MiB body is served, through a NATS message over the 1 MiB default"
+[ "$near" = "200" ] || { echo "a 1.9 MiB body was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
+echo "a 1.9 MiB body is served, through a NATS message over the 1 MiB default"
 
 # a caller that goes away mid-stream: the api stops at once, tells the seat
 # to stop, and answers the next caller

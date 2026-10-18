@@ -93,8 +93,11 @@ slow model, or an engine that answers at the end), then 30 s between events
 (`--seat-idle-s`). While a seat that accepted is waited for, the stream gets
 an SSE comment (`: keep-alive`) whenever 15 s pass with nothing sent, so a
 proxy does not cut it. A caller that goes away is found by the next write
-that fails, an event's or a keep-alive's, so within 15 s even while the seat
-is quiet: the stream ends there and the seat is sent `cancel`. A request body is at most 2 MiB for
+that fails, an event's or a keep-alive's. The first write after a caller
+closes is accepted (the caller answers it with a reset), so each keep-alive
+is followed a second later by an empty comment (`:`), the write that fails:
+a caller that leaves while the seat is quiet is found within about 16 s, and
+the stream ends there and the seat is sent `cancel`. A request body is at most 2 MiB for
 now (the contract's 12 MiB returns once hale's Server reads a body in linear
 memory; FRICTION.md); a larger one is answered `413 request_too_large` in
 the contract's envelope before it is read, and a chunked one (hale's Server reads `Content-Length`

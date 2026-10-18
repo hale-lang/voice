@@ -32,7 +32,7 @@ body into the row's request and writes the contract's JSON
 |---|---|
 | health | `GET /healthz`, `GET /readyz` |
 | the caller plane | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1/capabilities` (a project key required) |
-| inference | `POST /v1/responses`, `POST /v1/chat/completions`, served by a node's seat over NATS (not streamed yet) |
+| inference | `POST /v1/responses`, `POST /v1/chat/completions`, served by a node's seat over NATS, streamed or not (as SSE with `"stream": true`) |
 | the catalog | `GET`, `POST /admin/v1/models`; `GET`, `PATCH`, `DELETE /admin/v1/models/{model}` |
 | projects, budgets, limits | `/admin/v1/projects`, `.../{project}`, `.../{project}/budget`, `.../{project}/limits` |
 | keys | `GET`, `POST .../keys`; `GET`, `PATCH`, `DELETE .../keys/{key}` |

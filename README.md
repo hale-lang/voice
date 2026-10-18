@@ -151,8 +151,8 @@ refuse:
 | Kind | Closed by |
 |---|---|
 | `tri-state` | hale: a PATCH field that may be left out (kept), `null` (cleared) or a value; a presence pair (`has_x` beside `x`) says two of the three, so the row keeps `set_<field>` |
-| `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
-| `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
+| `map` | hale: a free-form JSON object (a seat's `config`, a change's `before` and `after`) and a map whose values are scalars (`Health.checks`); a hale map's values are records |
+| `json-text` | hale: a free-form JSON value inside a typed object (an engine's `config_schema`), so a node's `capabilities` ride as JSON text |
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |
 | `wire` | voice: the REST wire's shape differs from the row (`api/wire.hl` writes it) |

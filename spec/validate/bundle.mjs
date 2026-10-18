@@ -26,9 +26,9 @@ const bundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const WAITS_ON = {
   optional: 'hale-lang/hale#1600: optional fields (a value or null)',
   enum: 'hale step 0: enums',
-  map: 'hale step 0: maps, as bounded[S; N] indexed_by <field>',
+  map: 'hale: a free-form JSON object (a seat\'s config, a change\'s before and after), and a map whose values are scalars (Health.checks): a hale map is bounded[S; N] indexed_by <field>, its values records',
   wrapper: 'hale: a bounded field assigned whole (FRICTION.md); the list rides in a record',
-  'json-text': 'voice: a structured object carried as JSON text, typed once it may be null (#1600)',
+  'json-text': 'hale: a free-form JSON value inside a typed object (an engine\'s config_schema), so the node\'s capabilities ride as JSON text',
   path: 'voice: a path or query parameter carried in the row\'s request',
   wire: 'voice: the REST wire\'s shape differs from the row (written by api/wire.hl)',
   required: 'voice: the row gives the field a default, so the surface does not require it; the REST reader does (api/wire.hl)',
@@ -107,7 +107,7 @@ const NOT_COMPARED = {
   AccountQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
-  NodeReport: ['one row for two bodies, the node\'s `Capabilities` (PUT /node/v1/capabilities) and `LocalControls` (PUT /node/v1/local), each carried whole as JSON text and checked by the reader (api/fleet.hl)', ['json']],
+  NodeReport: ['the node\'s `Capabilities` (PUT /node/v1/capabilities), carried whole as JSON text and checked by the reader (api/fleet.hl): an engine\'s `config_schema` is free-form JSON, which the codec does not carry', ['json']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 
@@ -265,7 +265,7 @@ const RULES = [
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^(Model|ModelList)\b/, 'wire', 'the caller\'s model nests voice\'s fields under `voice`, and lists say `object`'],
-  [/^(Budget|(ProjectCreate|Project|ProjectList\.data\[\]|Capabilities)\.budget)\./, 'wire', 'a budget is its BudgetSet flattened into it on the wire'],
+  [/^(Budget|(ProjectCreate|Project|ProjectList\.data\[\]|Capabilities|ApiError\.voice)\.budget)\./, 'wire', 'a budget is its BudgetSet flattened into it on the wire'],
   [/^Registered\.nats/, 'wire', '`nats` is an object of url and subject on the wire'],
   [/(VoiceExtension|Served\.voice)\.(wall_ms|timing)$/, 'wire', 'the timing is an object of wall, queue and load on the wire'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],

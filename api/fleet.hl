@@ -27,7 +27,7 @@ type AssignedSeats { items: bounded[AssignedSeat; 16]; }
 type Assignment { version: Int = 0; max_in_flight: Int = 1; seats: bounded[AssignedSeat; 16]; }
 
 /// `Registration`. `capabilities` and `local` are the node's JSON objects.
-type Registration { protocol: Int = 0; version: String = ""; capabilities: String = ""; local: String = ""; }
+type Registration { protocol: Int = 0; version: String = ""; capabilities: String = ""; local: LocalControls = LocalControls { paused: false }; }
 
 /// `Registered`.
 type Registered {
@@ -50,12 +50,36 @@ type SeatStates { assignment_version: Int = 0; seats: bounded[SeatState; 16]; }
 /// -1 when it does not say.
 type Heartbeat { in_flight: Int = 0; seats: bounded[SeatState; 16]; assignment_version: Int = -1; }
 
-/// A JSON object the node reports whole: its `Capabilities` or its
-/// `LocalControls`.
+/// The node's `Capabilities`, carried whole as JSON: an engine's
+/// `config_schema` is free-form JSON, which the codec does not carry.
 type NodeReport { json: String = "{}"; }
 
-/// `QuotaReport`. `windows` is the JSON array of `QuotaWindow`s.
-type QuotaReport { seat: String = ""; windows: String = "[]"; }
+/// `LocalControls`: what the node's operator set on the machine.
+type LocalControls {
+    paused: Bool;
+    paused_seats: bounded[String; 32];
+    has_max_in_flight: Bool = false;
+    max_in_flight: Int = -1;
+    has_reason: Bool = false;
+    reason: String = "";
+}
+
+/// `QuotaWindow`: a limit the provider enforces on the account, as an
+/// engine last reported it.
+type QuotaWindow {
+    name: String;
+    used_percent: Float;
+    has_resets_at: Bool = false;
+    resets_at: Time = `1970-01-01T00:00:00Z`;
+    observed_at: Time;
+    has_seat: Bool = false;
+    seat: String = "";
+}
+
+type QuotaWindows { items: bounded[QuotaWindow; 16]; }
+
+/// `QuotaReport`.
+type QuotaReport { seat: String = ""; windows: bounded[QuotaWindow; 16]; }
 
 /// `Draining`.
 type Draining { reason: String = ""; }
@@ -107,10 +131,9 @@ locus NodePlane {
     fn register(r: Registration, ctx: std::api::Context) -> Registered fallible(ApiError) {
         if r.protocol != 2 { fail invalid("this coordinator speaks protocol 2", "protocol"); }
         let engines = declared_engines(r.capabilities) or raise;
-        check_local(r.local) or raise;
         let n = self.own(ctx) or raise;
         let now = now_seconds();
-        self.store.put_fleet(st::FleetRow { node: n.id, version: r.version, capabilities: r.capabilities, local: r.local, registered_at: now }) or fail store_failed(err);
+        self.store.put_fleet(st::FleetRow { node: n.id, version: r.version, capabilities: r.capabilities, local: local_json(r.local), registered_at: now }) or fail store_failed(err);
         self.store.put_beat(n.id, now, 0) or fail store_failed(err);
         let a = assignment_of(self.store, n) or raise;
         let mut out = Registered { heartbeat_interval_ms: HEARTBEAT_MS, nats_url: self.link.place(), nats_subject: "voice.node." + n.id, assignment: a };
@@ -157,11 +180,10 @@ locus NodePlane {
     }
 
     /// `reportLocalControls`.
-    fn local(l: NodeReport, ctx: std::api::Context) fallible(ApiError) {
-        check_local(l.json) or raise;
+    fn local(l: LocalControls, ctx: std::api::Context) fallible(ApiError) {
         let n = self.registered(ctx) or raise;
         let mut f = self.store.fleet(n.id) or fail store_failed(err);
-        f.local = l.json;
+        f.local = local_json(l);
         self.store.put_fleet(f) or fail store_failed(err);
     }
 
@@ -170,7 +192,7 @@ locus NodePlane {
         let n = self.registered(ctx) or raise;
         let s = self.store.seat(n.id, q.seat) or fail store_failed(err);
         if !s.present { fail not_found("no seat " + q.seat + " on node " + n.id); }
-        self.store.put_windows(s.account, q.windows) or fail store_failed(err);
+        self.store.put_windows(s.account, windows_json(q.windows)) or fail store_failed(err);
     }
 
     /// `nodeDraining`: no new requests go to it until it registers again.
@@ -284,6 +306,34 @@ fn check_local(json: String) -> Bool fallible(ApiError) {
     return true;
 }
 
+/// Local controls, checked.
+fn read_local(json: String) -> LocalControls fallible(ApiError) {
+    check_local(json) or raise;
+    let mut l = LocalControls { paused: std::json::find_bool_field(json, "paused") };
+    let held = names_of(std::json::find_field_raw(json, "paused_seats"), "local") or raise;
+    l.paused_seats = held.items;
+    let cap = kind_of(json, "max_in_flight");
+    if cap != "missing" && cap != "null" {
+        l.has_max_in_flight = true;
+        l.max_in_flight = nullable_count(json, "max_in_flight") or raise;
+    }
+    if kind_of(json, "reason") == "string" {
+        l.has_reason = true;
+        l.reason = std::json::find_string_field(json, "reason");
+    }
+    return l;
+}
+
+/// The local controls a fleet row holds, as voice wrote them.
+fn local_of(json: String) -> LocalControls {
+    return read_local(json) or LocalControls { paused: false };
+}
+
+fn local_json(l: LocalControls) -> String {
+    return "{\"paused\": " + jbool(l.paused) + ", \"paused_seats\": " + st::jnames(l.paused_seats)
+        + ", \"max_in_flight\": " + jcount_or_null(l.has_max_in_flight, l.max_in_flight) + ", \"reason\": " + jstring_or_null(l.has_reason, l.reason) + "}";
+}
+
 /// True when the node's local controls hold `seat` (or the whole node).
 fn locally_paused(local: String, seat: String) -> Bool {
     if len(local) == 0 { return false; }
@@ -335,11 +385,12 @@ fn read_registration(body: String) -> Registration fallible(ApiError) {
     if kind_of(body, "protocol") != "number" { fail invalid("`protocol` is required", "protocol"); }
     if kind_of(body, "capabilities") != "object" { fail invalid("`capabilities` is a required object", "capabilities"); }
     if kind_of(body, "local") != "object" { fail invalid("`local` is a required object", "local"); }
+    let local = read_local(std::str::trim(std::json::find_field_raw(body, "local"))) or raise;
     return Registration {
         protocol: std::json::find_int_field(body, "protocol"),
         version: required_string(body, "version") or raise,
         capabilities: std::str::trim(std::json::find_field_raw(body, "capabilities")),
-        local: std::str::trim(std::json::find_field_raw(body, "local"))
+        local: local
     };
 }
 
@@ -368,15 +419,51 @@ fn read_node_report(body: String) -> NodeReport fallible(ApiError) {
 fn read_quota(body: String) -> QuotaReport fallible(ApiError) {
     object_body(body) or raise;
     if kind_of(body, "windows") != "array" { fail invalid("`windows` is a required list", "windows"); }
+    let mut out = QuotaReport { seat: required_string(body, "seat") or raise };
     let mut it = std::json::array_first(std::json::find_field_raw(body, "windows"));
-    let mut n = 0;
     while !it.done {
-        check_window(std::str::trim(it.element)) or raise;
-        n = n + 1;
-        if n > 16 { fail invalid("at most 16 quota windows", "windows"); }
+        let w = read_window(std::str::trim(it.element)) or raise;
+        push(out.windows, w) or fail invalid("at most 16 quota windows", "windows");
         it = std::json::array_next(it);
     }
-    return QuotaReport { seat: required_string(body, "seat") or raise, windows: std::str::trim(std::json::find_field_raw(body, "windows")) };
+    return out;
+}
+
+/// One `QuotaWindow`, checked.
+fn read_window(w: String) -> QuotaWindow fallible(ApiError) {
+    check_window(w) or raise;
+    let resets = kind_of(w, "resets_at") == "string";
+    let seat = kind_of(w, "seat") == "string";
+    return QuotaWindow {
+        name: std::json::find_string_field(w, "name"),
+        used_percent: std::str::parse_float(std::str::trim(std::json::find_field_raw(w, "used_percent"))) or 0.0,
+        has_resets_at: resets,
+        resets_at: if resets { rfc3339(std::json::find_string_field(w, "resets_at")) or `1970-01-01T00:00:00Z` } else { `1970-01-01T00:00:00Z` },
+        observed_at: rfc3339(std::json::find_string_field(w, "observed_at")) or `1970-01-01T00:00:00Z`,
+        has_seat: seat,
+        seat: if seat { std::json::find_string_field(w, "seat") } else { "" }
+    };
+}
+
+/// The windows an account's row holds, as voice wrote them.
+fn windows_of(json: String) -> QuotaWindows {
+    let mut out = QuotaWindows { };
+    let mut it = std::json::array_first(json);
+    while !it.done {
+        let w = read_window(std::str::trim(it.element)) or QuotaWindow { name: "", used_percent: 0.0, observed_at: `1970-01-01T00:00:00Z` };
+        if len(w.name) > 0 { push(out.items, w) or discard; }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+fn windows_json(ws: bounded[QuotaWindow; 16]) -> String {
+    let out = st::JsonList { };
+    for w in ws {
+        out.add("{\"name\": " + jq(w.name) + ", \"used_percent\": " + to_string(w.used_percent) + ", \"resets_at\": " + jtime_or_null(w.has_resets_at, w.resets_at)
+                + ", \"observed_at\": " + jtime(w.observed_at) + (if w.has_seat { ", \"seat\": " + jq(w.seat) } else { "" }) + "}");
+    }
+    return "[" + out.text() + "]";
 }
 
 /// One `QuotaWindow`, as the admin plane will show it: a `name`, a

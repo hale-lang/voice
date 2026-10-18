@@ -299,3 +299,9 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** the REST reader refuses a body without a required list; the gap stays listed.
 
+## A Float does not survive `to_string`, nor the api codec
+
+**hale 0.25.1.** `to_string(Float)` keeps six significant digits: `99.999995` is written `100` and `33.333333333333336` is written `33.3333`, so `parse_float(to_string(x)) == x` fails for most values. `T::api_encode` writes a Float field the same way (`{"used_percent":100}` for 99.999995), so a Float that crosses the api codec comes back as a different number.
+
+**Working shape:** a quota window's `used_percent` is written by `float_text` (api/fleet.hl), which writes the fewest fraction digits that read back as the same Float. The codec's own encoding is hale's to fix.
+

@@ -3,6 +3,7 @@
 // the one-brain lock, the reclaim of a dead api instance, node liveness and
 // the route table read from the fleet as reported.
 import ".." as brain;
+import "../../api" as api;
 import "../../store" as st;
 import "../../lib/pond/pq" as pq;
 import "../../lib/pond/db" as db;
@@ -106,6 +107,16 @@ fn main() {
     // the version goes on past the stored one, whatever the clock says
     run(c2, "UPDATE route_table SET version = 9000000000000");
     std::test::assert_eq_int(brain::write_table(c2).version, 9000000000001, "a version is never below the one before it");
+    // a use just under 100%, written back as the api writes a quota report,
+    // leaves the account headroom: its seat still routes
+    let near = api::read_window("{\"name\": \"five_hour\", \"used_percent\": 99.999995, \"observed_at\": \"2026-10-17T00:00:00Z\", \"resets_at\": \"2099-01-01T00:00:00Z\"}") or api::QuotaWindow { name: "", used_percent: 0.0, observed_at: `1970-01-01T00:00:00Z` };
+    let mut report = api::QuotaWindows { };
+    push(report.items, near) or discard;
+    store.put_windows("static", api::windows_json(report.items)) or std::test::assert(false, "the windows are written");
+    std::test::assert_eq_str(one(c2, "SELECT used_percent::text FROM quota_window WHERE account = 'static'"), "99.999995", "the use as reported");
+    brain::write_table(c2);
+    std::test::assert(std::str::contains(one(c2, "SELECT body::text FROM route_table"), "laptop/static"), "a seat whose account is at 99.999995% still routes");
+    run(c2, "DELETE FROM quota_window WHERE account = 'static'");
     run(c2, "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'five_hour', 100, now() + interval '1 hour', now())");
     brain::write_table(c2);
     let full = one(c2, "SELECT body::text FROM route_table");

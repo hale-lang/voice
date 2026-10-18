@@ -117,7 +117,7 @@ const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'i
 // that stands for a value or null (`Restriction.names`).
 const WRAPPERS = new Set(['Names', 'Limits', 'SeatModels', 'SeatViews', 'ModelIds', 'AppliedLimits', 'Problems', 'Attempts', 'AssignedSeats', 'SeatStateList']);
 // Records that stand for a value or null.
-const NULLABLES = new Set(['Restriction', 'MaybeBudget']);
+const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
@@ -264,7 +264,7 @@ const RULES = [
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^(Model|ModelList)\b/, 'wire', 'the caller\'s model nests voice\'s fields under `voice`, and lists say `object`'],
-  [/^(Budget|ProjectCreate\.budget)\./, 'wire', 'a budget is its BudgetSet flattened into it on the wire'],
+  [/^(Budget|(ProjectCreate|Project|ProjectList\.data\[\]|Capabilities)\.budget)\./, 'wire', 'a budget is its BudgetSet flattened into it on the wire'],
   [/^Registered\.nats/, 'wire', '`nats` is an object of url and subject on the wire'],
   [/(VoiceExtension|Served\.voice)\.(wall_ms|timing)$/, 'wire', 'the timing is an object of wall, queue and load on the wire'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],

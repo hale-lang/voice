@@ -150,7 +150,7 @@ refuse:
 
 | Kind | Closed by |
 |---|---|
-| `optional` | hale-lang/hale#1600, optional fields: a `null` today rides as a flag (`priced`, `any`, `set_*`) or an empty value |
+| `optional` | voice: a request's field that may be left out or `null` still rides as a flag (`set_*`, `priced`, `any`) or an empty value; an answer's is a presence pair (`has_x` beside `x`, hale 0.25) |
 | `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
 | `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
 | `path` | voice: a path or query parameter carried in the row's request |

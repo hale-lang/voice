@@ -145,7 +145,7 @@ locus Models {
         let p = self.store.project(k.project) or fail metering_failed(err);
         let row = self.store.model(r.model) or fail metering_failed(err);
         if !row.present || row.removed || !visible(p, k, r.model) {
-            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model, param: "model" };
+            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model, has_param: true, param: "model" };
         }
         return model_with_seats(self.store, row) or raise;
     }
@@ -162,9 +162,12 @@ locus Models {
             project_name: p.name,
             key_id: k.id,
             key_name: k.name,
-            accounts: if k.accounts.any { p.accounts } else { k.accounts },
-            budget: if p.budgeted { MaybeBudget { present: true, budget: budget_view(p.budget, now_seconds()) } } else { MaybeBudget { } }
+            has_budget: p.budgeted,
+            budget: budget_view(p.budget, now_seconds())
         };
+        let spends = if k.accounts.any { p.accounts } else { k.accounts };
+        out.has_accounts = !spends.any;
+        out.accounts = spends.names.items;
         out.data_classes = p.data_classes.items;
         for r in rows.rows {
             if !r.removed && visible(p, k, r.id) { push(out.models, r.id) or discard; }
@@ -177,7 +180,7 @@ locus Models {
         }
         let accounts = self.store.accounts() or fail metering_failed(err);
         for a in accounts.rows {
-            if !a.archived && allows(out.accounts, a.id) {
+            if !a.archived && allows(spends, a.id) {
                 for l in a.limits.items {
                     push(out.limits, l) or discard;
                 }
@@ -225,7 +228,7 @@ fn catalog_view(r: st::ModelRow) -> CatalogModel {
         kind: model_kind_of(r.kind),
         context_length: r.context_length,
         max_output_tokens: r.max_output_tokens,
-        priced: r.priced,
+        has_price: r.priced,
         price: r.price,
         available: false,
         created_at: r.created_at
@@ -240,7 +243,7 @@ fn model_view(r: st::ModelRow) -> Model {
         kind: r.kind,
         context_length: r.context_length,
         max_output_tokens: r.max_output_tokens,
-        priced: r.priced,
+        has_price: r.priced,
         price: r.price,
         available: false
     };
@@ -249,11 +252,11 @@ fn model_view(r: st::ModelRow) -> Model {
 // ---- errors ----------------------------------------------------------
 
 fn invalid(message: String, param: String) -> ApiError {
-    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::invalid_request, message: message, param: param };
+    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::invalid_request, message: message, has_param: len(param) > 0, param: param };
 }
 
 fn unsupported(message: String, param: String) -> ApiError {
-    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::unsupported, message: message, param: param };
+    return ApiError { status: 400, kind: "invalid_request", code: ErrorCode::unsupported, message: message, has_param: len(param) > 0, param: param };
 }
 
 fn not_found(message: String) -> ApiError {
@@ -315,9 +318,11 @@ type Capabilities {
     key_name: String = "";
     data_classes: bounded[String; 32];
     models: bounded[String; 256];
-    accounts: st::Restriction = st::Restriction { };
+    has_accounts: Bool = false;
+    accounts: bounded[String; 32];
     limits: bounded[st::Limit; 1056];
-    budget: MaybeBudget = MaybeBudget { };
+    has_budget: Bool = false;
+    budget: Budget = Budget { };
 }
 
 fn capabilities_json(c: Capabilities) -> String {
@@ -332,8 +337,8 @@ fn capabilities_json(c: Capabilities) -> String {
     }
     let limits = limits_list.text();
     return "{\"project\": {\"id\": " + jq(c.project_id) + ", \"name\": " + jq(c.project_name) + "}, \"key\": {\"id\": " + jq(c.key_id) + ", \"name\": " + jq(c.key_name) + "}"
-        + ", \"data_classes\": " + st::jnames(c.data_classes) + ", \"models\": [" + models + "], \"accounts\": " + jrestriction(c.accounts)
-        + ", \"limits\": [" + limits + "], \"budget\": " + maybe_budget_json(c.budget) + "}";
+        + ", \"data_classes\": " + st::jnames(c.data_classes) + ", \"models\": [" + models + "], \"accounts\": " + jnames_or_null(c.has_accounts, c.accounts)
+        + ", \"limits\": [" + limits + "], \"budget\": " + (if c.has_budget { budget_json(c.budget) } else { "null" }) + "}";
 }
 
 /// Whether a model can be served now, and the data classes the seats that

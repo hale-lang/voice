@@ -15,9 +15,9 @@
 // holds the api until its seat answers.
 //
 // With `"stream": true` the answer is the standard event stream, sent as
-// it comes (stream.hl). A request body is at most `MAX_REQUEST_BYTES` (2 MiB
-// until hale reads a body linearly, then the contract's 12 MiB), and a larger
-// one is answered `413 request_too_large` by the Server (main.hl).
+// it comes (stream.hl). A request body is at most 12 MiB
+// (`MAX_REQUEST_BYTES`), and a larger one is answered `413
+// request_too_large` by the Server (main.hl).
 
 /// An inference request: what admission reads, and `body`, the standard
 /// request a node is sent (a Chat Completions request converted).
@@ -375,18 +375,39 @@ fn serve_message(request_id: String, reply_to: String, c: Candidate, r: Inferenc
 
 /// The body's members but `voice`, `stream`, `stream_options` and
 /// `background`, which the coordinator keeps (protocol.yaml `Serve.body`).
+/// Those members are small and the rest may be 12 MiB, so a body with none
+/// of them is passed on as it is, and one with any is cut around them, each
+/// kept member copied once as written, not rebuilt.
 fn standard_body(body: String) -> String {
-    let out_list = st::JsonList { };
     let mut it = std::json::object_first(body);
+    let mut dropping = false;
+    while !it.done && !dropping {
+        dropping = coordinator_member(std::json::obj_key_string(it, body));
+        it = std::json::object_next(it, body);
+    }
+    if !dropping { return body; }
+    let src = std::bytes::from_string(body);
+    let out = std::bytes::BytesBuilder { initial_cap: len(body) + 2 };
+    out.append_str("{");
+    let mut kept = 0;
+    it = std::json::object_first(body);
     while !it.done {
-        let key = std::json::obj_key_string(it, body);
-        if key != "voice" && key != "stream" && key != "stream_options" && key != "background" {
-            out_list.add(jq(key) + ": " + std::str::trim(std::json::obj_value_raw(it, body)));
+        if !coordinator_member(std::json::obj_key_string(it, body)) {
+            if kept > 0 { out.append_str(", "); }
+            // from the key's opening quote to the value's end
+            out.append_slice(src, it.key_start - 1, it.val_end);
+            kept = kept + 1;
         }
         it = std::json::object_next(it, body);
     }
-    let out = out_list.text();
-    return "{" + out + "}";
+    out.append_str("}");
+    let b = out.finish() or b"{}";
+    return std::str::from_bytes(b);
+}
+
+/// A member of a request the coordinator keeps from the seat.
+fn coordinator_member(key: String) -> Bool {
+    return key == "voice" || key == "stream" || key == "stream_options" || key == "background";
 }
 
 /// A Chat Completions request as the standard request: its messages as

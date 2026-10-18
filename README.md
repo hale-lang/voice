@@ -97,11 +97,10 @@ that fails, an event's or a keep-alive's. The first write after a caller
 closes is accepted (the caller answers it with a reset), so each keep-alive
 is followed a second later by an empty comment (`:`), the write that fails:
 a caller that leaves while the seat is quiet is found within about 16 s, and
-the stream ends there and the seat is sent `cancel`. A request body is at most 2 MiB for
-now (the contract's 12 MiB returns once hale's Server reads a body in linear
-memory; FRICTION.md); a larger one is answered `413 request_too_large` in
-the contract's envelope before it is read, and a chunked one (hale's Server reads `Content-Length`
-bodies only) is refused `400`.
+the stream ends there and the seat is sent `cancel`. A request body is at
+most 12 MiB; a larger one is answered `413 request_too_large` in the
+contract's envelope before it is read, and a chunked one (hale's Server
+reads `Content-Length` bodies only) is refused `400`.
 
 Usage and the admin event stream answer their happy path:
 a canned body from [`api/canned/`](./api/canned/), one file per

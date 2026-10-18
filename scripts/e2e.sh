@@ -48,7 +48,8 @@ fi
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
 api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
-pids+=($!)
+api_pid=$!
+pids+=($api_pid)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 
 post() { curl -fsS -X POST "$api$1" -H 'content-type: application/json' -d "$2"; }
@@ -77,17 +78,27 @@ echo "laptop/static is up"
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
 
-# a body over the cap is answered 413 in the contract's envelope, unread; one
-# under it is served. The cap is 2 MiB until hale reads a body in linear
-# memory (FRICTION.md); the contract's 12 MiB returns then.
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (3 * 1024 * 1024)}))' >"$work/big.json"
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * int(1.9 * 1024 * 1024)}))' >"$work/near.json"
+# a body over 12 MiB is answered 413 in the contract's envelope, unread; one
+# just under it is served, through a NATS message well over the 1 MiB default
+# (deploy/nats/nats.conf allows 16 MiB). Its cost is linear in its size: the
+# api's peak stays under 200 MB, streamed under 256 MB (it was ~9.5 GB at
+# 12 MiB before hale 0.25.1; FRICTION.md).
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "stream": True, "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near-stream.json"
 # (the api answers before reading, so curl may fail sending the rest)
 big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
-case "$big" in *'"code": "request_too_large"'*413) echo "a 3 MiB body is refused 413 request_too_large" ;; *) echo "a 3 MiB body: $big" | tail -c 300; exit 1 ;; esac
+case "$big" in *'"code": "request_too_large"'*413) echo "a 13 MiB body is refused 413 request_too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
 near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
-[ "$near" = "200" ] || { echo "a 1.9 MiB body was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
-echo "a 1.9 MiB body is served, through a NATS message over the 1 MiB default"
+[ "$near" = "200" ] || { echo "a body just under 12 MiB was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
+peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
+[ -n "$peak_kb" ] && [ "$peak_kb" -lt 204800 ] || { echo "the api peaked at ${peak_kb:-?} kB serving a body just under 12 MiB"; exit 1; }
+echo "a body just under 12 MiB is served, through a NATS message over the 1 MiB default; the api peaked at $((peak_kb / 1024)) MB"
+streamed=$(curl -s -o "$work/near-stream.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near-stream.json" || true)
+[ "$streamed" = "200" ] && grep -q '^event: response.completed' "$work/near-stream.out" || { echo "a streamed body just under 12 MiB was answered $streamed: $(head -c 300 "$work/near-stream.out")"; exit 1; }
+peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
+[ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 12 MiB"; exit 1; }
+echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
 
 # a caller that goes away mid-stream: the api stops at once, tells the seat
 # to stop, and answers the next caller

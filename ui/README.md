@@ -49,8 +49,9 @@ reusable parts become a library.
 ## Developing
 
 Against the api, which serves configuration and the node plane for real
-(in memory, starting empty) and answers usage, routes and the event stream
-with a canned happy path:
+(in memory, starting empty), answers routes from the route table a brain
+writes (`503 route_table_unavailable` until one has), and usage and the
+event stream with a canned happy path:
 
 ```sh
 hale build api && api/api --port 8080      # in the repository root

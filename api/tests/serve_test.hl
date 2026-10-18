@@ -130,7 +130,8 @@ fn streamed_with_sse(e: api::Endpoints, key: String, nodes: Nodes) {
 
 /// A stream whose seat dies once it has begun ends with the evidence; a
 /// caller that goes away ends the stream at once, the seat told to stop.
-fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes) {
+fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes, laptop: String) {
+    beat(e, laptop);
     e.inference.idle = 2s;
     e.inference.keep_alive = 1s;
     nodes.dying = "laptop";
@@ -163,7 +164,8 @@ fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes) {
 /// A seat has the first-output span to its first output, then the idle
 /// span between events; a stream a seat that accepted keeps quiet is opened
 /// by its keep-alive, which finds a caller that has gone.
-fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes) {
+fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes, laptop: String) {
+    beat(e, laptop);
     e.inference.first = 6s;
     e.inference.idle = 1s;
     e.inference.keep_alive = 1s;
@@ -176,6 +178,7 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes) {
     nodes.slow = "";
 
     e.inference.first = 2s;
+    beat(e, laptop);
     nodes.mute = "laptop";
     let m = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
     std::test::assert_eq_int(m.status, 200, "a seat that accepts and stays quiet: " + m.body);
@@ -188,6 +191,7 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes) {
 
     // the caller went away while the seat was quiet: found at the next
     // keep-alive, not at the first-output span
+    beat(e, laptop);
     let before = nodes.cancelled;
     e.inference.first = 30s;
     let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
@@ -205,6 +209,14 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes) {
 
 fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
     return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
+}
+
+/// A heartbeat from the node `token` names, its seat up. A node is up for
+/// three heartbeat intervals (15 s) after its last; the stream tests wait
+/// out seconds of seat silence, so they beat before relying on the laptop
+/// being eligible, however slow the machine.
+fn beat(e: api::Endpoints, token: String) {
+    expect(plane(e, "/node/v1/heartbeat", token, "{\"in_flight\": 0, \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}"), 204, "a heartbeat");
 }
 
 fn plane(e: api::Endpoints, path: String, token: String, body: String) -> std::http::Response {
@@ -311,10 +323,12 @@ fn main() {
     std::test::assert_eq_str(std::json::find_string_field(cut_choice, "finish_reason"), "length", "a cut answer stopped for length");
 
     streamed_with_sse(e, key, nodes);
-    streamed_failures(e, key, nodes);
-    first_output_span(e, key, nodes);
+    streamed_failures(e, key, nodes, laptop);
+    first_output_span(e, key, nodes, laptop);
 
     // a seat that refuses: the request moves to another
+    // the waits above outlast the up window of the laptop's registration
+    beat(e, laptop);
     let desktop = bring_up(e, "desktop");
     nodes.refusing = "laptop";
     let moved_stream = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");

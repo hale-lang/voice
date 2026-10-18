@@ -13,33 +13,132 @@ locus Nodes {
     params {
         refusing: String = "";
         failing: String = "";
+        // a node that goes silent after its first text delta, as one killed
+        // mid-answer does
+        dying: String = "";
         tool: String = "";
+        // offers finished before their result came (the link sends cancel)
+        cancelled: Int = 0;
         offers: Int = 0;
         last_body: String = "";
+        // the open offer: its script of events, how far it was read, and
+        // the result it ends with
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = true;
     }
     fn place() -> String { return "nats://nats.test:4222"; }
     fn assign(node: String, body: String) -> Bool { return true; }
     @unbounded
-    fn serve(to: String, reply_to: String, body: String, wait: Duration) -> api::ServeOutcome {
+    fn offer(to: String, reply_to: String, body: String) -> api::ServeOutcome {
         self.offers = self.offers + 1;
         self.last_body = body;
         if to == self.refusing { return api::ServeOutcome { ack: "refused", reason: "seat static is paused" }; }
-        if to == self.failing { return api::ServeOutcome { ack: "accepted", outcome: "failed", error_code: "engine_failed", error_message: "the engine exited", retryable: true }; }
         let id = std::json::find_string_field(body, "request_id");
+        self.at = 0;
+        self.ended = false;
+        if to == self.failing {
+            self.script = "";
+            self.result = "{\"type\": \"result\", \"request_id\": \"" + id + "\", \"outcome\": \"failed\", \"error\": {\"code\": \"engine_failed\", \"message\": \"the engine exited\", \"retryable\": true}}";
+            return api::ServeOutcome { ack: "accepted" };
+        }
         let model = std::json::find_string_field(body, "model");
         let named = std::json::string_field(body, "engine_model");
         let run = node::run_static(id, model, if named.kind == "string" { named.text } else { model }, std::str::trim(std::json::find_field_raw(body, "body")), node::static_config(if len(self.tool) > 0 { "{\"text\": \"hello from voice\", \"tool_call\": {\"name\": \"" + self.tool + "\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}}" } else { "{\"text\": \"hello from voice\", \"chunk_chars\": 8}" }));
-        let mut out = api::ServeOutcome { ack: "accepted", outcome: run.outcome, model: run.model };
-        let mut rest = run.script;
-        let mut at = std::str::index_of(rest, "\n");
-        while at >= 0 {
-            let event = rest[0..at];
-            rest = rest[(at + 1)..len(rest)];
-            out = api::take_event(out, event);
-            at = std::str::index_of(rest, "\n");
+        self.script = run.script;
+        self.result = node::result_message(id, run, 0, 0);
+        if to == self.dying {
+            // its events up to and including its first delta, then nothing
+            let cut = std::str::index_of(run.script, "response.output_text.delta");
+            let nl = std::str::index_of(run.script[cut..len(run.script)], "\n");
+            self.script = run.script[0..(cut + nl + 1)];
+            self.result = "";
         }
-        return out;
+        return api::ServeOutcome { ack: "accepted" };
     }
+    /// The script's next event, then its result.
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if !std::str::starts_with(line, "pause ") && len(line) > 0 { return api::LinkMsg { kind: "event", json: line }; }
+        }
+        if !self.ended && len(self.result) > 0 {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        // silent: the wait passes
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn finish() {
+        if !self.ended { self.cancelled = self.cancelled + 1; }
+        self.ended = true;
+    }
+}
+
+/// The streamed answers: the standard event stream, and Chat Completions
+/// chunks, as Server-Sent Events.
+fn streamed_with_sse(e: api::Endpoints, key: String, nodes: Nodes) {
+    let r = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    std::test::assert_eq_int(r.status, 200, "a streamed response: " + r.body);
+    std::test::assert(std::str::starts_with(r.content_type, "text/event-stream"), "is an event stream");
+    std::test::assert(std::str::starts_with(r.headers, "X-Request-Id: resp_"), "with its request id");
+    std::test::assert(std::str::starts_with(r.body, "event: response.created\ndata: {"), "that starts with response.created");
+    std::test::assert(std::str::contains(r.body, "event: response.output_text.delta\n") && std::str::contains(r.body, "\"delta\": \"hello fr\""), "streams the text");
+    std::test::assert(std::str::contains(r.body, "event: response.completed\n") && std::str::contains(r.body, "\"voice\": {\"request_id\": \"resp_"), "ends with the response, its voice object in it");
+    std::test::assert(std::str::contains(r.body, "\"sequence_number\": 0}") && !std::str::contains(r.body, ",\"sequence_number\":"), "numbered by the api, not the node");
+    std::test::assert(std::str::ends_with(std::str::trim(r.body), "data: [DONE]"), "and ends with [DONE]");
+
+    let c = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": true}");
+    std::test::assert_eq_int(c.status, 200, "a streamed chat completion: " + c.body);
+    std::test::assert(std::str::starts_with(c.body, "data: {\"id\": \"resp_") && std::str::contains(c.body, "\"object\": \"chat.completion.chunk\""), "as chunks");
+    std::test::assert(std::str::contains(c.body, "\"delta\": {\"role\": \"assistant\", \"content\": \"\"}"), "the role first");
+    std::test::assert(std::str::contains(c.body, "\"delta\": {\"content\": \"hello fr\"}"), "then the text");
+    std::test::assert(std::str::contains(c.body, "\"finish_reason\": \"stop\"}], \"usage\": {\"prompt_tokens\":") && std::str::contains(c.body, "\"voice\": {\"request_id\""), "the last chunk with its finish, usage and voice");
+    std::test::assert(!std::str::contains(c.body, "event: ") && std::str::ends_with(std::str::trim(c.body), "data: [DONE]"), "unnamed events, ending with [DONE]");
+
+    nodes.tool = "weather";
+    let t = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"weather?\"}], \"stream\": true}");
+    std::test::assert(std::str::contains(t.body, "\"tool_calls\": [{\"index\": 0, \"id\": \"call_") && std::str::contains(t.body, "\"name\": \"weather\""), "a tool call streamed as one");
+    std::test::assert(std::str::contains(t.body, "\"function\": {\"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}") && std::str::contains(t.body, "\"finish_reason\": \"tool_calls\""), "its arguments, and the finish");
+    nodes.tool = "";
+}
+
+/// A stream whose seat dies once it has begun ends with the evidence; a
+/// caller that goes away ends the stream at once, the seat told to stop.
+fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes) {
+    e.inference.idle = 2s;
+    e.inference.keep_alive = 1s;
+    nodes.dying = "laptop";
+    let r = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    std::test::assert_eq_int(r.status, 200, "a stream whose seat dies: " + r.body);
+    std::test::assert(std::str::contains(r.body, "\n: keep-alive\n"), "kept alive while the seat is silent");
+    std::test::assert(std::str::contains(r.body, "event: error\ndata: {\"type\": \"error\""), "an error event");
+    std::test::assert(std::str::contains(r.body, "event: response.failed\ndata: {\"type\": \"response.failed\""), "then response.failed");
+    std::test::assert(std::str::contains(r.body, "\"status\": \"failed\"") && std::str::contains(r.body, "\"text\": \"hello fr\""), "carrying the response as far as it came");
+    std::test::assert(std::str::contains(r.body, "\"error\": {\"code\": \"upstream_failed\"") && std::str::contains(r.body, "\"attempts\": [{\"seat\": \"laptop/static\""), "with its error and its voice, attempts included");
+    std::test::assert(std::str::ends_with(std::str::trim(r.body), "data: [DONE]") && !std::str::contains(r.body, "response.completed"), "never as a completed one");
+
+    let c = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": true}");
+    std::test::assert(std::str::contains(c.body, "\"finish_reason\": \"error\"}], \"error\": {\"message\":") && std::str::contains(c.body, "\"usage\": null, \"voice\": {"), "a chat stream ends with a chunk finished error: " + c.body);
+    std::test::assert(!std::str::contains(c.body, "\"finish_reason\": \"stop\""), "never as a complete one");
+    nodes.dying = "";
+
+    // the caller went away: the stream ends after its first event, and the
+    // offer is finished before its result (the link sends cancel)
+    let before = nodes.cancelled;
+    let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
+    let req = api::read_inference("{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}", "responses") or api::InferenceRequest { };
+    let gone = e.inference.stream(req, ctx, api::EventStream { gone: true }) or std::http::Response { status: 0, body: "" };
+    std::test::assert(std::str::starts_with(gone.body, "event: response.created") && !std::str::contains(gone.body, "response.in_progress"), "a gone caller is sent nothing more");
+    std::test::assert_eq_int(nodes.cancelled, before + 1, "and its seat is cancelled");
+    e.inference.idle = 30s;
+    e.inference.keep_alive = 15s;
 }
 
 fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
@@ -149,9 +248,15 @@ fn main() {
     let cut_choice = std::json::array_first(std::json::find_field_raw(cut.body, "choices")).element;
     std::test::assert_eq_str(std::json::find_string_field(cut_choice, "finish_reason"), "length", "a cut answer stopped for length");
 
+    streamed_with_sse(e, key, nodes);
+    streamed_failures(e, key, nodes);
+
     // a seat that refuses: the request moves to another
     let desktop = bring_up(e, "desktop");
     nodes.refusing = "laptop";
+    let moved_stream = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    std::test::assert(std::str::starts_with(moved_stream.body, "event: voice:attempt\ndata: {\"type\": \"voice:attempt\", \"sequence_number\": 0, \"attempt\": {\"seat\": \"laptop/static\""), "a streamed request says the switch first: " + moved_stream.body);
+    std::test::assert(std::str::contains(moved_stream.body, "\"next_seat\": \"desktop/static\"") && std::str::contains(moved_stream.body, "event: response.created\ndata: {") && std::str::contains(moved_stream.body, "\"sequence_number\": 1}"), "then the next seat's events, numbered on");
     let moved = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
     expect(moved, 200, "served elsewhere");
     let attempts = std::json::find_field_raw(std::json::find_field_raw(moved.body, "voice"), "attempts");
@@ -172,6 +277,9 @@ fn main() {
     std::test::assert_eq_str(std::json::find_string_field(tried.element, "seat"), "laptop/static", "and every seat it tried");
     std::test::assert_eq_str(std::json::find_string_field(std::json::array_next(tried).element, "seat"), "desktop/static", "in turn");
     std::test::assert(std::str::contains(nodes.last_body, "\"reply_to\": \"voice.reply." + std::json::find_string_field(fv, "request_id") + ".2\""), "each attempt answering on a subject of its own");
+    let failed_stream = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}");
+    expect(failed_stream, 502, "a streamed request every seat failed before any output is answered whole");
+    std::test::assert(std::str::starts_with(failed_stream.content_type, "application/json"), "as JSON, no stream begun");
     nodes.refusing = "";
     nodes.failing = "";
 

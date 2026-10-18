@@ -68,11 +68,11 @@ const nodeBodies = {
 };
 
 // what an endpoint answers instead of its success, while it cannot succeed:
-// inference needs a node to serve it (no node can connect yet), and a
-// streamed answer needs a response body the api can stream
+// inference needs a node to serve it, streamed or not (a stream opens only
+// once a seat answers, so a refusal is answered whole)
 const refusals = {
-  createResponse: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
-  createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [400, 'unsupported'] },
+  createResponse: { json: [503, 'no_eligible_seat'], stream: [503, 'no_eligible_seat'] },
+  createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [503, 'no_eligible_seat'] },
   // no brain works here, so no route table reaches the api
   getRoutes: { json: [503, 'route_table_unavailable'] },
 };

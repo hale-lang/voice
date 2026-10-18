@@ -2,8 +2,11 @@
 // completion, and validate both against the bundled spec. With `502`, every
 // seat is set to fail: the response must be the contract's `502`, with the
 // request id and every attempt in `error.voice`. With `tool`, the seat
-// answers with a tool call, and the chat completion must carry it.
-//   usage: node served.mjs <bundled.json> <base-url> <project-key> [502|tool]
+// answers with a tool call, and the chat completion must carry it. With
+// `stream`, both are asked with `stream: true`: every event must be one
+// the contract allows on `text/event-stream`, and the stream must end with
+// `data: [DONE]`.
+//   usage: node served.mjs <bundled.json> <base-url> <project-key> [502|tool|stream]
 import fs from 'fs';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
@@ -13,6 +16,55 @@ const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); aj
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
 let fails = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
+// The events of a text/event-stream body: [{ event, data }].
+function sse(text) {
+  const out = [];
+  for (const block of text.split('\n\n')) {
+    if (!block.trim()) continue;
+    let event = '', data = [];
+    for (const line of block.split('\n')) {
+      if (line.startsWith('event: ')) event = line.slice(7);
+      else if (line.startsWith('data: ')) data.push(line.slice(6));
+    }
+    out.push({ event, data: data.join('\n') });
+  }
+  return out;
+}
+if (expect === 'stream') {
+  const streams = [
+    ['/v1/responses', { model: 'echo-1', input: 'hello there', stream: true }],
+    ['/v1/chat/completions', { model: 'echo-1', messages: [{ role: 'user', content: 'hi' }], stream: true }],
+  ];
+  let total = 0;
+  for (const [path, body] of streams) {
+    const r = await fetch(base + path, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` } });
+    const text = await r.text();
+    if (r.status !== 200) { fail(path, `status ${r.status}: ${text.slice(0, 200)}`); continue; }
+    if (!(r.headers.get('content-type') || '').startsWith('text/event-stream')) fail(path, 'not text/event-stream: ' + r.headers.get('content-type'));
+    if (!(r.headers.get('x-request-id') || '').startsWith('resp_')) fail(path, 'no X-Request-Id');
+    const schema = spec.paths[path].post.responses['200'].content['text/event-stream'].schema;
+    const f = ajv.compile(strip(schema));
+    const events = sse(text);
+    if (events.at(-1)?.data !== '[DONE]') fail(path, 'does not end with data: [DONE]');
+    let text_seen = '', last = null;
+    for (const e of events.slice(0, -1)) {
+      let j;
+      try { j = JSON.parse(e.data); } catch { fail(path, 'an event that is not JSON: ' + e.data.slice(0, 80)); continue; }
+      if (!f(j)) fail(path + ' ' + (j.type || 'chunk'), JSON.stringify(f.errors.slice(0, 3)));
+      if (path === '/v1/responses' && e.event !== j.type) fail(path, `event name ${e.event} for ${j.type}`);
+      if (j.type === 'response.output_text.delta') text_seen += j.delta;
+      if (j.choices?.[0]?.delta?.content) text_seen += j.choices[0].delta.content;
+      last = j;
+    }
+    if (!text_seen.includes('hello from voice')) fail(path, 'the deltas do not make the seat text: ' + text_seen);
+    const voice = last?.response?.voice || last?.voice;
+    if (!voice?.request_id) fail(path, 'the last event carries no voice object');
+    total += events.length;
+    console.log(path, 'stream', r.status, events.length, 'events,', voice?.served?.seat);
+  }
+  console.log(`2 streams, ${total} events, ${fails} failures`);
+  process.exit(fails ? 1 : 0);
+}
 if (expect === 'tool') {
   // the seat answers with a tool call: a chat completion that carries it
   const r = await fetch(base + '/v1/chat/completions', { method: 'POST', body: JSON.stringify({ model: 'echo-1', messages: [{ role: 'user', content: 'weather?' }], tools: [{ type: 'function', function: { name: 'weather' } }] }), headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` } });

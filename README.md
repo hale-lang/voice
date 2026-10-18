@@ -14,10 +14,10 @@ settled direction in [`DIRECTION.md`](./DIRECTION.md).
 **Status:** the specification, and the api and the node on their way
 from a stub to the real thing: configuration (the catalog, accounts, nodes
 and seats, projects, budgets, limits and keys, with the change log), the
-caller's view of it, the node plane, and inference served by a node's
-static seat over NATS are real; usage, the route table and the admin event
-stream still answer a canned happy path (below), and streamed responses
-wait on hale's streaming. The contract comes first.
+caller's view of it, the node plane, the brain and its route table, and
+inference served by a node's static seat over NATS, streamed or not, are
+real; usage and the admin event stream still answer a canned happy path
+(below). The contract comes first.
 
 ## The api
 
@@ -75,13 +75,27 @@ request id and the attempts in `error.voice`. A seat whose node holds a
 local cap of 0 is not offered. Chat Completions messages are converted to
 the standard's input items (content parts, tool calls and tool results),
 and what has no standard form is refused `400 unsupported`. The api serves
-its callers one at a time, and opens a NATS connection for each attempt. A request with `"stream": true` is answered `400 unsupported`:
-hale's `std::http::Server` cannot stream a response body yet.
-A request body over 1 MiB is refused by the server before voice reads it,
-`413` in plain text, though the contract allows 12 MiB and a JSON error
-(see [`FRICTION.md`](./FRICTION.md)).
+its callers one at a time, and opens a NATS connection for each attempt.
+With `"stream": true` the answer is Server-Sent Events over a chunked
+body (hale's `std::http::SseWriter`): `/v1/responses` sends the standard
+event stream, a `voice:attempt` event before the next seat's first when a
+seat fails before output, the terminal event with `voice`, then `data:
+[DONE]`; `/v1/chat/completions` sends `chat.completion.chunk`s, the last
+with `usage` and `voice`, then `data: [DONE]`. The stream opens at the
+first event a seat sends, so a request every seat refuses is still answered
+whole. A seat that fails once the stream has begun ends it with the
+evidence: an `error` event and `response.failed` carrying the response so
+far with `voice`, or a last chunk finished `error` with an `error` object
+and `voice`; a truncated answer never ends as a complete one. A seat is
+waited for between events (30 s, `--seat-idle-s`), and a waiting stream
+gets an SSE comment every 15 s; a caller that goes away ends the stream at
+once and its seat is sent `cancel`. A request body is at most 2 MiB for
+now (the contract's 12 MiB returns once hale's Server reads a body in linear
+memory; FRICTION.md); a larger one is answered `413 request_too_large` in
+the contract's envelope before it is read, and a chunked one (hale's Server reads `Content-Length`
+bodies only) is refused `400`.
 
-Usage, the route table and the admin event stream answer their happy path:
+Usage and the admin event stream answer their happy path:
 a canned body from [`api/canned/`](./api/canned/), one file per
 `operationId`. Each is replaced by a row as it is made real.
 
@@ -110,7 +124,7 @@ write.
 After a change to a row, export it again and commit the result.
 
 The bundle is the surface's own shape, not the REST wire's: a row is
-`POST /call/<member>`, and its types say what the codec of hale 0.24.0 can
+`POST /call/<member>`, and its types say what the codec of hale 0.25.0 can
 carry. [`api/gaps.json`](./api/gaps.json) lists every place
 where a row's type differs from the contract schema it stands for, each
 with what closes it, and `spec/validate/bundle.mjs` (`npm run bundle`)
@@ -130,7 +144,6 @@ refuse:
 | `optional` | hale-lang/hale#1600, optional fields: a `null` today rides as a flag (`priced`, `any`, `set_*`) or an empty value |
 | `enum` | hale's step 0, enums: an enum is a `String` today |
 | `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
-| `name` | hale: a valid, stable schema name for an imported type (the export names them `st::X`, which OpenAPI refuses) |
 | `wrapper` | hale: a `bounded` field assigned whole; a list rides in a record (`Names { items }`) |
 | `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
 | `path` | voice: a path or query parameter carried in the row's request |

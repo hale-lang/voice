@@ -135,19 +135,6 @@ the date first (the month 1 to 12, the day within the month, leap years
 counted) and takes an offset off by hand, with exactly two digits for its
 hours and its minutes.
 
-## `std::http::Server` refuses a body over 1 MiB before the handler sees it
-
-**hale 0.24.0.** A request whose body is over 1 MiB is answered by the
-server itself: `413 Content Too Large`, `Content-Type: text/plain`, body
-`payload too large`. The handler never runs, so the answer is neither the
-contract's limit (a request body may be up to 12 MiB) nor its shape (an
-`ErrorResponse` with `code`). The cap is not a knob of `std::http::Server`.
-
-**Working shape:** none in voice; the contract stays at 12 MiB and the
-JSON error. A request between 1 and 12 MiB (a long conversation, an
-attached file) is refused with plain text until the server's cap can be
-set (`TODO` in `api/inference.hl`, a line in the README).
-
 ## A NATS client held for the api's life grows with every served request
 
 **hale 0.24.0, pond `realtime/nats` at `697852f`.** The api first held one
@@ -253,15 +240,33 @@ method name, as `draining` and `drain` are.
 
 ## `hale api export`'s OpenAPI form does not lint
 
-**hale 0.24.0.** The exported `Voice.openapi.json` fails `redocly lint`
-with ten errors. Nine are component names: a type from an imported seed is
-named by its alias (`st::Names`), and `::` is not allowed in an OpenAPI
-component key. The tenth is the missing `servers`. Every field of a row
-that has a default is optional in the export, so a type whose fields all
-have defaults requires nothing.
+**hale 0.24.0; narrowed in 0.25.0.** The exported `Voice.openapi.json`
+failed `redocly lint` with ten errors: nine component names (a type from an
+imported seed was named by its alias, `st::Names`, and `::` is not allowed
+in an OpenAPI component key) and the missing `servers`. hale 0.25.0 names
+imported types plainly, so one error is left: no `servers`. Every field of
+a row that has a default is optional in the export, so a type whose fields
+all have defaults requires nothing.
 
 **Working shape:** the bundle is committed as exported, and its drift is
 checked with `hale api export --check`. Its fit to the contract is checked
 field by field instead of by linting (`spec/validate/bundle.mjs`), with
-each gap classed in `api/gaps.json`; the `name` gaps wait on stable
-names for imported types.
+each gap classed in `api/gaps.json`.
+
+## A bounded list can't be returned by value from a fn
+
+**hale 0.25.0.** `fn names() -> bounded[String; 4] { let mut r = Row { }; push(r.names, "a") or discard; return r.names; }` (with `type Row { names: bounded[String; 4]; }`) typechecks, then fails the build: "codegen error: unsupported in codegen v0: bounded[T; N] cannot be returned by value — it lives inline in its containing type".
+
+**Working shape:** a function returns a record that holds the list (`Names { items }`), and since 0.25.0 a caller assigns the field whole (`row.owners = names_of(x).items`).
+
+## `std::http::Server` does not read a chunked request body
+
+**hale 0.25.0.** A request sent with `Transfer-Encoding: chunked` and no `Content-Length` reaches the handler with an empty body: the Server reads `Content-Length` bodies only, a deferral hale named with its streamed responses (hale-lang/hale#1596). The body cap and its `413` hold only for bodies with a `Content-Length`, which the usual SDKs send.
+
+**Working shape:** the api refuses a chunked request body `400 invalid_request`, saying a chunked body is not accepted and `Content-Length` is required (`whole_body` in `api/endpoints.hl`), instead of reading it as a body that is not JSON.
+
+## `std::http::Server` reassembles a request body in memory quadratic in its size
+
+**hale 0.25.0.** The connection loop (`__http_handle_one_conn`, io_tcp_serve.hl) grows the request with `raw = raw + chunk` per 8 KiB `recv`, and every prefix stays until the connection is served. A handler that only answers `len(req.body)` peaks at 74 MB for a 1 MiB body, 274 MB for 2 MiB, 1.07 GB for 4 MiB and 4.2 GB for 8 MiB; an 11 MiB body took the api to 7.7 GB, before its handler ran (so before any key is checked). It stayed hidden under the 1 MiB default cap; `max_request_bytes` at the contract's 12 MiB makes a 12 MiB body cost about 9.5 GB.
+
+**Working shape:** the api's cap is 2 MiB until then (`MAX_REQUEST_BYTES`, api/main.hl; about 274 MB worst case), still answered `413 request_too_large` in the contract's envelope. The contract's 12 MiB returns when a hale release reads the body in linear memory (a `std::bytes::BytesBuilder` in place of `raw = raw + chunk`).

@@ -17,14 +17,16 @@ main locus Api {
         node_nats: String = "";
         ui: String = "";
         database: String = "";
+        // seconds a seat may go silent before it has failed
+        idle_s: Int = 30;
         instance: String = "";
         pulse: Pulse = Pulse { database: self.database, instance: self.instance };
     }
     placement { pulse: pinned; }
-    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database); }
+    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.idle_s); }
 }
 
-fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String) {
+fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, idle_s: Int) {
     println("voice api on http://", host, ":", port, "; canned bodies from ", canned);
     println("voice api: nodes over NATS at ", nats, if len(node_nats) > 0 { " (" + node_nats + " from the nodes' side)" } else { "" });
     if len(ui) > 0 { println("voice api: serving the admin ui from ", ui); }
@@ -32,13 +34,32 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
         let d = st::parse_dsn(database);
         println("voice api: the store is Postgres at ", d.host, ":", d.port);
         let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
-        std::http::Server { host: host, port: port, handler: endpoints };
+        endpoints.inference.idle = idle_s * 1s;
+        std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     } else {
         println("voice api: the store is in memory (lost on restart)");
         let endpoints = Endpoints { canned: canned, ui: ui, link: NatsLink { url: nats, node_url: node_nats } };
-        std::http::Server { host: host, port: port, handler: endpoints };
+        endpoints.inference.idle = idle_s * 1s;
+        std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     }
 }
+
+/// A request body is at most 2 MiB for now; the contract's is 12 MiB
+/// (openapi.yaml). hale 0.25.0's Server reads a body in memory quadratic in
+/// its size before the handler runs, so before any key is checked: 12 MiB
+/// costs about 9.5 GB, 2 MiB about 274 MB (FRICTION.md).
+// TODO(hale: linear request body read in std::http::Server): raise this to
+// the contract's 12 MiB (12582912) once a hale release reads the body into a
+// BytesBuilder instead of `raw = raw + chunk` (__http_handle_one_conn).
+const MAX_REQUEST_BYTES: Int = 2097152;
+
+/// The answer to a body over the cap, in the contract's envelope
+/// (`TooLarge`); the Server sends it before reading the body.
+fn too_large() -> std::http::Response {
+    return std::http::Response { status: 413, content_type: "application/json", body: TOO_LARGE };
+}
+
+const TOO_LARGE: String = "{\"error\": {\"message\": \"a request body is at most 2 MiB\", \"type\": \"invalid_request\", \"code\": \"request_too_large\", \"param\": null}}";
 
 /// The migrations, in order: each a file of `dir`, store.md's SQL.
 const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n";
@@ -102,13 +123,14 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 }
 
 /// `api [--host H] [--port N] [--canned DIR] [--nats URL] [--node-nats URL]
-/// [--ui DIR] [--database URL]`, or `api migrate --database URL
+/// [--ui DIR] [--database URL] [--seat-idle-s N]`, or `api migrate --database URL
 /// [--migrations DIR]`. The canned and migrations directories default to
 /// `canned` and `migrations` beside the binary; with no `--ui` the app is
 /// not served. `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
 /// is `postgres://user:password@host:port/database`; without it the store
-/// is in memory.
+/// is in memory. `--seat-idle-s` is how long a seat may send nothing before
+/// it has failed (30 s).
 fn main() {
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
@@ -119,6 +141,7 @@ fn main() {
     let mut nats = "nats://127.0.0.1:4222";
     let mut node_nats = "";
     let mut ui = "";
+    let mut idle_s = 30;
     let mut i = if migrating { 2 } else { 1 };
     while i + 1 < std::env::args_count() {
         let flag = std::env::arg(i);
@@ -143,6 +166,12 @@ fn main() {
             migrations = value;
         } else if flag == "--ui" {
             ui = value;
+        } else if flag == "--seat-idle-s" {
+            idle_s = std::str::parse_int(value) or - 1;
+            if idle_s < 1 {
+                eprintln("voice api: --seat-idle-s takes a number of seconds, not ", value);
+                std::process::exit(2);
+            }
         }
         i = i + 2;
     }
@@ -155,7 +184,7 @@ fn main() {
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
     let id = st::random_id(6);
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, instance: "api-" + id };
+    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, idle_s: idle_s, instance: "api-" + id };
 }
 
 /// `name` in the directory holding the running binary, or `name` as given

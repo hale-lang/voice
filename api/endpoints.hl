@@ -40,6 +40,7 @@ locus Endpoints {
 
     fn route(req: std::http::Request) -> std::http::Response fallible(ApiError) {
         let c = std::http::build_context(req);
+        whole_body(req) or raise;
         admin_body(req) or raise;
 
         // health
@@ -319,6 +320,11 @@ locus Endpoints {
     fn infer(req: std::http::Request, endpoint: String) -> std::http::Response fallible(ApiError) {
         let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
         let r = read_inference(req.body, endpoint) or raise;
+        if r.stream {
+            // the standard event stream, on this connection (stream.hl)
+            let out = EventStream { conn_fd: req.conn_fd };
+            return self.inference.stream(r, ctx, out) or raise;
+        }
         if endpoint == "chat" {
             let s = self.inference.chat(r, ctx) or raise;
             return served_answer(s.request_id, chat_completion_json(s));
@@ -356,6 +362,17 @@ fn failed(e: ApiError) -> std::http::Response {
         return std::http::Response { status: 401, content_type: "application/json", headers: "WWW-Authenticate: Bearer", body: error_json(e) };
     }
     return json_answer(e.status, error_json(e));
+}
+
+/// A request body comes with its `Content-Length`. hale's Server does not
+/// read a chunked one (`Transfer-Encoding: chunked`; FRICTION.md), so the
+/// handler would see it empty: it is refused for what it is, not as a body
+/// that is not JSON.
+fn whole_body(req: std::http::Request) -> Bool fallible(ApiError) {
+    if std::str::contains(std::str::lower(std::http::header(req, "Transfer-Encoding")), "chunked") {
+        fail invalid("a chunked request body is not accepted: send it with Content-Length", "");
+    }
+    return true;
 }
 
 /// An admin-plane write carries its body as JSON, as the contract declares,

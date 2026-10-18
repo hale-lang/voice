@@ -5,19 +5,16 @@
 // limit carries no `remaining`; the counters come with reservation.
 
 /// `Budget`: the allowance in its current window. `window_end` is `null`
-/// (`ends` false) for a lifetime cap.
+/// for a lifetime cap.
 type Budget {
     set: st::BudgetSet = st::BudgetSet { period: st::Period::month };
     spent_micros: Int = 0;
     reserved_micros: Int = 0;
     remaining_micros: Int = 0;
     window_start: Time = `1970-01-01T00:00:00Z`;
-    ends: Bool = false;
+    has_window_end: Bool = false;
     window_end: Time = `1970-01-01T00:00:00Z`;
 }
-
-/// A project's budget, or none (`null`).
-type MaybeBudget { present: Bool = false; budget: Budget = Budget { }; }
 
 /// `PUT .../budget` for the project the path names.
 type BudgetRequest { project: String; set: st::BudgetSet = st::BudgetSet { period: st::Period::month }; anchored: Bool = false; }
@@ -125,7 +122,7 @@ fn budget_view(b: st::BudgetSet, now: Time) -> Budget {
         let span = if b.period == st::Period::day { 86400 } else { 7 * 86400 };
         let start = if at < anchor { anchor } else { anchor + ((at - anchor) / span) * span };
         out.window_start = std::time::time_from_unix(start);
-        out.ends = true;
+        out.has_window_end = true;
         out.window_end = std::time::time_from_unix(start + span);
         return out;
     }
@@ -138,7 +135,7 @@ fn budget_view(b: st::BudgetSet, now: Time) -> Budget {
     let start = add_months(b.period_anchor, k);
     let end = add_months(b.period_anchor, k + 1);
     out.window_start = start;
-    out.ends = true;
+    out.has_window_end = true;
     out.window_end = end;
     return out;
 }
@@ -164,7 +161,7 @@ fn read_limit(obj: String) -> st::Limit fallible(ApiError) {
     let raw = std::str::trim(std::json::find_field_raw(obj, "window_seconds"));
     if kind_of(obj, "window_seconds") != "number" || !is_integer(raw) { fail invalid("a limit's `window_seconds` is a required integer", "window_seconds"); }
     let window = std::str::parse_int(raw) or fail invalid("a limit's `window_seconds` is out of range", "window_seconds");
-    return st::Limit {
+    return st::counted(st::Limit {
         scope: st::scope_of(scope),
         model: string_or(obj, "model", "") or raise,
         account: string_or(obj, "account", "") or raise,
@@ -173,7 +170,7 @@ fn read_limit(obj: String) -> st::Limit fallible(ApiError) {
         input_tokens: nullable_count(obj, "input_tokens") or raise,
         output_tokens: nullable_count(obj, "output_tokens") or raise,
         concurrent: nullable_count(obj, "concurrent") or raise
-    };
+    });
 }
 
 /// A `limits` array; empty when absent.
@@ -226,17 +223,18 @@ fn read_limits_request(body: String, project: String) -> LimitsRequest fallible(
     return r;
 }
 
-fn jnullable(n: Int) -> String {
-    return if n < 0 { "null" } else { to_string(n) };
+/// A count, or `null` when it is not set.
+fn jcount_or_null(has: Bool, n: Int) -> String {
+    return if has { to_string(n) } else { "null" };
 }
 
 fn limit_json(l: st::Limit) -> String {
     let mut out = "{\"scope\": " + jq(st::scope_name(l.scope));
     if len(l.model) > 0 { out = out + ", \"model\": " + jq(l.model); }
     if len(l.account) > 0 { out = out + ", \"account\": " + jq(l.account); }
-    return out + ", \"window_seconds\": " + to_string(l.window_seconds) + ", \"requests\": " + jnullable(l.requests)
-        + ", \"input_tokens\": " + jnullable(l.input_tokens) + ", \"output_tokens\": " + jnullable(l.output_tokens)
-        + ", \"concurrent\": " + jnullable(l.concurrent) + "}";
+    return out + ", \"window_seconds\": " + to_string(l.window_seconds) + ", \"requests\": " + jcount_or_null(l.has_requests, l.requests)
+        + ", \"input_tokens\": " + jcount_or_null(l.has_input_tokens, l.input_tokens) + ", \"output_tokens\": " + jcount_or_null(l.has_output_tokens, l.output_tokens)
+        + ", \"concurrent\": " + jcount_or_null(l.has_concurrent, l.concurrent) + "}";
 }
 
 fn limits_json(ls: bounded[st::Limit; 16]) -> String {
@@ -257,9 +255,5 @@ fn budget_json(b: Budget) -> String {
     return "{\"allowance_micros\": " + to_string(b.set.allowance_micros) + ", \"currency\": " + jq(b.set.currency) + ", \"period\": " + jq(st::period_name(b.set.period))
         + ", \"period_anchor\": " + jtime(b.set.period_anchor) + ", \"spent_micros\": " + to_string(b.spent_micros)
         + ", \"reserved_micros\": " + to_string(b.reserved_micros) + ", \"remaining_micros\": " + to_string(b.remaining_micros)
-        + ", \"window_start\": " + jtime(b.window_start) + ", \"window_end\": " + jtime_or_null(b.ends, b.window_end) + "}";
-}
-
-fn maybe_budget_json(b: MaybeBudget) -> String {
-    return if b.present { budget_json(b.budget) } else { "null" };
+        + ", \"window_start\": " + jtime(b.window_start) + ", \"window_end\": " + jtime_or_null(b.has_window_end, b.window_end) + "}";
 }

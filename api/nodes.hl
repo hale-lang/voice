@@ -75,7 +75,8 @@ type SeatView {
     enabled: Bool = true;
     config: String = "{}";
     status: SeatStatus;
-    // the node's reason, "" for `null`
+    // the node's reason
+    has_reason: Bool = false;
     reason: String = "";
     in_flight: Int = 0;
     problems: bounded[String; 8];
@@ -86,30 +87,36 @@ type SeatViews { items: bounded[SeatView; 16]; }
 type SeatList { data: bounded[SeatView; 16]; }
 
 /// `Node`, and `NodeWithToken` when `enrollment_token` is set (only the
-/// answers to its creation and to a rotation). `max_in_flight` -1 is `null`.
+/// answers to its creation and to a rotation). A field whose flag is false
+/// is `null`.
 type Node {
     id: String = "";
     name: String = "";
     status: NodeStatus;
     // the node software's version, its capabilities and local controls as
-    // it last declared them: "" for `null` until it first registers
+    // it last declared them, until it first registers
+    has_version: Bool = false;
     version: String = "";
+    has_capabilities: Bool = false;
     capabilities: String = "";
+    has_local: Bool = false;
     local: String = "";
+    has_max_in_flight: Bool = false;
     max_in_flight: Int = -1;
-    // -1 for `null` until it first registers
+    // until it first registers
+    has_effective_max_in_flight: Bool = false;
     effective_max_in_flight: Int = -1;
     in_flight: Int = 0;
     assignment_version: Int = 0;
-    // -1 for `null`
+    has_applied_version: Bool = false;
     applied_version: Int = -1;
     seats: bounded[SeatView; 16];
-    connected: Bool = false;
+    has_connected_at: Bool = false;
     connected_at: Time = `1970-01-01T00:00:00Z`;
-    beating: Bool = false;
+    has_last_heartbeat_at: Bool = false;
     last_heartbeat_at: Time = `1970-01-01T00:00:00Z`;
     created_at: Time = `1970-01-01T00:00:00Z`;
-    revoked: Bool = false;
+    has_revoked_at: Bool = false;
     revoked_at: Time = `1970-01-01T00:00:00Z`;
     enrollment_token: String = "";
 }
@@ -248,24 +255,31 @@ locus Nodes {
         let seats = self.store.seats() or fail store_failed(err);
         let f = self.store.fleet(r.id) or fail store_failed(err);
         let b = self.store.beat(r.id) or fail store_failed(err);
+        let effective = effective_cap(self.store, r) or raise;
         let mut v = Node {
             id: r.id,
             name: r.name,
             status: node_state_of(node_status(self.store, r, now_seconds()) or raise),
+            has_version: len(f.version) > 0,
             version: f.version,
+            has_capabilities: len(f.capabilities) > 0,
             capabilities: f.capabilities,
+            has_local: len(f.local) > 0,
             local: f.local,
+            has_max_in_flight: r.max_in_flight >= 0,
             max_in_flight: r.max_in_flight,
-            effective_max_in_flight: effective_cap(self.store, r) or raise,
+            has_effective_max_in_flight: effective >= 0,
+            effective_max_in_flight: effective,
             in_flight: b.in_flight,
             assignment_version: r.assignment_version,
+            has_applied_version: f.applied_version >= 0,
             applied_version: f.applied_version,
-            connected: f.present,
+            has_connected_at: f.present,
             connected_at: f.registered_at,
-            beating: b.present,
+            has_last_heartbeat_at: b.present,
             last_heartbeat_at: b.at,
             created_at: r.created_at,
-            revoked: r.revoked,
+            has_revoked_at: r.revoked,
             revoked_at: r.revoked_at
         };
         for s in seats.rows {
@@ -451,6 +465,7 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatView falli
             for st in states.rows {
                 if st.seat == s.id {
                     v.status = seat_status_of(st.status);
+                    v.has_reason = len(st.reason) > 0;
                     v.reason = st.reason;
                     v.in_flight = st.in_flight;
                 }
@@ -519,7 +534,8 @@ fn serves_field(body: String) -> st::SeatModels fallible(ApiError) {
     while !it.done {
         let e = std::str::trim(it.element);
         if !std::json::valid_object(e) { fail invalid("each of `serves` is an object naming its `model`", "serves"); }
-        let m = st::SeatModel { model: required_string(e, "model") or raise, engine_name: nullable_string(e, "as") or raise };
+        let engine_name = nullable_string(e, "as") or raise;
+        let m = st::SeatModel { model: required_string(e, "model") or raise, has_engine_name: len(engine_name) > 0, engine_name: engine_name };
         push(out.items, m) or fail invalid("`serves` holds at most 16 models", "serves");
         it = std::json::array_next(it);
     }
@@ -612,7 +628,7 @@ fn seat_json(s: SeatView) -> String {
     return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": " + st::serves_json(s.serves)
         + ", \"data_classes\": " + st::jnames(s.data_classes) + ", \"concurrency\": " + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
         + ", \"config\": " + s.config + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(seat_status_name(s.status))
-        + ", \"reason\": " + (if len(s.reason) > 0 { jq(s.reason) } else { "null" }) + ", \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
+        + ", \"reason\": " + jstring_or_null(s.has_reason, s.reason) + ", \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
 }
 
 fn seat_list_json(l: SeatList) -> String {
@@ -632,12 +648,12 @@ fn node_json(n: Node) -> String {
     }
     let seats = seats_list.text();
     let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(node_state_name(n.status))
-        + ", \"version\": " + (if len(n.version) > 0 { jq(n.version) } else { "null" }) + ", \"capabilities\": " + jraw_or_null(n.capabilities)
-        + ", \"local\": " + jraw_or_null(n.local) + ", \"max_in_flight\": " + jnullable(n.max_in_flight)
-        + ", \"effective_max_in_flight\": " + jnullable(n.effective_max_in_flight) + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
-        + ", \"applied_version\": " + jnullable(n.applied_version) + ", \"seats\": [" + seats + "], \"connected_at\": " + jtime_or_null(n.connected, n.connected_at)
-        + ", \"last_heartbeat_at\": " + jtime_or_null(n.beating, n.last_heartbeat_at)
-        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.revoked, n.revoked_at);
+        + ", \"version\": " + jstring_or_null(n.has_version, n.version) + ", \"capabilities\": " + jraw_if(n.has_capabilities, n.capabilities)
+        + ", \"local\": " + jraw_if(n.has_local, n.local) + ", \"max_in_flight\": " + jcount_or_null(n.has_max_in_flight, n.max_in_flight)
+        + ", \"effective_max_in_flight\": " + jcount_or_null(n.has_effective_max_in_flight, n.effective_max_in_flight) + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
+        + ", \"applied_version\": " + jcount_or_null(n.has_applied_version, n.applied_version) + ", \"seats\": [" + seats + "], \"connected_at\": " + jtime_or_null(n.has_connected_at, n.connected_at)
+        + ", \"last_heartbeat_at\": " + jtime_or_null(n.has_last_heartbeat_at, n.last_heartbeat_at)
+        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.has_revoked_at, n.revoked_at);
     if len(n.enrollment_token) > 0 { out = out + ", \"enrollment_token\": " + jq(n.enrollment_token); }
     return out + "}";
 }
@@ -647,8 +663,8 @@ fn node_json(n: Node) -> String {
 /// change would make the log grow with the fleet on each node edit.
 fn node_change_json(n: Node) -> String {
     return "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(node_state_name(n.status))
-        + ", \"max_in_flight\": " + jnullable(n.max_in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
-        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.revoked, n.revoked_at) + "}";
+        + ", \"max_in_flight\": " + jcount_or_null(n.has_max_in_flight, n.max_in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
+        + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": " + jtime_or_null(n.has_revoked_at, n.revoked_at) + "}";
 }
 
 fn node_list_json(l: NodeList) -> String {

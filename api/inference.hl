@@ -35,18 +35,30 @@ type InferenceRequest {
     body: String = "{}";
 }
 
-/// `Served`: what actually served a request. `provider` "" is `null`.
+/// `Served`: what actually served a request.
 type ServedBy {
     model: String = "";
+    has_quantization: Bool = false;
+    quantization: String = "";
     node: String = "";
     seat: String = "";
     account: String = "";
     engine: String = "";
+    has_provider: Bool = false;
     provider: String = "";
 }
 
-/// `Attempt`. `error` "" when it served.
-type Attempt { seat: String = ""; account: String = ""; outcome: AttemptOutcome; error: String = ""; wall_ms: Int = 0; }
+/// `Attempt`. `error` "" when it served; nothing is counted yet, so no
+/// output is known before a failure.
+type Attempt {
+    seat: String = "";
+    account: String = "";
+    outcome: AttemptOutcome;
+    error: String = "";
+    has_output_tokens_before_failure: Bool = false;
+    output_tokens_before_failure: Int = 0;
+    wall_ms: Int = 0;
+}
 
 type Attempts { items: bounded[Attempt; 8]; }
 
@@ -241,26 +253,26 @@ locus Inference {
     /// or the refusal.
     fn admit(r: InferenceRequest, ctx: std::api::Context) -> Candidates fallible(ApiError) {
         if len(r.previous_response_id) > 0 {
-            fail ApiError { status: 400, kind: "invalid_request", code: ErrorCode::previous_response_not_found, message: "responses are not stored, so no previous response can be continued", param: "previous_response_id" };
+            fail ApiError { status: 400, kind: "invalid_request", code: ErrorCode::previous_response_not_found, message: "responses are not stored, so no previous response can be continued", has_param: true, param: "previous_response_id" };
         }
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         if !k.present { fail invalid_key(); }
         let p = self.store.project(k.project) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
         if !m.present || m.removed {
-            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model + " in the catalog", param: "model" };
+            fail ApiError { status: 404, kind: "not_found", code: ErrorCode::model_not_found, message: "no model " + r.model + " in the catalog", has_param: true, param: "model" };
         }
         if !visible(p, k, r.model) {
-            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::model_not_permitted, message: "this key may not use model " + r.model, param: "model" };
+            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::model_not_permitted, message: "this key may not use model " + r.model, has_param: true, param: "model" };
         }
         if len(r.account) > 0 {
             let a = self.store.account(r.account) or fail metering_failed(err);
             if !a.present || a.archived || !allows(p.accounts, r.account) || !allows(k.accounts, r.account) {
-                fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::account_not_permitted, message: "this key may not spend account " + r.account, param: "voice.account" };
+                fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::account_not_permitted, message: "this key may not spend account " + r.account, has_param: true, param: "voice.account" };
             }
         }
         if !has_name(p.data_classes.items, r.data_class) {
-            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::data_class_refused, message: "project " + p.id + " may not send data of class " + r.data_class, param: "voice.data_class" };
+            fail ApiError { status: 403, kind: "permission_error", code: ErrorCode::data_class_refused, message: "project " + p.id + " may not send data of class " + r.data_class, has_param: true, param: "voice.data_class" };
         }
 
         let seats = self.store.seats() or fail metering_failed(err);
@@ -270,7 +282,7 @@ locus Inference {
                 if sm.model == r.model {
                     out.serving = out.serving + 1;
                     let eligible = self.eligible(s, p, k, r) or raise;
-                    if eligible { push(out.items, Candidate { seat: s, engine_name: sm.engine_name }) or discard; }
+                    if eligible { push(out.items, Candidate { seat: s, engine_name: if sm.has_engine_name { sm.engine_name } else { "" } }) or discard; }
                 }
             }
         }
@@ -604,8 +616,8 @@ fn voice_json(v: VoiceExtension) -> String {
     let attempts = attempts_json(v.attempts);
     let s = v.served;
     return "{\"request_id\": " + jq(v.request_id) + ", \"project\": " + jq(v.project) + ", \"key\": " + jq(v.key)
-        + ", \"served\": {\"model\": " + jq(s.model) + ", \"quantization\": null, \"node\": " + jq(s.node) + ", \"seat\": " + jq(s.seat)
-        + ", \"account\": " + jq(s.account) + ", \"engine\": " + jq(s.engine) + ", \"provider\": " + (if len(s.provider) > 0 { jq(s.provider) } else { "null" }) + "}"
+        + ", \"served\": {\"model\": " + jq(s.model) + ", \"quantization\": " + jstring_or_null(s.has_quantization, s.quantization) + ", \"node\": " + jq(s.node) + ", \"seat\": " + jq(s.seat)
+        + ", \"account\": " + jq(s.account) + ", \"engine\": " + jq(s.engine) + ", \"provider\": " + jstring_or_null(s.has_provider, s.provider) + "}"
         + ", \"price_micros\": " + to_string(v.price_micros) + ", \"currency\": " + jq(v.currency)
         + ", \"timing\": {\"wall_ms\": " + to_string(v.wall_ms) + ", \"queue_ms\": 0, \"load_ms\": 0}, \"attempts\": " + attempts + "}";
 }

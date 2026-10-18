@@ -44,7 +44,9 @@ if [ -n "${DATABASE_URL:-}" ]; then
   api/api migrate --database "$DATABASE_URL" --migrations store/migrations
   store=(--database "$DATABASE_URL")
 fi
-api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" "${store[@]}" >"$work/api.log" 2>&1 &
+# a seat silent for 10 s has failed (30 s by default), so the steps that kill
+# a node mid-stream end in seconds
+api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 
@@ -59,7 +61,8 @@ token=$(post /admin/v1/nodes '{"id": "laptop"}' | field enrollment_token)
 post /admin/v1/nodes/laptop/seats '{"id": "static", "engine": "static", "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 
 node/node --id laptop --api "$api" --token "$token" --data "$work/node-data" --capabilities deploy/node/capabilities.json --port "$NODE_PORT" >"$work/node.log" 2>&1 &
-pids+=($!)
+laptop_pid=$!
+pids+=($laptop_pid)
 
 seat_status() { curl -fsS "$api/admin/v1/nodes/laptop/seats/static" | field status; }
 wait_for() {
@@ -74,14 +77,36 @@ echo "laptop/static is up"
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
 
 # a body over 12 MiB is answered 413 in the contract's envelope, unread;
-# one just under it is served (deploy/nats/nats.conf allows 16 MiB)
+# one over the Server's old 1 MiB default is served (deploy/nats/nats.conf
+# allows 16 MiB). 3 MiB, not just under the cap: hale's Server reassembles a
+# body in memory quadratic in its size (FRICTION.md), 11 MiB costing ~8 GB.
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (11 * 1024 * 1024)}))' >"$work/near.json"
-big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json")
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (3 * 1024 * 1024)}))' >"$work/near.json"
+# (the api answers before reading, so curl may fail sending the rest)
+big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
 case "$big" in *'"code": "request_too_large"'*413) echo "a 13 MiB body is refused 413 request_too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
-near=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json")
-[ "$near" = "200" ] || { echo "an 11 MiB body was answered $near"; exit 1; }
-echo "an 11 MiB body is served, through a 16 MiB NATS message"
+near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
+[ "$near" = "200" ] || { echo "a 3 MiB body was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
+echo "a 3 MiB body is served, through a NATS message over the 1 MiB default"
+
+# a caller that goes away mid-stream: the api stops at once, tells the seat
+# to stop, and answers the next caller
+slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
+wait_for up
+curl -s -N --max-time 2 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/left.sse" || true
+t0=$(date +%s%N)
+health_ms=$(curl -fsS -o /dev/null -w '%{time_total}' "$api/healthz")
+for i in $(seq 1 50); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+stopped_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$stopped_ms" -lt 2000 ] || { echo "the seat served on $stopped_ms ms after its caller left"; cat "$work/node.log"; exit 1; }
+python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)' "$health_ms" || { echo "/healthz waited $health_ms s behind a caller that left"; exit 1; }
+echo "a caller that left after 2 s of a 20 s stream: the seat stopped within $stopped_ms ms, /healthz answered in $health_ms s"
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+wait_for up
 
 # a local pause only restricts: the seat is held, and nothing serves
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "max_in_flight": null, "reason": "e2e"}' >/dev/null
@@ -193,7 +218,8 @@ fi
 token2=$(post /admin/v1/nodes '{"id": "mini"}' | field enrollment_token)
 post /admin/v1/nodes/mini/seats '{"id": "steady", "engine": "static", "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "from the mini"}}' >/dev/null
 node/node --id mini --api "$api" --token "$token2" --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
-pids+=($!)
+mini_pid=$!
+pids+=($mini_pid)
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
 for i in $(seq 1 100); do
   [ "$(seat_status)" = "up" ] && [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
@@ -233,3 +259,27 @@ wait_for up
 
 # the node's own API, with its seat, against node.yaml
 (cd spec/validate && node node-live.mjs ../../build/node.bundled.json "http://127.0.0.1:${NODE_PORT}")
+
+# a node killed mid-stream: the stream ends with the evidence, never as a
+# complete answer (laptop for a response, then mini for a chat completion)
+curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "max_in_flight": null, "reason": null}' >/dev/null
+slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
+wait_for up
+curl -s -N -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/killed.sse" &
+streaming=$!
+sleep 1.5
+kill -9 "$laptop_pid"
+wait "$streaming" || true
+(cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/responses "$work/killed.sse" failed) || { head -c 400 "$work/killed.sse"; exit 1; }
+curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d "{\"enabled\": true, ${slow:1:-1}}" >/dev/null
+for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
+curl -s -N -X POST "$api/v1/chat/completions" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}], "stream": true}' >"$work/killed-chat.sse" &
+streaming=$!
+# the dead laptop takes its 5 s ack wait first, then mini streams
+for i in $(seq 1 100); do grep -q '"content": "x"' "$work/killed-chat.sse" 2>/dev/null && break; sleep 0.1; done
+sleep 1
+kill -9 "$mini_pid"
+wait "$streaming" || true
+(cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/chat/completions "$work/killed-chat.sse" failed) || { head -c 400 "$work/killed-chat.sse"; exit 1; }
+echo "a node killed mid-stream ends both streams with the evidence"

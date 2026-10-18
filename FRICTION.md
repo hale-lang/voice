@@ -258,3 +258,15 @@ each gap classed in `api/gaps.json`.
 **hale 0.25.0.** `fn names() -> bounded[String; 4] { let mut r = Row { }; push(r.names, "a") or discard; return r.names; }` (with `type Row { names: bounded[String; 4]; }`) typechecks, then fails the build: "codegen error: unsupported in codegen v0: bounded[T; N] cannot be returned by value — it lives inline in its containing type".
 
 **Working shape:** a function returns a record that holds the list (`Names { items }`), and since 0.25.0 a caller assigns the field whole (`row.owners = names_of(x).items`).
+
+## `std::http::Server` does not read a chunked request body
+
+**hale 0.25.0.** A request sent with `Transfer-Encoding: chunked` and no `Content-Length` reaches the handler with an empty body: the Server reads `Content-Length` bodies only, a deferral hale named with its streamed responses (hale-lang/hale#1596). The 12 MiB cap and its `413` hold only for bodies with a `Content-Length`, which the usual SDKs send.
+
+**Working shape:** the api refuses a chunked request body `400 invalid_request`, saying a chunked body is not accepted and `Content-Length` is required (`whole_body` in `api/endpoints.hl`), instead of reading it as a body that is not JSON.
+
+## `std::http::Server` reassembles a request body in memory quadratic in its size
+
+**hale 0.25.0.** The connection loop (`__http_handle_one_conn`, io_tcp_serve.hl) grows the request with `raw = raw + chunk` per 8 KiB `recv`, and every prefix stays until the connection is served. A handler that only answers `len(req.body)` peaks at 74 MB for a 1 MiB body, 274 MB for 2 MiB, 1.07 GB for 4 MiB and 4.2 GB for 8 MiB; an 11 MiB body took the api to 7.7 GB, before its handler ran (so before any key is checked). It stayed hidden under the 1 MiB default cap; `max_request_bytes` at the contract's 12 MiB makes a 12 MiB body cost about 9.5 GB.
+
+**Working shape:** none in voice: the cap stays at the contract's 12 MiB (`MAX_REQUEST_BYTES`, api/main.hl), and e2e serves a 3 MiB body rather than one near the cap. The fix is hale's: reassemble into a `std::bytes::BytesBuilder`.

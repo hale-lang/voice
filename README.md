@@ -83,8 +83,16 @@ seat fails before output, the terminal event with `voice`, then `data:
 [DONE]`; `/v1/chat/completions` sends `chat.completion.chunk`s, the last
 with `usage` and `voice`, then `data: [DONE]`. The stream opens at the
 first event a seat sends, so a request every seat refuses is still answered
-whole. A request body is at most 12 MiB; a larger one is answered `413
-request_too_large` in the contract's envelope before it is read.
+whole. A seat that fails once the stream has begun ends it with the
+evidence: an `error` event and `response.failed` carrying the response so
+far with `voice`, or a last chunk finished `error` with an `error` object
+and `voice`; a truncated answer never ends as a complete one. A seat is
+waited for between events (30 s, `--seat-idle-s`), and a waiting stream
+gets an SSE comment every 15 s; a caller that goes away ends the stream at
+once and its seat is sent `cancel`. A request body is at most 12 MiB; a
+larger one is answered `413 request_too_large` in the contract's envelope
+before it is read, and a chunked one (hale's Server reads `Content-Length`
+bodies only) is refused `400`.
 
 Usage and the admin event stream answer their happy path:
 a canned body from [`api/canned/`](./api/canned/), one file per

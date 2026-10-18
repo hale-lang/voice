@@ -87,8 +87,11 @@ locus Inference {
     params {
         store: st::Store;
         link: Link;
-        // how long a seat may take to answer
-        wait: Duration = 120s;
+        // how long a seat may go without sending anything before it has
+        // failed: a wait between events, not for the whole answer
+        idle: Duration = 30s;
+        // how often an open stream that is waiting gets a keep-alive comment
+        keep_alive: Duration = 15s;
     }
 
     /// `createResponse`.
@@ -119,7 +122,7 @@ locus Inference {
             n = n + 1;
             let reply_to = "voice.reply." + request_id + "." + to_string(n);
             let t0 = std::time::monotonic_ns();
-            let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.wait);
+            let o = serve_over(self.link, c.seat.node, reply_to, serve_message(request_id, reply_to, c, r), self.idle);
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
                 push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "served", wall_ms: ms }) or discard;
@@ -161,10 +164,12 @@ locus Inference {
             let mut ending = "";
             if o.ack == "accepted" {
                 st.output = false;
-                let deadline = std::time::monotonic() + self.wait;
+                // the seat has `idle` from its last message to its next
+                let mut deadline = std::time::monotonic() + self.idle;
                 let mut done = false;
                 while !done && std::time::monotonic() < deadline {
                     let msg = self.link.next(1s);
+                    if msg.kind == "event" || msg.kind == "result" { deadline = std::time::monotonic() + self.idle; }
                     if msg.kind == "event" {
                         o = take_event(o, msg.json);
                         if terminal(std::json::find_string_field(msg.json, "type")) {
@@ -182,6 +187,13 @@ locus Inference {
                         done = true;
                     } else if msg.kind == "lost" {
                         done = true;
+                    } else {
+                        out.keep_alive(self.keep_alive);
+                    }
+                    if out.gone {
+                        // the caller went away: the seat is told to stop
+                        self.link.finish();
+                        return out.end();
                     }
                 }
                 self.link.finish();
@@ -202,14 +214,15 @@ locus Inference {
             push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: "failed", error: reason, wall_ms: ms }) or discard;
             if st.output || o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
                 if out.opened {
-                    fail_stream(out, st, "upstream_failed", "seat " + why);
+                    fail_stream(out, st, "upstream_failed", "seat " + why, failed_voice(request_id, k, m, c, attempts, (std::time::monotonic_ns() - started) / 1000000));
                     return out.end();
                 }
                 fail ApiError { status: 502, kind: "model_error", code: "upstream_failed", message: "seat " + why, voice: attempts_voice(request_id, attempts) };
             }
         }
         if out.opened {
-            fail_stream(out, st, "upstream_failed", "every eligible seat failed; the last, " + why);
+            let last = at(candidates.items, count(candidates.items) - 1) or Candidate { };
+            fail_stream(out, st, "upstream_failed", "every eligible seat failed; the last, " + why, failed_voice(request_id, k, m, last, attempts, (std::time::monotonic_ns() - started) / 1000000));
             return out.end();
         }
         fail ApiError { status: 502, kind: "server_error", code: "upstream_failed", message: "every eligible seat failed; the last, " + why, voice: attempts_voice(request_id, attempts) };
@@ -277,7 +290,7 @@ fn failure_of(o: ServeOutcome) -> String {
     if o.ack == "refused" { return "refused: " + o.reason; }
     if o.ack != "accepted" { return o.ack + ": " + o.reason; }
     if o.outcome == "failed" { return "failed (" + o.error_code + "): " + o.error_message; }
-    if o.outcome == "unfinished" { return "no result within the wait"; }
+    if o.outcome == "unfinished" { return "the seat sent nothing within the idle span"; }
     return o.outcome;
 }
 
@@ -306,6 +319,21 @@ fn served(request_id: String, model: String, k: st::KeyRow, m: st::ModelRow, c: 
             wall_ms: wall_ms,
             attempts: attempts
         }
+    };
+}
+
+/// The `voice` object of a request that failed on seat `c` once its stream
+/// had begun: nothing charged, every attempt listed.
+fn failed_voice(request_id: String, k: st::KeyRow, m: st::ModelRow, c: Candidate, attempts: Attempts, wall_ms: Int) -> VoiceExtension {
+    return VoiceExtension {
+        request_id: request_id,
+        project: k.project,
+        key: k.id,
+        served: ServedBy { model: m.id, node: c.seat.node, seat: c.seat.ref, account: c.seat.account, engine: c.seat.engine },
+        price_micros: 0,
+        currency: if m.priced { m.price.currency } else { "USD" },
+        wall_ms: wall_ms,
+        attempts: attempts
     };
 }
 

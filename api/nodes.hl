@@ -10,13 +10,13 @@
 
 type NodeRef { node: String; }
 
-/// `NodeCreate`. `max_in_flight` -1 is `null`.
-type NodeCreate { id: String; name: String = ""; max_in_flight: Int = -1; }
+/// `NodeCreate`. No `max_in_flight` (or `null`) is no cap of its own.
+type NodeCreate { id: String; name: String = ""; has_max_in_flight: Bool = false; max_in_flight: Int = -1; }
 
 /// `NodeUpdate`, for the node the path names.
 type NodeUpdate {
     node: String;
-    set_name: Bool = false;
+    has_name: Bool = false;
     name: String = "";
     set_max_in_flight: Bool = false;
     max_in_flight: Int = -1;
@@ -46,19 +46,19 @@ type SeatCreate {
 type SeatUpdate {
     node: String;
     seat: String;
-    set_engine: Bool = false;
+    has_engine: Bool = false;
     engine: String = "";
-    set_account: Bool = false;
+    has_account: Bool = false;
     account: String = "";
-    set_serves: Bool = false;
+    has_serves: Bool = false;
     serves: bounded[st::SeatModel; 16];
-    set_data_classes: Bool = false;
+    has_data_classes: Bool = false;
     data_classes: bounded[String; 32];
-    set_concurrency: Bool = false;
+    has_concurrency: Bool = false;
     concurrency: Int = 1;
-    set_enabled: Bool = false;
+    has_enabled: Bool = false;
     enabled: Bool = true;
-    set_config: Bool = false;
+    has_config: Bool = false;
     config: String = "{}";
 }
 
@@ -145,10 +145,11 @@ locus Nodes {
     fn create(c: NodeCreate) -> Node fallible(ApiError) {
         if !is_slug(c.id) { fail invalid("`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63", "id"); }
         if len(c.name) > 128 { fail invalid("`name` is at most 128 characters", "name"); }
-        check_cap(c.max_in_flight) or raise;
+        let cap = if c.has_max_in_flight { c.max_in_flight } else { -1 };
+        check_cap(cap) or raise;
         let token_hex = random_hex(20) or fail entropy_failed(err.message);
         let token = "vn-" + token_hex;
-        let mut row = st::NodeRow { id: c.id, name: c.name, token_digest: secret_digest(token), max_in_flight: c.max_in_flight, created_at: now_seconds() };
+        let mut row = st::NodeRow { id: c.id, name: c.name, token_digest: secret_digest(token), max_in_flight: cap, created_at: now_seconds() };
         row.assignment_version = 1;
         let mut v = self.view(row) or raise;
         let added = self.store.insert_node(row, change("create", "nodes/" + c.id, "", node_change_json(v))) or fail store_failed(err);
@@ -178,7 +179,7 @@ locus Nodes {
     fn update_held(u: NodeUpdate) -> Node fallible(ApiError) {
         let mut row = self.known(u.node) or raise;
         let before = self.view(row) or raise;
-        if u.set_name {
+        if u.has_name {
             if len(u.name) > 128 { fail invalid("`name` is at most 128 characters", "name"); }
             row.name = u.name;
         }
@@ -380,13 +381,13 @@ locus Seats {
         let n = self.node_of(u.node) or raise;
         let mut row = self.known(u.node, u.seat) or raise;
         let before = seat_view(self.store, row, n) or raise;
-        if u.set_engine { row.engine = u.engine; }
-        if u.set_account { row.account = u.account; }
-        if u.set_serves { row.serves.items = u.serves; }
-        if u.set_data_classes { row.data_classes.items = u.data_classes; }
-        if u.set_concurrency { row.concurrency = u.concurrency; }
-        if u.set_enabled { row.enabled = u.enabled; }
-        if u.set_config { row.config = u.config; }
+        if u.has_engine { row.engine = u.engine; }
+        if u.has_account { row.account = u.account; }
+        if u.has_serves { row.serves.items = u.serves; }
+        if u.has_data_classes { row.data_classes.items = u.data_classes; }
+        if u.has_concurrency { row.concurrency = u.concurrency; }
+        if u.has_enabled { row.enabled = u.enabled; }
+        if u.has_config { row.config = u.config; }
         self.check(row) or raise;
         let after = seat_view(self.store, row, n) or raise;
         self.store.update_seat(row, change("update", seat_target(row), seat_json(before), seat_json(after))) or fail store_failed(err);
@@ -559,7 +560,8 @@ fn bool_or(body: String, name: String, otherwise: Bool) -> Bool fallible(ApiErro
 
 fn read_node_create(body: String) -> NodeCreate fallible(ApiError) {
     object_body(body) or raise;
-    return NodeCreate { id: required_string(body, "id") or raise, name: string_or(body, "name", "") or raise, max_in_flight: cap_field(body, "max_in_flight") or raise };
+    let cap = cap_field(body, "max_in_flight") or raise;
+    return NodeCreate { id: required_string(body, "id") or raise, name: string_or(body, "name", "") or raise, has_max_in_flight: cap >= 0, max_in_flight: cap };
 }
 
 fn read_node_update(body: String, node: String) -> NodeUpdate fallible(ApiError) {
@@ -567,7 +569,7 @@ fn read_node_update(body: String, node: String) -> NodeUpdate fallible(ApiError)
     if sets(body, "id") { fail invalid("a node's `id` cannot change", "id"); }
     return NodeUpdate {
         node: node,
-        set_name: sets(body, "name"),
+        has_name: sets(body, "name"),
         name: string_or(body, "name", "") or raise,
         set_max_in_flight: sets(body, "max_in_flight"),
         max_in_flight: cap_field(body, "max_in_flight") or raise
@@ -601,17 +603,17 @@ fn read_seat_update(body: String, node: String, seat: String) -> SeatUpdate fall
     let mut u = SeatUpdate {
         node: node,
         seat: seat,
-        set_engine: sets(body, "engine"),
+        has_engine: sets(body, "engine"),
         engine: string_or(body, "engine", "") or raise,
-        set_account: sets(body, "account"),
+        has_account: sets(body, "account"),
         account: string_or(body, "account", "") or raise,
-        set_serves: sets(body, "serves"),
-        set_data_classes: sets(body, "data_classes"),
-        set_concurrency: sets(body, "concurrency"),
+        has_serves: sets(body, "serves"),
+        has_data_classes: sets(body, "data_classes"),
+        has_concurrency: sets(body, "concurrency"),
         concurrency: count_or(body, "concurrency", 1) or raise,
-        set_enabled: sets(body, "enabled"),
+        has_enabled: sets(body, "enabled"),
         enabled: bool_or(body, "enabled", true) or raise,
-        set_config: sets(body, "config"),
+        has_config: sets(body, "config"),
         config: config_field(body) or raise
     };
     u.serves = serves.items;

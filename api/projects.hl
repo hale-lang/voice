@@ -26,17 +26,18 @@ locus Projects {
         let mut row = st::ProjectRow {
             id: c.id,
             name: c.name,
-            models: c.models,
-            accounts: c.accounts,
+            models: restriction_of(c.has_models, c.models),
+            accounts: restriction_of(c.has_accounts, c.accounts),
             created_at: now_seconds()
         };
         row.owners.items = c.owners;
         row.data_classes.items = c.data_classes;
         row.limits.items = c.limits;
-        if c.budgeted {
-            check_budget(c.budget.set) or raise;
+        if c.has_budget {
+            let set = budget_set_of(c.budget.allowance_micros, c.budget.currency, c.budget.period, c.budget.has_period_anchor, c.budget.period_anchor);
+            check_budget(set) or raise;
             row.budgeted = true;
-            row.budget = anchored(c.budget);
+            row.budget = set;
         }
         if count(row.data_classes.items) == 0 { push(row.data_classes.items, "internal") or discard; }
         let v = self.view(row) or raise;
@@ -66,12 +67,12 @@ locus Projects {
     fn update_held(u: ProjectUpdate) -> Project fallible(ApiError) {
         let mut row = self.known(u.project) or raise;
         let before = self.view(row) or raise;
-        if u.set_name {
+        if u.has_name {
             check_name(u.name) or raise;
             row.name = u.name;
         }
-        if u.set_owners { row.owners.items = u.owners; }
-        if u.set_data_classes { row.data_classes.items = u.data_classes; }
+        if u.has_owners { row.owners.items = u.owners; }
+        if u.has_data_classes { row.data_classes.items = u.data_classes; }
         if u.set_models { row.models = u.models; }
         if u.set_accounts { row.accounts = u.accounts; }
         self.keys_within(row) or raise;
@@ -138,11 +139,12 @@ locus Projects {
     /// `set_budget`, holding the resource from its read to its write.
     fn set_budget_held(b: BudgetRequest) -> Budget fallible(ApiError) {
         let mut row = self.known(b.project) or raise;
-        check_budget(b.set) or raise;
+        let set = budget_set_of(b.allowance_micros, b.currency, b.period, b.has_period_anchor, b.period_anchor);
+        check_budget(set) or raise;
         let now = now_seconds();
         let before = if row.budgeted { budget_json(budget_view(row.budget, now)) } else { "" };
         row.budgeted = true;
-        row.budget = anchored(b);
+        row.budget = set;
         let after = budget_view(row.budget, now);
         self.store.update_project(row, change(if len(before) > 0 { "update" } else { "create" }, "projects/" + row.id + "/budget", before, budget_json(after))) or fail store_failed(err);
         return after;
@@ -231,14 +233,6 @@ locus Projects {
     }
 }
 
-/// A budget as set: one that names no anchor counts from the start of the
-/// current calendar period.
-fn anchored(b: BudgetRequest) -> st::BudgetSet {
-    let mut set = b.set;
-    if !b.anchored { set.period_anchor = period_start(set.period, now_seconds()); }
-    return set;
-}
-
 locus Keys {
     params { store: st::Store; }
 
@@ -271,11 +265,13 @@ locus Keys {
         let p = self.project_of(c.project) or raise;
         if p.archived { fail invalid("project " + c.project + " is archived, and an archived project takes no key", ""); }
         check_name(c.name) or raise;
-        within(p.models, c.models, "models") or raise;
-        within(p.accounts, c.accounts, "accounts") or raise;
+        let models = restriction_of(c.has_models, c.models);
+        let accounts = restriction_of(c.has_accounts, c.accounts);
+        within(p.models, models, "models") or raise;
+        within(p.accounts, accounts, "accounts") or raise;
         check_limits(c.limits, "key", "limits") or raise;
         let now = now_seconds();
-        if c.expires && std::time::unix(c.expires_at) <= std::time::unix(now) { fail invalid("`expires_at` is in the past", "expires_at"); }
+        if c.has_expires_at && std::time::unix(c.expires_at) <= std::time::unix(now) { fail invalid("`expires_at` is in the past", "expires_at"); }
         let secret_hex = random_hex(20) or fail entropy_failed(err.message);
         let id_hex = random_hex(8) or fail entropy_failed(err.message);
         let secret = "vk-" + secret_hex;
@@ -286,10 +282,10 @@ locus Keys {
             name: c.name,
             prefix: secret[0..7],
             digest: secret_digest(secret),
-            models: c.models,
-            accounts: c.accounts,
+            models: models,
+            accounts: accounts,
             created_at: now,
-            expires: c.expires,
+            expires: c.has_expires_at,
             expires_at: c.expires_at
         };
         row.limits.items = c.limits;
@@ -323,7 +319,7 @@ locus Keys {
         let p = self.project_of(u.project) or raise;
         let now = now_seconds();
         let before = key_view(k, now);
-        if u.set_name {
+        if u.has_name {
             check_name(u.name) or raise;
             k.name = u.name;
         }
@@ -335,7 +331,7 @@ locus Keys {
             within(p.accounts, u.accounts, "accounts") or raise;
             k.accounts = u.accounts;
         }
-        if u.set_limits {
+        if u.has_limits {
             check_limits(u.limits, "key", "limits") or raise;
             k.limits.items = u.limits;
         }

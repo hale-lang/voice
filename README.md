@@ -150,7 +150,7 @@ refuse:
 
 | Kind | Closed by |
 |---|---|
-| `optional` | voice: a request's field that may be left out or `null` still rides as a flag (`set_*`, `priced`, `any`) or an empty value; an answer's is a presence pair (`has_x` beside `x`, hale 0.25) |
+| `tri-state` | hale: a PATCH field that may be left out (kept), `null` (cleared) or a value; a presence pair (`has_x` beside `x`) says two of the three, so the row keeps `set_<field>` |
 | `map` | hale's step 0, maps as `bounded[S; N] indexed_by <field>`: a map or free-form object is JSON text today |
 | `json-text` | voice: a structured object carried as JSON text, to type once it may be `null` |
 | `path` | voice: a path or query parameter carried in the row's request |

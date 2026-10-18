@@ -33,6 +33,7 @@ const WAITS_ON = {
   wire: 'voice: the REST wire\'s shape differs from the row (written by api/wire.hl)',
   required: 'voice: the row gives the field a default, so the surface does not require it; the REST reader does (api/wire.hl)',
   open: 'voice: the contract admits several shapes there (oneOf/anyOf, or none named); the row carries one, as the REST reader does',
+  'tri-state': 'hale: a field that may be left out, null or a value; a PATCH leaves it as it is when it is left out and clears it on null, and a presence pair reads null as left out',
 };
 
 // Each row type, and the contract schema it stands for: a component name,
@@ -271,7 +272,6 @@ const RULES = [
   [/^Capabilities\.(project_id|project_name|key_id|key_name|project|key)$/, 'wire', 'the project and the key are objects of id and name on the wire'],
   [/^ApiError\.(kind|type)$/, 'wire', 'the row\'s `kind` is the envelope\'s `type`, renamed by the wire (error_json)'],
   [/^ApiError\.status$/, 'wire', 'the HTTP status the error answers with, not a field of the envelope'],
-  [/^BudgetRequest\.(set|allowance_micros|currency|period|period_anchor)$/, 'wire', 'the body is the BudgetSet, which the row carries under `set`'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard
 // request and response, which pass through as JSON text. `Served.voice`
@@ -279,9 +279,19 @@ const RULES = [
 const WHOLE = [
   [/^(Served\.(?!voice\b)|InferenceRequest\.)/, 'the standard request and response pass through as JSON text (`body`, `response`)'],
 ];
+// A PATCH's field that the contract lets be null, where null clears it
+// and leaving it out keeps it: three states, which a presence pair (two)
+// cannot say. The row carries the field's presence as `set_<field>` and
+// null as its value's own flag or an empty value; the REST reader reads
+// all three.
+const TRI_STATE = [
+  [/^(AccountUpdate\.(provider|set_provider)|CatalogModelUpdate\.(price|priced|set_price)|KeyUpdate\.(models|accounts|expires_at|expires|set_models|set_accounts|set_expires)|NodeUpdate\.(max_in_flight|set_max_in_flight)|ProjectUpdate\.(models|accounts|set_models|set_accounts))$/,
+    'a PATCH field that may be left out (kept), null (cleared) or a value'],
+];
 // Kinds a rule may class; any other that no rule classes fails.
 const RULED = new Set(['missing', 'extra', 'type', 'over-required']);
 function reclass(at, kind) {
+  for (const [re, why] of TRI_STATE) if ((kind === 'optional' || kind === 'extra') && re.test(at)) return { kind: 'tri-state', why };
   // a shape the contract leaves open says why, wherever it is
   if (kind === 'open') {
     for (const [re, k, why, only] of RULES) if (only === 'open' && re.test(at)) return { kind: k, why };

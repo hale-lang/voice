@@ -55,8 +55,40 @@ version moves on in SQL, so no instance's write is lost or reuses a
 version (`scripts/race.sh` checks it with two instances). A store failure
 answers a fixed message with an id; what Postgres said goes to the api's
 stderr only, and nothing of the database URL is printed but its host and
-port. Without a database the store is in the process (`MemoryStore`),
-lost on restart, which is what `hale test api` runs on. Budgets are
+port. Grafted into a DNA habitat, voice's genome needs a `database`
+(the root [`hale.toml`](./hale.toml), `[dna] needs`), and when neither
+`--database` nor `VOICE_DATABASE_URL` is given the api and the brain use
+the one the habitat provisioned, `HALE_DNA_DATABASE_DSN`: a DSN with no
+password, whose `vault=` names the vault entry pq reads it from when it
+authenticates. Its own NATS, grafted, is the habitat's `broker`
+([`lib/broker`](./lib/broker/broker.hl)): `HALE_DNA_BROKER_URL`, `_USER`
+and `_VAULT` replace `--nats` and name its account, and every subject
+moves under the prefix `HALE_DNA_BROKER_SUBJECTS` grants (`voice.node.*`
+becomes `heart.<id>.node.*`, and the same for `reply` and `route`), the
+request inboxes under `HALE_DNA_BROKER_INBOX` when it is handed over and
+under the prefix when not; standalone, the subjects are `voice.*` as
+always. The nodes have their own account there
+(`HALE_DNA_BROKER_NODE_USER`, its password in the vault entry
+`HALE_DNA_BROKER_NODE_VAULT`), which a node is handed in its
+registration's answer over its enrollment-authenticated call: the api
+writes that answer itself on the node's connection, the password revealed
+into that write alone, escaped as a JSON string there, and the answer
+marked `no-store`. That account is one per heart, shared by every node today: a node
+holding it can read every node's requests and answer for another node
+(its subjects are `heart.<id>.node.>` and the replies). Per-node users,
+each held to its own subjects, come later. A hand-over is whole or
+refused: any of the broker's variables, or of the head's, set without the
+rest stops the api (and the brain) at start, rather than running it
+standalone; so does a vault without the heart's own broker password. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
+`HALE_DNA_OIDC_ISSUER`, `HALE_DNA_OIDC_CLIENT` and
+`HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
+`--issuer`, `--client` and `--client-vault` when they are set, and the
+habitat migrates the database itself (`[dna.migrations.database]` in
+`hale.toml`: `api migrate`, run at every graft, `hale habitat migrate` and
+upgrade, its own ledger making a run at the head a no-op that exits 0):
+neither the api nor the brain migrates on its own. `E2E_BROKER=grafted scripts/e2e.sh` runs the
+whole e2e on a NATS whose one account may use `heart.zz.>` alone. Without a database the store is in the process
+(`MemoryStore`), lost on restart, which is what `hale test api` runs on. Budgets are
 configuration: nothing is charged against them yet.
 
 **Rate limits** are enforced on one admission path, their limits from one
@@ -71,7 +103,8 @@ application `--application` names (its id at the head, which the head's
 `/api/hale/v1/applications` lists) through the head as a service (a
 `client_credentials` token from `--issuer` under `--client`, its secret
 the vault's `oidc-service-<client>` or `--client-vault`), every
-`--limits-every-s`, each call one attempt under a 30 s deadline
+`--limits-every-s` seconds (or `VOICE_LIMITS_EVERY_S`, which the flag
+overrides; 30 by default), each call one attempt under a 30 s deadline
 ([`api/deadline.hl`](./api/deadline.hl)). A request reads only the limits
 last read, never the head. An answer from the head must give its length
 or its chunks, and one cut short does not land, so no project goes
@@ -104,7 +137,7 @@ api/api --head http://127.0.0.1:8792 --application <id> --issuer http://127.0.0.
 end against a DNA organization, from the Board's ratification to the
 caller's 429, a superseding limit, and a head stopped with the limits
 read last standing and no answer waiting on it (`VOICE_DNA_FIXTURE=1`,
-with a hale whose record is in memory).
+with a hale whose record is in memory, v0.26.0 on).
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node
@@ -235,9 +268,17 @@ seat fail every request after that long, for drills.
 
 ```sh
 hale build node
-node/node --id laptop --api http://127.0.0.1:8080 --token vn-... --data node-data --capabilities deploy/node/capabilities.json --port 8081
+node/node --id laptop --api http://127.0.0.1:8080 --token-vault node-laptop-enrollment --data node-data --capabilities deploy/node/capabilities.json --port 8081
 hale test node
 ```
+
+The enrollment token comes from the vault entry `--token-vault` (or
+`VOICE_ENROLLMENT_TOKEN_VAULT`) names, read through `std::secret` and
+revealed only into the request it authorizes, which is how a grafted node
+is handed it. `--token vn-...` and `VOICE_ENROLLMENT_TOKEN` still work
+standalone, and the node warns that the token is in the open. A database
+URL with its password in it warns the same way; `?vault=ENTRY` in its
+place names the password's vault entry.
 
 [`scripts/e2e.sh`](./scripts/e2e.sh) runs the whole path on one machine:
 NATS (in a container of its own, or the one `NATS_URL` names), the api and
@@ -669,17 +710,23 @@ Every line the api, the brain and the node write goes through `std::log`:
 each program's `log.hl` logs under its logger (`voice.api`,
 `voice.brain`, `voice.node`; the vendored Postgres driver and migrator
 under `pq` and `migrate`), a message and its fields as logfmt (`k=v`), and
-its `main` holds the one sink, `std::log`'s StdoutSink: info on stdout,
-warnings and errors on stderr, `HALE_LOG` the threshold. Voice prints
-nothing outside it, and CI refuses a bare `print`, `println`, `eprint` or
-`eprintln` outside the tests directories. One line is not voice's: the
+its `main` holds the one sink, voice's `RecordSink`
+([`lib/logfmt`](./lib/logfmt/logfmt.hl)), which writes each event as one
+logfmt record: the event's time, its level, its logger and its message,
+then its fields. Info goes on stdout, warnings and errors on stderr; the
+record is the same on both. Each line is data a collector parses, as the
+standard pack's first clause asks (GH #1591, "Logs are structured"), and
+the attach manifest declares it ([`dna/applications/voice.toml`](./dna/applications/voice.toml)).
+Voice prints nothing outside the sink, and CI refuses a bare `print`,
+`println`, `eprint` or `eprintln` anywhere else outside the tests
+directories. One line is not voice's: the
 Hale runtime's `perror` when a client hangs up while the api writes
 (`lotus_tcp_send_str: write: Broken pipe` on stderr), which FRICTION.md
 lists for hale.
 
 ```text
-[INFO voice.api] serving url=http://127.0.0.1:8080 canned=api/canned
-[WARN voice.api] NATS unreachable nats=nats://127.0.0.1:4222 error=...
+time=2026-10-19T04:12:09Z level=info logger=voice.api msg=serving url=http://127.0.0.1:8080 canned=api/canned
+time=2026-10-19T04:12:09Z level=warn logger=voice.api msg="NATS unreachable" nats=nats://127.0.0.1:4222 error=...
 ```
 
 ## In Hale

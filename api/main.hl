@@ -15,6 +15,8 @@
 /// `HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`); without the token
 /// nothing is published and no connection is made.
 
+import "../lib/logfmt" as logfmt;
+import "../lib/broker" as broker;
 import "../lib/pond/pq" as pq;
 import "../lib/pond/migrations" as migs;
 main locus Api {
@@ -23,6 +25,8 @@ main locus Api {
         port: Int = 8080;
         canned: String = "canned";
         nats: String = "nats://127.0.0.1:4222";
+        // voice's own NATS: `nats` standalone, the habitat's broker grafted
+        broker: broker::Broker = broker::Broker { url: self.nats };
         node_nats: String = "";
         ui: String = "";
         database: String = "";
@@ -62,19 +66,19 @@ main locus Api {
         teller: pinned;
         governance: pinned;
     }
-    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org, self.head, self.held); }
+    run() { serve(self.host, self.port, self.canned, self.broker, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org, self.head, self.held); }
 }
 
-fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int, org: String, head: String, held: HeldLimits) {
+fn serve(host: String, port: Int, canned: String, b: broker::Broker, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int, org: String, head: String, held: HeldLimits) {
     log_info("serving", fields2(std::log::kv("url", "http://" + host + ":" + to_string(port)), std::log::kv("canned", canned)));
-    log_info("nodes over NATS", fields2(std::log::kv("nats", nats), std::log::kv("node_nats", if len(node_nats) > 0 { node_nats } else { nats })));
+    log_info("nodes over NATS", fields2(std::log::kv("nats", b.url), std::log::kv("node_nats", if len(node_nats) > 0 { node_nats } else { b.url })));
     if len(ui) > 0 { log_info("serving the admin ui", std::log::kv("ui", ui)); }
     if len(org) > 0 { log_info("telling the organization each served request", std::log::kv("subject", org + ".app.voice.usage.recorded")); }
     if len(head) > 0 { log_info("the rate limits are the organization's ratified practices", std::log::kv("head", head)); }
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         log_info("the store is Postgres", std::log::kv("at", d.host + ":" + to_string(d.port)));
-        let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats }, held: held };
+        let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: b.url, node_url: node_nats, user: b.user, vault: b.vault, subjects: b.root, inbox: b.inbox }, held: held, node_user: b.node_user, node_secret: std::secret::Credential { vault: b.node_vault } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
         endpoints.inference.pulse = len(org) > 0;
@@ -83,7 +87,7 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     } else {
         log_info("the store is in memory, lost on restart", "");
-        let endpoints = Endpoints { canned: canned, ui: ui, link: NatsLink { url: nats, node_url: node_nats }, held: held };
+        let endpoints = Endpoints { canned: canned, ui: ui, link: NatsLink { url: b.url, node_url: node_nats, user: b.user, vault: b.vault, subjects: b.root, inbox: b.inbox }, held: held, node_user: b.node_user, node_secret: std::secret::Credential { vault: b.node_vault } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
         endpoints.inference.pulse = len(org) > 0;
@@ -120,7 +124,7 @@ fn migrate(database: String, dir: String) -> Int {
         return 2;
     }
     let d = st::parse_dsn(database);
-    let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, database: d.database, sslmode: d.sslmode };
+    let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, vault: d.vault, database: d.database, sslmode: d.sslmode };
     let st = conn.open();
     if !st.ok {
         log_error("migrate: Postgres refused", fields2(std::log::kv("at", d.host + ":" + to_string(d.port)), fields2(std::log::kv("kind", st.err.kind), std::log::kv("detail", st::redact(st.err.detail, d)))));
@@ -173,14 +177,16 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 /// `canned` and `migrations` beside the binary; with no `--ui` the app is
 /// not served. `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
-/// is `postgres://user:password@host:port/database`; without it the store
-/// is in memory. `--seat-first-s` is how long a seat may take to its first
+/// is `postgres://user:password@host:port/database`; without either, a
+/// grafted api's database is the one the habitat hands it
+/// (`HALE_DNA_DATABASE_DSN`, its password in the vault entry it names), and
+/// a standalone one's store is in memory. `--seat-first-s` is how long a seat may take to its first
 /// output (120 s: a slow model, or an engine that answers at the end), and
 /// `--seat-idle-s` how long it may then send nothing (30 s), before it has
 /// failed.
 fn main() {
     // the one sink: every logger's lines are written here (log.hl)
-    let sink = std::log::StdoutSink { };
+    let sink = logfmt::RecordSink { };
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
     let mut migrations = beside_binary("migrations");
@@ -197,7 +203,16 @@ fn main() {
     let mut issuer = "";
     let mut client = "";
     let mut client_vault = "";
+    // how often the ratified limits are read again: VOICE_LIMITS_EVERY_S,
+    // which --limits-every-s overrides
     let mut limits_every_s = 30;
+    if std::env::var_exists("VOICE_LIMITS_EVERY_S") {
+        limits_every_s = std::str::parse_int(std::env::var("VOICE_LIMITS_EVERY_S")) or - 1;
+        if limits_every_s < 1 {
+            log_error("VOICE_LIMITS_EVERY_S takes a number of seconds", std::log::kv("value", std::env::var("VOICE_LIMITS_EVERY_S")));
+            std::process::exit(2);
+        }
+    }
     let mut i = if migrating { 2 } else { 1 };
     while i + 1 < std::env::args_count() {
         let flag = std::env::arg(i);
@@ -253,14 +268,33 @@ fn main() {
         }
         i = i + 2;
     }
+    // grafted, the habitat's database when none is given (store/pg_store.hl)
+    let given = database;
+    database = st::database_or_habitat(database);
+    if len(given) == 0 && len(database) > 0 { log_info("grafted: the store's database is the one the habitat provisioned", std::log::kv("from", st::HABITAT_DATABASE_ENV)); }
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         if len(d.problem) > 0 {
             log_error(d.problem, "");
             std::process::exit(2);
         }
+        if len(d.password) > 0 { log_warn("the database URL carries its password in the open: name its vault entry instead (postgres://user@host/db?vault=ENTRY)", ""); }
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
+    // grafted, the habitat hands over the head and this service's client
+    // there; each one it hands over replaces its flag
+    let handed = head_handover(env_or("HALE_DNA_HEAD_URL", ""), env_or("HALE_DNA_APPLICATION_ID", ""), env_or("HALE_DNA_OIDC_ISSUER", ""), env_or("HALE_DNA_OIDC_CLIENT", ""), env_or("HALE_DNA_OIDC_CLIENT_VAULT", ""));
+    if len(handed.problem) > 0 {
+        log_error(handed.problem, "");
+        std::process::exit(2);
+    }
+    if handed.handed {
+        head = handed.head;
+        application = handed.application;
+        issuer = handed.issuer;
+        client = handed.client;
+        client_vault = handed.client_vault;
+    }
     if len(head) > 0 {
         if len(client_vault) == 0 { client_vault = "oidc-service-" + client; }
         if len(application) == 0 || len(issuer) == 0 || len(client) == 0 {
@@ -282,8 +316,31 @@ fn main() {
         log_error("HALE_DNA_NATS_ORG names an organization, but its server, user or vault entry is missing (HALE_DNA_NATS_URL_APP, HALE_DNA_NATS_USER_APP, HALE_DNA_NATS_VAULT_APP)", "");
         std::process::exit(2);
     }
+    // grafted, voice's own NATS is the habitat's broker (lib/broker)
+    let b = broker::broker_or(nats);
+    if len(b.problem) > 0 {
+        log_error(b.problem, "");
+        std::process::exit(2);
+    }
+    if b.grafted {
+        let own = std::secret::Credential { vault: b.vault };
+        if !own.ready() {
+            log_error("the vault holds no password for this heart's broker account", std::log::kv("entry", b.vault));
+            std::process::exit(2);
+        }
+        log_info("grafted: voice's own NATS is the habitat's broker", fields2(std::log::kv("user", b.user), std::log::kv("subjects", b.root + ".>")));
+    }
+    if len(b.node_user) > 0 {
+        let node_secret = std::secret::Credential { vault: b.node_vault };
+        if !node_secret.ready() {
+            log_error("the vault holds no password for the nodes' broker account", std::log::kv("entry", b.node_vault));
+            std::process::exit(2);
+        }
+    } else if b.grafted {
+        log_warn("grafted, but no account for the nodes on the habitat's broker (HALE_DNA_BROKER_NODE_USER, HALE_DNA_BROKER_NODE_VAULT): nodes are handed none", "");
+    }
     let id = st::random_id(6);
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, head: head, application: application, issuer: issuer, client: client, client_vault: client_vault, limits_every_s: limits_every_s, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
+    Api { host: host, port: port, canned: canned, nats: b.url, broker: b, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, head: head, application: application, issuer: issuer, client: client, client_vault: client_vault, limits_every_s: limits_every_s, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
 }
 
 /// The environment's `name`, or `otherwise` when it is unset.

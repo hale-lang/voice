@@ -16,7 +16,23 @@
 
 /// What registration gave the node: where NATS is, its subject, its
 /// assignment and the local controls it registered with.
-type Joined { nats_url: String = ""; subject: String = ""; assignment: String = ""; local: String = ""; }
+/// Registration's answer as the session takes it, with `local` the
+/// controls it was sent with; JSON strings unescaped.
+fn joined_of(answer: String, local: String) -> Joined {
+    let nats_place = std::json::find_field_raw(answer, "nats");
+    return Joined {
+        nats_url: std::json::find_string_field(nats_place, "url"),
+        subject: std::json::find_string_field(nats_place, "subject"),
+        user: std::json::find_string_field(nats_place, "user"),
+        password: std::json::find_string_field(nats_place, "password"),
+        assignment: std::str::trim(std::json::find_field_raw(answer, "assignment")),
+        local: local
+    };
+}
+
+/// What registration answered. `user` and `password` are the nodes'
+/// account on the habitat's broker when voice is grafted, "" otherwise.
+type Joined { nats_url: String = ""; subject: String = ""; user: String = ""; password: String = ""; assignment: String = ""; local: String = ""; }
 
 topic PlaneJoined { payload: Joined; }
 
@@ -57,7 +73,10 @@ locus Plane {
     params {
         data: String = "node-data";
         api: String = "";
+        // the enrollment token: `--token`'s, in the open (standalone), or
+        // else the credential's, revealed only into a request's header
         token: String = "";
+        credential: std::secret::Credential = std::secret::Credential { };
         capabilities: String = "";
         registered: Bool = false;
         interval_ms: Int = 5000;
@@ -146,19 +165,13 @@ locus Plane {
             return;
         }
         let answer = std::str::from_bytes(resp.body);
-        let nats_place = std::json::find_field_raw(answer, "nats");
         self.interval_ms = std::json::find_int_field(answer, "heartbeat_interval_ms");
         if self.interval_ms < 1000 { self.interval_ms = 5000; }
         self.local = local;
         self.registered = true;
         self.next_beat = std::time::monotonic_ns() + self.interval_ms * 1000000;
         PlaneReport <- PlaneState { state: "registered", detail: "" };
-        PlaneJoined <- Joined {
-            nats_url: std::json::find_string_field(nats_place, "url"),
-            subject: std::json::find_string_field(nats_place, "subject"),
-            assignment: std::str::trim(std::json::find_field_raw(answer, "assignment")),
-            local: local
-        };
+        PlaneJoined <- joined_of(answer, local);
     }
 
     /// `GET /node/v1/assignment`, for the session to adopt when it is newer.
@@ -204,13 +217,13 @@ locus Plane {
             PlaneReport <- PlaneState { state: "", detail: "bad api address: " + self.api };
             return std::http::ClientResponse { status: 0, body: b"" };
         }
-        let req = std::http::ClientRequest {
-            method: method,
-            url: url,
-            headers: "Authorization: Bearer " + self.token + "\r\nContent-Type: application/json",
-            body: std::bytes::from_string(body)
-        };
-        return std::http::request(req) or self.unreachable(err);
+        // the token goes on the wire as it is held: a revealed secret is
+        // consumed by the request it is written into (spec/semantics.md,
+        // "@sealed")
+        if len(self.token) > 0 {
+            return std::http::request(std::http::ClientRequest { method: method, url: url, headers: "Authorization: Bearer " + self.token + "\r\nContent-Type: application/json", body: std::bytes::from_string(body) }) or self.unreachable(err);
+        }
+        return std::http::request(std::http::ClientRequest { method: method, url: url, headers: "Authorization: Bearer " + self.credential.reveal_text() + "\r\nContent-Type: application/json", body: std::bytes::from_string(body) }) or self.unreachable(err);
     }
 
     /// The api could not be reached: say so and hand back a zero status.

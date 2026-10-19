@@ -13,7 +13,8 @@ import "../lib/pond/db" as db;
 
 locus PgStore {
     params {
-        // postgres://user:password@host:port/database
+        // postgres://user:password@host:port/database, or the habitat's
+        // with its password's vault entry (parse_dsn)
         url: String = "";
         conn: pq::PgConn = pq::PgConn { sslmode: "prefer" };
         opened: Bool = false;
@@ -28,6 +29,7 @@ locus PgStore {
         self.conn.port = d.port;
         self.conn.user = d.user;
         self.conn.password = d.password;
+        self.conn.vault = d.vault;
         self.conn.database = d.database;
         self.conn.sslmode = d.sslmode;
     }
@@ -706,12 +708,17 @@ locus PgStore {
 // ---- rows and their columns ----------------------------------------------
 
 /// A DSN's parts; `problem` says what is wrong with it, "" when nothing is.
-type Dsn { host: String = "127.0.0.1"; port: Int = 5432; user: String = "postgres"; password: String = ""; database: String = "postgres"; sslmode: String = "prefer"; problem: String = ""; }
+/// `vault` names the `std::secret` vault entry that holds the password,
+/// when the DSN carries none (the habitat's, below).
+type Dsn { host: String = "127.0.0.1"; port: Int = 5432; user: String = "postgres"; password: String = ""; vault: String = ""; database: String = "postgres"; sslmode: String = "prefer"; problem: String = ""; }
 
-/// `postgres://user[:password]@host[:port]/database[?sslmode=MODE]`. The
-/// credentials end at the last `@`, so a password may hold one, and the
-/// user, the password and the database are percent-decoded. Nothing of a
-/// DSN is ever printed but the host and the port.
+/// `postgres://user[:password]@host[:port]/database[?sslmode=MODE][&vault=ENTRY]`.
+/// The credentials end at the last `@`, so a password may hold one, and
+/// the user, the password and the database are percent-decoded. A DSN the
+/// habitat hands a grafted heart (`HALE_DNA_DATABASE_DSN`) carries no
+/// password: its `vault` names the entry that holds it, which pq reads on
+/// the sealed side when it authenticates. A DSN with both is refused.
+/// Nothing of a DSN is ever printed but the host and the port.
 fn parse_dsn(url: String) -> Dsn {
     let mut d = Dsn { };
     let sep = std::str::index_of(url, "://");
@@ -719,12 +726,8 @@ fn parse_dsn(url: String) -> Dsn {
     let q = std::str::index_of(rest, "?");
     if q >= 0 {
         let query = rest[(q + 1)..len(rest)];
-        let mode = std::str::index_of(query, "sslmode=");
-        if mode >= 0 {
-            let v = query[(mode + 8)..len(query)];
-            let amp = std::str::index_of(v, "&");
-            d.sslmode = if amp >= 0 { v[0..amp] } else { v };
-        }
+        d.sslmode = query_value(query, "sslmode", d.sslmode);
+        d.vault = pct_decode(query_value(query, "vault", ""));
         rest = rest[0..q];
     }
     let at = last_index(rest, "@");
@@ -752,7 +755,31 @@ fn parse_dsn(url: String) -> Dsn {
     } else if len(rest) > 0 {
         d.host = rest;
     }
+    if len(d.vault) > 0 && len(d.password) > 0 { d.problem = "the database URL names both a password and a vault entry for it"; }
     return d;
+}
+
+/// Where a grafted voice finds its database: the habitat provisions the
+/// `database` its genome needs (hale.toml, `[dna] needs`) and hands the
+/// heart its DSN here, its password in the vault entry the DSN names.
+const HABITAT_DATABASE_ENV: String = "HALE_DNA_DATABASE_DSN";
+
+/// The database a program was given: `given` (its `--database`, or
+/// `VOICE_DATABASE_URL`, standalone), else the habitat's when voice is
+/// grafted, else "" (the store in memory).
+fn database_or_habitat(given: String) -> String {
+    if len(given) > 0 { return given; }
+    return if std::env::var_exists(HABITAT_DATABASE_ENV) { std::env::var(HABITAT_DATABASE_ENV) } else { "" };
+}
+
+/// The value of `name` in a URL's query, `otherwise` without it.
+fn query_value(query: String, name: String, otherwise: String) -> String {
+    let key = name + "=";
+    let at = if std::str::starts_with(query, key) { 0 } else { std::str::index_of(query, "&" + key) };
+    if at < 0 { return otherwise; }
+    let v = query[(at + (if at == 0 { 0 } else { 1 }) + len(key))..len(query)];
+    let amp = std::str::index_of(v, "&");
+    return if amp >= 0 { v[0..amp] } else { v };
 }
 
 /// `text` with the DSN's password, user and database taken out, for a

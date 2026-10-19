@@ -12,6 +12,9 @@
 #   DATABASE_URL=postgres://... scripts/e2e.sh      # the store in that
 #                                                   # database, migrated first,
 #                                                   # and two brains over it
+#   E2E_BROKER=grafted scripts/e2e.sh   # voice's own NATS as a habitat's
+#                                       # broker hands it over: one account,
+#                                       # every subject under heart.zz.>
 #
 # Needs api/api, node/node and brain/brain built, build/openapi.bundled.json,
 # build/node.bundled.json and spec/validate's packages (see
@@ -38,9 +41,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -z "${NATS_URL:-}" ]; then
+nats_conf=deploy/nats/nats.conf
+[ "${E2E_BROKER:-}" = grafted ] && nats_conf=scripts/e2e-broker-nats.conf
+if [ -z "${NATS_URL:-}" ] || [ "${E2E_BROKER:-}" = grafted ]; then
   container="voice-e2e-nats-$$"
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/$nats_conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 fi
 for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NATS_URL##*:}") 2>/dev/null && break; sleep 0.2; done
@@ -54,6 +59,16 @@ nats_box stream add ZZORG --subjects 'zzorg.>' --defaults >/dev/null
 mkdir -m 700 "$work/vault"
 printf 'apppw' >"$work/vault/nats-zzorg-app-voice"
 chmod 600 "$work/vault/nats-zzorg-app-voice"
+# a brain pointed at a NATS of a step's own: grafted, the hand-over's
+# address is the one it dials, so the step names it there too
+broker_at() { if [ "${E2E_BROKER:-}" = grafted ]; then echo "HALE_DNA_BROKER_URL=$1"; fi; }
+if [ "${E2E_BROKER:-}" = grafted ]; then
+  # the habitat's hand-over of the broker, for the api and the brains
+  printf 'brokerpw' >"$work/vault/nats-heart-zz"
+  printf '%s' 'no"de\pw' >"$work/vault/nats-heart-zz-node"
+  chmod 600 "$work/vault/nats-heart-zz" "$work/vault/nats-heart-zz-node"
+  export HALE_VAULT_DIR="$work/vault" HALE_DNA_BROKER_URL="$NATS_URL" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz HALE_DNA_BROKER_SUBJECTS='heart.zz.>' HALE_DNA_BROKER_NODE_USER=heart-zz-node HALE_DNA_BROKER_NODE_VAULT=nats-heart-zz-node
+fi
 # the api reaches them through a proxy the e2e can stall
 python3 scripts/nerves-proxy.py "$NERVES_PORT" "$ORG_PORT" "$work/stall" &
 pids+=($!)
@@ -63,6 +78,11 @@ api=http://127.0.0.1:${API_PORT}
 store=()
 if [ -n "${DATABASE_URL:-}" ]; then
   api/api migrate --database "$DATABASE_URL" --migrations store/migrations
+  # the habitat runs it at every graft, migrate and upgrade: at the head it
+  # applies nothing and exits 0
+  api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/migrate2.log" 2>&1 || { echo "a second migrate at the head failed"; cat "$work/migrate2.log"; exit 1; }
+  grep -q 'applied=0 ' "$work/migrate2.log" || { echo "a second migrate at the head applied something"; cat "$work/migrate2.log"; exit 1; }
+  echo "migrate is idempotent: at the head it applies nothing and exits 0"
   store=(--database "$DATABASE_URL")
 fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
@@ -131,6 +151,34 @@ assert e["requested_model"] == "echo-1" and e["seat"] == "laptop/static" and e["
 assert e["input_tokens"] > 0 and e["currency"] == "USD", e
 ' || { echo "the usage event is not as served"; nats_box stream get ZZORG 1 -j; exit 1; }
 echo "each served request is told to the organization ($told usage events on zzorg.app.voice.usage.recorded)"
+
+# grafted: the nodes' account on the broker, as registration hands it over.
+# laptop serves only because it connected with it (the broker takes no
+# unauthenticated client); a node enrolled for the probe registers and
+# reads the account from the answer, and the broker refuses it everything
+# outside its grants
+if [ "${E2E_BROKER:-}" = grafted ]; then
+  ptoken=$(post /admin/v1/nodes '{"id": "probe"}' | field enrollment_token)
+  curl -fsS -D "$work/reg.headers" -o "$work/reg.json" -X POST "$api/node/v1/register" -H "Authorization: Bearer $ptoken" -H 'content-type: application/json' \
+    -d "{\"protocol\": 2, \"version\": \"e2e\", \"capabilities\": {\"max_in_flight\": 1, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}, \"local\": {\"paused\": false, \"paused_seats\": []}}"
+  python3 - "$work/reg.json" <<'PY' || { echo "the registration did not hand over the nodes' account: $(cat "$work/reg.json")"; exit 1; }
+import json, sys
+n = json.load(open(sys.argv[1]))["nats"]
+assert n["subject"] == "heart.zz.node.probe" and n["user"] == "heart-zz-node" and n["password"] == 'no"de\\pw', n
+PY
+  grep -qi '^cache-control: no-store' "$work/reg.headers" || { echo "the registration's answer may be stored: $(cat "$work/reg.headers")"; exit 1; }
+  ! grep -qF 'no"de' "$work/api.log" || { echo "the api logged the nodes' password"; exit 1; }
+  # what the CLI said, its own failure apart (a refusal is one)
+  as_node() { docker run --rm --network host natsio/nats-box:latest nats -s "nats://127.0.0.1:${NATS_PORT}" --user heart-zz-node --password 'no"de\pw' "$@" 2>&1 || true; }
+  grep -q 'Published' <<<"$(as_node pub heart.zz.reply.probe.event x)" || { echo "the nodes' account may not publish a reply"; exit 1; }
+  for refused in "pub heart.zz.node.laptop.assign x" "pub heart.zz.route x" "pub voice.node.laptop.assign x"; do
+    grep -q 'Permissions Violation' <<<"$(as_node $refused)" || { echo "the nodes' account was not refused: $refused"; exit 1; }
+  done
+  grep -q 'Permissions Violation' <<<"$(as_node sub 'heart.zz.reply.>' --count 1 --timeout 3s)" || { echo "the nodes' account may read others' replies"; exit 1; }
+  grep -q 'Authorization Violation' <<<"$(docker run --rm --network host natsio/nats-box:latest nats -s "nats://127.0.0.1:${NATS_PORT}" pub heart.zz.reply.x y 2>&1 || true)" || { echo "the broker took a client with no account"; exit 1; }
+  curl -fsS -X DELETE "$api/admin/v1/nodes/probe" >/dev/null
+  echo "grafted, a node is handed the nodes' account at registration, connects with it, and is refused outside its grants"
+fi
 
 # the nerves stall (they take connections and say nothing): no answer
 # waits on them; once they are back, the events queued meanwhile land
@@ -276,7 +324,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   # a NATS address that never answers holds no tick: the table goes on
   # every second and one brain keeps the lock
   for p in "${pids[@]}"; do case "$(ps -o comm= -p "$p" 2>/dev/null)" in brain*) kill "$p" 2>/dev/null || true ;; esac; done
-  brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
+  env $(broker_at nats://10.255.255.1:4222) brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
   pids+=($!)
   for i in $(seq 1 100); do grep -q 'working' "$work/brain4.log" && break; sleep 0.2; done
   grep -q 'working' "$work/brain4.log" || { echo "a brain with an unanswering NATS did not work"; cat "$work/brain4.log"; exit 1; }
@@ -295,7 +343,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   python3 scripts/silent-nats.py "$SILENT_PORT" "$work/silent.log" &
   pids+=($!)
   sleep 0.5
-  brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
+  env $(broker_at "nats://127.0.0.1:$SILENT_PORT") brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
   pids+=($!)
   sleep 30
   spacing=$(python3 -c 'import sys; t=[float(l) for l in open(sys.argv[1]) if l.strip()]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
@@ -321,7 +369,7 @@ responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key"
 if [ -n "$container" ]; then
   docker rm -f "$container" >/dev/null
   curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "after the blip"}}' >/dev/null
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/$nats_conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   t0=$(date +%s)
   for i in $(seq 1 100); do
     out=$(responds)
@@ -339,7 +387,11 @@ fi
 # it, so either store offers laptop's seat first)
 token2=$(post /admin/v1/nodes '{"id": "mini"}' | field enrollment_token)
 post /admin/v1/nodes/mini/seats '{"id": "steady", "engine": "static", "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "from the mini"}}' >/dev/null
-node/node --id mini --api "$api" --token "$token2" --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
+# mini's token is in the vault, as a grafted node's is (laptop's is in the
+# open, on the command line, as a standalone node may still give it)
+printf '%s' "$token2" >"$work/vault/node-mini-enrollment"
+chmod 600 "$work/vault/node-mini-enrollment"
+HALE_VAULT_DIR="$work/vault" node/node --id mini --api "$api" --token-vault node-mini-enrollment --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
 mini_pid=$!
 pids+=($mini_pid)
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
@@ -358,6 +410,9 @@ assert r["voice"]["served"]["seat"] == "mini/steady", r["voice"]["served"]
 assert a[0]["seat"] == "laptop/static" and a[0]["outcome"] == "failed", a
 ' || { echo "failover after a slow failure did not serve: $out"; cat "$work/node2.log"; exit 1; }
 [ "$ms" -lt 15000 ] || { echo "failover took $ms ms, more than the failure (8 s), the ack wait (5 s) and the second seat's own time"; exit 1; }
+grep -q 'the enrollment token is in the open' "$work/node.log" || { echo "a node given its token on the command line did not warn that it is in the open"; exit 1; }
+! grep -q 'in the open' "$work/node2.log" || { echo "a node with its token in the vault warned"; exit 1; }
+echo "a node enrolled with its token from the vault; one given it in the open warned"
 echo "failed over from laptop/static to mini/steady in $ms ms"
 
 # every seat fails: a 502 that names the request and every attempt

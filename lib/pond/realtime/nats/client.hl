@@ -28,7 +28,7 @@ locus NatsTransport {
             std::io::tcp::set_recv_timeout(self.sock, d) or discard;
         }
     }
-    fn write_all(b: Bytes) -> Int {
+    fn write_all(@secret b: Bytes) -> Int {
         if self.tls >= 0 { return std::io::tls::send_bytes(self.tls, b); }
         if self.sock >= 0 { return std::io::tcp::__send_bytes(self.sock, b); }
         return -1;
@@ -47,8 +47,7 @@ locus NatsTransport {
 }
 
 // Lowercase hex of `b`.
-// @unbounded: two characters per byte of a fixed-size random id.
-@unbounded
+// Two characters per byte of a fixed-size random id.
 fn hex_of(b: Bytes) -> String {
     let digits = "0123456789abcdef";
     let mut out = "";
@@ -73,6 +72,11 @@ locus NatsClient {
         user: String = "";
         pass: String = "";
         token: String = "";
+        // The password presented as `user`, sealed: revealed on the one
+        // line that writes CONNECT and nowhere else — never kept in a
+        // field, returned, or put in a URL. With one set, `pass` and a
+        // URL's own password are not used.
+        credential: std::secret::Credential = std::secret::Credential { };
         name: String = "";
         // false: this connection's own publishes are not delivered back
         // to its own subscriptions (what a bus adapter wants).
@@ -104,9 +108,9 @@ locus NatsClient {
     }
 
     // Record why the last operation failed, as "<kind>: <detail>".
-    // @unbounded: once per failure, and a failure ends the operation
-    // or the connection.
-    @unbounded
+    // `self.last_error` holds only the last failure, replaced whole (the old text is
+    // retired); the survey cannot prove the new text independent of it.
+    @bounded_by(self.last_error)
     fn note(kind: String, detail: String) { self.last_error = kind + ": " + detail; }
 
     fn fail_with(kind: String, detail: String) -> NatsError {
@@ -139,7 +143,7 @@ locus NatsClient {
         return true;
     }
 
-    fn write(b: Bytes) -> Bool {
+    fn write(@secret b: Bytes) -> Bool {
         if !self.io.is_open() { return false; }
         if self.io.write_all(b) < 0 {
             self.connected = false;
@@ -149,16 +153,26 @@ locus NatsClient {
         return true;
     }
 
-    fn write_str(s: String) -> Bool { return self.write(std::bytes::from_string(s)); }
+    // `@secret`: the CONNECT line carries a revealed password through
+    // these three to the socket, each in one statement (spec/semantics.md
+    // § "@sealed")
+    fn write_str(@secret s: String) -> Bool { return self.write(std::bytes::from_string(s)); }
 
     /// Dial, read INFO, send CONNECT, and wait for the server's PONG to
     /// the PING after it: the server has accepted the connection when
     /// the PONG arrives, and a `-ERR` (bad credentials) arrives instead.
-    fn open() -> Bool {
+    fn open() -> Bool { return self.open_as(self.credential); }
+
+    /// `open`, presenting `credential`'s password as `user` (a holder of
+    /// the client passes its own: a `NatsConn`'s).
+    fn open_as(credential: std::secret::Credential) -> Bool {
         self.close();
         self.last_error = "";
         if !self.parse_url() { return false; }
-        let h = std::io::tcp::connect(self.host, self.port) or - 1;
+        // voice: a dial bounded by the client's timeout; `connect` waits out
+        // the kernel's SYN retries (about two minutes) on an address that
+        // never answers
+        let h = std::io::tcp::connect_within(self.host, self.port, self.timeout) or - 1;
         if h < 0 { self.note("connect", "tcp to " + self.host + ":" + to_string(self.port)); return false; }
         self.io.sock = h;
         std::io::tcp::set_nodelay(h, true) or discard;
@@ -185,7 +199,9 @@ locus NatsClient {
             self.io.tls = t;
             self.io.set_recv_deadline(self.timeout);
         }
-        if !self.write_str(connect_line(self.user, self.pass, self.token, self.name, self.echo) + ping_line()) { self.io.close(); return false; }
+        // the one place a sealed credential is revealed: straight into the
+        // CONNECT it authenticates
+        if !self.write_str(with_password(connect_line(self.user, "", self.token, self.name, self.echo), if credential.ready() { credential.reveal_text() } else { self.pass }) + ping_line()) { self.io.close(); return false; }
         while std::time::monotonic() < deadline {
             if !self.pull() { break; }
             while self.framer.next() {
@@ -300,9 +316,9 @@ locus NatsClient {
         self.last.data = data;
     }
 
-    // @unbounded: one entry per message that arrives while a `request`
-    // waits; read_msg empties the stash once it has handed them all out.
-    @unbounded
+    // One entry per message that arrives while a `request` waits;
+    // read_msg empties the stash once it has handed them all out.
+    @bounded_by(request)
     fn set_aside() {
         let f = self.framer.frame;
         self.stash.push(f.subject, f.data);

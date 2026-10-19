@@ -3,11 +3,18 @@
 Copied verbatim from where each says, sources only (not tests or examples). Pond is Apache-2.0
 (`LICENSE`, beside this file).
 
-- `realtime/nats/`: `client.hl`, `proto.hl`, `types.hl` and `log.hl` of
-  `hale-lang/pond`'s `realtime/nats` at `697852f` (2026-09-24): the core
-  NATS client (`NatsClient`) and what it needs; the bus adapter, JetStream
-  and the test fake are not taken. The api (`api/link.hl`) and the node
-  (`node/session.hl`) import it. A pond issue the brain works around
+- `realtime/nats/`: `adapter.hl`, `client.hl`, `jetstream.hl`, `proto.hl`,
+  `types.hl` and `log.hl` of hale v0.25.1's `dna/core/pond/realtime/nats`,
+  which is pond's `realtime/nats` with hale's changes since (among them a
+  password from a `std::secret` vault entry, hale-lang/hale#989): the NATS
+  client, the bus adapter and JetStream; the test fake is not taken. The
+  api (`api/link.hl`, and the organization's events: `api/main.hl`) and
+  the node (`node/session.hl`) import it. Two changes of voice's own,
+  marked `voice:`: `NatsPublisher` (`adapter.hl`) logs through `std::log`
+  rather than printing bare, and `NatsClient.open_as` (`client.hl`) dials
+  with `std::io::tcp::connect_within`, bounded by the client's timeout,
+  rather than `connect`, which waits about two minutes on an address
+  that never answers. A pond issue the brain works around
   without changing it: `NatsClient.open` dials with `std::io::tcp::connect`,
   which waits about two minutes on an address that never answers; the
   brain's notifier probes the address with `std::io::tcp::connect_within`

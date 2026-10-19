@@ -480,6 +480,27 @@ is published is only its version, and losing a notice costs a second. Usage is w
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
+**The organization's events are not usage's second write either.** Run
+attached to an organization (Hale's DNA), the api tells it each request a
+seat served or began, streamed or not, as an event: a `UsageEvent` on
+`app.voice.usage.recorded` ([`api/events.hl`](./api/events.hl)), its `id`
+the request's, its `status` how it ended (`served`, `incomplete`,
+`cancelled` when the caller left, `failed` when the seat failed after
+output; a token count the seat did not report is left out). It goes out on the organization's own nerves, a
+JetStream stream, not voice's NATS: the attach hands the api its server,
+its user, the vault entry of that user's password and the organization's
+token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
+`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), and the events are told
+from the teller ([`api/teller.hl`](./api/teller.hl)), a pinned locus of
+its own: a request hands its event over and goes on, so no answer waits
+on the nerves. The teller queues at most 1024 events, keeps one
+connection, publishes each under its id and waits for the stream's
+acknowledgement, each step bounded at 2 s; a publish that does not land
+is tried again after a back-off (to 5 s), and when the queue is full the
+oldest event is dropped, counted and logged. The organization records each event once, as a reading
+under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
+nothing is published and no connection is made.
+
 **Why the broker is in the MVP:** a single api instance would not need it,
 but the MVP's job is to lay the process model the rest is built on, and a
 path first exercised when the second instance appears is a path that has
@@ -602,9 +623,12 @@ each program's `log.hl` logs under its logger (`voice.api`,
 `voice.brain`, `voice.node`; the vendored Postgres driver and migrator
 under `pq` and `migrate`), a message and its fields as logfmt (`k=v`), and
 its `main` holds the one sink, `std::log`'s StdoutSink: info on stdout,
-warnings and errors on stderr, `HALE_LOG` the threshold. No program prints
-outside it, and CI refuses a bare `println` or `eprintln` outside the
-tests.
+warnings and errors on stderr, `HALE_LOG` the threshold. Voice prints
+nothing outside it, and CI refuses a bare `print`, `println`, `eprint` or
+`eprintln` outside the tests directories. One line is not voice's: the
+Hale runtime's `perror` when a client hangs up while the api writes
+(`lotus_tcp_send_str: write: Broken pipe` on stderr), which FRICTION.md
+lists for hale.
 
 ```text
 [INFO voice.api] serving url=http://127.0.0.1:8080 canned=api/canned

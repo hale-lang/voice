@@ -181,13 +181,16 @@ KeyRows { }; count(ks.rows)`).
 string, rows by newline and columns by tab, with no escaping, so a column
 holding a tab or a newline (a JSON document, a name) cannot be split
 back. And a connection with `sslmode=prefer` to a server without TLS
-prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
+printed `[pq] tls: ... negotiated PLAINTEXT` on stdout, which failed a
 `hale test` (a passing test is silent).
 
 **Working shape:** every read is `SELECT row_to_json(t) FROM (...) t`, one
 JSON object a line, since JSON escapes every tab and newline
 (`store/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
-the tests and compose use `sslmode=disable` on the private network.
+the tests and compose use `sslmode=disable` on the private network. Since
+voice#28 the plaintext notice goes through `std::log` (logger `pq`, a
+change of voice's own in the vendored copy), so a test, which holds no
+sink, prints nothing.
 
 ## A text built or read a line at a time is quadratic in memory
 
@@ -304,4 +307,22 @@ each gap classed in `api/gaps.json`.
 **hale 0.25.1.** `to_string(Float)` keeps six significant digits: `99.999995` is written `100` and `33.333333333333336` is written `33.3333`, so `parse_float(to_string(x)) == x` fails for most values. `T::api_encode` writes a Float field the same way (`{"used_percent":100}` for 99.999995), so a Float that crosses the api codec comes back as a different number.
 
 **Working shape:** a quota window's `used_percent` is written by `float_text` (api/fleet.hl), which writes the fewest fraction digits that read back as the same Float. The codec's own encoding is hale's to fix.
+
+## The runtime writes to stderr outside any logger
+
+**hale 0.25.1.** When a client hangs up while the api writes its answer, the runtime prints `lotus_tcp_send_str: write: Broken pipe` (a `perror` in the C runtime) on stderr. It is a write by Hale's runtime, outside `std::log` and outside the program, so a program that routes every line through its logger still has this one, unstructured.
+
+**Working shape:** none in voice; the README's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
+
+## A program that reads `self.draining` waits out the whole drain grace, its HTTP server never ending on it
+
+**hale 0.25.1.** The drain on SIGINT or SIGTERM is installed only in a program that reads `self.draining`. Once anything does (a pinned queue's `while !self.draining` loop, or pond's `NatsConn`), a signal waits for the main locus's `run()` to return, and the api's `run()` is `std::http::Server`, which does not end on the drain. So every stop waits out the grace: "the drain begun by signal 15 did not finish within 5000 ms ... live loci that read draining: `Teller` x1". The api took 5 s to stop instead of a few milliseconds.
+
+**Working shape:** nothing in the api reads `self.draining`. The teller's loop (api/teller.hl) runs until the process ends, so a signal ends it at once, as before, and events not yet told go with it.
+
+## A binding's literal that reads the locus's params passes the check and fails the build
+
+**hale 0.25.1.** In `bindings { T: nats::NatsPublisher { url: self.nerves_url, ... } codec(...); }` `hale check` accepts `self.nerves_url`; `hale build` then fails: "codegen error: unsupported in codegen v0: self.org read outside a locus method".
+
+**Working shape:** no binding. The teller (api/teller.hl) is a pinned locus whose params the main locus's own literal sets from its params, which a params initializer may read.
 

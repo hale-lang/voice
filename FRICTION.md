@@ -306,7 +306,7 @@ each gap classed in `api/gaps.json`.
 
 **hale 0.25.1.** `to_string(Float)` keeps six significant digits: `99.999995` is written `100` and `33.333333333333336` is written `33.3333`, so `parse_float(to_string(x)) == x` fails for most values. `T::api_encode` writes a Float field the same way (`{"used_percent":100}` for 99.999995), so a Float that crosses the api codec comes back as a different number.
 
-**Working shape:** a quota window's `used_percent` is written by `float_text` (api/fleet.hl), which writes the fewest fraction digits that read back as the same Float. The codec's own encoding is hale's to fix.
+**Working shape (until hale v0.26.0):** a quota window's `used_percent` was written by `float_text`, which wrote the fewest fraction digits that read back as the same Float. **Closed in hale v0.26.0:** `to_string(Float)` and the api codec both write a Float that reads back as itself; `float_text` is gone, and node_plane_test keeps the write-back and codec checks.
 
 ## The runtime writes to stderr outside any logger
 

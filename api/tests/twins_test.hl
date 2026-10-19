@@ -1,0 +1,118 @@
+// The REST router answers read types that carry stored JSON as text
+// (SeatRead, NodeRead, AssignmentRead, RegisteredRead, ChangeRead); the
+// surface describes their typed twins (SeatView, Node, Assignment,
+// Registered, Change). For a value within the 64 KiB a JSON value holds,
+// the router's JSON and the typed twin's api_encode say the same thing:
+// the same members with the same values, key order, spacing and absent
+// nulls apart. A field added to one twin and not the other fails here,
+// rather than sitting at its default on one side.
+import ".." as api;
+import "../../store" as st;
+
+type Parts { items: bounded[String; 64]; }
+
+/// `p` with `x` in order.
+@unbounded
+fn insert_sorted(p: Parts, x: String) -> Parts {
+    let mut out = Parts { };
+    let mut placed = false;
+    for y in p.items {
+        if !placed && x < y {
+            push(out.items, x) or discard;
+            placed = true;
+        }
+        push(out.items, y) or discard;
+    }
+    if !placed { push(out.items, x) or discard; }
+    return out;
+}
+
+/// `json` in one spelling: an object's members sorted by key, a member
+/// whose value is `null` left out (an absent field), strings escaped one
+/// way, no spacing.
+@unbounded
+fn canon(json: String) -> String {
+    let t = std::str::trim(json);
+    if std::str::starts_with(t, "{") {
+        let mut parts = Parts { };
+        let mut it = std::json::object_first(t);
+        while !it.done {
+            let v = std::str::trim(std::json::obj_value_raw(it, t));
+            if v != "null" { parts = insert_sorted(parts, "\"" + std::json::escape_string(std::json::obj_key_string(it, t)) + "\":" + canon(v)); }
+            it = std::json::object_next(it, t);
+        }
+        let mut out = "";
+        for p in parts.items {
+            out = out + (if len(out) > 0 { "," } else { "" }) + p;
+        }
+        return "{" + out + "}";
+    }
+    if std::str::starts_with(t, "[") {
+        let mut out = "";
+        let mut it = std::json::array_first(t);
+        while !it.done {
+            out = out + (if len(out) > 0 { "," } else { "" }) + canon(it.element);
+            it = std::json::array_next(it);
+        }
+        return "[" + out + "]";
+    }
+    if std::str::starts_with(t, "\"") { return "\"" + std::json::escape_string(std::json::unescape_string(t[1..(len(t) - 1)])) + "\""; }
+    return t;
+}
+
+fn same(rest: String, typed: String, what: String) {
+    std::test::assert(len(canon(rest)) > 40, what + ": a whole answer: " + canon(rest));
+    std::test::assert_eq_str(canon(typed), canon(rest), what + ": the router's JSON and the typed twin's");
+}
+
+fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
+    return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
+}
+
+const CONFIG: String = "{\"text\": \"hi\", \"chunk_chars\": 8, \"nested\": {\"b\": [1, 2.5], \"a\": true}}";
+
+fn main() {
+    let e = api::Endpoints { };
+    call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
+    call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
+    let token = std::json::find_string_field(call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\", \"name\": \"Laptop\", \"max_in_flight\": 3}").body, "enrollment_token");
+    call(e, "POST", "/admin/v1/nodes/laptop/seats", "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\", \"as\": \"echo\"}], \"concurrency\": 2, \"config\": " + CONFIG + "}");
+    let reg = e.handle(std::http::Request { method: "POST", path: "/node/v1/register", headers: "Authorization: Bearer " + token, body: "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": {\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"description\": \"canned\", \"models\": [\"echo-1\"], \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}, \"local\": {\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}}" });
+    std::test::assert_eq_int(reg.status, 200, "the node registers: " + reg.body);
+    call(e, "PATCH", "/admin/v1/nodes/laptop/seats/static", "{\"concurrency\": 1}");
+
+    // the spelling itself: order and absent nulls do not count, a member does
+    std::test::assert_eq_str(canon("{\"b\": [1, {\"y\": null, \"x\": \"\\u0041\"}], \"a\": 1}"), canon("{\"a\":1,\"b\":[1,{\"x\":\"A\"}]}"), "one spelling");
+    std::test::assert(canon("{\"a\": 1}") != canon("{\"a\": 1, \"b\": 2}"), "a member more is a difference");
+
+    // a seat
+    let seat = e.seats.get_read(api::SeatRef { node: "laptop", seat: "static" }) or api::SeatRead { status: api::SeatStatus::offline };
+    same(api::seat_json(seat), api::SeatView::api_encode(api::seat_view_of(seat) or api::SeatView { status: api::SeatStatus::offline }), "a seat");
+
+    // a node, with its capabilities and its seats (its token is written by
+    // the router only in the answers that carry it)
+    let node = e.nodes.get_read(api::NodeRef { node: "laptop" }) or api::NodeRead { status: api::NodeStatus::pending };
+    std::test::assert(node.has_capabilities && count(node.seats) == 1, "a registered node with a seat");
+    let typed_node = api::node_of_read(node) or api::Node { status: api::NodeStatus::pending };
+    same(api::node_json(node), std::str::replace(api::Node::api_encode(typed_node), "\"enrollment_token\":\"\"", "\"enrollment_token\":null"), "a node");
+
+    // its assignment, and its seats
+    let row = e.store.node("laptop") or st::NodeRow { };
+    let assigned = api::assignment_of(e.store, row) or api::AssignmentRead { };
+    std::test::assert(count(assigned.seats) == 1, "an assignment with its seat");
+    same(api::assignment_json(assigned), api::Assignment::api_encode(api::assignment_of_read(assigned) or api::Assignment { }), "an assignment");
+
+    // a registration's answer (the router nests `nats`; the twin has its two
+    // fields flat, a wire difference the fit lists)
+    let r = api::RegisteredRead { nats_url: "nats://nats:4222", nats_subject: "voice.node.laptop", assignment: assigned };
+    let rest = api::registered_json(r);
+    let flat = std::str::replace(rest, "\"nats\": {\"url\": \"nats://nats:4222\", \"subject\": \"voice.node.laptop\"}", "\"nats_url\": \"nats://nats:4222\", \"nats_subject\": \"voice.node.laptop\"");
+    std::test::assert(flat != rest, "the router's answer nests nats: " + rest);
+    same(flat, api::Registered::api_encode(api::registered_of_read(r) or api::Registered { }), "a registration's answer");
+
+    // the change log
+    let q = st::ChangeQuery { target: "nodes/laptop/seats/static" };
+    let changes = e.changes.list_read(q) or api::ChangeReadList { };
+    std::test::assert(count(changes.data) == 2, "a create and an update");
+    same(api::change_list_json(changes), api::ChangeList::api_encode(e.changes.list(q) or api::ChangeList { }), "the change log");
+}

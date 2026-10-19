@@ -34,7 +34,10 @@ type ServeOutcome {
 interface Link {
     /// Where NATS is, from a node's side: what registration tells it.
     fn place() -> String;
-    /// Publish `body` on `voice.node.<node>.assign`; false when it could
+    /// The root every subject is under: `voice`, or the habitat broker's
+    /// prefix (lib/broker).
+    fn root() -> String;
+    /// Publish `body` on `<root>.node.<node>.assign`; false when it could
     /// not be sent.
     fn assign(node: String, body: String) -> Bool;
     /// Offer `body` (a `serve` message naming `reply_to`) to the node: its
@@ -87,21 +90,31 @@ locus NatsLink {
         url: String = "";
         // the address nodes dial, when theirs differs
         node_url: String = "";
+        // grafted, the habitat broker's account (its user, and the vault
+        // entry of its password), the root of its subjects and where a
+        // request's inbox is (lib/broker); standalone, none, `voice` and
+        // NATS's own
+        user: String = "";
+        vault: String = "";
+        subjects: String = "voice";
+        inbox: String = "_INBOX";
         // the offer open now
         attempt: NatsAttempt = NatsAttempt { };
     }
 
     fn place() -> String { return if len(self.node_url) > 0 { self.node_url } else { self.url }; }
 
+    fn root() -> String { return self.subjects; }
+
     fn assign(node: String, body: String) -> Bool {
         if len(self.url) == 0 { return false; }
-        let c = nats::NatsClient { url: self.url, name: "voice-api" };
+        let c = nats::NatsClient { url: self.url, name: "voice-api", user: self.user, credential: std::secret::Credential { vault: self.vault } };
         if !c.open() {
             log_warn("NATS unreachable", fields2(std::log::kv("nats", self.url), std::log::kv("error", c.last_error)));
             return false;
         }
         let mut sent = true;
-        c.pub_msg("voice.node." + node + ".assign", "", std::bytes::from_string(body)) or { sent = false; };
+        c.pub_msg(self.subjects + ".node." + node + ".assign", "", std::bytes::from_string(body)) or { sent = false; };
         c.flush() or { sent = false; };
         c.close();
         return sent;
@@ -112,7 +125,7 @@ locus NatsLink {
     /// of its own, with its own connection, gone when the next replaces it.
     fn offer(node: String, reply_to: String, body: String) -> ServeOutcome {
         if len(self.url) == 0 { return ServeOutcome { ack: "lost", reason: "no NATS is configured" }; }
-        self.attempt = NatsAttempt { node: node, reply_to: reply_to, request_id: std::json::find_string_field(body, "request_id") };
+        self.attempt = NatsAttempt { node: node, reply_to: reply_to, request_id: std::json::find_string_field(body, "request_id"), subjects: self.subjects, c: nats::NatsClient { name: "voice-api", user: self.user, credential: std::secret::Credential { vault: self.vault }, inbox_prefix: self.inbox } };
         return self.attempt.offer(self.url, body);
     }
 
@@ -130,6 +143,7 @@ locus NatsAttempt {
         node: String = "";
         reply_to: String = "";
         request_id: String = "";
+        subjects: String = "voice";
         c: nats::NatsClient = nats::NatsClient { name: "voice-api" };
         open: Bool = false;
         finished: Bool = false;
@@ -144,7 +158,7 @@ locus NatsAttempt {
             self.c.close();
             return ServeOutcome { ack: "lost", reason: why };
         }
-        let reply = self.c.request("voice.node." + self.node + ".serve", std::bytes::from_string(body), 5s) or nats::NatsMsg { };
+        let reply = self.c.request(self.subjects + ".node." + self.node + ".serve", std::bytes::from_string(body), 5s) or nats::NatsMsg { };
         let ack = std::str::from_bytes(reply.data);
         let mut out = ServeOutcome { ack: std::json::find_string_field(ack, "outcome") };
         if len(ack) > 0 && std::json::find_string_field(ack, "request_id") != self.request_id {
@@ -154,7 +168,7 @@ locus NatsAttempt {
             if len(ack) == 0 || out.ack != "refused" {
                 // it may still take the request once it reads it
                 let why = self.c.last_error;
-                cancel(self.c, self.node, self.request_id);
+                cancel(self.c, self.subjects, self.node, self.request_id);
                 self.c.close();
                 return ServeOutcome { ack: "unanswered", reason: "node " + self.node + " did not answer: " + why };
             }
@@ -189,7 +203,7 @@ locus NatsAttempt {
 
     fn finish() {
         if !self.open { return; }
-        if !self.finished && self.c.connected { cancel(self.c, self.node, self.request_id); }
+        if !self.finished && self.c.connected { cancel(self.c, self.subjects, self.node, self.request_id); }
         self.c.close();
         self.open = false;
     }
@@ -197,9 +211,9 @@ locus NatsAttempt {
 
 /// `cancel` on the node's subject: the api stopped waiting for the
 /// request, so the seat should stop serving it.
-fn cancel(c: nats::NatsClient, node: String, request_id: String) {
+fn cancel(c: nats::NatsClient, subjects: String, node: String, request_id: String) {
     let msg = "{\"type\": \"cancel\", \"request_id\": " + jq(request_id) + ", \"reason\": \"abandoned\"}";
-    c.pub_msg("voice.node." + node + ".cancel", "", std::bytes::from_string(msg)) or discard;
+    c.pub_msg(subjects + ".node." + node + ".cancel", "", std::bytes::from_string(msg)) or discard;
     c.flush() or discard;
 }
 

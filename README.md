@@ -60,7 +60,21 @@ port. Grafted into a DNA habitat, voice's genome needs a `database`
 `--database` nor `VOICE_DATABASE_URL` is given the api and the brain use
 the one the habitat provisioned, `HALE_DNA_DATABASE_DSN`: a DSN with no
 password, whose `vault=` names the vault entry pq reads it from when it
-authenticates. Without a database the store is in the process
+authenticates. Its own NATS, grafted, is the habitat's `broker`
+([`lib/broker`](./lib/broker/broker.hl)): `HALE_DNA_BROKER_URL`, `_USER`
+and `_VAULT` replace `--nats` and name its account, and every subject
+moves under the prefix `HALE_DNA_BROKER_SUBJECTS` grants (`voice.node.*`
+becomes `heart.<id>.node.*`, and the same for `reply` and `route`), the
+request inboxes under `HALE_DNA_BROKER_INBOX` when it is handed over and
+under the prefix when not; standalone, the subjects are `voice.*` as
+always. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
+`HALE_DNA_OIDC_ISSUER`, `HALE_DNA_OIDC_CLIENT` and
+`HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
+`--issuer`, `--client` and `--client-vault` when they are set, and the
+habitat migrates the database itself (`[dna.migrations.database]` in
+`hale.toml`, `api migrate` at graft and upgrade): neither the api nor the
+brain migrates on its own. `E2E_BROKER=grafted scripts/e2e.sh` runs the
+whole e2e on a NATS whose one account may use `heart.zz.>` alone. Without a database the store is in the process
 (`MemoryStore`), lost on restart, which is what `hale test api` runs on. Budgets are
 configuration: nothing is charged against them yet.
 

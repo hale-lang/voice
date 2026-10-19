@@ -12,6 +12,9 @@
 #   DATABASE_URL=postgres://... scripts/e2e.sh      # the store in that
 #                                                   # database, migrated first,
 #                                                   # and two brains over it
+#   E2E_BROKER=grafted scripts/e2e.sh   # voice's own NATS as a habitat's
+#                                       # broker hands it over: one account,
+#                                       # every subject under heart.zz.>
 #
 # Needs api/api, node/node and brain/brain built, build/openapi.bundled.json,
 # build/node.bundled.json and spec/validate's packages (see
@@ -38,9 +41,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ -z "${NATS_URL:-}" ]; then
+nats_conf=deploy/nats/nats.conf
+[ "${E2E_BROKER:-}" = grafted ] && nats_conf=scripts/e2e-broker-nats.conf
+if [ -z "${NATS_URL:-}" ] || [ "${E2E_BROKER:-}" = grafted ]; then
   container="voice-e2e-nats-$$"
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/$nats_conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 fi
 for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NATS_URL##*:}") 2>/dev/null && break; sleep 0.2; done
@@ -54,6 +59,15 @@ nats_box stream add ZZORG --subjects 'zzorg.>' --defaults >/dev/null
 mkdir -m 700 "$work/vault"
 printf 'apppw' >"$work/vault/nats-zzorg-app-voice"
 chmod 600 "$work/vault/nats-zzorg-app-voice"
+# a brain pointed at a NATS of a step's own: grafted, the hand-over's
+# address is the one it dials, so the step names it there too
+broker_at() { if [ "${E2E_BROKER:-}" = grafted ]; then echo "HALE_DNA_BROKER_URL=$1"; fi; }
+if [ "${E2E_BROKER:-}" = grafted ]; then
+  # the habitat's hand-over of the broker, for the api and the brains
+  printf 'brokerpw' >"$work/vault/nats-heart-zz"
+  chmod 600 "$work/vault/nats-heart-zz"
+  export HALE_VAULT_DIR="$work/vault" HALE_DNA_BROKER_URL="$NATS_URL" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz HALE_DNA_BROKER_SUBJECTS='heart.zz.>'
+fi
 # the api reaches them through a proxy the e2e can stall
 python3 scripts/nerves-proxy.py "$NERVES_PORT" "$ORG_PORT" "$work/stall" &
 pids+=($!)
@@ -276,7 +290,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   # a NATS address that never answers holds no tick: the table goes on
   # every second and one brain keeps the lock
   for p in "${pids[@]}"; do case "$(ps -o comm= -p "$p" 2>/dev/null)" in brain*) kill "$p" 2>/dev/null || true ;; esac; done
-  brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
+  env $(broker_at nats://10.255.255.1:4222) brain/brain --database "$DATABASE_URL" --nats nats://10.255.255.1:4222 >"$work/brain4.log" 2>&1 &
   pids+=($!)
   for i in $(seq 1 100); do grep -q 'working' "$work/brain4.log" && break; sleep 0.2; done
   grep -q 'working' "$work/brain4.log" || { echo "a brain with an unanswering NATS did not work"; cat "$work/brain4.log"; exit 1; }
@@ -295,7 +309,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   python3 scripts/silent-nats.py "$SILENT_PORT" "$work/silent.log" &
   pids+=($!)
   sleep 0.5
-  brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
+  env $(broker_at "nats://127.0.0.1:$SILENT_PORT") brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
   pids+=($!)
   sleep 30
   spacing=$(python3 -c 'import sys; t=[float(l) for l in open(sys.argv[1]) if l.strip()]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
@@ -321,7 +335,7 @@ responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key"
 if [ -n "$container" ]; then
   docker rm -f "$container" >/dev/null
   curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "after the blip"}}' >/dev/null
-  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/deploy/nats/nats.conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
+  docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/$nats_conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   t0=$(date +%s)
   for i in $(seq 1 100); do
     out=$(responds)

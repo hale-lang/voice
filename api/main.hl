@@ -5,9 +5,19 @@
 /// `canned/`, named by the endpoint's operationId, until each is made real.
 /// See endpoints.hl. `api migrate` brings a database's schema up to date
 /// and exits.
+///
+/// Attached to an organization (Hale's DNA), the api tells it each served
+/// request as an event (events.hl) on the organization's nerves: the usage
+/// topic is bound to pond's NATS adapter, and a pinned connection writes it
+/// and waits for the stream to acknowledge it. The attach hands the api its
+/// server, user, the vault entry of that user's password and the
+/// organization's token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
+/// `HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`); without the token
+/// nothing is published and no connection is made.
 
 import "../lib/pond/pq" as pq;
 import "../lib/pond/migrations" as migs;
+import "../lib/pond/realtime/nats" as nats;
 main locus Api {
     params {
         host: String = "127.0.0.1";
@@ -23,27 +33,57 @@ main locus Api {
         idle_s: Int = 30;
         instance: String = "";
         pulse: Pulse = Pulse { database: self.database, instance: self.instance };
+        // the organization's nerves: its token ("" when voice is attached to
+        // none), the application's server, its user and the vault entry of
+        // that user's password, which the client reveals on CONNECT alone
+        org: String = "";
+        nerves_url: String = "";
+        nerves_user: String = "";
+        nerves_vault: String = "";
+        // with no organization the connection's loop ends at once and is
+        // never written to (Inference.pulse is off)
+        nerves: nats::NatsConn = nats::NatsConn {
+            url: self.nerves_url,
+            user: self.nerves_user,
+            credential: std::secret::Credential { vault: self.nerves_vault },
+            name: "voice-api",
+            subject_prefix: self.org + ".",
+            jetstream: true,
+            run_for_ms: if len(self.org) > 0 { 0 } else { 1 }
+        };
     }
-    placement { pulse: pinned; }
-    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s); }
+    placement {
+        pulse: pinned;
+        nerves: pinned;
+    }
+    bindings { UsageRecorded: nats::NatsAdapter { } codec(UsageJson { }); }
+    // an event the stream did not take in time: the connection is gone,
+    // and the api keeps answering without it
+    on_failure(c: nats::NatsConn, err: ClosureViolation) {
+        log_error("the organization's nerves stopped: events are no longer told", std::log::kv("error", c.last_error));
+    }
+    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org); }
 }
 
-fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int) {
+fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int, org: String) {
     log_info("serving", fields2(std::log::kv("url", "http://" + host + ":" + to_string(port)), std::log::kv("canned", canned)));
     log_info("nodes over NATS", fields2(std::log::kv("nats", nats), std::log::kv("node_nats", if len(node_nats) > 0 { node_nats } else { nats })));
     if len(ui) > 0 { log_info("serving the admin ui", std::log::kv("ui", ui)); }
+    if len(org) > 0 { log_info("telling the organization each served request", std::log::kv("subject", org + ".app.voice.usage.recorded")); }
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         log_info("the store is Postgres", std::log::kv("at", d.host + ":" + to_string(d.port)));
         let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
+        endpoints.inference.pulse = len(org) > 0;
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     } else {
         log_info("the store is in memory, lost on restart", "");
         let endpoints = Endpoints { canned: canned, ui: ui, link: NatsLink { url: nats, node_url: node_nats } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
+        endpoints.inference.pulse = len(org) > 0;
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     }
 }
@@ -194,8 +234,22 @@ fn main() {
         }
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
+    // the attach's hand-over (spec/dna.md, "One transport: the nerves")
+    let org = env_or("HALE_DNA_NATS_ORG", "");
+    let nerves_url = env_or("HALE_DNA_NATS_URL_APP", "");
+    let nerves_user = env_or("HALE_DNA_NATS_USER_APP", "");
+    let nerves_vault = env_or("HALE_DNA_NATS_VAULT_APP", "");
+    if len(org) > 0 && (len(nerves_url) == 0 || len(nerves_user) == 0 || len(nerves_vault) == 0) {
+        log_error("HALE_DNA_NATS_ORG names an organization, but its server, user or vault entry is missing (HALE_DNA_NATS_URL_APP, HALE_DNA_NATS_USER_APP, HALE_DNA_NATS_VAULT_APP)", "");
+        std::process::exit(2);
+    }
     let id = st::random_id(6);
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id };
+    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
+}
+
+/// The environment's `name`, or `otherwise` when it is unset.
+fn env_or(name: String, otherwise: String) -> String {
+    return if std::env::var_exists(name) { std::env::var(name) } else { otherwise };
 }
 
 /// `name` in the directory holding the running binary, or `name` as given

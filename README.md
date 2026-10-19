@@ -480,6 +480,21 @@ is published is only its version, and losing a notice costs a second. Usage is w
 broker as well would be a second write that can disagree with the first. A
 consumer that wants usage as it happens reads the ledger by cursor.
 
+**The organization's events are not usage's second write either.** Run
+attached to an organization (Hale's DNA), the api tells it each request a
+seat served, streamed or not, as an event: `UsageRecorded`, a `UsageEvent`
+on `app.voice.usage.recorded` ([`api/events.hl`](./api/events.hl)), its
+`id` the request's. It goes out on the organization's own nerves, a
+JetStream stream, not voice's NATS: the attach hands the api its server,
+its user, the vault entry of that user's password and the organization's
+token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
+`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), a pinned connection
+writes each event and waits for the stream to acknowledge it, and one the
+stream does not take in time stops the events, logged, while the api
+keeps serving. The organization records each event once, as a reading
+under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
+nothing is published and no connection is made.
+
 **Why the broker is in the MVP:** a single api instance would not need it,
 but the MVP's job is to lay the process model the rest is built on, and a
 path first exercised when the second instance appears is a path that has

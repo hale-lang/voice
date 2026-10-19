@@ -110,7 +110,11 @@ locus Inference {
         idle: Duration = 30s;
         // how often an open stream that is waiting gets a keep-alive comment
         keep_alive: Duration = 15s;
+        // tell the organization each served request (events.hl): set when
+        // voice is attached to one (main.hl)
+        pulse: Bool = false;
     }
+    bus { publish UsageRecorded; }
 
     /// `createResponse`.
     fn respond(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
@@ -144,7 +148,9 @@ locus Inference {
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted" && (o.outcome == "served" || o.outcome == "incomplete") && len(o.response) > 0 {
                 push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::served, wall_ms: ms }) or discard;
-                return served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000);
+                let s = served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000);
+                self.settled(r, s);
+                return s;
             }
             let reason = failure_of(o);
             why = c.seat.ref + ": " + reason;
@@ -230,7 +236,9 @@ locus Inference {
                     told = told + 1;
                 }
                 push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::served, wall_ms: ms }) or discard;
-                finish_stream(out, st, ending, served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000));
+                let s = served(request_id, r.model, k, m, c, o, attempts.items, (std::time::monotonic_ns() - started) / 1000000);
+                finish_stream(out, st, ending, s);
+                self.settled(r, s);
                 return out.end();
             }
             let reason = failure_of(o);
@@ -250,6 +258,12 @@ locus Inference {
             return out.end();
         }
         fail ApiError { status: 502, kind: "server_error", code: ErrorCode::upstream_failed, message: "every eligible seat failed; the last, " + why, has_voice: true, voice: attempts_voice(request_id, attempts.items) };
+    }
+
+    /// A request a seat served: its usage told to the organization, when
+    /// voice is attached to one.
+    fn settled(r: InferenceRequest, s: Served) {
+        if self.pulse { UsageRecorded <- usage_event(r, s); }
     }
 
     /// Admit `r` for the caller `ctx` names: the seats it may be offered,

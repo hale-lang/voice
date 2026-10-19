@@ -290,11 +290,11 @@ each gap classed in `api/gaps.json`.
 
 **hale 0.25.1.** The contract has three shapes no Hale type says:
 
-- a free-form JSON object: a seat's `config` (valid against its engine's `config_schema`, itself free-form), a change's `before` and `after`;
+- a free-form JSON object: a seat's `config` (valid against its engine's `config_schema`, itself free-form), a change's `before` and `after`. Closed by hale's `std::json::Value` (v0.26.0): each is one now, carried byte for byte, and a node's capabilities are a typed record around it;
 - a map whose values are scalars: `Health.checks`, dependency to `"ok"` or `"unavailable"` (a hale map, `bounded[S; N] indexed_by <field>`, has records as its values). Closed by hale's map of values (`indexed_by name -> status`, hale-lang/hale#1656): `Health.checks` is one now;
 - a PATCH field that may be left out (kept), `null` (cleared) or a value: an account's `provider`, a model's `price`, a key's `models`, `accounts` and `expires_at`, a node's `max_in_flight`, a project's `models` and `accounts` (a presence pair reads `null` as left out). Closed by hale's presence triple (`clear_x` beside `has_x` and `x`, hale-lang/hale#1664): each is one now;
 
-**Working shape:** the row carries the object as JSON text (`config`, `before`, `after`, a node's `capabilities`), the check as a field of its own (`Health.store`, until the map of values), and the PATCH field as `set_<field>` beside a value that says `null` its own way (until the presence triple). The REST reader and writer speak the contract's form; `api/gaps.json` lists each place, classed `map` and `json-text`.
+**Working shape (until hale v0.26.0):** the row carried the object as JSON text (`config`, `before`, `after`, a node's `capabilities`), the check as a field of its own (`Health.store`), and the PATCH field as `set_<field>` beside a value that said `null` its own way. All three shapes are closed now; `api/gaps.json` lists no `map`, `json-text` or `tri-state` gap.
 
 ## A bounded list is never required
 

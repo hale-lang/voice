@@ -26,9 +26,9 @@ const bundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const WAITS_ON = {
   optional: 'hale-lang/hale#1600: optional fields (a value or null)',
   enum: 'hale step 0: enums',
-  map: 'hale: a free-form JSON object (a seat\'s config, a change\'s before and after)',
+  map: 'voice: a free-form JSON object the row carries as text: std::json::Value carries it (hale v0.26.0); none today',
   wrapper: 'hale: a bounded field assigned whole (FRICTION.md); the list rides in a record',
-  'json-text': 'hale: a free-form JSON value inside a typed object (an engine\'s config_schema), so the node\'s capabilities ride as JSON text',
+  'json-text': 'voice: a typed object the row carries as free-form JSON (std::json::Value)',
   path: 'voice: a path or query parameter carried in the row\'s request',
   'map-values': 'voice: a map whose values one side says and the other does not, so they are not compared',
   wire: 'voice: the REST wire\'s shape differs from the row (written by api/wire.hl)',
@@ -107,7 +107,6 @@ const NOT_COMPARED = {
   AccountQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
-  NodeReport: ['the node\'s `Capabilities` (PUT /node/v1/capabilities), carried whole as JSON text and checked by the reader (api/fleet.hl): an engine\'s `config_schema` is free-form JSON, which the codec does not carry', ['json']],
   Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, so its schema is never on the wire; the map\'s value is compared as `Health.checks{}`', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
@@ -198,6 +197,14 @@ function compare(at, c, bIn) {
   } else if (cs.enum && bt === 'string') { gap(at + ' (enum)', 'enum'); return; }
   // a narrowing: the row refuses values the contract allows
   else if (bs.enum && !cs.enum) { gap(at + ' (narrowed to an enum)', 'type'); return; }
+  // free-form JSON (`std::json::Value`, `x-hale-any`): the contract's
+  // free-form object is what it carries, byte for byte; a contract that
+  // names the object's fields is a shape the row does not check
+  if (bs['x-hale-any'] === true) {
+    if (ct === 'object' && (!cs.properties || cs.additionalProperties)) return;
+    gap(at, 'json-text');
+    return;
+  }
   // a contract shape with no single type: several, or none named
   if (ct === undefined) { gap(at, 'open'); return; }
   if (ct === 'object' && bt === 'string') {
@@ -272,8 +279,7 @@ const beyond = Object.entries(NOT_COMPARED).flatMap(([n, [, only]]) =>
 // A field the row has and the contract does not, or the reverse, classed
 // by why: the first rule whose pattern the gap's place matches.
 const RULES = [
-  [/\.set_[a-z_]+$/, 'optional', 'a PATCH field\'s presence: only the fields present change'],
-  [/\.(priced|expires|used|revoked|archived|connected|beating|ends|budgeted|anchored)$/, 'optional', 'the null of the field beside it'],
+  [/\.(used|revoked|archived|connected|beating|ends|budgeted|anchored)$/, 'optional', 'the null of the field beside it'],
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^(Model|ModelList)\b/, 'wire', 'the caller\'s model nests voice\'s fields under `voice`, and lists say `object`'],

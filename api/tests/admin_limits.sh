@@ -13,7 +13,9 @@
 #   3. The head (`hale dna head`), its stub provider answering the
 #      `client_credentials` grant for the service `voice-api`, its secret
 #      in the vault, and the record mapping the service.
-#   4. Voice's api under `--head`, reading the limits as the service: the
+#   4. Voice's api given the head as a grafted one is (HALE_DNA_HEAD_URL,
+#      HALE_DNA_APPLICATION_ID, HALE_DNA_OIDC_ISSUER, HALE_DNA_OIDC_CLIENT,
+#      HALE_DNA_OIDC_CLIENT_VAULT), reading the limits as the service: the
 #      admin plane shows the ratified limit and where it came from, refuses
 #      to set it, and a project key's third request in the window is `429`
 #      with `Retry-After`.
@@ -134,8 +136,11 @@ application=$(curl -sf -H "Authorization: Bearer $token" "$H/api/hale/v1/applica
 [[ -n "$application" ]] || fail "the head names no application"
 # ---- 4. voice's api under the head, as the service
 voice_port=$(free_port); V=http://127.0.0.1:$voice_port
-"$voice/api/api" --port "$voice_port" --canned "$voice/api/canned" \
-  --head "$H" --application "$application" --issuer "$issuer" --client voice-api --limits-every-s 1 >"$root/voice.log" 2>&1 &
+# as a grafted api is: the head and its service client handed over in the
+# environment alone (the habitat's variables), no head flag, the reading
+# interval the default
+HALE_DNA_HEAD_URL="$H" HALE_DNA_APPLICATION_ID="$application" HALE_DNA_OIDC_ISSUER="$issuer" HALE_DNA_OIDC_CLIENT=voice-api HALE_DNA_OIDC_CLIENT_VAULT=oidc-service-voice-api \
+  "$voice/api/api" --port "$voice_port" --canned "$voice/api/canned" >"$root/voice.log" 2>&1 &
 jobs_started+=($!)
 until_ok 20 "voice's api answering" curl -sf -o /dev/null "$V/healthz"
 curl -sf -X POST -H 'Content-Type: application/json' -d '{"id": "personal", "name": "Personal"}' "$V/admin/v1/projects" >/dev/null || fail "no project personal"

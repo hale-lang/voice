@@ -137,9 +137,9 @@ application=$(curl -sf -H "Authorization: Bearer $token" "$H/api/hale/v1/applica
 # ---- 4. voice's api under the head, as the service
 voice_port=$(free_port); V=http://127.0.0.1:$voice_port
 # as a grafted api is: the head and its service client handed over in the
-# environment alone (the habitat's variables), no head flag, the reading
-# interval the default
-HALE_DNA_HEAD_URL="$H" HALE_DNA_APPLICATION_ID="$application" HALE_DNA_OIDC_ISSUER="$issuer" HALE_DNA_OIDC_CLIENT=voice-api HALE_DNA_OIDC_CLIENT_VAULT=oidc-service-voice-api \
+# environment alone (the habitat's variables), no flag, the reading interval
+# voice's own knob
+VOICE_LIMITS_EVERY_S=1 HALE_DNA_HEAD_URL="$H" HALE_DNA_APPLICATION_ID="$application" HALE_DNA_OIDC_ISSUER="$issuer" HALE_DNA_OIDC_CLIENT=voice-api HALE_DNA_OIDC_CLIENT_VAULT=oidc-service-voice-api \
   "$voice/api/api" --port "$voice_port" --canned "$voice/api/canned" >"$root/voice.log" 2>&1 &
 jobs_started+=($!)
 until_ok 20 "voice's api answering" curl -sf -o /dev/null "$V/healthz"

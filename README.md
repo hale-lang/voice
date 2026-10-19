@@ -96,7 +96,8 @@ application `--application` names (its id at the head, which the head's
 `/api/hale/v1/applications` lists) through the head as a service (a
 `client_credentials` token from `--issuer` under `--client`, its secret
 the vault's `oidc-service-<client>` or `--client-vault`), every
-`--limits-every-s`, each call one attempt under a 30 s deadline
+`--limits-every-s` seconds (or `VOICE_LIMITS_EVERY_S`, which the flag
+overrides; 30 by default), each call one attempt under a 30 s deadline
 ([`api/deadline.hl`](./api/deadline.hl)). A request reads only the limits
 last read, never the head. An answer from the head must give its length
 or its chunks, and one cut short does not land, so no project goes

@@ -131,7 +131,7 @@ api/api --head http://127.0.0.1:8792 --application <id> --issuer http://127.0.0.
 end against a DNA organization, from the Board's ratification to the
 caller's 429, a superseding limit, and a head stopped with the limits
 read last standing and no answer waiting on it (`VOICE_DNA_FIXTURE=1`,
-with a hale whose record is in memory).
+with a hale whose record is in memory, v0.26.0 on).
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node

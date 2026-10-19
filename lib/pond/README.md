@@ -19,9 +19,12 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   (`store/pg_store.hl`) and `api migrate` import them. One change of
   voice's own, marked `voice:` in `pq/pq.hl`: a result's rows are written
   into one buffer (`__pump`, `__append_row`) instead of growing the result
-  text by `+` per row, which kept every prefix until the caller returned.
+  text by `+` per row, which kept every prefix until the caller returned;
+  and the plaintext fallback of `sslmode=prefer` is logged through
+  `std::log` (logger `pq`) rather than printed bare.
 - `migrations/`: pond's `migrations` at `e2dfe4e`, which `api migrate`
-  runs. A pond issue it works around without changing it: `Migrator`
+  runs. One change of voice's own, marked `voice:`: its verbose lines go
+  through `std::log` (logger `migrate`) rather than printed bare. A pond issue it works around without changing it: `Migrator`
   creates `schema_migrations` before it takes its advisory lock, so two
   runs at once on a fresh database could both create it and one fail;
   `api migrate` takes an advisory lock of its own around the whole run.

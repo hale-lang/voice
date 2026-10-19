@@ -62,7 +62,7 @@ main locus Brain {
     }
 
     run() {
-        println("voice brain: the store at ", self.conn.host, ":", self.conn.port, "; the route table's version on ", (if len(self.nats) > 0 { self.nats } else { "no NATS" }));
+        log_info("the store, and the route table's version on NATS", fields2(std::log::kv("store", self.conn.host + ":" + to_string(self.conn.port)), std::log::kv("nats", if len(self.nats) > 0 { self.nats } else { "none" })));
         while true {
             self.tick();
             std::time::sleep(self.interval);
@@ -76,13 +76,13 @@ main locus Brain {
         if !self.opened {
             let st = self.conn.open();
             if !st.ok {
-                self.say("unreachable", "voice brain: Postgres unreachable: " + st.err.detail);
+                self.say("unreachable", "Postgres unreachable: " + st.err.detail);
                 return;
             }
             let v = self.conn.query_one("SHOW server_version_num");
             let num = std::str::parse_int(std::str::trim(v.data)) or 0;
             if v.ok && num < 140000 {
-                eprintln("voice brain: Postgres 14 or newer is required (idle_session_timeout frees a stopped brain's lock); this server is ", std::str::trim(v.data));
+                log_error("Postgres 14 or newer is required: idle_session_timeout frees a stopped brain's lock", std::log::kv("server_version_num", std::str::trim(v.data)));
                 std::process::exit(1);
             }
             let mut i = 0;
@@ -103,18 +103,18 @@ main locus Brain {
                 return;
             }
             if std::str::trim(lock.data) != "t" {
-                self.say("standby", "voice brain: another brain holds the lock; standing by");
+                self.say("standby", "another brain holds the lock; standing by");
                 return;
             }
             self.holding = true;
-            self.say("working", "voice brain: holding the lock; working");
+            self.say("working", "holding the lock; working");
         }
         let reclaimed = reclaim(self.conn);
         if reclaimed < 0 {
             self.drop("the connection, reclaiming");
             return;
         }
-        if reclaimed > 0 { println("voice brain: reclaimed ", reclaimed, " dead api instance(s)"); }
+        if reclaimed > 0 { log_info("reclaimed dead api instances", std::log::kv("count", to_string(reclaimed))); }
         let version = self.written();
         if version < 0 { return; }
         // the notifier tells NATS; the tick never waits on it
@@ -139,14 +139,14 @@ main locus Brain {
     /// Say trouble, or its end, once each time it changes.
     fn trouble_is(what: String) {
         if what == self.trouble { return; }
-        if len(what) > 0 { eprintln("voice brain: ", what); } else { println("voice brain: the route table is written again"); }
+        if len(what) > 0 { log_warn(what, ""); } else { log_info("the route table is written again", ""); }
         self.trouble = what;
     }
 
     /// The connection failed: the lock went with it. Stand by until it is
     /// back and the lock is ours again.
     fn drop(why: String) {
-        eprintln("voice brain: ", why, "; dropping the connection and the lock");
+        log_warn(why + "; dropping the connection and the lock", "");
         self.conn.close();
         self.opened = false;
         self.holding = false;
@@ -157,7 +157,7 @@ main locus Brain {
     fn say(state: String, line: String) {
         if self.said == state { return; }
         self.said = state;
-        println(line);
+        if state == "unreachable" { log_warn(line, ""); } else { log_info(line, ""); }
     }
 }
 
@@ -240,7 +240,7 @@ fn reclaim(conn: pq::PgConn) -> Int {
     let dead = conn.query_params(DEAD_INSTANCES, none);
     if !dead.ok {
         if dead.err.kind == "io" { return -1; }
-        eprintln("voice brain: reading dead api instances: ", dead.err.detail);
+        log_warn("reading dead api instances", std::log::kv("detail", dead.err.detail));
         return 0;
     }
     let mut n = 0;
@@ -276,7 +276,7 @@ fn reclaim_one(conn: pq::PgConn, instance: String) -> Int {
         if !r.ok {
             conn.rollback();
             if r.err.kind == "io" { return -1; }
-            eprintln("voice brain: reclaiming ", instance, ": ", r.err.detail, "; left for the next tick");
+            log_warn("reclaiming an instance failed; left for the next tick", fields2(std::log::kv("instance", instance), std::log::kv("detail", r.err.detail)));
             return 0;
         }
         if i == 0 && r.rows_affected == 0 {
@@ -315,6 +315,8 @@ fn reclaim_step(i: Int) -> String {
 /// `brain --database URL [--nats URL]`; `--database` may come as
 /// VOICE_DATABASE_URL.
 fn main() {
+    // the one sink: every logger's lines are written here (log.hl)
+    let sink = std::log::StdoutSink { };
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
     let mut nats = "nats://127.0.0.1:4222";
     let mut i = 1;
@@ -329,7 +331,7 @@ fn main() {
         i = i + 2;
     }
     if len(database) == 0 {
-        eprintln("usage: brain --database postgres://user:password@host:port/database [--nats URL]");
+        log_error("usage: brain --database postgres://user:password@host:port/database [--nats URL]", "");
         std::process::exit(2);
     }
     Brain { database: database, nats: nats, notifier: Notifier { url: nats } };

@@ -324,5 +324,5 @@ each gap classed in `api/gaps.json`.
 
 **hale 0.25.1.** In `bindings { T: nats::NatsPublisher { url: self.nerves_url, ... } codec(...); }` `hale check` accepts `self.nerves_url`; `hale build` then fails: "codegen error: unsupported in codegen v0: self.org read outside a locus method".
 
-**Working shape:** the binding reads what it needs from the environment itself (`std::env::var("HALE_DNA_NATS_URL_APP")`), where the attach hands it over.
+**Working shape:** no binding. The teller (api/teller.hl) is a pinned locus whose params the main locus's own literal sets from its params, which a params initializer may read.
 

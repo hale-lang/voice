@@ -8,8 +8,12 @@
 ///
 /// Attached to an organization (Hale's DNA), the api tells it each served
 /// request as an event (events.hl) on the organization's nerves: the usage
-/// topic is bound to pond's NATS adapter, and a pinned connection writes it
-/// and waits for the stream to acknowledge it. The attach hands the api its
+/// topic is bound to pond's `NatsPublisher`, which dials the server for
+/// each event, publishes it onto the organization's stream, waits for the
+/// stream to acknowledge it and hangs up, holding nothing between events
+/// (no connection, no thread: one that a drain would wait on). An event the
+/// stream does not take is logged, and the api keeps serving. The attach
+/// hands the api its
 /// server, user, the vault entry of that user's password and the
 /// organization's token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
 /// `HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`); without the token
@@ -33,34 +37,22 @@ main locus Api {
         idle_s: Int = 30;
         instance: String = "";
         pulse: Pulse = Pulse { database: self.database, instance: self.instance };
-        // the organization's nerves: its token ("" when voice is attached to
-        // none), the application's server, its user and the vault entry of
-        // that user's password, which the client reveals on CONNECT alone
+        // the organization's token, "" when voice is attached to none (its
+        // nerves: the binding below)
         org: String = "";
-        nerves_url: String = "";
-        nerves_user: String = "";
-        nerves_vault: String = "";
-        // with no organization the connection's loop ends at once and is
-        // never written to (Inference.pulse is off)
-        nerves: nats::NatsConn = nats::NatsConn {
-            url: self.nerves_url,
-            user: self.nerves_user,
-            credential: std::secret::Credential { vault: self.nerves_vault },
+    }
+    placement { pulse: pinned; }
+    // the attach's hand-over, read where the binding is made (a binding
+    // reads no param of the locus); with no organization `url` is "" and
+    // nothing is published (Inference.pulse is off as well)
+    bindings {
+        UsageRecorded: nats::NatsPublisher {
+            url: if len(std::env::var("HALE_DNA_NATS_ORG")) > 0 { std::env::var("HALE_DNA_NATS_URL_APP") } else { "" },
+            user: std::env::var("HALE_DNA_NATS_USER_APP"),
+            credential: std::secret::Credential { vault: std::env::var("HALE_DNA_NATS_VAULT_APP") },
             name: "voice-api",
-            subject_prefix: self.org + ".",
-            jetstream: true,
-            run_for_ms: if len(self.org) > 0 { 0 } else { 1 }
-        };
-    }
-    placement {
-        pulse: pinned;
-        nerves: pinned;
-    }
-    bindings { UsageRecorded: nats::NatsAdapter { } codec(UsageJson { }); }
-    // an event the stream did not take in time: the connection is gone,
-    // and the api keeps answering without it
-    on_failure(c: nats::NatsConn, err: ClosureViolation) {
-        log_error("the organization's nerves stopped: events are no longer told", std::log::kv("error", c.last_error));
+            subject_prefix: std::env::var("HALE_DNA_NATS_ORG") + "."
+        } codec(UsageJson { });
     }
     run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org); }
 }
@@ -244,7 +236,7 @@ fn main() {
         std::process::exit(2);
     }
     let id = st::random_id(6);
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
+    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, org: org };
 }
 
 /// The environment's `name`, or `otherwise` when it is unset.

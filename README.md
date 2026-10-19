@@ -488,10 +488,11 @@ on `app.voice.usage.recorded` ([`api/events.hl`](./api/events.hl)), its
 JetStream stream, not voice's NATS: the attach hands the api its server,
 its user, the vault entry of that user's password and the organization's
 token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
-`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), a pinned connection
-writes each event and waits for the stream to acknowledge it, and one the
-stream does not take in time stops the events, logged, while the api
-keeps serving. The organization records each event once, as a reading
+`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), and pond's
+`NatsPublisher` dials the server for each event, publishes it onto the
+organization's stream, waits for the stream to acknowledge it and hangs
+up. An event the stream does not take is logged, and the api keeps
+serving. The organization records each event once, as a reading
 under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
 nothing is published and no connection is made.
 

@@ -314,3 +314,15 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** none in voice; the README's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 
+## A drain waits on a locus whose run() has returned
+
+**hale 0.25.1.** A pinned `NatsConn` (pond) given `run_for_ms: 1`, so its `run()` returns at once when there is nothing to connect to, holds a SIGTERM drain for its whole grace: "the drain begun by signal 15 did not finish within 5000 ms (a run() that never reads self.draining?); ... live loci that read draining: `NatsConn` x1". Its `run()` had returned long before, so it was not reading anything; the api took 5 s to stop instead of a few milliseconds.
+
+**Working shape:** the usage events go through pond's `NatsPublisher`, which holds no connection or thread between events, instead of a pinned `NatsConn` (api/main.hl).
+
+## A binding's literal that reads the locus's params passes the check and fails the build
+
+**hale 0.25.1.** In `bindings { T: nats::NatsPublisher { url: self.nerves_url, ... } codec(...); }` `hale check` accepts `self.nerves_url`; `hale build` then fails: "codegen error: unsupported in codegen v0: self.org read outside a locus method".
+
+**Working shape:** the binding reads what it needs from the environment itself (`std::env::var("HALE_DNA_NATS_URL_APP")`), where the attach hands it over.
+

@@ -279,8 +279,7 @@ const beyond = Object.entries(NOT_COMPARED).flatMap(([n, [, only]]) =>
 // A field the row has and the contract does not, or the reverse, classed
 // by why: the first rule whose pattern the gap's place matches.
 const RULES = [
-  [/\.set_[a-z_]+$/, 'optional', 'a PATCH field\'s presence: only the fields present change'],
-  [/\.(priced|expires|used|revoked|archived|connected|beating|ends|budgeted|anchored)$/, 'optional', 'the null of the field beside it'],
+  [/\.(used|revoked|archived|connected|beating|ends|budgeted|anchored)$/, 'optional', 'the null of the field beside it'],
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^(Model|ModelList)\b/, 'wire', 'the caller\'s model nests voice\'s fields under `voice`, and lists say `object`'],

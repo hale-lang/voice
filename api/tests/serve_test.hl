@@ -207,6 +207,72 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes, laptop: Strin
     e.inference.keep_alive = 15s;
 }
 
+/// Rate limits: the stored ones enforced, then a ratified practice in
+/// their place under a head (admission.hl, governance.hl).
+fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
+    beat(e, laptop);
+    let hi = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 2}, {\"scope\": \"model\", \"model\": \"other-1\", \"window_seconds\": 60, \"requests\": 0}]}"), 200, "a limit of two a minute, and none for another model");
+    let one = ask(e, "/v1/responses", key, hi);
+    expect(one, 200, "the first is served");
+    std::test::assert(std::str::contains(one.headers, "x-ratelimit-limit-requests: 2") && std::str::contains(one.headers, "x-ratelimit-remaining-requests: 1") && std::str::contains(one.headers, "x-ratelimit-reset-requests: "), "with the limit's headers: " + one.headers);
+    expect(ask(e, "/v1/responses", key, hi), 200, "the second is served; another model's limit does not apply");
+    let third = ask(e, "/v1/responses", key, hi);
+    expect(third, 429, "the third is past the limit");
+    std::test::assert(std::str::contains(third.headers, "Retry-After: "), "with Retry-After: " + third.headers);
+    let refusal = std::json::find_field_raw(third.body, "error");
+    std::test::assert(std::json::find_string_field(refusal, "code") == "rate_limited" && std::json::find_string_field(refusal, "type") == "too_many_requests", "rate_limited: " + third.body);
+    std::test::assert_eq_int(std::json::find_int_field(std::json::find_field_raw(std::json::find_field_raw(refusal, "voice"), "limit"), "requests"), 2, "naming the limit that refused it");
+    expect(ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}"), 429, "a stream too, before it begins");
+    let stored = admin(e, "GET", "/admin/v1/projects/work/limits", "");
+    std::test::assert_eq_str(std::json::find_string_field(stored.body, "source"), "stored", "the stored limits are the source");
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "the limit lifted");
+    expect(ask(e, "/v1/responses", key, hi), 200, "and served again");
+
+    // a key's own limit
+    let keys = std::json::find_field_raw(admin(e, "GET", "/admin/v1/projects/work/keys", "").body, "data");
+    let kid = std::json::find_string_field(std::json::array_first(keys).element, "id");
+    std::test::assert(len(kid) > 0, "the key's id: " + keys);
+    expect(admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": [{\"scope\": \"key\", \"window_seconds\": 60, \"requests\": 1}]}"), 200, "a key limited to one a minute");
+    expect(ask(e, "/v1/responses", key, hi), 200, "its first is served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "its second is past the key's limit");
+    expect(admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": []}"), 200, "the key's limit lifted");
+
+    // under a head, the organization's ratified practice is the limit, and
+    // the stored ones are not: one a minute, though five are stored
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 5}]}"), 200, "five stored");
+    e.projects.governed = true;
+    e.inference.governance.head = "http://head.test";
+    e.inference.governance.landed = true;
+    e.inference.governance.read_at_ns = std::time::monotonic_ns();
+    e.inference.governance.limits.push(api::PracticeLimit { project: "work", name: "operating/limits/work", id: "p_1", limit: api::parse_limit("The limit for work.\nwindow_seconds: 60\nrequests: 1") });
+    expect(ask(e, "/v1/responses", key, hi), 200, "the first under the practice is served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "the second is past the ratified limit");
+    let ratified = admin(e, "GET", "/admin/v1/projects/work/limits", "");
+    std::test::assert(std::json::find_string_field(ratified.body, "source") == "practice" && std::json::find_string_field(std::json::find_field_raw(ratified.body, "practice"), "name") == "operating/limits/work", "the limit shown is the practice's, and says so: " + ratified.body);
+    std::test::assert_eq_int(std::json::find_int_field(std::json::array_first(std::json::find_field_raw(ratified.body, "limits")).element, "requests"), 1, "its limit");
+    let refused = admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}");
+    expect(refused, 409, "the admin plane cannot set what the organization decides");
+    std::test::assert(std::str::contains(refused.body, "organization's practice"), "and says why: " + refused.body);
+
+    // a head that has not answered yet: the limits fail closed
+    e.inference.governance.landed = false;
+    e.inference.governance.read_at_ns = 0 - 1;
+    e.inference.governance.head = "http://127.0.0.1:1";
+    e.inference.governance.issuer = "http://127.0.0.1:1";
+    e.inference.governance.client = "voice-api";
+    let closed = ask(e, "/v1/responses", key, hi);
+    expect(closed, 503, "before any limits are read, a keyed request is refused");
+    std::test::assert(std::str::contains(closed.body, "metering_unavailable") && std::str::contains(closed.headers, "Retry-After: 30"), "metering_unavailable, retrying at the next read: " + closed.headers + " " + closed.body);
+    std::test::assert(!std::str::contains(closed.headers, "x-ratelimit"), "and states no limit");
+    expect(admin(e, "GET", "/admin/v1/projects/work/limits", ""), 503, "nor can the admin plane read them");
+
+    e.projects.governed = false;
+    e.inference.governance.head = "";
+    e.inference.governance.limits.pop() or discard;
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "ungoverned again, the stored limits lifted");
+}
+
 fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
     return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
 }
@@ -325,6 +391,7 @@ fn main() {
     streamed_with_sse(e, key, nodes);
     streamed_failures(e, key, nodes, laptop);
     first_output_span(e, key, nodes, laptop);
+    rate_limits(e, key, laptop);
 
     // a seat that refuses: the request moves to another
     // the waits above outlast the up window of the laptop's registration

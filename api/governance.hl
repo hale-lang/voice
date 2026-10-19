@@ -1,0 +1,251 @@
+// Rate limits as the organization ratified them (voice#1, #8): when the
+// api runs with `--head`, a project's limit is the practice
+// `operating/limits/<project>`, proposed like any practice, decided by the
+// Board, and changed only by a superseding practice the Board ratifies.
+// Voice decides nothing about policy; it reads the ratified practices and
+// enforces them (admission.hl).
+//
+// The practice's text states its own grammar: one `name: value` per line,
+// the names those of the contract's `Limit` (`window_seconds`, `requests`,
+// `input_tokens`, `output_tokens`, `concurrent`), each a whole number alone
+// after its name. A name left out is unlimited; every other line, a value
+// with words after it included, is prose.
+//
+// The api reads them through the organization's head and nowhere else, as
+// a service (spec/dna.md, "A service is a principal too"): a token of the
+// issuer's `client_credentials` grant under its own client id, its secret
+// the vault's (`std::secret`), presented as a bearer on the head's API
+// routes. It reads again at most once per `every`, when a request arrives,
+// each call bounded at 2 s. Until a read lands, a keyed request is refused
+// (`503 metering_unavailable`): the limits fail closed. Once one has, what
+// it read last stands while the head does not answer, and each refusal is
+// logged once. A project the organization ratified no limit for is not
+// limited. Of several ratified practices of one project (a superseding one
+// before the old one's retirement lands), the last proposed is in force.
+
+const LIMIT_PREFIX: String = "operating/limits/";
+
+/// One project's ratified limit: the practice it was read from, and the
+/// limit (scope `project`).
+type PracticeLimit {
+    project: String = "";
+    // the practice's name and id, as the head lists it
+    name: String = "";
+    id: String = "";
+    limit: st::Limit = st::Limit { scope: st::LimitScope::project };
+}
+
+@form(vec)
+locus PracticeLimits { capacity { heap rows of PracticeLimit; } }
+
+/// A whole number, -1 when `text` is not one.
+fn whole(text: String) -> Int {
+    let t = std::str::trim(text);
+    if len(t) == 0 { return -1; }
+    let mut i = 0;
+    while i < len(t) {
+        let c = std::str::byte_at_unchecked(t, i);
+        if c < 48 || c > 57 { return -1; }
+        i = i + 1;
+    }
+    return std::str::parse_int(t) or - 1;
+}
+
+/// A practice's text as a project-scope limit: its `name: value` lines,
+/// the rest prose.
+@unbounded
+fn parse_limit(text: String) -> st::Limit {
+    let mut l = st::Limit { scope: st::LimitScope::project };
+    let v = std::str::bytes_view(text);
+    let mut start = 0;
+    while start < v.n {
+        let end = st::line_end(v, start);
+        let line = std::str::trim(std::str::slice(v, start, end));
+        start = end + 1;
+        let colon = std::str::index_of(line, ":");
+        if colon <= 0 { continue; }
+        let name = std::str::trim(line[0..colon]);
+        let value = whole(line[(colon + 1)..len(line)]);
+        if value < 0 { continue; }
+        if name == "window_seconds" && value > 0 { l.window_seconds = value; }
+        if name == "requests" { l.requests = value; }
+        if name == "input_tokens" { l.input_tokens = value; }
+        if name == "output_tokens" { l.output_tokens = value; }
+        if name == "concurrent" { l.concurrent = value; }
+    }
+    return st::counted(l);
+}
+
+/// `p` into `read`, in the order the head lists practices (the order they
+/// were proposed): a later ratified practice of the same project replaces
+/// an earlier one, so a superseding limit is in force even before the
+/// retirement of the one it supersedes lands.
+@unbounded
+fn fold_limit(read: PracticeLimits, p: PracticeLimit) {
+    let mut k = 0;
+    while k < read.len() {
+        let have = read.get(k) or PracticeLimit { };
+        if have.project == p.project {
+            read.set(k, p) or discard;
+            return;
+        }
+        k = k + 1;
+    }
+    read.push(p);
+}
+
+fn no_answer(e: std::http::HttpError) -> std::http::ClientResponse {
+    return std::http::ClientResponse { status: 0, headers: "", body: b"" };
+}
+
+/// `text` percent-encoded for a form body: unreserved characters kept.
+@unbounded
+fn form_encode(text: String) -> String {
+    let hex = "0123456789ABCDEF";
+    let out = std::bytes::BytesBuilder { initial_cap: len(text) * 3 + 1 };
+    let mut i = 0;
+    while i < len(text) {
+        let c = std::str::byte_at_unchecked(text, i);
+        let keep = (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46 || c == 95 || c == 126;
+        out.append_str(if keep { text[i..(i + 1)] } else { "%" + hex[(c / 16)..(c / 16 + 1)] + hex[(c % 16)..(c % 16 + 1)] });
+        i = i + 1;
+    }
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// What a read through the head found: the head answered, or why it did
+/// not.
+type HeadRead { ok: Bool = false; why: String = ""; }
+
+/// The organization's ratified limits, read through its head.
+locus Governance {
+    params {
+        // the organization's head ("" = the limits are the api's own)
+        head: String = "";
+        // the identity provider the head trusts, and this service's client
+        // id there
+        issuer: String = "";
+        client: String = "";
+        // the vault entry holding the client's secret (`oidc-service-<id>`)
+        secret: std::secret::Credential = std::secret::Credential { };
+        every: Duration = 30s;
+        http: std::http::Client = std::http::Client { timeout_ms: 2000 };
+        read_at_ns: Int = 0 - 1;
+        // a read has landed: the limits are known
+        landed: Bool = false;
+        token: String = "";
+        token_until_ns: Int = 0;
+        // why the last read did not land ("" when it did)
+        refused: String = "";
+        limits: PracticeLimits = PracticeLimits { };
+    }
+
+    fn governed() -> Bool { return len(self.head) > 0; }
+
+    /// Read again when the last read is older than `every`.
+    fn refresh(now_ns: Int) {
+        if !self.governed() { return; }
+        if self.read_at_ns >= 0 && now_ns - self.read_at_ns < self.every / 1ns { return; }
+        self.read_at_ns = now_ns;
+        let r = self.read(now_ns);
+        if r.ok {
+            if len(self.refused) > 0 || !self.landed { log_info("the ratified rate limits are read", std::log::kv("projects", to_string(self.limits.len()))); }
+            self.refused = "";
+            self.landed = true;
+        } else if r.why != self.refused {
+            log_warn("the ratified rate limits were not read: " + r.why, std::log::kv("then", if self.landed { "the last ones read stand" } else { "keyed requests are refused until they are" }));
+            self.refused = r.why;
+        }
+    }
+
+    /// The ratified limit of `project`; `project` "" in the answer when
+    /// the organization ratified none.
+    @unbounded
+    fn limit_of(project: String) -> PracticeLimit {
+        let mut i = 0;
+        while i < self.limits.len() {
+            let p = self.limits.get(i) or PracticeLimit { };
+            if p.project == project { return p; }
+            i = i + 1;
+        }
+        return PracticeLimit { };
+    }
+
+    /// A token for this service, from the issuer's token endpoint, kept
+    /// until a minute before it expires; "" with `why` when the issuer
+    /// refuses.
+    fn service_token(now_ns: Int) -> HeadRead {
+        if len(self.token) > 0 && now_ns < self.token_until_ns - 60000000000 { return HeadRead { ok: true }; }
+        let found = self.http.get(self.issuer + "/.well-known/openid-configuration") or no_answer(err);
+        let endpoint = std::json::find_string_field(std::str::from_bytes(found.body), "token_endpoint");
+        if found.status != 200 || len(endpoint) == 0 { return HeadRead { why: "the issuer's discovery document did not answer" }; }
+        if !self.secret.ready() { return HeadRead { why: "the vault holds no secret for this service" }; }
+        // the secret goes on the wire as the vault holds it: a revealed
+        // secret is consumed by the write itself, never passed through a
+        // program's own function (spec/semantics.md, "@sealed")
+        let answered = self.http.post(endpoint, std::bytes::from_string("grant_type=client_credentials&client_id=" + form_encode(self.client) + "&client_secret=" + self.secret.reveal_text()), "application/x-www-form-urlencoded") or no_answer(err);
+        let body = std::str::from_bytes(answered.body);
+        let token = std::json::find_string_field(body, "access_token");
+        if answered.status != 200 || len(token) == 0 { return HeadRead { why: "the issuer refused this service (" + to_string(answered.status) + ")" }; }
+        self.token = token;
+        self.token_until_ns = now_ns + std::json::find_int_field(body, "expires_in") * 1000000000;
+        return HeadRead { ok: true };
+    }
+
+    /// A GET on the head's API as this service.
+    fn head_get(path: String) -> std::http::ClientResponse {
+        let empty = std::http::Url { };
+        let url = std::http::parse_url(self.head + path) or empty;
+        let answered = self.http.request(std::http::ClientRequest { method: "GET", url: url, headers: "Authorization: Bearer " + self.token, body: b"" }) or no_answer(err);
+        // a token the head no longer takes is asked for again next time
+        if answered.status == 401 { self.token = ""; }
+        return answered;
+    }
+
+    /// The ratified limits through the head, every page of one snapshot.
+    /// What was read last stands when this does not land.
+    @unbounded
+    fn read(now_ns: Int) -> HeadRead {
+        let t = self.service_token(now_ns);
+        if !t.ok { return t; }
+        let apps = self.head_get("/api/hale/v1/applications");
+        let first = std::json::array_first(std::json::find_field_raw(std::json::find_field_raw(std::str::from_bytes(apps.body), "data"), "items"));
+        let app = if first.done { "" } else { std::json::find_string_field(first.element, "id") };
+        if apps.status != 200 || len(app) == 0 { return HeadRead { why: "the head names no application (" + to_string(apps.status) + ")" }; }
+        let read = PracticeLimits { };
+        let mut offset = 0;
+        let mut snapshot = "";
+        let mut pages = 0;
+        while offset >= 0 && pages < 100 {
+            let at = if offset > 0 { "&offset=" + to_string(offset) + "&snapshot=" + form_encode(snapshot) } else { "" };
+            let page = self.head_get("/api/hale/v1/applications/" + form_encode(app) + "/dna/practices?limit=100" + at);
+            // the record moved between pages: read it whole next time
+            if page.status == 409 { return HeadRead { why: "the record moved while it was read" }; }
+            if page.status != 200 { return HeadRead { why: "the head did not answer the practices (" + to_string(page.status) + ")" }; }
+            let data = std::json::find_field_raw(std::str::from_bytes(page.body), "data");
+            let mut it = std::json::array_first(std::json::find_field_raw(data, "items"));
+            while !it.done {
+                let name = std::json::find_string_field(it.element, "name");
+                if std::str::starts_with(name, LIMIT_PREFIX) && len(name) > len(LIMIT_PREFIX) && std::json::find_string_field(it.element, "state") == "ratified" {
+                    fold_limit(read, PracticeLimit { project: name[len(LIMIT_PREFIX)..len(name)], name: name, id: std::json::find_string_field(it.element, "id"), limit: parse_limit(std::json::find_string_field(it.element, "text")) });
+                }
+                it = std::json::array_next(it);
+            }
+            let p = std::json::find_field_raw(data, "page");
+            if len(snapshot) == 0 { snapshot = std::json::find_string_field(p, "snapshot"); }
+            // -1 (or none) on the last page
+            offset = if std::json::string_field(p, "next_offset").kind == "number" { std::json::find_int_field(p, "next_offset") } else { -1 };
+            pages = pages + 1;
+        }
+        while self.limits.len() > 0 {
+            let gone = self.limits.pop() or PracticeLimit { };
+        }
+        let mut i = 0;
+        while i < read.len() {
+            self.limits.push(read.get(i) or PracticeLimit { });
+            i = i + 1;
+        }
+        return HeadRead { ok: true };
+    }
+}

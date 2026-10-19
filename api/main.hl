@@ -32,6 +32,15 @@ main locus Api {
         idle_s: Int = 30;
         instance: String = "";
         pulse: Pulse = Pulse { database: self.database, instance: self.instance };
+        // the organization's head, when its rate limits are the
+        // organization's ratified practices (governance.hl): its address,
+        // the issuer it trusts, this service's client id there, the vault
+        // entry of the client's secret and how often to read them again
+        head: String = "";
+        issuer: String = "";
+        client: String = "";
+        client_vault: String = "";
+        limits_every_s: Int = 30;
         // the organization's nerves: its token ("" when voice is attached to
         // none), the application's server, its user and the vault entry of
         // that user's password
@@ -46,10 +55,26 @@ main locus Api {
         pulse: pinned;
         teller: pinned;
     }
-    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org); }
+    run() { serve(self.host, self.port, self.canned, self.nats, self.node_nats, self.ui, self.database, self.first_s, self.idle_s, self.org, Governed { head: self.head, issuer: self.issuer, client: self.client, client_vault: self.client_vault, every_s: self.limits_every_s }); }
 }
 
-fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int, org: String) {
+/// Where the rate limits come from under a head (governance.hl); `head`
+/// "" for the stored ones.
+type Governed { head: String = ""; issuer: String = ""; client: String = ""; client_vault: String = ""; every_s: Int = 30; }
+
+/// The endpoints' rate limits under `g`.
+fn govern(endpoints: Endpoints, g: Governed) {
+    if len(g.head) == 0 { return; }
+    endpoints.projects.governed = true;
+    endpoints.inference.governance.head = g.head;
+    endpoints.inference.governance.issuer = g.issuer;
+    endpoints.inference.governance.client = g.client;
+    endpoints.inference.governance.secret = std::secret::Credential { vault: g.client_vault };
+    endpoints.inference.governance.every = g.every_s * 1s;
+    log_info("the rate limits are the organization's ratified practices", fields2(std::log::kv("head", g.head), std::log::kv("client", g.client)));
+}
+
+fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int, org: String, g: Governed) {
     log_info("serving", fields2(std::log::kv("url", "http://" + host + ":" + to_string(port)), std::log::kv("canned", canned)));
     log_info("nodes over NATS", fields2(std::log::kv("nats", nats), std::log::kv("node_nats", if len(node_nats) > 0 { node_nats } else { nats })));
     if len(ui) > 0 { log_info("serving the admin ui", std::log::kv("ui", ui)); }
@@ -61,6 +86,7 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
         endpoints.inference.pulse = len(org) > 0;
+        govern(endpoints, g);
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     } else {
         log_info("the store is in memory, lost on restart", "");
@@ -68,6 +94,7 @@ fn serve(host: String, port: Int, canned: String, nats: String, node_nats: Strin
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
         endpoints.inference.pulse = len(org) > 0;
+        govern(endpoints, g);
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     }
 }
@@ -171,6 +198,11 @@ fn main() {
     let mut ui = "";
     let mut first_s = 120;
     let mut idle_s = 30;
+    let mut head = "";
+    let mut issuer = "";
+    let mut client = "";
+    let mut client_vault = "";
+    let mut limits_every_s = 30;
     let mut i = if migrating { 2 } else { 1 };
     while i + 1 < std::env::args_count() {
         let flag = std::env::arg(i);
@@ -201,6 +233,20 @@ fn main() {
                 log_error("--seat-first-s takes a number of seconds", std::log::kv("value", value));
                 std::process::exit(2);
             }
+        } else if flag == "--head" {
+            head = value;
+        } else if flag == "--issuer" {
+            issuer = value;
+        } else if flag == "--client" {
+            client = value;
+        } else if flag == "--client-vault" {
+            client_vault = value;
+        } else if flag == "--limits-every-s" {
+            limits_every_s = std::str::parse_int(value) or - 1;
+            if limits_every_s < 1 {
+                log_error("--limits-every-s takes a number of seconds", std::log::kv("value", value));
+                std::process::exit(2);
+            }
         } else if flag == "--seat-idle-s" {
             idle_s = std::str::parse_int(value) or - 1;
             if idle_s < 1 {
@@ -218,6 +264,18 @@ fn main() {
         }
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
+    if len(head) > 0 {
+        if len(client_vault) == 0 { client_vault = "oidc-service-" + client; }
+        if len(issuer) == 0 || len(client) == 0 {
+            log_error("--head takes --issuer and --client: the limits are read through it as a service", "");
+            std::process::exit(2);
+        }
+        let secret = std::secret::Credential { vault: client_vault };
+        if !secret.ready() {
+            log_error("the vault holds no secret for this service", std::log::kv("entry", client_vault));
+            std::process::exit(2);
+        }
+    }
     // the attach's hand-over (spec/dna.md, "One transport: the nerves")
     let org = env_or("HALE_DNA_NATS_ORG", "");
     let nerves_url = env_or("HALE_DNA_NATS_URL_APP", "");
@@ -228,7 +286,7 @@ fn main() {
         std::process::exit(2);
     }
     let id = st::random_id(6);
-    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
+    Api { host: host, port: port, canned: canned, nats: nats, node_nats: node_nats, ui: ui, database: database, first_s: first_s, idle_s: idle_s, instance: "api-" + id, head: head, issuer: issuer, client: client, client_vault: client_vault, limits_every_s: limits_every_s, org: org, nerves_url: nerves_url, nerves_user: nerves_user, nerves_vault: nerves_vault };
 }
 
 /// The environment's `name`, or `otherwise` when it is unset.

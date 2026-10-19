@@ -1,0 +1,92 @@
+// Rate limits, enforced: one admission path, its limits from one of two
+// sources, never both. With `--head` a project's limit is its ratified
+// practice and nothing else (governance.hl); without, the limits the
+// admin plane stored apply: the project's, its model-scope ones for the
+// model asked for, and the key's. Each is enforced the same way here.
+//
+// A limit's `requests` count requests per `window_seconds`, and its
+// `concurrent` the requests in flight at once; a request past either is
+// `429 rate_limited` with `Retry-After` and the limit that refused it, and
+// an admitted one carries the tightest `requests` limit's
+// `x-ratelimit-*-requests` headers. `input_tokens` and `output_tokens` are
+// read and shown, and not enforced yet: a token is known only once the
+// seat has answered, and charging it is the reservation the store.md
+// design keeps across instances. The windows are this instance's, on the
+// monotonic clock.
+
+/// One limit's window: requests counted since `start_ns`, and those in
+/// flight.
+type Window {
+    scope: String = "";
+    start_ns: Int = 0;
+    used: Int = 0;
+    in_flight: Int = 0;
+}
+
+@form(vec)
+locus Windows { capacity { heap rows of Window; } }
+
+/// The limits one request is held to, with the place each window is kept
+/// under (`project:<id>`, `model:<project>/<model>`, `key:<id>`).
+type Applied {
+    scopes: bounded[String; 34];
+    limits: bounded[st::Limit; 34];
+}
+
+/// What admission held for one request: the windows it counts in flight
+/// against, and the headers its answer carries.
+type Held {
+    scopes: bounded[String; 34];
+    headers: String = "";
+}
+
+/// Seconds as the contract writes a reset: `1s`, `6m0s`.
+fn duration(seconds: Int) -> String {
+    if seconds < 60 { return to_string(seconds) + "s"; }
+    return to_string(seconds / 60) + "m" + to_string(seconds % 60) + "s";
+}
+
+/// The window kept under `scope`: a fresh one when there is none.
+@unbounded
+fn window_of(ws: Windows, scope: String, now_ns: Int) -> Window {
+    let mut i = 0;
+    while i < ws.len() {
+        let w = ws.get(i) or Window { };
+        if w.scope == scope { return w; }
+        i = i + 1;
+    }
+    return Window { scope: scope, start_ns: now_ns };
+}
+
+@unbounded
+fn put_window(ws: Windows, w: Window) {
+    let mut i = 0;
+    while i < ws.len() {
+        let have = ws.get(i) or Window { };
+        if have.scope == w.scope {
+            ws.set(i, w) or discard;
+            return;
+        }
+        i = i + 1;
+    }
+    ws.push(w);
+}
+
+/// A request past `l`: `429 rate_limited`, retrying after `retry` seconds.
+fn rate_limited(l: st::Limit, what: String, retry: Int) -> ApiError {
+    let mut voice = ErrorVoice { };
+    voice.has_limit = true;
+    voice.limit = l;
+    return ApiError { status: 429, kind: "too_many_requests", code: ErrorCode::rate_limited, message: what, has_voice: true, voice: voice, retry_after: if retry > 0 { retry } else { 1 } };
+}
+
+/// No ratified limits read yet: a keyed request is refused, since the
+/// limits fail closed.
+fn limits_unavailable(retry: Int) -> ApiError {
+    return ApiError { status: 503, kind: "server_error", code: ErrorCode::metering_unavailable, message: "the project's rate limits are not read yet: they are the organization's, and its head has not answered", retry_after: retry };
+}
+
+/// The rate-limit headers of an admitted request under `l`.
+fn limited_headers(l: st::Limit, remaining: Int, reset: Int) -> String {
+    return "x-ratelimit-limit-requests: " + to_string(l.requests) + "\r\nx-ratelimit-remaining-requests: " + to_string(remaining) + "\r\nx-ratelimit-reset-requests: " + duration(reset);
+}

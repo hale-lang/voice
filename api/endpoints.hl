@@ -103,13 +103,19 @@ locus Endpoints {
             return json_answer(200, budget_json(b));
         }
         if std::http::is_route(c, "GET", "/admin/v1/projects/:project/limits") {
-            let l = self.projects.limits(ProjectRef { project: std::http::path_param(c.params, "project") }) or raise;
-            return json_answer(200, "{\"limits\": " + limits_json(l.limits) + "}");
+            let project = std::http::path_param(c.params, "project");
+            let l = self.projects.limits(ProjectRef { project: project }) or raise;
+            // under a head, the organization's ratified limit (governance.hl)
+            if self.inference.governance.governed() {
+                let ratified = self.inference.ratified(project) or raise;
+                return json_answer(200, limit_set_json(ratified));
+            }
+            return json_answer(200, limit_set_json(l));
         }
         if std::http::is_route(c, "PUT", "/admin/v1/projects/:project/limits") {
             let r = read_limits_request(req.body, std::http::path_param(c.params, "project")) or raise;
             let l = self.projects.set_limits(r) or raise;
-            return json_answer(200, "{\"limits\": " + limits_json(l.limits) + "}");
+            return json_answer(200, limit_set_json(l));
         }
         if std::http::is_route(c, "GET", "/admin/v1/projects/:project/keys") {
             let l = self.keys.list(ProjectRef { project: std::http::path_param(c.params, "project") }) or raise;
@@ -328,10 +334,10 @@ locus Endpoints {
         }
         if endpoint == "chat" {
             let s = self.inference.chat(r, ctx) or raise;
-            return served_answer(s.request_id, chat_completion_json(s));
+            return served_answer(s, chat_completion_json(s));
         }
         let s = self.inference.respond(r, ctx) or raise;
-        return served_answer(s.request_id, response_json(s));
+        return served_answer(s, response_json(s));
     }
 
     /// The node an enrollment token names.
@@ -352,15 +358,19 @@ fn caller_json(body: String) -> std::http::Response {
     return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: req_" + id, body: body };
 }
 
-/// A served inference request, under its request id.
-fn served_answer(request_id: String, body: String) -> std::http::Response {
-    return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: " + request_id, body: body };
+/// A served inference request, under its request id, with its rate-limit
+/// headers.
+fn served_answer(s: Served, body: String) -> std::http::Response {
+    return std::http::Response { status: 200, content_type: "application/json", headers: "X-Request-Id: " + s.request_id + (if len(s.headers) > 0 { "\r\n" + s.headers } else { "" }), body: body };
 }
 
 /// A row's failure, in the contract's envelope.
 fn failed(e: ApiError) -> std::http::Response {
     if e.status == 401 {
         return std::http::Response { status: 401, content_type: "application/json", headers: "WWW-Authenticate: Bearer", body: error_json(e) };
+    }
+    if e.retry_after > 0 {
+        return std::http::Response { status: e.status, content_type: "application/json", headers: "Retry-After: " + to_string(e.retry_after), body: error_json(e) };
     }
     return json_answer(e.status, error_json(e));
 }

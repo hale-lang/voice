@@ -56,9 +56,38 @@ version (`scripts/race.sh` checks it with two instances). A store failure
 answers a fixed message with an id; what Postgres said goes to the api's
 stderr only, and nothing of the database URL is printed but its host and
 port. Without a database the store is in the process (`MemoryStore`),
-lost on restart, which is what `hale test api` runs on. Budgets and limits
-are configuration: nothing is counted against them until requests are
-served.
+lost on restart, which is what `hale test api` runs on. Budgets are
+configuration: nothing is charged against them yet.
+
+**Rate limits** are enforced on one admission path, their limits from one
+of two sources, never both ([`api/admission.hl`](./api/admission.hl)).
+Without `--head` they are the limits the admin plane stored: the
+project's, its model-scope ones for the model asked for, and the key's.
+With `--head`, voice runs under a DNA organization, and a project's limit
+is its ratified practice `operating/limits/<project>`, which its Board
+decides ([`api/governance.hl`](./api/governance.hl)): the api reads the
+ratified practices through the head as a service (a `client_credentials`
+token from `--issuer` under `--client`, its secret the vault's
+`oidc-service-<client>` or `--client-vault`), at most once per
+`--limits-every-s`. `GET .../limits` then shows the ratified limit with
+`source: practice` and the practice it came from, `PUT .../limits` answers
+`409 conflict`, and until the head has answered once a keyed request is
+`503 metering_unavailable`; after that, the last limits read stand while
+it does not answer. A limit's `requests` per `window_seconds` and its
+`concurrent` are counted, and a request past either is `429 rate_limited`
+with `Retry-After` and the limit in `voice.limit`; an admitted request
+carries the `x-ratelimit-*-requests` headers. The windows are each api
+instance's own, and token limits are shown, not yet enforced: both wait
+on the reservation in [`spec/store.md`](./spec/store.md).
+
+```sh
+api/api --head http://127.0.0.1:8792 --issuer http://127.0.0.1:8794 --client voice-api
+```
+
+[`api/tests/admin_limits.sh`](./api/tests/admin_limits.sh) runs it end to
+end against a DNA organization, from the Board's ratification to the
+caller's 429 and a superseding limit (`VOICE_DNA_FIXTURE=1`, with a hale
+whose record is in memory).
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node

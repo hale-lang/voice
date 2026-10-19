@@ -207,6 +207,103 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes, laptop: Strin
     e.inference.keep_alive = 15s;
 }
 
+/// Rate limits: the stored ones enforced, then a ratified practice in
+/// their place under a head (admission.hl, governance.hl).
+fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
+    beat(e, laptop);
+    let hi = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 2}, {\"scope\": \"model\", \"model\": \"other-1\", \"window_seconds\": 60, \"requests\": 0}]}"), 200, "a limit of two a minute, and none for another model");
+    let one = ask(e, "/v1/responses", key, hi);
+    expect(one, 200, "the first is served");
+    std::test::assert(std::str::contains(one.headers, "x-ratelimit-limit-requests: 2") && std::str::contains(one.headers, "x-ratelimit-remaining-requests: 1") && std::str::contains(one.headers, "x-ratelimit-reset-requests: "), "with the limit's headers: " + one.headers);
+    expect(ask(e, "/v1/responses", key, hi), 200, "the second is served; another model's limit does not apply");
+    let third = ask(e, "/v1/responses", key, hi);
+    expect(third, 429, "the third is past the limit");
+    std::test::assert(std::str::contains(third.headers, "Retry-After: "), "with Retry-After: " + third.headers);
+    let refusal = std::json::find_field_raw(third.body, "error");
+    std::test::assert(std::json::find_string_field(refusal, "code") == "rate_limited" && std::json::find_string_field(refusal, "type") == "too_many_requests", "rate_limited: " + third.body);
+    std::test::assert_eq_int(std::json::find_int_field(std::json::find_field_raw(std::json::find_field_raw(refusal, "voice"), "limit"), "requests"), 2, "naming the limit that refused it");
+    expect(ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}"), 429, "a stream too, before it begins");
+    let stored = admin(e, "GET", "/admin/v1/projects/work/limits", "");
+    std::test::assert_eq_str(std::json::find_string_field(stored.body, "source"), "stored", "the stored limits are the source");
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "the limit lifted");
+    expect(ask(e, "/v1/responses", key, hi), 200, "and served again");
+
+    // a key's own limit
+    let keys = std::json::find_field_raw(admin(e, "GET", "/admin/v1/projects/work/keys", "").body, "data");
+    let kid = std::json::find_string_field(std::json::array_first(keys).element, "id");
+    std::test::assert(len(kid) > 0, "the key's id: " + keys);
+    expect(admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": [{\"scope\": \"key\", \"window_seconds\": 60, \"requests\": 1}]}"), 200, "a key limited to one a minute");
+    expect(ask(e, "/v1/responses", key, hi), 200, "its first is served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "its second is past the key's limit");
+    expect(admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": []}"), 200, "the key's limit lifted");
+
+    // a request limit and a token limit on the same window each have a
+    // counter of their own: the token limit counts no requests, and the
+    // remaining requests go down by one a request
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 30, \"requests\": 3}, {\"scope\": \"project\", \"window_seconds\": 30, \"input_tokens\": 1000}]}"), 200, "three a window, and a token limit beside it");
+    let mut left = 2;
+    while left >= 0 {
+        let a = ask(e, "/v1/responses", key, hi);
+        expect(a, 200, "served under three a window");
+        std::test::assert(std::str::contains(a.headers, "x-ratelimit-limit-requests: 3\r\nx-ratelimit-remaining-requests: " + to_string(left) + "\r\n"), to_string(left) + " remaining: " + a.headers);
+        left = left - 1;
+    }
+    expect(ask(e, "/v1/responses", key, hi), 429, "the fourth is past the limit, and only then");
+    // and two request limits on one window: the tighter one's headers
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 4}, {\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 2}]}"), 200, "four and two a window");
+    let tight = ask(e, "/v1/responses", key, hi);
+    expect(tight, 200, "the first served");
+    std::test::assert(std::str::contains(tight.headers, "x-ratelimit-limit-requests: 2\r\nx-ratelimit-remaining-requests: 1\r\n"), "the tighter limit's headers: " + tight.headers);
+    expect(ask(e, "/v1/responses", key, hi), 200, "the second served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "the third past the tighter limit");
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "the limits lifted");
+
+    // under a head, the organization's ratified practice is the limit, and
+    // the stored ones are not: one a minute, though five are stored
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 5}]}"), 200, "five stored");
+    e.projects.governed = true;
+    e.inference.governed = true;
+    let read = api::PracticeLimits { };
+    read.push(api::PracticeLimit { project: "work", name: "operating/limits/work", id: "p_1", limit: api::parse_limit("The limit for work.\nwindow_seconds: 60\nrequests: 1") });
+    api::hold_limits(e.inference.held, 1, read);
+    expect(ask(e, "/v1/responses", key, hi), 200, "the first under the practice is served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "the second is past the ratified limit");
+    let ratified = admin(e, "GET", "/admin/v1/projects/work/limits", "");
+    std::test::assert(std::json::find_string_field(ratified.body, "source") == "practice" && std::json::find_string_field(std::json::find_field_raw(ratified.body, "practice"), "name") == "operating/limits/work", "the limit shown is the practice's, and says so: " + ratified.body);
+    std::test::assert_eq_int(std::json::find_int_field(std::json::array_first(std::json::find_field_raw(ratified.body, "limits")).element, "requests"), 1, "its limit");
+    let refused = admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}");
+    expect(refused, 409, "the admin plane cannot set what the organization decides");
+    std::test::assert(std::str::contains(refused.body, "organization's practice"), "and says why: " + refused.body);
+
+    // a later generation replaces the limits whole: a project it has no
+    // practice for is no longer limited
+    api::hold_limits(e.inference.held, 2, api::PracticeLimits { });
+    expect(ask(e, "/v1/responses", key, hi), 200, "the practice gone, the project is not limited");
+
+    // a project whose ratified practices are ambiguous, with no limit
+    // held before: its keyed requests are refused, and its limits unread
+    let unsettled = api::PracticeLimits { };
+    unsettled.push(api::PracticeLimit { project: "work", name: "operating/limits/work", closed: true, why: "2 of its ratified practices are in force, none superseding the others" });
+    api::hold_limits(e.inference.held, 3, unsettled);
+    let ambiguous = ask(e, "/v1/responses", key, hi);
+    expect(ambiguous, 503, "an ambiguous project's request is refused");
+    std::test::assert(std::str::contains(ambiguous.body, "metering_unavailable") && std::str::contains(ambiguous.body, "are in force"), "saying why: " + ambiguous.body);
+    expect(admin(e, "GET", "/admin/v1/projects/work/limits", ""), 503, "and its limits are not shown");
+
+    // no read landed yet: the limits fail closed
+    e.inference.held.remove("held") or discard;
+    let closed = ask(e, "/v1/responses", key, hi);
+    expect(closed, 503, "before any limits are read, a keyed request is refused");
+    std::test::assert(std::str::contains(closed.body, "metering_unavailable") && std::str::contains(closed.headers, "Retry-After: 1"), "metering_unavailable, retrying in a second: " + closed.headers + " " + closed.body);
+    std::test::assert(!std::str::contains(closed.headers, "x-ratelimit"), "and states no limit");
+    expect(admin(e, "GET", "/admin/v1/projects/work/limits", ""), 503, "nor can the admin plane read them");
+
+    e.projects.governed = false;
+    e.inference.governed = false;
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "ungoverned again, the stored limits lifted");
+}
+
 fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
     return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
 }
@@ -325,6 +422,7 @@ fn main() {
     streamed_with_sse(e, key, nodes);
     streamed_failures(e, key, nodes, laptop);
     first_output_span(e, key, nodes, laptop);
+    rate_limits(e, key, laptop);
 
     // a seat that refuses: the request moves to another
     // the waits above outlast the up window of the laptop's registration

@@ -326,3 +326,14 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** no binding. The teller (api/teller.hl) is a pinned locus whose params the main locus's own literal sets from its params, which a params initializer may read.
 
+## `std::http::Client` bounds its dial, not its answer
+
+**hale 0.25.1, and main at ec6fc8f.** `timeout_ms` bounds the TCP connect (and the TLS handshake); the request's write and the read of the answer have no bound, and `max_retries` (3 by default) repeats the whole exchange. A peer that takes the connection and never answers (a head stopped mid-run, a proxy that holds it) keeps the caller for as long as it holds, so a call a locus makes on a schedule has no deadline it can state.
+
+**Working shape:** api/deadline.hl, an HTTP/1.1 exchange over `std::io::tcp` or `std::io::tls` under one deadline: `connect_within`, then `set_send_timeout` and `set_recv_timeout` set to what is left of it before each write and read, the answer read to its `Content-Length`, its last chunk or the close. A total deadline on `std::http::Client` (say `deadline_ms`) would retire it.
+
+## A pinned locus's log line waits for the main thread's next request
+
+**hale 0.25.1, and main at ec6fc8f.** A `std::log::Logger` line written on a pinned locus's thread reaches `StdoutSink` only when the main thread next drains its bus queue, and a main thread serving `std::http::Server` drains it between requests. With no request coming in, the teller's and the limits reader's warnings (a head that stopped answering) are not written at all until one does. A probe (a pinned locus logging once a second beside a Server) wrote nothing for five seconds, then all five lines on the first request.
+
+**Working shape:** none in the api. The DNA fixture (api/tests/admin_limits.sh) asks the api's `/healthz` while it waits for a reader's line.

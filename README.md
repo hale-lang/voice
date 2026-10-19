@@ -56,9 +56,55 @@ version (`scripts/race.sh` checks it with two instances). A store failure
 answers a fixed message with an id; what Postgres said goes to the api's
 stderr only, and nothing of the database URL is printed but its host and
 port. Without a database the store is in the process (`MemoryStore`),
-lost on restart, which is what `hale test api` runs on. Budgets and limits
-are configuration: nothing is counted against them until requests are
-served.
+lost on restart, which is what `hale test api` runs on. Budgets are
+configuration: nothing is charged against them yet.
+
+**Rate limits** are enforced on one admission path, their limits from one
+of two sources, never both ([`api/admission.hl`](./api/admission.hl)).
+Without `--head` they are the limits the admin plane stored: the
+project's, its model-scope ones for the model asked for, and the key's.
+With `--head`, voice runs under a DNA organization, and a project's limit
+is its ratified practice `operating/limits/<project>`, which its Board
+decides ([`api/governance.hl`](./api/governance.hl)). A reader of its own,
+a pinned locus off the request path, reads the ratified practices of the
+application `--application` names (its id at the head, which the head's
+`/api/hale/v1/applications` lists) through the head as a service (a
+`client_credentials` token from `--issuer` under `--client`, its secret
+the vault's `oidc-service-<client>` or `--client-vault`), every
+`--limits-every-s`, each call one attempt under a 30 s deadline
+([`api/deadline.hl`](./api/deadline.hl)). A request reads only the limits
+last read, never the head. An answer from the head must give its length
+or its chunks, and one cut short does not land, so no project goes
+unlimited because a page was cut. Of a project's ratified practices, the
+one in force is the one no other supersedes; a project whose practices are
+ambiguous (two in force, or a cycle of supersessions) keeps the limit held
+for it, or, with none, its keyed requests are `503`, and the other
+projects are read as they are. `GET .../limits` then shows the
+ratified limit with `source: practice` and the practice it came from,
+`PUT .../limits` answers `409 conflict`, and until a read has landed a
+keyed request is `503 metering_unavailable`; after that, the last limits
+read stand while a read does not land, and the reader logs why.
+
+A limit's `requests` per `window_seconds` are counted, each limit's
+counter kept under its scope, its window and its kind, and a request past
+any is `429 rate_limited` with `Retry-After` and the limit in
+`voice.limit`; an admitted request carries the `x-ratelimit-*-requests`
+headers of the limit with the fewest left. The counters are each api
+instance's own. Token limits are shown, not yet enforced: they wait on
+the reservation in [`spec/store.md`](./spec/store.md). `concurrent` is
+shown and not enforced: an instance serves one request at a time (its
+HTTP server is serial), so a limit on requests in flight could never
+refuse one.
+
+```sh
+api/api --head http://127.0.0.1:8792 --application <id> --issuer http://127.0.0.1:8794 --client voice-api
+```
+
+[`api/tests/admin_limits.sh`](./api/tests/admin_limits.sh) runs it end to
+end against a DNA organization, from the Board's ratification to the
+caller's 429, a superseding limit, and a head stopped with the limits
+read last standing and no answer waiting on it (`VOICE_DNA_FIXTURE=1`,
+with a hale whose record is in memory).
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node
@@ -497,8 +543,9 @@ on the nerves. The teller queues at most 1024 events, keeps one
 connection, publishes each under its id and waits for the stream's
 acknowledgement, each step bounded at 2 s; a publish that does not land
 is tried again after a back-off (to 5 s), and when the queue is full the
-oldest event is dropped, counted and logged. The organization records each event once, as a reading
-under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
+oldest event is dropped and counted, the running total logged at most
+once a second while drops go on and once more after the last. The
+organization records each event once, as a reading under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
 nothing is published and no connection is made.
 
 **Why the broker is in the MVP:** a single api instance would not need it,

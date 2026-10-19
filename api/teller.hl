@@ -10,8 +10,11 @@
 // A publish that does not land keeps its event at the head of the queue
 // and is tried again after a back-off (50 ms doubling to 5 s), the
 // connection dropped and dialled again. When the queue is full the oldest
-// event is dropped for the newest, counted and logged, so a usage loss is
-// never silent. With no organization (`url` ""), nothing is queued and
+// event is dropped for the newest and counted, and the running total of
+// drops is logged at most once a second while they go on, and once more
+// within a second of the last, so a usage loss is never silent and the
+// log always ends on the true count. (The teller stops only with the
+// process, by its signal: see `run`.) With no organization (`url` ""), nothing is queued and
 // nothing is dialled.
 
 import "../lib/pond/realtime/nats" as nats;
@@ -37,6 +40,9 @@ locus Teller {
         queued: Int = 0;
         told: Int = 0;
         dropped: Int = 0;
+        // the drops the log has counted, and when it last did
+        dropped_said: Int = 0;
+        dropped_said_ns: Int = 0;
         client: nats::NatsClient = nats::NatsClient { };
         credential: std::secret::Credential = std::secret::Credential { };
         connected: Bool = false;
@@ -63,7 +69,7 @@ locus Teller {
             self.head = (self.head + 1) % self.capacity;
             self.queued = self.queued - 1;
             self.dropped = self.dropped + 1;
-            if self.dropped == 1 || self.dropped % 100 == 0 { log_warn("usage events dropped: the organization's nerves are not taking them", fields2(std::log::kv("dropped", to_string(self.dropped)), std::log::kv("queued", to_string(self.queued + 1)))); }
+            self.say_drops(std::time::monotonic_ns());
         }
         let slot = (self.head + self.queued) % self.capacity;
         if slot < self.ring.len() { self.ring.set(slot, e) or discard; } else { self.ring.push(e); }
@@ -77,6 +83,7 @@ locus Teller {
     run() {
         while true {
             let now = std::time::monotonic_ns();
+            self.say_drops(now);
             if self.queued > 0 && now >= self.retry_at_ns {
                 self.tell_one(now);
             } else {
@@ -84,6 +91,15 @@ locus Teller {
                 std::time::sleep(20ms);
             }
         }
+    }
+
+    /// The running total of drops, logged when it has grown, at most once
+    /// a second.
+    fn say_drops(now: Int) {
+        if self.dropped == self.dropped_said || now - self.dropped_said_ns < 1000000000 { return; }
+        log_warn("usage events dropped: the organization's nerves are not taking them", fields2(std::log::kv("dropped_total", to_string(self.dropped)), std::log::kv("queued", to_string(self.queued))));
+        self.dropped_said = self.dropped;
+        self.dropped_said_ns = now;
     }
 
     /// The oldest event, told: dropped from the queue once the stream has
@@ -109,7 +125,7 @@ locus Teller {
         self.told = self.told + 1;
         self.backoff_ms = 0;
         if len(self.trouble) > 0 {
-            log_info("usage events are told again", std::log::kv("queued", to_string(self.queued)));
+            log_info("usage events are told again", fields2(std::log::kv("queued", to_string(self.queued)), std::log::kv("dropped_total", to_string(self.dropped))));
             self.trouble = "";
         }
     }

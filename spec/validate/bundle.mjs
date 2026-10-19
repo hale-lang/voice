@@ -217,7 +217,9 @@ function fields(at, cs, bs) {
   const breq = new Set(bs.required || []);
   const creq = new Set(cs.required || []);
   for (const k of Object.keys(cp)) {
-    if (cp[k].readOnly) continue;
+    // a read-only field is the server's to write: compared where the row
+    // has it (an answer), skipped where it has not (a request)
+    if (cp[k].readOnly && !(k in bp)) continue;
     if (!(k in bp)) gap(`${at}.${k}`, 'missing');
     else {
       if (creq.has(k) && !breq.has(k)) gap(`${at}.${k} (required)`, 'required');
@@ -271,7 +273,7 @@ const RULES = [
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
   [/^Capabilities\.(project_id|project_name|key_id|key_name|project|key)$/, 'wire', 'the project and the key are objects of id and name on the wire'],
   [/^ApiError\.(kind|type)$/, 'wire', 'the row\'s `kind` is the envelope\'s `type`, renamed by the wire (error_json)'],
-  [/^ApiError\.status$/, 'wire', 'the HTTP status the error answers with, not a field of the envelope'],
+  [/^ApiError\.(status|retry_after)$/, 'wire', 'the HTTP status the error answers with and its Retry-After header, not fields of the envelope'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard
 // request and response, which pass through as JSON text. `Served.voice`

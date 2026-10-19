@@ -92,6 +92,8 @@ type Served {
     output_tokens: Int = 0;
     response: String = "{}";
     voice: VoiceExtension = VoiceExtension { };
+    // the rate-limit headers its answer carries (admission.hl), "" for none
+    headers: String = "";
 }
 
 /// One seat a request could be offered, and its own name for the model.
@@ -113,6 +115,13 @@ locus Inference {
         // tell the organization each served request (events.hl): set when
         // voice is attached to one (main.hl)
         pulse: Bool = false;
+        // the rate limits: the organization's ratified practices when it
+        // has a head (`governed`; governance.hl), as its reader last left
+        // them in `held`, the stored ones otherwise, and this instance's
+        // counters over them (admission.hl)
+        governed: Bool = false;
+        held: HeldLimits = HeldLimits { };
+        windows: Windows = Windows { };
     }
     bus { publish UsageToTell; }
 
@@ -126,11 +135,19 @@ locus Inference {
         return self.serve(r, ctx) or raise;
     }
 
-    /// Admit, then offer the request to each eligible seat in turn until
-    /// one serves it.
+    /// Hold the request to its rate limits, admit it, then offer it to
+    /// each eligible seat in turn until one serves it. A limit is policy:
+    /// it refuses before anything is looked for to serve.
     fn serve(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
-        let started = std::time::monotonic_ns();
+        let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
+        let mut s = self.serve_held(r, ctx, candidates) or raise;
+        s.headers = held.headers;
+        return s;
+    }
+
+    fn serve_held(r: InferenceRequest, ctx: std::api::Context, candidates: Candidates) -> Served fallible(ApiError) {
+        let started = std::time::monotonic_ns();
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
         let id_hex = random_hex(12) or fail entropy_failed(err.message);
@@ -169,13 +186,18 @@ locus Inference {
     /// keep-alive span, nothing is sent, so a request every seat refuses is
     /// answered whole, as a `502`.
     fn stream(r: InferenceRequest, ctx: std::api::Context, out: EventStream) -> std::http::Response fallible(ApiError) {
-        let started = std::time::monotonic_ns();
+        let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
+        return self.stream_held(r, ctx, out, candidates, held) or raise;
+    }
+
+    fn stream_held(r: InferenceRequest, ctx: std::api::Context, out: EventStream, candidates: Candidates, held: Held) -> std::http::Response fallible(ApiError) {
+        let started = std::time::monotonic_ns();
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
         let id_hex = random_hex(12) or fail entropy_failed(err.message);
         let request_id = "resp_" + id_hex;
-        out.headers = "X-Request-Id: " + request_id;
+        out.headers = "X-Request-Id: " + request_id + (if len(held.headers) > 0 { "\r\n" + held.headers } else { "" });
         // the keep-alive span runs from here until something is sent
         out.sent_ns = std::time::monotonic_ns();
         let mut st = StreamState { endpoint: r.endpoint, request_id: request_id, model: r.model, created: std::time::unix(now_seconds()) };
@@ -268,6 +290,93 @@ locus Inference {
     /// `status` saying how it ended (`cancelled`, `failed`).
     fn unfinished(r: InferenceRequest, request_id: String, k: st::KeyRow, m: st::ModelRow, c: Candidate, status: String, started: Int) {
         if self.pulse { UsageToTell <- unfinished_usage(r, request_id, k, m, c, status, (std::time::monotonic_ns() - started) / 1000000); }
+    }
+
+    /// The limits `r` is held to, from the one source in force: the
+    /// project's ratified practice under a head, as last read (never read
+    /// here: governance.hl), the stored limits otherwise (the project's, its
+    /// model-scope ones for `r.model`, and the key's).
+    @unbounded
+    fn applied(r: InferenceRequest, k: st::KeyRow, p: st::ProjectRow) -> Applied fallible(ApiError) {
+        let mut out = Applied { };
+        if self.governed {
+            if !limits_landed(self.held) { fail limits_unavailable(1); }
+            let pl = held_limit(self.held, k.project);
+            if pl.closed { fail limit_unsettled(pl); }
+            if len(pl.project) > 0 { out = apply(out, "practice:" + k.project, pl.limit); }
+            return out;
+        }
+        for l in p.limits.items {
+            let model = l.scope == st::LimitScope::model && l.model == r.model;
+            if l.scope == st::LimitScope::project || model { out = apply(out, if model { "model:" + p.id + "/" + l.model } else { "project:" + p.id }, l); }
+        }
+        for l in k.limits.items {
+            if l.scope == st::LimitScope::key { out = apply(out, "key:" + k.id, l); }
+        }
+        return out;
+    }
+
+    /// `project`'s limits as the organization ratified them (under a
+    /// head), as last read: its practice's limit, or none, and where it was
+    /// read from.
+    fn ratified(project: String) -> LimitSet fallible(ApiError) {
+        if !limits_landed(self.held) { fail limits_unavailable(1); }
+        let pl = held_limit(self.held, project);
+        if pl.closed { fail limit_unsettled(pl); }
+        let mut out = LimitSet { source: LimitSource::practice };
+        if len(pl.project) > 0 {
+            push(out.limits, pl.limit) or discard;
+            out.has_practice = true;
+            out.practice = PracticeRef { name: pl.name, id: pl.id };
+        }
+        return out;
+    }
+
+    /// Hold `r` to its limits: refused past any of them, or counted once
+    /// in each of their counters. Nothing is counted for a request refused.
+    @unbounded
+    fn hold(r: InferenceRequest, ctx: std::api::Context) -> Held fallible(ApiError) {
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        if !k.present { return Held { }; }
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        let now = std::time::monotonic_ns();
+        let a = self.applied(r, k, p) or raise;
+        let mut i = 0;
+        while i < count(a.keys) {
+            let key = at(a.keys, i) or "";
+            let l = at(a.limits, i) or st::Limit { scope: st::LimitScope::project };
+            let w = window_of(self.windows, key, l, now);
+            if w.used >= l.requests {
+                fail rate_limited(l, "project " + k.project + " is past its limit of " + to_string(l.requests) + " requests per " + to_string(l.window_seconds) + "s", reset_of(w, l, now));
+            }
+            i = i + 1;
+        }
+        let mut out = Held { };
+        let mut fewest = -1;
+        i = 0;
+        while i < count(a.keys) {
+            let key = at(a.keys, i) or "";
+            let l = at(a.limits, i) or st::Limit { scope: st::LimitScope::project };
+            let mut w = window_of(self.windows, key, l, now);
+            // counted once, by the first of the limits that read it
+            let mut first = true;
+            let mut k = 0;
+            while k < i {
+                if (at(a.keys, k) or "") == key { first = false; }
+                k = k + 1;
+            }
+            if first {
+                w.used = w.used + 1;
+                put_window(self.windows, w);
+            }
+            let left = l.requests - w.used;
+            if fewest < 0 || left < fewest {
+                fewest = left;
+                out.headers = limited_headers(l, left, reset_of(w, l, now));
+            }
+            i = i + 1;
+        }
+        return out;
     }
 
     /// A request a seat served: its usage told to the organization, when
@@ -648,9 +757,13 @@ fn attempts_voice(request_id: String, attempts: bounded[Attempt; 8]) -> ErrorVoi
 /// An error's `voice` object, as JSON. A store failure's has no
 /// attempts, and says none.
 fn error_voice_json(v: ErrorVoice) -> String {
-    return "{\"request_id\": " + jq(v.request_id) + (if v.has_limit { ", \"limit\": " + limit_json(v.limit) } else { "" })
-        + (if v.has_budget { ", \"budget\": " + budget_json(v.budget) } else { "" })
-        + (if count(v.attempts) > 0 { ", \"attempts\": " + attempts_json(v.attempts) } else { "" }) + "}";
+    let out = st::JsonList { };
+    // a request refused before it was numbered (a rate limit) has no id
+    if len(v.request_id) > 0 { out.add("\"request_id\": " + jq(v.request_id)); }
+    if v.has_limit { out.add("\"limit\": " + limit_json(v.limit)); }
+    if v.has_budget { out.add("\"budget\": " + budget_json(v.budget)); }
+    if count(v.attempts) > 0 { out.add("\"attempts\": " + attempts_json(v.attempts)); }
+    return "{" + out.text() + "}";
 }
 
 fn voice_json(v: VoiceExtension) -> String {

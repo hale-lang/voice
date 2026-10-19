@@ -7,11 +7,20 @@
 //
 // HTTP/1.1 with `Connection: close`, over `std::io::tcp` or, for `https`,
 // `std::io::tls`; an answer is read to its `Content-Length`, to the end of
-// its chunks or to the peer's close, whichever it gives.
+// its chunks or to the peer's close, whichever it gives. An answer short
+// of its length, or chunked without its last (empty) chunk and the end of
+// its trailer, is cut, never whole. One that gives neither (read to the
+// close) cannot be told from a cut one: it says so (`framed` false), and
+// a reader that must not take part of an answer for all of it refuses it.
 
 /// What an exchange answered: its status and body, or `why` there was no
-/// whole answer (`status` 0).
-type Answer { status: Int = 0; body: String = ""; why: String = ""; }
+/// whole answer (`status` 0); `framed` when the answer gave its length or
+/// its chunks, so that it is known to be whole.
+type Answer { status: Int = 0; body: String = ""; why: String = ""; framed: Bool = false; }
+
+/// A chunked body, its chunks joined; `whole` when its last chunk and the
+/// end of its trailer were there.
+type Dechunked { body: String = ""; whole: Bool = false; }
 
 /// An open exchange: its connection, the URL it was opened for and the
 /// instant it must be over by; `why` it did not open (`handle` -1).
@@ -175,12 +184,16 @@ fn parse_answer(text: String) -> Answer {
     if status < 100 { return Answer { why: "not an HTTP answer" }; }
     let head = std::str::lower(text[0..end]);
     let body = text[(end + 4)..len(text)];
-    if header_value(head, "transfer-encoding") == "chunked" { return Answer { status: status, body: dechunk(body) }; }
+    if header_value(head, "transfer-encoding") == "chunked" {
+        let d = dechunk(body);
+        if !d.whole { return Answer { why: "a chunked answer cut short" }; }
+        return Answer { status: status, body: d.body, framed: true };
+    }
     let length = header_value(head, "content-length");
     if len(length) == 0 { return Answer { status: status, body: body }; }
     let n = std::str::parse_int(length) or - 1;
     if n < 0 || len(body) < n { return Answer { why: "an answer cut short" }; }
-    return Answer { status: status, body: body[0..n] };
+    return Answer { status: status, body: body[0..n], framed: true };
 }
 
 /// A hexadecimal size, -1 when `text` is not one.
@@ -199,21 +212,28 @@ fn hex_size(text: String) -> Int {
     return n;
 }
 
-/// A chunked body, its chunks joined.
+/// A chunked body, its chunks joined, and whether it ended: a size that
+/// is not one, a chunk short of its size or no last chunk is not whole.
 @unbounded
-fn dechunk(body: String) -> String {
+fn dechunk(body: String) -> Dechunked {
     let mut out = "";
     let mut rest = body;
     while true {
         let line = std::str::index_of(rest, "\r\n");
-        if line < 0 { break; }
+        if line < 0 { return Dechunked { body: out }; }
         let word = rest[0..line];
         let semi = std::str::index_of(word, ";");
         let size = hex_size(std::str::trim(if semi < 0 { word } else { word[0..semi] }));
-        if size <= 0 || line + 2 + size > len(rest) { break; }
+        if size < 0 { return Dechunked { body: out }; }
+        if size == 0 {
+            // the trailer: header lines, then an empty one
+            let trailer = rest[(line + 2)..len(rest)];
+            return Dechunked { body: out, whole: std::str::starts_with(trailer, "\r\n") || std::str::index_of(trailer, "\r\n\r\n") >= 0 };
+        }
+        // the chunk and the CRLF after it
+        if line + 4 + size > len(rest) || rest[(line + 2 + size)..(line + 4 + size)] != "\r\n" { return Dechunked { body: out }; }
         out = out + rest[(line + 2)..(line + 2 + size)];
-        let next = line + 4 + size;
-        rest = if next < len(rest) { rest[next..len(rest)] } else { "" };
+        rest = rest[(line + 4 + size)..len(rest)];
     }
-    return out;
+    return Dechunked { body: out };
 }

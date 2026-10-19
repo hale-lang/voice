@@ -26,15 +26,17 @@
 // Until a read lands, a keyed request is refused (`503
 // metering_unavailable`): the limits fail closed. Once one has, the limits
 // it read stand until another lands; a read that does not land (the head
-// or the issuer not answering, the record moving between pages, more than
-// `PAGES_MAX` pages, two ratified practices of one project neither of
-// which supersedes the other) keeps them and is logged once. A project the
-// organization ratified no limit for is not limited. Of several ratified
-// practices of one project, the one in force is the one no other
-// supersedes: a superseding practice is in force from its ratification,
-// before the retirement of the one it supersedes lands. (The head shows no
-// time of ratification, so the order is the record's `supersedes` chain,
-// never the listing's.)
+// or the issuer not answering, an answer cut short or read to the close,
+// the record moving between pages, more than `PAGES_MAX` pages) keeps them
+// and is logged once. A project the organization ratified no limit for is
+// not limited. Of several ratified practices of one project, the one in
+// force is the one no other supersedes: a superseding practice is in force
+// from its ratification, before the retirement of the one it supersedes
+// lands. (The head shows no time of ratification, so the order is the
+// record's `supersedes` chain, never the listing's.) A project whose
+// practices are ambiguous, two in force or a cycle of supersessions, is
+// decided alone: it keeps the limit held for it, or, with none, its keyed
+// requests are refused, and every other project is read as it is.
 
 const LIMIT_PREFIX: String = "operating/limits/";
 
@@ -48,6 +50,12 @@ type PracticeLimit {
     // the practice it supersedes, "" for none
     supersedes: String = "";
     limit: st::Limit = st::Limit { scope: st::LimitScope::project };
+    // the project's limit is not known (its ratified practices are
+    // ambiguous, and no limit was read for it before): its keyed requests
+    // are refused
+    closed: Bool = false;
+    // why a project's ratified practices are ambiguous ("" when not)
+    why: String = "";
 }
 
 /// The most pages of practices one read takes; past them it does not
@@ -96,31 +104,127 @@ fn parse_limit(text: String) -> st::Limit {
 }
 
 /// The limits in force among the ratified practices `found`, into `out`:
-/// of a project's, the one no other of them supersedes. "" when every
-/// project has one, else why not.
+/// of a project's, the one no other of them supersedes. A project whose
+/// practices are ambiguous (two in force, or a supersession cycle among
+/// them) goes into `unsettled` instead, with why; every other project is
+/// read as it is.
 @unbounded
-fn in_force(found: PracticeLimits, out: PracticeLimits) -> String {
+fn in_force(found: PracticeLimits, out: PracticeLimits, unsettled: PracticeLimits) {
     let mut i = 0;
     while i < found.len() {
         let p = found.get(i) or PracticeLimit { };
         i = i + 1;
-        let mut superseded = false;
+        if has_project(out, p.project) || has_project(unsettled, p.project) { continue; }
+        let mut heads = 0;
+        let mut head = PracticeLimit { };
+        let mut cycle = false;
         let mut k = 0;
         while k < found.len() {
             let q = found.get(k) or PracticeLimit { };
-            if q.project == p.project && len(q.supersedes) > 0 && q.supersedes == p.id { superseded = true; }
             k = k + 1;
+            if q.project != p.project { continue; }
+            if !superseded(found, q) {
+                heads = heads + 1;
+                head = q;
+            }
+            if in_cycle(found, q) { cycle = true; }
         }
-        if superseded { continue; }
-        k = 0;
-        while k < out.len() {
-            let have = out.get(k) or PracticeLimit { };
-            if have.project == p.project { return "two ratified practices of " + p.name + ", neither superseding the other"; }
-            k = k + 1;
+        if cycle {
+            unsettled.push(PracticeLimit { project: p.project, name: p.name, why: "its ratified practices supersede each other in a cycle" });
+        } else if heads != 1 {
+            unsettled.push(PracticeLimit { project: p.project, name: p.name, why: to_string(heads) + " of its ratified practices are in force, none superseding the others" });
+        } else {
+            out.push(head);
         }
-        out.push(p);
     }
-    return "";
+}
+
+/// `limits` holds one for `project`.
+@unbounded
+fn has_project(limits: PracticeLimits, project: String) -> Bool {
+    let mut i = 0;
+    while i < limits.len() {
+        let have = limits.get(i) or PracticeLimit { };
+        if have.project == project { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Another of `found`, of `p`'s project, supersedes `p`.
+@unbounded
+fn superseded(found: PracticeLimits, p: PracticeLimit) -> Bool {
+    let mut k = 0;
+    while k < found.len() {
+        let q = found.get(k) or PracticeLimit { };
+        if q.project == p.project && len(q.supersedes) > 0 && q.supersedes == p.id { return true; }
+        k = k + 1;
+    }
+    return false;
+}
+
+/// The practice `p`'s project's that `p` supersedes, among `found`;
+/// `id` "" when there is none.
+@unbounded
+fn superseded_by(found: PracticeLimits, p: PracticeLimit) -> PracticeLimit {
+    if len(p.supersedes) == 0 { return PracticeLimit { }; }
+    let mut k = 0;
+    while k < found.len() {
+        let q = found.get(k) or PracticeLimit { };
+        if q.project == p.project && q.id == p.supersedes { return q; }
+        k = k + 1;
+    }
+    return PracticeLimit { };
+}
+
+/// Following what `p` supersedes, among `found`, comes back round: more
+/// steps than there are practices.
+@unbounded
+fn in_cycle(found: PracticeLimits, p: PracticeLimit) -> Bool {
+    let mut at = p;
+    let mut steps = 0;
+    while steps <= found.len() {
+        let next = superseded_by(found, at);
+        if len(next.id) == 0 { return false; }
+        at = next;
+        steps = steps + 1;
+    }
+    return true;
+}
+
+/// Each project of `unsettled` into `read`: the limit `current` held for
+/// it, which stands, or, with none, closed.
+@unbounded
+fn settle(read: PracticeLimits, unsettled: PracticeLimits, current: PracticeLimits) {
+    let mut i = 0;
+    while i < unsettled.len() {
+        let u = unsettled.get(i) or PracticeLimit { };
+        i = i + 1;
+        let mut kept = false;
+        let mut k = 0;
+        while k < current.len() {
+            let have = current.get(k) or PracticeLimit { };
+            if have.project == u.project {
+                read.push(have);
+                kept = true;
+            }
+            k = k + 1;
+        }
+        if !kept { read.push(PracticeLimit { project: u.project, name: u.name, closed: true, why: u.why }); }
+    }
+}
+
+/// The projects of `unsettled`, and why, for a log line.
+@unbounded
+fn unsettled_text(unsettled: PracticeLimits) -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < unsettled.len() {
+        let u = unsettled.get(i) or PracticeLimit { };
+        out = out + (if len(out) > 0 { "; " } else { "" }) + u.project + ": " + u.why;
+        i = i + 1;
+    }
+    return out;
 }
 
 /// `text` percent-encoded for a form body: unreserved characters kept.
@@ -211,8 +315,10 @@ locus Governance {
         before: PracticeLimits = PracticeLimits { };
         token: String = "";
         token_until_ns: Int = 0;
-        // why the last read did not land ("" when it did)
+        // why the last read did not land ("" when it did), and the projects
+        // whose ratified practices it found ambiguous
         refused: String = "";
+        ambiguous: String = "";
     }
 
     fn governed() -> Bool { return len(self.head) > 0; }
@@ -240,13 +346,15 @@ locus Governance {
             return;
         }
         let read = PracticeLimits { };
-        let why = in_force(found, read);
-        if len(why) > 0 {
-            if why != self.refused {
-                log_warn("the ratified rate limits were not read: " + why, std::log::kv("then", if self.generation > 0 { "the last ones read stand" } else { "keyed requests are refused until they are" }));
-                self.refused = why;
-            }
-            return;
+        let unsettled = PracticeLimits { };
+        in_force(found, read, unsettled);
+        // an ambiguous project keeps the limit held for it, or is closed;
+        // every other project is read as it is
+        settle(read, unsettled, self.current);
+        let ambiguous = unsettled_text(unsettled);
+        if ambiguous != self.ambiguous {
+            if len(ambiguous) > 0 { log_warn("a project's ratified rate limit is ambiguous: " + ambiguous, std::log::kv("then", "its last limit stands, or, with none, its keyed requests are refused")); } else { log_info("no project's ratified rate limit is ambiguous", ""); }
+            self.ambiguous = ambiguous;
         }
         if len(self.refused) > 0 || self.generation == 0 { log_info("the ratified rate limits are read", std::log::kv("projects", to_string(read.len()))); }
         self.refused = "";
@@ -312,6 +420,9 @@ locus Governance {
             if page.status == 409 { return HeadRead { why: "the record moved while it was read" }; }
             if page.status == 404 { return HeadRead { why: "the head has no application " + self.application }; }
             if page.status != 200 { return HeadRead { why: "the head did not answer the practices" + said(page) }; }
+            // read to the close, a cut answer would pass for a whole one:
+            // a project missing from it would be unlimited
+            if !page.framed { return HeadRead { why: "the head's answer gave neither its length nor chunks" }; }
             let data = std::json::find_field_raw(page.body, "data");
             let mut it = std::json::array_first(std::json::find_field_raw(data, "items"));
             while !it.done {

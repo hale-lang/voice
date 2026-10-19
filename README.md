@@ -73,8 +73,13 @@ application `--application` names (its id at the head, which the head's
 the vault's `oidc-service-<client>` or `--client-vault`), every
 `--limits-every-s`, each call one attempt under a 30 s deadline
 ([`api/deadline.hl`](./api/deadline.hl)). A request reads only the limits
-last read, never the head. Of a project's ratified practices, the one in
-force is the one no other supersedes. `GET .../limits` then shows the
+last read, never the head. An answer from the head must give its length
+or its chunks, and one cut short does not land, so no project goes
+unlimited because a page was cut. Of a project's ratified practices, the
+one in force is the one no other supersedes; a project whose practices are
+ambiguous (two in force, or a cycle of supersessions) keeps the limit held
+for it, or, with none, its keyed requests are `503`, and the other
+projects are read as they are. `GET .../limits` then shows the
 ratified limit with `source: practice` and the practice it came from,
 `PUT .../limits` answers `409 conflict`, and until a read has landed a
 keyed request is `503 metering_unavailable`; after that, the last limits
@@ -538,8 +543,9 @@ on the nerves. The teller queues at most 1024 events, keeps one
 connection, publishes each under its id and waits for the stream's
 acknowledgement, each step bounded at 2 s; a publish that does not land
 is tried again after a back-off (to 5 s), and when the queue is full the
-oldest event is dropped, counted and logged. The organization records each event once, as a reading
-under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
+oldest event is dropped and counted, the running total logged at most
+once a second while drops go on and once more after the last. The
+organization records each event once, as a reading under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
 nothing is published and no connection is made.
 
 **Why the broker is in the MVP:** a single api instance would not need it,

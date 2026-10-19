@@ -72,7 +72,8 @@ always. The nodes have their own account there
 `HALE_DNA_BROKER_NODE_VAULT`), which a node is handed in its
 registration's answer over its enrollment-authenticated call: the api
 writes that answer itself on the node's connection, the password revealed
-into that write alone and the answer marked `no-store`. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
+into that write alone, escaped as a JSON string there, and the answer
+marked `no-store`. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
 `HALE_DNA_OIDC_ISSUER`, `HALE_DNA_OIDC_CLIENT` and
 `HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
 `--issuer`, `--client` and `--client-vault` when they are set, and the

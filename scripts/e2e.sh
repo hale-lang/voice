@@ -65,7 +65,7 @@ broker_at() { if [ "${E2E_BROKER:-}" = grafted ]; then echo "HALE_DNA_BROKER_URL
 if [ "${E2E_BROKER:-}" = grafted ]; then
   # the habitat's hand-over of the broker, for the api and the brains
   printf 'brokerpw' >"$work/vault/nats-heart-zz"
-  printf 'nodepw' >"$work/vault/nats-heart-zz-node"
+  printf '%s' 'no"de\pw' >"$work/vault/nats-heart-zz-node"
   chmod 600 "$work/vault/nats-heart-zz" "$work/vault/nats-heart-zz-node"
   export HALE_VAULT_DIR="$work/vault" HALE_DNA_BROKER_URL="$NATS_URL" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz HALE_DNA_BROKER_SUBJECTS='heart.zz.>' HALE_DNA_BROKER_NODE_USER=heart-zz-node HALE_DNA_BROKER_NODE_VAULT=nats-heart-zz-node
 fi
@@ -159,12 +159,12 @@ if [ "${E2E_BROKER:-}" = grafted ]; then
   python3 - "$work/reg.json" <<'PY' || { echo "the registration did not hand over the nodes' account: $(cat "$work/reg.json")"; exit 1; }
 import json, sys
 n = json.load(open(sys.argv[1]))["nats"]
-assert n["subject"] == "heart.zz.node.probe" and n["user"] == "heart-zz-node" and n["password"] == "nodepw", n
+assert n["subject"] == "heart.zz.node.probe" and n["user"] == "heart-zz-node" and n["password"] == 'no"de\\pw', n
 PY
   grep -qi '^cache-control: no-store' "$work/reg.headers" || { echo "the registration's answer may be stored: $(cat "$work/reg.headers")"; exit 1; }
-  ! grep -q 'nodepw' "$work/api.log" || { echo "the api logged the nodes' password"; exit 1; }
+  ! grep -qF 'no"de' "$work/api.log" || { echo "the api logged the nodes' password"; exit 1; }
   # what the CLI said, its own failure apart (a refusal is one)
-  as_node() { docker run --rm --network host natsio/nats-box:latest nats -s "nats://heart-zz-node:nodepw@127.0.0.1:${NATS_PORT}" "$@" 2>&1 || true; }
+  as_node() { docker run --rm --network host natsio/nats-box:latest nats -s "nats://127.0.0.1:${NATS_PORT}" --user heart-zz-node --password 'no"de\pw' "$@" 2>&1 || true; }
   grep -q 'Published' <<<"$(as_node pub heart.zz.reply.probe.event x)" || { echo "the nodes' account may not publish a reply"; exit 1; }
   for refused in "pub heart.zz.node.laptop.assign x" "pub heart.zz.route x" "pub voice.node.laptop.assign x"; do
     grep -q 'Permissions Violation' <<<"$(as_node $refused)" || { echo "the nodes' account was not refused: $refused"; exit 1; }

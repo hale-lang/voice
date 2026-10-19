@@ -55,8 +55,13 @@ version moves on in SQL, so no instance's write is lost or reuses a
 version (`scripts/race.sh` checks it with two instances). A store failure
 answers a fixed message with an id; what Postgres said goes to the api's
 stderr only, and nothing of the database URL is printed but its host and
-port. Without a database the store is in the process (`MemoryStore`),
-lost on restart, which is what `hale test api` runs on. Budgets are
+port. Grafted into a DNA habitat, voice's genome needs a `database`
+(the root [`hale.toml`](./hale.toml), `[dna] needs`), and when neither
+`--database` nor `VOICE_DATABASE_URL` is given the api and the brain use
+the one the habitat provisioned, `HALE_DNA_DATABASE_DSN`: a DSN with no
+password, whose `vault=` names the vault entry pq reads it from when it
+authenticates. Without a database the store is in the process
+(`MemoryStore`), lost on restart, which is what `hale test api` runs on. Budgets are
 configuration: nothing is charged against them yet.
 
 **Rate limits** are enforced on one admission path, their limits from one
@@ -669,17 +674,23 @@ Every line the api, the brain and the node write goes through `std::log`:
 each program's `log.hl` logs under its logger (`voice.api`,
 `voice.brain`, `voice.node`; the vendored Postgres driver and migrator
 under `pq` and `migrate`), a message and its fields as logfmt (`k=v`), and
-its `main` holds the one sink, `std::log`'s StdoutSink: info on stdout,
-warnings and errors on stderr, `HALE_LOG` the threshold. Voice prints
-nothing outside it, and CI refuses a bare `print`, `println`, `eprint` or
-`eprintln` outside the tests directories. One line is not voice's: the
+its `main` holds the one sink, voice's `RecordSink`
+([`lib/logfmt`](./lib/logfmt/logfmt.hl)), which writes each event as one
+logfmt record: the event's time, its level, its logger and its message,
+then its fields. Info goes on stdout, warnings and errors on stderr; the
+record is the same on both. Each line is data a collector parses, as the
+standard pack's first clause asks (GH #1591, "Logs are structured"), and
+the attach manifest declares it ([`dna/applications/voice.toml`](./dna/applications/voice.toml)).
+Voice prints nothing outside the sink, and CI refuses a bare `print`,
+`println`, `eprint` or `eprintln` anywhere else outside the tests
+directories. One line is not voice's: the
 Hale runtime's `perror` when a client hangs up while the api writes
 (`lotus_tcp_send_str: write: Broken pipe` on stderr), which FRICTION.md
 lists for hale.
 
 ```text
-[INFO voice.api] serving url=http://127.0.0.1:8080 canned=api/canned
-[WARN voice.api] NATS unreachable nats=nats://127.0.0.1:4222 error=...
+time=2026-10-19T04:12:09Z level=info logger=voice.api msg=serving url=http://127.0.0.1:8080 canned=api/canned
+time=2026-10-19T04:12:09Z level=warn logger=voice.api msg="NATS unreachable" nats=nats://127.0.0.1:4222 error=...
 ```
 
 ## In Hale

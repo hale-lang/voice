@@ -15,6 +15,7 @@
 /// `HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`); without the token
 /// nothing is published and no connection is made.
 
+import "../lib/logfmt" as logfmt;
 import "../lib/pond/pq" as pq;
 import "../lib/pond/migrations" as migs;
 main locus Api {
@@ -120,7 +121,7 @@ fn migrate(database: String, dir: String) -> Int {
         return 2;
     }
     let d = st::parse_dsn(database);
-    let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, database: d.database, sslmode: d.sslmode };
+    let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, vault: d.vault, database: d.database, sslmode: d.sslmode };
     let st = conn.open();
     if !st.ok {
         log_error("migrate: Postgres refused", fields2(std::log::kv("at", d.host + ":" + to_string(d.port)), fields2(std::log::kv("kind", st.err.kind), std::log::kv("detail", st::redact(st.err.detail, d)))));
@@ -173,14 +174,16 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 /// `canned` and `migrations` beside the binary; with no `--ui` the app is
 /// not served. `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
-/// is `postgres://user:password@host:port/database`; without it the store
-/// is in memory. `--seat-first-s` is how long a seat may take to its first
+/// is `postgres://user:password@host:port/database`; without either, a
+/// grafted api's database is the one the habitat hands it
+/// (`HALE_DNA_DATABASE_DSN`, its password in the vault entry it names), and
+/// a standalone one's store is in memory. `--seat-first-s` is how long a seat may take to its first
 /// output (120 s: a slow model, or an engine that answers at the end), and
 /// `--seat-idle-s` how long it may then send nothing (30 s), before it has
 /// failed.
 fn main() {
     // the one sink: every logger's lines are written here (log.hl)
-    let sink = std::log::StdoutSink { };
+    let sink = logfmt::RecordSink { };
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
     let mut migrations = beside_binary("migrations");
@@ -253,6 +256,10 @@ fn main() {
         }
         i = i + 2;
     }
+    // grafted, the habitat's database when none is given (store/pg_store.hl)
+    let given = database;
+    database = st::database_or_habitat(database);
+    if len(given) == 0 && len(database) > 0 { log_info("grafted: the store's database is the one the habitat provisioned", std::log::kv("from", st::HABITAT_DATABASE_ENV)); }
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         if len(d.problem) > 0 {

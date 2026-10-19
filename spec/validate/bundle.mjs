@@ -30,6 +30,7 @@ const WAITS_ON = {
   wrapper: 'hale: a bounded field assigned whole (FRICTION.md); the list rides in a record',
   'json-text': 'hale: a free-form JSON value inside a typed object (an engine\'s config_schema), so the node\'s capabilities ride as JSON text',
   path: 'voice: a path or query parameter carried in the row\'s request',
+  'map-values': 'voice: a map whose values one side says and the other does not, so they are not compared',
   wire: 'voice: the REST wire\'s shape differs from the row (written by api/wire.hl)',
   required: 'voice: the row gives the field a default, so the surface does not require it; the REST reader does (api/wire.hl)',
   open: 'voice: the contract admits several shapes there (oneOf/anyOf, or none named); the row carries one, as the REST reader does',
@@ -108,7 +109,7 @@ const NOT_COMPARED = {
   ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
   NodeReport: ['the node\'s `Capabilities` (PUT /node/v1/capabilities), carried whole as JSON text and checked by the reader (api/fleet.hl): an engine\'s `config_schema` is free-form JSON, which the codec does not carry', ['json']],
-  Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, which the map\'s own comparison covers', ['name', 'status']],
+  Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, so its schema is never on the wire; the map\'s value is compared as `Health.checks{}`', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 
@@ -206,7 +207,16 @@ function compare(at, c, bIn) {
     return;
   }
   if (ct === 'array' && bt === 'string') { gap(at, 'json-text'); return; }
-  if (ct === 'object' && bt === 'object') { fields(at, cs, bs); return; }
+  if (ct === 'object' && bt === 'object') {
+    // a map's values: compared when both sides say them, a gap of its own
+    // when only one does (a boolean says no schema)
+    const ca = cs.additionalProperties, ba = bs.additionalProperties;
+    const cmap = !!ca && typeof ca === 'object', bmap = !!ba && typeof ba === 'object';
+    if (cmap && bmap) compare(at + '{}', ca, ba);
+    else if (cmap !== bmap) gap(at + '{}', 'map-values');
+    fields(at, cs, bs);
+    return;
+  }
   if (ct === 'array' && bt === 'array') { compare(at + '[]', cs.items, bs.items); return; }
   // an integer where the contract says number is a narrowing too
   if (ct === 'number' && bt === 'integer') { gap(at + ' (narrowed to an integer)', 'type'); return; }

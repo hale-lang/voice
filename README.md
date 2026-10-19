@@ -235,6 +235,7 @@ refuse:
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |
 | `wire` | voice: the REST wire's shape differs from the row (`api/wire.hl` writes it) |
+| `map-values` | voice: a map whose values one side says and the other does not, so they are not compared; none today (a map's values are compared as `<field>{}` when both say them) |
 | `open` | voice: the contract admits several shapes there (`oneOf`/`anyOf`); the row carries one, as the reader does |
 
 After a change, `npm run bundle -- --write` writes the gaps again; the diff

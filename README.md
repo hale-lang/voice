@@ -78,8 +78,9 @@ marked `no-store`. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
 `HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
 `--issuer`, `--client` and `--client-vault` when they are set, and the
 habitat migrates the database itself (`[dna.migrations.database]` in
-`hale.toml`, `api migrate` at graft and upgrade): neither the api nor the
-brain migrates on its own. `E2E_BROKER=grafted scripts/e2e.sh` runs the
+`hale.toml`: `api migrate`, run at every graft, `hale habitat migrate` and
+upgrade, its own ledger making a run at the head a no-op that exits 0):
+neither the api nor the brain migrates on its own. `E2E_BROKER=grafted scripts/e2e.sh` runs the
 whole e2e on a NATS whose one account may use `heart.zz.>` alone. Without a database the store is in the process
 (`MemoryStore`), lost on restart, which is what `hale test api` runs on. Budgets are
 configuration: nothing is charged against them yet.

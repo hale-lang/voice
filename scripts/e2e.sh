@@ -78,6 +78,11 @@ api=http://127.0.0.1:${API_PORT}
 store=()
 if [ -n "${DATABASE_URL:-}" ]; then
   api/api migrate --database "$DATABASE_URL" --migrations store/migrations
+  # the habitat runs it at every graft, migrate and upgrade: at the head it
+  # applies nothing and exits 0
+  api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/migrate2.log" 2>&1 || { echo "a second migrate at the head failed"; cat "$work/migrate2.log"; exit 1; }
+  grep -q 'applied=0 ' "$work/migrate2.log" || { echo "a second migrate at the head applied something"; cat "$work/migrate2.log"; exit 1; }
+  echo "migrate is idempotent: at the head it applies nothing and exits 0"
   store=(--database "$DATABASE_URL")
 fi
 # a seat has 30 s to its first output (120 s by default), then may be silent

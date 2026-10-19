@@ -116,9 +116,11 @@ locus Inference {
         // voice is attached to one (main.hl)
         pulse: Bool = false;
         // the rate limits: the organization's ratified practices when it
-        // has a head (governance.hl), the stored ones otherwise, and this
-        // instance's windows over them (admission.hl)
-        governance: Governance = Governance { };
+        // has a head (`governed`; governance.hl), as its reader last left
+        // them in `held`, the stored ones otherwise, and this instance's
+        // counters over them (admission.hl)
+        governed: Bool = false;
+        held: HeldLimits = HeldLimits { };
         windows: Windows = Windows { };
     }
     bus { publish UsageToTell; }
@@ -138,15 +140,8 @@ locus Inference {
     /// it refuses before anything is looked for to serve.
     fn serve(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
         let held = self.hold(r, ctx) or raise;
-        let candidates = self.admit(r, ctx) or {
-            self.let_go(held);
-            fail err;
-        };
-        let mut s = self.serve_held(r, ctx, candidates) or {
-            self.let_go(held);
-            fail err;
-        };
-        self.let_go(held);
+        let candidates = self.admit(r, ctx) or raise;
+        let mut s = self.serve_held(r, ctx, candidates) or raise;
         s.headers = held.headers;
         return s;
     }
@@ -192,16 +187,8 @@ locus Inference {
     /// answered whole, as a `502`.
     fn stream(r: InferenceRequest, ctx: std::api::Context, out: EventStream) -> std::http::Response fallible(ApiError) {
         let held = self.hold(r, ctx) or raise;
-        let candidates = self.admit(r, ctx) or {
-            self.let_go(held);
-            fail err;
-        };
-        let answer = self.stream_held(r, ctx, out, candidates, held) or {
-            self.let_go(held);
-            fail err;
-        };
-        self.let_go(held);
-        return answer;
+        let candidates = self.admit(r, ctx) or raise;
+        return self.stream_held(r, ctx, out, candidates, held) or raise;
     }
 
     fn stream_held(r: InferenceRequest, ctx: std::api::Context, out: EventStream, candidates: Candidates, held: Held) -> std::http::Response fallible(ApiError) {
@@ -306,44 +293,34 @@ locus Inference {
     }
 
     /// The limits `r` is held to, from the one source in force: the
-    /// project's ratified practice under a head, the stored limits
-    /// otherwise (the project's, its model-scope ones for `r.model`, and
-    /// the key's). A window is kept per limit, by scope and length.
+    /// project's ratified practice under a head, as last read (never read
+    /// here: governance.hl), the stored limits otherwise (the project's, its
+    /// model-scope ones for `r.model`, and the key's).
     @unbounded
-    fn applied(r: InferenceRequest, k: st::KeyRow, p: st::ProjectRow, now_ns: Int) -> Applied fallible(ApiError) {
+    fn applied(r: InferenceRequest, k: st::KeyRow, p: st::ProjectRow) -> Applied fallible(ApiError) {
         let mut out = Applied { };
-        if self.governance.governed() {
-            self.governance.refresh(now_ns);
-            if !self.governance.landed { fail limits_unavailable(self.governance.every / 1s); }
-            let pl = self.governance.limit_of(k.project);
-            if len(pl.project) > 0 {
-                push(out.scopes, "practice:" + k.project + "@" + to_string(pl.limit.window_seconds)) or discard;
-                push(out.limits, pl.limit) or discard;
-            }
+        if self.governed {
+            if !limits_landed(self.held) { fail limits_unavailable(1); }
+            let pl = held_limit(self.held, k.project);
+            if len(pl.project) > 0 { out = apply(out, "practice:" + k.project, pl.limit); }
             return out;
         }
         for l in p.limits.items {
             let model = l.scope == st::LimitScope::model && l.model == r.model;
-            if l.scope == st::LimitScope::project || model {
-                push(out.scopes, (if model { "model:" + p.id + "/" + l.model } else { "project:" + p.id }) + "@" + to_string(l.window_seconds)) or discard;
-                push(out.limits, l) or discard;
-            }
+            if l.scope == st::LimitScope::project || model { out = apply(out, if model { "model:" + p.id + "/" + l.model } else { "project:" + p.id }, l); }
         }
         for l in k.limits.items {
-            if l.scope == st::LimitScope::key {
-                push(out.scopes, "key:" + k.id + "@" + to_string(l.window_seconds)) or discard;
-                push(out.limits, l) or discard;
-            }
+            if l.scope == st::LimitScope::key { out = apply(out, "key:" + k.id, l); }
         }
         return out;
     }
 
     /// `project`'s limits as the organization ratified them (under a
-    /// head): its practice's limit, or none, and where it was read from.
+    /// head), as last read: its practice's limit, or none, and where it was
+    /// read from.
     fn ratified(project: String) -> LimitSet fallible(ApiError) {
-        self.governance.refresh(std::time::monotonic_ns());
-        if !self.governance.landed { fail limits_unavailable(self.governance.every / 1s); }
-        let pl = self.governance.limit_of(project);
+        if !limits_landed(self.held) { fail limits_unavailable(1); }
+        let pl = held_limit(self.held, project);
         let mut out = LimitSet { source: LimitSource::practice };
         if len(pl.project) > 0 {
             push(out.limits, pl.limit) or discard;
@@ -353,69 +330,51 @@ locus Inference {
         return out;
     }
 
-    /// Hold `r` to its limits: refused past any of them, or counted in
-    /// each window and in flight until `let_go`. Nothing is counted for a
-    /// request refused.
+    /// Hold `r` to its limits: refused past any of them, or counted once
+    /// in each of their counters. Nothing is counted for a request refused.
     @unbounded
     fn hold(r: InferenceRequest, ctx: std::api::Context) -> Held fallible(ApiError) {
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         if !k.present { return Held { }; }
         let p = self.store.project(k.project) or fail metering_failed(err);
         let now = std::time::monotonic_ns();
-        let a = self.applied(r, k, p, now) or raise;
+        let a = self.applied(r, k, p) or raise;
         let mut i = 0;
-        while i < count(a.scopes) {
-            let scope = at(a.scopes, i) or "";
+        while i < count(a.keys) {
+            let key = at(a.keys, i) or "";
             let l = at(a.limits, i) or st::Limit { scope: st::LimitScope::project };
-            let span = l.window_seconds * 1000000000;
-            let mut w = window_of(self.windows, scope, now);
-            if now - w.start_ns >= span {
-                w.start_ns = now;
-                w.used = 0;
-            }
-            let reset = (w.start_ns + span - now + 999999999) / 1000000000;
-            if l.has_requests && w.used >= l.requests {
-                fail rate_limited(l, "project " + k.project + " is past its limit of " + to_string(l.requests) + " requests per " + to_string(l.window_seconds) + "s", reset);
-            }
-            if l.has_concurrent && w.in_flight >= l.concurrent {
-                fail rate_limited(l, "project " + k.project + " has " + to_string(l.concurrent) + " requests in flight, its limit", 1);
+            let w = window_of(self.windows, key, l, now);
+            if w.used >= l.requests {
+                fail rate_limited(l, "project " + k.project + " is past its limit of " + to_string(l.requests) + " requests per " + to_string(l.window_seconds) + "s", reset_of(w, l, now));
             }
             i = i + 1;
         }
         let mut out = Held { };
-        let mut tightest = -1;
+        let mut fewest = -1;
         i = 0;
-        while i < count(a.scopes) {
-            let scope = at(a.scopes, i) or "";
+        while i < count(a.keys) {
+            let key = at(a.keys, i) or "";
             let l = at(a.limits, i) or st::Limit { scope: st::LimitScope::project };
-            let span = l.window_seconds * 1000000000;
-            let mut w = window_of(self.windows, scope, now);
-            if now - w.start_ns >= span {
-                w.start_ns = now;
-                w.used = 0;
+            let mut w = window_of(self.windows, key, l, now);
+            // counted once, by the first of the limits that read it
+            let mut first = true;
+            let mut k = 0;
+            while k < i {
+                if (at(a.keys, k) or "") == key { first = false; }
+                k = k + 1;
             }
-            w.used = w.used + 1;
-            w.in_flight = w.in_flight + 1;
-            put_window(self.windows, w);
-            push(out.scopes, scope) or discard;
-            if l.has_requests && (tightest < 0 || l.requests - w.used < tightest) {
-                tightest = l.requests - w.used;
-                out.headers = limited_headers(l, l.requests - w.used, (w.start_ns + span - now + 999999999) / 1000000000);
+            if first {
+                w.used = w.used + 1;
+                put_window(self.windows, w);
+            }
+            let left = l.requests - w.used;
+            if fewest < 0 || left < fewest {
+                fewest = left;
+                out.headers = limited_headers(l, left, reset_of(w, l, now));
             }
             i = i + 1;
         }
         return out;
-    }
-
-    /// A held request is over: out of flight in each of its windows.
-    @unbounded
-    fn let_go(h: Held) {
-        let now = std::time::monotonic_ns();
-        for scope in h.scopes {
-            let mut w = window_of(self.windows, scope, now);
-            if w.in_flight > 0 { w.in_flight = w.in_flight - 1; }
-            put_window(self.windows, w);
-        }
     }
 
     /// A request a seat served: its usage told to the organization, when

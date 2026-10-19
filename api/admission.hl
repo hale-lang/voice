@@ -4,40 +4,52 @@
 // admin plane stored apply: the project's, its model-scope ones for the
 // model asked for, and the key's. Each is enforced the same way here.
 //
-// A limit's `requests` count requests per `window_seconds`, and its
-// `concurrent` the requests in flight at once; a request past either is
-// `429 rate_limited` with `Retry-After` and the limit that refused it, and
-// an admitted one carries the tightest `requests` limit's
-// `x-ratelimit-*-requests` headers. `input_tokens` and `output_tokens` are
-// read and shown, and not enforced yet: a token is known only once the
-// seat has answered, and charging it is the reservation the store.md
-// design keeps across instances. The windows are this instance's, on the
+// A limit's `requests` count requests per `window_seconds`, in a counter
+// kept under the limit itself: its scope, its window and its kind. Each
+// request is counted once in each counter, however many limits read it
+// (two `requests` limits of one scope on one window read one count), a
+// limit with no `requests` has none, and a limit raised or lowered within
+// its window keeps the requests already counted. A request past any limit
+// is `429 rate_limited` with `Retry-After` and the limit that refused it,
+// and an admitted one carries the `x-ratelimit-*-requests` headers of the
+// limit with the fewest requests left. `input_tokens`, `output_tokens` and
+// `concurrent` are read and shown, and not enforced: a token is known only
+// once the seat has answered, and charging it is the reservation the
+// store.md design keeps across instances; an instance serves one request
+// at a time (its HTTP server is serial), so a limit on requests in flight
+// could never refuse one. The counters are this instance's, on the
 // monotonic clock.
 
-/// One limit's window: requests counted since `start_ns`, and those in
-/// flight.
+/// One limit's counter: requests counted since `start_ns`.
 type Window {
-    scope: String = "";
+    key: String = "";
     start_ns: Int = 0;
     used: Int = 0;
-    in_flight: Int = 0;
 }
 
 @form(vec)
 locus Windows { capacity { heap rows of Window; } }
 
-/// The limits one request is held to, with the place each window is kept
-/// under (`project:<id>`, `model:<project>/<model>`, `key:<id>`).
+/// The limits one request is held to, each with the key of its counter
+/// (`<scope>@<window>/requests`, the scope `project:<id>`,
+/// `model:<project>/<model>`, `key:<id>` or `practice:<project>`).
 type Applied {
-    scopes: bounded[String; 34];
+    keys: bounded[String; 34];
     limits: bounded[st::Limit; 34];
 }
 
-/// What admission held for one request: the windows it counts in flight
-/// against, and the headers its answer carries.
-type Held {
-    scopes: bounded[String; 34];
-    headers: String = "";
+/// What admission held for one request: the headers its answer carries.
+type Held { headers: String = ""; }
+
+/// `l` under `scope`, into `a`, with its counter's key: a limit with no
+/// `requests` has none.
+fn apply(a: Applied, scope: String, l: st::Limit) -> Applied {
+    if !l.has_requests { return a; }
+    let key = scope + "@" + to_string(l.window_seconds) + "/requests";
+    let mut out = a;
+    push(out.keys, key) or discard;
+    push(out.limits, l) or discard;
+    return out;
 }
 
 /// Seconds as the contract writes a reset: `1s`, `6m0s`.
@@ -46,16 +58,20 @@ fn duration(seconds: Int) -> String {
     return to_string(seconds / 60) + "m" + to_string(seconds % 60) + "s";
 }
 
-/// The window kept under `scope`: a fresh one when there is none.
+/// The counter kept under `key`, started again when its window has
+/// passed: a fresh one when there is none.
 @unbounded
-fn window_of(ws: Windows, scope: String, now_ns: Int) -> Window {
+fn window_of(ws: Windows, key: String, l: st::Limit, now_ns: Int) -> Window {
     let mut i = 0;
     while i < ws.len() {
         let w = ws.get(i) or Window { };
-        if w.scope == scope { return w; }
+        if w.key == key {
+            if now_ns - w.start_ns >= l.window_seconds * 1000000000 { return Window { key: key, start_ns: now_ns }; }
+            return w;
+        }
         i = i + 1;
     }
-    return Window { scope: scope, start_ns: now_ns };
+    return Window { key: key, start_ns: now_ns };
 }
 
 @unbounded
@@ -63,13 +79,18 @@ fn put_window(ws: Windows, w: Window) {
     let mut i = 0;
     while i < ws.len() {
         let have = ws.get(i) or Window { };
-        if have.scope == w.scope {
+        if have.key == w.key {
             ws.set(i, w) or discard;
             return;
         }
         i = i + 1;
     }
     ws.push(w);
+}
+
+/// Seconds until `w`'s window under `l` starts again, rounded up.
+fn reset_of(w: Window, l: st::Limit, now_ns: Int) -> Int {
+    return (w.start_ns + l.window_seconds * 1000000000 - now_ns + 999999999) / 1000000000;
 }
 
 /// A request past `l`: `429 rate_limited`, retrying after `retry` seconds.
@@ -81,7 +102,8 @@ fn rate_limited(l: st::Limit, what: String, retry: Int) -> ApiError {
 }
 
 /// No ratified limits read yet: a keyed request is refused, since the
-/// limits fail closed.
+/// limits fail closed, until the reader's first read lands (it tries every
+/// second until then).
 fn limits_unavailable(retry: Int) -> ApiError {
     return ApiError { status: 503, kind: "server_error", code: ErrorCode::metering_unavailable, message: "the project's rate limits are not read yet: they are the organization's, and its head has not answered", retry_after: retry };
 }

@@ -65,29 +65,41 @@ Without `--head` they are the limits the admin plane stored: the
 project's, its model-scope ones for the model asked for, and the key's.
 With `--head`, voice runs under a DNA organization, and a project's limit
 is its ratified practice `operating/limits/<project>`, which its Board
-decides ([`api/governance.hl`](./api/governance.hl)): the api reads the
-ratified practices through the head as a service (a `client_credentials`
-token from `--issuer` under `--client`, its secret the vault's
-`oidc-service-<client>` or `--client-vault`), at most once per
-`--limits-every-s`. `GET .../limits` then shows the ratified limit with
-`source: practice` and the practice it came from, `PUT .../limits` answers
-`409 conflict`, and until the head has answered once a keyed request is
-`503 metering_unavailable`; after that, the last limits read stand while
-it does not answer. A limit's `requests` per `window_seconds` and its
-`concurrent` are counted, and a request past either is `429 rate_limited`
-with `Retry-After` and the limit in `voice.limit`; an admitted request
-carries the `x-ratelimit-*-requests` headers. The windows are each api
-instance's own, and token limits are shown, not yet enforced: both wait
-on the reservation in [`spec/store.md`](./spec/store.md).
+decides ([`api/governance.hl`](./api/governance.hl)). A reader of its own,
+a pinned locus off the request path, reads the ratified practices of the
+application `--application` names (its id at the head, which the head's
+`/api/hale/v1/applications` lists) through the head as a service (a
+`client_credentials` token from `--issuer` under `--client`, its secret
+the vault's `oidc-service-<client>` or `--client-vault`), every
+`--limits-every-s`, each call one attempt under a 30 s deadline
+([`api/deadline.hl`](./api/deadline.hl)). A request reads only the limits
+last read, never the head. Of a project's ratified practices, the one in
+force is the one no other supersedes. `GET .../limits` then shows the
+ratified limit with `source: practice` and the practice it came from,
+`PUT .../limits` answers `409 conflict`, and until a read has landed a
+keyed request is `503 metering_unavailable`; after that, the last limits
+read stand while a read does not land, and the reader logs why.
+
+A limit's `requests` per `window_seconds` are counted, each limit's
+counter kept under its scope, its window and its kind, and a request past
+any is `429 rate_limited` with `Retry-After` and the limit in
+`voice.limit`; an admitted request carries the `x-ratelimit-*-requests`
+headers of the limit with the fewest left. The counters are each api
+instance's own. Token limits are shown, not yet enforced: they wait on
+the reservation in [`spec/store.md`](./spec/store.md). `concurrent` is
+shown and not enforced: an instance serves one request at a time (its
+HTTP server is serial), so a limit on requests in flight could never
+refuse one.
 
 ```sh
-api/api --head http://127.0.0.1:8792 --issuer http://127.0.0.1:8794 --client voice-api
+api/api --head http://127.0.0.1:8792 --application <id> --issuer http://127.0.0.1:8794 --client voice-api
 ```
 
 [`api/tests/admin_limits.sh`](./api/tests/admin_limits.sh) runs it end to
 end against a DNA organization, from the Board's ratification to the
-caller's 429 and a superseding limit (`VOICE_DNA_FIXTURE=1`, with a hale
-whose record is in memory).
+caller's 429, a superseding limit, and a head stopped with the limits
+read last standing and no answer waiting on it (`VOICE_DNA_FIXTURE=1`,
+with a hale whose record is in memory).
 
 A node is `pending` until it registers, then `up` while it heartbeats and
 `down` after three missed intervals; each seat shows the state its node

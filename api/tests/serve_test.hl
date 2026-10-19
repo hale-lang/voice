@@ -238,14 +238,35 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
     expect(ask(e, "/v1/responses", key, hi), 429, "its second is past the key's limit");
     expect(admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": []}"), 200, "the key's limit lifted");
 
+    // a request limit and a token limit on the same window each have a
+    // counter of their own: the token limit counts no requests, and the
+    // remaining requests go down by one a request
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 30, \"requests\": 3}, {\"scope\": \"project\", \"window_seconds\": 30, \"input_tokens\": 1000}]}"), 200, "three a window, and a token limit beside it");
+    let mut left = 2;
+    while left >= 0 {
+        let a = ask(e, "/v1/responses", key, hi);
+        expect(a, 200, "served under three a window");
+        std::test::assert(std::str::contains(a.headers, "x-ratelimit-limit-requests: 3\r\nx-ratelimit-remaining-requests: " + to_string(left) + "\r\n"), to_string(left) + " remaining: " + a.headers);
+        left = left - 1;
+    }
+    expect(ask(e, "/v1/responses", key, hi), 429, "the fourth is past the limit, and only then");
+    // and two request limits on one window: the tighter one's headers
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 4}, {\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 2}]}"), 200, "four and two a window");
+    let tight = ask(e, "/v1/responses", key, hi);
+    expect(tight, 200, "the first served");
+    std::test::assert(std::str::contains(tight.headers, "x-ratelimit-limit-requests: 2\r\nx-ratelimit-remaining-requests: 1\r\n"), "the tighter limit's headers: " + tight.headers);
+    expect(ask(e, "/v1/responses", key, hi), 200, "the second served");
+    expect(ask(e, "/v1/responses", key, hi), 429, "the third past the tighter limit");
+    expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "the limits lifted");
+
     // under a head, the organization's ratified practice is the limit, and
     // the stored ones are not: one a minute, though five are stored
     expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 5}]}"), 200, "five stored");
     e.projects.governed = true;
-    e.inference.governance.head = "http://head.test";
-    e.inference.governance.landed = true;
-    e.inference.governance.read_at_ns = std::time::monotonic_ns();
-    e.inference.governance.limits.push(api::PracticeLimit { project: "work", name: "operating/limits/work", id: "p_1", limit: api::parse_limit("The limit for work.\nwindow_seconds: 60\nrequests: 1") });
+    e.inference.governed = true;
+    let read = api::PracticeLimits { };
+    read.push(api::PracticeLimit { project: "work", name: "operating/limits/work", id: "p_1", limit: api::parse_limit("The limit for work.\nwindow_seconds: 60\nrequests: 1") });
+    api::hold_limits(e.inference.held, 1, read);
     expect(ask(e, "/v1/responses", key, hi), 200, "the first under the practice is served");
     expect(ask(e, "/v1/responses", key, hi), 429, "the second is past the ratified limit");
     let ratified = admin(e, "GET", "/admin/v1/projects/work/limits", "");
@@ -255,21 +276,21 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
     expect(refused, 409, "the admin plane cannot set what the organization decides");
     std::test::assert(std::str::contains(refused.body, "organization's practice"), "and says why: " + refused.body);
 
-    // a head that has not answered yet: the limits fail closed
-    e.inference.governance.landed = false;
-    e.inference.governance.read_at_ns = 0 - 1;
-    e.inference.governance.head = "http://127.0.0.1:1";
-    e.inference.governance.issuer = "http://127.0.0.1:1";
-    e.inference.governance.client = "voice-api";
+    // a later generation replaces the limits whole: a project it has no
+    // practice for is no longer limited
+    api::hold_limits(e.inference.held, 2, api::PracticeLimits { });
+    expect(ask(e, "/v1/responses", key, hi), 200, "the practice gone, the project is not limited");
+
+    // no read landed yet: the limits fail closed
+    e.inference.held.remove("held") or discard;
     let closed = ask(e, "/v1/responses", key, hi);
     expect(closed, 503, "before any limits are read, a keyed request is refused");
-    std::test::assert(std::str::contains(closed.body, "metering_unavailable") && std::str::contains(closed.headers, "Retry-After: 30"), "metering_unavailable, retrying at the next read: " + closed.headers + " " + closed.body);
+    std::test::assert(std::str::contains(closed.body, "metering_unavailable") && std::str::contains(closed.headers, "Retry-After: 1"), "metering_unavailable, retrying in a second: " + closed.headers + " " + closed.body);
     std::test::assert(!std::str::contains(closed.headers, "x-ratelimit"), "and states no limit");
     expect(admin(e, "GET", "/admin/v1/projects/work/limits", ""), 503, "nor can the admin plane read them");
 
     e.projects.governed = false;
-    e.inference.governance.head = "";
-    e.inference.governance.limits.pop() or discard;
+    e.inference.governed = false;
     expect(admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"), 200, "ungoverned again, the stored limits lifted");
 }
 

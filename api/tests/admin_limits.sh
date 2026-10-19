@@ -119,15 +119,23 @@ H=http://127.0.0.1:$head_port
 issuer=http://127.0.0.1:$oidc_port
 (cd "$app" && exec env HALE_DNA_HEAD_STATE="$root/state" HALE_DNA_OIDC_SERVICES=voice-api \
   "$hale" dna head . --port "$head_port" --api-port "$api_port" --oidc-port "$oidc_port" --commands-port "$commands_port" >"$root/head.log" 2>&1) &
-jobs_started+=($!)
+head_job=$!
+jobs_started+=("$head_job")
 until_ok 180 "the head listening" grep -q "hale dna head: http://127.0.0.1:$head_port/" "$root/head.log"
 until_ok 20 "the stub provider answering" curl -sf -o /dev/null "$issuer/.well-known/openid-configuration"
 
 step "the head is up"
+# the application's id at the head, as an operator reads it: the service's
+# own token, and the head's applications
+secret=$(cat "$HALE_VAULT_DIR/oidc-service-voice-api")
+token_endpoint=$(curl -sf "$issuer/.well-known/openid-configuration" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token_endpoint"])')
+token=$(curl -sf --data-urlencode grant_type=client_credentials --data-urlencode client_id=voice-api --data-urlencode "client_secret=$secret" "$token_endpoint" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+application=$(curl -sf -H "Authorization: Bearer $token" "$H/api/hale/v1/applications" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["items"][0]["id"])')
+[[ -n "$application" ]] || fail "the head names no application"
 # ---- 4. voice's api under the head, as the service
 voice_port=$(free_port); V=http://127.0.0.1:$voice_port
 "$voice/api/api" --port "$voice_port" --canned "$voice/api/canned" \
-  --head "$H" --issuer "$issuer" --client voice-api --limits-every-s 1 >"$root/voice.log" 2>&1 &
+  --head "$H" --application "$application" --issuer "$issuer" --client voice-api --limits-every-s 1 >"$root/voice.log" 2>&1 &
 jobs_started+=($!)
 until_ok 20 "voice's api answering" curl -sf -o /dev/null "$V/healthz"
 curl -sf -X POST -H 'Content-Type: application/json' -d '{"id": "personal", "name": "Personal"}' "$V/admin/v1/projects" >/dev/null || fail "no project personal"
@@ -170,4 +178,26 @@ until_ok 300 "the ratified limit of 5 read through the head" ratified 5
 served=0
 for _ in 1 2 3 4; do [[ $(ask) != 429 ]] && served=$((served + 1)) || break; done
 [[ $served == 3 ]] || fail "under the limit of 5, $served more were admitted in the window (3 expected)"
-echo "admin_limits: the limit of 2 refused the third request; the superseding limit of 5 admitted three more"
+step "the superseding limit of 5 admitted three more"
+# ---- 6. a head that stops answering: the limits read last stand, and no
+# answer waits on it (the head stopped, its socket still taking
+# connections that nothing reads)
+# the processes listening on the head's port and its API child's
+listening() { ss -ltnpH "sport = :$1" | grep -oE 'pid=[0-9]+' | cut -d= -f2; }
+head_pids=$( (listening "$head_port"; listening "$api_port") | sort -u | tr '\n' ' ')
+[[ -n "${head_pids// /}" ]] || fail "no process found listening for the head"
+step "the head stopped (pids $head_pids)"
+unread() { grep -c 'the ratified rate limits were not read' "$root/voice.log" || true; }
+unread_before=$(unread)
+for p in $head_pids; do kill -STOP "$p" 2>/dev/null || true; done
+sleep 3
+t0=$(date +%s%N); code=$(ask); ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[[ $code == 429 ]] || fail "with the head stopped, the window's sixth request was not refused by the limit read last ($code)"
+(( ms < 1000 )) || fail "with the head stopped, an answer took ${ms} ms"
+# the read under way ends at its deadline, and says so
+# (a pinned locus's log line is written when the main thread next serves
+# a request: FRICTION.md)
+more_unread() { curl -s -o /dev/null "$V/healthz"; (( $(unread) > unread_before )); }
+until_ok 60 "the read the stopped head did not answer logged" more_unread
+for p in $head_pids; do kill -CONT "$p" 2>/dev/null || true; done
+echo "admin_limits: the limit of 2 refused the third request; the superseding limit of 5 admitted three more; a stopped head held up no answer (${ms} ms)"

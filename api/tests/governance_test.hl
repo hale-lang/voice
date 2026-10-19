@@ -1,6 +1,7 @@
 // A project's limit as the organization ratified it: the practice's own
-// grammar, the later of two ratified practices in force, and the forms
-// the head and the contract are written in. Reading through a head is
+// grammar, the superseding one of two ratified practices in force, the
+// limits held a generation at a time, the deadline on every call to the
+// head, and the forms the head and the contract are written in. Reading through a head is
 // the end-to-end fixture's (api/tests/admin_limits.sh); enforcing it is
 // serve_test's.
 import ".." as api;
@@ -15,13 +16,53 @@ fn main() {
     std::test::assert(!odd.has_requests && odd.window_seconds == 60 && odd.has_concurrent && odd.concurrent == 4, "only a whole number alone counts, and a window is at least a second");
 
     // a superseding practice before the old one's retirement lands: the
-    // later one is in force
-    let folded = api::PracticeLimits { };
-    api::fold_limit(folded, api::PracticeLimit { project: "personal", limit: api::parse_limit("requests: 2") });
-    api::fold_limit(folded, api::PracticeLimit { project: "work", limit: api::parse_limit("requests: 9") });
-    api::fold_limit(folded, api::PracticeLimit { project: "personal", limit: api::parse_limit("requests: 5") });
-    let first = folded.get(0) or api::PracticeLimit { };
-    std::test::assert(folded.len() == 2 && first.project == "personal" && first.limit.requests == 5, "the later practice of a project replaces the earlier");
+    // one no other supersedes is in force, whatever order the head lists
+    // them in
+    let found = api::PracticeLimits { };
+    found.push(api::PracticeLimit { project: "personal", id: "d_new", supersedes: "d_old", limit: api::parse_limit("requests: 5") });
+    found.push(api::PracticeLimit { project: "work", id: "d_work", limit: api::parse_limit("requests: 9") });
+    found.push(api::PracticeLimit { project: "personal", id: "d_old", limit: api::parse_limit("requests: 2") });
+    let read = api::PracticeLimits { };
+    std::test::assert_eq_str(api::in_force(found, read), "", "every project has one in force");
+    let first = read.get(0) or api::PracticeLimit { };
+    std::test::assert(read.len() == 2 && first.project == "personal" && first.limit.requests == 5, "the superseding practice is in force, listed first or not");
+    let tied = api::PracticeLimits { };
+    tied.push(api::PracticeLimit { project: "personal", name: "operating/limits/personal", id: "d_a", limit: api::parse_limit("requests: 5") });
+    tied.push(api::PracticeLimit { project: "personal", name: "operating/limits/personal", id: "d_b", limit: api::parse_limit("requests: 2") });
+    std::test::assert(std::str::contains(api::in_force(tied, api::PracticeLimits { }), "neither superseding the other"), "two neither of which supersedes the other: the read does not land");
+
+    // held limits: the generation in force, never a mix
+    let held = api::HeldLimits { };
+    std::test::assert(!api::limits_landed(held), "nothing read yet");
+    api::hold_limits(held, 1, read);
+    std::test::assert(api::limits_landed(held) && api::held_limit(held, "work").limit.requests == 9, "the first generation held");
+    let next = api::PracticeLimits { };
+    next.push(api::PracticeLimit { project: "work", id: "d_work2", limit: api::parse_limit("requests: 3") });
+    api::hold_limits(held, 2, next);
+    std::test::assert(api::held_limit(held, "work").limit.requests == 3 && len(api::held_limit(held, "personal").project) == 0, "the second replaces it whole");
+
+    // an answer, whole or chunked
+    let plain = api::parse_answer("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}");
+    std::test::assert(plain.status == 200 && plain.body == "{}", "a whole answer");
+    std::test::assert(api::answer_whole("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}") && !api::answer_whole("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n{}"), "whole at its length, and not before");
+    let chunked = "HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n3\r\n{\"a\r\n4\r\n\": 1\r\n1\r\n}\r\n0\r\n\r\n";
+    std::test::assert(api::answer_whole(chunked), "a chunked answer is whole at its last chunk");
+    let c = api::parse_answer(chunked);
+    std::test::assert(c.status == 404 && c.body == "{\"a\": 1}", "its chunks joined: " + c.body);
+
+    // a peer that takes the connection and never answers costs the
+    // deadline and no more
+    let silent = std::io::tcp::listen_socket("127.0.0.1", 0) or - 1;
+    std::test::assert(silent >= 0, "a listener that never accepts");
+    let t0 = std::time::monotonic_ns();
+    let a = api::exchange("http://127.0.0.1:" + to_string(std::io::tcp::__local_port(silent)) + "/api/hale/v1/applications", 300ms, "GET", "", "");
+    let ms = (std::time::monotonic_ns() - t0) / 1000000;
+    std::test::assert(a.status == 0 && std::str::contains(a.why, "within the deadline"), "no answer: " + a.why);
+    std::test::assert(ms >= 250 && ms < 1000, "within its 300 ms deadline: " + to_string(ms) + " ms");
+    std::io::tcp::close_fd(silent);
+    // nothing listening: at once
+    let none = api::exchange("http://127.0.0.1:1/", 300ms, "GET", "", "");
+    std::test::assert(none.status == 0 && std::str::contains(none.why, "no connection"), "refused: " + none.why);
 
     std::test::assert_eq_str(api::form_encode("a&b+c%d e/f"), "a%26b%2Bc%25d%20e%2Ff", "a value is percent-encoded in a form or a query");
     std::test::assert_eq_str(api::duration(1), "1s", "one second");

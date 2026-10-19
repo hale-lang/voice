@@ -65,8 +65,9 @@ broker_at() { if [ "${E2E_BROKER:-}" = grafted ]; then echo "HALE_DNA_BROKER_URL
 if [ "${E2E_BROKER:-}" = grafted ]; then
   # the habitat's hand-over of the broker, for the api and the brains
   printf 'brokerpw' >"$work/vault/nats-heart-zz"
-  chmod 600 "$work/vault/nats-heart-zz"
-  export HALE_VAULT_DIR="$work/vault" HALE_DNA_BROKER_URL="$NATS_URL" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz HALE_DNA_BROKER_SUBJECTS='heart.zz.>'
+  printf 'nodepw' >"$work/vault/nats-heart-zz-node"
+  chmod 600 "$work/vault/nats-heart-zz" "$work/vault/nats-heart-zz-node"
+  export HALE_VAULT_DIR="$work/vault" HALE_DNA_BROKER_URL="$NATS_URL" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz HALE_DNA_BROKER_SUBJECTS='heart.zz.>' HALE_DNA_BROKER_NODE_USER=heart-zz-node HALE_DNA_BROKER_NODE_VAULT=nats-heart-zz-node
 fi
 # the api reaches them through a proxy the e2e can stall
 python3 scripts/nerves-proxy.py "$NERVES_PORT" "$ORG_PORT" "$work/stall" &
@@ -145,6 +146,34 @@ assert e["requested_model"] == "echo-1" and e["seat"] == "laptop/static" and e["
 assert e["input_tokens"] > 0 and e["currency"] == "USD", e
 ' || { echo "the usage event is not as served"; nats_box stream get ZZORG 1 -j; exit 1; }
 echo "each served request is told to the organization ($told usage events on zzorg.app.voice.usage.recorded)"
+
+# grafted: the nodes' account on the broker, as registration hands it over.
+# laptop serves only because it connected with it (the broker takes no
+# unauthenticated client); a node enrolled for the probe registers and
+# reads the account from the answer, and the broker refuses it everything
+# outside its grants
+if [ "${E2E_BROKER:-}" = grafted ]; then
+  ptoken=$(post /admin/v1/nodes '{"id": "probe"}' | field enrollment_token)
+  curl -fsS -D "$work/reg.headers" -o "$work/reg.json" -X POST "$api/node/v1/register" -H "Authorization: Bearer $ptoken" -H 'content-type: application/json' \
+    -d "{\"protocol\": 2, \"version\": \"e2e\", \"capabilities\": {\"max_in_flight\": 1, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}, \"local\": {\"paused\": false, \"paused_seats\": []}}"
+  python3 - "$work/reg.json" <<'PY' || { echo "the registration did not hand over the nodes' account: $(cat "$work/reg.json")"; exit 1; }
+import json, sys
+n = json.load(open(sys.argv[1]))["nats"]
+assert n["subject"] == "heart.zz.node.probe" and n["user"] == "heart-zz-node" and n["password"] == "nodepw", n
+PY
+  grep -qi '^cache-control: no-store' "$work/reg.headers" || { echo "the registration's answer may be stored: $(cat "$work/reg.headers")"; exit 1; }
+  ! grep -q 'nodepw' "$work/api.log" || { echo "the api logged the nodes' password"; exit 1; }
+  # what the CLI said, its own failure apart (a refusal is one)
+  as_node() { docker run --rm --network host natsio/nats-box:latest nats -s "nats://heart-zz-node:nodepw@127.0.0.1:${NATS_PORT}" "$@" 2>&1 || true; }
+  grep -q 'Published' <<<"$(as_node pub heart.zz.reply.probe.event x)" || { echo "the nodes' account may not publish a reply"; exit 1; }
+  for refused in "pub heart.zz.node.laptop.assign x" "pub heart.zz.route x" "pub voice.node.laptop.assign x"; do
+    grep -q 'Permissions Violation' <<<"$(as_node $refused)" || { echo "the nodes' account was not refused: $refused"; exit 1; }
+  done
+  grep -q 'Permissions Violation' <<<"$(as_node sub 'heart.zz.reply.>' --count 1 --timeout 3s)" || { echo "the nodes' account may read others' replies"; exit 1; }
+  grep -q 'Authorization Violation' <<<"$(docker run --rm --network host natsio/nats-box:latest nats -s "nats://127.0.0.1:${NATS_PORT}" pub heart.zz.reply.x y 2>&1 || true)" || { echo "the broker took a client with no account"; exit 1; }
+  curl -fsS -X DELETE "$api/admin/v1/nodes/probe" >/dev/null
+  echo "grafted, a node is handed the nodes' account at registration, connects with it, and is refused outside its grants"
+fi
 
 # the nerves stall (they take connections and say nothing): no answer
 # waits on them; once they are back, the events queued meanwhile land

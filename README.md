@@ -67,7 +67,12 @@ moves under the prefix `HALE_DNA_BROKER_SUBJECTS` grants (`voice.node.*`
 becomes `heart.<id>.node.*`, and the same for `reply` and `route`), the
 request inboxes under `HALE_DNA_BROKER_INBOX` when it is handed over and
 under the prefix when not; standalone, the subjects are `voice.*` as
-always. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
+always. The nodes have their own account there
+(`HALE_DNA_BROKER_NODE_USER`, its password in the vault entry
+`HALE_DNA_BROKER_NODE_VAULT`), which a node is handed in its
+registration's answer over its enrollment-authenticated call: the api
+writes that answer itself on the node's connection, the password revealed
+into that write alone and the answer marked `no-store`. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
 `HALE_DNA_OIDC_ISSUER`, `HALE_DNA_OIDC_CLIENT` and
 `HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
 `--issuer`, `--client` and `--client-vault` when they are set, and the

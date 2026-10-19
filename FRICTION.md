@@ -181,13 +181,16 @@ KeyRows { }; count(ks.rows)`).
 string, rows by newline and columns by tab, with no escaping, so a column
 holding a tab or a newline (a JSON document, a name) cannot be split
 back. And a connection with `sslmode=prefer` to a server without TLS
-prints `[pq] tls: ... negotiated PLAINTEXT` on stdout, which fails a
+printed `[pq] tls: ... negotiated PLAINTEXT` on stdout, which failed a
 `hale test` (a passing test is silent).
 
 **Working shape:** every read is `SELECT row_to_json(t) FROM (...) t`, one
 JSON object a line, since JSON escapes every tab and newline
 (`store/pg_store.hl`, as DNA's ledger does); the DSN takes `?sslmode=`, and
-the tests and compose use `sslmode=disable` on the private network.
+the tests and compose use `sslmode=disable` on the private network. Since
+voice#28 the plaintext notice goes through `std::log` (logger `pq`, a
+change of voice's own in the vendored copy), so a test, which holds no
+sink, prints nothing.
 
 ## A text built or read a line at a time is quadratic in memory
 
@@ -304,4 +307,10 @@ each gap classed in `api/gaps.json`.
 **hale 0.25.1.** `to_string(Float)` keeps six significant digits: `99.999995` is written `100` and `33.333333333333336` is written `33.3333`, so `parse_float(to_string(x)) == x` fails for most values. `T::api_encode` writes a Float field the same way (`{"used_percent":100}` for 99.999995), so a Float that crosses the api codec comes back as a different number.
 
 **Working shape:** a quota window's `used_percent` is written by `float_text` (api/fleet.hl), which writes the fewest fraction digits that read back as the same Float. The codec's own encoding is hale's to fix.
+
+## The runtime writes to stderr outside any logger
+
+**hale 0.25.1.** When a client hangs up while the api writes its answer, the runtime prints `lotus_tcp_send_str: write: Broken pipe` (a `perror` in the C runtime) on stderr. It is a write by Hale's runtime, outside `std::log` and outside the program, so a program that routes every line through its logger still has this one, unstructured.
+
+**Working shape:** none in voice; the README's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 

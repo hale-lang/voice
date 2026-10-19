@@ -617,9 +617,12 @@ each program's `log.hl` logs under its logger (`voice.api`,
 `voice.brain`, `voice.node`; the vendored Postgres driver and migrator
 under `pq` and `migrate`), a message and its fields as logfmt (`k=v`), and
 its `main` holds the one sink, `std::log`'s StdoutSink: info on stdout,
-warnings and errors on stderr, `HALE_LOG` the threshold. No program prints
-outside it, and CI refuses a bare `println` or `eprintln` outside the
-tests.
+warnings and errors on stderr, `HALE_LOG` the threshold. Voice prints
+nothing outside it, and CI refuses a bare `print`, `println`, `eprint` or
+`eprintln` outside the tests directories. One line is not voice's: the
+Hale runtime's `perror` when a client hangs up while the api writes
+(`lotus_tcp_send_str: write: Broken pipe` on stderr), which FRICTION.md
+lists for hale.
 
 ```text
 [INFO voice.api] serving url=http://127.0.0.1:8080 canned=api/canned

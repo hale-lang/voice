@@ -26,7 +26,7 @@ const bundle = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const WAITS_ON = {
   optional: 'hale-lang/hale#1600: optional fields (a value or null)',
   enum: 'hale step 0: enums',
-  map: 'hale: a free-form JSON object (a seat\'s config, a change\'s before and after), and a map whose values are scalars (Health.checks): a hale map is bounded[S; N] indexed_by <field>, its values records',
+  map: 'hale: a free-form JSON object (a seat\'s config, a change\'s before and after)',
   wrapper: 'hale: a bounded field assigned whole (FRICTION.md); the list rides in a record',
   'json-text': 'hale: a free-form JSON value inside a typed object (an engine\'s config_schema), so the node\'s capabilities ride as JSON text',
   path: 'voice: a path or query parameter carried in the row\'s request',
@@ -108,6 +108,7 @@ const NOT_COMPARED = {
   ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
   'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
   NodeReport: ['the node\'s `Capabilities` (PUT /node/v1/capabilities), carried whole as JSON text and checked by the reader (api/fleet.hl): an engine\'s `config_schema` is free-form JSON, which the codec does not carry', ['json']],
+  Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, which the map\'s own comparison covers', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 

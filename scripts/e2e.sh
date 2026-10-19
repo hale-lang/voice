@@ -25,6 +25,7 @@ NODE2_PORT=${NODE2_PORT:-18092}
 SILENT_PORT=${SILENT_PORT:-14299}
 NATS_PORT=${NATS_PORT:-14222}
 ORG_PORT=${ORG_PORT:-14298}
+NERVES_PORT=${NERVES_PORT:-14297}
 work=$(mktemp -d)
 container=""
 org_container="voice-e2e-org-$$"
@@ -53,6 +54,10 @@ nats_box stream add ZZORG --subjects 'zzorg.>' --defaults >/dev/null
 mkdir -m 700 "$work/vault"
 printf 'apppw' >"$work/vault/nats-zzorg-app-voice"
 chmod 600 "$work/vault/nats-zzorg-app-voice"
+# the api reaches them through a proxy the e2e can stall
+python3 scripts/nerves-proxy.py "$NERVES_PORT" "$ORG_PORT" "$work/stall" &
+pids+=($!)
+for i in $(seq 1 50); do (exec 3<>"/dev/tcp/127.0.0.1/${NERVES_PORT}") 2>/dev/null && break; sleep 0.2; done
 
 api=http://127.0.0.1:${API_PORT}
 store=()
@@ -63,7 +68,7 @@ fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
-HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${ORG_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
+HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
   api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
@@ -95,6 +100,19 @@ echo "laptop/static is up"
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
 
+# the newest usage event on the organization's stream, as JSON
+last_event() {
+  local seq
+  seq=$(nats_box stream info ZZORG -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"]["last_seq"])')
+  nats_box stream get ZZORG "$seq" -j | python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["data"]).decode())'
+}
+# a usage event with this status lands within 10 s
+told_as() {
+  local i
+  for i in $(seq 1 50); do last_event | python3 -c 'import json,sys; e=json.load(sys.stdin); sys.exit(0 if e["status"] == sys.argv[1] else 1)' "$1" && return 0; sleep 0.2; done
+  echo "no usage event told the request as $1: $(last_event)"; return 1
+}
+
 # each request a seat served is told to the organization: a usage event on
 # zzorg.app.voice.usage.recorded, its id the request's, acknowledged by
 # the stream
@@ -113,6 +131,22 @@ assert e["requested_model"] == "echo-1" and e["seat"] == "laptop/static" and e["
 assert e["input_tokens"] > 0 and e["currency"] == "USD", e
 ' || { echo "the usage event is not as served"; nats_box stream get ZZORG 1 -j; exit 1; }
 echo "each served request is told to the organization ($told usage events on zzorg.app.voice.usage.recorded)"
+
+# the nerves stall (they take connections and say nothing): no answer
+# waits on them; once they are back, the events queued meanwhile land
+touch "$work/stall"
+sleep 0.3
+for i in 1 2 3; do
+  ms=$(curl -s -o /dev/null -w '%{time_total}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' | python3 -c 'import sys; print(int(float(sys.stdin.read()) * 1000))')
+  [ "$ms" -lt 1000 ] || { echo "an answer waited ${ms} ms on stalled nerves"; tail -5 "$work/api.log"; exit 1; }
+done
+rm -f "$work/stall"
+for i in $(seq 1 150); do
+  now=$(nats_box stream info ZZORG -j | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"]["messages"])')
+  [ "$now" -ge $((told + 3)) ] && break; sleep 0.2
+done
+[ "$now" -ge $((told + 3)) ] || { echo "the events queued while the nerves stalled did not land ($now on the stream, $((told + 3)) expected)"; tail -5 "$work/api.log"; exit 1; }
+echo "answers did not wait on stalled nerves, and the three events queued meanwhile landed after"
 
 # a body over 12 MiB is answered 413 in the contract's envelope, unread; one
 # just under it is served, through a NATS message well over the 1 MiB default
@@ -152,6 +186,10 @@ stopped_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 [ "$stopped_ms" -lt 2000 ] || { echo "the seat served on $stopped_ms ms after its caller left"; cat "$work/node.log"; exit 1; }
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 2 else 1)' "$health_ms" || { echo "/healthz waited $health_ms s behind a caller that left"; exit 1; }
 echo "a caller that left after 2 s of a 20 s stream: the seat stopped within $stopped_ms ms, /healthz answered in $health_ms s"
+# what its seat spent on the caller is told, as cancelled, its tokens unknown
+told_as cancelled
+last_event | python3 -c 'import json,sys; e=json.load(sys.stdin); assert e["seat"] == "laptop/static" and "output_tokens" not in e and e["price_micros"] == 0, e' || exit 1
+echo "the stream the caller left is told as cancelled"
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
@@ -367,3 +405,5 @@ kill -9 "$mini_pid"
 wait "$streaming" || true
 (cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/chat/completions "$work/killed-chat.sse" failed) || { head -c 400 "$work/killed-chat.sse"; exit 1; }
 echo "a node killed mid-stream ends both streams with the evidence"
+told_as failed
+echo "a stream whose seat failed after output is told as failed"

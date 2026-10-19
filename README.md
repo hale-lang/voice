@@ -482,17 +482,22 @@ consumer that wants usage as it happens reads the ledger by cursor.
 
 **The organization's events are not usage's second write either.** Run
 attached to an organization (Hale's DNA), the api tells it each request a
-seat served, streamed or not, as an event: `UsageRecorded`, a `UsageEvent`
-on `app.voice.usage.recorded` ([`api/events.hl`](./api/events.hl)), its
-`id` the request's. It goes out on the organization's own nerves, a
+seat served or began, streamed or not, as an event: a `UsageEvent` on
+`app.voice.usage.recorded` ([`api/events.hl`](./api/events.hl)), its `id`
+the request's, its `status` how it ended (`served`, `incomplete`,
+`cancelled` when the caller left, `failed` when the seat failed after
+output; a token count the seat did not report is left out). It goes out on the organization's own nerves, a
 JetStream stream, not voice's NATS: the attach hands the api its server,
 its user, the vault entry of that user's password and the organization's
 token (`HALE_DNA_NATS_URL_APP`, `HALE_DNA_NATS_USER_APP`,
-`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), and pond's
-`NatsPublisher` dials the server for each event, publishes it onto the
-organization's stream, waits for the stream to acknowledge it and hangs
-up. An event the stream does not take is logged, and the api keeps
-serving. The organization records each event once, as a reading
+`HALE_DNA_NATS_VAULT_APP`, `HALE_DNA_NATS_ORG`), and the events are told
+from the teller ([`api/teller.hl`](./api/teller.hl)), a pinned locus of
+its own: a request hands its event over and goes on, so no answer waits
+on the nerves. The teller queues at most 1024 events, keeps one
+connection, publishes each under its id and waits for the stream's
+acknowledgement, each step bounded at 2 s; a publish that does not land
+is tried again after a back-off (to 5 s), and when the queue is full the
+oldest event is dropped, counted and logged. The organization records each event once, as a reading
 under its id, and acts on nothing it says. Without `HALE_DNA_NATS_ORG`
 nothing is published and no connection is made.
 

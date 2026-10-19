@@ -9,9 +9,12 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   password from a `std::secret` vault entry, hale-lang/hale#989): the NATS
   client, the bus adapter and JetStream; the test fake is not taken. The
   api (`api/link.hl`, and the organization's events: `api/main.hl`) and
-  the node (`node/session.hl`) import it. One change of voice's own,
-  marked `voice:` in `adapter.hl`: `NatsPublisher` logs through `std::log`
-  rather than printing bare. A pond issue the brain works around
+  the node (`node/session.hl`) import it. Two changes of voice's own,
+  marked `voice:`: `NatsPublisher` (`adapter.hl`) logs through `std::log`
+  rather than printing bare, and `NatsClient.open_as` (`client.hl`) dials
+  with `std::io::tcp::connect_within`, bounded by the client's timeout,
+  rather than `connect`, which waits about two minutes on an address
+  that never answers. A pond issue the brain works around
   without changing it: `NatsClient.open` dials with `std::io::tcp::connect`,
   which waits about two minutes on an address that never answers; the
   brain's notifier probes the address with `std::io::tcp::connect_within`

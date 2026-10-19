@@ -114,7 +114,7 @@ locus Inference {
         // voice is attached to one (main.hl)
         pulse: Bool = false;
     }
-    bus { publish UsageRecorded; }
+    bus { publish UsageToTell; }
 
     /// `createResponse`.
     fn respond(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
@@ -156,6 +156,7 @@ locus Inference {
             why = c.seat.ref + ": " + reason;
             push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::failed, error: reason, wall_ms: ms }) or discard;
             if o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
+                if o.output { self.unfinished(r, request_id, k, m, c, "failed", started); }
                 fail ApiError { status: 502, kind: "model_error", code: ErrorCode::upstream_failed, message: "seat " + why, has_voice: true, voice: attempts_voice(request_id, attempts.items) };
             }
         }
@@ -221,8 +222,10 @@ locus Inference {
                     }
                     if msg.kind == "event" || msg.kind == "result" { deadline = std::time::monotonic() + (if o.output { self.idle } else { self.first }); }
                     if out.gone {
-                        // the caller went away: the seat is told to stop
+                        // the caller went away: the seat is told to stop,
+                        // and what it spent on the caller is told
                         self.link.finish();
+                        if st.output || o.output { self.unfinished(r, request_id, k, m, c, "cancelled", started); }
                         return out.end();
                     }
                 }
@@ -245,6 +248,7 @@ locus Inference {
             why = c.seat.ref + ": " + reason;
             push(attempts.items, Attempt { seat: c.seat.ref, account: c.seat.account, outcome: AttemptOutcome::failed, error: reason, wall_ms: ms }) or discard;
             if st.output || o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
+                if st.output || o.output { self.unfinished(r, request_id, k, m, c, "failed", started); }
                 if out.opened {
                     fail_stream(out, st, "upstream_failed", "seat " + why, failed_voice(request_id, k, m, c, attempts.items, (std::time::monotonic_ns() - started) / 1000000));
                     return out.end();
@@ -260,10 +264,17 @@ locus Inference {
         fail ApiError { status: 502, kind: "server_error", code: ErrorCode::upstream_failed, message: "every eligible seat failed; the last, " + why, has_voice: true, voice: attempts_voice(request_id, attempts.items) };
     }
 
+    /// A request that seat `c` began and did not finish: its usage told,
+    /// `status` saying how it ended (`cancelled`, `failed`).
+    fn unfinished(r: InferenceRequest, request_id: String, k: st::KeyRow, m: st::ModelRow, c: Candidate, status: String, started: Int) {
+        if self.pulse { UsageToTell <- unfinished_usage(r, request_id, k, m, c, status, (std::time::monotonic_ns() - started) / 1000000); }
+    }
+
     /// A request a seat served: its usage told to the organization, when
-    /// voice is attached to one.
+    /// voice is attached to one: handed to the teller (teller.hl), never
+    /// waited on.
     fn settled(r: InferenceRequest, s: Served) {
-        if self.pulse { UsageRecorded <- usage_event(r, s); }
+        if self.pulse { UsageToTell <- usage_event(r, s); }
     }
 
     /// Admit `r` for the caller `ctx` names: the seats it may be offered,

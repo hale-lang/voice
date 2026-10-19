@@ -314,11 +314,11 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** none in voice; the README's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 
-## A drain waits on a locus whose run() has returned
+## A program that reads `self.draining` waits out the whole drain grace, its HTTP server never ending on it
 
-**hale 0.25.1.** A pinned `NatsConn` (pond) given `run_for_ms: 1`, so its `run()` returns at once when there is nothing to connect to, holds a SIGTERM drain for its whole grace: "the drain begun by signal 15 did not finish within 5000 ms (a run() that never reads self.draining?); ... live loci that read draining: `NatsConn` x1". Its `run()` had returned long before, so it was not reading anything; the api took 5 s to stop instead of a few milliseconds.
+**hale 0.25.1.** The drain on SIGINT or SIGTERM is installed only in a program that reads `self.draining`. Once anything does (a pinned queue's `while !self.draining` loop, or pond's `NatsConn`), a signal waits for the main locus's `run()` to return, and the api's `run()` is `std::http::Server`, which does not end on the drain. So every stop waits out the grace: "the drain begun by signal 15 did not finish within 5000 ms ... live loci that read draining: `Teller` x1". The api took 5 s to stop instead of a few milliseconds.
 
-**Working shape:** the usage events go through pond's `NatsPublisher`, which holds no connection or thread between events, instead of a pinned `NatsConn` (api/main.hl).
+**Working shape:** nothing in the api reads `self.draining`. The teller's loop (api/teller.hl) runs until the process ends, so a signal ends it at once, as before, and events not yet told go with it.
 
 ## A binding's literal that reads the locus's params passes the check and fails the build
 

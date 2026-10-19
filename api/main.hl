@@ -29,18 +29,18 @@ main locus Api {
 }
 
 fn serve(host: String, port: Int, canned: String, nats: String, node_nats: String, ui: String, database: String, first_s: Int, idle_s: Int) {
-    println("voice api on http://", host, ":", port, "; canned bodies from ", canned);
-    println("voice api: nodes over NATS at ", nats, if len(node_nats) > 0 { " (" + node_nats + " from the nodes' side)" } else { "" });
-    if len(ui) > 0 { println("voice api: serving the admin ui from ", ui); }
+    log_info("serving", fields2(std::log::kv("url", "http://" + host + ":" + to_string(port)), std::log::kv("canned", canned)));
+    log_info("nodes over NATS", fields2(std::log::kv("nats", nats), std::log::kv("node_nats", if len(node_nats) > 0 { node_nats } else { nats })));
+    if len(ui) > 0 { log_info("serving the admin ui", std::log::kv("ui", ui)); }
     if len(database) > 0 {
         let d = st::parse_dsn(database);
-        println("voice api: the store is Postgres at ", d.host, ":", d.port);
+        log_info("the store is Postgres", std::log::kv("at", d.host + ":" + to_string(d.port)));
         let endpoints = Endpoints { canned: canned, ui: ui, store: st::PgStore { url: database }, link: NatsLink { url: nats, node_url: node_nats } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
         std::http::Server { host: host, port: port, handler: endpoints, max_request_bytes: MAX_REQUEST_BYTES, too_large: too_large() };
     } else {
-        println("voice api: the store is in memory (lost on restart)");
+        log_info("the store is in memory, lost on restart", "");
         let endpoints = Endpoints { canned: canned, ui: ui, link: NatsLink { url: nats, node_url: node_nats } };
         endpoints.inference.first = first_s * 1s;
         endpoints.inference.idle = idle_s * 1s;
@@ -71,14 +71,14 @@ const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_dr
 @bounded_by(MIGRATIONS)
 fn migrate(database: String, dir: String) -> Int {
     if len(database) == 0 {
-        eprintln("voice migrate: --database (or VOICE_DATABASE_URL) is required");
+        log_error("migrate: --database (or VOICE_DATABASE_URL) is required", "");
         return 2;
     }
     let d = st::parse_dsn(database);
     let conn = pq::PgConn { host: d.host, port: d.port, user: d.user, password: d.password, database: d.database, sslmode: d.sslmode };
     let st = conn.open();
     if !st.ok {
-        eprintln("voice migrate: Postgres at ", d.host, ":", d.port, ": ", st.err.kind, " ", st::redact(st.err.detail, d));
+        log_error("migrate: Postgres refused", fields2(std::log::kv("at", d.host + ":" + to_string(d.port)), fields2(std::log::kv("kind", st.err.kind), std::log::kv("detail", st::redact(st.err.detail, d)))));
         return 1;
     }
     // pond's migrator creates its tracking table before it takes its own
@@ -86,7 +86,7 @@ fn migrate(database: String, dir: String) -> Int {
     // a lock of voice's first (lib/pond/README.md)
     let held = conn.query_one("SELECT pg_advisory_lock(7205)");
     if !held.ok {
-        eprintln("voice migrate: could not take the migration lock: ", held.err.kind, " ", st::redact(held.err.detail, d));
+        log_error("migrate: could not take the migration lock", fields2(std::log::kv("kind", held.err.kind), std::log::kv("detail", st::redact(held.err.detail, d))));
         conn.close();
         return 1;
     }
@@ -102,7 +102,7 @@ fn migrate(database: String, dir: String) -> Int {
         let file = dir + "/" + tail[(s2 + 1)..len(tail)];
         let sql = std::io::fs::read_file(file) or "";
         if len(sql) == 0 {
-            eprintln("voice migrate: no migration at ", file);
+            log_error("migrate: no migration", std::log::kv("file", file));
             return 1;
         }
         set.add(std::str::parse_int(line[0..s1]) or 0, tail[0..s2], sql);
@@ -113,12 +113,12 @@ fn migrate(database: String, dir: String) -> Int {
     conn.query_one("SELECT pg_advisory_unlock(7205)");
     conn.close();
     if applied < 0 { return 1; }
-    println("voice migrate: ", applied, " applied; the schema is at version ", set.count());
+    log_info("migrate: the schema is current", fields2(std::log::kv("applied", to_string(applied)), std::log::kv("version", to_string(set.count()))));
     return 0;
 }
 
 fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
-    eprintln("voice migrate: ", e.kind, " at version ", e.version, " (", e.name, "): ", st::redact(e.detail, d));
+    log_error("migrate: a migration failed", fields2(fields2(std::log::kv("kind", e.kind), std::log::kv("version", to_string(e.version))), fields2(std::log::kv("name", e.name), std::log::kv("detail", st::redact(e.detail, d)))));
     return -1;
 }
 
@@ -134,6 +134,8 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 /// `--seat-idle-s` how long it may then send nothing (30 s), before it has
 /// failed.
 fn main() {
+    // the one sink: every logger's lines are written here (log.hl)
+    let sink = std::log::StdoutSink { };
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") { std::env::var("VOICE_DATABASE_URL") } else { "" };
     let mut migrations = beside_binary("migrations");
@@ -154,7 +156,7 @@ fn main() {
         } else if flag == "--port" {
             port = std::str::parse_int(value) or - 1;
             if port < 1 || port > 65535 {
-                eprintln("voice api: --port takes a port number, not ", value);
+                log_error("--port takes a port number", std::log::kv("value", value));
                 std::process::exit(2);
             }
         } else if flag == "--canned" {
@@ -172,13 +174,13 @@ fn main() {
         } else if flag == "--seat-first-s" {
             first_s = std::str::parse_int(value) or - 1;
             if first_s < 1 {
-                eprintln("voice api: --seat-first-s takes a number of seconds, not ", value);
+                log_error("--seat-first-s takes a number of seconds", std::log::kv("value", value));
                 std::process::exit(2);
             }
         } else if flag == "--seat-idle-s" {
             idle_s = std::str::parse_int(value) or - 1;
             if idle_s < 1 {
-                eprintln("voice api: --seat-idle-s takes a number of seconds, not ", value);
+                log_error("--seat-idle-s takes a number of seconds", std::log::kv("value", value));
                 std::process::exit(2);
             }
         }
@@ -187,7 +189,7 @@ fn main() {
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         if len(d.problem) > 0 {
-            eprintln("voice api: ", d.problem);
+            log_error(d.problem, "");
             std::process::exit(2);
         }
     }

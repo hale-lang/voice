@@ -595,6 +595,22 @@ that dies with its api instance is recorded as abandoned by the brain.
 | The brain | Serving continues on the last route table, which goes stale until a brain works again; a standby takes over within about 11 s. |
 | Postgres | Nothing is served and nothing is configured until it is back. |
 
+## Logs
+
+Every line the api, the brain and the node write goes through `std::log`:
+each program's `log.hl` logs under its logger (`voice.api`,
+`voice.brain`, `voice.node`; the vendored Postgres driver and migrator
+under `pq` and `migrate`), a message and its fields as logfmt (`k=v`), and
+its `main` holds the one sink, `std::log`'s StdoutSink: info on stdout,
+warnings and errors on stderr, `HALE_LOG` the threshold. No program prints
+outside it, and CI refuses a bare `println` or `eprintln` outside the
+tests.
+
+```text
+[INFO voice.api] serving url=http://127.0.0.1:8080 canned=api/canned
+[WARN voice.api] NATS unreachable nats=nats://127.0.0.1:4222 error=...
+```
+
 ## In Hale
 
 Voice is three Hale programs, the api, the brain and the node, from the MVP

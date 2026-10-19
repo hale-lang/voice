@@ -31,7 +31,7 @@ type Problems { items: bounded[String; 8]; }
 type SeatRef { node: String; seat: String; }
 
 /// `Seat`, as created on the node the path names. `config` is the engine's
-/// JSON object, as text: the codec carries no free-form object.
+/// JSON object, free-form: its `config_schema` says it.
 type SeatCreate {
     node: String;
     id: String;
@@ -42,7 +42,7 @@ type SeatCreate {
     data_classes: bounded[String; 32];
     concurrency: Int = 1;
     enabled: Bool = true;
-    config: String = "{}";
+    config: std::json::Value = std::json::Value::null();
 }
 
 /// `SeatUpdate`, for the seat the path names.
@@ -62,7 +62,7 @@ type SeatUpdate {
     has_enabled: Bool = false;
     enabled: Bool = true;
     has_config: Bool = false;
-    config: String = "{}";
+    config: std::json::Value = std::json::Value::null();
 }
 
 /// `SeatView`.
@@ -76,7 +76,7 @@ type SeatView {
     data_classes: bounded[String; 32];
     concurrency: Int = 1;
     enabled: Bool = true;
-    config: String = "{}";
+    config: std::json::Value = std::json::Value::null();
     status: SeatStatus;
     // the node's reason
     has_reason: Bool = false;
@@ -101,7 +101,7 @@ type Node {
     has_version: Bool = false;
     version: String = "";
     has_capabilities: Bool = false;
-    capabilities: String = "";
+    capabilities: NodeCapabilities = NodeCapabilities { max_in_flight: 0 };
     has_local: Bool = false;
     local: LocalControls = LocalControls { paused: false };
     has_max_in_flight: Bool = false;
@@ -268,7 +268,7 @@ locus Nodes {
             has_version: len(f.version) > 0,
             version: f.version,
             has_capabilities: len(f.capabilities) > 0,
-            capabilities: f.capabilities,
+            capabilities: NodeCapabilities::api_decode(f.capabilities) or no_capabilities(),
             has_local: len(f.local) > 0,
             local: local_of(f.local),
             has_max_in_flight: r.max_in_flight >= 0,
@@ -342,7 +342,7 @@ locus Seats {
             account: c.account,
             concurrency: c.concurrency,
             enabled: c.enabled,
-            config: c.config
+            config: c.config.text
         };
         row.serves.items = c.serves;
         row.data_classes.items = c.data_classes;
@@ -391,7 +391,7 @@ locus Seats {
         if u.has_data_classes { row.data_classes.items = u.data_classes; }
         if u.has_concurrency { row.concurrency = u.concurrency; }
         if u.has_enabled { row.enabled = u.enabled; }
-        if u.has_config { row.config = u.config; }
+        if u.has_config { row.config = u.config.text; }
         self.check(row) or raise;
         let after = seat_view(self.store, row, n) or raise;
         self.store.update_seat(row, change("update", seat_target(row), seat_json(before), seat_json(after))) or fail store_failed(err);
@@ -457,7 +457,7 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatView falli
         account: s.account,
         concurrency: s.concurrency,
         enabled: s.enabled,
-        config: s.config
+        config: json_value(s.config)
     };
     v.serves = s.serves.items;
     v.data_classes = s.data_classes.items;
@@ -548,11 +548,11 @@ fn serves_field(body: String) -> st::SeatModels fallible(ApiError) {
 }
 
 /// `config`: a JSON object, kept as written; `{}` when absent.
-fn config_field(body: String) -> String fallible(ApiError) {
+fn config_field(body: String) -> std::json::Value fallible(ApiError) {
     let kind = kind_of(body, "config");
-    if kind == "missing" { return "{}"; }
+    if kind == "missing" { return json_value("{}"); }
     if kind != "object" { fail invalid("`config` is an object", "config"); }
-    return std::str::trim(std::json::find_field_raw(body, "config"));
+    return std::json::Value::parse(std::str::trim(std::json::find_field_raw(body, "config"))) or fail invalid("`config` is an object of at most 64 KiB and 64 levels", "config");
 }
 
 fn bool_or(body: String, name: String, otherwise: Bool) -> Bool fallible(ApiError) {
@@ -634,7 +634,7 @@ fn seat_json(s: SeatView) -> String {
     let problems = problems_list.text();
     return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": " + jq(s.account) + ", \"serves\": " + st::serves_json(s.serves)
         + ", \"data_classes\": " + st::jnames(s.data_classes) + ", \"concurrency\": " + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
-        + ", \"config\": " + s.config + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(seat_status_name(s.status))
+        + ", \"config\": " + s.config.text + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node) + ", \"status\": " + jq(seat_status_name(s.status))
         + ", \"reason\": " + jstring_or_null(s.has_reason, s.reason) + ", \"in_flight\": " + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
 }
 
@@ -655,7 +655,7 @@ fn node_json(n: Node) -> String {
     }
     let seats = seats_list.text();
     let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": " + jq(node_state_name(n.status))
-        + ", \"version\": " + jstring_or_null(n.has_version, n.version) + ", \"capabilities\": " + jraw_if(n.has_capabilities, n.capabilities)
+        + ", \"version\": " + jstring_or_null(n.has_version, n.version) + ", \"capabilities\": " + jraw_if(n.has_capabilities, NodeCapabilities::api_encode(n.capabilities))
         + ", \"local\": " + jraw_if(n.has_local, local_json(n.local)) + ", \"max_in_flight\": " + jcount_or_null(n.has_max_in_flight, n.max_in_flight)
         + ", \"effective_max_in_flight\": " + jcount_or_null(n.has_effective_max_in_flight, n.effective_max_in_flight) + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": " + to_string(n.assignment_version)
         + ", \"applied_version\": " + jcount_or_null(n.has_applied_version, n.applied_version) + ", \"seats\": [" + seats + "], \"connected_at\": " + jtime_or_null(n.has_connected_at, n.connected_at)

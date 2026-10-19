@@ -229,8 +229,8 @@ refuse:
 
 | Kind | Closed by |
 |---|---|
-| `map` | hale: a free-form JSON object (a seat's `config`, a change's `before` and `after`) |
-| `json-text` | hale: a free-form JSON value inside a typed object (an engine's `config_schema`), so a node's `capabilities` ride as JSON text |
+| `map` | voice: a free-form JSON object the row carries as text, where `std::json::Value` carries it; none today |
+| `json-text` | voice: a typed object the row carries as free-form JSON (`std::json::Value`); none today |
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |
 | `wire` | voice: the REST wire's shape differs from the row (`api/wire.hl` writes it) |

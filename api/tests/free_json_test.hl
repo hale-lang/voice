@@ -1,0 +1,36 @@
+// Free-form JSON (std::json::Value): a seat's config, a change's before and
+// after, and an engine's config_schema cross byte for byte, key order,
+// spacing and a number's spelling kept.
+import ".." as api;
+
+fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
+    return e.handle(std::http::Request { method: method, path: path, headers: "Content-Type: application/json", body: body });
+}
+
+const CONFIG: String = "{\"text\":  \"hi\", \"z\": 1, \"a\": [1, 2.50, {\"deep\": null}]}";
+const SCHEMA: String = "{\"type\": \"object\",   \"required\": [\"text\"], \"properties\": {\"text\": {\"type\": \"string\"}}}";
+
+fn main() {
+    let e = api::Endpoints { };
+    call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
+    call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
+    call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}");
+    let seat = call(e, "POST", "/admin/v1/nodes/laptop/seats", "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": " + CONFIG + "}");
+    std::test::assert_eq_int(seat.status, 201, "a seat: " + seat.body);
+    std::test::assert(std::str::contains(seat.body, "\"config\": " + CONFIG), "its config, byte for byte: " + seat.body);
+    let got = call(e, "GET", "/admin/v1/nodes/laptop/seats/static", "");
+    std::test::assert(std::str::contains(got.body, "\"config\": " + CONFIG), "and read back so: " + got.body);
+    let changes = call(e, "GET", "/admin/v1/changes?target=nodes/laptop/seats/static", "");
+    std::test::assert(std::str::contains(changes.body, CONFIG), "the change's after holds it as written: " + changes.body);
+    std::test::assert(std::str::contains(changes.body, "\"before\": null"), "and a create's before is null");
+    std::test::assert_eq_int(call(e, "PATCH", "/admin/v1/nodes/laptop/seats/static", "{\"config\": [1, 2]}").status, 400, "a config is an object");
+
+    // an engine's config_schema, through the codec of the node's capabilities
+    let caps = api::NodeCapabilities::api_decode("{\"max_in_flight\": 2, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": " + SCHEMA + "}]}") or api::no_capabilities();
+    std::test::assert(caps.max_in_flight == 2 && count(caps.engines) == 1, "the capabilities read");
+    let engine = at(caps.engines, 0) or api::NodeEngine { id: "", kind: "", config_schema: std::json::Value::null() };
+    std::test::assert_eq_str(engine.config_schema.text, SCHEMA, "the config_schema, as written");
+    std::test::assert(std::str::contains(api::NodeCapabilities::api_encode(caps), "\"config_schema\":" + SCHEMA) || std::str::contains(api::NodeCapabilities::api_encode(caps), "\"config_schema\": " + SCHEMA), "and written back as it was: " + api::NodeCapabilities::api_encode(caps));
+    let refused = api::NodeCapabilities::api_decode("{\"max_in_flight\": 2, \"engines\": [{\"id\": \"s\", \"kind\": \"static\", \"config_schema\": {\"a\": }}]}") or api::NodeCapabilities { max_in_flight: -7 };
+    std::test::assert_eq_int(refused.max_in_flight, -7, "a config_schema that is not JSON is refused");
+}

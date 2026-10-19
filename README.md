@@ -240,9 +240,17 @@ seat fail every request after that long, for drills.
 
 ```sh
 hale build node
-node/node --id laptop --api http://127.0.0.1:8080 --token vn-... --data node-data --capabilities deploy/node/capabilities.json --port 8081
+node/node --id laptop --api http://127.0.0.1:8080 --token-vault node-laptop-enrollment --data node-data --capabilities deploy/node/capabilities.json --port 8081
 hale test node
 ```
+
+The enrollment token comes from the vault entry `--token-vault` (or
+`VOICE_ENROLLMENT_TOKEN_VAULT`) names, read through `std::secret` and
+revealed only into the request it authorizes, which is how a grafted node
+is handed it. `--token vn-...` and `VOICE_ENROLLMENT_TOKEN` still work
+standalone, and the node warns that the token is in the open. A database
+URL with its password in it warns the same way; `?vault=ENTRY` in its
+place names the password's vault entry.
 
 [`scripts/e2e.sh`](./scripts/e2e.sh) runs the whole path on one machine:
 NATS (in a container of its own, or the one `NATS_URL` names), the api and

@@ -339,7 +339,11 @@ fi
 # it, so either store offers laptop's seat first)
 token2=$(post /admin/v1/nodes '{"id": "mini"}' | field enrollment_token)
 post /admin/v1/nodes/mini/seats '{"id": "steady", "engine": "static", "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "from the mini"}}' >/dev/null
-node/node --id mini --api "$api" --token "$token2" --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
+# mini's token is in the vault, as a grafted node's is (laptop's is in the
+# open, on the command line, as a standalone node may still give it)
+printf '%s' "$token2" >"$work/vault/node-mini-enrollment"
+chmod 600 "$work/vault/node-mini-enrollment"
+HALE_VAULT_DIR="$work/vault" node/node --id mini --api "$api" --token-vault node-mini-enrollment --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
 mini_pid=$!
 pids+=($mini_pid)
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
@@ -358,6 +362,9 @@ assert r["voice"]["served"]["seat"] == "mini/steady", r["voice"]["served"]
 assert a[0]["seat"] == "laptop/static" and a[0]["outcome"] == "failed", a
 ' || { echo "failover after a slow failure did not serve: $out"; cat "$work/node2.log"; exit 1; }
 [ "$ms" -lt 15000 ] || { echo "failover took $ms ms, more than the failure (8 s), the ack wait (5 s) and the second seat's own time"; exit 1; }
+grep -q 'the enrollment token is in the open' "$work/node.log" || { echo "a node given its token on the command line did not warn that it is in the open"; exit 1; }
+! grep -q 'in the open' "$work/node2.log" || { echo "a node with its token in the vault warned"; exit 1; }
+echo "a node enrolled with its token from the vault; one given it in the open warned"
 echo "failed over from laptop/static to mini/steady in $ms ms"
 
 # every seat fails: a 502 that names the request and every attempt

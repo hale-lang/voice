@@ -39,7 +39,7 @@ written in markdown, in two forms, so ingest never guesses.
 | `seed` | A Hale seed or package: a unit of code with its own gate. | A directory with `hale.toml` or a package manifest, the outermost one (a workspace's members are its own) |
 | `contract` | A specification two or more processes meet at. | `spec/*.yaml`, `spec/*.md`, `spec/vendor/*` |
 | `noun` | A schema inside a contract: a thing the system knows. | `components/schemas`, the store's tables |
-| `deployment` | An instance of the process model, running or named. | `compose.yaml` (built); the README's `Deployment` table |
+| `deployment` | An instance of the process model, running or named. | `compose.yaml` (built); `docs/internals.md`'s `Deployment` table |
 | `practice` | A rule about how work is done, as advice until ratified as law. | List items marked `derived`, `practice` or `law` |
 | `gate` | A check that must pass. | Jobs in `.github/workflows/ci.yml` |
 | `document` | Prose that explains or decides. | Every `.md` |
@@ -52,11 +52,11 @@ written in markdown, in two forms, so ingest never guesses.
 | Edge | Reads as | Where it comes from |
 |---|---|---|
 | `unfold(Σ, [children])` | This node is made of these. | `purpose` to every axiom; a process to the seed of the same name |
-| `meets(contract; servers; consumers; carriers)` | These processes meet at this contract; the server implements it, the consumers depend on it, the carrier transports it. | The README's contract table |
+| `meets(contract; servers; consumers; carriers)` | These processes meet at this contract; the server implements it, the consumers depend on it, the carrier transports it. | `docs/internals.md`'s contract table |
 | `names(contract, [nouns])` | This contract defines these nouns. | Its schemas, its tables |
 | `refers(noun, noun, via)` | A `$ref` or foreign key. | The same |
 | `constrains(axiom, [nodes])` | This decision shaped these. | The files an `axiom` item links to |
-| `runs(deployment, [processes])` | This deployment runs these. | `compose.yaml`; the README's deployment table |
+| `runs(deployment, [processes])` | This deployment runs these. | `compose.yaml`; `docs/internals.md`'s deployment table |
 | `gates(gate, [nodes])` | This check guards these. | The seeds, contracts and `compose` a job's steps name |
 | `binds(practice, [nodes])` | This rule applies to these. | A ratified practice's bindings |
 | `witnesses(witness, [nodes])` | This evidence is about these. | The paths an entry names |
@@ -129,7 +129,7 @@ keep a `FRICTION.md`.
 **gate**: `ci/api`, `ci/brain`, `ci/node`, `ci/e2e`, `ci/ui`,
 `ci/contracts`, `ci/store`, `ci/image`.
 
-**document**: `README.md`, `DIRECTION.md`, `FRICTION.md`, `GRAPH.md`,
+**document**: `README.md`, `docs/internals.md`, `DIRECTION.md`, `FRICTION.md`, `GRAPH.md`,
 `ui/README.md`, `ui/DESIGN.md`, `spec/store.md`.
 
 **witness**: the three `FRICTION.md` entries (a `Router.add` handler
@@ -144,7 +144,7 @@ first links, hale-lang/hale#1048.
 - *(holes: the positions under every process and deployment, and the
   board under `purpose`; below.)*
 
-`meets` (the contract as the meeting point; the README's contract table, in
+`meets` (the contract as the meeting point; `docs/internals.md`'s contract table, in
 its order):
 - `openapi.yaml`, over HTTP: served by `api`; consumed by callers, `ui`,
   `node` (its node plane).

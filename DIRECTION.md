@@ -121,7 +121,7 @@ Requests move between the pieces as Hale bus topics, keyed by node and by
 request, bound to NATS from the MVP on: an api instance publishes `serve` on
 the node's subject, and the node streams the answer to the reply subject
 that request named. No instance holds a node's connection, so nothing is
-forwarded. The [README](./README.md) documents the architecture.
+forwarded. [`docs/internals.md`](./docs/internals.md) documents the architecture.
 
 - `axiom` **The MVP runs the real process model.** The api and the brain are
   separate processes from the start (one api, one [brain](./brain/)), so the

@@ -441,7 +441,7 @@ already exercised by the one. See [In Hale](#in-hale).
   never holds the credential.
 - **Node:** one machine running voice's node software. Created on the
   coordinator, which issues its enrollment token.
-- **Engine:** what a node offers: a kind (`static`, `claude-cli`, ...) with
+- **Engine:** what a node offers: a kind (`static`, `openai-compatible`, `claude-cli`, ...) with
   the login it runs under. Listed by the node's operator in a capabilities
   file on the machine, with the node's hard limits, because only the
   machine holds the login. Two logins for one CLI are two engines.
@@ -781,7 +781,15 @@ already there.
   assignment that comes back, and every `assign` after, is reconciled
   against it, and seat states are posted back.
 - Each seat is a locus running its engine: the static engine answers in
-  process, and CLI engines run their CLI as a supervised child process.
+  process; the openai-compatible engine (node/compat.hl) posts the request's
+  messages to `<base_url>/chat/completions` with `stream: true` and plays
+  the upstream's chunks as the standard's events, reporting the upstream's
+  final usage and the cost at the seat's price (0 for a local server); its
+  key is read from a vault slot into the request and goes nowhere else. The
+  stdlib client reads a response whole, so the stream is read to its end
+  before its events are published; an unreachable or refusing upstream, an
+  error status or an empty stream fails the seat with nothing published, and
+  the coordinator fails the request over. CLI engines run their CLI as a supervised child process.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls.
 

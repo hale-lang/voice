@@ -20,7 +20,7 @@ base=https://github.com/hale-lang/hale/releases/download/$v
 mkdir -p ~/.hale/bin && cd "$(mktemp -d)"
 curl -fsSLO $base/$name && curl -fsSLO $base/$name.sha256
 shasum -a 256 -c $name.sha256          # must say OK
-tar xzf $name -C ~/.hale/bin
+tar xzf $name -C ~/.hale/bin           # hale and the *.dylib files beside it: hale loads them from its own directory
 export PATH="$HOME/.hale/bin:$PATH"    # and in ~/.zshrc
 hale --version
 ```

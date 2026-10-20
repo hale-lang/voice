@@ -46,6 +46,7 @@ COPY store store
 COPY api api
 COPY brain brain
 COPY node node
+COPY deploy/node deploy/node
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build api && hale build brain && hale build node
 

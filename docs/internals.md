@@ -794,7 +794,39 @@ already there.
   it is relayed after it ends until hale's client streams. An unreachable
   or refusing upstream, an error status or an empty stream fails the seat
   before any event is published, and the coordinator fails the request over.
-  CLI engines run their CLI as a supervised child process.
+  The claude-cli engine (node/claude.hl) runs `claude -p --output-format
+  stream-json --verbose --include-partial-messages` as a child process, the
+  prompt on its stdin and no tools allowed, and plays its `text_delta`
+  events as the standard's events as they arrive (a finished message stands
+  in when no partial events come); the result line's `usage` is the run's
+  usage and its cost is 0, the seat being flat-rate. A missing binary (exit
+  127), a nonzero exit or an error result before output, 300 s of silence or
+  no output fails the seat, and cancelling the request kills the child.
+  Other CLI engines follow that shape.
+
+  **One node, several logins (hale-lang/voice#2).** Two accounts on one CLI
+  are two seats of one `claude-cli` engine (or two engines), each naming its
+  own vault entry. The login is the long-lived OAuth token `claude
+  setup-token` prints, one per account, and nothing else about the account
+  is shared: there is no config directory per login to point at, because
+  with a token in the environment the CLI needs none, and the child runs
+  from the seat's own fresh private directory (the one holding the token file, removed when the run ends; never a shared one) with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+  `CLAUDE_CONFIG_DIR` removed from its environment, so nothing ambient can
+  outrank the seat's login. The token is never revealed into a value (hale's
+  `@sealed` rule): the sealed credential writes it to a 0600 file in a fresh
+  private directory, a shell reads it into `CLAUDE_CODE_OAUTH_TOKEN` and
+  removes the file, and the CLI is exec'd from there; the argv names the
+  file, never the token. The directory is removed when the run ends. The
+  node's operator provisions each token in the vault out of band; voice
+  holds none.
+
+  **The prompt is a caller's, so the CLI is locked down.** It starts with
+  `--tools ""` (no built-in tool), `--permission-mode dontAsk`,
+  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP server) and
+  `--setting-sources ""` (the CLI accepts an empty list, so none of the
+  operator's user, project or local settings, hooks or CLAUDE.md load). The
+  empty values are written in the wrapper shell, since the newline-separated
+  argv cannot carry an empty element.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls.
 

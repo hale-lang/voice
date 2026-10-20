@@ -810,7 +810,7 @@ already there.
   setup-token` prints, one per account, and nothing else about the account
   is shared: there is no config directory per login to point at, because
   with a token in the environment the CLI needs none, and the child runs
-  from `/tmp` with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
+  from the seat's own fresh private directory (the one holding the token file, removed when the run ends; never a shared one) with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
   `CLAUDE_CONFIG_DIR` removed from its environment, so nothing ambient can
   outrank the seat's login. The token is never revealed into a value (hale's
   `@sealed` rule): the sealed credential writes it to a 0600 file in a fresh
@@ -819,6 +819,14 @@ already there.
   file, never the token. The directory is removed when the run ends. The
   node's operator provisions each token in the vault out of band; voice
   holds none.
+
+  **The prompt is a caller's, so the CLI is locked down.** It starts with
+  `--tools ""` (no built-in tool), `--permission-mode dontAsk`,
+  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP server) and
+  `--setting-sources ""` (the CLI accepts an empty list, so none of the
+  operator's user, project or local settings, hooks or CLAUDE.md load). The
+  empty values are written in the wrapper shell, since the newline-separated
+  argv cannot carry an empty element.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls.
 

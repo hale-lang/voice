@@ -105,5 +105,7 @@ event stream still answer a canned body.
 
 - [`docs/internals.md`](./docs/internals.md): how each piece works, the
   request path, state, security, failure and deployment.
+- [`docs/node-on-a-mac.md`](./docs/node-on-a-mac.md): one Mac serving
+  models (Ollama, the claude CLI) to a habitat, under launchd.
 - [`DIRECTION.md`](./DIRECTION.md): where voice is going.
 - [`FRICTION.md`](./FRICTION.md): what writing voice in Hale has run into.

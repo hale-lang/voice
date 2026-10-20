@@ -97,6 +97,43 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/healthz >/dev/null 2>&1 && break; sleep 0.2; done
           cd spec/validate && npm ci && npm run node-live -- http://127.0.0.1:8081
 
+  # The proof the node builds and runs on macOS (docs/node-on-a-mac.md): the
+  # released aarch64-apple-darwin toolchain, no Postgres, no NATS, no compose.
+  node-macos:
+    name: node (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/hale
+      - name: Build
+        run: hale build node
+      - name: Test (engine, compat, claude, capabilities, assignment)
+        # engine_memory_test reads /proc/self/status, which macOS has not:
+        # it is the one test left to the Linux job
+        run: |
+          for f in node/tests/*_test.hl; do
+            case "$f" in
+              */engine_memory_test.hl) echo "skip $f: reads /proc (Linux only)"; continue ;;
+            esac
+            hale test "$f" || exit 1
+          done
+      - name: The built node runs
+        run: |
+          # no --id: the node names its usage and exits 2
+          set +e
+          node/node 2>build-node-usage.txt
+          code=$?
+          cat build-node-usage.txt
+          [ "$code" = 2 ] && grep -q 'usage: node --id' build-node-usage.txt
+      - name: The built node starts with the Mac example and answers its local API
+        run: |
+          mkdir -p build
+          node/node --id ci-mac --data build/node-data --capabilities deploy/node/capabilities.mac.json --port 8081 &
+          pid=$!
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/node/v1/capabilities >/tmp/caps.json 2>/dev/null && break; sleep 0.2; done
+          kill $pid
+          grep -q claude-cli /tmp/caps.json && grep -q openai-compatible /tmp/caps.json
+
   e2e:
     name: end to end
     runs-on: ubuntu-24.04

@@ -794,6 +794,24 @@ already there.
   it is relayed after it ends until hale's client streams. An unreachable
   or refusing upstream, an error status or an empty stream fails the seat
   before any event is published, and the coordinator fails the request over.
+  Tools go through it: a request's `tools`, `tool_choice` and
+  `parallel_tool_calls` go upstream as the chat wire names them (the
+  schemas byte for byte), a `function_call` item as an assistant message's
+  `tool_calls` (a run of them is one message) and a `function_call_output`
+  as a `tool` message. The upstream's streamed `delta.tool_calls` become a
+  `function_call` item: `response.output_item.added` when a call's index
+  first appears (its id and name), `response.function_call_arguments.delta`
+  for each argument fragment as it arrives (a server that sends the
+  arguments as an object whole is relayed the same), and the `.done` pair
+  when the next call or the stream ends; on the https whole-read path the
+  same events are played after the stream ends. Calls arrive in index
+  order; one that interleaves fails the seat. The api renders them as
+  `tool_calls` deltas with `finish_reason: "tool_calls"`, or as the
+  Responses API's `function_call` items. Which seats carry tools is derived,
+  not declared: an openai-compatible seat does, a static seat only as its
+  `tool_call` drill, and a claude-cli seat never. A node refuses a `serve`
+  carrying `tools` for a seat that does not before any event (`refused`,
+  which is a seat failure), so the coordinator offers it to the next seat.
   The claude-cli engine (node/claude.hl) runs `claude -p --output-format
   stream-json --verbose --include-partial-messages` as a child process, the
   prompt on its stdin and no tools allowed, and plays its `text_delta`

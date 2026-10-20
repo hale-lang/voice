@@ -337,3 +337,9 @@ each gap classed in `api/gaps.json`.
 **hale 0.25.1, and main at ec6fc8f.** A `std::log::Logger` line written on a pinned locus's thread reaches `StdoutSink` only when the main thread next drains its bus queue, and a main thread serving `std::http::Server` drains it between requests. With no request coming in, the teller's and the limits reader's warnings (a head that stopped answering) are not written at all until one does. A probe (a pinned locus logging once a second beside a Server) wrote nothing for five seconds, then all five lines on the first request.
 
 **Working shape:** none in the api. The DNA fixture (api/tests/admin_limits.sh) asks the api's `/healthz` while it waits for a reader's line.
+
+## `std::http`'s client reads a response whole, so an https upstream is relayed after it ends
+
+**hale 0.27.0.** `std::http::request` returns a `ClientResponse` with the body read to its end. The openai-compatible engine (node/compat.hl) asks a chat-completions upstream for a stream, but over https the whole stream is read first and its events are published afterward: the caller sees no first token until the model has finished, and a tool call's argument fragments arrive all at once. Filed as [hale-lang/hale#1698](https://github.com/hale-lang/hale/issues/1698), modelled on the server side's chunked/SSE writer (#1596): a client that hands back the body as it arrives.
+
+**Working shape:** an http upstream is spoken to over `std::io::tcp` and relayed chunk by chunk (`Upstream.open` and `next_data`); an https upstream goes through `std::http::request` and is played from the finished body (`compat_play`), the same events in the same order, only late.

@@ -65,6 +65,26 @@ fn stub_conn(s: std::io::tcp::Stream) {
         s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n")) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /tools/chat/completions ") {
+        // the tools arrive as the chat wire names them, the schema byte for byte
+        if !std::str::contains(req, "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"find it\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}}]") || !std::str::contains(req, "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}") {
+            answer(s, "400 Bad Request", "{\"error\":{\"message\":\"tools did not arrive\"}}");
+            return;
+        }
+        s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n") or discard;
+        if std::str::contains(req, "\"role\":\"tool\",\"tool_call_id\":\"call_9\",\"content\":\"12 C\"") && std::str::contains(req, "\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]") {
+            s.send(chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"It is 12 C.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n") + "0\r\n\r\n") or discard;
+            return;
+        }
+        s.send(chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n")) or discard;
+        std::time::sleep(100ms);
+        let frag = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n";
+        s.send(chunk(frag[0..30])) or discard;
+        std::time::sleep(100ms);
+        s.send(chunk(frag[30..len(frag)])) or discard;
+        s.send(chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"Oslo\\\"}\"}}]}}]}\n\ndata: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n") + "0\r\n\r\n") or discard;
+        return;
+    }
     answer(s, "503 Service Unavailable", "{\"error\":{\"message\":\"model is loading\"}}");
 }
 
@@ -154,10 +174,42 @@ main locus App {
         let cut = node::run_compat("resp_k6", "voice-1", ask, node::compat_config("{\"base_url\": \"" + self.base + "/cut\", \"model\": \"stub-7b\"}"));
         std::test::assert_eq_str(cut.outcome, "failed", "a stream that closes before its end fails the run");
         std::test::assert(std::str::contains(cut.failure, "early"), "and says so: " + cut.failure);
+        // a tool call split across chunks: events as they arrive, whole at the end
+        let ask_tools = "{\"model\": \"voice-1\", \"input\": \"weather in Oslo?\", " + TOOLS_TAIL;
+        let tc = node::compat_config("{\"base_url\": \"" + self.base + "/tools\", \"model\": \"stub-7b\"}");
+        let tup = node::upstream_for("resp_t1", "voice-1", ask_tools, tc);
+        tup.open(node::compat_request(ask_tools, tc));
+        let mut events = "";
+        let mut fragments = 0;
+        while !tup.done {
+            let d = tup.next_data();
+            if len(d) > 0 {
+                let lines = tup.feed(d);
+                if std::str::contains(lines, "response.function_call_arguments.delta") { fragments = fragments + 1; }
+                events = events + lines;
+            }
+        }
+        let tend = tup.finish();
+        std::test::assert_eq_str(tend.outcome, "served", "a tool call is a served run: " + tend.failure);
+        std::test::assert_eq_int(fragments, 2, "the arguments leave in the upstream's fragments");
+        std::test::assert(std::str::contains(events, "\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_t1_0\",\"call_id\":\"call_9\",\"name\":\"lookup\""), "the call opens with its id and name: " + events);
+        std::test::assert(std::str::contains(events, "\"delta\":\"{\\\"city\\\":\"") && std::str::contains(events, "\"delta\":\"\\\"Oslo\\\"}\""), "the fragments as deltas");
+        let all = events + tend.script;
+        std::test::assert(std::str::contains(all, "\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_t1_0\",\"output_index\":0,\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\""), "the arguments whole at the end");
+        std::test::assert(std::str::contains(all, "\"type\":\"response.completed\"") && std::str::contains(all, "\"output\":[{\"type\":\"function_call\""), "and the response holds the call");
+        std::test::assert(!std::str::contains(all, "output_text"), "with no text events");
+
+        // the second turn: the call and its result go upstream as chat messages
+        let second = "{\"model\": \"voice-1\", \"input\": [{\"type\": \"message\", \"role\": \"user\", \"content\": \"weather in Oslo?\"}, {\"type\": \"function_call\", \"call_id\": \"call_9\", \"name\": \"lookup\", \"arguments\": \"{\\\"city\\\":\\\"Oslo\\\"}\"}, {\"type\": \"function_call_output\", \"call_id\": \"call_9\", \"output\": \"12 C\"}], " + TOOLS_TAIL;
+        let answered = node::run_compat("resp_t2", "voice-1", second, tc);
+        std::test::assert_eq_str(answered.outcome, "served", "the second turn is served: " + answered.failure);
+        std::test::assert(std::str::contains(answered.script, "\"text\":\"It is 12 C.\""), "with the text the upstream gave");
         let nobody = node::run_compat("resp_k5", "voice-1", ask, node::compat_config("{\"base_url\": \"http://127.0.0.1:1\", \"model\": \"stub-7b\"}"));
         std::test::assert(nobody.outcome == "failed" && std::str::contains(nobody.failure, "could not be reached"), "an unreachable upstream fails the seat");
     }
 }
+
+const TOOLS_TAIL: String = "\"tools\": [{\"type\": \"function\", \"name\": \"lookup\", \"description\": \"find it\", \"parameters\": {\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}}], \"tool_choice\": {\"type\": \"function\", \"name\": \"lookup\"}}";
 
 fn main() {
     // config
@@ -175,6 +227,13 @@ fn main() {
     std::test::assert(std::str::contains(req, "\"model\":\"llama3\""), "the upstream's model, not the catalog's");
     std::test::assert(std::str::contains(req, "[{\"role\":\"system\",\"content\":\"be brief\"},{\"role\":\"user\",\"content\":\"ab\"},{\"role\":\"assistant\",\"content\":\"ok\"}]"), "instructions and items become messages: " + req);
     std::test::assert(std::str::contains(req, "\"stream\":true") && std::str::contains(req, "\"include_usage\":true") && std::str::contains(req, "\"max_tokens\":50"), "streamed, with usage and the cap");
+
+    // tools: a request carries them or not, and only some seats take them
+    std::test::assert(node::request_has_tools("{\"tools\": [{\"type\": \"function\", \"name\": \"a\"}]}") && !node::request_has_tools("{\"tools\": []}") && !node::request_has_tools("{\"input\": \"x\"}"), "a request has tools when it lists one");
+    std::test::assert(node::seat_carries_tools("openai-compatible", "{}"), "an openai-compatible seat carries tools");
+    std::test::assert(!node::seat_carries_tools("static", "{\"text\": \"hi\"}"), "a static seat refuses them");
+    std::test::assert(node::seat_carries_tools("static", "{\"text\": \"hi\", \"tool_call\": {\"name\": \"t\"}}"), "unless it is the tool-call drill");
+    std::test::assert(!node::seat_carries_tools("claude-cli", "{}"), "and a claude-cli seat answers text only");
 
     // the node offers the kind and checks its seats
     let file = "{\"max_in_flight\": 2, \"engines\": [{\"id\": \"ollama\", \"kind\": \"openai-compatible\"}]}";

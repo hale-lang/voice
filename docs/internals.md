@@ -441,7 +441,7 @@ already exercised by the one. See [In Hale](#in-hale).
   never holds the credential.
 - **Node:** one machine running voice's node software. Created on the
   coordinator, which issues its enrollment token.
-- **Engine:** what a node offers: a kind (`static`, `claude-cli`, ...) with
+- **Engine:** what a node offers: a kind (`static`, `openai-compatible`, `claude-cli`, ...) with
   the login it runs under. Listed by the node's operator in a capabilities
   file on the machine, with the node's hard limits, because only the
   machine holds the login. Two logins for one CLI are two engines.
@@ -781,7 +781,20 @@ already there.
   assignment that comes back, and every `assign` after, is reconciled
   against it, and seat states are posted back.
 - Each seat is a locus running its engine: the static engine answers in
-  process, and CLI engines run their CLI as a supervised child process.
+  process; the openai-compatible engine (node/compat.hl) posts the request's
+  messages to `<base_url>/chat/completions` with `stream: true` and plays
+  the upstream's chunks as the standard's events, reporting the upstream's
+  final usage and the cost at the seat's price (0 for a local server); its
+  key is read from a vault slot into the request and goes nowhere else. An
+  http upstream (a local server) is spoken to over `std::io::tcp`: the
+  node writes the POST, reads the status and headers, de-chunks the body as
+  it arrives and publishes each chunk's event as soon as its `data:` line is
+  complete (the run is whole when `[DONE]` arrives, the terminal chunk of a chunked body does, or Content-Length bytes have been read; a connection that ends or stays silent for 120 s before that fails the run). An https
+  upstream goes through the stdlib client, which reads a response whole, so
+  it is relayed after it ends until hale's client streams. An unreachable
+  or refusing upstream, an error status or an empty stream fails the seat
+  before any event is published, and the coordinator fails the request over.
+  CLI engines run their CLI as a supervised child process.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls.
 

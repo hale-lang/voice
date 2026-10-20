@@ -1,0 +1,450 @@
+// The openai-compatible engine (protocol.yaml `OpenAICompatibleConfig`): a
+// seat that proxies to a server speaking the chat-completions wire (Ollama,
+// LM Studio, the llama.cpp server, or a hosted one). The request's input
+// becomes `messages`; the upstream is asked for a stream; its chunks come
+// back as the standard's events, the same ones the static engine emits.
+//
+// An http upstream (a local server) is spoken to over std::io::tcp and
+// relayed as it arrives: each chunk's event is published as soon as its
+// `data:` line is complete. An https upstream goes through the stdlib
+// client, which reads a response whole, so it is relayed after it ends
+// until hale's client streams.
+
+/// A seat's openai-compatible config. `problem` is why it is not one, ""
+/// when it is.
+type CompatConfig {
+    base_url: String = "";
+    model: String = "";
+    // the std::secret vault entry holding the API key; "" for none
+    key_vault: String = "";
+    // micros per million tokens, as a catalog model's price; 0 for local
+    input_per_mtok_micros: Int = 0;
+    output_per_mtok_micros: Int = 0;
+    problem: String = "";
+}
+
+fn compat_config(config: String) -> CompatConfig {
+    if !std::json::valid_object(config) { return CompatConfig { problem: "config is not an object" }; }
+    let base = std::json::string_field(config, "base_url");
+    if base.kind != "string" || !(std::str::starts_with(base.text, "http://") || std::str::starts_with(base.text, "https://")) { return CompatConfig { problem: "config needs base_url, an http or https URL" }; }
+    let model = std::json::string_field(config, "model");
+    if model.kind != "string" || len(model.text) == 0 { return CompatConfig { problem: "config needs model, a non-empty string" }; }
+    let mut c = CompatConfig { base_url: base.text, model: model.text };
+    while std::str::ends_with(c.base_url, "/") { c.base_url = c.base_url[0..(len(c.base_url) - 1)]; }
+    let vault = std::json::string_field(config, "api_key_vault");
+    if vault.kind == "string" { c.key_vault = vault.text; } else if vault.kind != "missing" && vault.kind != "null" { return CompatConfig { problem: "config api_key_vault is a vault entry name" }; }
+    if std::json::string_field(config, "input_per_mtok_micros").kind == "number" { c.input_per_mtok_micros = std::json::find_int_field(config, "input_per_mtok_micros"); }
+    if std::json::string_field(config, "output_per_mtok_micros").kind == "number" { c.output_per_mtok_micros = std::json::find_int_field(config, "output_per_mtok_micros"); }
+    if c.input_per_mtok_micros < 0 || c.output_per_mtok_micros < 0 { return CompatConfig { problem: "config prices are at least 0" }; }
+    return c;
+}
+
+/// The text of a message's content: a string as it is, a list of parts as
+/// their texts joined.
+@unbounded
+fn content_text(content: String) -> String {
+    let raw = std::str::trim(content);
+    if !std::str::starts_with(raw, "[") { return std::json::string_field("{\"c\":" + raw + "}", "c").text; }
+    let mut out = "";
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let part = std::json::string_field(it.element, "text");
+        if part.kind == "string" { out = out + part.text; }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+fn chat_message(role: String, text: String) -> String {
+    return "{\"role\":" + q(role) + ",\"content\":" + q(text) + "}";
+}
+
+/// The chat-completions request for a standard request body: its
+/// `instructions` as a system message, its `input` (a text, or items with a
+/// role and content) as the rest, and the output cap.
+@unbounded
+fn compat_request(body: String, c: CompatConfig) -> String {
+    let mut messages = "";
+    let instructions = std::json::string_field(body, "instructions");
+    if instructions.kind == "string" && len(instructions.text) > 0 { messages = chat_message("system", instructions.text); }
+    let input = std::json::string_field(body, "input");
+    if input.kind == "string" {
+        messages = messages + (if len(messages) > 0 { "," } else { "" }) + chat_message("user", input.text);
+    } else {
+        let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(body, "input")));
+        while !it.done {
+            let role = std::json::string_field(it.element, "role");
+            let text = content_text(std::json::find_field_raw(it.element, "content"));
+            if role.kind == "string" {
+                messages = messages + (if len(messages) > 0 { "," } else { "" }) + chat_message(role.text, text);
+            }
+            it = std::json::array_next(it);
+        }
+    }
+    let mut out = "{\"model\":" + q(c.model) + ",\"messages\":[" + messages + "],\"stream\":true,\"stream_options\":{\"include_usage\":true}";
+    if std::json::string_field(body, "max_output_tokens").kind == "number" { out = out + ",\"max_tokens\":" + to_string(std::json::find_int_field(body, "max_output_tokens")); }
+    if std::json::string_field(body, "temperature").kind == "number" { out = out + ",\"temperature\":" + member_or(body, "temperature", "1"); }
+    return out + "}";
+}
+
+/// Micros owed for a run: the tokens at the seat's per-million prices,
+/// rounded up.
+fn compat_cost(c: CompatConfig, input: Int, output: Int) -> Int {
+    return (input * c.input_per_mtok_micros + output * c.output_per_mtok_micros + 999999) / 1000000;
+}
+
+/// How long an upstream may be silent mid-stream before its seat fails.
+const COMPAT_IDLE_MS: Int = 120000;
+
+/// A run that failed before any output: nothing is played, so the
+/// coordinator's failover sees a clean seat failure.
+fn compat_failed(c: CompatConfig, served: String, why: String) -> StaticRun {
+    return StaticRun { outcome: "failed", failure: why, model: served };
+}
+
+/// The hex number a chunk-size line starts with, -1 if it has none.
+fn hex_size(line: String) -> Int {
+    let v = std::str::bytes_view(line);
+    let mut n = 0;
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        let d = if b >= 48 && b <= 57 { b - 48 } else if b >= 97 && b <= 102 { b - 87 } else if b >= 65 && b <= 70 { b - 55 } else { -1 };
+        if d < 0 { break; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    return if i == 0 { -1 } else { n };
+}
+
+/// The payload of one SSE event block: its `data:` lines joined by newlines.
+@unbounded
+fn sse_data(block: String) -> String {
+    let v = std::str::bytes_view(block);
+    let mut out = "";
+    let mut start = 0;
+    while start < v.n {
+        let at = line_end(v, start);
+        let ln = std::str::slice(v, start, at);
+        start = at + 1;
+        if std::str::starts_with(ln, "data:") {
+            let d = ln[5..len(ln)];
+            out = out + (if len(out) > 0 { "\n" } else { "" }) + (if std::str::starts_with(d, " ") { d[1..len(d)] } else { d });
+        }
+    }
+    return out;
+}
+
+/// One run on an upstream: the connection (for an http upstream), the
+/// stream read off it, and the events built from the stream so far. The
+/// key is read from its vault slot into the request it is written into and
+/// goes nowhere else: not a log line, not an event.
+locus Upstream {
+    params {
+        url: String = "";
+        vault: String = "";
+        cfg: CompatConfig = CompatConfig { };
+        id: String = "";
+        model: String = "";
+        req: String = "";
+        // the connection and what has been read off it
+        fd: Int = -1;
+        raw: String = "";
+        body: String = "";
+        head_done: Bool = false;
+        chunked: Bool = false;
+        chunk_left: Int = 0;
+        skip_crlf: Int = 0;
+        // a read came back empty: the connection ended, or its idle window passed
+        eof: Bool = false;
+        // the framing says the body is whole
+        complete: Bool = false;
+        content_length: Int = -1;
+        received: Int = 0;
+        done: Bool = false;
+        status: Int = 0;
+        failure: String = "";
+        // the events built
+        item_id: String = "";
+        created: Int = 0;
+        seq: Int = 0;
+        text: String = "";
+        finish_reason: String = "";
+        ran: String = "";
+        input: Int = -1;
+        output: Int = -1;
+        began: Bool = false;
+    }
+
+    /// The request through the stdlib client, whole (https).
+    fn post(request: String) -> std::http::ClientResponse {
+        let parsed = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
+        let none = std::http::ClientResponse { status: 0, body: b"" };
+        if len(parsed.host) == 0 { return none; }
+        let headers = "Content-Type: application/json\r\nAccept: text/event-stream";
+        if len(self.vault) > 0 {
+            let credential = std::secret::Credential { vault: self.vault };
+            return std::http::request(std::http::ClientRequest { method: "POST", url: parsed, headers: headers + "\r\nAuthorization: Bearer " + credential.reveal_text(), body: std::bytes::from_string(request) }) or none;
+        }
+        return std::http::request(std::http::ClientRequest { method: "POST", url: parsed, headers: headers, body: std::bytes::from_string(request) }) or none;
+    }
+
+    /// Dial the upstream and send the request; a failure is `failure`.
+    fn open(request: String) {
+        let u = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
+        let fd = if len(u.host) == 0 { -1 } else { std::io::tcp::connect_within(u.host, u.port, 5s) or - 1 };
+        if fd < 0 {
+            self.failure = "the upstream at " + self.url + " could not be reached";
+            self.done = true;
+            return;
+        }
+        self.fd = fd;
+        std::io::tcp::set_recv_timeout(fd, COMPAT_IDLE_MS * 1ms) or discard;
+        let s = std::io::tcp::Stream { conn_fd: fd, owns_fd: false };
+        let head = "POST " + u.path + " HTTP/1.1\r\nHost: " + u.host + ":" + to_string(u.port) + "\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nConnection: close\r\nContent-Length: " + to_string(len(request));
+        if len(self.vault) > 0 {
+            let credential = std::secret::Credential { vault: self.vault };
+            s.send(head + "\r\nAuthorization: Bearer " + credential.reveal_text() + "\r\n\r\n" + request) or self.fail_send();
+        } else {
+            s.send(head + "\r\n\r\n" + request) or self.fail_send();
+        }
+    }
+
+    fn fail_send() {
+        self.failure = "the upstream at " + self.url + " took no request";
+        self.done = true;
+    }
+
+    /// Read what has arrived, once (a wait of at most the idle window), into
+    /// the decoded body. An empty read is the end of the connection or the
+    /// window passing; either way nothing more is coming.
+    @unbounded
+    fn pump() {
+        if self.fd >= 0 && !self.eof {
+            let s = std::io::tcp::Stream { conn_fd: self.fd, owns_fd: false };
+            let got = s.recv(65536) or "";
+            if len(got) > 0 {
+                self.raw = self.raw + got;
+            } else {
+                self.eof = true;
+            }
+        }
+        if !self.head_done {
+            let he = std::str::index_of(self.raw, "\r\n\r\n");
+            if he < 0 { return; }
+            let head = self.raw[0..he];
+            self.raw = self.raw[(he + 4)..len(self.raw)];
+            self.head_done = true;
+            self.status = std::str::parse_int(std::str::trim(head[9..12])) or 0;
+            let lowered = std::str::lower(head);
+            self.chunked = std::str::contains(lowered, "transfer-encoding: chunked");
+            let cl = std::str::index_of(lowered, "content-length:");
+            if cl >= 0 && !self.chunked {
+                let rest = lowered[(cl + 15)..len(lowered)];
+                let end = std::str::index_of(rest, "\r\n");
+                self.content_length = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or - 1;
+            }
+        }
+        if !self.chunked {
+            self.body = self.body + self.raw;
+            self.received = self.received + len(self.raw);
+            self.raw = "";
+            if self.content_length >= 0 && self.received >= self.content_length { self.complete = true; }
+        } else {
+            while len(self.raw) > 0 {
+                if self.skip_crlf > 0 {
+                    let n = if self.skip_crlf < len(self.raw) { self.skip_crlf } else { len(self.raw) };
+                    self.raw = self.raw[n..len(self.raw)];
+                    self.skip_crlf = self.skip_crlf - n;
+                } else if self.chunk_left == 0 {
+                    let e = std::str::index_of(self.raw, "\r\n");
+                    if e < 0 { break; }
+                    let size = hex_size(self.raw[0..e]);
+                    self.raw = self.raw[(e + 2)..len(self.raw)];
+                    if size <= 0 {
+                        self.complete = true;
+                        self.raw = "";
+                        break;
+                    }
+                    self.chunk_left = size;
+                } else {
+                    let n = if self.chunk_left < len(self.raw) { self.chunk_left } else { len(self.raw) };
+                    self.body = self.body + self.raw[0..n];
+                    self.raw = self.raw[n..len(self.raw)];
+                    self.chunk_left = self.chunk_left - n;
+                    if self.chunk_left == 0 { self.skip_crlf = 2; }
+                }
+            }
+        }
+        self.body = std::str::replace(self.body, "\r\n", "\n");
+    }
+
+    /// The next event's payload, "" when there is none yet (the caller
+    /// looks at its cancel and asks again) or when `done` says the stream
+    /// ended or failed.
+    @unbounded
+    fn next_data() -> String {
+        if self.done { return ""; }
+        while true {
+            let ok = self.status >= 200 && self.status < 300;
+            if self.head_done && !ok {
+                // an error answer: read it out, then fail the seat with its message
+                if self.eof || self.complete {
+                    let err = std::json::find_string_field(std::json::find_field_raw(self.body, "error"), "message");
+                    self.failure = "the upstream answered " + to_string(self.status) + (if len(err) > 0 { ": " + err } else { "" });
+                    self.done = true;
+                    return "";
+                }
+                self.pump();
+                return "";
+            }
+            let at = std::str::index_of(self.body, "\n\n");
+            if at >= 0 {
+                let d = sse_data(self.body[0..at]);
+                self.body = self.body[(at + 2)..len(self.body)];
+                if d == "[DONE]" {
+                    self.done = true;
+                    return "";
+                }
+                if len(d) > 0 { return d; }
+            } else if self.complete {
+                let d = sse_data(self.body);
+                self.body = "";
+                self.done = true;
+                return if d == "[DONE]" { "" } else { d };
+            } else if self.eof {
+                // the connection ended or went quiet before the framing or a [DONE] said the stream was whole
+                self.failure = "the upstream ended its stream early";
+                self.done = true;
+                return "";
+            } else {
+                self.pump();
+                if len(self.body) == 0 || std::str::index_of(self.body, "\n\n") < 0 { return ""; }
+            }
+        }
+        return "";
+    }
+
+    /// The events for one chunk's payload, as script lines; a payload that
+    /// cannot be one sets `failure`.
+    @unbounded
+    fn feed(data: String) -> String {
+        if !std::json::valid_object(data) {
+            self.failure = "the upstream sent a stream chunk that is not JSON";
+            self.done = true;
+            return "";
+        }
+        if std::json::string_field(data, "error").kind == "object" {
+            self.failure = "the upstream failed mid-stream: " + std::json::find_string_field(std::json::find_field_raw(data, "error"), "message");
+            self.done = true;
+            return "";
+        }
+        let m = std::json::string_field(data, "model");
+        if m.kind == "string" && len(m.text) > 0 { self.ran = m.text; }
+        let usage = std::str::trim(std::json::find_field_raw(data, "usage"));
+        if std::str::starts_with(usage, "{") {
+            self.input = std::json::find_int_field(usage, "prompt_tokens");
+            self.output = std::json::find_int_field(usage, "completion_tokens");
+        }
+        let choice = std::json::array_first(std::str::trim(std::json::find_field_raw(data, "choices")));
+        if choice.done { return ""; }
+        let fr = std::json::string_field(choice.element, "finish_reason");
+        if fr.kind == "string" { self.finish_reason = fr.text; }
+        let piece = std::json::string_field(std::json::find_field_raw(choice.element, "delta"), "content");
+        if piece.kind != "string" || len(piece.text) == 0 { return ""; }
+        let mut out = "";
+        if !self.began {
+            self.began = true;
+            self.created = std::time::unix(std::time::current());
+            self.item_id = "msg_" + (if std::str::starts_with(self.id, "resp_") { self.id[5..len(self.id)] } else { self.id });
+            let pending = response_object(self.id, self.created, "in_progress", self.model, self.req, "", "null");
+            out = line("{\"type\":\"response.created\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq) + "}")
+                + line("{\"type\":\"response.in_progress\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq + 1) + "}")
+                + line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(self.item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
+                + line("{\"type\":\"response.content_part.added\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 3) + "}");
+            self.seq = self.seq + 4;
+        }
+        self.text = self.text + piece.text;
+        out = out + line("{\"type\":\"response.output_text.delta\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"delta\":" + q(piece.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}");
+        self.seq = self.seq + 1;
+        return out;
+    }
+
+    /// End the run: close the connection and say how it went, with the
+    /// events that close the stream as the script.
+    fn finish() -> StaticRun {
+        if self.fd >= 0 {
+            std::io::tcp::close_fd(self.fd);
+            self.fd = -1;
+        }
+        let served = self.cfg.model;
+        if len(self.failure) > 0 { return compat_failed(self.cfg, served, self.failure); }
+        if !self.began { return compat_failed(self.cfg, served, "the upstream sent no output"); }
+        let complete = self.finish_reason != "length";
+        let state = if complete { "completed" } else { "incomplete" };
+        let input = if self.input < 0 { tokens_of(input_chars(self.req)) } else { self.input };
+        let output = if self.output < 0 { tokens_of(len(self.text)) } else { self.output };
+        let item = message_item(self.item_id, state, self.text, true);
+        let tail = line("{\"type\":\"response.output_text.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"text\":" + q(self.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.content_part.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":" + q(self.text) + ",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 1) + "}")
+            + line("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + item + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
+            + line("{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" }) + ",\"response\":" + response_object(self.id, self.created, state, self.model, self.req, item, usage_object(input, output)) + ",\"sequence_number\":" + to_string(self.seq + 3) + "}");
+        return StaticRun {
+            script: tail,
+            outcome: if complete { "served" } else { "incomplete" },
+            model: if len(self.ran) > 0 { self.ran } else { served },
+            input_tokens: input,
+            output_tokens: output,
+            cost_micros: compat_cost(self.cfg, input, output)
+        };
+    }
+}
+
+fn upstream_for(id: String, model: String, body: String, c: CompatConfig) -> Upstream {
+    return Upstream { url: c.base_url, vault: c.key_vault, cfg: c, id: id, model: model, req: body };
+}
+
+/// Run the stream to its end, collecting every event: the script of the
+/// run, as `compat_play` and `run_compat` hand it back.
+@unbounded
+fn drain(up: Upstream) -> StaticRun {
+    let script = std::bytes::BytesBuilder { initial_cap: 4096 };
+    while !up.done {
+        let d = up.next_data();
+        if len(d) > 0 { script.append_str(up.feed(d)); }
+    }
+    let end = up.finish();
+    if end.outcome == "failed" { return end; }
+    script.append_str(end.script);
+    let played = script.snapshot() or b"";
+    return StaticRun { script: std::str::from_bytes(played), outcome: end.outcome, model: end.model, input_tokens: end.input_tokens, output_tokens: end.output_tokens, cost_micros: end.cost_micros };
+}
+
+/// Play an upstream's whole answer as a run. `status` is the HTTP status
+/// (0 when the upstream could not be reached), `sse` its body.
+fn compat_play(id: String, model: String, served: String, body: String, c: CompatConfig, status: Int, sse: String) -> StaticRun {
+    if status == 0 { return compat_failed(c, served, "the upstream at " + c.base_url + " could not be reached"); }
+    let up = upstream_for(id, model, body, c);
+    up.status = status;
+    up.head_done = true;
+    up.complete = true;
+    up.body = std::str::replace(sse, "\r\n", "\n");
+    return drain(up);
+}
+
+/// Whether the upstream is spoken to over a socket and relayed as it
+/// arrives (http), rather than read whole through the stdlib client.
+fn compat_streams(c: CompatConfig) -> Bool {
+    return std::str::starts_with(c.base_url, "http://");
+}
+
+/// Answer one request on the upstream, collecting the events.
+fn run_compat(id: String, model: String, body: String, c: CompatConfig) -> StaticRun {
+    let up = upstream_for(id, model, body, c);
+    if compat_streams(c) {
+        up.open(compat_request(body, c));
+        return drain(up);
+    }
+    let r = up.post(compat_request(body, c));
+    return compat_play(id, model, c.model, body, c, r.status, std::str::from_bytes(r.body));
+}

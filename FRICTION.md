@@ -312,7 +312,7 @@ each gap classed in `api/gaps.json`.
 
 **hale 0.25.1.** When a client hangs up while the api writes its answer, the runtime prints `lotus_tcp_send_str: write: Broken pipe` (a `perror` in the C runtime) on stderr. It is a write by Hale's runtime, outside `std::log` and outside the program, so a program that routes every line through its logger still has this one, unstructured.
 
-**Working shape:** none in voice; the README's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
+**Working shape:** none in voice; docs/internals.md's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 
 ## A program that reads `self.draining` waits out the whole drain grace, its HTTP server never ending on it
 

@@ -2,7 +2,7 @@
 
 Postgres holds everything durable, and the api and the brain both read and
 write it, so its tables and the transactions over them are a contract
-between them. This document is that contract: the state laws the README
+between them. This document is that contract: the state laws docs/internals.md
 states in prose, written as SQL. The migrations in the shared store seed
 are its executable form and must match it.
 

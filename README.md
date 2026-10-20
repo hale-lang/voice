@@ -55,7 +55,7 @@ version moves on in SQL, so no instance's write is lost or reuses a
 version (`scripts/race.sh` checks it with two instances). A store failure
 answers a fixed message with an id; what Postgres said goes to the api's
 stderr only, and nothing of the database URL is printed but its host and
-port. Grafted into a DNA habitat, voice's genome needs a `database`
+port. A DNA habitat takes voice with `hale habitat graft <dir> [--attach]`. Grafted, voice's genome needs a `database`
 (the root [`hale.toml`](./hale.toml), `[dna] needs`), and when neither
 `--database` nor `VOICE_DATABASE_URL` is given the api and the brain use
 the one the habitat provisioned, `HALE_DNA_DATABASE_DSN`: a DSN with no
@@ -147,7 +147,9 @@ in the catalog). A seat's `config`, a change's `before` and `after` and an
 engine's `config_schema` are free-form JSON, kept as written: a new one is
 at most 64 KiB (65536 bytes) and 64 levels deep, or it is refused `400`.
 JSON the store already holds is answered and assigned exactly as stored,
-whatever its size, and never re-parsed on the way out. A change to a node
+whatever its size, and never re-parsed on the way out. A PATCH field that
+may be cleared is three-way: left out keeps it, `null` clears it, a value
+sets it. A change to a node
 or its seats is a new assignment, published to the node on NATS. An inference request is admitted (its key,
 model, account and data class), then offered to each seat that could take
 it in turn: a seat that refuses, does not answer, or fails before output is
@@ -214,7 +216,7 @@ write.
 After a change to a row, export it again and commit the result.
 
 The bundle is the surface's own shape, not the REST wire's: a row is
-`POST /call/<member>`, and its types say what the codec of hale 0.25.0 can
+`POST /call/<member>`, and its types say what the codec of hale 0.27.0 can
 carry. [`api/gaps.json`](./api/gaps.json) lists every place
 where a row's type differs from the contract schema it stands for, each
 with what closes it, and `spec/validate/bundle.mjs` (`npm run bundle`)
@@ -486,7 +488,8 @@ when it cannot reach the coordinator.
    the model's current price, and records the request as in flight on this
    instance. If a limit does not fit, nothing is held and the answer is
    `429`. The transactions are in [`spec/store.md`](./spec/store.md).
-3. **Pick a seat** from the route table in memory: the best-ranked seat
+3. **Pick a seat** from the route table in memory (today, from the fleet's
+   state in the store; see "The brain"): the best-ranked seat
    for the model among the permitted accounts, with room by the api's own
    count. If the model's accounts are all exhausted, the answer is
    `503 no_capacity` with the earliest reset. If every seat is busy, the api
@@ -516,8 +519,8 @@ numbers and the caller's `metadata`.
 
 ## The route table
 
-The brain turns the state of the fleet into a ranked table the api routes
-from. It is one row in Postgres, rewritten every second; NATS carries only
+The brain turns the state of the fleet into a ranked table the api is to
+route from (it does not yet; see "The brain"). It is one row in Postgres, rewritten every second; NATS carries only
 the notice of its new version.
 
 - **Contents.** Per model, the seats that can serve it (up, on a node that
@@ -556,12 +559,12 @@ traffic in a handler, and no api instance holds a node: whichever instance
 routes a request talks to the node directly, and the answer comes straight
 back to it. Nothing is forwarded between instances.
 
-**These topics are bound to NATS from the MVP on**, in `main`'s
-`bindings { }` block through pond's NATS adapter
+**These topics are carried by NATS from the MVP on**, through pond's NATS
+client
 ([`pond/realtime/nats`](https://github.com/hale-lang/pond/tree/main/realtime/nats)),
 in the api and in the node alike. With one api instance the same path is
 simply exercised by one process. The brain's notice of a new route table
-rides the same connection (`spec/internal.yaml`). See Hale's
+goes out through the same client (`spec/internal.yaml`). See Hale's
 [across binaries](https://hale-lang.org/docs/services/multi-binary).
 
 **What does not go on the bus: state.** The reservation and the settlement
@@ -648,9 +651,8 @@ as a one-shot `migrate` step that the api and the brain wait on
 (two at once are safe: `api migrate` holds an advisory lock of its own
 around pond's, which creates its tracking table before it locks), never from
 the api or the brain themselves, so neither ever starts against a schema it
-does not expect. Today the store and its migrations live in the api
-(`api migrate`); they move to a store seed the api and the brain share when
-the brain reads the store.
+does not expect. The migrations are in the store seed ([`store/migrations/`](./store/migrations/)),
+run by `api migrate`; in a habitat, by the habitat.
 
 ### Why Postgres, and not also Redis
 
@@ -718,7 +720,7 @@ its `main` holds the one sink, voice's `RecordSink`
 ([`lib/logfmt`](./lib/logfmt/logfmt.hl)), which writes each event as one
 logfmt record: the event's time, its level, its logger and its message,
 then its fields. Info goes on stdout, warnings and errors on stderr; the
-record is the same on both. Each line is data a collector parses, as the
+record is the same on both, and `HALE_LOG` sets the threshold. Each line is data a collector parses, as the
 standard pack's first clause asks (GH #1591, "Logs are structured"), and
 the attach manifest declares it ([`dna/applications/voice.toml`](./dna/applications/voice.toml)).
 Voice prints nothing outside the sink, and CI refuses a bare `print`,
@@ -770,13 +772,13 @@ from Hale's
   publishes its version, and reclaims what dead api instances held. Per-tick work runs in a method, so each tick's memory is
   reclaimed.
 
-**Which topics bind, and which use the client.** A `keyed_by` topic over
-a binding is one subject that every subscriber receives and filters, so
-`bindings { }` carries only what is truly a broadcast: the route table's
-version on `voice.route`. The per-node and per-request subjects (`serve`, `assign`,
-`cancel` to a node; a request's events and result back) are published and
-subscribed through the NATS client directly, with the subjects
-`spec/protocol.yaml` names, so a node receives only its own requests and an
+**Subjects.** A `keyed_by` topic over a binding is one subject that every
+subscriber receives and filters, so no program declares a `bindings { }`
+block. The route table's version on `voice.route`, the per-node subjects
+(`serve`, `assign`, `cancel` to a node) and the per-request ones (a
+request's events and result back) are published and subscribed through the
+NATS client directly, with the subjects `spec/protocol.yaml` and
+`spec/internal.yaml` name, so a node receives only its own requests and an
 instance only its own answers. That is what the per-node NATS permissions
 rely on.
 

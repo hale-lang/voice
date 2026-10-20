@@ -1,0 +1,330 @@
+// The claude-cli engine (protocol.yaml `ClaudeCliConfig`): a seat that runs
+// `claude -p` as a child process under a login the node holds as a secret.
+// The login is the long-lived OAuth token `claude setup-token` prints, one
+// per account, kept in the vault; it reaches the child only through its
+// environment (CLAUDE_CODE_OAUTH_TOKEN), never its argv and never a shared
+// config directory, so several accounts on one node cannot cross. The
+// prompt goes to the child's stdin; its stream-json output is read as it
+// arrives and played as the standard's events, the same ones the static
+// engine emits. The seat is flat-rate: the run's cost is 0, and the
+// account's own limits are its only cap.
+
+/// A seat's claude-cli config. `problem` is why it is not one, "" when it is.
+type ClaudeConfig {
+    // the std::secret vault entry holding the account's token
+    token_vault: String = "";
+    // the CLI's own name for the model; "" for its default
+    model: String = "";
+    problem: String = "";
+}
+
+fn claude_config(config: String) -> ClaudeConfig {
+    if !std::json::valid_object(config) { return ClaudeConfig { problem: "config is not an object" }; }
+    let vault = std::json::string_field(config, "token_vault");
+    if vault.kind != "string" || len(vault.text) == 0 { return ClaudeConfig { problem: "config needs token_vault, the vault entry holding the account's token" }; }
+    let mut c = ClaudeConfig { token_vault: vault.text };
+    let model = std::json::string_field(config, "model");
+    if model.kind == "string" { c.model = model.text; } else if model.kind != "missing" && model.kind != "null" { return ClaudeConfig { problem: "config model is a string" }; }
+    return c;
+}
+
+/// How long the child may be silent mid-run before its seat fails.
+const CLAUDE_IDLE_MS: Int = 300000;
+
+/// The prompt the CLI is given on stdin: the request's `instructions`, then
+/// its `input` (a text, or items with a role and content).
+@unbounded
+fn claude_prompt(body: String) -> String {
+    let mut out = "";
+    let instructions = std::json::string_field(body, "instructions");
+    if instructions.kind == "string" && len(instructions.text) > 0 { out = instructions.text + "\n\n"; }
+    let input = std::json::string_field(body, "input");
+    if input.kind == "string" { return out + input.text; }
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(body, "input")));
+    while !it.done {
+        let role = std::json::string_field(it.element, "role");
+        let text = content_text(std::json::find_field_raw(it.element, "content"));
+        if role.kind == "string" { out = out + role.text + ": " + text + "\n\n"; }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The child's argv. It names the token's file, not the token.
+fn claude_argv(c: ClaudeConfig, command: String, token_file: String) -> String {
+    // dontAsk refuses every tool the run was not allowed, and none is: the
+    // seat answers a prompt, it does not act on the machine
+    // the shell reads the token into the CLI's environment and removes the file
+    let sh = "sh\n-c\nCLAUDE_CODE_OAUTH_TOKEN=\"$(cat \"$1\")\"; rm -f \"$1\"; export CLAUDE_CODE_OAUTH_TOKEN; shift; exec \"$@\"\nsh\n" + token_file + "\n";
+    let base = sh + command + "\n-p\n--output-format\nstream-json\n--verbose\n--include-partial-messages\n--no-session-persistence\n--permission-mode\ndontAsk";
+    return if len(c.model) > 0 { base + "\n--model\n" + c.model } else { base };
+}
+
+/// One run of the CLI: the child, what has been read off its stdout, and
+/// the events built from it so far. The token is read from its vault slot
+/// into the child's environment and goes nowhere else: not a log line, not
+/// an event, not a failure message.
+locus ClaudeRun {
+    params {
+        cfg: ClaudeConfig = ClaudeConfig { };
+        command: String = "claude";
+        id: String = "";
+        model: String = "";
+        req: String = "";
+        child: std::process::Child = std::process::Child { };
+        // the private directory the token file was made in
+        dir: String = "";
+        raw: String = "";
+        err: String = "";
+        // the child has been reaped, with this code (-1: by a signal)
+        exited: Bool = false;
+        code: Int = 0;
+        last_read: Int = 0;
+        done: Bool = false;
+        failure: String = "";
+        // the events built
+        item_id: String = "";
+        created: Int = 0;
+        seq: Int = 0;
+        text: String = "";
+        partial: Bool = false;
+        began: Bool = false;
+        ended: Bool = false;
+        stop: String = "";
+        ran: String = "";
+        input: Int = -1;
+        output: Int = -1;
+    }
+
+    /// Start the CLI and hand it the prompt; a failure is `failure`. The
+    /// token is never revealed into a value here (spec/semantics.md
+    /// "@sealed"): the sealed credential writes it to a file only this user
+    /// can read, in a fresh private directory, and a shell reads it from
+    /// there into the CLI's environment and removes the file. The argv
+    /// names the file, not the token.
+    fn open() {
+        let credential = std::secret::Credential { vault: self.cfg.token_vault };
+        if !credential.ready() {
+            self.failure = "the vault holds no token for this seat";
+            self.done = true;
+            return;
+        }
+        let made = std::process::run("mktemp\n-d\n-t\nvoice-claude-XXXXXX") or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+        self.dir = std::str::trim(made.stdout);
+        if made.code != 0 || len(self.dir) == 0 {
+            self.dir = "";
+            self.failure = "no private directory could be made for the seat's token";
+            self.done = true;
+            return;
+        }
+        if !credential.write_private(self.dir + "/token") {
+            self.failure = "the seat's token could not be written privately for the CLI";
+            self.done = true;
+            return;
+        }
+        // an API key in the node's own environment would outrank the login
+        let opts = std::process::SpawnOptions { cwd: "/tmp", unset_env: "ANTHROPIC_API_KEY\nANTHROPIC_AUTH_TOKEN\nCLAUDE_CONFIG_DIR" };
+        let s = std::process::spawn_with(claude_argv(self.cfg, self.command, self.dir + "/token"), opts) or std::process::Child { };
+        if s.pid <= 0 {
+            self.failure = "the claude CLI could not be started";
+            self.done = true;
+            return;
+        }
+        std::process::adopt(self.child, s);
+        self.last_read = std::time::monotonic_ns();
+        std::process::write_stdin(self.child, claude_prompt(self.req)) or discard;
+        std::process::close_stdin(self.child);
+    }
+
+    /// The text, clipped, for a failure message.
+    fn clip(s: String) -> String {
+        return if len(s) > 300 { s[0..300] } else { s };
+    }
+
+    /// Read what the child has written, once; learn whether it has ended.
+    @unbounded
+    fn pump() {
+        let got = std::process::read_stdout(self.child) or "";
+        if len(got) > 0 {
+            self.raw = self.raw + got;
+            self.last_read = std::time::monotonic_ns();
+        }
+        let e = std::process::read_stderr(self.child) or "";
+        if len(e) > 0 && len(self.err) < 2000 { self.err = self.err + e; }
+        if len(got) == 0 && !self.exited {
+            let c = std::process::try_wait(self.child) or - 1;
+            if c != -2 {
+                self.exited = true;
+                self.code = c;
+                // what it wrote last, before it ended
+                self.raw = self.raw + (std::process::read_stdout(self.child) or "");
+                self.err = self.err + (std::process::read_stderr(self.child) or "");
+            }
+        }
+    }
+
+    /// The next stream-json line, "" when there is none yet (the caller
+    /// looks at its cancel and asks again) or when `done` says the output
+    /// ended or failed.
+    @unbounded
+    fn next_data() -> String {
+        if self.done { return ""; }
+        while true {
+            let at = std::str::index_of(self.raw, "\n");
+            if at >= 0 {
+                let l = std::str::trim(self.raw[0..at]);
+                self.raw = self.raw[(at + 1)..len(self.raw)];
+                if len(l) > 0 { return l; }
+            } else if self.exited {
+                let l = std::str::trim(self.raw);
+                self.raw = "";
+                if len(l) > 0 { return l; }
+                self.done = true;
+                return "";
+            } else {
+                self.pump();
+                if std::str::index_of(self.raw, "\n") < 0 && !self.exited {
+                    if (std::time::monotonic_ns() - self.last_read) / 1000000 > CLAUDE_IDLE_MS {
+                        self.failure = "the claude CLI stayed silent too long";
+                        self.done = true;
+                    } else {
+                        std::time::sleep(5ms);
+                    }
+                    return "";
+                }
+            }
+        }
+        return "";
+    }
+
+    /// The events for text the model wrote.
+    @unbounded
+    fn delta(piece: String) -> String {
+        let mut out = "";
+        if !self.began {
+            self.began = true;
+            self.created = std::time::unix(std::time::current());
+            self.item_id = "msg_" + (if std::str::starts_with(self.id, "resp_") { self.id[5..len(self.id)] } else { self.id });
+            let pending = response_object(self.id, self.created, "in_progress", self.model, self.req, "", "null");
+            out = line("{\"type\":\"response.created\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq) + "}")
+                + line("{\"type\":\"response.in_progress\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq + 1) + "}")
+                + line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(self.item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
+                + line("{\"type\":\"response.content_part.added\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 3) + "}");
+            self.seq = self.seq + 4;
+        }
+        self.text = self.text + piece;
+        out = out + line("{\"type\":\"response.output_text.delta\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"delta\":" + q(piece) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}");
+        self.seq = self.seq + 1;
+        return out;
+    }
+
+    /// The events for one stream-json line, as script lines; a line that
+    /// says the run failed sets `failure`.
+    @unbounded
+    fn feed(data: String) -> String {
+        if !std::json::valid_object(data) { return ""; }
+        let kind = std::json::find_string_field(data, "type");
+        if kind == "stream_event" {
+            let ev = std::json::find_field_raw(data, "event");
+            if std::json::find_string_field(ev, "type") != "content_block_delta" { return ""; }
+            let d = std::json::find_field_raw(ev, "delta");
+            if std::json::find_string_field(d, "type") != "text_delta" { return ""; }
+            let piece = std::json::string_field(d, "text");
+            if piece.kind != "string" || len(piece.text) == 0 { return ""; }
+            self.partial = true;
+            return self.delta(piece.text);
+        }
+        if kind == "assistant" {
+            let msg = std::str::trim(std::json::find_field_raw(data, "message"));
+            let m = std::json::string_field(msg, "model");
+            if m.kind == "string" && len(m.text) > 0 { self.ran = m.text; }
+            // the finished message repeats what the partial events carried
+            if self.partial { return ""; }
+            let mut out = "";
+            let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(msg, "content")));
+            while !it.done {
+                let t = std::json::string_field(it.element, "text");
+                if std::json::find_string_field(it.element, "type") == "text" && t.kind == "string" && len(t.text) > 0 { out = out + self.delta(t.text); }
+                it = std::json::array_next(it);
+            }
+            return out;
+        }
+        if kind == "result" {
+            self.ended = true;
+            let result = std::json::string_field(data, "result");
+            if std::json::find_bool_field(data, "is_error") {
+                self.failure = "the claude CLI reported an error: " + self.clip(if result.kind == "string" { result.text } else { "no reason given" });
+                self.done = true;
+                return "";
+            }
+            let sr = std::json::string_field(data, "stop_reason");
+            if sr.kind == "string" { self.stop = sr.text; }
+            let usage = std::str::trim(std::json::find_field_raw(data, "usage"));
+            if std::str::starts_with(usage, "{") {
+                self.input = std::json::find_int_field(usage, "input_tokens") + std::json::find_int_field(usage, "cache_creation_input_tokens") + std::json::find_int_field(usage, "cache_read_input_tokens");
+                self.output = std::json::find_int_field(usage, "output_tokens");
+            }
+            // a run that streamed nothing still has its answer
+            if !self.began && result.kind == "string" && len(result.text) > 0 { return self.delta(result.text); }
+            return "";
+        }
+        return "";
+    }
+
+    /// End the run: stop the child if it still runs and say how it went,
+    /// with the events that close the stream as the script.
+    fn finish() -> StaticRun {
+        if !self.exited { std::process::kill(self.child) or discard; }
+        if len(self.dir) > 0 {
+            std::process::run("rm\n-rf\n" + self.dir) or discard;
+            self.dir = "";
+        }
+        let served = if len(self.cfg.model) > 0 { self.cfg.model } else { "claude" };
+        if len(self.failure) > 0 { return StaticRun { outcome: "failed", failure: self.failure, model: served }; }
+        if !self.ended && self.exited && self.code != 0 {
+            let why = if self.code == 127 { "the claude CLI was not found" } else { "the claude CLI exited with code " + to_string(self.code) };
+            let tail = std::str::trim(self.clip(self.err));
+            return StaticRun { outcome: "failed", failure: why + (if len(tail) > 0 { ": " + tail } else { "" }), model: served };
+        }
+        if !self.began { return StaticRun { outcome: "failed", failure: "the claude CLI sent no output", model: served }; }
+        if !self.ended { return StaticRun { outcome: "failed", failure: "the claude CLI ended its stream early", model: served }; }
+        let complete = self.stop != "max_tokens";
+        let state = if complete { "completed" } else { "incomplete" };
+        let input = if self.input < 0 { tokens_of(input_chars(self.req)) } else { self.input };
+        let output = if self.output < 0 { tokens_of(len(self.text)) } else { self.output };
+        let item = message_item(self.item_id, state, self.text, true);
+        let tail = line("{\"type\":\"response.output_text.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"text\":" + q(self.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.content_part.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":" + q(self.text) + ",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 1) + "}")
+            + line("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + item + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
+            + line("{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" }) + ",\"response\":" + response_object(self.id, self.created, state, self.model, self.req, item, usage_object(input, output)) + ",\"sequence_number\":" + to_string(self.seq + 3) + "}");
+        return StaticRun {
+            script: tail,
+            outcome: if complete { "served" } else { "incomplete" },
+            model: if len(self.ran) > 0 { self.ran } else { served },
+            input_tokens: input,
+            output_tokens: output,
+            // flat-rate: the account's own limits are the cap
+            cost_micros: 0
+        };
+    }
+}
+
+fn claude_run_for(id: String, model: String, body: String, c: ClaudeConfig) -> ClaudeRun {
+    return ClaudeRun { cfg: c, id: id, model: model, req: body };
+}
+
+/// Run the CLI to its end, collecting every event: the script of the run.
+@unbounded
+fn run_claude(run: ClaudeRun) -> StaticRun {
+    let script = std::bytes::BytesBuilder { initial_cap: 4096 };
+    run.open();
+    while !run.done {
+        let d = run.next_data();
+        if len(d) > 0 { script.append_str(run.feed(d)); }
+    }
+    let end = run.finish();
+    if end.outcome == "failed" { return end; }
+    script.append_str(end.script);
+    let played = script.snapshot() or b"";
+    return StaticRun { script: std::str::from_bytes(played), outcome: end.outcome, model: end.model, input_tokens: end.input_tokens, output_tokens: end.output_tokens, cost_micros: end.cost_micros };
+}

@@ -236,8 +236,30 @@ locus Session {
         let mut first = -1;
         let compat = engine_kind(self.capabilities, seat.engine) == "openai-compatible";
         let cc = compat_config(seat.config);
+        let cli = engine_kind(self.capabilities, seat.engine) == "claude-cli";
         let mut run = StaticRun { };
-        if compat && compat_streams(cc) {
+        if cli {
+            // the CLI's output is relayed as it arrives, like an http upstream's
+            let cr = claude_run_for(id, model, request, claude_config(seat.config));
+            cr.open();
+            while !cr.done && !self.cancelled {
+                let d = cr.next_data();
+                if len(d) > 0 {
+                    let lines = cr.feed(d);
+                    let lv = std::str::bytes_view(lines);
+                    let mut at = 0;
+                    while at < lv.n {
+                        let e = line_end(lv, at);
+                        let ev = std::str::slice(lv, at, e);
+                        at = e + 1;
+                        if first < 0 && std::str::contains(ev, "response.output_text.delta") { first = (std::time::monotonic_ns() - t0) / 1000000; }
+                        self.client.pub_msg(reply_to + ".event", "", std::bytes::from_string("{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev + "}")) or discard;
+                    }
+                }
+                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
+            }
+            run = cr.finish();
+        } else if compat && compat_streams(cc) {
             // an http upstream is relayed as it arrives: each event leaves
             // as soon as its chunk is complete
             let up = upstream_for(id, model, request, cc);

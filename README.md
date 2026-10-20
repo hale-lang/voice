@@ -16,7 +16,7 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
 
 ```
  caller ──HTTP──▶ api ──NATS──▶ node ──▶ seat (an engine under an account)
-                   │  ▲                   static, openai-compatible, claude-cli, ...
+                   │  ▲                   static, openai-compatible, claude-cli (a login per account), ...
                    ▼  │
                  Postgres ◀── brain (ranks seats into the route table)
 ```

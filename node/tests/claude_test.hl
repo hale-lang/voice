@@ -1,0 +1,153 @@
+// The claude-cli engine: its config, the prompt it sends, and a seat run
+// against a stub `claude` (a shell script printing canned stream-json, with
+// pauses, that checks the token reached its environment). No real CLI, no
+// login, no model.
+import ".." as node;
+
+fn stub_path() -> String {
+    return "/tmp/voice-claude-stub-" + to_string(std::process::pid());
+}
+
+fn last_write_file() -> String {
+    return stub_path() + ".last";
+}
+
+fn write_stub(name: String, body: String) -> String {
+    let path = stub_path() + "-" + name;
+    std::io::fs::write_file(path, "#!/bin/sh\n" + body) or discard;
+    std::process::run("chmod\n+x\n" + path) or discard;
+    return path;
+}
+
+const INIT: String = "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-stub-1\"}";
+const D1: String = "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hel\"}}}";
+const D2: String = "{\"type\":\"stream_event\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"lo\"}}}";
+const MSG: String = "{\"type\":\"assistant\",\"message\":{\"model\":\"claude-stub-1\",\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}}";
+const DONE: String = "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Hello\",\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":3,\"output_tokens\":2}}";
+
+fn run_of(command: String, c: node::ClaudeConfig, ask: String) -> node::ClaudeRun {
+    let r = node::claude_run_for("resp_c1", "voice-1", ask, c);
+    r.command = command;
+    return r;
+}
+
+main locus App {
+    params { }
+    run() {
+        let ask = "{\"model\": \"voice-1\", \"input\": \"hi there\"}";
+        let cfg = node::claude_config("{\"token_vault\": \"voice-test-claude-token\"}");
+        std::test::assert_eq_str(cfg.problem, "", "a valid config");
+
+        // streams: the stub checks the token is in its environment and not
+        // in its argv, reads the prompt, and writes with pauses
+        let good = write_stub("good", "[ \"$CLAUDE_CODE_OAUTH_TOKEN\" = \"sk-ant-oat-stub\" ] || { echo 'no token' >&2; exit 3; }\ncase \"$*\" in *sk-ant-oat-stub*) echo 'token in argv' >&2; exit 4;; esac\ncase \"$*\" in *stream-json*) ;; *) exit 5;; esac\nPROMPT=$(cat)\n[ \"$PROMPT\" = 'hi there' ] || { echo \"prompt: $PROMPT\" >&2; exit 6; }\necho '" + INIT + "'\nsleep 0.3\necho '" + D1 + "'\nsleep 0.3\necho '" + D2 + "'\necho '" + MSG + "'\nsleep 0.3\ndate +%s%N > " + last_write_file() + "\necho '" + DONE + "'\n");
+        let up = run_of(good, cfg, ask);
+        up.open();
+        std::test::assert_eq_str(up.failure, "", "the stub starts: " + up.failure);
+        let mut first_at = -1;
+        let mut script = "";
+        while !up.done {
+            let d = up.next_data();
+            if len(d) > 0 {
+                let lines = up.feed(d);
+                script = script + lines;
+                if first_at < 0 && std::str::contains(lines, "response.output_text.delta") { first_at = std::time::monotonic_ns(); }
+            }
+        }
+        let end = up.finish();
+        std::test::assert_eq_str(end.outcome, "served", "served: " + end.failure);
+        std::test::assert(first_at > 0, "an event was published");
+        let last = std::str::parse_int(std::str::trim(std::io::fs::read_file(last_write_file()) or "0")) or 0;
+        std::test::assert(last > 0, "the stub finished writing");
+        std::test::assert_eq_int((len(script) - len(std::str::replace(script, "\"type\":\"response.output_text.delta\"", ""))) / len("\"type\":\"response.output_text.delta\""), 2, "the assistant message repeats nothing the partial events sent");
+        std::test::assert(std::str::contains(script, "\"delta\":\"Hel\""), "the first delta");
+        std::test::assert(std::str::contains(end.script, "\"text\":\"Hello\""), "the whole text");
+        std::test::assert(std::str::contains(end.script, "\"type\":\"response.completed\""), "and the run completes");
+        std::test::assert_eq_int(end.input_tokens, 10, "input tokens include the cache's");
+        std::test::assert_eq_int(end.output_tokens, 2, "output tokens");
+        std::test::assert_eq_int(end.cost_micros, 0, "flat-rate: the price is 0");
+        std::test::assert_eq_str(end.model, "claude-stub-1", "the model the CLI ran");
+        std::test::assert(!std::str::contains(script + end.script, "sk-ant-oat-stub"), "the token is not played");
+
+        // streamed, not buffered: the first delta arrived before the stub's last write
+        std::io::fs::write_file(last_write_file(), "0") or discard;
+        let up2 = run_of(good, cfg, ask);
+        up2.open();
+        let mut seen_first = -1;
+        while !up2.done {
+            let d = up2.next_data();
+            if len(d) > 0 && seen_first < 0 && std::str::contains(up2.feed(d), "response.output_text.delta") { seen_first = std::time::monotonic_ns(); }
+        }
+        up2.finish();
+        let last2 = std::str::parse_int(std::str::trim(std::io::fs::read_file(last_write_file()) or "0")) or 0;
+        std::test::assert(seen_first > 0 && last2 > 0 && seen_first < last2, "the first event is read before the CLI's last write");
+
+        // without partial events the finished message carries the text
+        let plain = write_stub("plain", "cat >/dev/null\necho '" + MSG + "'\necho '" + DONE + "'\n");
+        let r1 = node::run_claude(run_of(plain, cfg, ask));
+        std::test::assert_eq_str(r1.outcome, "served", "served: " + r1.failure);
+        std::test::assert(std::str::contains(r1.script, "\"delta\":\"Hello\""), "the message becomes a delta");
+
+        // an auth error in the result fails the seat before any output
+        let auth = write_stub("auth", "cat >/dev/null\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"Invalid bearer token\"}'\nexit 1\n");
+        let r2 = node::run_claude(run_of(auth, cfg, ask));
+        std::test::assert(r2.outcome == "failed" && std::str::contains(r2.failure, "Invalid bearer token"), "an auth error fails the seat: " + r2.failure);
+        std::test::assert_eq_int(len(r2.script), 0, "before any output");
+
+        // a nonzero exit before output, with its stderr
+        let boom = write_stub("boom", "cat >/dev/null\necho 'login required' >&2\nexit 2\n");
+        let r3 = node::run_claude(run_of(boom, cfg, ask));
+        std::test::assert(r3.outcome == "failed" && std::str::contains(r3.failure, "code 2") && std::str::contains(r3.failure, "login required"), "a nonzero exit fails the seat: " + r3.failure);
+
+        // a missing binary
+        let r4 = node::run_claude(run_of("/nonexistent/claude", cfg, ask));
+        std::test::assert(r4.outcome == "failed" && std::str::contains(r4.failure, "not found"), "a missing CLI fails the seat: " + r4.failure);
+
+        // output that ends before the result
+        let cut = write_stub("cut", "cat >/dev/null\necho '" + D1 + "'\n");
+        let r5 = node::run_claude(run_of(cut, cfg, ask));
+        std::test::assert(r5.outcome == "failed" && std::str::contains(r5.failure, "early"), "a stream with no result fails: " + r5.failure);
+
+        // no token in the vault
+        let r6 = node::run_claude(run_of(good, node::claude_config("{\"token_vault\": \"voice-test-no-such\"}"), ask));
+        std::test::assert(r6.outcome == "failed" && std::str::contains(r6.failure, "no token"), "an empty vault fails the seat: " + r6.failure);
+
+        // cancel kills the child
+        let slow = write_stub("slow", "echo $$ > " + stub_path() + ".pid\nexec sleep 30\n");
+        let up3 = run_of(slow, cfg, ask);
+        up3.open();
+        std::time::sleep(300ms);
+        let pid = std::str::trim(std::io::fs::read_file(stub_path() + ".pid") or "");
+        std::test::assert(len(pid) > 0, "the child runs");
+        up3.finish();
+        let alive = std::process::run("kill\n-0\n" + pid) or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+        std::test::assert(alive.code != 0, "finish stopped the child");
+        std::process::run("sh\n-c\nrm -f " + stub_path() + "*") or discard;
+    }
+}
+
+fn main() {
+    std::test::assert(len(node::claude_config("{}").problem) > 0, "token_vault is required");
+    std::test::assert(len(node::claude_config("{\"token_vault\": 3}").problem) > 0, "and is a name");
+    std::test::assert_eq_str(node::claude_config("{\"token_vault\": \"t\", \"model\": \"sonnet\"}").model, "sonnet", "a model may be named");
+    let c = node::claude_config("{\"token_vault\": \"t\"}");
+
+    // the prompt and argv
+    std::test::assert_eq_str(node::claude_prompt("{\"instructions\": \"be brief\", \"input\": \"hi\"}"), "be brief\n\nhi", "instructions then input");
+    std::test::assert(std::str::contains(node::claude_prompt("{\"input\": [{\"role\": \"user\", \"content\": \"a\"}, {\"role\": \"assistant\", \"content\": \"b\"}]}"), "user: a\n\nassistant: b"), "items keep their roles");
+    let argv = node::claude_argv(c, "claude", "/tmp/x/token");
+    std::test::assert(std::str::contains(argv, "stream-json") && std::str::contains(argv, "--include-partial-messages") && std::str::contains(argv, "\nclaude\n-p\n"), "the CLI is run in print mode, streaming");
+    std::test::assert(!std::str::contains(argv, "--model"), "no model unless one is named");
+
+    // the node offers the kind and checks its seats
+    let file = "{\"max_in_flight\": 2, \"engines\": [{\"id\": \"claude-work\", \"kind\": \"claude-cli\"}]}";
+    std::test::assert_eq_str(node::capabilities_problem(file), "", "the kind is one this build runs");
+    std::test::assert(std::str::contains(node::declared_capabilities(file), "\"token_vault\""), "and declares its config schema");
+    let assigned = "{\"version\": 1, \"max_in_flight\": 2, \"seats\": [{\"id\": \"a\", \"engine\": \"claude-work\", \"config\": {\"token_vault\": \"claude-work-token\"}}, {\"id\": \"b\", \"engine\": \"claude-work\", \"config\": {}}]}";
+    let seats = node::apply_assignment(assigned, node::declared_capabilities(file), node::LOCAL_DEFAULT);
+    std::test::assert_eq_str(node::seat_of(seats, "a").status, "up", "a seat naming its token is up");
+    std::test::assert_eq_str(node::seat_of(seats, "b").status, "refused", "one without is refused");
+
+    std::io::fs::write_file(std::secret::vault_local_dir() + "/voice-test-claude-token", "sk-ant-oat-stub") or discard;
+    App { };
+}

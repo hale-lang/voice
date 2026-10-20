@@ -232,10 +232,39 @@ locus Session {
         self.looked = std::time::monotonic_ns();
         let t0 = std::time::monotonic_ns();
         let model = std::json::find_string_field(msg, "model");
-        let engine_model = std::json::string_field(msg, "engine_model");
         let request = std::str::trim(std::json::find_field_raw(msg, "body"));
-        let run = if engine_kind(self.capabilities, seat.engine) == "openai-compatible" { run_compat(id, model, request, compat_config(seat.config)) } else { run_static(id, model, if engine_model.kind == "string" { engine_model.text } else { model }, request, static_config(seat.config)) };
         let mut first = -1;
+        let compat = engine_kind(self.capabilities, seat.engine) == "openai-compatible";
+        let cc = compat_config(seat.config);
+        let mut run = StaticRun { };
+        if compat && compat_streams(cc) {
+            // an http upstream is relayed as it arrives: each event leaves
+            // as soon as its chunk is complete
+            let up = upstream_for(id, model, request, cc);
+            up.open(compat_request(request, cc));
+            while !up.done && !self.cancelled {
+                let d = up.next_data();
+                if len(d) > 0 {
+                    let lines = up.feed(d);
+                    let lv = std::str::bytes_view(lines);
+                    let mut at = 0;
+                    while at < lv.n {
+                        let e = line_end(lv, at);
+                        let ev = std::str::slice(lv, at, e);
+                        at = e + 1;
+                        if first < 0 && std::str::contains(ev, "response.output_text.delta") { first = (std::time::monotonic_ns() - t0) / 1000000; }
+                        self.client.pub_msg(reply_to + ".event", "", std::bytes::from_string("{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev + "}")) or discard;
+                    }
+                }
+                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
+            }
+            run = up.finish();
+        } else if compat {
+            run = run_compat(id, model, request, cc);
+        } else {
+            let engine_model = std::json::string_field(msg, "engine_model");
+            run = run_static(id, model, if engine_model.kind == "string" { engine_model.text } else { model }, request, static_config(seat.config));
+        }
         let v = std::str::bytes_view(run.script);
         let mut start = 0;
         while start < v.n && !self.cancelled {

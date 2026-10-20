@@ -10,18 +10,69 @@ fn sse(chunks: String, usage: String, finish: String) -> String {
 
 const HELLO: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\ndata: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n";
 
-locus StubUpstream {
-    params { seen: Int = 0; }
-    fn handle(req: std::http::Request) -> std::http::Response {
-        if req.method != "POST" { return std::http::Response { status: 405, body: "no" }; }
-        if req.path == "/v1/chat/completions" {
-            if std::str::contains(req.headers, "Authorization: Bearer stub-key") && std::str::contains(req.body, "\"stream\":true") && std::str::contains(req.body, "\"model\":\"stub-7b\"") {
-                return std::http::Response { status: 200, content_type: "text/event-stream", body: sse(HELLO, "{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}", "stop") };
-            }
-            return std::http::Response { status: 401, content_type: "application/json", body: "{\"error\":{\"message\":\"bad key\"}}" };
+fn hex(n: Int) -> String {
+    if n < 16 { return substring("0123456789abcdef", n, n + 1); }
+    return hex(n / 16) + substring("0123456789abcdef", n % 16, n % 16 + 1);
+}
+
+fn substring(s: String, lo: Int, hi: Int) -> String {
+    return std::str::substring(s, lo, hi);
+}
+
+fn chunk(s: String) -> String {
+    return hex(len(s)) + "\r\n" + s + "\r\n";
+}
+
+fn last_write_file() -> String {
+    return "/tmp/voice-compat-" + to_string(std::process::pid()) + ".last";
+}
+
+fn answer(s: std::io::tcp::Stream, status: String, body: String) {
+    s.send("HTTP/1.1 " + status + "\r\nContent-Type: application/json\r\nContent-Length: " + to_string(len(body)) + "\r\nConnection: close\r\n\r\n" + body) or discard;
+}
+
+/// The stub upstream: one connection, one canned answer. The streamed one
+/// sends its SSE in several chunked writes, an event cut across two of
+/// them, with a pause between, and notes the time of its last write.
+fn stub_conn(s: std::io::tcp::Stream) {
+    let req = s.recv(65536) or "";
+    if !std::str::starts_with(req, "POST ") { answer(s, "405 Method Not Allowed", "{}"); return; }
+    if std::str::starts_with(req, "POST /v1/chat/completions ") {
+        if std::str::contains(req, "Authorization: Bearer stub-key") && std::str::contains(req, "\"stream\":true") && std::str::contains(req, "\"model\":\"stub-7b\"") {
+            s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n") or discard;
+            let first = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"}}]}\n\n";
+            s.send(chunk(first)) or discard;
+            std::time::sleep(300ms);
+            let second = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n\n";
+            s.send(chunk(second[0..20])) or discard;
+            std::time::sleep(100ms);
+            s.send(chunk(second[20..len(second)])) or discard;
+            std::time::sleep(300ms);
+            std::io::fs::write_file(last_write_file(), to_string(std::time::monotonic_ns())) or discard;
+            s.send(chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"model\":\"stub-7b\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}\n\ndata: [DONE]\n\n") + "0\r\n\r\n") or discard;
+            return;
         }
-        if req.path == "/local/chat/completions" { return std::http::Response { status: 200, content_type: "text/event-stream", body: sse(HELLO, "", "length") }; }
-        return std::http::Response { status: 503, content_type: "application/json", body: "{\"error\":{\"message\":\"model is loading\"}}" };
+        answer(s, "401 Unauthorized", "{\"error\":{\"message\":\"bad key\"}}");
+        return;
+    }
+    if std::str::starts_with(req, "POST /local/chat/completions ") {
+        // no framing: the body runs to the end of the connection
+        s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" + sse(HELLO, "", "length")) or discard;
+        return;
+    }
+    answer(s, "503 Service Unavailable", "{\"error\":{\"message\":\"model is loading\"}}");
+}
+
+/// Takes the stub's connections, one at a time, on a listener the test
+/// bound.
+locus Stub {
+    params { fd: Int = -1; }
+    run() {
+        while true {
+            let conn = std::io::tcp::accept_one(self.fd) or - 1;
+            if conn < 0 { return; }
+            stub_conn(std::io::tcp::Stream { conn_fd: conn });
+        }
     }
 }
 
@@ -40,7 +91,7 @@ fn free_port() -> Int {
 
 main locus App {
     params {
-        srv: std::http::Server = std::http::Server { port: 1, handler: StubUpstream { } };
+        srv: Stub = Stub { };
         base: String = "";
     }
     placement { srv: cooperative(pool = io); }
@@ -62,6 +113,23 @@ main locus App {
         std::test::assert(std::str::contains(run.script, "\"text\":\"Hello\""), "with the whole text");
         std::test::assert(!std::str::contains(run.script, "stub-key"), "the key is not played");
         std::test::assert(std::str::contains(node::result_message("resp_k1", run, 1, 2), "\"usage\":{\"cost_micros\":9}"), "the result carries the cost");
+
+        // streamed: the first event is published before the stub's last write
+        let up = node::upstream_for("resp_k0", "voice-1", ask, keyed);
+        up.open(node::compat_request(ask, keyed));
+        let mut first_at = -1;
+        while !up.done {
+            let d = up.next_data();
+            if len(d) > 0 {
+                let lines = up.feed(d);
+                if first_at < 0 && std::str::contains(lines, "response.output_text.delta") { first_at = std::time::monotonic_ns(); }
+            }
+        }
+        let end = up.finish();
+        let last = std::str::parse_int(std::io::fs::read_file(last_write_file()) or "0") or 0;
+        std::test::assert(first_at > 0 && last > 0 && first_at < last, "the first event is published before the upstream's last write");
+        std::test::assert_eq_str(end.outcome, "served", "and the run ends served: " + end.failure);
+        std::test::assert_eq_int(end.output_tokens, 2, "with the usage of the last chunk");
 
         // the upstream refuses the key: a failure, with nothing played
         let wrong = node::run_compat("resp_k2", "voice-1", ask, node::compat_config("{\"base_url\": \"" + self.base + "/v1\", \"model\": \"stub-7b\"}"));
@@ -118,5 +186,7 @@ fn main() {
     std::io::fs::write_file(std::secret::vault_local_dir() + "/voice-test-key", "stub-key") or discard;
     let port = free_port();
     std::test::assert(port > 0, "a free loopback port");
-    App { srv: std::http::Server { port: port, handler: StubUpstream { } }, base: "http://127.0.0.1:" + to_string(port) };
+    let fd = std::io::tcp::listen_socket("127.0.0.1", port) or - 1;
+    std::test::assert(fd >= 0, "the stub listens");
+    App { srv: Stub { fd: fd }, base: "http://127.0.0.1:" + to_string(port) };
 }

@@ -785,11 +785,16 @@ already there.
   messages to `<base_url>/chat/completions` with `stream: true` and plays
   the upstream's chunks as the standard's events, reporting the upstream's
   final usage and the cost at the seat's price (0 for a local server); its
-  key is read from a vault slot into the request and goes nowhere else. The
-  stdlib client reads a response whole, so the stream is read to its end
-  before its events are published; an unreachable or refusing upstream, an
-  error status or an empty stream fails the seat with nothing published, and
-  the coordinator fails the request over. CLI engines run their CLI as a supervised child process.
+  key is read from a vault slot into the request and goes nowhere else. An
+  http upstream (a local server) is spoken to over `std::io::tcp`: the
+  node writes the POST, reads the status and headers, de-chunks the body as
+  it arrives and publishes each chunk's event as soon as its `data:` line is
+  complete (`[DONE]` or the end of the connection ends the run). An https
+  upstream goes through the stdlib client, which reads a response whole, so
+  it is relayed after it ends until hale's client streams. An unreachable
+  or refusing upstream, an error status or an empty stream fails the seat
+  before any event is published, and the coordinator fails the request over.
+  CLI engines run their CLI as a supervised child process.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls.
 

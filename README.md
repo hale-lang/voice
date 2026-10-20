@@ -30,7 +30,7 @@ body into the row's request and writes the contract's JSON
 
 | Served for real | Endpoints |
 |---|---|
-| health | `GET /healthz`, `GET /readyz` |
+| health | `GET /healthz`, `GET /readyz`; the runtime's own `/healthz`, `/readyz` and `/capacity` on port 9090 (`VOICE_PROBE_PORT`), which a deployment's healthcheck asks |
 | the caller plane | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1/capabilities` (a project key required) |
 | inference | `POST /v1/responses`, `POST /v1/chat/completions`, served by a node's seat over NATS, streamed or not (as SSE with `"stream": true`) |
 | the catalog | `GET`, `POST /admin/v1/models`; `GET`, `PATCH`, `DELETE /admin/v1/models/{model}` |

@@ -23,6 +23,9 @@ locus Nodes {
         // a node that accepts and then sends nothing at all
         mute: String = "";
         tool: String = "";
+        // when set, every seat answers as an openai-compatible one whose
+        // upstream streamed this SSE (a tool call in fragments)
+        compat_sse: String = "";
         // offers finished before their result came (the link sends cancel)
         cancelled: Int = 0;
         offers: Int = 0;
@@ -60,7 +63,8 @@ locus Nodes {
         }
         let model = std::json::find_string_field(body, "model");
         let named = std::json::string_field(body, "engine_model");
-        let run = node::run_static(id, model, if named.kind == "string" { named.text } else { model }, std::str::trim(std::json::find_field_raw(body, "body")), node::static_config(if len(self.tool) > 0 { "{\"text\": \"hello from voice\", \"tool_call\": {\"name\": \"" + self.tool + "\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}}" } else { "{\"text\": \"hello from voice\", \"chunk_chars\": 8}" }));
+        let cfg = node::compat_config("{\"base_url\": \"http://upstream.test/v1\", \"model\": \"stub-7b\"}");
+        let run = if len(self.compat_sse) > 0 { node::compat_play(id, model, "stub-7b", std::str::trim(std::json::find_field_raw(body, "body")), cfg, 200, self.compat_sse) } else { node::run_static(id, model, if named.kind == "string" { named.text } else { model }, std::str::trim(std::json::find_field_raw(body, "body")), node::static_config(if len(self.tool) > 0 { "{\"text\": \"hello from voice\", \"tool_call\": {\"name\": \"" + self.tool + "\", \"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}}" } else { "{\"text\": \"hello from voice\", \"chunk_chars\": 8}" })) };
         self.script = run.script;
         self.result = node::result_message(id, run, 0, 0);
         if to == self.dying {
@@ -127,7 +131,30 @@ fn streamed_with_sse(e: api::Endpoints, key: String, nodes: Nodes) {
     std::test::assert(std::str::contains(t.body, "\"tool_calls\": [{\"index\": 0, \"id\": \"call_") && std::str::contains(t.body, "\"name\": \"weather\""), "a tool call streamed as one");
     std::test::assert(std::str::contains(t.body, "\"function\": {\"arguments\": \"{\\\"city\\\": \\\"Oslo\\\"}\"}") && std::str::contains(t.body, "\"finish_reason\": \"tool_calls\""), "its arguments, and the finish");
     nodes.tool = "";
+
+    // an openai-compatible seat's tool call, split across upstream chunks
+    nodes.compat_sse = FRAGMENTED_CALL;
+    let f = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"weather?\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"lookup\"}}], \"stream\": true}");
+    std::test::assert(std::str::contains(f.body, "\"tool_calls\": [{\"index\": 0, \"id\": \"call_9\", \"type\": \"function\", \"function\": {\"name\": \"lookup\", \"arguments\": \"\"}}]"), "the call opens with its id and name: " + f.body);
+    std::test::assert(std::str::contains(f.body, "\"function\": {\"arguments\": \"{\\\"ci\"}") && std::str::contains(f.body, "\"function\": {\"arguments\": \"ty\\\":\\\"Os\"}") && std::str::contains(f.body, "\"function\": {\"arguments\": \"lo\\\"}\"}"), "its arguments in the upstream's fragments");
+    std::test::assert(std::str::contains(f.body, "\"finish_reason\": \"tool_calls\""), "and the finish");
+    let w = ask(e, "/v1/chat/completions", key, "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"weather?\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"lookup\"}}]}");
+    let w_choice = std::json::array_first(std::json::find_field_raw(w.body, "choices")).element;
+    std::test::assert_eq_str(std::json::find_string_field(w_choice, "finish_reason"), "tool_calls", "whole: stopped for its call");
+    let w_call = std::json::array_first(std::json::find_field_raw(std::json::find_field_raw(w_choice, "message"), "tool_calls")).element;
+    std::test::assert_eq_str(std::json::find_string_field(w_call, "id"), "call_9", "whole: its id");
+    std::test::assert_eq_str(std::json::find_string_field(std::json::find_field_raw(w_call, "function"), "arguments"), "{\"city\":\"Oslo\"}", "whole: the fragments joined");
+    let r = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"weather?\", \"tools\": [{\"type\": \"function\", \"name\": \"lookup\"}]}");
+    std::test::assert(std::str::contains(r.body, "\"type\":\"function_call\"") && std::str::contains(r.body, "\"call_id\":\"call_9\""), "a response carries the function_call item");
+    nodes.compat_sse = "";
 }
+
+/// An upstream's stream of one tool call, its arguments in fragments.
+const FRAGMENTED_CALL: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"ci\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ty\\\":\\\"Os\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"lo\\\"}\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
 
 /// A stream whose seat dies once it has begun ends with the evidence; a
 /// caller that goes away ends the stream at once, the seat told to stop.

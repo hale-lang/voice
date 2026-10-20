@@ -59,9 +59,60 @@ fn chat_message(role: String, text: String) -> String {
     return "{\"role\":" + q(role) + ",\"content\":" + q(text) + "}";
 }
 
+/// Whether a standard request carries `tools`: only an engine that
+/// speaks tool calls can take it.
+fn request_has_tools(body: String) -> Bool {
+    let tools = std::str::trim(std::json::find_field_raw(body, "tools"));
+    if !std::str::starts_with(tools, "[") { return false; }
+    return !std::json::array_first(tools).done;
+}
+
+/// A standard function tool as the chat-completions wire's, the schema
+/// carried byte for byte.
+fn chat_tool(t: String) -> String {
+    let mut f = "{\"name\":" + q(std::json::find_string_field(t, "name"));
+    if std::json::string_field(t, "description").kind == "string" { f = f + ",\"description\":" + q(std::json::find_string_field(t, "description")); }
+    if std::json::string_field(t, "parameters").kind == "object" { f = f + ",\"parameters\":" + std::str::trim(std::json::find_field_raw(t, "parameters")); }
+    if std::json::string_field(t, "strict").kind == "bool" { f = f + ",\"strict\":" + std::str::trim(std::json::find_field_raw(t, "strict")); }
+    return "{\"type\":\"function\",\"function\":" + f + "}}";
+}
+
+/// The standard's `tools` as a chat-completions list.
+@unbounded
+fn chat_tools(tools: String) -> String {
+    let mut out = "";
+    let mut it = std::json::array_first(tools);
+    while !it.done {
+        let t = std::str::trim(it.element);
+        if std::json::find_string_field(t, "type") == "function" { out = out + (if len(out) > 0 { "," } else { "" }) + chat_tool(t); }
+        it = std::json::array_next(it);
+    }
+    return "[" + out + "]";
+}
+
+/// `tool_choice` on the chat wire: a mode as it is, a named function as
+/// that wire names one.
+fn chat_tool_choice(body: String) -> String {
+    let kind = std::json::string_field(body, "tool_choice").kind;
+    if kind == "string" { return q(std::json::find_string_field(body, "tool_choice")); }
+    let name = std::json::find_string_field(std::json::find_field_raw(body, "tool_choice"), "name");
+    return "{\"type\":\"function\",\"function\":{\"name\":" + q(name) + "}}";
+}
+
+fn add_message(messages: String, m: String) -> String {
+    return messages + (if len(messages) > 0 { "," } else { "" }) + m;
+}
+
+/// An assistant's turn of tool calls, as one message.
+fn calls_message(calls: String) -> String {
+    return "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[" + calls + "]}";
+}
+
 /// The chat-completions request for a standard request body: its
 /// `instructions` as a system message, its `input` (a text, or items with a
-/// role and content) as the rest, and the output cap.
+/// role and content, calls and their outputs) as the rest, its tools, and
+/// the output cap. A run of `function_call` items is one assistant message
+/// with `tool_calls`; a `function_call_output` is a `tool` message.
 @unbounded
 fn compat_request(body: String, c: CompatConfig) -> String {
     let mut messages = "";
@@ -69,19 +120,39 @@ fn compat_request(body: String, c: CompatConfig) -> String {
     if instructions.kind == "string" && len(instructions.text) > 0 { messages = chat_message("system", instructions.text); }
     let input = std::json::string_field(body, "input");
     if input.kind == "string" {
-        messages = messages + (if len(messages) > 0 { "," } else { "" }) + chat_message("user", input.text);
+        messages = add_message(messages, chat_message("user", input.text));
     } else {
+        let mut calls = "";
         let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(body, "input")));
         while !it.done {
-            let role = std::json::string_field(it.element, "role");
-            let text = content_text(std::json::find_field_raw(it.element, "content"));
-            if role.kind == "string" {
-                messages = messages + (if len(messages) > 0 { "," } else { "" }) + chat_message(role.text, text);
+            let kind = std::json::find_string_field(it.element, "type");
+            if kind == "function_call" {
+                calls = calls + (if len(calls) > 0 { "," } else { "" }) + "{\"id\":" + q(std::json::find_string_field(it.element, "call_id")) + ",\"type\":\"function\",\"function\":{\"name\":" + q(std::json::find_string_field(it.element, "name")) + ",\"arguments\":" + q(std::json::find_string_field(it.element, "arguments")) + "}}";
+            } else {
+                if len(calls) > 0 {
+                    messages = add_message(messages, calls_message(calls));
+                    calls = "";
+                }
+                if kind == "function_call_output" {
+                    let out = std::json::string_field(it.element, "output");
+                    let text = if out.kind == "string" { out.text } else { content_text(std::json::find_field_raw(it.element, "output")) };
+                    messages = add_message(messages, "{\"role\":\"tool\",\"tool_call_id\":" + q(std::json::find_string_field(it.element, "call_id")) + ",\"content\":" + q(text) + "}");
+                } else {
+                    let role = std::json::string_field(it.element, "role");
+                    let text = content_text(std::json::find_field_raw(it.element, "content"));
+                    if role.kind == "string" { messages = add_message(messages, chat_message(role.text, text)); }
+                }
             }
             it = std::json::array_next(it);
         }
+        if len(calls) > 0 { messages = add_message(messages, calls_message(calls)); }
     }
     let mut out = "{\"model\":" + q(c.model) + ",\"messages\":[" + messages + "],\"stream\":true,\"stream_options\":{\"include_usage\":true}";
+    if request_has_tools(body) {
+        out = out + ",\"tools\":" + chat_tools(std::str::trim(std::json::find_field_raw(body, "tools")));
+        if std::json::string_field(body, "tool_choice").kind != "missing" && std::json::string_field(body, "tool_choice").kind != "null" { out = out + ",\"tool_choice\":" + chat_tool_choice(body); }
+        if std::json::string_field(body, "parallel_tool_calls").kind == "bool" { out = out + ",\"parallel_tool_calls\":" + std::str::trim(std::json::find_field_raw(body, "parallel_tool_calls")); }
+    }
     if std::json::string_field(body, "max_output_tokens").kind == "number" { out = out + ",\"max_tokens\":" + to_string(std::json::find_int_field(body, "max_output_tokens")); }
     if std::json::string_field(body, "temperature").kind == "number" { out = out + ",\"temperature\":" + member_or(body, "temperature", "1"); }
     return out + "}";
@@ -174,6 +245,22 @@ locus Upstream {
         input: Int = -1;
         output: Int = -1;
         began: Bool = false;
+        // the message item (text) is open, and is closed
+        text_open: Bool = false;
+        text_closed: Bool = false;
+        // output items opened so far, and the finished ones as a list body
+        nout: Int = 0;
+        done_items: String = "";
+        // the tool call being built: the upstream's index for it (-1 for
+        // none), its item, call id, name and the arguments so far
+        call_at: Int = -1;
+        call_out: Int = 0;
+        call_item: String = "";
+        call_id: String = "";
+        call_name: String = "";
+        call_args: String = "";
+        calls: Int = 0;
+        args_len: Int = 0;
     }
 
     /// The request through the stdlib client, whole (https).
@@ -350,23 +437,124 @@ locus Upstream {
         if choice.done { return ""; }
         let fr = std::json::string_field(choice.element, "finish_reason");
         if fr.kind == "string" { self.finish_reason = fr.text; }
-        let piece = std::json::string_field(std::json::find_field_raw(choice.element, "delta"), "content");
-        if piece.kind != "string" || len(piece.text) == 0 { return ""; }
+        let delta = std::json::find_field_raw(choice.element, "delta");
         let mut out = "";
-        if !self.began {
-            self.began = true;
-            self.created = std::time::unix(std::time::current());
-            self.item_id = "msg_" + (if std::str::starts_with(self.id, "resp_") { self.id[5..len(self.id)] } else { self.id });
-            let pending = response_object(self.id, self.created, "in_progress", self.model, self.req, "", "null");
-            out = line("{\"type\":\"response.created\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq) + "}")
-                + line("{\"type\":\"response.in_progress\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq + 1) + "}")
-                + line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(self.item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
-                + line("{\"type\":\"response.content_part.added\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 3) + "}");
-            self.seq = self.seq + 4;
+        let piece = std::json::string_field(delta, "content");
+        if piece.kind == "string" && len(piece.text) > 0 && self.calls == 0 {
+            out = self.preamble() + self.open_text();
+            self.text = self.text + piece.text;
+            out = out + line("{\"type\":\"response.output_text.delta\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"delta\":" + q(piece.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}");
+            self.seq = self.seq + 1;
         }
-        self.text = self.text + piece.text;
-        out = out + line("{\"type\":\"response.output_text.delta\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"delta\":" + q(piece.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}");
-        self.seq = self.seq + 1;
+        let tcs = std::str::trim(std::json::find_field_raw(delta, "tool_calls"));
+        if std::str::starts_with(tcs, "[") {
+            let mut it = std::json::array_first(tcs);
+            while !it.done && len(self.failure) == 0 {
+                out = out + self.tool_fragment(std::str::trim(it.element));
+                it = std::json::array_next(it);
+            }
+        }
+        return out;
+    }
+
+    /// The events that begin the response, once.
+    @unbounded
+    fn preamble() -> String {
+        if self.began { return ""; }
+        self.began = true;
+        self.created = std::time::unix(std::time::current());
+        self.item_id = "msg_" + self.suffix();
+        let pending = response_object(self.id, self.created, "in_progress", self.model, self.req, "", "null");
+        let out = line("{\"type\":\"response.created\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.in_progress\",\"response\":" + pending + ",\"sequence_number\":" + to_string(self.seq + 1) + "}");
+        self.seq = self.seq + 2;
+        return out;
+    }
+
+    @unbounded
+    fn suffix() -> String {
+        return if std::str::starts_with(self.id, "resp_") { self.id[5..len(self.id)] } else { self.id };
+    }
+
+    /// The events that open the message item, once.
+    @unbounded
+    fn open_text() -> String {
+        if self.text_open { return ""; }
+        self.text_open = true;
+        self.nout = 1;
+        let out = line("{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":" + message_item(self.item_id, "in_progress", "", false) + ",\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.content_part.added\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 1) + "}");
+        self.seq = self.seq + 2;
+        return out;
+    }
+
+    /// The events that close the message item, when it is open.
+    @unbounded
+    fn close_text(state: String) -> String {
+        if !self.text_open || self.text_closed { return ""; }
+        self.text_closed = true;
+        let item = message_item(self.item_id, state, self.text, true);
+        self.done_items = item;
+        let out = line("{\"type\":\"response.output_text.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"text\":" + q(self.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.content_part.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":" + q(self.text) + ",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 1) + "}")
+            + line("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + item + ",\"sequence_number\":" + to_string(self.seq + 2) + "}");
+        self.seq = self.seq + 3;
+        return out;
+    }
+
+    /// The events that close the tool call being built, when there is one.
+    @unbounded
+    fn close_call() -> String {
+        if self.call_at < 0 { return ""; }
+        let item = function_call_item(self.call_item, self.call_id, self.call_name, self.call_args, "completed");
+        self.done_items = self.done_items + (if len(self.done_items) > 0 { "," } else { "" }) + item;
+        let out = line("{\"type\":\"response.function_call_arguments.done\",\"item_id\":" + q(self.call_item) + ",\"output_index\":" + to_string(self.call_out) + ",\"arguments\":" + q(self.call_args) + ",\"sequence_number\":" + to_string(self.seq) + "}")
+            + line("{\"type\":\"response.output_item.done\",\"output_index\":" + to_string(self.call_out) + ",\"item\":" + item + ",\"sequence_number\":" + to_string(self.seq + 1) + "}");
+        self.seq = self.seq + 2;
+        self.call_at = -1;
+        return out;
+    }
+
+    /// One fragment of an upstream tool call: a new index opens a call (the
+    /// one before it is whole), and its argument text is relayed as it
+    /// arrives. The upstream sends calls in index order.
+    @unbounded
+    fn tool_fragment(f: String) -> String {
+        let at = std::json::string_field(f, "index");
+        let idx = if at.kind == "number" { std::json::find_int_field(f, "index") } else { if self.call_at < 0 { 0 } else { self.call_at } };
+        let fn_raw = std::str::trim(std::json::find_field_raw(f, "function"));
+        let name = std::json::find_string_field(fn_raw, "name");
+        let mut out = "";
+        if idx != self.call_at {
+            if idx < self.call_at {
+                self.failure = "the upstream interleaved its tool calls";
+                self.done = true;
+                return "";
+            }
+            out = self.preamble() + self.close_text("completed") + self.close_call();
+            self.call_at = idx;
+            self.call_out = self.nout;
+            self.nout = self.nout + 1;
+            self.calls = self.calls + 1;
+            self.call_item = "fc_" + self.suffix() + "_" + to_string(idx);
+            let given = std::json::find_string_field(f, "id");
+            self.call_id = if len(given) > 0 { given } else { "call_" + self.suffix() + "_" + to_string(idx) };
+            self.call_name = name;
+            self.call_args = "";
+            out = out + line("{\"type\":\"response.output_item.added\",\"output_index\":" + to_string(self.call_out) + ",\"item\":" + function_call_item(self.call_item, self.call_id, self.call_name, "", "in_progress") + ",\"sequence_number\":" + to_string(self.seq) + "}");
+            self.seq = self.seq + 1;
+        } else if len(name) > 0 && len(self.call_name) == 0 {
+            self.call_name = name;
+        }
+        // arguments are a JSON text in fragments; some servers send an object whole
+        let akind = std::json::string_field(fn_raw, "arguments").kind;
+        let args = if akind == "string" { std::json::find_string_field(fn_raw, "arguments") } else if akind == "object" || akind == "array" { std::str::trim(std::json::find_field_raw(fn_raw, "arguments")) } else { "" };
+        if len(args) > 0 {
+            self.call_args = self.call_args + args;
+            self.args_len = self.args_len + len(args);
+            out = out + line("{\"type\":\"response.function_call_arguments.delta\",\"item_id\":" + q(self.call_item) + ",\"output_index\":" + to_string(self.call_out) + ",\"delta\":" + q(args) + ",\"sequence_number\":" + to_string(self.seq) + "}");
+            self.seq = self.seq + 1;
+        }
         return out;
     }
 
@@ -383,14 +571,11 @@ locus Upstream {
         let complete = self.finish_reason != "length";
         let state = if complete { "completed" } else { "incomplete" };
         let input = if self.input < 0 { tokens_of(input_chars(self.req)) } else { self.input };
-        let output = if self.output < 0 { tokens_of(len(self.text)) } else { self.output };
-        let item = message_item(self.item_id, state, self.text, true);
-        let tail = line("{\"type\":\"response.output_text.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"text\":" + q(self.text) + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}")
-            + line("{\"type\":\"response.content_part.done\",\"item_id\":" + q(self.item_id) + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":" + q(self.text) + ",\"annotations\":[]},\"sequence_number\":" + to_string(self.seq + 1) + "}")
-            + line("{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + item + ",\"sequence_number\":" + to_string(self.seq + 2) + "}")
-            + line("{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" }) + ",\"response\":" + response_object(self.id, self.created, state, self.model, self.req, item, usage_object(input, output)) + ",\"sequence_number\":" + to_string(self.seq + 3) + "}");
+        let output = if self.output < 0 { tokens_of(len(self.text) + self.args_len) } else { self.output };
+        let tail = self.close_text(state) + self.close_call();
+        let end = line("{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" }) + ",\"response\":" + response_object(self.id, self.created, state, self.model, self.req, self.done_items, usage_object(input, output)) + ",\"sequence_number\":" + to_string(self.seq) + "}");
         return StaticRun {
-            script: tail,
+            script: tail + end,
             outcome: if complete { "served" } else { "incomplete" },
             model: if len(self.ran) > 0 { self.ran } else { served },
             input_tokens: input,

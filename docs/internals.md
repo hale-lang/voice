@@ -789,7 +789,7 @@ already there.
   http upstream (a local server) is spoken to over `std::io::tcp`: the
   node writes the POST, reads the status and headers, de-chunks the body as
   it arrives and publishes each chunk's event as soon as its `data:` line is
-  complete (`[DONE]` or the end of the connection ends the run). An https
+  complete (the run is whole when `[DONE]` arrives, the terminal chunk of a chunked body does, or Content-Length bytes have been read; a connection that ends or stays silent for 120 s before that fails the run). An https
   upstream goes through the stdlib client, which reads a response whole, so
   it is relayed after it ends until hale's client streams. An unreachable
   or refusing upstream, an error status or an empty stream fails the seat

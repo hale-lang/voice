@@ -60,6 +60,11 @@ fn stub_conn(s: std::io::tcp::Stream) {
         s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n" + sse(HELLO, "", "length")) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /cut/chat/completions ") {
+        // closes mid-stream: one event, no terminal chunk, no [DONE]
+        s.send("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n" + chunk("data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n")) or discard;
+        return;
+    }
     answer(s, "503 Service Unavailable", "{\"error\":{\"message\":\"model is loading\"}}");
 }
 
@@ -71,7 +76,9 @@ locus Stub {
         while true {
             let conn = std::io::tcp::accept_one(self.fd) or - 1;
             if conn < 0 { return; }
-            stub_conn(std::io::tcp::Stream { conn_fd: conn });
+            stub_conn(std::io::tcp::Stream { conn_fd: conn, owns_fd: false });
+            // the stub's answer ends with the connection
+            std::io::tcp::close_fd(conn);
         }
     }
 }
@@ -144,6 +151,9 @@ main locus App {
         std::test::assert_eq_str(local.outcome, "incomplete", "finish_reason length is incomplete");
         std::test::assert_eq_int(local.cost_micros, 0, "a local seat costs nothing");
         std::test::assert_eq_int(local.output_tokens, 2, "tokens estimated when the upstream gives no usage");
+        let cut = node::run_compat("resp_k6", "voice-1", ask, node::compat_config("{\"base_url\": \"" + self.base + "/cut\", \"model\": \"stub-7b\"}"));
+        std::test::assert_eq_str(cut.outcome, "failed", "a stream that closes before its end fails the run");
+        std::test::assert(std::str::contains(cut.failure, "early"), "and says so: " + cut.failure);
         let nobody = node::run_compat("resp_k5", "voice-1", ask, node::compat_config("{\"base_url\": \"http://127.0.0.1:1\", \"model\": \"stub-7b\"}"));
         std::test::assert(nobody.outcome == "failed" && std::str::contains(nobody.failure, "could not be reached"), "an unreachable upstream fails the seat");
     }

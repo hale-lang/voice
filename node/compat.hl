@@ -4,11 +4,9 @@
 // becomes `messages`; the upstream is asked for a stream; its chunks come
 // back as the standard's events, the same ones the static engine emits.
 //
-// An http upstream (a local server) is spoken to over std::io::tcp and
-// relayed as it arrives: each chunk's event is published as soon as its
-// `data:` line is complete. An https upstream goes through the stdlib
-// client, which reads a response whole, so it is relayed after it ends
-// until hale's client streams.
+// The upstream, http or https, is read with the stdlib client's
+// `std::http::SseReader`, an event at a time, and relayed as it arrives: each
+// chunk's event is published as soon as it is read.
 
 /// A seat's openai-compatible config. `problem` is why it is not one, ""
 /// when it is.
@@ -239,29 +237,6 @@ fn compat_failed(c: CompatConfig, served: String, why: String) -> StaticRun {
     return StaticRun { outcome: "failed", failure: why, model: served };
 }
 
-/// The hex number a chunk-size line starts with, -1 if it has none.
-fn hex_size(line: String) -> Int {
-    let v = std::str::bytes_view(line);
-    let mut n = 0;
-    let mut i = 0;
-    while i < v.n {
-        let b = std::str::byte_at(v, i);
-        let d = if b >= 48 && b <= 57 {
-            b - 48
-        } else if b >= 97 && b <= 102 {
-            b - 87
-        } else if b >= 65 && b <= 70 {
-            b - 55
-        } else {
-                -1
-        };
-        if d < 0 { break; }
-        n = n * 16 + d;
-        i = i + 1;
-    }
-    return if i == 0 { -1 } else { n };
-}
-
 /// The payload of one SSE event block: its `data:` lines joined by newlines.
 @unbounded
 fn sse_data(block: String) -> String {
@@ -281,7 +256,149 @@ fn sse_data(block: String) -> String {
     return out;
 }
 
-/// One run on an upstream: the connection (for an http upstream), the
+/// What a source of upstream events gave: an event's payload, or the end of
+/// the stream, or why it failed.
+type Datum {
+    data: String = "";
+    ended: Bool = false;
+    failure: String = "";
+}
+
+/// The whole run of an exchange is bounded, not each read: a model that
+/// thinks for minutes is waited for, a hung one is not waited for for ever.
+const COMPAT_TOTAL_MS: Int = 1800000;
+
+/// The upstream's stream off the wire. Birth dials and reads the head.
+locus HttpSse {
+    params {
+        url: String = "";
+        request: String = "";
+        vault: String = "";
+        // the exchange, begun by `open`; until then a reader of a port nobody serves
+        rd: std::http::SseReader = std::http::SseReader {
+            req: std::http::ClientRequest {
+                method: "GET",
+                url: std::http::parse_url("http://127.0.0.1:1/") or std::http::Url { },
+                body: b"",
+            },
+        };
+        // a keyed upstream is read whole (see `open`)
+        keyed: Bool = false;
+        canned: CannedSse = CannedSse { };
+    }
+
+    /// The exchange with the upstream, begun.
+    @unbounded
+    fn open() {
+        let parsed = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
+        let headers = "Content-Type: application/json";
+        if len(self.vault) > 0 {
+            // KNOWN GAP (hale #1719): the checker does not yet take a reader's
+            // request as a wire write, so a revealed key cannot be written into
+            // an `SseReader`. A keyed upstream is read whole through
+            // `std::http::request`, where it can, and relayed after it ends.
+            self.keyed = true;
+            let r = self.whole(parsed);
+            self.canned = CannedSse {
+                status: r.status,
+                body: std::str::replace(std::str::from_bytes(r.body), "\r\n", "\n"),
+            };
+            if r.status == 0 {
+                self.canned = CannedSse { status: 0 };
+            }
+            return;
+        }
+        self.rd = std::http::SseReader {
+            req: std::http::ClientRequest {
+                method: "POST",
+                url: parsed,
+                headers: headers,
+                body: std::bytes::from_string(self.request),
+            },
+            timeout_ms: COMPAT_TOTAL_MS,
+        };
+    }
+
+    /// The keyed request through the stdlib client, whole.
+    @unbounded
+    fn whole(parsed: std::http::Url) -> std::http::ClientResponse {
+        let credential = std::secret::Credential { vault: self.vault };
+        return std::http::request(
+            std::http::ClientRequest {
+                method: "POST",
+                url: parsed,
+                headers: "Content-Type: application/json\r\nAccept: text/event-stream\r\nAuthorization: Bearer "
+                    + credential.reveal_text(),
+                body: std::bytes::from_string(self.request),
+            },
+        ) or std::http::ClientResponse { status: 0, body: b"" };
+    }
+
+    @unbounded
+    fn next() -> Datum {
+        if self.keyed {
+            if self.canned.status == 0 {
+                return Datum { failure: "the upstream at " + self.url + " could not be reached" };
+            }
+            return self.canned.next();
+        }
+        if self.rd.body.status == 0 {
+            return Datum { failure: "the upstream at " + self.url + " could not be reached" };
+        }
+        if self.rd.body.status < 200 || self.rd.body.status >= 300 {
+            let text = std::bytes::BytesBuilder { initial_cap: 1024 };
+            let mut reading = true;
+            while reading {
+                let piece = self.rd.body.chunk() or b"";
+                if len(piece) == 0 { reading = false; } else { text.append(piece); }
+            }
+            let body = std::str::from_bytes(text.snapshot() or b"");
+            return error_datum(self.rd.body.status, body);
+        }
+        let e = self.rd.event() or {
+            if err.kind == "end" { return Datum { ended: true }; }
+            return Datum { failure: "the upstream ended its stream early" };
+        };
+        if e.data == "[DONE]" { return Datum { ended: true }; }
+        return Datum { data: e.data };
+    }
+}
+
+/// An error answer's message, as the failure of the seat.
+fn error_datum(status: Int, body: String) -> Datum {
+    let err = std::json::find_string_field(std::json::find_field_raw(body, "error"), "message");
+    return Datum {
+        failure: "the upstream answered " + to_string(status)
+            + (if len(err) > 0 { ": " + err } else { "" })
+    };
+}
+
+/// An answer already in hand: its status and its `text/event-stream` body.
+locus CannedSse {
+    params {
+        status: Int = 200;
+        body: String = "";
+    }
+
+    @unbounded
+    fn next() -> Datum {
+        if self.status < 200 || self.status >= 300 { return error_datum(self.status, self.body); }
+        while true {
+            let at = std::str::index_of(self.body, "\n\n");
+            if at < 0 { break; }
+            let d = sse_data(self.body[0..at]);
+            self.body = self.body[(at + 2)..len(self.body)];
+            if d == "[DONE]" { return Datum { ended: true }; }
+            if len(d) > 0 { return Datum { data: d }; }
+        }
+        let d = sse_data(self.body);
+        self.body = "";
+        if len(d) == 0 || d == "[DONE]" { return Datum { ended: true }; }
+        return Datum { data: d };
+    }
+}
+
+/// One run on an upstream: the source of its events, the
 /// stream read off it, and the events built from the stream so far. The
 /// key is read from its vault slot into the request it is written into and
 /// goes nowhere else: not a log line, not an event.
@@ -293,22 +410,11 @@ locus Upstream {
         id: String = "";
         model: String = "";
         req: String = "";
-        // the connection and what has been read off it
-        fd: Int = -1;
-        raw: String = "";
-        body: String = "";
-        head_done: Bool = false;
-        chunked: Bool = false;
-        chunk_left: Int = 0;
-        skip_crlf: Int = 0;
-        // a read came back empty: the connection ended, or its idle window passed
-        eof: Bool = false;
-        // the framing says the body is whole
-        complete: Bool = false;
-        content_length: Int = -1;
-        received: Int = 0;
+        // where the events come from: the wire, or an answer in hand
+        use_wire: Bool = false;
+        wire: HttpSse = HttpSse { };
+        canned: CannedSse = CannedSse { };
         done: Bool = false;
-        status: Int = 0;
         failure: String = "";
         // the events built
         item_id: String = "";
@@ -338,193 +444,21 @@ locus Upstream {
         args_len: Int = 0;
     }
 
-    /// The request through the stdlib client, whole (https).
-    fn post(request: String) -> std::http::ClientResponse {
-        let parsed = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
-        let none = std::http::ClientResponse { status: 0, body: b"" };
-        if len(parsed.host) == 0 { return none; }
-        let headers = "Content-Type: application/json\r\nAccept: text/event-stream";
-        if len(self.vault) > 0 {
-            let credential = std::secret::Credential { vault: self.vault };
-            return std::http::request(
-                std::http::ClientRequest {
-                    method: "POST",
-                    url: parsed,
-                    headers: headers + "\r\nAuthorization: Bearer " + credential.reveal_text(),
-                    body: std::bytes::from_string(request),
-                },
-            ) or none;
-        }
-        return std::http::request(
-            std::http::ClientRequest {
-                method: "POST",
-                url: parsed,
-                headers: headers,
-                body: std::bytes::from_string(request),
-            },
-        ) or none;
-    }
-
-    /// Dial the upstream and send the request; a failure is `failure`.
-    fn open(request: String) {
-        let u = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
-        let fd = if len(u.host) == 0 {
-                -1
-        } else {
-            std::io::tcp::connect_within(u.host, u.port, 5s) or - 1
-        };
-        if fd < 0 {
-            self.failure = "the upstream at " + self.url + " could not be reached";
-            self.done = true;
-            return;
-        }
-        self.fd = fd;
-        std::io::tcp::set_recv_timeout(fd, COMPAT_IDLE_MS * 1ms) or discard;
-        let s = std::io::tcp::Stream { conn_fd: fd, owns_fd: false };
-        let head = "POST " + u.path + " HTTP/1.1\r\nHost: " + u.host + ":" + to_string(u.port)
-            + "\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nConnection: close\r\nContent-Length: "
-            + to_string(len(request));
-        if len(self.vault) > 0 {
-            let credential = std::secret::Credential { vault: self.vault };
-            s.send(
-                head + "\r\nAuthorization: Bearer " + credential.reveal_text() + "\r\n\r\n"
-                    + request,
-            ) or self.fail_send();
-        } else {
-            s.send(head + "\r\n\r\n" + request) or self.fail_send();
-        }
-    }
-
-    fn fail_send() {
-        self.failure = "the upstream at " + self.url + " took no request";
-        self.done = true;
-    }
-
-    /// Read what has arrived, once (a wait of at most the idle window), into
-    /// the decoded body. An empty read is the end of the connection or the
-    /// window passing; either way nothing more is coming.
-    @unbounded
-    fn pump() {
-        if self.fd >= 0 && !self.eof {
-            let s = std::io::tcp::Stream { conn_fd: self.fd, owns_fd: false };
-            let got = s.recv(65536) or "";
-            if len(got) > 0 {
-                self.raw = self.raw + got;
-            } else {
-                self.eof = true;
-            }
-        }
-        if !self.head_done {
-            let he = std::str::index_of(self.raw, "\r\n\r\n");
-            if he < 0 { return; }
-            let head = self.raw[0..he];
-            self.raw = self.raw[(he + 4)..len(self.raw)];
-            self.head_done = true;
-            self.status = std::str::parse_int(std::str::trim(head[9..12])) or 0;
-            let lowered = std::str::lower(head);
-            self.chunked = std::str::contains(lowered, "transfer-encoding: chunked");
-            let cl = std::str::index_of(lowered, "content-length:");
-            if cl >= 0 && !self.chunked {
-                let rest = lowered[(cl + 15)..len(lowered)];
-                let end = std::str::index_of(rest, "\r\n");
-                self.content_length = std::str::parse_int(
-                    std::str::trim(if end < 0 { rest } else { rest[0..end] }),
-                ) or
-                    - 1;
-            }
-        }
-        if !self.chunked {
-            self.body = self.body + self.raw;
-            self.received = self.received + len(self.raw);
-            self.raw = "";
-            if self.content_length >= 0 && self.received >= self.content_length {
-                self.complete = true;
-            }
-        } else {
-            while len(self.raw) > 0 {
-                if self.skip_crlf > 0 {
-                    let n = if self.skip_crlf < len(self.raw) {
-                        self.skip_crlf
-                    } else {
-                        len(self.raw)
-                    };
-                    self.raw = self.raw[n..len(self.raw)];
-                    self.skip_crlf = self.skip_crlf - n;
-                } else if self.chunk_left == 0 {
-                    let e = std::str::index_of(self.raw, "\r\n");
-                    if e < 0 { break; }
-                    let size = hex_size(self.raw[0..e]);
-                    self.raw = self.raw[(e + 2)..len(self.raw)];
-                    if size <= 0 {
-                        self.complete = true;
-                        self.raw = "";
-                        break;
-                    }
-                    self.chunk_left = size;
-                } else {
-                    let n = if self.chunk_left < len(self.raw) {
-                        self.chunk_left
-                    } else {
-                        len(self.raw)
-                    };
-                    self.body = self.body + self.raw[0..n];
-                    self.raw = self.raw[n..len(self.raw)];
-                    self.chunk_left = self.chunk_left - n;
-                    if self.chunk_left == 0 { self.skip_crlf = 2; }
-                }
-            }
-        }
-        self.body = std::str::replace(self.body, "\r\n", "\n");
-    }
-
-    /// The next event's payload, "" when there is none yet (the caller
-    /// looks at its cancel and asks again) or when `done` says the stream
-    /// ended or failed.
-    @unbounded
+    /// The next event's payload, "" when there is none (the caller asks
+    /// again until `done`, which says the stream ended or failed).
     fn next_data() -> String {
         if self.done { return ""; }
-        while true {
-            let ok = self.status >= 200 && self.status < 300;
-            if self.head_done && !ok {
-                // an error answer: read it out, then fail the seat with its message
-                if self.eof || self.complete {
-                    let err = std::json::find_string_field(
-                        std::json::find_field_raw(self.body, "error"),
-                        "message",
-                    );
-                    self.failure = "the upstream answered " + to_string(self.status)
-                        + (if len(err) > 0 { ": " + err } else { "" });
-                    self.done = true;
-                    return "";
-                }
-                self.pump();
-                return "";
-            }
-            let at = std::str::index_of(self.body, "\n\n");
-            if at >= 0 {
-                let d = sse_data(self.body[0..at]);
-                self.body = self.body[(at + 2)..len(self.body)];
-                if d == "[DONE]" {
-                    self.done = true;
-                    return "";
-                }
-                if len(d) > 0 { return d; }
-            } else if self.complete {
-                let d = sse_data(self.body);
-                self.body = "";
-                self.done = true;
-                return if d == "[DONE]" { "" } else { d };
-            } else if self.eof {
-                // the connection ended or went quiet before the framing or a [DONE] said the stream was whole
-                self.failure = "the upstream ended its stream early";
-                self.done = true;
-                return "";
-            } else {
-                self.pump();
-                if len(self.body) == 0 || std::str::index_of(self.body, "\n\n") < 0 { return ""; }
-            }
+        let d = if self.use_wire { self.wire.next() } else { self.canned.next() };
+        if len(d.failure) > 0 {
+            self.failure = d.failure;
+            self.done = true;
+            return "";
         }
-        return "";
+        if d.ended {
+            self.done = true;
+            return "";
+        }
+        return d.data;
     }
 
     /// The events for one chunk's payload, as script lines; a payload that
@@ -769,10 +703,6 @@ locus Upstream {
     /// End the run: close the connection and say how it went, with the
     /// events that close the stream as the script.
     fn finish() -> StaticRun {
-        if self.fd >= 0 {
-            std::io::tcp::close_fd(self.fd);
-            self.fd = -1;
-        }
         let served = self.cfg.model;
         if len(self.failure) > 0 { return compat_failed(self.cfg, served, self.failure); }
         if !self.began { return compat_failed(self.cfg, served, "the upstream sent no output"); }
@@ -810,14 +740,20 @@ locus Upstream {
     }
 }
 
-fn upstream_for(id: String, model: String, body: String, c: CompatConfig) -> Upstream {
+fn upstream_for(
+    id: String,
+    model: String,
+    body: String,
+    c: CompatConfig,
+    status: Int,
+    sse: String
+) -> Upstream {
     return Upstream {
-        url: c.base_url,
-        vault: c.key_vault,
         cfg: c,
         id: id,
         model: model,
         req: body,
+        canned: CannedSse { status: status, body: std::str::replace(sse, "\r\n", "\n") },
     };
 }
 
@@ -858,27 +794,25 @@ fn compat_play(
     if status == 0 {
         return compat_failed(c, served, "the upstream at " + c.base_url + " could not be reached");
     }
-    let up = upstream_for(id, model, body, c);
-    up.status = status;
-    up.head_done = true;
-    up.complete = true;
-    up.body = std::str::replace(sse, "\r\n", "\n");
+    let up = upstream_for(id, model, body, c, status, sse);
     return drain(up);
 }
 
-/// Whether the upstream is spoken to over a socket and relayed as it
-/// arrives (http), rather than read whole through the stdlib client.
-fn compat_streams(c: CompatConfig) -> Bool {
-    return std::str::starts_with(c.base_url, "http://");
+/// The upstream's events off the wire for `body`, http or https alike.
+fn upstream_over_wire(id: String, model: String, body: String, c: CompatConfig) -> Upstream {
+    let up = Upstream {
+        cfg: c,
+        id: id,
+        model: model,
+        req: body,
+        use_wire: true,
+        wire: HttpSse { url: c.base_url, vault: c.key_vault, request: compat_request(body, c) },
+    };
+    up.wire.open();
+    return up;
 }
 
 /// Answer one request on the upstream, collecting the events.
 fn run_compat(id: String, model: String, body: String, c: CompatConfig) -> StaticRun {
-    let up = upstream_for(id, model, body, c);
-    if compat_streams(c) {
-        up.open(compat_request(body, c));
-        return drain(up);
-    }
-    let r = up.post(compat_request(body, c));
-    return compat_play(id, model, c.model, body, c, r.status, std::str::from_bytes(r.body));
+    return drain(upstream_over_wire(id, model, body, c));
 }

@@ -23,7 +23,7 @@ jobs:
         run: hale fmt --check api store lib
       - name: No print outside the logger (std::log; its sink, lib/logfmt, and tests apart)
         run: |
-          if grep -rnE --include='*.hl' --exclude-dir=tests --exclude-dir=logfmt '\b(e?print(ln)?)\s*\(' api brain node store lib | grep -vE '^[^:]+:[0-9]+:\s*//'; then
+          if grep -rnE --include='*.hl' --exclude-dir=tests --exclude-dir=logfmt --exclude=install.hl '\b(e?print(ln)?)\s*\(' api brain node store lib | grep -vE '^[^:]+:[0-9]+:\s*//'; then
             echo "a bare print outside std::log (docs/internals.md, Logs)"; exit 1
           fi
       - name: Verify
@@ -133,6 +133,36 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/node/v1/capabilities >/tmp/caps.json 2>/dev/null && break; sleep 0.2; done
           kill $pid
           grep -q claude-cli /tmp/caps.json && grep -q openai-compatible /tmp/caps.json
+      - name: The node installs as a launchd user agent and is removed (docs/node-on-a-mac.md)
+        run: |
+          hale build api
+          # a fake ollama: its models are the seats the node offers
+          mkdir -p build/fake-bin
+          printf '#!/bin/sh\necho "NAME ID SIZE MODIFIED"\necho "llama3.2:latest abc 2GB now"\n' > build/fake-bin/ollama
+          chmod +x build/fake-bin/ollama
+          export PATH="$PWD/build/fake-bin:$PATH"
+          api/api --port 8080 --nats "" &
+          api_pid=$!
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
+          node/node install --id ci-mac --api http://127.0.0.1:8080 --node-bin "$PWD/node/node" \
+            --data "$PWD/build/ci-node-data" --vault "$PWD/build/ci-vault" --port 8082 --no-start | tee install.txt
+          grep -q 'seat ci-mac/ollama-llama3-2-latest serves llama3.2:latest' install.txt
+          grep -q '^key     vk-' install.txt
+          plist="$HOME/Library/LaunchAgents/net.hale-lang.voice-node.ci-mac.plist"
+          plutil -lint "$plist"
+          grep -q 'ci-node-data' "$plist"
+          curl -fsS http://127.0.0.1:8080/admin/v1/nodes/ci-mac/seats | grep -q '"ref": "ci-mac/ollama-llama3-2-latest"'
+          node/node uninstall --id ci-mac
+          test ! -e "$plist"
+          # the agent itself: a runner may have no user session to load it into
+          if node/node install --id ci-mac2 --api http://127.0.0.1:8080 --node-bin "$PWD/node/node" \
+               --data "$PWD/build/ci-node-data2" --vault "$PWD/build/ci-vault2" --port 8083; then
+            launchctl print "gui/$(id -u)/net.hale-lang.voice-node.ci-mac2" | grep -q 'state'
+          else
+            echo "::warning::launchctl could not load a user agent on this runner"
+          fi
+          node/node uninstall --id ci-mac2
+          kill $api_pid
 
   e2e:
     name: end to end

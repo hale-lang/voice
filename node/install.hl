@@ -1,0 +1,202 @@
+// `node install` and `node uninstall`: a Mac's node as a launchd user agent
+// (mac.hl, docs/node-on-a-mac.md). This file is the commands' own output:
+// what they print is their product (the key is shown here once), so it is
+// the one place in the node that writes to stdout outside the logger.
+
+/// The admin calls over HTTP, to the api at `api`.
+locus HttpAdmin {
+    params {
+        api: String = "";
+        key: String = "";
+    }
+    @unbounded
+    fn send(method: String, path: String, body: String) -> Reply {
+        let url = std::http::parse_url(self.api + path) or std::http::Url { };
+        if len(url.host) == 0 { return Reply { status: 0, body: "bad api address: " + self.api }; }
+        let auth = if len(self.key) > 0 {
+            "Authorization: Bearer " + self.key + "\r\n"
+        } else {
+            ""
+        };
+        let r = std::http::request(
+            std::http::ClientRequest {
+                method: method,
+                url: url,
+                headers: auth + "Content-Type: application/json",
+                body: std::bytes::from_string(body),
+            },
+        ) or std::http::ClientResponse { status: 0, body: b"" };
+        return Reply { status: r.status, body: std::str::from_bytes(r.body) };
+    }
+}
+
+const LABEL_PREFIX: String = "net.hale-lang.voice-node.";
+
+@unbounded
+fn home_dir() -> String {
+    return if std::env::var_exists("HOME") { std::env::var("HOME") } else { "" };
+}
+
+@unbounded
+fn uid() -> String {
+    return std::str::trim((std::process::run("id\n-u") or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: "501",
+        stderr: "",
+    }).stdout);
+}
+
+@unbounded
+fn absolute(path: String) -> String {
+    if std::str::starts_with(path, "/") { return path; }
+    let here = std::str::trim((std::process::run("pwd") or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: ".",
+        stderr: "",
+    }).stdout);
+    return here + "/" + path;
+}
+
+fn plist_path(label: String) -> String {
+    return home_dir() + "/Library/LaunchAgents/" + label + ".plist";
+}
+
+fn fail_install(why: String) {
+    log_error(why, "");
+    std::process::exit(1);
+}
+
+/// The value after `name` in the arguments from 2 on, or `otherwise`.
+@unbounded
+fn option(name: String, otherwise: String) -> String {
+    let mut i = 2;
+    while i + 1 < std::env::args_count() {
+        if std::env::arg(i) == name { return std::env::arg(i + 1); }
+        i = i + 1;
+    }
+    return otherwise;
+}
+
+@unbounded
+fn flag_given(name: String) -> Bool {
+    let mut i = 2;
+    while i < std::env::args_count() {
+        if std::env::arg(i) == name { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+const INSTALL_USAGE: String = "usage: node install --id ID --api URL [--admin-key K] [--port N] [--data DIR] [--vault DIR] [--node-bin FILE] [--no-start]\n       node uninstall --id ID";
+
+/// `node install`: find the seats, record them on the api, write the
+/// capabilities and the plist, and start the agent.
+@unbounded
+fn install() {
+    let id = option("--id", "");
+    let api = option("--api", "");
+    if len(id) == 0 || len(api) == 0 || len(home_dir()) == 0 {
+        log_error(INSTALL_USAGE, "");
+        std::process::exit(2);
+    }
+    let home = home_dir();
+    let data = absolute(option("--data", home + "/.voice/node-data"));
+    let vault = absolute(option("--vault", home + "/.voice/vault"));
+    let node_bin = absolute(option("--node-bin", std::env::arg(0)));
+    let port = std::str::parse_int(option("--port", "8081")) or 8081;
+    let label = LABEL_PREFIX + id;
+    let enrollment = "node-" + id + "-enrollment";
+    let claude_vault = "claude-" + id + "-token";
+    let path = "/opt/homebrew/bin:/usr/local/bin:"
+        + (if std::env::var_exists("PATH") { std::env::var("PATH") } else { "/usr/bin:/bin" });
+
+    std::process::run("mkdir\n-p\n-m\n700\n" + vault) or discard;
+    std::process::run("mkdir\n-p\n" + data) or discard;
+    std::process::run("mkdir\n-p\n" + home + "/Library/Logs") or discard;
+    std::process::run("mkdir\n-p\n" + home + "/Library/LaunchAgents") or discard;
+
+    let offers = discover(
+        Discovery {
+            node: id,
+            path: path,
+            claude_login: std::io::fs::file_exists(vault + "/" + claude_vault),
+            claude_vault: claude_vault
+        },
+    );
+    let capabilities = capabilities_for(offers);
+    let problem = capabilities_problem(capabilities);
+    if len(problem) > 0 {
+        fail_install("the capabilities for this machine are not valid: " + problem);
+    }
+    std::io::fs::write_file(data + "/capabilities.json", capabilities) or fail_install(
+        "the capabilities file could not be written",
+    );
+
+    let admin = HttpAdmin { api: api, key: option("--admin-key", "") };
+    let p = provision(admin, id, offers, std::io::fs::file_exists(vault + "/" + enrollment));
+    if !p.ok { fail_install(p.why); }
+    // The key is shown the moment it is issued, before any step that can
+    // still fail: the api never shows it again.
+    if len(p.key) > 0 { println("key     " + p.key + "   (shown once: keep it)"); }
+    if len(p.token) > 0 {
+        std::io::fs::write_file(vault + "/" + enrollment, p.token) or fail_install(
+            "the enrollment token could not be kept",
+        );
+        std::process::run("chmod\n600\n" + vault + "/" + enrollment) or discard;
+    }
+
+    let agent = Agent {
+        label: label,
+        node_bin: node_bin,
+        id: id,
+        api: api,
+        token_vault: enrollment,
+        data: data,
+        capabilities: data + "/capabilities.json",
+        port: port,
+        vault_dir: vault,
+        path: path,
+        log: home + "/Library/Logs/voice-node-" + id + ".log"
+    };
+    std::io::fs::write_file(plist_path(label), launchd_plist(agent)) or fail_install(
+        "the launchd plist could not be written",
+    );
+    if !flag_given("--no-start") {
+        std::process::run("launchctl\nbootout\ngui/" + uid() + "/" + label) or discard;
+        let started = std::process::run(
+            "launchctl\nbootstrap\ngui/" + uid() + "\n" + plist_path(label),
+        ) or std::process::ProcessOutput {
+            code: 1,
+            signal: 0,
+            stdout: "",
+            stderr: "launchctl did not run",
+        };
+        if started.code != 0 {
+            fail_install("launchctl could not start the agent: " + std::str::trim(started.stderr));
+        }
+    }
+    println("node    " + id + " (agent " + label + ", log " + agent.log + ")");
+    print(p.lines);
+    println("account " + p.account + " (free)");
+    println("project " + p.project);
+    if len(p.key) == 0 {
+        println("key     already issued for project " + p.project + " (not shown again)");
+    }
+}
+
+/// `node uninstall`: stop the agent and remove its plist. The node's data,
+/// vault and rows on the api are left.
+@unbounded
+fn uninstall() {
+    let id = option("--id", "");
+    if len(id) == 0 {
+        log_error(INSTALL_USAGE, "");
+        std::process::exit(2);
+    }
+    let label = LABEL_PREFIX + id;
+    std::process::run("launchctl\nbootout\ngui/" + uid() + "/" + label) or discard;
+    std::process::run("rm\n-f\n" + plist_path(label)) or discard;
+    println("removed " + label);
+}

@@ -85,12 +85,30 @@ locus EventTick {
                 }
             }
             if self.wants("change") {
-                let page = self.changes.list_read(st::ChangeQuery { limit: 100 }) or raise;
+                // Pages come newest first: walk back to the page that holds
+                // the place, then tell that page's changes past it, oldest
+                // first. A subscriber further behind than one page gets the
+                // rest on its next answers, so no stored change is skipped.
+                let mut q = st::ChangeQuery { limit: 1000 };
+                let mut page = self.changes.list_read(q) or raise;
+                let mut back = page.has_next_cursor;
+                while back {
+                    let oldest = at(page.data, count(page.data) - 1) or ChangeRead {
+                        action: action_of("create"),
+                    };
+                    if change_seq(oldest) <= self.change_mark {
+                        back = false;
+                    } else {
+                        q.cursor = page.next_cursor;
+                        page = self.changes.list_read(q) or raise;
+                        back = page.has_next_cursor;
+                    }
+                }
                 let mut i = count(page.data) - 1;
                 while i >= 0 {
                     let c = at(page.data, i) or ChangeRead { action: action_of("create") };
                     i = i - 1;
-                    let seq = std::str::parse_int(c.id[4..len(c.id)]) or 0;
+                    let seq = change_seq(c);
                     if seq <= self.change_mark { continue; }
                     self.change_mark = seq;
                     self.tell("change", "change_" + to_string(seq), c.at, change_json(c));
@@ -188,7 +206,7 @@ locus AdminEvents {
         self.usage_mark = std::str::parse_int(id[1..dc]) or - 1;
         self.change_mark = std::str::parse_int(id[(dc + 2)..dn]) or - 1;
         if self.usage_mark < 0 || self.change_mark < 0 { return false; }
-        let mut rest = id[(dn + 3)..len(id)];
+        let mut rest = id[(dn + 2)..len(id)];
         let mut marks = NodeMarks { };
         while len(rest) > 0 {
             let comma = std::str::index_of(rest, ",");
@@ -216,6 +234,11 @@ locus AdminEvents {
         out.send_with("", self.place(), "");
         return out.end();
     }
+}
+
+/// A change's place in the log: the number in its id (`chg_<n>`).
+fn change_seq(c: ChangeRead) -> Int {
+    return std::str::parse_int(c.id[4..len(c.id)]) or 0;
 }
 
 /// The `type` filter of a subscription, refusing a type the stream does

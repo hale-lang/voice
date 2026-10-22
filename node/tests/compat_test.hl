@@ -43,14 +43,36 @@ fn answer(s: std::io::tcp::Stream, status: String, body: String) {
     ) or discard;
 }
 
+/// The request off the connection, whole: the client may send its head and
+/// its body in separate writes.
+fn read_request(s: std::io::tcp::Stream) -> String {
+    let mut req = s.recv(65536) or "";
+    let he = std::str::index_of(req, "\r\n\r\n");
+    if he < 0 { return req; }
+    let lowered = std::str::lower(req[0..he]);
+    let at = std::str::index_of(lowered, "content-length:");
+    if at < 0 { return req; }
+    let rest = lowered[(at + 15)..len(lowered)];
+    let end = std::str::index_of(rest, "\r\n");
+    let want = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or 0;
+    while len(req) < he + 4 + want {
+        let more = s.recv(65536) or "";
+        if len(more) == 0 { break; }
+        req = req + more;
+    }
+    return req;
+}
+
 /// The stub upstream: one connection, one canned answer. The streamed one
 /// sends its SSE in several chunked writes, an event cut across two of
 /// them, with a pause between, and notes the time of its last write.
 fn stub_conn(s: std::io::tcp::Stream) {
-    let req = s.recv(65536) or "";
+    let req = read_request(s);
     if !std::str::starts_with(req, "POST ") { answer(s, "405 Method Not Allowed", "{}"); return; }
-    if std::str::starts_with(req, "POST /v1/chat/completions ") {
-        if std::str::contains(req, "Authorization: Bearer stub-key")
+    // /v2 is the same stream with no key asked (a keyless seat, read as it arrives)
+    let open = std::str::starts_with(req, "POST /v2/chat/completions ");
+    if std::str::starts_with(req, "POST /v1/chat/completions ") || open {
+        if (std::str::contains(req, "Authorization: Bearer stub-key") || open)
             && std::str::contains(req, "\"stream\":true")
             && std::str::contains(req, "\"model\":\"stub-7b\"")
         {
@@ -225,8 +247,11 @@ main locus App {
         );
 
         // streamed: the first event is published before the stub's last write
-        let up = node::upstream_for("resp_k0", "voice-1", ask, keyed);
-        up.open(node::compat_request(ask, keyed));
+        // (a keyed upstream is read whole until hale lets a reveal into a reader)
+        let unkeyed = node::compat_config(
+            "{\"base_url\": \"" + self.base + "/v2\", \"model\": \"stub-7b\"}",
+        );
+        let up = node::upstream_over_wire("resp_k0", "voice-1", ask, unkeyed);
         let mut first_at = -1;
         while !up.done {
             let d = up.next_data();
@@ -308,8 +333,7 @@ main locus App {
         let tc = node::compat_config(
             "{\"base_url\": \"" + self.base + "/tools\", \"model\": \"stub-7b\"}",
         );
-        let tup = node::upstream_for("resp_t1", "voice-1", ask_tools, tc);
-        tup.open(node::compat_request(ask_tools, tc));
+        let tup = node::upstream_over_wire("resp_t1", "voice-1", ask_tools, tc);
         let mut events = "";
         let mut fragments = 0;
         while !tup.done {

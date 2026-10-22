@@ -110,6 +110,17 @@ fn stub_conn(s: std::io::tcp::Stream) {
         ) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /silent/chat/completions ") {
+        // one event, then silence with the connection open
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + chunk(
+                    "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                ),
+        ) or discard;
+        std::time::sleep(5s);
+        return;
+    }
     if std::str::starts_with(req, "POST /cut/chat/completions ") {
         // closes mid-stream: one event, no terminal chunk, no [DONE]
         s.send(
@@ -322,6 +333,40 @@ main locus App {
             local.output_tokens,
             2,
             "tokens estimated when the upstream gives no usage",
+        );
+        // a silent upstream gives control back every second: the session
+        // services a cancel (and an assignment, and a refusal) between reads,
+        // so a cancelled request is released within about a second, however
+        // long the upstream stays quiet (the exchange's deadline is 30 min)
+        let quiet = node::upstream_over_wire(
+            "resp_q",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/silent\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let began = std::time::monotonic_ns();
+        let mut reads = 0;
+        let mut cancelled = false;
+        let mut said = "";
+        while !quiet.done && !cancelled {
+            let d = quiet.next_data();
+            if len(d) > 0 { said = said + d; }
+            reads = reads + 1;
+            // the session's `interject` finds the cancel after the first quiet read
+            if reads == 3 { cancelled = true; }
+        }
+        let waited = (std::time::monotonic_ns() - began) / 1000000;
+        std::test::assert(std::str::contains(said, "Hel"), "the event that came is read: " + said);
+        std::test::assert(
+            !quiet.done && len(quiet.failure) == 0,
+            "a quiet upstream is not an ended or failed one",
+        );
+        std::test::assert(
+            waited >= 900 && waited < 3000,
+            "two quiet reads gave control back in about a second each: " + to_string(waited)
+                + " ms",
         );
         let cut = node::run_compat(
             "resp_k6",

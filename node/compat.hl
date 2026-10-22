@@ -264,12 +264,20 @@ type Datum {
     // ended by the body closing, not by `[DONE]`: an end only when the
     // model said it finished (a finish reason), else a failure
     closed: Bool = false;
+    // nothing arrived within the read window: the stream is open and quiet
+    idle: Bool = false;
     failure: String = "";
 }
 
 /// The whole run of an exchange is bounded, not each read: a model that
 /// thinks for minutes is waited for, a hung one is not waited for for ever.
 const COMPAT_TOTAL_MS: Int = 1800000;
+
+/// How long one read of the upstream waits for an event. A quiet upstream
+/// gives control back at this interval, so the session services a cancel, an
+/// assignment or a refusal within about this long, whatever the upstream does
+/// (the exchange's deadline above still ends the whole of it).
+const COMPAT_READ_MS: Int = 1000;
 
 /// The upstream's stream off the wire. Birth dials and reads the head.
 locus HttpSse {
@@ -352,13 +360,14 @@ locus HttpSse {
             let text = std::bytes::BytesBuilder { initial_cap: 1024 };
             let mut reading = true;
             while reading {
-                let piece = self.rd.body.chunk() or b"";
+                let piece = self.rd.body.chunk_within(COMPAT_READ_MS) or b"";
                 if len(piece) == 0 { reading = false; } else { text.append(piece); }
             }
             let body = std::str::from_bytes(text.snapshot() or b"");
             return error_datum(self.rd.body.status, body);
         }
-        let e = self.rd.event() or {
+        let e = self.rd.event_within(COMPAT_READ_MS) or {
+            if err.kind == "idle" { return Datum { idle: true }; }
             if err.kind == "end" { return Datum { ended: true, closed: true }; }
             return Datum { failure: "the upstream ended its stream early" };
         };
@@ -449,7 +458,9 @@ locus Upstream {
     }
 
     /// The next event's payload, "" when there is none (the caller asks
-    /// again until `done`, which says the stream ended or failed).
+    /// again until `done`, which says the stream ended or failed). A quiet
+    /// upstream returns "" after `COMPAT_READ_MS` with `done` still false:
+    /// the caller services what has arrived for it, and asks again.
     fn next_data() -> String {
         if self.done { return ""; }
         let d = if self.use_wire { self.wire.next() } else { self.canned.next() };

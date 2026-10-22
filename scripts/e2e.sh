@@ -26,6 +26,8 @@ API_PORT=${API_PORT:-18090}
 NODE_PORT=${NODE_PORT:-18091}
 NODE2_PORT=${NODE2_PORT:-18092}
 SILENT_PORT=${SILENT_PORT:-14299}
+QUIET_PORT=${QUIET_PORT:-18093}
+UPSTREAM_PORT=${UPSTREAM_PORT:-14296}
 NATS_PORT=${NATS_PORT:-14222}
 ORG_PORT=${ORG_PORT:-14298}
 NERVES_PORT=${NERVES_PORT:-14297}
@@ -277,6 +279,41 @@ python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 20 else 1)' "$health_
 echo "a caller that left a quiet seat after 2 s: found by its keep-alive, the seat stopped within $stopped_ms ms, /healthz answered in $health_s s"
 curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
+
+# an upstream that opens its stream and goes silent does not pin a request
+# the api cancelled: the node reads it a second at a time and services its
+# control messages between reads, so a `cancel` released the request within
+# about a second, however long the upstream stays quiet (the exchange's
+# deadline is 30 min)
+python3 scripts/silent-upstream.py "$UPSTREAM_PORT" "$work/silent-upstream.log" &
+pids+=($!)
+for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$UPSTREAM_PORT") 2>/dev/null && break; sleep 0.1; done
+post /admin/v1/models '{"id": "quiet-1"}' >/dev/null
+qtoken=$(post /admin/v1/nodes '{"id": "quiet"}' | field enrollment_token)
+post /admin/v1/nodes/quiet/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "quiet-1"}], "config": {"base_url": "http://127.0.0.1:'"$UPSTREAM_PORT"'/v1", "model": "stub-7b"}}' >/dev/null
+echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/quiet-caps.json"
+node/node --id quiet --api "$api" --token "$qtoken" --data "$work/quiet-data" --capabilities "$work/quiet-caps.json" --port "$QUIET_PORT" >"$work/quiet.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/quiet/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
+curl -s -N --max-time 40 -D "$work/quiet.head" -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "quiet-1", "input": "hi", "stream": true}' >"$work/quiet-up.sse" &
+quiet_curl=$!
+for i in $(seq 1 100); do
+  [ "$(curl -fsS "http://127.0.0.1:${QUIET_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "1" ] && break
+  sleep 0.1
+done
+quiet_id=$(tr -d '\r' <"$work/quiet.head" | awk -F': ' 'tolower($1) == "x-request-id" {print $2}')
+[ -n "$quiet_id" ] || { echo "the request has no id"; cat "$work/quiet.head"; exit 1; }
+sleep 2
+t0=$(date +%s%N)
+python3 scripts/nats-publish.py "${NATS_URL#nats://}" "voice.node.quiet.cancel" '{"type": "cancel", "request_id": "'"$quiet_id"'"}'
+for i in $(seq 1 60); do
+  [ "$(curl -fsS "http://127.0.0.1:${QUIET_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+released_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$released_ms" -lt 3000 ] || { echo "a cancelled request was held $released_ms ms by a silent upstream"; tail -5 "$work/quiet.log"; exit 1; }
+echo "a cancel released a request on a silent upstream in $released_ms ms"
+kill "$quiet_curl" 2>/dev/null || true
 
 # a local pause only restricts: the seat is held, and nothing serves
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "max_in_flight": null, "reason": "e2e"}' >/dev/null

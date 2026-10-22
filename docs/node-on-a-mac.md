@@ -14,7 +14,7 @@ prebuilt node binary. Apple silicon only; Xcode's command line tools
 (`xcode-select --install`) supply the C compiler.
 
 ```sh
-v=v0.27.0
+v=v0.28.0
 name=hale-$v-aarch64-apple-darwin.tar.gz
 base=https://github.com/hale-lang/hale/releases/download/$v
 mkdir -p ~/.hale/bin && cd "$(mktemp -d)"

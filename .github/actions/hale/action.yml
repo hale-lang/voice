@@ -1,13 +1,37 @@
 name: Install hale
-description: Installs a released hale toolchain (checksum-verified) and what it needs to build native programs.
+description: Installs a hale toolchain, built from a pinned commit of hale-lang/hale (or a released one, checksum-verified), and what it needs to build native programs.
 inputs:
-  version:
-    description: The hale release tag.
+  commit:
+    description: A full commit SHA of hale-lang/hale to build. With neither input set, the commit in hale.pin.
     required: false
-    default: v0.28.0
+    default: ""
+  version:
+    description: A hale release tag to download instead of building a commit. Set at most one of commit and version.
+    required: false
+    default: ""
 runs:
   using: composite
   steps:
+    - name: Which hale
+      id: which
+      shell: bash
+      run: |
+        set -euo pipefail
+        commit="${{ inputs.commit }}"
+        version="${{ inputs.version }}"
+        if [ -n "$commit" ] && [ -n "$version" ]; then
+          echo "set one of commit and version, not both" >&2; exit 1
+        fi
+        if [ -z "$commit" ] && [ -z "$version" ]; then
+          commit=$(tr -d '[:space:]' < "$GITHUB_WORKSPACE/hale.pin")
+        fi
+        if [ -n "$commit" ]; then
+          echo "key=hale-$commit-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_OUTPUT"
+        else
+          echo "key=hale-$version-${{ runner.os }}-${{ runner.arch }}" >> "$GITHUB_OUTPUT"
+        fi
+        echo "commit=$commit" >> "$GITHUB_OUTPUT"
+        echo "version=$version" >> "$GITHUB_OUTPUT"
     - name: Native build dependencies
       if: runner.os == 'Linux'
       shell: bash
@@ -22,9 +46,30 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.hale/bin
-        key: hale-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+        key: ${{ steps.which.outputs.key }}
+    # a commit is built as hale's own release.yml builds a release
+    - uses: dtolnay/rust-toolchain@stable
+      if: steps.cache.outputs.cache-hit != 'true' && steps.which.outputs.commit != ''
+    - name: LLVM 18 (Linux)
+      if: steps.cache.outputs.cache-hit != 'true' && steps.which.outputs.commit != '' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -eux
+        sudo apt-get install -y llvm-18-dev libpolly-18-dev libzstd-dev clang-18 libclang-18-dev zlib1g-dev
+    - name: LLVM 18 (macOS)
+      if: steps.cache.outputs.cache-hit != 'true' && steps.which.outputs.commit != '' && runner.os == 'macOS'
+      shell: bash
+      env:
+        HOMEBREW_NO_AUTO_UPDATE: "1"
+        HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
+      run: brew install llvm@18 zstd
+    - name: Build hale at the commit
+      if: steps.cache.outputs.cache-hit != 'true' && steps.which.outputs.commit != ''
+      shell: bash
+      run: |
+        "$GITHUB_WORKSPACE/scripts/build-hale.sh" "${{ steps.which.outputs.commit }}" "$HOME/.hale/bin"
     - name: Download and verify
-      if: steps.cache.outputs.cache-hit != 'true'
+      if: steps.cache.outputs.cache-hit != 'true' && steps.which.outputs.version != ''
       shell: bash
       run: |
         set -euo pipefail
@@ -41,8 +86,8 @@ runs:
             triple="aarch64-apple-darwin" ;;
           *) echo "unsupported runner OS: ${{ runner.os }}" >&2; exit 1 ;;
         esac
-        name="hale-${{ inputs.version }}-$triple.tar.gz"
-        base="https://github.com/hale-lang/hale/releases/download/${{ inputs.version }}"
+        name="hale-${{ steps.which.outputs.version }}-$triple.tar.gz"
+        base="https://github.com/hale-lang/hale/releases/download/${{ steps.which.outputs.version }}"
         mkdir -p ~/.hale/bin
         cd "$(mktemp -d)"
         curl -fsSLO "$base/$name"

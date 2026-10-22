@@ -8,10 +8,22 @@
 //
 // The front holds the store, the receivers of the rows and the data plane,
 // so they share one pool and one store: fn main builds it over the store it
-// was given.
+// was given. The store's Postgres connection is one conversation, so the
+// rows and the data plane enter one gate, a request at a time (gate.hl).
+//
+// A request body is at most 12 MiB (`max_request_bytes`; the rows and the
+// data plane share the listener's cap). The toolchain guards a row against a
+// cross-site write: a body that is not JSON is refused 415, and a write with
+// no body from an origin outside `cors` is refused 403. The data plane is
+// not guarded by it and guards itself: a caller's project key on /v1, a
+// node's enrollment token on /node/v1; the event stream and the route table
+// are reads.
 locus Front {
     params {
         bind: String = "127.0.0.1:8080";
+        // the origins that may write with no body (the transport's guard
+        // against a cross-site form): the app's own, by the names it is reached under
+        cors: String = "";
         ui: String = "";
         store: st::Store = st::MemoryStore { };
         link: Link = NatsLink { };
@@ -22,23 +34,25 @@ locus Front {
         governed: Bool = false;
         node_user: String = "";
         node_secret: std::secret::Credential = std::secret::Credential { };
+        gate: Gate = Gate { };
         tokens: AdminBearer = AdminBearer { };
         grants: AdminRoles = AdminRoles { };
         // the receivers of the surface's rows (surface.hl)
-        probes: Probes = Probes { store: self.store };
-        catalog: Catalog = Catalog { store: self.store };
+        probes: Probes = Probes { gate: self.gate, store: self.store };
+        catalog: Catalog = Catalog { gate: self.gate, store: self.store };
         projects: Projects = Projects {
             store: self.store,
             governed: self.governed,
             held: self.held,
         };
-        keys: Keys = Keys { store: self.store };
-        accounts: Accounts = Accounts { store: self.store };
-        nodes: Nodes = Nodes { store: self.store, link: self.link };
-        seats: Seats = Seats { store: self.store, link: self.link };
-        changes: Changes = Changes { store: self.store };
-        usage: Usage = Usage { store: self.store };
+        keys: Keys = Keys { gate: self.gate, store: self.store };
+        accounts: Accounts = Accounts { gate: self.gate, store: self.store };
+        nodes: Nodes = Nodes { gate: self.gate, store: self.store, link: self.link };
+        seats: Seats = Seats { gate: self.gate, store: self.store, link: self.link };
+        changes: Changes = Changes { gate: self.gate, store: self.store };
+        usage: Usage = Usage { gate: self.gate, store: self.store };
         data_plane: DataPlane = DataPlane {
+            gate: self.gate,
             ui: self.ui,
             store: self.store,
             link: self.link,
@@ -58,6 +72,8 @@ locus Front {
                 principals: self.tokens,
                 roles: self.grants,
                 anonymous: "operator",
+                cors: self.cors,
+                max_request_bytes: 12582912,
                 fallback: self.data_plane,
             },
             as: "web",

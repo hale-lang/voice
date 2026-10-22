@@ -157,6 +157,58 @@ locus Driver {
         std::test::assert_eq_int(head.status, 200, "HEAD of a GET route");
         std::test::assert_eq_int(len(head.body), 0, "has no body");
 
+        // ---- the toolchain's guard against a cross-site write: a form's
+        // body is not JSON (415), and a write with no body from an origin the
+        // app does not list is refused (403); the app's own origin writes
+        let form = call(
+            "POST",
+            base + "/admin/v1/projects",
+            "Content-Type: text/plain",
+            "{\"id\": \"x\", \"name\": \"X\"}",
+        );
+        std::test::assert_eq_int(form.status, 415, "a body that is not JSON: " + text(form));
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(form), "refusal"), "kind"),
+            "unsupported_media_type",
+            "refused as such",
+        );
+        let tmp = call(
+            "POST",
+            base + "/admin/v1/projects",
+            json,
+            "{\"id\": \"tmp\", \"name\": \"Tmp\"}",
+        );
+        std::test::assert_eq_int(tmp.status, 201, "a project to archive: " + text(tmp));
+        let none_made = call("GET", base + "/admin/v1/projects/x", "", "");
+        std::test::assert_eq_int(none_made.status, 404, "and nothing was made");
+        let cross = call(
+            "DELETE",
+            base + "/admin/v1/projects/tmp",
+            "Origin: http://evil.example",
+            "",
+        );
+        std::test::assert_eq_int(
+            cross.status,
+            403,
+            "a write with no body from another origin: " + text(cross),
+        );
+        let still = call("GET", base + "/admin/v1/projects/tmp", "", "");
+        std::test::assert_eq_str(field(text(still), "status"), "active", "nothing archived");
+        let mine = call(
+            "DELETE",
+            base + "/admin/v1/projects/tmp",
+            "Origin: http://app.example",
+            "",
+        );
+        std::test::assert_eq_int(mine.status, 200, "the app's own origin archives: " + text(mine));
+        let json_write = call(
+            "PATCH",
+            base + "/admin/v1/projects/tmp",
+            "Content-Type: application/json; charset=utf-8\r\nOrigin: http://app.example",
+            "{\"name\": \"Work again\"}",
+        );
+        std::test::assert_eq_int(json_write.status, 200, "and writes JSON: " + text(json_write));
+
         // ---- the data plane, on the same listener and connection
         let unknown = call("GET", base + "/nope", "", "");
         std::test::assert_eq_int(unknown.status, 404, "a path nothing serves");
@@ -264,7 +316,7 @@ locus Driver {
 
 main locus App {
     params {
-        front: api::Front = api::Front { bind: "127.0.0.1:0" };
+        front: api::Front = api::Front { bind: "127.0.0.1:0", cors: "http://app.example" };
         driver: Driver = Driver { };
         finished: Bool = false;
     }

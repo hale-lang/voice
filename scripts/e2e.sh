@@ -196,25 +196,26 @@ done
 [ "$now" -ge $((told + 3)) ] || { echo "the events queued while the nerves stalled did not land ($now on the stream, $((told + 3)) expected)"; tail -5 "$work/api.log"; exit 1; }
 echo "answers did not wait on stalled nerves, and the three events queued meanwhile landed after"
 
-# `http::Rest` reads a request body of at most 1 MiB (hale's transport, no
-# knob yet; the contract meant 12 MiB): a larger one is refused 400 malformed
-# before the data plane sees it, and one just under it is served. Its cost
-# is linear in its size: the api's peak stays under 200 MB, streamed under
-# 256 MB (it was ~9.5 GB at 12 MiB before hale 0.25.1; FRICTION.md).
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (2 * 1024 * 1024)}))' >"$work/big.json"
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (1024 * 1024 - 4096)}))' >"$work/near.json"
-python3 -c 'import json; print(json.dumps({"model": "echo-1", "stream": True, "input": "x" * (1024 * 1024 - 4096)}))' >"$work/near-stream.json"
+# a body over 12 MiB (`max_request_bytes` of the listener, which the data
+# plane shares) is refused 413 `too_large` before it is read; one just under
+# it is served, through a NATS message well over the 1 MiB default
+# (deploy/nats/nats.conf allows 16 MiB). Its cost is linear in its size: the
+# api's peak stays under 200 MB, streamed under 256 MB (it was ~9.5 GB at
+# 12 MiB before hale 0.25.1; FRICTION.md).
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near.json"
+python3 -c 'import json; print(json.dumps({"model": "echo-1", "stream": True, "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near-stream.json"
 big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
-case "$big" in *'"kind":"malformed"'*400) echo "a 2 MiB body is refused 400 malformed" ;; *) echo "a 2 MiB body: $big" | tail -c 300; exit 1 ;; esac
+case "$big" in *'"kind":"too_large"'*413) echo "a 13 MiB body is refused 413 too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
 near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
-[ "$near" = "200" ] || { echo "a body just under 1 MiB was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
+[ "$near" = "200" ] || { echo "a body just under 12 MiB was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
 peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
-[ -n "$peak_kb" ] && [ "$peak_kb" -lt 204800 ] || { echo "the api peaked at ${peak_kb:-?} kB serving a body just under 1 MiB"; exit 1; }
-echo "a body just under 1 MiB is served, the api peaked at $((peak_kb / 1024)) MB"
+[ -n "$peak_kb" ] && [ "$peak_kb" -lt 204800 ] || { echo "the api peaked at ${peak_kb:-?} kB serving a body just under 12 MiB"; exit 1; }
+echo "a body just under 12 MiB is served, through a NATS message over the 1 MiB default; the api peaked at $((peak_kb / 1024)) MB"
 streamed=$(curl -s -o "$work/near-stream.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near-stream.json" || true)
-[ "$streamed" = "200" ] && grep -q '^event: response.completed' "$work/near-stream.out" || { echo "a streamed body just under 1 MiB was answered $streamed: $(head -c 300 "$work/near-stream.out")"; exit 1; }
+[ "$streamed" = "200" ] && grep -q '^event: response.completed' "$work/near-stream.out" || { echo "a streamed body just under 12 MiB was answered $streamed: $(head -c 300 "$work/near-stream.out")"; exit 1; }
 peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
-[ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 1 MiB"; exit 1; }
+[ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 12 MiB"; exit 1; }
 echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
 
 # a caller that goes away mid-stream: the api stops at once, tells the seat

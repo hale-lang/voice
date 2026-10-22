@@ -261,6 +261,9 @@ fn sse_data(block: String) -> String {
 type Datum {
     data: String = "";
     ended: Bool = false;
+    // ended by the body closing, not by `[DONE]`: an end only when the
+    // model said it finished (a finish reason), else a failure
+    closed: Bool = false;
     failure: String = "";
 }
 
@@ -356,7 +359,7 @@ locus HttpSse {
             return error_datum(self.rd.body.status, body);
         }
         let e = self.rd.event() or {
-            if err.kind == "end" { return Datum { ended: true }; }
+            if err.kind == "end" { return Datum { ended: true, closed: true }; }
             return Datum { failure: "the upstream ended its stream early" };
         };
         if e.data == "[DONE]" { return Datum { ended: true }; }
@@ -393,7 +396,8 @@ locus CannedSse {
         }
         let d = sse_data(self.body);
         self.body = "";
-        if len(d) == 0 || d == "[DONE]" { return Datum { ended: true }; }
+        if d == "[DONE]" { return Datum { ended: true }; }
+        if len(d) == 0 { return Datum { ended: true, closed: true }; }
         return Datum { data: d };
     }
 }
@@ -456,6 +460,11 @@ locus Upstream {
         }
         if d.ended {
             self.done = true;
+            // a body that closed before the model finished is a failed
+            // stream, however cleanly the HTTP framing ended
+            if d.closed && len(self.finish_reason) == 0 {
+                self.failure = "the upstream closed its stream before the model finished";
+            }
             return "";
         }
         return d.data;

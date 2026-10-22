@@ -434,6 +434,202 @@ fn bounded(s: st::Store, label: String) {
     std::test::assert_eq_int(count(all.rows), 64, label + ": and every account reads back");
 }
 
+fn spent(
+    id: String,
+    when: String,
+    project: String,
+    key: String,
+    model: String,
+    node: String,
+    account: String,
+    input: Int,
+    output: Int,
+    price: Int
+) -> st::UsageRow {
+    let seat = if len(node) > 0 { node + "/static" } else { "" };
+    return st::UsageRow {
+        id: id,
+        created_at: t(when),
+        project: project,
+        key: key,
+        account: account,
+        requested_model: model,
+        served_model: model,
+        node: node,
+        seat: seat,
+        status: "served",
+        input_tokens: input,
+        output_tokens: output,
+        price_micros: price,
+        served: "{\"model\": \"" + model + "\", \"node\": \"" + node + "\", \"seat\": \"" + seat
+            + "\", \"account\": \"" + account + "\"}",
+        record: "{\"id\": \"" + id + "\", \"project\": \"" + project
+            + "\", \"metadata\": {\"batch\": \"" + (if project == "work" { "a" } else { "b" })
+            + "\"}}"
+    };
+}
+
+fn ids(r: st::UsageRows) -> String {
+    let mut out = "";
+    for u in r.rows {
+        out = out + (if len(out) > 0 { " " } else { "" }) + u.id;
+    }
+    return out;
+}
+
+/// The ledger: rows written once, read back whole, paged newest first,
+/// filtered, followed from a row on, and summed by group.
+fn ledger(s: st::Store, label: String) {
+    s.insert_usage(
+        spent("u1", "2026-10-17T10:15:00Z", "work", "k1", "echo-1", "laptop", "static", 10, 5, 100),
+    )
+    or discard;
+    s.insert_usage(
+        spent("u2", "2026-10-17T10:45:00Z", "work", "k2", "echo-1", "laptop", "static", 20, 6, 200),
+    )
+    or discard;
+    s.insert_usage(
+        spent("u3", "2026-10-18T09:00:00Z", "play", "k3", "other-1", "desk", "paid", 1, 1, 5),
+    )
+    or discard;
+    s.insert_usage(
+        spent("u1", "2026-10-19T10:00:00Z", "work", "k1", "echo-1", "laptop", "static", 99, 99, 99),
+    )
+    or discard;
+    let u1 = s.usage("u1") or st::UsageRow { };
+    std::test::assert(u1.present && u1.seq == 1, label + ": a row reads back, numbered in order");
+    std::test::assert(
+        std::str::contains(u1.record, "\"id\": \"u1\""),
+        label + ": with its whole record",
+    );
+    std::test::assert(
+        !(s.usage("none") or st::UsageRow { present: true }).present,
+        label + ": a request not in the ledger is absent",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { }) or st::UsageRows { }),
+        "u3 u2 u1",
+        label + ": newest first, a request id recorded once",
+    );
+    let page = s.usage_rows(st::UsageQuery { limit: 2 }) or st::UsageRows { };
+    std::test::assert(ids(page) == "u3 u2" && page.more, label + ": a page says there is more");
+    let u2 = s.usage("u2") or st::UsageRow { };
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { cursor: u2.seq }) or st::UsageRows { }),
+        "u1",
+        label + ": older than a cursor",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { project: "play" }) or st::UsageRows { }),
+        "u3",
+        label + ": by project",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { key: "k2" }) or st::UsageRows { }),
+        "u2",
+        label + ": by key",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { model: "other-1" }) or st::UsageRows { }),
+        "u3",
+        label + ": by model",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { account: "static" }) or st::UsageRows { }),
+        "u2 u1",
+        label + ": by account",
+    );
+    std::test::assert_eq_str(
+        ids(
+            s.usage_rows(st::UsageQuery { metadata: names("batch=a", "") }) or st::UsageRows { },
+        ),
+        "u2 u1",
+        label + ": by metadata",
+    );
+    std::test::assert_eq_str(
+        ids(
+            s.usage_rows(
+                st::UsageQuery {
+                    has_from: true,
+                    from: t("2026-10-17T10:30:00Z"),
+                    has_to: true,
+                    to: t("2026-10-17T23:00:00Z")
+                },
+            ) or st::UsageRows { },
+        ),
+        "u2",
+        label + ": by time",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_after(1, 10) or st::UsageRows { }),
+        "u2 u3",
+        label + ": followed from a row on, oldest first",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_after(1, 1) or st::UsageRows { }),
+        "u2",
+        label + ": for at most a limit",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_after(3, 10) or st::UsageRows { }),
+        "",
+        label + ": nothing past the last",
+    );
+
+    let by_project = s.usage_summary(st::UsageSummaryQuery { by: names("project", "") })
+    or st::UsageGroups { };
+    std::test::assert_eq_int(count(by_project.rows), 2, label + ": two projects");
+    let work = at(by_project.rows, 0) or st::UsageGroup { };
+    std::test::assert_eq_str(
+        work.group,
+        "{\"project\": \"work\"}",
+        label + ": a group is its fields",
+    );
+    std::test::assert(
+        work.requests == 2 && work.input_tokens == 30 && work.output_tokens == 11
+            && work.price_micros == 300 && work.currency == "USD",
+        label + ": totals of a group",
+    );
+    let play = at(by_project.rows, 1) or st::UsageGroup { };
+    std::test::assert(play.requests == 1 && play.price_micros == 5, label + ": and of the next");
+    let by_day = s.usage_summary(
+        st::UsageSummaryQuery { by: names("day", "") },
+    ) or st::UsageGroups { };
+    std::test::assert_eq_int(count(by_day.rows), 2, label + ": two days");
+    std::test::assert_eq_str(
+        (at(by_day.rows, 0) or st::UsageGroup { }).group,
+        "{\"day\": \"2026-10-17T00:00:00Z\"}",
+        label + ": a day is its start",
+    );
+    let by_hour = s.usage_summary(
+        st::UsageSummaryQuery { by: names("hour", "") },
+    ) or st::UsageGroups { };
+    std::test::assert_eq_str(
+        (at(by_hour.rows, 0) or st::UsageGroup { }).group,
+        "{\"hour\": \"2026-10-17T10:00:00Z\"}",
+        label + ": and an hour",
+    );
+    let two = s.usage_summary(
+        st::UsageSummaryQuery {
+            by: names("node", "seat"),
+            q: st::UsageQuery { project: "work" },
+        },
+    ) or st::UsageGroups { };
+    std::test::assert_eq_int(count(two.rows), 1, label + ": filtered, then grouped");
+    std::test::assert_eq_str(
+        (at(two.rows, 0) or st::UsageGroup { }).group,
+        "{\"node\": \"laptop\", \"seat\": \"laptop/static\"}",
+        label + ": by two fields",
+    );
+    let bad = s.usage_summary(st::UsageSummaryQuery { by: names("colour", "") })
+    or st::UsageGroups { };
+    std::test::assert_eq_int(
+        count(bad.rows),
+        0,
+        label + ": a field it does not group by is refused",
+    );
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -492,16 +688,19 @@ fn main() {
         "a database given is the one used",
     );
     exercise(st::MemoryStore { }, "memory");
+    ledger(st::MemoryStore { }, "memory");
     bounded(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
     pg.conn.exec(
-        "TRUNCATE change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model RESTART IDENTITY CASCADE",
+        "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model RESTART IDENTITY CASCADE",
     );
     exercise(pg, "postgres");
+    pg.conn.exec("TRUNCATE usage RESTART IDENTITY");
+    ledger(pg, "postgres");
     pg.conn.exec(
-        "TRUNCATE change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model RESTART IDENTITY CASCADE",
+        "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model RESTART IDENTITY CASCADE",
     );
     bounded(pg, "postgres");
 }

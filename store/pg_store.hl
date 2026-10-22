@@ -761,6 +761,124 @@ locus PgStore {
         return out;
     }
 
+    // ---- the usage ledger
+
+    fn insert_usage(row: UsageRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(row.project);
+        a.add(row.key);
+        if len(row.account) > 0 { a.add(row.account); } else { a.add_null(); }
+        a.add(row.requested_model);
+        a.add(row.status);
+        add_json(a, row.served);
+        a.add(to_string(row.input_tokens));
+        a.add(to_string(row.output_tokens));
+        a.add(to_string(row.price_micros));
+        a.add(row.currency);
+        a.add(row.record);
+        self.write(
+            "INSERT INTO usage (id, created_at, project, key, account, requested_model, status, served, input_tokens, output_tokens, price_micros, currency, record) VALUES ($1, $2::timestamptz, $3, $4, $5, $6, $7, $8::jsonb, $9::bigint, $10::bigint, $11::bigint, $12, $13::jsonb) ON CONFLICT (id) DO NOTHING",
+            a,
+        ) or raise;
+    }
+
+    fn usage(id: String) -> UsageRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (SELECT seq, id, created_at, record FROM usage WHERE id = $1) t",
+            a,
+        ) or raise;
+        return if len(line) == 0 { UsageRow { } } else { usage_row(line) };
+    }
+
+    fn usage_rows(q: UsageQuery) -> UsageRows fallible(StoreError) {
+        let limit = if q.limit < 1 { 100 } else if q.limit > 1000 { 1000 } else { q.limit };
+        let a = db::Args { };
+        let cond = usage_where(q, a);
+        a.add(to_string(limit + 1));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT seq, id, created_at, record FROM usage WHERE "
+                + cond + " ORDER BY seq DESC LIMIT $" + to_string(8 + 2 * count(q.metadata.items))
+                + "::int) t",
+            a,
+        ) or raise;
+        let mut out = UsageRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
+            push(out.rows, usage_row(line)) or discard;
+        }
+        return out;
+    }
+
+    fn usage_after(seq: Int, limit: Int) -> UsageRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(to_string(seq));
+        a.add(to_string(limit));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT seq, id, created_at, record FROM usage WHERE seq > $1::bigint ORDER BY seq LIMIT $2::int) t",
+            a,
+        ) or raise;
+        let mut out = UsageRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, usage_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn usage_summary(s: UsageSummaryQuery) -> UsageGroups fallible(StoreError) {
+        let mut exprs = "";
+        let mut names = "";
+        for f in s.by.items {
+            let e = group_sql(f);
+            if len(e) == 0 { fail StoreError { kind: "invalid", message: "no group " + f }; }
+            exprs = exprs + (if len(exprs) > 0 { ", " } else { "" }) + "'" + f + "', " + e;
+            names = names + f;
+        }
+        let a = db::Args { };
+        let cond = usage_where(s.q, a);
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT jsonb_build_object(" + exprs
+                + ")::text AS grp, count(*) AS requests, coalesce(sum(input_tokens), 0)::bigint AS input_tokens, coalesce(sum(output_tokens), 0)::bigint AS output_tokens, coalesce(sum(price_micros), 0)::bigint AS price_micros, currency FROM usage WHERE "
+                + cond + " GROUP BY 1, currency ORDER BY min(seq) LIMIT 1000) t",
+            a,
+        ) or raise;
+        let mut out = UsageGroups { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, UsageGroup {
+                group: pg_text(line, "grp"),
+                requests: std::json::find_int_field(line, "requests"),
+                input_tokens: std::json::find_int_field(line, "input_tokens"),
+                output_tokens: std::json::find_int_field(line, "output_tokens"),
+                price_micros: std::json::find_int_field(line, "price_micros"),
+                currency: pg_text(line, "currency")
+            }) or discard;
+        }
+        return out;
+    }
+
     // ---- the fleet as reported
 
     fn fleet(node: String) -> FleetRow fallible(StoreError) {
@@ -1099,6 +1217,58 @@ const NODE_COLUMNS: String = "SELECT id, name, encode(token_digest, 'hex') AS to
 const SEAT_COLUMNS: String = "SELECT node, id, engine, account, serves, data_classes, concurrency, enabled, config FROM seat";
 
 const INSERT_LIMIT: String = "INSERT INTO \"limit\" (scope, project, key, model_id, account, window_seconds, requests, input_tokens, output_tokens, concurrent) VALUES ($1, $2, $3, $4, $5, $6::int, $7::int, $8::bigint, $9::bigint, $10::int)";
+
+/// The SQL a summary groups `field` by, "" for a field it does not.
+fn group_sql(field: String) -> String {
+    if field == "project" { return "project"; }
+    if field == "key" { return "key"; }
+    if field == "model" { return "coalesce(served->>'model', requested_model)"; }
+    if field == "account" { return "coalesce(account, '')"; }
+    if field == "seat" { return "coalesce(served->>'seat', '')"; }
+    if field == "node" { return "coalesce(served->>'node', '')"; }
+    if field == "day" {
+        return "to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"00:00:00\"Z\"')";
+    }
+    if field == "hour" {
+        return "to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:00:00\"Z\"')";
+    }
+    return "";
+}
+
+/// The condition `q` puts on `usage` (the cursor included), its
+/// parameters added to `a` as $1..$7 and then a pair each for the metadata.
+// Each parameter goes into `a`, a list built for one statement.
+@bounded_by(a)
+fn usage_where(q: UsageQuery, a: db::Args) -> String {
+    a.add(q.project);
+    a.add(q.key);
+    a.add(q.model);
+    a.add(q.account);
+    if q.has_from { a.add(std::time::iso8601(q.from)); } else { a.add_null(); }
+    if q.has_to { a.add(std::time::iso8601(q.to)); } else { a.add_null(); }
+    a.add(to_string(q.cursor));
+    let mut cond = "($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR requested_model = $3 OR served->>'model' = $3) AND ($4 = '' OR account = $4) AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz) AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz) AND ($7::bigint = 0 OR seq < $7::bigint)";
+    let mut n = 8;
+    for pair in q.metadata.items {
+        let eq = std::str::index_of(pair, "=");
+        a.add(if eq < 0 { pair } else { pair[0..eq] });
+        if eq < 0 { a.add_null(); } else { a.add(pair[(eq + 1)..len(pair)]); }
+        cond = cond + " AND record->'metadata'->>$" + to_string(n) + " = $" + to_string(n + 1);
+        n = n + 2;
+    }
+    return cond;
+}
+
+/// A ledger row as a read answers it.
+fn usage_row(line: String) -> UsageRow {
+    return UsageRow {
+        seq: std::json::find_int_field(line, "seq"),
+        id: pg_text(line, "id"),
+        created_at: pg_time(pg_text(line, "created_at")),
+        record: raw_or_empty(line, "record"),
+        present: true
+    };
+}
 
 /// A timestamptz as Postgres writes it in UTC (`...+00:00`), as a `Time`.
 fn pg_time(text: String) -> Time {

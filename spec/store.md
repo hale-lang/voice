@@ -266,7 +266,9 @@ create index on usage (account, created_at desc);
 ```
 
 Summaries (`GET /admin/v1/usage/summary`) are aggregates over `usage`, and
-the admin event stream's `usage` events are its rows as they are inserted.
+the admin event stream's `usage` events are its rows past the subscriber's
+place. `seq` (migration 0006) numbers rows in the order they were written: a
+page is "older than" a row, and the stream follows "newer than" the last.
 
 ## The transactions
 

@@ -75,7 +75,12 @@ const refusals = {
   createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [503, 'no_eligible_seat'] },
   // no brain works here, so no route table reaches the api
   getRoutes: { json: [503, 'route_table_unavailable'] },
+  // nothing here can serve a request, so the ledger holds no record to read
+  getUsage: { json: [404, 'not_found'] },
 };
+
+// the query an operation needs to be answered at all
+const queries = { summarizeUsage: '?group_by=project,account' };
 
 const calls = [], last = [];
 for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object.entries(item)) {
@@ -84,9 +89,26 @@ for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object
 }
 for (const [p, m, op] of [...calls, ...last]) {
   const code = Object.keys(op.responses).find(c => c.startsWith('2'));
-  const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]);
+  const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]) + (queries[op.operationId] ?? '');
   const content = op.responses[code].content;
   const who = p.startsWith('/node/') ? nodeAuth : auth;
+  if (op.operationId === 'streamAdminEvents') {
+    // connect for a place, make a change, and ask again from that place
+    n++;
+    const head = await fetch(url, { headers: who });
+    if (String(head.status) !== code) fail('streamAdminEvents', `status ${head.status} != ${code}`);
+    if (!(head.headers.get('content-type') || '').startsWith('text/event-stream')) fail('streamAdminEvents', 'content-type');
+    const place = (await head.text()).split('\n').filter(l => l.startsWith('id: ')).pop()?.slice(4);
+    if (!place) { fail('streamAdminEvents', 'no place to resume from'); continue; }
+    await setup('/admin/v1/projects', { id: 'followed', name: 'Followed' });
+    const again = await fetch(url, { headers: { ...who, 'last-event-id': place } });
+    const f = ajv.compile(strip(content['text/event-stream'].schema));
+    const datas = (await again.text()).split('\n\n').map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(d => d && d.length > 6).map(l => JSON.parse(l.slice(6)));
+    const told = datas.find(d => d.type === 'change' && d.data.target === 'projects/followed');
+    if (!told) fail('streamAdminEvents', 'the change of a project was not told');
+    for (const d of datas) if (!f(d)) fail('streamAdminEvents', JSON.stringify(f.errors.slice(0, 3)));
+    continue;
+  }
   if (!content) {
     n++;
     const body = ['post', 'put'].includes(m) ? JSON.stringify(nodeBodies[op.operationId] ?? {}) : undefined;

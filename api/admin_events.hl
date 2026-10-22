@@ -1,0 +1,232 @@
+// The admin event stream, `GET /admin/v1/events` (spec/openapi.yaml,
+// `AdminEvent`): what happens, to a subscriber that follows it. A
+// subscriber that connects with no place sees only what follows; one that
+// reconnects with `Last-Event-ID` is told everything past that place, from
+// the rows (nothing is held by the api between connections).
+//
+// Every event is read from a row the store holds, so it comes from the
+// place it happened and from any api instance alike: a request served is
+// its ledger row (`usage`, the whole record), a key, project, account,
+// model, node or seat changed is its change row (`change`), and a node
+// registered, lost, drained or revoked is its status moving (`node`, the
+// whole node as `GET /admin/v1/nodes/{id}` answers it). A place is the
+// marks of those rows: the last ledger row and change told, and each
+// node's status. The api's HTTP server answers one request at a time, so
+// each answer is short and the browser's EventSource reconnects at the
+// `retry` it is given (the stream stays open instead once the router
+// moves onto `http::Rest`).
+
+/// The `type`s a subscriber may ask for.
+const EVENT_TYPES: String = "node usage change";
+
+/// A node's place in the stream: its id and status, as a number. The
+/// nodes' marks are numbers so that a subscriber holds no text between
+/// looks.
+fn node_mark(id: String, status: String) -> Int {
+    let v = std::str::bytes_view(id + "=" + status);
+    let mut h = 7;
+    let mut i = 0;
+    while i < v.n {
+        h = (h * 31 + std::str::byte_at(v, i)) % 1000000007;
+        i = i + 1;
+    }
+    return h;
+}
+
+/// One look at the rows, for one subscriber: what is past its marks is
+/// told to `out`, and the marks move on. A locus of its own so that what
+/// a look allocates is reclaimed when it ends, not held for as long as the
+/// subscriber stays.
+locus EventTick {
+    params {
+        store: st::Store;
+        nodes: Nodes;
+        changes: Changes;
+        types: st::Names = st::Names { };
+        out: EventStream;
+        // look only to take the marks (the head of the stream), telling nothing
+        quiet: Bool = false;
+        usage_mark: Int = 0;
+        change_mark: Int = 0;
+        node_marks: NodeMarks = NodeMarks { };
+    }
+
+    birth() {
+        self.look() or {
+            log_error(
+                "the admin event stream could not be read",
+                std::log::kv("error", err.message),
+            );
+        };
+    }
+
+    /// True when the subscriber wants events of type `t`.
+    fn wants(t: String) -> Bool {
+        let asked = self.types.items;
+        if count(asked) == 0 { return true; }
+        for w in asked {
+            if w == t { return true; }
+        }
+        return false;
+    }
+
+    fn look() fallible(ApiError) {
+        if self.quiet {
+            let u = self.store.usage_rows(st::UsageQuery { limit: 1 }) or fail store_failed(err);
+            self.usage_mark = (at(u.rows, 0) or st::UsageRow { }).seq;
+            let c = self.store.changes(st::ChangeQuery { limit: 1 }) or fail store_failed(err);
+            self.change_mark = (at(c.rows, 0) or st::ChangeRow { }).seq;
+        } else {
+            if self.wants("usage") {
+                let rows = self.store.usage_after(self.usage_mark, 100) or fail store_failed(err);
+                for r in rows.rows {
+                    self.usage_mark = r.seq;
+                    self.tell("usage", "usage_" + to_string(r.seq), r.created_at, r.record);
+                }
+            }
+            if self.wants("change") {
+                let page = self.changes.list_read(st::ChangeQuery { limit: 100 }) or raise;
+                let mut i = count(page.data) - 1;
+                while i >= 0 {
+                    let c = at(page.data, i) or ChangeRead { action: action_of("create") };
+                    i = i - 1;
+                    let seq = std::str::parse_int(c.id[4..len(c.id)]) or 0;
+                    if seq <= self.change_mark { continue; }
+                    self.change_mark = seq;
+                    self.tell("change", "change_" + to_string(seq), c.at, change_json(c));
+                }
+            }
+        }
+        let l = self.nodes.list_read() or raise;
+        let mut fresh = NodeMarks { };
+        for n in l.data {
+            let m = node_mark(n.id, node_state_name(n.status));
+            push(fresh.items, m) or discard;
+            if !self.quiet && self.wants("node") && !has_mark(self.node_marks, m) {
+                self.tell(
+                    "node",
+                    "node_" + to_string(std::time::monotonic_ns()),
+                    now_seconds(),
+                    node_json(n),
+                );
+            }
+        }
+        self.node_marks = fresh;
+    }
+
+    /// One event on the stream.
+    fn tell(t: String, id: String, when: Time, data: String) {
+        self.out.send_with(
+            t,
+            id,
+            "{\"id\": " + jq(id) + ", \"at\": " + jtime(when) + ", \"type\": " + jq(t)
+                + ", \"data\": " + data + "}",
+        );
+    }
+}
+
+/// The nodes' marks, as many as the store holds nodes.
+type NodeMarks { items: bounded[Int; 64]; }
+
+fn has_mark(marks: NodeMarks, m: Int) -> Bool {
+    for x in marks.items {
+        if x == m { return true; }
+    }
+    return false;
+}
+
+/// One subscriber's place in the stream.
+locus AdminEvents {
+    params {
+        store: st::Store;
+        nodes: Nodes;
+        changes: Changes;
+        // the `type`s asked for; none means all
+        types: st::Names = st::Names { };
+        // the last ledger row and change told, and each node's place
+        usage_mark: Int = 0;
+        change_mark: Int = 0;
+        node_marks: NodeMarks = NodeMarks { };
+    }
+
+    /// One look, quiet or telling `out`; the marks move on.
+    fn look(out: EventStream, quiet: Bool) {
+        let t = EventTick {
+            store: self.store,
+            nodes: self.nodes,
+            changes: self.changes,
+            types: self.types,
+            out: out,
+            quiet: quiet,
+            usage_mark: self.usage_mark,
+            change_mark: self.change_mark,
+            node_marks: self.node_marks,
+        };
+        self.usage_mark = t.usage_mark;
+        self.change_mark = t.change_mark;
+        self.node_marks = t.node_marks;
+    }
+
+    /// The place the stream has reached, as an event id: the last ledger
+    /// row and change told, and each node's mark.
+    fn place() -> String {
+        let mut nodes = "";
+        let marks = self.node_marks.items;
+        for m in marks {
+            nodes = nodes + (if len(nodes) > 0 { "," } else { "" }) + to_string(m);
+        }
+        return "u" + to_string(self.usage_mark) + ".c" + to_string(self.change_mark) + ".n"
+            + nodes;
+    }
+
+    /// Take the marks from an event id `place` wrote; false when it is
+    /// not one.
+    fn resume(id: String) -> Bool {
+        let dc = std::str::index_of(id, ".c");
+        let dn = std::str::index_of(id, ".n");
+        if !std::str::starts_with(id, "u") || dc < 0 || dn < dc { return false; }
+        self.usage_mark = std::str::parse_int(id[1..dc]) or - 1;
+        self.change_mark = std::str::parse_int(id[(dc + 2)..dn]) or - 1;
+        if self.usage_mark < 0 || self.change_mark < 0 { return false; }
+        let mut rest = id[(dn + 3)..len(id)];
+        let mut marks = NodeMarks { };
+        while len(rest) > 0 {
+            let comma = std::str::index_of(rest, ",");
+            let one = if comma < 0 { rest } else { rest[0..comma] };
+            rest = if comma < 0 { "" } else { rest[(comma + 1)..len(rest)] };
+            push(marks.items, std::str::parse_int(one) or 0) or discard;
+        }
+        self.node_marks = marks;
+        return true;
+    }
+
+    /// One answer of the stream. The api's HTTP server answers one request
+    /// at a time, so a stream held open would hold every other request
+    /// off: the answer is what happened past the subscriber's place, then
+    /// its new place as the id the browser sends back as `Last-Event-ID`
+    /// when it reconnects (`retry` says how soon). A subscriber with no
+    /// place is at the head: it is told nothing of what came before.
+    fn follow(out: EventStream, last: String) -> std::http::Response {
+        out.raw("retry: 2000\n\n");
+        if self.resume(last) {
+            self.look(out, false);
+        } else {
+            self.look(out, true);
+        }
+        out.send_with("", self.place(), "");
+        return out.end();
+    }
+}
+
+/// The `type` filter of a subscription, refusing a type the stream does
+/// not carry.
+fn read_event_types(path: String) -> st::Names fallible(ApiError) {
+    let asked = query_all(path, "type");
+    let wanted = asked.items;
+    for t in wanted {
+        if !std::str::contains(" " + EVENT_TYPES + " ", " " + t + " ") {
+            fail invalid("`type` is any of " + EVENT_TYPES, "type");
+        }
+    }
+    return asked;
+}

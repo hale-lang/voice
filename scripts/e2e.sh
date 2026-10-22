@@ -89,7 +89,7 @@ fi
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
 HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
-  api/api --port "$API_PORT" --canned api/canned --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
+  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done

@@ -201,8 +201,7 @@ process model):
   seed `spec/validate`.
 - `ci/ui` to seed `ui`.
 - `ci/contracts` to `openapi.yaml`, `node.yaml`, `protocol.yaml`,
-  `internal.yaml`, seed `spec/validate` (the canned bodies against
-  `openapi.yaml`).
+  `internal.yaml`, seed `spec/validate` (the contracts' validity).
 - `ci/store` to `store.md` (its schema, applied to Postgres, and the
   api's migrations against it).
 - `ci/image` to `compose`.

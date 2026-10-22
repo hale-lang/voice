@@ -4,6 +4,7 @@
 // seats that are not eligible.
 import ".." as api;
 import "../../node" as node;
+import "../../store" as st;
 
 /// A link to nodes that answer with the static engine, in process. A node
 /// named in `refusing` refuses every request; one in `failing` fails it
@@ -822,6 +823,194 @@ fn bring_up(e: api::Endpoints, id: String) -> String {
     return token;
 }
 
+/// What the admin stream tells a subscriber on `tail` now.
+fn told(tail: api::AdminEvents) -> String {
+    let out = api::EventStream { };
+    tail.look(out, false);
+    return out.end().body;
+}
+
+/// A request served is one row in the ledger: read back by id, listed,
+/// filtered, summed, and told to the subscriber that was connected when it
+/// was served (and to none that connected after).
+fn ledger(e: api::Endpoints, tail: api::AdminEvents, id: String) {
+    let g = admin(e, "GET", "/admin/v1/usage/" + id, "");
+    expect(g, 200, "the ledger has the request");
+    std::test::assert_eq_str(std::json::find_string_field(g.body, "id"), id, "its id");
+    std::test::assert_eq_str(
+        std::json::find_string_field(g.body, "project"),
+        "work",
+        "its project",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(g.body, "requested_model"),
+        "echo-1",
+        "the model asked for",
+    );
+    std::test::assert_eq_str(std::json::find_string_field(g.body, "status"), "served", "served");
+    std::test::assert_eq_str(
+        std::json::find_string_field(g.body, "endpoint"),
+        "responses",
+        "on the endpoint it came by",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(g.body, "input_tokens"), 3, "tokens in");
+    std::test::assert_eq_int(std::json::find_int_field(g.body, "output_tokens"), 4, "tokens out");
+    std::test::assert_eq_int(std::json::find_int_field(g.body, "price_micros"), 69, "its price");
+    let served = std::json::find_field_raw(g.body, "served");
+    std::test::assert_eq_str(std::json::find_string_field(served, "node"), "laptop", "the node");
+    std::test::assert_eq_str(
+        std::json::find_string_field(served, "seat"),
+        "laptop/static",
+        "the seat",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(served, "account"),
+        "static",
+        "the account",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(
+            std::json::find_field_raw(g.body, "metadata"),
+            "dna.attempt_id",
+        ),
+        "w-1",
+        "the caller's metadata, untouched",
+    );
+    std::test::assert(
+        std::json::find_int_field(std::json::find_field_raw(g.body, "timing"), "wall_ms") >= 0,
+        "its timing",
+    );
+    expect(admin(e, "GET", "/admin/v1/usage/resp_none", ""), 404, "no such record");
+
+    let l = admin(e, "GET", "/admin/v1/usage", "");
+    expect(l, 200, "the ledger, listed");
+    std::test::assert_eq_str(
+        std::json::find_string_field(
+            std::json::array_first(std::json::find_field_raw(l.body, "data")).element,
+            "id",
+        ),
+        id,
+        "newest first",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(l.body, "next_cursor")),
+        "null",
+        "one page",
+    );
+    std::test::assert(
+        std::str::contains(
+            admin(e, "GET", "/admin/v1/usage?metadata=dna.attempt_id%3Dw-1", "").body,
+            id,
+        ),
+        "filtered by the metadata it has",
+    );
+    std::test::assert(
+        !std::str::contains(
+            admin(e, "GET", "/admin/v1/usage?metadata=dna.attempt_id%3Dw-2", "").body,
+            id,
+        ),
+        "and not by one it has not",
+    );
+    std::test::assert(
+        !std::str::contains(admin(e, "GET", "/admin/v1/usage?project=other", "").body, id),
+        "nor by another project",
+    );
+    expect(admin(e, "GET", "/admin/v1/usage?cursor=oops", ""), 400, "a cursor that is not one");
+
+    let sum = admin(e, "GET", "/admin/v1/usage/summary?group_by=project,model", "");
+    expect(sum, 200, "the summary");
+    let row = std::json::array_first(std::json::find_field_raw(sum.body, "data")).element;
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(row, "group"), "project"),
+        "work",
+        "grouped by project",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(row, "group"), "model"),
+        "echo",
+        "and by the model that served",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(row, "requests"), 1, "one request");
+    std::test::assert_eq_int(std::json::find_int_field(row, "input_tokens"), 3, "summed in");
+    std::test::assert_eq_int(std::json::find_int_field(row, "output_tokens"), 4, "summed out");
+    std::test::assert_eq_int(std::json::find_int_field(row, "price_micros"), 69, "and its spend");
+
+    // the subscriber that was connected is told; one that connects now is not
+    let body = told(tail);
+    std::test::assert(
+        std::str::starts_with(
+            body,
+            "id: usage_1\nevent: usage\ndata: {\"id\": \"usage_1\", \"at\": ",
+        ),
+        "the request is told: " + body,
+    );
+    std::test::assert(
+        std::str::contains(body, "\"type\": \"usage\", \"data\": {\"id\": \"" + id + "\""),
+        "with its record",
+    );
+    std::test::assert_eq_str(told(tail), "", "once");
+    let late = api::AdminEvents { store: e.store, nodes: e.nodes, changes: e.changes };
+    late.look(api::EventStream { }, true);
+    std::test::assert_eq_str(told(late), "", "a subscriber that connects late is told nothing");
+    let only = api::AdminEvents {
+        store: e.store,
+        nodes: e.nodes,
+        changes: e.changes,
+        types: api::read_event_types("/admin/v1/events?type=change") or st::Names { },
+    };
+    // over the wire: a first connection is at the head, a reconnection from
+    // a place is told what came after it
+    let first = e.handle(std::http::Request { method: "GET", path: "/admin/v1/events" });
+    std::test::assert(
+        std::str::starts_with(first.body, "retry: 2000\n\n")
+            && std::str::contains(first.body, "id: u1.c")
+            && !std::str::contains(first.body, "event: usage"),
+        "a first connection is given its place: " + first.body,
+    );
+    let back = e.handle(
+        std::http::Request {
+            method: "GET",
+            path: "/admin/v1/events?type=usage",
+            headers: "Last-Event-ID: u0.c0.n",
+        },
+    );
+    std::test::assert(
+        std::str::contains(back.body, "event: usage\ndata: {\"id\": \"usage_1\"")
+            && !std::str::contains(back.body, "event: change"),
+        "a reconnection is told what came after its place, of the types asked: " + back.body,
+    );
+    only.look(api::EventStream { }, true);
+    std::test::assert_eq_str(told(only), "", "nor is one asking for another type");
+}
+
+/// A node revoked is told as the node it now is, beside its change.
+fn node_told(e: api::Endpoints) {
+    let tail = api::AdminEvents { store: e.store, nodes: e.nodes, changes: e.changes };
+    tail.look(api::EventStream { }, true);
+    expect(admin(e, "DELETE", "/admin/v1/nodes/desktop", ""), 200, "a node revoked");
+    let body = told(tail);
+    std::test::assert(
+        std::str::contains(body, "event: node\ndata: {")
+            && std::str::contains(body, "\"type\": \"node\", \"data\": {\"id\": \"desktop\""),
+        "the node: " + body,
+    );
+    std::test::assert(std::str::contains(body, "\"status\": \"revoked\""), "as it now is");
+    std::test::assert(
+        std::str::contains(body, "event: change\ndata: {")
+            && std::str::contains(body, "\"target\": \"nodes/desktop\""),
+        "and the change",
+    );
+}
+
+/// The requests a project made, as the summary adds them up.
+fn requests_of_work(e: api::Endpoints) -> Int {
+    let sum = admin(e, "GET", "/admin/v1/usage/summary?group_by=project", "");
+    return std::json::find_int_field(
+        std::json::array_first(std::json::find_field_raw(sum.body, "data")).element,
+        "requests",
+    );
+}
+
 fn main() {
     let nodes = Nodes { };
     let e = api::Endpoints { link: nodes };
@@ -864,6 +1053,8 @@ fn main() {
     );
 
     // a response
+    let tail = api::AdminEvents { store: e.store, nodes: e.nodes, changes: e.changes };
+    tail.look(api::EventStream { }, true);
     let r = ask(
         e,
         "/v1/responses",
@@ -929,6 +1120,7 @@ fn main() {
             && std::str::contains(nodes.last_body, "\"engine_model\": \"echo\""),
         "the node gets the standard request and the seat's name for the model",
     );
+    ledger(e, tail, id);
 
     // a chat completion
     let c = ask(
@@ -1100,7 +1292,13 @@ fn main() {
         "a cut answer stopped for length",
     );
 
+    let before = requests_of_work(e);
     streamed_with_sse(e, key, nodes);
+    std::test::assert_eq_int(
+        requests_of_work(e),
+        before + 6,
+        "each of the six requests streamed_with_sse served, streamed or not, is a row",
+    );
     streamed_failures(e, key, nodes, laptop);
     first_output_span(e, key, nodes, laptop);
     rate_limits(e, key, laptop);
@@ -1253,4 +1451,5 @@ fn main() {
         "no_eligible_seat",
     );
     std::test::assert_eq_int(nodes.offers, before, "nothing was offered");
+    node_told(e);
 }

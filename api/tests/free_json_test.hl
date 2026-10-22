@@ -17,6 +17,14 @@ fn big_config(n: Int) -> String {
     return "{\"text\": \"" + text + "\", \"chunk_chars\": 8}";
 }
 
+/// `n` bytes of text.
+@unbounded
+fn pad(n: Int) -> String {
+    let mut text = "a";
+    while len(text) < n { text = text + text; }
+    return text[0..n];
+}
+
 fn nothing() -> api::SeatView {
     return api::SeatView { ref: "refused", status: api::SeatStatus::offline };
 }
@@ -67,6 +75,62 @@ fn main() {
         !created.has_before && created.before.text == "null",
         "and a create's before is null",
     );
+
+    // an accepted seat stays readable through its change: a config past
+    // 48 KiB is refused at the write (the reviewer's 65,480 characters of text
+    // fit a value alone, not the seat that holds them), one at the bound is
+    // created, and the change list answers with it
+    let wide = api::SeatCreate {
+        node: "laptop",
+        id: "wide",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(
+            "{\"text\": \"" + pad(65480) + "\"}",
+        ) or std::json::Value::null(),
+    };
+    let mut refused = "";
+    seats.create(wide) or {
+        refused = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::starts_with(refused, "invalid `config` is at most 48 KiB (49152 bytes)"),
+        "a config past the bound is refused, saying so: " + refused,
+    );
+    let bound = "{\"text\": \"" + pad(49152 - 12) + "\"}";
+    std::test::assert_eq_int(len(bound), 49152, "a config at the bound");
+    let mut at_bound = api::SeatCreate {
+        node: "laptop",
+        id: "bound",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(bound) or std::json::Value::null(),
+    };
+    push(at_bound.serves, st::SeatModel { model: "echo-1" }) or discard;
+    let made = seats.create(at_bound) or nothing();
+    std::test::assert_eq_str(made.ref, "laptop/bound", "created");
+    let wide_log = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/bound" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(
+        count(wide_log.data),
+        1,
+        "the change list answers, with the seat's change",
+    );
+    let archived = seats.remove(api::SeatRef { node: "laptop", seat: "bound" }) or nothing();
+    std::test::assert_eq_str(
+        archived.ref,
+        "laptop/bound",
+        "and its removal, a before of the same size",
+    );
+    let after_remove = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/bound" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(count(after_remove.data), 2, "is readable too");
 
     // a config stored before the 64 KiB a value holds (an old row): never
     // replaced, assigned to its node intact

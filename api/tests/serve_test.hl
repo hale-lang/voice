@@ -1046,6 +1046,62 @@ fn requests_of_work(e: api::Endpoints) -> Int {
     );
 }
 
+/// The place an event-stream answer ends at (its `id: u…` line).
+fn place_of(body: String) -> String {
+    let at = std::str::index_of(body, "id: u");
+    if at < 0 { return ""; }
+    let rest = body[(at + 4)..len(body)];
+    return rest[0..std::str::index_of(rest, "\n")];
+}
+
+/// How many times `what` occurs in `s`.
+fn occurrences(s: String, what: String) -> Int {
+    let mut n = 0;
+    let mut rest = s;
+    let mut at = std::str::index_of(rest, what);
+    while at >= 0 {
+        n = n + 1;
+        rest = rest[(at + len(what))..len(rest)];
+        at = std::str::index_of(rest, what);
+    }
+    return n;
+}
+
+/// A subscriber more than a page of changes behind is told every one of
+/// them over its reconnections, each answer making progress.
+fn change_backlog() {
+    let e = api::Endpoints { };
+    expect(admin(e, "POST", "/admin/v1/models", "{\"id\": \"m\"}"), 201, "a model");
+    let first = e.handle(
+        std::http::Request { method: "GET", path: "/admin/v1/events?type=change" },
+    );
+    let mut place = place_of(first.body);
+    let mut i = 1;
+    while i <= 1500 {
+        admin(e, "PATCH", "/admin/v1/models/m", "{\"context_length\": " + to_string(i) + "}");
+        i = i + 1;
+    }
+    let mut told = 0;
+    let mut rounds = 0;
+    let mut more = true;
+    while more && rounds < 10 {
+        let back = e.handle(
+            std::http::Request {
+                method: "GET",
+                path: "/admin/v1/events?type=change",
+                headers: "Last-Event-ID: " + place,
+            },
+        );
+        let n = occurrences(back.body, "event: change\n");
+        told = told + n;
+        rounds = rounds + 1;
+        more = n > 0;
+        place = place_of(back.body);
+    }
+    std::test::assert_eq_int(told, 1500, "every change behind the place is told, once");
+    std::test::assert(rounds <= 3, "in a page per answer: " + to_string(rounds));
+}
+
 fn main() {
     let nodes = Nodes { };
     let e = api::Endpoints { link: nodes };
@@ -1487,4 +1543,5 @@ fn main() {
     );
     std::test::assert_eq_int(nodes.offers, before, "nothing was offered");
     node_told(e);
+    change_backlog();
 }

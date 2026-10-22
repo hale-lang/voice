@@ -218,6 +218,45 @@ peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
 [ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 12 MiB"; exit 1; }
 echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
 
+# one streamed inference held open does not hold the api: an admin read, the
+# node link, the event stream and a cancel all complete promptly beside it
+# (only the moments a request touches Postgres take turns)
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "'$(printf 'y%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}' >/dev/null
+wait_for up
+curl -s -N --max-time 40 -D "$work/held.head" -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/held.sse" &
+held_curl=$!
+for i in $(seq 1 100); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "1" ] && break
+  sleep 0.1
+done
+held_id=$(tr -d '\r' <"$work/held.head" | awk -F': ' 'tolower($1) == "x-request-id" {print $2}')
+[ -n "$held_id" ] || { echo "the held stream has no request id"; cat "$work/held.head"; exit 1; }
+sleep 1
+within() { # <label> <max ms> <command...>
+  local label=$1 max=$2; shift 2
+  local t=$(date +%s%N)
+  "$@" >/dev/null || { echo "$label failed beside a held stream"; exit 1; }
+  local ms=$(( ($(date +%s%N) - t) / 1000000 ))
+  [ "$ms" -lt "$max" ] || { echo "$label took $ms ms beside a held stream"; exit 1; }
+  echo "$label: $ms ms beside a held stream"
+}
+within "an admin read" 2000 curl -fsS --max-time 10 "$api/admin/v1/projects"
+within "a change-log read" 2000 curl -fsS --max-time 10 "$api/admin/v1/changes?limit=1"
+within "the node link" 2000 curl -fsS --max-time 10 "$api/node/v1/assignment" -H "authorization: Bearer $token"
+within "the event stream" 2000 curl -fsS --max-time 10 "$api/admin/v1/events?type=change"
+t0=$(date +%s%N)
+python3 scripts/nats-publish.py "${NATS_URL#nats://}" "voice.node.laptop.cancel" '{"type": "cancel", "request_id": "'"$held_id"'"}'
+for i in $(seq 1 40); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+released_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$released_ms" -lt 2000 ] || { echo "a cancel took $released_ms ms to release the held stream"; exit 1; }
+echo "a cancel released the held stream in $released_ms ms"
+kill "$held_curl" 2>/dev/null || true
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+wait_for up
+
 # a caller that goes away mid-stream: the api stops at once, tells the seat
 # to stop, and answers the next caller
 slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'

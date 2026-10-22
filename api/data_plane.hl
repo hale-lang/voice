@@ -19,8 +19,10 @@
 locus DataPlane {
     params {
         ui: String = "";
-        // serializes the store's use across requests (gate.hl): the rows share it
-        gate: Gate = Gate { };
+        // one inference at a time: a request's state (its offer on the link, the
+        // limits' windows) is the instance's, so a second waits its turn, while
+        // everything else (the rows, the node link, the event stream) goes on
+        turn: st::Lock = st::Lock { };
         // the configuration and the fleet as reported: in the process
         // unless the api is given a database (main.hl)
         store: st::Store = st::MemoryStore { };
@@ -83,10 +85,7 @@ locus DataPlane {
     }
 
     fn handle(req: std::http::Request) -> std::http::Response {
-        self.gate.enter();
-        let answer = self.route(req) or failed(err);
-        self.gate.leave();
-        return answer;
+        return self.route(req) or failed(err);
     }
 
     fn route(req: std::http::Request) -> std::http::Response fallible(ApiError) {
@@ -211,6 +210,20 @@ locus DataPlane {
     /// An inference request: the caller's key, then the row's handler,
     /// which admits it and has a seat serve it.
     fn infer(req: std::http::Request, endpoint: String) -> std::http::Response fallible(ApiError) {
+        self.turn.enter();
+        let answered = self.infer_in_turn(req, endpoint) or {
+            self.turn.leave();
+            fail err;
+        };
+        self.turn.leave();
+        return answered;
+    }
+
+    /// `infer`, in the instance's turn.
+    fn infer_in_turn(
+        req: std::http::Request,
+        endpoint: String
+    ) -> std::http::Response fallible(ApiError) {
         let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
         let r = read_inference(req.body, endpoint) or raise;
         if r.stream {

@@ -31,9 +31,9 @@ const WAITS_ON = {
   'json-text': 'voice: a typed object the row carries as free-form JSON (std::json::Value)',
   path: 'voice: a path or query parameter carried in the row\'s request',
   'map-values': 'voice: a map whose values one side says and the other does not, so they are not compared',
-  wire: 'voice: the REST wire\'s shape differs from the row (written by api/wire.hl)',
-  required: 'voice: the row gives the field a default, so the surface does not require it; the REST reader does (api/wire.hl)',
-  open: 'voice: the contract admits several shapes there (oneOf/anyOf, or none named); the row carries one, as the REST reader does',
+  wire: 'voice: the wire\'s shape differs from the row',
+  required: 'voice: the row gives the field a default, so the surface does not require it',
+  open: 'voice: the contract admits several shapes there (oneOf/anyOf, or none named); the row carries one',
 };
 
 // Each row type, and the contract schema it stands for: a component name,
@@ -44,9 +44,6 @@ const MAP = {
   CatalogModelCreate: 'CatalogModelCreate',
   CatalogModelUpdate: 'CatalogModelUpdate',
   CatalogList: 'GET /admin/v1/models',
-  Model: 'Model',
-  ModelList: 'ModelList',
-  Capabilities: 'Capabilities',
   Project: 'Project',
   ProjectCreate: 'ProjectCreate',
   ProjectUpdate: 'ProjectUpdate',
@@ -56,7 +53,6 @@ const MAP = {
   KeyUpdate: 'KeyUpdate',
   KeyList: 'GET /admin/v1/projects/{project}/keys',
   Budget: 'Budget',
-  'BudgetSet': 'BudgetSet',
   LimitSet: 'LimitSet',
   'Limit': 'Limit',
   'ModelPrice': 'ModelPrice',
@@ -76,20 +72,11 @@ const MAP = {
   Change: 'Change',
   ChangeList: 'GET /admin/v1/changes',
   Attempt: 'Attempt',
-  VoiceExtension: 'VoiceResponseExtension',
+  Problem: 'AdminProblem',
+  UsageRecord: 'UsageRecord',
+  UsageList: 'GET /admin/v1/usage',
+  UsageSummary: 'UsageSummary',
   ServedBy: 'Served',
-  Served: 'Response',
-  InferenceRequest: 'CreateResponseRequest',
-  Registration: 'Registration',
-  Registered: 'Registered',
-  Assignment: 'Assignment',
-  AssignedSeat: 'Seat',
-  SeatState: 'SeatState',
-  SeatStates: 'SeatStates',
-  Heartbeat: 'Heartbeat',
-  QuotaReport: 'QuotaReport',
-  Draining: 'Draining',
-  ApiError: 'ErrorResponse.error',
   BudgetRequest: 'BudgetSet',
   LimitsRequest: 'LimitSet',
 };
@@ -98,15 +85,7 @@ const MAP = {
 // fields its reason allows it: a component that grows a field its reason
 // does not cover (a body field on a path record) fails the run.
 const NOT_COMPARED = {
-  AccountRef: ['the path parameter `account`; no body', ['account']],
-  KeyRef: ['the path parameters `project` and `key`; no body', ['project', 'key']],
-  ModelRef: ['the path parameter `model`; no body', ['model']],
   NodeRef: ['the path parameter `node`; no body', ['node']],
-  ProjectRef: ['the path parameter `project`; no body', ['project']],
-  SeatRef: ['the path parameters `node` and `seat`; no body', ['node', 'seat']],
-  AccountQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
-  ProjectQuery: ['the query parameter `include_archived`; no body', ['include_archived']],
-  'ChangeQuery': ['the query parameters of `GET /admin/v1/changes` (`target`, `from`, `to`, `limit`, `cursor`, with `has_from` and `has_to` for a `from` or `to` given); no body', ['target', 'has_from', 'from', 'has_to', 'to', 'limit', 'cursor']],
   Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, so its schema is never on the wire; the map\'s value is compared as `Health.checks{}`', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
@@ -122,7 +101,7 @@ const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
-const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'Served', 'Registered', 'Assignment', 'AssignedSeat', 'ApiError']);
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;
@@ -282,14 +261,9 @@ const RULES = [
   [/\.(used|revoked|archived|connected|beating|ends|budgeted|anchored)$/, 'optional', 'the null of the field beside it'],
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
-  [/^(Model|ModelList)\b/, 'wire', 'the caller\'s model nests voice\'s fields under `voice`, and lists say `object`'],
-  [/^(Budget|(ProjectCreate|Project|ProjectList\.data\[\]|Capabilities|ApiError\.voice)\.budget)\./, 'wire', 'a budget is its BudgetSet flattened into it on the wire'],
-  [/^Registered\.nats/, 'wire', '`nats` is an object of url and subject on the wire'],
-  [/(VoiceExtension|Served\.voice)\.(wall_ms|timing)$/, 'wire', 'the timing is an object of wall, queue and load on the wire'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
-  [/^Capabilities\.(project_id|project_name|key_id|key_name|project|key)$/, 'wire', 'the project and the key are objects of id and name on the wire'],
-  [/^ApiError\.(kind|type)$/, 'wire', 'the row\'s `kind` is the envelope\'s `type`, renamed by the wire (error_json)'],
-  [/^ApiError\.(status|retry_after)$/, 'wire', 'the HTTP status the error answers with and its Retry-After header, not fields of the envelope'],
+  [/^(AccountUpdate|CatalogModelUpdate|NodeUpdate|SeatUpdate|ProjectUpdate)\.(id|budget|limits)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
+  [/^UsageSummary\.data\[\]\.refused$/, 'wire', 'a summary counts the requests the ledger holds, and refusals are not written to it'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard
 // request and response, which pass through as JSON text. `Served.voice`

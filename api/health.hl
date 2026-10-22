@@ -5,7 +5,11 @@
 const VERSION: String = "0.1.0";
 
 locus Probes {
-    params { store: st::Store; }
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+    }
 
     /// `getLiveness`: the process serves HTTP at all.
     fn liveness() -> Health {
@@ -14,10 +18,22 @@ locus Probes {
 
     /// `getReadiness`: the store answers. Having no seats up is not
     /// unreadiness.
-    fn readiness() -> Health {
+    fn readiness() -> Health fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.readiness_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `readiness`, inside the gate.
+    fn readiness_in_gate() -> Health fallible(CtlError) {
         let state = if self.store.ready() { HealthStatus::ok } else { HealthStatus::unavailable };
         let mut h = Health { status: state, version: VERSION };
         push(h.checks, Check { name: "store", status: state }) or discard;
+        if state != HealthStatus::ok { fail CtlError::NotReady(h); }
         return h;
     }
 }

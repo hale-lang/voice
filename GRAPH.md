@@ -213,12 +213,12 @@ new migration" to `store.md`.
 
 `witnesses`:
 - the `Router.add` entry, and hale-lang/hale#1048, to seed `api` (the
-  `is_route` ladder in `api/endpoints.hl`).
+  `is_route` ladder in `api/data_plane.hl`).
 - the triple-quoted strings entry to seed `api` (canned bodies live in
   files).
-- the `is_route` captures entry to seed `api` (`api/endpoints.hl` reads
+- the `is_route` captures entry to seed `api` (`api/data_plane.hl` reads
   `c.params` in the branch that matched).
-- the surface codec entry to seed `api` (`api/surface.hl`, `api/wire.hl`)
+- the surface codec entry to seed `api` (`api/surface.hl`)
   and seed `spec/validate` (`live.mjs`).
 - the `bounded` assignment entry to seed `api` (`Names`, `Restriction`).
 - the hashmap row warning entry to seed `store` (`MemoryStore`'s `@unbounded`

@@ -17,65 +17,221 @@ fn big_config(n: Int) -> String {
     return "{\"text\": \"" + text + "\", \"chunk_chars\": 8}";
 }
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+/// `n` bytes of text.
+@unbounded
+fn pad(n: Int) -> String {
+    let mut text = "a";
+    while len(text) < n { text = text + text; }
+    return text[0..n];
+}
+
+/// An object nested `levels` containers deep: `{"x": [[...0...]]}`.
+fn nested(levels: Int) -> String {
+    let mut open = "{\"x\":";
+    let mut close = "}";
+    let mut i = 1;
+    while i < levels {
+        open = open + "[";
+        close = "]" + close;
+        i = i + 1;
+    }
+    return open + "0" + close;
+}
+
+fn nothing() -> api::SeatView {
+    return api::SeatView { ref: "refused", status: api::SeatStatus::offline };
 }
 
 const CONFIG: String = "{\"text\":  \"hi\", \"z\": 1, \"a\": [1, 2.50, {\"deep\": null}]}";
 const SCHEMA: String = "{\"type\": \"object\",   \"required\": [\"text\"], \"properties\": {\"text\": {\"type\": \"string\"}}}";
 
 fn main() {
-    let e = api::Endpoints { };
-    call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
-    call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
-    call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}");
-    let seat = call(
-        e,
-        "POST",
-        "/admin/v1/nodes/laptop/seats",
-        "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": "
-            + CONFIG + "}",
-    );
-    std::test::assert_eq_int(seat.status, 201, "a seat: " + seat.body);
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: api::NatsLink { } };
+    let seats = api::Seats { store: e.store, link: api::NatsLink { } };
+    let changes = api::Changes { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    nodes.create(api::NodeCreate { id: "laptop" }) or discard;
+    let mut create = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(CONFIG) or std::json::Value::null(),
+    };
+    push(create.serves, st::SeatModel { model: "echo-1" }) or discard;
+    let seat = seats.create(create) or nothing();
+    std::test::assert_eq_str(seat.ref, "laptop/static", "a seat");
+    std::test::assert_eq_str(seat.config.text, CONFIG, "its config, byte for byte");
+    let got = seats.get(api::SeatRef { node: "laptop", seat: "static" }) or nothing();
+    std::test::assert_eq_str(got.config.text, CONFIG, "and read back so");
     std::test::assert(
-        std::str::contains(seat.body, "\"config\": " + CONFIG),
-        "its config, byte for byte: " + seat.body,
+        std::str::contains(api::SeatView::api_encode(got), "\"config\":" + CONFIG)
+            || std::str::contains(api::SeatView::api_encode(got), "\"config\": " + CONFIG),
+        "and on the codec's wire as written: " + api::SeatView::api_encode(got),
     );
-    let got = call(e, "GET", "/admin/v1/nodes/laptop/seats/static", "");
-    std::test::assert(
-        std::str::contains(got.body, "\"config\": " + CONFIG),
-        "and read back so: " + got.body,
+    let log = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/static" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    let created = at(log.data, 0) or api::Change { action: api::ChangeAction::delete };
+    std::test::assert_eq_str(
+        std::json::find_field_raw(created.after.text, "config"),
+        CONFIG,
+        "the change's after holds it as written: " + created.after.text,
     );
-    let changes = call(e, "GET", "/admin/v1/changes?target=nodes/laptop/seats/static", "");
     std::test::assert(
-        std::str::contains(changes.body, CONFIG),
-        "the change's after holds it as written: " + changes.body,
-    );
-    std::test::assert(
-        std::str::contains(changes.body, "\"before\": null"),
+        !created.has_before && created.before.text == "null",
         "and a create's before is null",
     );
-    std::test::assert_eq_int(
-        call(e, "PATCH", "/admin/v1/nodes/laptop/seats/static", "{\"config\": [1, 2]}").status,
-        400,
-        "a config is an object",
+
+    // an accepted seat stays readable through its change: a config past
+    // 48 KiB is refused at the write (the reviewer's 65,480 characters of text
+    // fit a value alone, not the seat that holds them), one at the bound is
+    // created, and the change list answers with it
+    let wide = api::SeatCreate {
+        node: "laptop",
+        id: "wide",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(
+            "{\"text\": \"" + pad(65480) + "\"}",
+        ) or std::json::Value::null(),
+    };
+    let mut refused = "";
+    seats.create(wide) or {
+        refused = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::starts_with(refused, "invalid `config` is at most 48 KiB (49152 bytes)"),
+        "a config past the bound is refused, saying so: " + refused,
     );
+    let bound = "{\"text\": \"" + pad(49152 - 12) + "\"}";
+    std::test::assert_eq_int(len(bound), 49152, "a config at the bound");
+    let mut at_bound = api::SeatCreate {
+        node: "laptop",
+        id: "bound",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(bound) or std::json::Value::null(),
+    };
+    push(at_bound.serves, st::SeatModel { model: "echo-1" }) or discard;
+    let made = seats.create(at_bound) or nothing();
+    std::test::assert_eq_str(made.ref, "laptop/bound", "created");
+    let wide_log = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/bound" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(
+        count(wide_log.data),
+        1,
+        "the change list answers, with the seat's change",
+    );
+    let archived = seats.remove(api::SeatRef { node: "laptop", seat: "bound" }) or nothing();
+    std::test::assert_eq_str(
+        archived.ref,
+        "laptop/bound",
+        "and its removal, a before of the same size",
+    );
+    let after_remove = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/bound" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(count(after_remove.data), 2, "is readable too");
+
+    // one check covers every member of every resource: a model's `owned_by`
+    // has no bound of its own, but the model is stored whole in its change, so
+    // one whose stored form the change log could not read back is refused, and
+    // one exactly at the boundary is accepted and listed
+    let probe = catalog.create(api::CatalogModelCreate { id: "m0", owned_by: "a" })
+    or api::CatalogModel { kind: api::ModelKind::local };
+    let base = len(api::catalog_model_json(probe)) - 1;
+    let fits = 65536 - base;
+    let at_edge = catalog.create(api::CatalogModelCreate { id: "m1", owned_by: pad(fits) })
+    or api::CatalogModel { kind: api::ModelKind::local };
+    std::test::assert_eq_str(
+        at_edge.id,
+        "m1",
+        "a model whose stored form is exactly 65536 bytes is created",
+    );
+    std::test::assert_eq_int(len(api::catalog_model_json(at_edge)), 65536, "at the boundary");
+    let edge_log = changes.list(api::ChangeAsk { target: "models/m1" }) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(count(edge_log.data), 1, "and its change is listed");
+    let mut over = "";
+    catalog.create(api::CatalogModelCreate { id: "m2", owned_by: pad(fits + 1) }) or {
+        over = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::starts_with(
+            over,
+            "invalid the after of the change for models/m2 would be 65537 bytes",
+        ),
+        "one byte over is refused, saying so: " + over,
+    );
+    let mut huge = "";
+    catalog.create(api::CatalogModelCreate { id: "m3", owned_by: pad(100000) }) or {
+        huge = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::contains(huge, "cannot read back"),
+        "an oversize name is refused: " + huge,
+    );
+    let unmade = changes.list(api::ChangeAsk { target: "models/m2" }) or api::ChangeList { };
+    std::test::assert_eq_int(count(unmade.data), 0, "and nothing was made");
+
+    // and its levels: the stored seat nests the config one level down, so a
+    // config 64 levels deep is refused, one 63 deep is created and listed
+    let deep64 = nested(64);
+    let mut too_deep = "";
+    seats.create(
+        api::SeatCreate {
+            node: "laptop",
+            id: "deep64",
+            engine: "static",
+            account: "static",
+            config: std::json::Value::parse(deep64) or std::json::Value::null(),
+        },
+    ) or {
+        too_deep = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::starts_with(too_deep, "invalid `config` is at most 63 levels deep"),
+        "a config 64 levels deep is refused, saying so: " + too_deep,
+    );
+    let mut deep63 = api::SeatCreate {
+        node: "laptop",
+        id: "deep63",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse(nested(63)) or std::json::Value::null(),
+    };
+    push(deep63.serves, st::SeatModel { model: "echo-1" }) or discard;
+    let level = seats.create(deep63) or nothing();
+    std::test::assert_eq_str(level.ref, "laptop/deep63", "a config 63 levels deep is created");
+    let level_log = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats/deep63" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert_eq_int(count(level_log.data), 1, "and its change is listed");
 
     // a config stored before the 64 KiB a value holds (an old row): never
-    // replaced, written back as stored, and assigned to its node intact
+    // replaced, assigned to its node intact
     let big = big_config(70000);
     std::test::assert(len(big) > 65536, "a config past 64 KiB");
-    let token = std::json::find_string_field(
-        call(e, "POST", "/admin/v1/nodes", "{\"id\": \"mini\"}").body,
-        "enrollment_token",
-    );
+    let mini = nodes.create(api::NodeCreate { id: "mini" }) or api::Node {
+        status: api::NodeStatus::revoked,
+    };
+    let token = mini.enrollment_token;
+    std::test::assert(len(token) > 0, "a node to register");
     let mut old = st::SeatRow {
         ref: "mini/old",
         node: "mini",
@@ -95,19 +251,6 @@ fn main() {
         },
     ) or false;
     std::test::assert(stored, "the old row, written into the store directly");
-    let read = call(e, "GET", "/admin/v1/nodes/mini/seats/old", "");
-    std::test::assert_eq_int(read.status, 200, "read: " + head(read.body));
-    std::test::assert(
-        std::str::contains(read.body, "\"config\": " + big + ", "),
-        "the stored config, byte for byte",
-    );
-    let listed = call(e, "GET", "/admin/v1/nodes/mini", "");
-    std::test::assert(
-        std::str::contains(listed.body, "\"config\": " + big + ", "),
-        "in its node too",
-    );
-    let history = call(e, "GET", "/admin/v1/changes?target=nodes/mini/seats/old", "");
-    std::test::assert(std::str::contains(history.body, big), "and its change's after as stored");
     let reg = e.handle(
         std::http::Request {
             method: "POST",
@@ -121,24 +264,33 @@ fn main() {
         std::str::contains(reg.body, "\"config\": " + big + "}"),
         "and is assigned the seat with its config intact",
     );
-    // the surface's typed answer cannot hold it: an error that says so, never null
-    let typed = e.seats.get(api::SeatRef { node: "mini", seat: "old" }) or api::SeatView {
-        ref: "refused",
-        status: api::SeatStatus::offline,
-    };
-    std::test::assert_eq_str(
-        typed.ref,
-        "refused",
-        "the typed answer refuses it rather than answering null",
-    );
-    let why = e.seats.get(api::SeatRef { node: "mini", seat: "old" }) or api::SeatView {
-        ref: err.message,
-        status: api::SeatStatus::offline,
+    // the surface's typed answers cannot hold it: an error that says so,
+    // never null, wherever the seat is read
+    let mut refusal = "";
+    seats.get(api::SeatRef { node: "mini", seat: "old" }) or {
+        refusal = api::ctl_class(err) + " " + api::ctl_problem(err).message;
     };
     std::test::assert(
-        std::str::contains(why.ref, "seat mini/old's config is ")
-            && std::str::contains(why.ref, " bytes"),
-        "naming the field and its size: " + why.ref,
+        std::str::starts_with(refusal, "unavailable ")
+            && std::str::contains(refusal, "seat mini/old's config is ")
+            && std::str::contains(refusal, " bytes"),
+        "the typed answer refuses it, naming the field and its size: " + refusal,
+    );
+    refusal = "";
+    nodes.get(api::NodeRef { node: "mini" }) or {
+        refusal = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::contains(refusal, "seat mini/old's config is "),
+        "and in its node: " + refusal,
+    );
+    refusal = "";
+    changes.list(api::ChangeAsk { target: "nodes/mini/seats/old" }) or {
+        refusal = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::contains(refusal, " bytes of stored JSON"),
+        "and in the change's after: " + refusal,
     );
     // an engine without its config_schema is refused, naming the engine
     let bare = e.handle(
@@ -153,13 +305,6 @@ fn main() {
         bare.status == 400
             && std::str::contains(bare.body, "engine static declares no `config_schema`"),
         "an engine with no config_schema: " + head(bare.body),
-    );
-
-    // a new write past it is refused, naming the limit
-    let past = call(e, "PATCH", "/admin/v1/nodes/mini/seats/old", "{\"config\": " + big + "}");
-    std::test::assert(
-        past.status == 400 && std::str::contains(past.body, "64 KiB"),
-        "a new config past 64 KiB is refused: " + head(past.body),
     );
 
     // an engine's config_schema, through the codec of the node's capabilities

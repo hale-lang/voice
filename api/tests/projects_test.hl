@@ -1,303 +1,269 @@
-// Projects on the admin plane: GET/POST /admin/v1/projects and
-// GET/PATCH/DELETE /admin/v1/projects/{project}, through the router.
+// Projects on the admin plane: the rows of `Projects` (list, create, get,
+// update, archive), called on a receiver over a store.
 import ".." as api;
+import "../../store" as st;
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+fn names(xs: bounded[String; 32]) -> String {
+    let mut out = "";
+    for x in xs {
+        out = out + (if len(out) > 0 { "," } else { "" }) + x;
+    }
+    return out;
 }
 
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
-}
-
-fn raw(r: std::http::Response, name: String) -> String {
-    return std::str::trim(std::json::find_field_raw(r.body, name));
-}
-
-fn code(r: std::http::Response) -> String {
-    return std::json::find_string_field(std::json::find_field_raw(r.body, "error"), "code");
+fn limit(scope: st::LimitScope, requests: Int) -> st::Limit {
+    return st::counted(st::Limit { scope: scope, window_seconds: 60, requests: requests });
 }
 
 fn main() {
-    let e = api::Endpoints { };
+    let store = st::MemoryStore { };
+    let projects = api::Projects { store: store };
+    let keys = api::Keys { store: store };
+    let changes = api::Changes { store: store };
 
-    expect(call(e, "GET", "/admin/v1/projects", ""), 200, "no projects yet");
+    let none = projects.list(api::ProjectQuery { }) or api::ProjectList { };
+    std::test::assert_eq_int(count(none.data), 0, "no projects yet");
 
-    let work = call(
-        e,
-        "POST",
-        "/admin/v1/projects",
-        "{\"id\": \"work\", \"name\": \"Work\", \"owners\": [\"operator@example.com\"], \"data_classes\": [\"public\", \"internal\"]}",
-    );
-    expect(work, 201, "create");
-    std::test::assert_eq_str(
-        std::json::find_string_field(work.body, "status"),
-        "active",
-        "a new project is active",
-    );
-    std::test::assert_eq_str(
-        raw(work, "data_classes"),
-        "[\"public\", \"internal\"]",
-        "its data classes",
-    );
-    std::test::assert_eq_str(raw(work, "models"), "null", "the whole catalog");
-    std::test::assert_eq_str(raw(work, "accounts"), "null", "any account");
-    std::test::assert_eq_str(raw(work, "budget"), "null", "no budget yet");
-    std::test::assert_eq_str(raw(work, "limits"), "[]", "no limits yet");
-    std::test::assert_eq_int(std::json::find_int_field(work.body, "key_count"), 0, "no keys");
-    std::test::assert_eq_str(raw(work, "archived_at"), "null", "not archived");
+    let mut c = api::ProjectCreate { id: "work", name: "Work" };
+    push(c.owners, "operator@example.com") or discard;
+    push(c.data_classes, "public") or discard;
+    push(c.data_classes, "internal") or discard;
+    let work = projects.create(c) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert(work.status == api::Lifecycle::active, "a new project is active");
+    std::test::assert_eq_str(work.id, "work", "its id");
+    std::test::assert_eq_str(names(work.owners), "operator@example.com", "its owners");
+    std::test::assert_eq_str(names(work.data_classes), "public,internal", "its data classes");
+    std::test::assert(!work.has_models, "the whole catalog");
+    std::test::assert(!work.has_accounts, "any account");
+    std::test::assert(!work.has_budget, "no budget yet");
+    std::test::assert_eq_int(count(work.limits), 0, "no limits yet");
+    std::test::assert_eq_int(work.key_count, 0, "no keys");
+    std::test::assert(!work.has_archived_at, "not archived");
 
-    let lab = call(
-        e,
-        "POST",
-        "/admin/v1/projects",
-        "{\"id\": \"lab\", \"name\": \"Lab\", \"models\": [\"echo-1\"]}",
-    );
-    expect(lab, 201, "a restricted project");
+    let mut l = api::ProjectCreate { id: "lab", name: "Lab", has_models: true };
+    push(l.models, "echo-1") or discard;
+    let lab = projects.create(l) or api::Project { status: api::Lifecycle::archived };
     std::test::assert_eq_str(
-        raw(lab, "data_classes"),
-        "[\"internal\"]",
+        names(lab.data_classes),
+        "internal",
         "data classes default to internal",
     );
-    std::test::assert_eq_str(raw(lab, "models"), "[\"echo-1\"]", "restricted to one model");
+    std::test::assert(lab.has_models, "restricted");
+    std::test::assert_eq_str(names(lab.models), "echo-1", "restricted to one model");
 
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"work\", \"name\": \"Again\"}"),
-        409,
+    let mut failed = "";
+    projects.create(api::ProjectCreate { id: "work", name: "Again" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert_eq_str(
+        failed,
+        "conflict project work exists; a project id is never reused",
         "an id is taken once",
     );
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"Work\", \"name\": \"W\"}"),
-        400,
-        "an id is lowercase",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"-w\", \"name\": \"W\"}"),
-        400,
-        "an id starts with a letter or digit",
-    );
-    expect(call(e, "POST", "/admin/v1/projects", "{\"id\": \"w\"}"), 400, "a name is required");
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/projects",
-            "{\"id\": \"w\", \"name\": \"W\", \"owners\": \"me\"}",
-        ),
-        400,
-        "owners is a list",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/projects",
-            "{\"id\": \"w\", \"name\": \"W\", \"budget\": {\"allowance_micros\": -1, \"period\": \"month\"}}",
-        ),
-        400,
-        "an allowance is at least 0",
-    );
-    expect(call(e, "GET", "/admin/v1/projects/w", ""), 404, "a refused create made nothing");
-    let budgeted = call(
-        e,
-        "POST",
-        "/admin/v1/projects",
-        "{\"id\": \"w\", \"name\": \"W\", \"budget\": {\"allowance_micros\": 1000, \"period\": \"month\"}, \"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 600}]}",
-    );
-    expect(budgeted, 201, "a project with its budget and limits");
-    std::test::assert_eq_int(
-        std::json::find_int_field(raw(budgeted, "budget"), "allowance_micros"),
-        1000,
-        "its budget",
-    );
-    std::test::assert_eq_int(
-        std::json::find_int_field(
-            std::json::array_first(raw(budgeted, "limits")).element,
-            "requests",
-        ),
-        600,
-        "its limit",
-    );
-    let patched = call(
-        e,
-        "PATCH",
-        "/admin/v1/projects/w",
-        "{\"budget\": {\"allowance_micros\": 1, \"period\": \"day\"}}",
-    );
-    expect(patched, 400, "a budget has its own endpoint");
-    std::test::assert_eq_str(code(patched), "unsupported", "unsupported");
-
-    expect(call(e, "GET", "/admin/v1/projects/work", ""), 200, "get");
-    expect(call(e, "GET", "/admin/v1/projects/nope", ""), 404, "an unknown project");
-
-    let renamed = call(
-        e,
-        "PATCH",
-        "/admin/v1/projects/lab",
-        "{\"name\": \"The lab\", \"models\": null}",
-    );
-    expect(renamed, 200, "patch");
-    std::test::assert_eq_str(
-        std::json::find_string_field(renamed.body, "name"),
-        "The lab",
-        "renamed",
-    );
-    std::test::assert_eq_str(raw(renamed, "models"), "null", "the restriction lifted");
-    std::test::assert_eq_str(
-        raw(renamed, "data_classes"),
-        "[\"internal\"]",
-        "a field not set stays",
-    );
-    expect(
-        call(e, "PATCH", "/admin/v1/projects/lab", "{\"name\": \"\"}"),
-        400,
-        "a name is not empty",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/projects",
-            "{\"id\": \"acct\", \"name\": \"A\", \"accounts\": [\"Not An Id!\"]}",
-        ),
-        400,
-        "accounts are account ids",
-    );
-    let plain = e.handle(
-        std::http::Request {
-            method: "POST",
-            path: "/admin/v1/projects",
-            headers: "Content-Type: text/plain",
-            body: "{\"id\": \"csrf\", \"name\": \"C\"}",
+    failed = "";
+    projects.create(api::ProjectCreate { id: "Work", name: "W" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "an id is lowercase");
+    failed = "";
+    projects.create(api::ProjectCreate { id: "-w", name: "W" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "an id starts with a letter or digit");
+    failed = "";
+    projects.create(api::ProjectCreate { id: "w", name: "" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid name", "a name is required");
+    failed = "";
+    projects.create(
+        api::ProjectCreate {
+            id: "w",
+            name: "W",
+            has_budget: true,
+            budget: api::BudgetInput { allowance_micros: -1, period: st::Period::month },
         },
-    );
-    expect(plain, 400, "an admin write is JSON");
-    expect(call(e, "GET", "/admin/v1/projects/csrf", ""), 404, "and a refused one made nothing");
-    expect(
-        e.handle(
-            std::http::Request {
-                method: "POST",
-                path: "/admin/v1/projects",
-                headers: "content-type: Application/JSON; charset=utf-8",
-                body: "{\"id\": \"cased\", \"name\": \"C\"}",
-            },
-        ),
-        201,
-        "in any case, with parameters",
-    );
+    ) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid allowance_micros", "an allowance is at least 0");
+    failed = "";
+    projects.get(api::ProjectRef { project: "w" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "a refused create made nothing");
+
+    let mut b = api::ProjectCreate {
+        id: "w",
+        name: "W",
+        has_budget: true,
+        budget: api::BudgetInput { allowance_micros: 1000, period: st::Period::month },
+    };
+    push(b.limits, limit(st::LimitScope::project, 600)) or discard;
+    let budgeted = projects.create(b) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert_eq_str(budgeted.id, "w", "a project with its budget and limits");
+    std::test::assert(budgeted.has_budget, "it has a budget");
+    std::test::assert_eq_int(budgeted.budget.allowance_micros, 1000, "its budget");
+    std::test::assert_eq_int(count(budgeted.limits), 1, "one limit");
+    let mut requests = -1;
+    for lim in budgeted.limits {
+        requests = lim.requests;
+    }
+    std::test::assert_eq_int(requests, 600, "its limit");
+
+    failed = "";
+    let mut code_is_unsupported = false;
+    projects.update(api::ProjectUpdate { project: "w", has_budget: true }) or {
+        failed = api::ctl_class(err);
+        code_is_unsupported = api::ctl_problem(err).code == api::ErrorCode::unsupported;
+    };
+    std::test::assert_eq_str(failed, "invalid", "a budget has its own endpoint");
+    std::test::assert(code_is_unsupported, "unsupported");
+    failed = "";
+    projects.update(api::ProjectUpdate { project: "w", has_limits: true }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid limits", "so do the limits");
+    failed = "";
+    projects.update(api::ProjectUpdate { project: "w", has_id: true, id: "x" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "an id never changes");
+
+    let got = projects.get(api::ProjectRef { project: "work" }) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert_eq_str(got.id, "work", "get");
+    failed = "";
+    projects.get(api::ProjectRef { project: "nope" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "an unknown project");
+
+    let renamed = projects.update(
+        api::ProjectUpdate { project: "lab", has_name: true, name: "The lab", clear_models: true },
+    ) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert_eq_str(renamed.name, "The lab", "renamed");
+    std::test::assert(!renamed.has_models, "the restriction lifted");
+    std::test::assert_eq_str(names(renamed.data_classes), "internal", "a field not set stays");
+    failed = "";
+    projects.update(api::ProjectUpdate { project: "lab", has_name: true, name: "" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a name is not empty");
 
     // narrowing a project below what its keys name is refused, naming them
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/projects",
-            "{\"id\": \"nar\", \"name\": \"N\", \"models\": [\"echo-1\", \"live-1\"]}",
-        ),
-        201,
-        "a project with two models",
+    let mut n = api::ProjectCreate { id: "nar", name: "N", has_models: true };
+    push(n.models, "echo-1") or discard;
+    push(n.models, "live-1") or discard;
+    projects.create(n) or discard;
+    let mut nk = api::KeyCreate { project: "nar", name: "k", has_models: true };
+    push(nk.models, "live-1") or discard;
+    let narrow_key = keys.create(nk) or api::Key { status: api::KeyStatus::revoked };
+    let narrow_id = narrow_key.id;
+    std::test::assert(len(narrow_id) > 0, "a key to narrow below");
+    let mut to_echo = api::ProjectUpdate { project: "nar", has_models: true };
+    push(to_echo.models, "echo-1") or discard;
+    failed = "";
+    projects.update(to_echo) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
+    std::test::assert(
+        std::str::starts_with(failed, "invalid "),
+        "narrowing below a key: " + failed,
     );
-    let narrow_key = call(
-        e,
-        "POST",
-        "/admin/v1/projects/nar/keys",
-        "{\"name\": \"k\", \"models\": [\"live-1\"]}",
-    );
-    let narrow_id = std::json::find_string_field(narrow_key.body, "id");
-    let narrowed = call(e, "PATCH", "/admin/v1/projects/nar", "{\"models\": [\"echo-1\"]}");
-    expect(narrowed, 400, "narrowing below a key");
-    std::test::assert(std::str::contains(narrowed.body, narrow_id), "names the key");
-    expect(
-        call(
-            e,
-            "PATCH",
-            "/admin/v1/projects/nar",
-            "{\"models\": [\"echo-1\", \"live-1\", \"more-1\"]}",
-        ),
-        200,
-        "widening is fine",
-    );
-    expect(
-        call(e, "DELETE", "/admin/v1/projects/nar/keys/" + narrow_id, ""),
-        200,
-        "once the key is revoked",
-    );
-    expect(
-        call(e, "PATCH", "/admin/v1/projects/nar", "{\"models\": [\"echo-1\"]}"),
-        200,
-        "the project narrows",
+    std::test::assert(std::str::contains(failed, narrow_id), "names the key: " + failed);
+    let mut wider = api::ProjectUpdate { project: "nar", has_models: true };
+    push(wider.models, "echo-1") or discard;
+    push(wider.models, "live-1") or discard;
+    push(wider.models, "more-1") or discard;
+    let widened = projects.update(wider) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert_eq_str(names(widened.models), "echo-1,live-1,more-1", "widening is fine");
+    keys.revoke(api::KeyRef { project: "nar", key: narrow_id }) or discard;
+    let narrowed = projects.update(to_echo) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert_eq_str(
+        names(narrowed.models),
+        "echo-1",
+        "once the key is revoked, the project narrows",
     );
 
     // archiving revokes the project's keys and takes it out of the list
-    let key = call(e, "POST", "/admin/v1/projects/lab/keys", "{\"name\": \"ci\"}");
-    expect(key, 201, "a key to revoke");
-    let key_id = std::json::find_string_field(key.body, "id");
-    let gone = call(e, "DELETE", "/admin/v1/projects/lab", "");
-    expect(gone, 200, "archive");
-    std::test::assert_eq_str(
-        std::json::find_string_field(gone.body, "status"),
-        "archived",
-        "archived",
-    );
+    let key = keys.create(api::KeyCreate { project: "lab", name: "ci" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    };
+    std::test::assert(len(key.id) > 0, "a key to revoke");
+    let gone = projects.archive(api::ProjectRef { project: "lab" }) or api::Project {
+        status: api::Lifecycle::active,
+    };
+    std::test::assert(gone.status == api::Lifecycle::archived, "archived");
     std::test::assert(
-        std::str::ends_with(std::json::find_string_field(gone.body, "archived_at"), "Z"),
+        gone.has_archived_at && std::str::ends_with(std::time::iso8601(gone.archived_at), "Z"),
         "when",
     );
-    let revoked = call(e, "GET", "/admin/v1/projects/lab/keys/" + key_id, "");
-    std::test::assert_eq_str(
-        std::json::find_string_field(revoked.body, "status"),
-        "revoked",
-        "its key is revoked",
-    );
-    let log = call(e, "GET", "/admin/v1/changes?target=projects/lab", "").body;
-    let newest = std::json::array_first(std::json::find_field_raw(log, "data"));
-    std::test::assert_eq_str(
-        std::json::find_string_field(newest.element, "action"),
-        "archive",
-        "the archive, newest",
-    );
-    let next = std::json::array_next(newest).element;
-    std::test::assert_eq_str(
-        std::json::find_string_field(next, "action"),
-        "revoke",
+    let revoked = keys.get(api::KeyRef { project: "lab", key: key.id }) or api::Key {
+        status: api::KeyStatus::active,
+    };
+    std::test::assert(revoked.status == api::KeyStatus::revoked, "its key is revoked");
+    let log = changes.list(api::ChangeAsk { target: "projects/lab" }) or api::ChangeList { };
+    std::test::assert(count(log.data) >= 2, "the log holds the archive and the revoke");
+    let mut newest = api::Change { action: api::ChangeAction::create };
+    let mut next = api::Change { action: api::ChangeAction::create };
+    let mut at = 0;
+    for ch in log.data {
+        if at == 0 { newest = ch; }
+        if at == 1 { next = ch; }
+        at = at + 1;
+    }
+    std::test::assert(newest.action == api::ChangeAction::archive, "the archive, newest");
+    std::test::assert(
+        next.action == api::ChangeAction::revoke,
         "with a change for the key it revoked",
     );
     std::test::assert_eq_str(
-        std::json::find_string_field(next, "target"),
-        "projects/lab/keys/" + key_id,
+        next.target,
+        "projects/lab/keys/" + key.id,
         "under the key's own target",
     );
     std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(next, "after"), "status"),
+        std::json::find_string_field(next.after.text, "status"),
         "revoked",
         "as it became",
     );
-    expect(call(e, "DELETE", "/admin/v1/projects/lab", ""), 200, "archiving again changes nothing");
-    let late = call(e, "POST", "/admin/v1/projects/lab/keys", "{\"name\": \"late\"}");
-    expect(late, 400, "an archived project takes no key");
-    std::test::assert_eq_str(
-        code(late),
-        "invalid_request",
-        "as an invalid request, not a conflict",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"lab\", \"name\": \"Lab\"}"),
-        409,
-        "its id is never reused",
-    );
-
-    let active = call(e, "GET", "/admin/v1/projects", "");
+    let again = projects.archive(api::ProjectRef { project: "lab" }) or api::Project {
+        status: api::Lifecycle::active,
+    };
     std::test::assert(
-        std::str::contains(active.body, "\"work\"") && !std::str::contains(active.body, "\"lab\""),
-        "the list leaves archived projects out",
+        again.status == api::Lifecycle::archived,
+        "archiving again changes nothing",
     );
-    let all = call(e, "GET", "/admin/v1/projects?include_archived=true", "");
-    std::test::assert(std::str::contains(all.body, "\"lab\""), "unless it is asked for them");
+    let after_log = changes.list(api::ChangeAsk { target: "projects/lab" }) or api::ChangeList { };
+    std::test::assert_eq_int(count(after_log.data), count(log.data), "and logs nothing");
+    failed = "";
+    let mut late_code = false;
+    keys.create(api::KeyCreate { project: "lab", name: "late" }) or {
+        failed = api::ctl_class(err);
+        late_code = api::ctl_problem(err).code == api::ErrorCode::invalid_request;
+    };
+    std::test::assert_eq_str(failed, "invalid", "an archived project takes no key");
+    std::test::assert(late_code, "as an invalid request, not a conflict");
+    failed = "";
+    projects.create(api::ProjectCreate { id: "lab", name: "Lab" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "its id is never reused");
+
+    let active = projects.list(api::ProjectQuery { }) or api::ProjectList { };
+    let mut seen_work = false;
+    let mut seen_lab = false;
+    for p in active.data {
+        if p.id == "work" { seen_work = true; }
+        if p.id == "lab" { seen_lab = true; }
+    }
+    std::test::assert(seen_work && !seen_lab, "the list leaves archived projects out");
+    let all = projects.list(api::ProjectQuery { include_archived: true }) or api::ProjectList { };
+    seen_lab = false;
+    for p in all.data {
+        if p.id == "lab" { seen_lab = true; }
+    }
+    std::test::assert(seen_lab, "unless it is asked for them");
 }

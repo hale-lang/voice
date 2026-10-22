@@ -111,111 +111,252 @@ fn unfinished_row(
     );
 }
 
+// ---- the ledger, as rows ---------------------------------------------
+
+/// How long a request took, in `UsageRecord.timing`.
+type UsageTiming { wall_ms: Int = 0; queue_ms: Int = 0; load_ms: Int = 0; }
+
+/// `UsageRecord`: one request, as the ledger holds it. A row is read from
+/// the record the store keeps whole (`UsageRow.record`), which is this
+/// shape as JSON; `metadata` is the caller's own object, untouched.
+type UsageRecord {
+    id: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    project: String = "";
+    key: String = "";
+    requested_model: String = "";
+    has_requested_account: Bool = false;
+    requested_account: String = "";
+    endpoint: String = "responses";
+    status: String = "served";
+    has_served: Bool = false;
+    served: ServedBy = ServedBy { };
+    data_class: String = "";
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    cache_write_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+    timing: UsageTiming = UsageTiming { };
+    attempts: bounded[Attempt; 8];
+    metadata: std::json::Value = std::json::Value::null();
+}
+
+/// A page of the ledger, newest first; `next_cursor` is `null` on the last.
+type UsageList {
+    data: bounded[UsageRecord; 1000];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
+
+/// Which request: the `{request_id}` of the path.
+type UsageRef { request_id: String; }
+
+/// The filters `GET /admin/v1/usage` takes. The times are RFC 3339 text and
+/// `metadata` one `name=value` pair, read when the handler runs so a bad
+/// one is refused by name.
+type UsageAsk {
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    account: String = "";
+    metadata: String = "";
+    from: String = "";
+    to: String = "";
+    limit: Int = -1;
+    cursor: String = "";
+}
+
+/// `GET /admin/v1/usage/summary`'s: the same filters, and the fields to group by.
+type UsageSummaryAsk {
+    group_by: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    account: String = "";
+    metadata: String = "";
+    from: String = "";
+    to: String = "";
+}
+
+/// One group of a summary: `group` keys the `group_by` fields.
+type UsageGroupOut {
+    group: std::json::Value = std::json::Value::null();
+    requests: Int = 0;
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+}
+
+type UsageSummary {
+    group_by: bounded[String; 32];
+    has_from: Bool = false;
+    from: Time = `1970-01-01T00:00:00Z`;
+    has_to: Bool = false;
+    to: Time = `1970-01-01T00:00:00Z`;
+    data: bounded[UsageGroupOut; 1000];
+}
+
 /// The ledger, read.
 locus Usage {
-    params { store: st::Store; }
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+    }
 
-    /// `listUsage`: newest first, as the JSON the contract describes.
-    fn list_json(q: st::UsageQuery) -> String fallible(ApiError) {
-        let rows = self.store.usage_rows(q) or fail store_failed(err);
-        let records = st::JsonList { };
+    /// `listUsage`: newest first.
+    fn list(a: UsageAsk) -> UsageList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `list`, inside the gate.
+    fn list_in_gate(a: UsageAsk) -> UsageList fallible(CtlError) {
+        let q = usage_query_of(a, true) or raise;
+        let rows = self.store.usage_rows(q) or fail store_down(err);
+        let mut out = UsageList { };
         let mut last = 0;
         for r in rows.rows {
-            records.add(r.record);
+            push(out.data, record_of(r.record, r.id) or raise) or discard;
             last = r.seq;
         }
-        return "{\"data\": [" + records.text() + "], \"next_cursor\": "
-            + jstring_or_null(rows.more, to_string(last)) + "}";
+        if rows.more {
+            out.has_next_cursor = true;
+            out.next_cursor = to_string(last);
+        }
+        return out;
     }
 
     /// `getUsage`.
-    fn get_json(id: String) -> String fallible(ApiError) {
-        let r = self.store.usage(id) or fail store_failed(err);
-        if !r.present { fail not_found("no usage record " + id); }
-        return r.record;
+    fn get(r: UsageRef) -> UsageRecord fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `get`, inside the gate.
+    fn get_in_gate(r: UsageRef) -> UsageRecord fallible(CtlError) {
+        let row = self.store.usage(r.request_id) or fail store_down(err);
+        if !row.present { fail missing("no usage record " + r.request_id); }
+        return record_of(row.record, r.request_id) or raise;
     }
 
     /// `summarizeUsage`: totals over the matching rows, one per group.
-    fn summary_json(by: st::Names, q: st::UsageQuery) -> String fallible(ApiError) {
+    fn summary(a: UsageSummaryAsk) -> UsageSummary fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.summary_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `summary`, inside the gate.
+    fn summary_in_gate(a: UsageSummaryAsk) -> UsageSummary fallible(CtlError) {
+        let by = group_by_of(a.group_by) or raise;
+        let q = usage_query_of(
+            UsageAsk {
+                project: a.project,
+                key: a.key,
+                model: a.model,
+                account: a.account,
+                metadata: a.metadata,
+                from: a.from,
+                to: a.to,
+            },
+            false,
+        ) or raise;
         let groups = self.store.usage_summary(
             st::UsageSummaryQuery { by: by, q: q },
-        ) or fail store_failed(err);
-        let data = st::JsonList { };
+        ) or fail store_down(err);
+        let mut out = UsageSummary {
+            has_from: q.has_from,
+            from: q.from,
+            has_to: q.has_to,
+            to: q.to,
+        };
+        out.group_by = by.items;
         for g in groups.rows {
-            data.add(
-                "{\"group\": " + g.group + ", \"requests\": " + to_string(g.requests)
-                    + ", \"input_tokens\": " + to_string(g.input_tokens)
-                    + ", \"output_tokens\": " + to_string(g.output_tokens)
-                    + ", \"price_micros\": " + to_string(g.price_micros) + ", \"currency\": "
-                    + jq(g.currency) + "}",
-            );
+            push(
+                out.data,
+                UsageGroupOut {
+                    group: stored_value(g.group, "a usage group") or raise,
+                    requests: g.requests,
+                    input_tokens: g.input_tokens,
+                    output_tokens: g.output_tokens,
+                    price_micros: g.price_micros,
+                    currency: g.currency,
+                },
+            ) or discard;
         }
-        let mut out = "{\"group_by\": " + st::jnames(by.items);
-        if q.has_from { out = out + ", \"from\": " + jtime(q.from); }
-        if q.has_to { out = out + ", \"to\": " + jtime(q.to); }
-        return out + ", \"data\": [" + data.text() + "]}";
+        return out;
     }
 }
 
-// ---- the wire ----------------------------------------------------------
+/// A ledger row's record as the typed `UsageRecord`.
+fn record_of(text: String, id: String) -> UsageRecord fallible(CtlError) {
+    return UsageRecord::api_decode(text) or fail CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::internal_error,
+            message: "usage record " + id + " is stored JSON that is not a usage record (`"
+                + err.field + "` is " + err.kind + ")",
+        },
+    );
+}
 
-/// The filters `GET /admin/v1/usage` and `/usage/summary` share. `path` is
-/// the request's, query and all: `metadata` repeats, which a route's
-/// parameters do not carry.
-fn read_usage_query(
-    p: std::http::RouteParams,
-    path: String,
-    paged: Bool
-) -> st::UsageQuery fallible(ApiError) {
+// ---- the query ---------------------------------------------------------
+
+/// The filters `GET /admin/v1/usage` and `/usage/summary` share.
+fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError) {
     let mut q = st::UsageQuery {
-        project: std::http::query_param(p, "project"),
-        key: std::http::query_param(p, "key"),
-        model: std::http::query_param(p, "model"),
-        account: std::http::query_param(p, "account"),
+        project: a.project,
+        key: a.key,
+        model: a.model,
+        account: a.account,
     };
-    let from = std::http::query_param(p, "from");
-    if len(from) > 0 {
+    if len(a.from) > 0 {
         q.has_from = true;
-        q.from = rfc3339(from) or fail invalid(
+        q.from = rfc3339(a.from) or fail bad(
             "`from` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
             "from"
         );
     }
-    let to = std::http::query_param(p, "to");
-    if len(to) > 0 {
+    if len(a.to) > 0 {
         q.has_to = true;
-        q.to = rfc3339(to) or fail invalid(
+        q.to = rfc3339(a.to) or fail bad(
             "`to` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
             "to"
         );
     }
-    let pairs = query_all(path, "metadata").items;
-    for pair in pairs {
-        if std::str::index_of(pair, "=") < 1 {
-            fail invalid("`metadata` is written name=value", "metadata");
+    if len(a.metadata) > 0 {
+        if std::str::index_of(a.metadata, "=") < 1 {
+            fail bad("`metadata` is written name=value", "metadata");
         }
-        push(q.metadata.items, pair) or fail invalid(
-            "`metadata` names at most 32 pairs",
-            "metadata"
-        );
+        push(q.metadata.items, a.metadata) or discard;
     }
     if paged {
-        let limit = std::http::query_param(p, "limit");
-        if len(limit) > 0 {
-            let n = std::str::parse_int(limit) or 0;
-            if !is_integer(limit) || n < 1 || n > 1000 {
-                fail invalid("`limit` is 1 to 1000", "limit");
-            }
-            q.limit = n;
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > 1000 { fail bad("`limit` is 1 to 1000", "limit"); }
+            q.limit = a.limit;
         }
-        let cursor = std::http::query_param(p, "cursor");
-        if len(cursor) > 0 {
-            let n = std::str::parse_int(cursor) or 0;
-            if !is_integer(cursor) || n < 1 {
-                fail invalid(
-                    "`cursor` names no usage record; pass a page's `next_cursor`",
-                    "cursor"
-                );
+        if len(a.cursor) > 0 {
+            let n = std::str::parse_int(a.cursor) or 0;
+            if !is_integer(a.cursor) || n < 1 {
+                fail bad("`cursor` names no usage record; pass a page's `next_cursor`", "cursor");
             }
             q.cursor = n;
         }
@@ -224,22 +365,21 @@ fn read_usage_query(
 }
 
 /// `group_by`: the fields a summary groups by, comma separated.
-fn read_group_by(p: std::http::RouteParams) -> st::Names fallible(ApiError) {
-    let raw = std::http::query_param(p, "group_by");
-    if len(raw) == 0 { fail invalid("`group_by` is required", "group_by"); }
+fn group_by_of(raw: String) -> st::Names fallible(CtlError) {
+    if len(raw) == 0 { fail bad("`group_by` is required", "group_by"); }
     let mut out = st::Names { };
-    let mut rest = st::pct_decode(raw);
+    let mut rest = raw;
     while len(rest) > 0 {
         let comma = std::str::index_of(rest, ",");
         let f = if comma < 0 { rest } else { rest[0..comma] };
         rest = if comma < 0 { "" } else { rest[(comma + 1)..len(rest)] };
         if !st::valid_group(f) {
-            fail invalid(
+            fail bad(
                 "`group_by` is any of project, key, model, account, seat, node, day, hour",
                 "group_by"
             );
         }
-        push(out.items, f) or fail invalid("`group_by` names at most 32 fields", "group_by");
+        push(out.items, f) or fail bad("`group_by` names at most 32 fields", "group_by");
     }
     return out;
 }

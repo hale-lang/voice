@@ -1,152 +1,142 @@
-// Accounts on the admin plane: GET/POST /admin/v1/accounts and
-// GET/PATCH/DELETE /admin/v1/accounts/{account}, through the router.
+// Accounts on the admin plane: the rows of `Accounts` (list, create, get,
+// update, archive), called on a receiver over a store.
 import ".." as api;
+import "../../store" as st;
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+fn blank() -> api::Account {
+    return api::Account { billing: api::Billing::none, status: api::Lifecycle::archived };
 }
 
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
-}
-
-fn raw(r: std::http::Response, name: String) -> String {
-    return std::str::trim(std::json::find_field_raw(r.body, name));
+fn ids(l: api::AccountList) -> String {
+    let mut out = ",";
+    for a in l.data {
+        out = out + a.id + ",";
+    }
+    return out;
 }
 
 fn main() {
-    let e = api::Endpoints { };
-    std::test::assert_eq_str(
-        std::str::trim(call(e, "GET", "/admin/v1/accounts", "").body),
-        "{\"data\": []}",
-        "none yet",
-    );
+    let store = st::MemoryStore { };
+    let accounts = api::Accounts { store: store };
 
-    let work = call(
-        e,
-        "POST",
-        "/admin/v1/accounts",
-        "{\"id\": \"claude-work\", \"name\": \"Claude (work)\", \"provider\": \"anthropic\", \"billing\": \"subscription\", \"limits\": [{\"scope\": \"account\", \"window_seconds\": 18000, \"requests\": 900}]}",
-    );
-    expect(work, 201, "create");
-    std::test::assert_eq_str(std::json::find_string_field(work.body, "status"), "active", "active");
-    std::test::assert_eq_str(
-        std::json::find_string_field(work.body, "provider"),
-        "anthropic",
-        "its provider",
-    );
-    std::test::assert_eq_str(raw(work, "seats"), "[]", "no seat spends it yet");
-    std::test::assert_eq_str(raw(work, "windows"), "[]", "no window reported");
-    std::test::assert_eq_str(raw(work, "exhausted_until"), "null", "not exhausted");
-    std::test::assert_eq_str(
-        std::json::find_string_field(
-            std::json::array_first(raw(work, "limits")).element,
-            "account",
+    let none = accounts.list(api::AccountQuery { }) or api::AccountList { };
+    std::test::assert_eq_int(count(none.data), 0, "none yet");
+
+    let mut c = api::AccountCreate {
+        id: "claude-work",
+        name: "Claude (work)",
+        has_provider: true,
+        provider: "anthropic",
+        has_billing: true,
+        billing: api::Billing::subscription,
+    };
+    push(
+        c.limits,
+        st::counted(
+            st::Limit { scope: st::LimitScope::account, window_seconds: 18000, requests: 900 },
         ),
-        "claude-work",
-        "an account limit names the account",
-    );
+    ) or discard;
+    let work = accounts.create(c) or blank();
+    std::test::assert(work.status == api::Lifecycle::active, "active");
+    std::test::assert(work.has_provider, "it has a provider");
+    std::test::assert_eq_str(work.provider, "anthropic", "its provider");
+    std::test::assert(work.billing == api::Billing::subscription, "its billing");
+    std::test::assert_eq_int(count(work.seats), 0, "no seat spends it yet");
+    std::test::assert_eq_int(count(work.windows), 0, "no window reported");
+    std::test::assert(!work.has_exhausted_until, "not exhausted");
+    let mut named = "";
+    for l in work.limits {
+        named = l.account;
+    }
+    std::test::assert_eq_str(named, "claude-work", "an account limit names the account");
 
-    let local = call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
-    expect(local, 201, "a local account");
-    std::test::assert_eq_str(
-        std::json::find_string_field(local.body, "billing"),
-        "none",
-        "billing defaults to none",
-    );
-    std::test::assert_eq_str(raw(local, "provider"), "null", "no provider");
+    let local = accounts.create(api::AccountCreate { id: "static", name: "Static" }) or blank();
+    std::test::assert_eq_str(local.id, "static", "a local account");
+    std::test::assert(local.billing == api::Billing::none, "billing defaults to none");
+    std::test::assert(!local.has_provider, "no provider");
 
-    expect(
-        call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Again\"}"),
-        409,
-        "an id is taken once",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/accounts",
-            "{\"id\": \"x\", \"name\": \"X\", \"billing\": \"free\"}",
-        ),
-        400,
-        "billing is subscription, metered or none",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/accounts", "{\"id\": \"X\", \"name\": \"X\"}"),
-        400,
-        "an id is a slug",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/accounts",
-            "{\"id\": \"x\", \"name\": \"X\", \"limits\": [{\"scope\": \"project\", \"window_seconds\": 60}]}",
-        ),
-        400,
-        "an account's limits are account-scope",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/accounts",
-            "{\"id\": \"x\", \"name\": \"X\", \"limits\": [{\"scope\": \"account\", \"account\": \"other\", \"window_seconds\": 60}]}",
-        ),
-        400,
-        "and name it",
-    );
+    let mut failed = "";
+    accounts.create(api::AccountCreate { id: "static", name: "Again" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "an id is taken once");
+    failed = "";
+    accounts.create(api::AccountCreate { id: "X", name: "X" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "an id is a slug");
+    let mut project_scope = api::AccountCreate { id: "x", name: "X" };
+    push(
+        project_scope.limits,
+        st::Limit { scope: st::LimitScope::project, window_seconds: 60 },
+    ) or discard;
+    failed = "";
+    accounts.create(project_scope) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid limits", "an account's limits are account-scope");
+    let mut other = api::AccountCreate { id: "x", name: "X" };
+    push(
+        other.limits,
+        st::Limit { scope: st::LimitScope::account, account: "other", window_seconds: 60 },
+    ) or discard;
+    failed = "";
+    accounts.create(other) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid limits", "and name it");
+    failed = "";
+    accounts.get(api::AccountRef { account: "x" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "a refused create made nothing");
 
-    expect(call(e, "GET", "/admin/v1/accounts/claude-work", ""), 200, "get");
-    expect(call(e, "GET", "/admin/v1/accounts/nope", ""), 404, "an unknown account");
-    let changed = call(
-        e,
-        "PATCH",
-        "/admin/v1/accounts/claude-work",
-        "{\"name\": \"Claude\", \"billing\": \"metered\", \"provider\": null}",
-    );
-    expect(changed, 200, "patch");
-    std::test::assert_eq_str(
-        std::json::find_string_field(changed.body, "billing"),
-        "metered",
-        "billing changed",
-    );
-    std::test::assert_eq_str(raw(changed, "provider"), "null", "provider cleared");
-    std::test::assert(std::str::contains(raw(changed, "limits"), "900"), "a field not set stays");
+    let got = accounts.get(api::AccountRef { account: "claude-work" }) or blank();
+    std::test::assert_eq_str(got.id, "claude-work", "get");
+    failed = "";
+    accounts.get(api::AccountRef { account: "nope" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "an unknown account");
+    let changed = accounts.update(
+        api::AccountUpdate {
+            account: "claude-work",
+            has_name: true,
+            name: "Claude",
+            has_billing: true,
+            billing: api::Billing::metered,
+            clear_provider: true,
+        },
+    ) or blank();
+    std::test::assert_eq_str(changed.name, "Claude", "renamed");
+    std::test::assert(changed.billing == api::Billing::metered, "billing changed");
+    std::test::assert(!changed.has_provider, "provider cleared");
+    let mut requests = -1;
+    for l in changed.limits {
+        requests = l.requests;
+    }
+    std::test::assert_eq_int(requests, 900, "a field not set stays");
+    failed = "";
+    accounts.update(api::AccountUpdate { account: "claude-work", has_id: true, id: "x" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "an id never changes");
 
-    let gone = call(e, "DELETE", "/admin/v1/accounts/static", "");
-    expect(gone, 200, "archive");
-    std::test::assert_eq_str(
-        std::json::find_string_field(gone.body, "status"),
-        "archived",
-        "archived",
-    );
-    expect(
-        call(e, "DELETE", "/admin/v1/accounts/static", ""),
-        200,
+    let gone = accounts.archive(api::AccountRef { account: "static" }) or blank();
+    std::test::assert(gone.status == api::Lifecycle::archived, "archived");
+    std::test::assert(gone.has_archived_at, "when");
+    let again = accounts.archive(api::AccountRef { account: "static" }) or blank();
+    std::test::assert(
+        again.status == api::Lifecycle::archived && again.archived_at == gone.archived_at,
         "archiving again changes nothing",
     );
-    expect(
-        call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}"),
-        409,
-        "its id is never reused",
-    );
-    std::test::assert(
-        !std::str::contains(call(e, "GET", "/admin/v1/accounts", "").body, "\"static\""),
-        "the list leaves it out",
-    );
-    std::test::assert(
-        std::str::contains(
-            call(e, "GET", "/admin/v1/accounts?include_archived=true", "").body,
-            "\"static\"",
-        ),
-        "unless asked",
-    );
+    failed = "";
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "its id is never reused");
+    let listed = accounts.list(api::AccountQuery { }) or api::AccountList { };
+    std::test::assert_eq_str(ids(listed), ",claude-work,", "the list leaves it out");
+    let all = accounts.list(api::AccountQuery { include_archived: true }) or api::AccountList { };
+    std::test::assert(std::str::contains(ids(all), ",static,"), "unless asked");
 }

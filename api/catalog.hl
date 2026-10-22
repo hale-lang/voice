@@ -6,11 +6,26 @@
 // classes a caller sees are those such seats carry.
 
 locus Catalog {
-    params { store: st::Store; }
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+    }
 
     /// `listCatalogModels`: every model not removed.
-    fn list() -> CatalogList fallible(ApiError) {
-        let rows = self.store.models() or fail store_failed(err);
+    fn list() -> CatalogList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `list`, inside the gate.
+    fn list_in_gate() -> CatalogList fallible(CtlError) {
+        let rows = self.store.models() or fail store_down(err);
         let mut out = CatalogList { };
         for r in rows.rows {
             if !r.removed {
@@ -22,8 +37,19 @@ locus Catalog {
     }
 
     /// `createCatalogModel`.
-    fn create(m: CatalogModelCreate) -> CatalogModel fallible(ApiError) {
-        if len(m.id) == 0 || len(m.id) > 128 { fail invalid("`id` is 1 to 128 characters", "id"); }
+    fn create(m: CatalogModelCreate) -> CatalogModel fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.create_in_gate(m) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `create`, inside the gate.
+    fn create_in_gate(m: CatalogModelCreate) -> CatalogModel fallible(CtlError) {
+        if len(m.id) == 0 || len(m.id) > 128 { fail bad("`id` is 1 to 128 characters", "id"); }
         check_model_fields(m.context_length, m.max_output_tokens) or raise;
         let row = st::ModelRow {
             id: m.id,
@@ -38,21 +64,44 @@ locus Catalog {
         let v = self.view(row) or raise;
         let added = self.store.insert_model(
             row,
-            change("create", "models/" + m.id, "", catalog_model_json(v)),
-        ) or fail store_failed(err);
-        if !added { fail conflict("model " + m.id + " exists; a model id is never reused"); }
+            checked_change("create", "models/" + m.id, "", catalog_model_json(v)) or raise,
+        ) or fail store_down(err);
+        if !added { fail clash("model " + m.id + " exists; a model id is never reused"); }
         return v;
     }
 
     /// `getCatalogModel`.
-    fn get(r: ModelRef) -> CatalogModel fallible(ApiError) {
+    fn get(r: ModelRef) -> CatalogModel fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `get`, inside the gate.
+    fn get_in_gate(r: ModelRef) -> CatalogModel fallible(CtlError) {
         let row = self.live(r.model) or raise;
         return self.view(row) or raise;
     }
 
     /// `updateCatalogModel`: the fields the request sets.
-    fn update(u: CatalogModelUpdate) -> CatalogModel fallible(ApiError) {
-        self.store.hold("models/" + u.model) or fail store_failed(err);
+    fn update(u: CatalogModelUpdate) -> CatalogModel fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.update_in_gate(u) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `update`, inside the gate.
+    fn update_in_gate(u: CatalogModelUpdate) -> CatalogModel fallible(CtlError) {
+        if u.has_id { fail bad("a model's `id` cannot change", "id"); }
+        self.store.hold("models/" + u.model) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;
@@ -62,7 +111,7 @@ locus Catalog {
     }
 
     /// `update`, holding the resource from its read to its write.
-    fn update_held(u: CatalogModelUpdate) -> CatalogModel fallible(ApiError) {
+    fn update_held(u: CatalogModelUpdate) -> CatalogModel fallible(CtlError) {
         let mut row = self.live(u.model) or raise;
         let before = self.view(row) or raise;
         if u.has_owned_by { row.owned_by = u.owned_by; }
@@ -77,20 +126,31 @@ locus Catalog {
         let after = self.view(row) or raise;
         self.store.update_model(
             row,
-            change(
+            checked_change(
                 "update",
                 "models/" + row.id,
                 catalog_model_json(before),
                 catalog_model_json(after),
-            ),
-        ) or fail store_failed(err);
+            ) or raise,
+        ) or fail store_down(err);
         return after;
     }
 
     /// `removeCatalogModel`: callers naming it get `model_not_found`; the
     /// id stays taken.
-    fn remove(r: ModelRef) -> CatalogModel fallible(ApiError) {
-        self.store.hold("models/" + r.model) or fail store_failed(err);
+    fn remove(r: ModelRef) -> CatalogModel fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.remove_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `remove`, inside the gate.
+    fn remove_in_gate(r: ModelRef) -> CatalogModel fallible(CtlError) {
+        self.store.hold("models/" + r.model) or fail store_down(err);
         let out = self.remove_held(r) or {
             self.store.let_go();
             fail err;
@@ -100,30 +160,30 @@ locus Catalog {
     }
 
     /// `remove`, holding the resource from its read to its write.
-    fn remove_held(r: ModelRef) -> CatalogModel fallible(ApiError) {
+    fn remove_held(r: ModelRef) -> CatalogModel fallible(CtlError) {
         let mut row = self.live(r.model) or raise;
         let before = self.view(row) or raise;
         row.removed = true;
         row.removed_at = now_seconds();
         self.store.update_model(
             row,
-            change("delete", "models/" + row.id, catalog_model_json(before), ""),
-        ) or fail store_failed(err);
+            checked_change("delete", "models/" + row.id, catalog_model_json(before), "") or raise,
+        ) or fail store_down(err);
         return before;
     }
 
     /// The model `id`, unless it is absent or removed.
-    fn live(id: String) -> st::ModelRow fallible(ApiError) {
-        let row = self.store.model(id) or fail store_failed(err);
-        if !row.present || row.removed { fail not_found("no model " + id + " in the catalog"); }
+    fn live(id: String) -> st::ModelRow fallible(CtlError) {
+        let row = self.store.model(id) or fail store_down(err);
+        if !row.present || row.removed { fail missing("no model " + id + " in the catalog"); }
         return row;
     }
 
     /// The row with the seats that serve it.
-    fn view(r: st::ModelRow) -> CatalogModel fallible(ApiError) {
-        let seats = self.store.seats() or fail store_failed(err);
+    fn view(r: st::ModelRow) -> CatalogModel fallible(CtlError) {
+        let seats = self.store.seats() or fail store_down(err);
         let mut v = catalog_view(r);
-        let a = availability(self.store, r.id) or raise;
+        let a = availability(self.store, r.id) or fail store_down(err);
         v.available = a.available;
         for s in seats.rows {
             if seat_serves(s, r.id) { push(v.seats, s.ref) or discard; }
@@ -145,7 +205,7 @@ locus Models {
         let mut out = ModelList { };
         for r in rows.rows {
             if !r.removed && visible(p, k, r.id) {
-                let v = model_with_seats(self.store, r) or raise;
+                let v = model_with_seats(self.store, r) or fail metering_failed(err);
                 push(out.data, v) or discard;
             }
         }
@@ -168,7 +228,7 @@ locus Models {
                 param: "model",
             };
         }
-        return model_with_seats(self.store, row) or raise;
+        return model_with_seats(self.store, row) or fail metering_failed(err);
     }
 
     /// `getCapabilities`: the project and key, the models the key may
@@ -235,10 +295,10 @@ fn has_name(ns: bounded[String; 32], name: String) -> Bool {
     return false;
 }
 
-fn check_model_fields(context_length: Int, max_output_tokens: Int) -> Bool fallible(ApiError) {
-    if context_length < 0 { fail invalid("`context_length` is at least 1", "context_length"); }
+fn check_model_fields(context_length: Int, max_output_tokens: Int) -> Bool fallible(CtlError) {
+    if context_length < 0 { fail bad("`context_length` is at least 1", "context_length"); }
     if max_output_tokens < 0 {
-        fail invalid("`max_output_tokens` is at least 1", "max_output_tokens");
+        fail bad("`max_output_tokens` is at least 1", "max_output_tokens");
     }
     return true;
 }
@@ -249,7 +309,9 @@ fn catalog_view(r: st::ModelRow) -> CatalogModel {
         id: r.id,
         owned_by: r.owned_by,
         kind: model_kind_of(r.kind),
+        has_context_length: r.context_length > 0,
         context_length: r.context_length,
+        has_max_output_tokens: r.max_output_tokens > 0,
         max_output_tokens: r.max_output_tokens,
         has_price: r.priced,
         price: r.price,
@@ -423,8 +485,8 @@ type Availability { available: Bool = false; data_classes: bounded[String; 32]; 
 /// A seat could serve `model` when it is enabled, spends an account that
 /// is not archived, and its node is up, not draining, has applied its
 /// assignment, reports it `up` and holds it by no local control.
-fn availability(store: st::Store, model: String) -> Availability fallible(ApiError) {
-    let seats = store.seats() or fail store_failed(err);
+fn availability(store: st::Store, model: String) -> Availability fallible(st::StoreError) {
+    let seats = store.seats() or raise;
     let mut out = Availability { };
     for s in seats.rows {
         if seat_serves(s, model) && s.enabled {
@@ -440,7 +502,7 @@ fn availability(store: st::Store, model: String) -> Availability fallible(ApiErr
     return out;
 }
 
-fn model_with_seats(store: st::Store, r: st::ModelRow) -> Model fallible(ApiError) {
+fn model_with_seats(store: st::Store, r: st::ModelRow) -> Model fallible(st::StoreError) {
     let mut v = model_view(r);
     let a = availability(store, r.id) or raise;
     v.available = a.available;

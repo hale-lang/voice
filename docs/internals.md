@@ -7,11 +7,32 @@ logs, how it is written in Hale and how it deploys.
 ## The api
 
 [`api/`](../api/) is a Hale program that serves every endpoint in
-`openapi.yaml`. The ones made real are rows of an `api` surface
-([`api/surface.hl`](../api/surface.hl)), each a handler on a receiver over
-the configuration store; a thin router matches method and path, decodes the
-body into the row's request and writes the contract's JSON
-([`api/endpoints.hl`](../api/endpoints.hl), [`api/wire.hl`](../api/wire.hl)).
+`openapi.yaml`. One port serves one origin (the admin UI is served from it
+too), in two parts. The control plane, the probes and the whole admin plane,
+is the rows of an `api` surface ([`api/surface.hl`](../api/surface.hl)): each
+a handler on a receiver over the configuration store, with the route it is
+served at (`rpc Projects::get at "GET /admin/v1/projects/{project}"`), served
+by hale's `http::Rest`, which decodes the path, the query and the body into
+the row's request, encodes the answer, and answers 404, 405, `OPTIONS` and
+`HEAD` itself ([`api/front.hl`](../api/front.hl)). Everything Rest does not
+serve goes to the data plane
+([`api/data_plane.hl`](../api/data_plane.hl)), a `std::http` handler on the
+same listener and connection: the OpenAI-compatible inference wire
+(`/v1/responses`, `/v1/chat/completions`, streamed), the caller plane's
+`/v1/models` and `/v1/capabilities`, the node link (`/node/v1/*`), the admin
+event stream, the route table (`/admin/v1/routes`, the brain's JSON as it is
+stored) and the app. The data plane authenticates its own callers (a project
+key, a node's token) and keeps the OpenAI error shape, which never moves;
+the exposure's gate judges only the rows.
+
+A control-plane failure is a classed variant of `CtlError`
+([`api/ctl.hl`](../api/ctl.hl)): `Invalid` 422, `NotFound` 404, `Conflict`
+409, `Unavailable` 503, named in the `Hale-Error-Class` header, the body the
+variant by codec, `{"NotFound": {"code": "not_found", "message": "..."}}`.
+A request the transport cannot decode into the row's request is its own
+refusal, `400 {"refusal": {"kind": "malformed", "reason": "missing_field:
+id"}}`. The rows are the contract: `hale api export` of the surface is
+[`api/bundle/`](../api/bundle/), compared with `spec/openapi.yaml` below.
 
 | Served for real | Endpoints |
 |---|---|
@@ -167,10 +188,11 @@ that fails, an event's or a keep-alive's. The first write after a caller
 closes is accepted (the caller answers it with a reset), so each keep-alive
 is followed a second later by an empty comment (`:`), the write that fails:
 a caller that leaves while the seat is quiet is found within about 16 s, and
-the stream ends there and the seat is sent `cancel`. A request body is at
-most 12 MiB; a larger one is answered `413 request_too_large` in the
-contract's envelope before it is read, and a chunked one (hale's Server
-reads `Content-Length` bodies only) is refused `400`.
+the stream ends there and the seat is sent `cancel`. `http::Rest` reads a
+request body of at most 1 MiB (hale's transport, no knob yet): a larger one,
+inference prompts included, is refused `400 malformed` before the data plane
+sees it, where the api used to take 12 MiB; and a chunked one (hale reads
+`Content-Length` bodies only) is refused `400`.
 
 ### Usage and the admin event stream
 
@@ -195,9 +217,9 @@ the browser sends back as `Last-Event-ID`; a connection with none is at
 the head and is told nothing of what came before, so a subscriber that
 connects late sees only what follows. Events are read from rows, so they
 come from any api instance and nothing is held between connections. The
-HTTP server answers one request at a time, so an answer is short and the
-browser reconnects at the `retry` it is given (2 s); the stream stays open
-once the router moves onto `http::Rest`. `?type=` (repeatable) narrows it.
+listener answers one request per connection, so an answer is short and the
+browser reconnects at the `retry` it is given (2 s). `?type=` (repeatable)
+narrows it.
 
 ```sh
 hale build api
@@ -223,9 +245,9 @@ api/bundle api`), and on any file in `api/bundle/` the export does not
 write.
 After a change to a row, export it again and commit the result.
 
-The bundle is the surface's own shape, not the REST wire's: a row is
-`POST /call/<member>`, and its types say what the codec of hale 0.27.0 can
-carry. [`api/gaps.json`](../api/gaps.json) lists every place
+The bundle is the surface's own shape, and since the rows are served from
+their routes it is the REST wire's too: a route per row, the types the codec
+carries. [`api/gaps.json`](../api/gaps.json) lists every place
 where a row's type differs from the contract schema it stands for, each
 with what closes it, and `spec/validate/bundle.mjs` (`npm run bundle`)
 fails when the gaps found and the gaps committed differ either way. It
@@ -247,7 +269,7 @@ refuse:
 | `json-text` | voice: a typed object the row carries as free-form JSON (`std::json::Value`); none today |
 | `path` | voice: a path or query parameter carried in the row's request |
 | `required` | voice: a row field with a default is not required on the surface |
-| `wire` | voice: the REST wire's shape differs from the row (`api/wire.hl` writes it) |
+| `wire` | voice: the wire's shape differs from the row |
 | `map-values` | voice: a map whose values one side says and the other does not, so they are not compared; none today (a map's values are compared as `<field>{}` when both say them) |
 | `open` | voice: the contract admits several shapes there (`oneOf`/`anyOf`); the row carries one, as the reader does |
 

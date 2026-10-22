@@ -23,19 +23,33 @@ locus Recorder {
     fn finish() { }
 }
 
-fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+fn node_of(nodes: api::Nodes, id: String) -> api::Node {
+    return nodes.get(api::NodeRef { node: id }) or api::Node { status: api::NodeStatus::down };
+}
+
+fn seat_of(seats: api::Seats, node: String, id: String) -> api::SeatView {
+    return seats.get(api::SeatRef { node: node, seat: id }) or api::SeatView {
+        status: api::SeatStatus::down
+    };
+}
+
+fn problem_in(s: api::SeatView, text: String) -> Bool {
+    let mut found = false;
+    for p in s.problems {
+        if std::str::contains(p, text) { found = true; }
+    }
+    return found;
+}
+
+fn account_of(accounts: api::Accounts, id: String) -> api::Account {
+    return accounts.get(api::AccountRef { account: id }) or api::Account {
+        billing: api::Billing::none,
+        status: api::Lifecycle::archived
+    };
 }
 
 fn plane(
-    e: api::Endpoints,
+    e: api::DataPlane,
     method: String,
     path: String,
     token: String,
@@ -64,25 +78,36 @@ const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight
 
 fn main() {
     let link = Recorder { };
-    let e = api::Endpoints { link: link };
-    admin(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
-    admin(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
-    let token = str(
-        admin(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\", \"max_in_flight\": 2}").body,
-        "enrollment_token",
-    );
-    admin(
-        e,
-        "POST",
-        "/admin/v1/nodes/laptop/seats",
-        "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": {\"text\": \"hello from voice\"}}",
-    );
-    admin(
-        e,
-        "POST",
-        "/admin/v1/nodes/laptop/seats",
-        "{\"id\": \"cli\", \"engine\": \"claude-work\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}]}",
-    );
+    let e = api::DataPlane { link: link };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: link };
+    let seats = api::Seats { store: e.store, link: link };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    let made = nodes.create(
+        api::NodeCreate { id: "laptop", has_max_in_flight: true, max_in_flight: 2 },
+    ) or { api::Node { status: api::NodeStatus::down } };
+    std::test::assert(made.has_enrollment_token, "a node's token");
+    let token = made.enrollment_token;
+    let mut hello = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(hello.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(hello) or discard;
+    let mut cli = api::SeatCreate {
+        node: "laptop",
+        id: "cli",
+        engine: "claude-work",
+        account: "static",
+    };
+    push(cli.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(cli) or discard;
     std::test::assert_eq_int(link.assigned, 0, "a node that has never registered is told nothing");
 
     // the token
@@ -146,21 +171,19 @@ fn main() {
         "every seat",
     );
     let version = std::json::find_int_field(a, "version");
-    let node = admin(e, "GET", "/admin/v1/nodes/laptop", "").body;
-    std::test::assert_eq_str(str(node, "status"), "up", "a node that registered is up");
-    std::test::assert_eq_str(str(node, "version"), "0.1.0", "its software's version");
-    std::test::assert_eq_int(
-        std::json::find_int_field(node, "effective_max_in_flight"),
-        2,
-        "its effective cap",
-    );
-    std::test::assert_eq_str(
-        str(std::json::array_first(std::json::find_field_raw(node, "seats")).element, "status"),
-        "pending",
+    let node = node_of(nodes, "laptop");
+    std::test::assert(node.status == api::NodeStatus::up, "a node that registered is up");
+    std::test::assert_eq_str(node.version, "0.1.0", "its software's version");
+    std::test::assert_eq_int(node.effective_max_in_flight, 2, "its effective cap");
+    std::test::assert(
+        seat_of(seats, "laptop", "static").status == api::SeatStatus::pending,
         "a seat waits for its node's report",
     );
     std::test::assert(
-        std::str::contains(node, "node laptop does not offer engine claude-work"),
+        problem_in(
+            seat_of(seats, "laptop", "cli"),
+            "node laptop does not offer engine claude-work",
+        ),
         "a seat outside what it offers",
     );
     expect(plane(e, "GET", "/node/v1/assignment", token, ""), 200, "the assignment");
@@ -169,11 +192,11 @@ fn main() {
     let states = "{\"assignment_version\": " + to_string(version)
         + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}, {\"id\": \"cli\", \"status\": \"refused\", \"reason\": \"no engine claude-work\", \"in_flight\": 0}]}";
     expect(plane(e, "POST", "/node/v1/seats", token, states), 204, "seat states");
-    let seat = admin(e, "GET", "/admin/v1/nodes/laptop/seats/static", "").body;
-    std::test::assert_eq_str(str(seat, "status"), "up", "the seat as the node reported it");
-    let refused = admin(e, "GET", "/admin/v1/nodes/laptop/seats/cli", "").body;
-    std::test::assert_eq_str(str(refused, "status"), "refused", "refused");
-    std::test::assert_eq_str(str(refused, "reason"), "no engine claude-work", "and why");
+    let up = seat_of(seats, "laptop", "static");
+    std::test::assert(up.status == api::SeatStatus::up, "the seat as the node reported it");
+    let refused = seat_of(seats, "laptop", "cli");
+    std::test::assert(refused.status == api::SeatStatus::refused, "refused");
+    std::test::assert_eq_str(refused.reason, "no engine claude-work", "and why");
     expect(
         plane(
             e,
@@ -185,11 +208,7 @@ fn main() {
         204,
         "heartbeat",
     );
-    std::test::assert_eq_int(
-        std::json::find_int_field(admin(e, "GET", "/admin/v1/nodes/laptop", "").body, "in_flight"),
-        1,
-        "its load",
-    );
+    std::test::assert_eq_int(node_of(nodes, "laptop").in_flight, 1, "its load");
     expect(
         plane(
             e,
@@ -240,27 +259,20 @@ fn main() {
         204,
         "local controls",
     );
-    let held = admin(e, "GET", "/admin/v1/nodes/laptop", "").body;
+    let held = node_of(nodes, "laptop");
     std::test::assert_eq_int(
-        std::json::find_int_field(held, "effective_max_in_flight"),
+        held.effective_max_in_flight,
         1,
         "a local cap lowers the effective one",
     );
-    std::test::assert_eq_str(
-        str(std::json::find_field_raw(held, "local"), "reason"),
-        "on battery",
-        "the controls as reported",
-    );
+    std::test::assert_eq_str(held.local.reason, "on battery", "the controls as reported");
     expect(
         plane(e, "PUT", "/node/v1/capabilities", token, "{\"max_in_flight\": 8, \"engines\": []}"),
         204,
         "capabilities",
     );
     std::test::assert(
-        std::str::contains(
-            admin(e, "GET", "/admin/v1/nodes/laptop/seats/static", "").body,
-            "does not offer engine static",
-        ),
+        problem_in(seat_of(seats, "laptop", "static"), "does not offer engine static"),
         "the assignment is checked against them again",
     );
     expect(
@@ -349,10 +361,12 @@ fn main() {
         400,
         "paused seats are seat ids",
     );
-    std::test::assert(
-        std::str::contains(admin(e, "GET", "/admin/v1/accounts/static", "").body, "five_hour"),
-        "the account shows its windows",
-    );
+    let mut windowed = false;
+    let account = account_of(accounts, "static");
+    for w in account.windows {
+        if w.name == "five_hour" { windowed = true; }
+    }
+    std::test::assert(windowed, "the account shows its windows");
     // a use is written back as it was reported (to_string(Float) reads
     // back as itself since hale v0.26.0): 99.999995 as 100 would read as an
     // exhausted account
@@ -367,7 +381,7 @@ fn main() {
         204,
         "quota near the top",
     );
-    let shown = admin(e, "GET", "/admin/v1/accounts/static", "").body;
+    let shown = api::account_json(account_of(accounts, "static"));
     std::test::assert(
         std::str::contains(shown, "\"used_percent\": 99.999995,")
             && std::str::contains(shown, "\"used_percent\": 33.333333333333336,"),
@@ -413,11 +427,14 @@ fn main() {
     expect(plane(e, "POST", "/node/v1/draining", token, ""), 204, "draining");
 
     // a change to its seats is a new assignment, published to it
-    expect(
-        admin(e, "PATCH", "/admin/v1/nodes/laptop/seats/static", "{\"concurrency\": 3}"),
-        200,
-        "change a seat",
-    );
+    seats.update(
+        api::SeatUpdate {
+            node: "laptop",
+            seat: "static",
+            has_concurrency: true,
+            concurrency: 3,
+        },
+    ) or discard;
     std::test::assert_eq_int(link.assigned, 1, "published");
     std::test::assert(
         std::str::starts_with(link.last, "laptop {\"type\": \"assign\""),
@@ -430,9 +447,8 @@ fn main() {
         ) > version,
         "at a newer version",
     );
-    std::test::assert_eq_str(
-        str(admin(e, "GET", "/admin/v1/nodes/laptop/seats/static", "").body, "status"),
-        "pending",
+    std::test::assert(
+        seat_of(seats, "laptop", "static").status == api::SeatStatus::pending,
         "pending until the node reports on it",
     );
 
@@ -476,14 +492,14 @@ fn main() {
     std::test::assert_eq_int(link.assigned, 3, "publishes nothing");
 
     // rotation and revocation
-    let token2 = str(admin(e, "POST", "/admin/v1/nodes/laptop/token", "").body, "enrollment_token");
+    let rotated = nodes.rotate_token(api::NodeRef { node: "laptop" }) or {
+        api::Node { status: api::NodeStatus::down }
+    };
+    std::test::assert(rotated.has_enrollment_token, "a rotation's token");
+    let token2 = rotated.enrollment_token;
     expect(plane(e, "GET", "/node/v1/assignment", token, ""), 401, "the old token stops at once");
     expect(plane(e, "GET", "/node/v1/assignment", token2, ""), 200, "the new one works");
-    admin(e, "DELETE", "/admin/v1/nodes/laptop", "");
+    nodes.revoke(api::NodeRef { node: "laptop" }) or discard;
     expect(plane(e, "POST", "/node/v1/register", token2, reg), 403, "a revoked node is refused");
-    std::test::assert_eq_str(
-        str(admin(e, "GET", "/admin/v1/nodes/laptop", "").body, "status"),
-        "revoked",
-        "revoked",
-    );
+    std::test::assert(node_of(nodes, "laptop").status == api::NodeStatus::revoked, "revoked");
 }

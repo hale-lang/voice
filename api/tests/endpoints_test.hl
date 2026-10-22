@@ -1,10 +1,12 @@
-// The router, in process: the usage ledger and the event stream answer
-// from an empty store, so a typo in a route or a missing body fails here
-// rather than on the wire. The endpoints with a row in the surface have
-// tests of their own, one file per resource.
+// The usage ledger answers from an empty store (the `Usage` rows), and the
+// data plane, in process: the paths no row serves (the event stream, the
+// route table, the chunked refusal, the ui helpers and the 404). A typo in a
+// route or a missing body fails here rather than on the wire. The rows of
+// the surface have tests of their own, one file per resource.
 import ".." as api;
+import "../../store" as st;
 
-fn expect(e: api::Endpoints, method: String, path: String, status: Int) {
+fn expect(e: api::DataPlane, method: String, path: String, status: Int) {
     let resp = e.handle(
         std::http::Request {
             method: method,
@@ -17,14 +19,33 @@ fn expect(e: api::Endpoints, method: String, path: String, status: Int) {
 }
 
 fn main() {
-    let e = api::Endpoints { };
     // usage is the ledger's: empty until a request is served (serve_test.hl)
-    expect(e, "GET", "/admin/v1/usage", 200);
-    expect(e, "GET", "/admin/v1/usage/summary?group_by=project", 200);
-    expect(e, "GET", "/admin/v1/usage/summary", 400);
-    expect(e, "GET", "/admin/v1/usage/summary?group_by=colour", 400);
-    expect(e, "GET", "/admin/v1/usage/resp_none", 404);
+    let usage = api::Usage { store: st::MemoryStore { } };
+    let none = usage.list(api::UsageAsk { }) or api::UsageList { has_next_cursor: true };
+    std::test::assert(count(none.data) == 0 && !none.has_next_cursor, "an empty ledger");
+    let grouped = usage.summary(api::UsageSummaryAsk { group_by: "project" }) or api::UsageSummary {
+        has_from: true,
+    };
+    std::test::assert(count(grouped.data) == 0 && !grouped.has_from, "and an empty summary");
+    std::test::assert_eq_str(at(grouped.group_by, 0) or "", "project", "grouped by project");
 
+    let mut failed = "";
+    usage.summary(api::UsageSummaryAsk { }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid group_by", "a summary names its grouping");
+    failed = "";
+    usage.summary(api::UsageSummaryAsk { group_by: "colour" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid group_by", "and a grouping the ledger has");
+    failed = "";
+    usage.get(api::UsageRef { request_id: "resp_none" }) or {
+        failed = api::ctl_class(err) + " " + to_string(api::ctl_status(err));
+    };
+    std::test::assert_eq_str(failed, "not_found 404", "no such request");
+
+    let e = api::DataPlane { };
     let chunked = e.handle(
         std::http::Request {
             method: "POST",
@@ -47,7 +68,7 @@ fn main() {
 
     expect(e, "GET", "/admin/v1/events", 200);
     expect(e, "GET", "/admin/v1/events?type=usage&type=node", 200);
-    expect(e, "GET", "/admin/v1/events?type=other", 400);
+    expect(e, "GET", "/admin/v1/events?type=other", 422);
     std::test::assert(api::is_ui_path("/nodes/laptop"), "an app route is the ui's");
     std::test::assert(!api::is_ui_path("/node/v1/assignment"), "the node plane is not");
     std::test::assert(api::has_extension("/assets/a.woff2"), "a file has an extension");
@@ -60,11 +81,8 @@ fn main() {
         "in the error envelope",
     );
 
-    // a route answers from its handler
-    let models = e.handle(std::http::Request { method: "GET", path: "/admin/v1/models" });
-    std::test::assert_eq_str(
-        std::str::trim(models.body),
-        "{\"data\": []}",
-        "the catalog starts empty",
-    );
+    // a row answers from its handler: the catalog starts empty
+    let catalog = api::Catalog { store: e.store };
+    let models = catalog.list() or api::CatalogList { };
+    std::test::assert_eq_int(count(models.data), 0, "the catalog starts empty");
 }

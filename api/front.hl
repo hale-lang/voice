@@ -1,0 +1,89 @@
+// The api's front: one listener, one origin. The control plane (the probes
+// and the admin plane) is the surface's rows, served by `http::Rest` from the
+// routes they declare (surface.hl); every path no row serves goes to the
+// data plane on the same listener and connection (data_plane.hl): the
+// OpenAI-compatible inference wire, the node link, the admin event stream
+// and the app. The exposure's gate (bearer, roles, `requires`) judges only
+// the rows; the data plane authenticates its own callers.
+//
+// The front holds the store, the receivers of the rows and the data plane,
+// so they share one pool and one store: fn main builds it over the store it
+// was given. The store's Postgres connection is one conversation, so the
+// admin plane takes turns at its own connection to the store (a row at a
+// time), the data plane's operations at theirs (store/lock.hl), and one
+// inference at a time is in its turn while everything else goes on.
+//
+// A request body is at most 12 MiB (`max_request_bytes`; the rows and the
+// data plane share the listener's cap). The toolchain guards a row against a
+// cross-site write: a body that is not JSON is refused 415, and a write with
+// no body from an origin outside `cors` is refused 403. The data plane is
+// not guarded by it and guards itself: a caller's project key on /v1, a
+// node's enrollment token on /node/v1; the event stream and the route table
+// are reads.
+locus Front {
+    params {
+        bind: String = "127.0.0.1:8080";
+        // the origins that may write with no body (the transport's guard
+        // against a cross-site form): the app's own, by the names it is reached under
+        cors: String = "";
+        ui: String = "";
+        store: st::Store = st::MemoryStore { };
+        // the store the rows use: with Postgres a connection of its own, so a
+        // transaction a row holds is not shared with the data plane's queries
+        rows_store: st::Store = self.store;
+        link: Link = NatsLink { };
+        held: HeldLimits = HeldLimits { };
+        first_s: Int = 120;
+        idle_s: Int = 30;
+        pulse: Bool = false;
+        governed: Bool = false;
+        node_user: String = "";
+        node_secret: std::secret::Credential = std::secret::Credential { };
+        gate: st::Lock = st::Lock { };
+        tokens: AdminBearer = AdminBearer { };
+        grants: AdminRoles = AdminRoles { };
+        // the receivers of the surface's rows (surface.hl)
+        probes: Probes = Probes { gate: self.gate, store: self.rows_store };
+        catalog: Catalog = Catalog { gate: self.gate, store: self.rows_store };
+        projects: Projects = Projects {
+            gate: self.gate,
+            store: self.rows_store,
+            governed: self.governed,
+            held: self.held,
+        };
+        keys: Keys = Keys { gate: self.gate, store: self.rows_store };
+        accounts: Accounts = Accounts { gate: self.gate, store: self.rows_store };
+        nodes: Nodes = Nodes { gate: self.gate, store: self.rows_store, link: self.link };
+        seats: Seats = Seats { gate: self.gate, store: self.rows_store, link: self.link };
+        changes: Changes = Changes { gate: self.gate, store: self.rows_store };
+        usage: Usage = Usage { gate: self.gate, store: self.rows_store };
+        data_plane: DataPlane = DataPlane {
+            ui: self.ui,
+            store: self.store,
+            link: self.link,
+            held: self.held,
+            first_s: self.first_s,
+            idle_s: self.idle_s,
+            pulse: self.pulse,
+            governed: self.governed,
+            node_user: self.node_user,
+            node_secret: self.node_secret,
+        };
+        web: api::Exposure = api::serve(
+            Voice,
+            http::Rest {
+                bind: self.bind,
+                codec: json,
+                principals: self.tokens,
+                roles: self.grants,
+                anonymous: "operator",
+                cors: self.cors,
+                max_request_bytes: 12582912,
+                fallback: self.data_plane,
+            },
+            as: "web",
+            bound: 256,
+            on_full: refuse
+        );
+    }
+}

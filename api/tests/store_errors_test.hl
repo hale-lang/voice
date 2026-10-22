@@ -5,22 +5,46 @@ import ".." as api;
 import "../../store" as st;
 
 fn main() {
-    let failed = api::store_failed(
+    // the control plane: a classed failure
+    let failed = api::store_down(
         st::StoreError {
             kind: "unavailable",
             message: "query_failed: duplicate key value violates unique constraint \"secret_idx\"",
         },
     );
+    let problem = api::ctl_problem(failed);
     std::test::assert(
-        failed.status == 500
-            && failed.code == api::ErrorCode::internal_error
-            && !std::str::contains(failed.message, "secret_idx"),
-        "an admin failure answers without what the store said: " + failed.message,
+        api::ctl_status(failed) == 503
+            && api::ctl_class(failed) == "unavailable"
+            && problem.code == api::ErrorCode::internal_error
+            && !std::str::contains(problem.message, "secret_idx"),
+        "an admin failure answers without what the store said: " + problem.message,
     );
     std::test::assert(
-        std::str::contains(failed.message, "err_")
-            && std::str::starts_with(failed.voice.request_id, "err_"),
-        "and with an id the api's log has",
+        std::str::contains(problem.message, "err_")
+            && problem.has_incident
+            && std::str::starts_with(problem.incident, "err_"),
+        "and with an incident the api's log has",
+    );
+    let full = api::store_down(
+        st::StoreError { kind: "full", message: "voice holds at most 64 projects" },
+    );
+    std::test::assert(
+        api::ctl_status(full) == 422
+            && api::ctl_class(full) == "invalid"
+            && api::ctl_problem(full).message == "voice holds at most 64 projects",
+        "a full store is the caller's to fix, and says so",
+    );
+
+    // the data plane keeps the OpenAI envelope
+    let data = api::store_failed(
+        st::StoreError { kind: "unavailable", message: "query_failed: secret_idx" },
+    );
+    std::test::assert(
+        data.status == 500
+            && !std::str::contains(data.message, "secret_idx")
+            && std::str::starts_with(data.voice.request_id, "err_"),
+        "the data plane's failure too: " + data.message,
     );
     let metering = api::metering_failed(
         st::StoreError { kind: "unavailable", message: "query_failed: secret_idx" },
@@ -29,11 +53,11 @@ fn main() {
         metering.status == 503 && !std::str::contains(metering.message, "secret_idx"),
         "on the caller plane too",
     );
-    let full = api::store_failed(
+    let data_full = api::store_failed(
         st::StoreError { kind: "full", message: "voice holds at most 64 projects" },
     );
     std::test::assert(
-        full.status == 400 && full.message == "voice holds at most 64 projects",
-        "a full store is the caller's to fix, and says so",
+        data_full.status == 400 && data_full.message == "voice holds at most 64 projects",
+        "a full store on the data plane is a 400",
     );
 }

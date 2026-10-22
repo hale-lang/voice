@@ -76,7 +76,7 @@ const refusals = {
   // no brain works here, so no route table reaches the api
   getRoutes: { json: [503, 'route_table_unavailable'] },
   // nothing here can serve a request, so the ledger holds no record to read
-  getUsage: { json: [404, 'not_found'] },
+  getUsage: { json: [404, 'not_found', 'NotFound'] },
 };
 
 // the query an operation needs to be answered at all
@@ -129,12 +129,14 @@ for (const [p, m, op] of [...calls, ...last]) {
     const text = await r.text();
     const refusal = refusals[op.operationId]?.[stream ? 'stream' : 'json'];
     if (refusal) {
-      const [status, errCode] = refusal;
+      const [status, errCode, variant] = refusal;
       if (r.status !== status) { fail(label, `status ${r.status} != ${status}: ${text.slice(0, 120)}`); continue; }
       const f = ajv.compile(strip(op.responses[String(status)].content['application/json'].schema));
       const j = JSON.parse(text);
       if (!f(j)) fail(label, JSON.stringify(f.errors.slice(0, 3)));
-      if (j?.error?.code !== errCode) fail(label, `code ${j?.error?.code} != ${errCode}`);
+      // the control plane's failures are a class's variant, `{"NotFound": {...}}`; the data plane's the envelope
+      const got = variant ? j?.[variant]?.code : j?.error?.code;
+      if (got !== errCode) fail(label, `code ${got} != ${errCode}`);
       continue;
     }
     if (String(r.status) !== code) { fail(label, `status ${r.status} != ${code}: ${text.slice(0, 120)}`); continue; }

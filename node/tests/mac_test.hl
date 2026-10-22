@@ -5,19 +5,157 @@
 import ".." as node;
 import "../../api" as api;
 
-/// The admin calls, answered by an api in process.
+/// The receivers behind the admin rows, over one store: the api in process.
+locus Rows {
+    params {
+        e: api::DataPlane;
+        nodes: api::Nodes = api::Nodes { store: self.e.store, link: self.e.link };
+        seats: api::Seats = api::Seats { store: self.e.store, link: self.e.link };
+        accounts: api::Accounts = api::Accounts { store: self.e.store };
+        catalog: api::Catalog = api::Catalog { store: self.e.store };
+        projects: api::Projects = api::Projects { store: self.e.store };
+        keys: api::Keys = api::Keys { store: self.e.store };
+    }
+}
+
+/// A request body with the path's parameter laid beside its members, as the
+/// REST transport binds it.
+fn with_param(body: String, name: String, value: String) -> String {
+    let given = if len(std::str::trim(body)) == 0 { "{}" } else { std::str::trim(body) };
+    let rest = given[1..len(given)];
+    let sep = if std::str::trim(rest) == "}" { "" } else { ", " };
+    return "{\"" + name + "\": " + "\"" + std::json::escape_string(value) + "\"" + sep + rest;
+}
+
+/// The `k`th `/`-separated segment of `path` (0 is the empty one before the
+/// first `/`), "" past the end.
+fn segment(path: String, k: Int) -> String {
+    let mut rest = path;
+    let mut i = 0;
+    while i < k {
+        let at = std::str::index_of(rest, "/");
+        if at < 0 { return ""; }
+        rest = rest[(at + 1)..len(rest)];
+        i = i + 1;
+    }
+    let end = std::str::index_of(rest, "/");
+    return if end < 0 { rest } else { rest[0..end] };
+}
+
+fn failure(e: api::CtlError) -> node::Reply {
+    return node::Reply { status: api::ctl_status(e), body: api::CtlError::api_encode(e) };
+}
+
+fn refused(what: String) -> node::Reply {
+    return node::Reply {
+        status: 400,
+        body: "{\"refusal\": {\"kind\": \"malformed\", \"reason\": \"" + what + "\"}}",
+    };
+}
+
+/// The admin calls provisioning makes, answered by the rows' receivers in
+/// process: the route, the request decoded by the rows' codec, the answer
+/// encoded by it, a failure as its class's status. A stand-in for the
+/// transport, which the end-to-end test (api/tests/rest_test.hl) covers.
 locus InProcess {
-    params { e: api::Endpoints; }
+    params { rows: Rows; }
     fn send(method: String, path: String, body: String) -> node::Reply {
-        let r = self.e.handle(
-            std::http::Request {
-                method: method,
-                path: path,
-                headers: "Content-Type: application/json",
-                body: body,
-            },
-        );
-        return node::Reply { status: r.status, body: r.body };
+        // /admin/v1/<resource>[/<id>[/<sub>[/<id>]]]
+        let resource = segment(path, 3);
+        let id = segment(path, 4);
+        let sub = segment(path, 5);
+        let sub_id = segment(path, 6);
+        if resource == "nodes" && len(id) == 0 && method == "POST" {
+            let c = api::NodeCreate::api_decode(body) or {
+                return refused("node");
+            };
+            let v = self.rows.nodes.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::Node::api_encode(v) };
+        }
+        if resource == "nodes" && sub == "token" && method == "POST" {
+            let v = self.rows.nodes.rotate_token(api::NodeRef { node: id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::Node::api_encode(v) };
+        }
+        if resource == "nodes" && sub == "seats" && len(sub_id) == 0 && method == "POST" {
+            let c = api::SeatCreate::api_decode(with_param(body, "node", id)) or {
+                return refused("seat");
+            };
+            let v = self.rows.seats.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::SeatView::api_encode(v) };
+        }
+        if resource == "nodes" && sub == "seats" && len(sub_id) == 0 && method == "GET" {
+            let v = self.rows.seats.list(api::NodeRef { node: id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::SeatList::api_encode(v) };
+        }
+        if resource == "accounts" && len(id) == 0 && method == "POST" {
+            let c = api::AccountCreate::api_decode(body) or {
+                return refused("account");
+            };
+            let v = self.rows.accounts.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::Account::api_encode(v) };
+        }
+        if resource == "accounts" && len(id) > 0 && method == "GET" {
+            let v = self.rows.accounts.get(api::AccountRef { account: id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::Account::api_encode(v) };
+        }
+        if resource == "models" && len(id) == 0 && method == "POST" {
+            let c = api::CatalogModelCreate::api_decode(body) or {
+                return refused("model");
+            };
+            let v = self.rows.catalog.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::CatalogModel::api_encode(v) };
+        }
+        if resource == "models" && len(id) > 0 && method == "GET" {
+            let v = self.rows.catalog.get(api::ModelRef { model: id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::CatalogModel::api_encode(v) };
+        }
+        if resource == "projects" && len(id) == 0 && method == "POST" {
+            let c = api::ProjectCreate::api_decode(body) or {
+                return refused("project");
+            };
+            let v = self.rows.projects.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::Project::api_encode(v) };
+        }
+        if resource == "projects" && sub == "keys" && len(sub_id) == 0 && method == "GET" {
+            let v = self.rows.keys.list(api::ProjectRef { project: id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::KeyList::api_encode(v) };
+        }
+        if resource == "projects" && sub == "keys" && len(sub_id) == 0 && method == "POST" {
+            let c = api::KeyCreate::api_decode(with_param(body, "project", id)) or {
+                return refused("key");
+            };
+            let v = self.rows.keys.create(c) or {
+                return failure(err);
+            };
+            return node::Reply { status: 201, body: api::Key::api_encode(v) };
+        }
+        if resource == "projects" && sub == "keys" && len(sub_id) > 0 && method == "DELETE" {
+            let v = self.rows.keys.revoke(api::KeyRef { project: id, key: sub_id }) or {
+                return failure(err);
+            };
+            return node::Reply { status: 200, body: api::Key::api_encode(v) };
+        }
+        return node::Reply { status: 404, body: "{}" };
     }
 }
 
@@ -35,7 +173,8 @@ fn seats_of(o: node::Offers) -> String {
     return out;
 }
 
-fn get(e: api::Endpoints, path: String, key: String) -> std::http::Response {
+/// A caller-plane read, answered by the data plane in process.
+fn get(e: api::DataPlane, path: String, key: String) -> std::http::Response {
     return e.handle(
         std::http::Request {
             method: "GET",
@@ -43,6 +182,11 @@ fn get(e: api::Endpoints, path: String, key: String) -> std::http::Response {
             headers: if len(key) > 0 { "Authorization: Bearer " + key } else { "" }
         },
     );
+}
+
+/// An admin read, answered by the rows in process.
+fn admin_get(a: InProcess, path: String) -> node::Reply {
+    return a.send("GET", path, "");
 }
 
 fn main() {
@@ -176,8 +320,8 @@ fn main() {
     );
 
     // ---- the rows on the api
-    let e = api::Endpoints { };
-    let admin = InProcess { e: e };
+    let e = api::DataPlane { };
+    let admin = InProcess { rows: Rows { e: e } };
     let p = node::provision(admin, "mac", both, false);
     std::test::assert(p.ok, "provisioned: " + p.why);
     std::test::assert(
@@ -185,23 +329,22 @@ fn main() {
         "the node's enrollment token is handed back",
     );
     std::test::assert(std::str::starts_with(p.key, "vk-"), "and the key, once: " + p.key);
-    let account = get(e, "/admin/v1/accounts/local-mac", "");
+    let account = admin_get(admin, "/admin/v1/accounts/local-mac");
     std::test::assert_eq_str(
         std::json::find_string_field(account.body, "billing"),
         "none",
         "the local account bills nothing: " + account.body,
     );
-    let model = get(e, "/admin/v1/models/llama3.2:latest", "");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(model.body, "price")),
-        "null",
-        "a model is free: " + model.body,
-    );
-    let seats = get(e, "/admin/v1/nodes/mac/seats", "");
+    let model = admin_get(admin, "/admin/v1/models/llama3.2:latest");
     std::test::assert(
-        std::str::contains(seats.body, "\"ref\": \"mac/ollama-llama3-2-latest\"")
-            && std::str::contains(seats.body, "\"ref\": \"mac/claude\"")
-            && std::str::contains(seats.body, "\"account\": \"local-mac\""),
+        !std::str::contains(model.body, "\"price\""),
+        "a model is free, its price left out: " + model.body,
+    );
+    let seats = admin_get(admin, "/admin/v1/nodes/mac/seats");
+    std::test::assert(
+        std::str::contains(seats.body, "\"ref\":\"mac/ollama-llama3-2-latest\"")
+            && std::str::contains(seats.body, "\"ref\":\"mac/claude\"")
+            && std::str::contains(seats.body, "\"account\":\"local-mac\""),
         "the seats are rows on the node, under the local account: " + seats.body,
     );
     let listed = get(e, "/v1/models", p.key);
@@ -223,7 +366,7 @@ fn main() {
     );
     // a project whose key never reached anyone (an install that failed after
     // the project was made) is given one by the next install
-    let keys = get(e, "/admin/v1/projects/local-mac/keys", "");
+    let keys = admin_get(admin, "/admin/v1/projects/local-mac/keys");
     let first = std::json::array_first(std::json::find_field_raw(keys.body, "data")).element;
     let gone = admin.send(
         "DELETE",

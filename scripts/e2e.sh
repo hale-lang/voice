@@ -110,9 +110,15 @@ node/node --id laptop --api "$api" --token "$token" --data "$work/node-data" --c
 laptop_pid=$!
 pids+=($laptop_pid)
 
+# the node has applied the assignment the last change to its seats made: the
+# seat's status is only that of the assignment before it until then
+applied() {
+  curl -fsS "$api/admin/v1/nodes/laptop" | python3 -c 'import json,sys; n=json.load(sys.stdin); sys.exit(0 if n.get("applied_version") == n["assignment_version"] else 1)'
+}
+
 seat_status() { curl -fsS "$api/admin/v1/nodes/laptop/seats/static" | field status; }
 wait_for() {
-  for i in $(seq 1 100); do [ "$(seat_status)" = "$1" ] && return 0; sleep 0.2; done
+  for i in $(seq 1 100); do [ "$(seat_status)" = "$1" ] && applied && return 0; sleep 0.2; done
   echo "the seat never became $1: $(curl -fsS "$api/admin/v1/nodes/laptop")"; echo "--- api"; cat "$work/api.log"; echo "--- node"; cat "$work/node.log"
   return 1
 }
@@ -198,17 +204,17 @@ done
 [ "$now" -ge $((told + 3)) ] || { echo "the events queued while the nerves stalled did not land ($now on the stream, $((told + 3)) expected)"; tail -5 "$work/api.log"; exit 1; }
 echo "answers did not wait on stalled nerves, and the three events queued meanwhile landed after"
 
-# a body over 12 MiB is answered 413 in the contract's envelope, unread; one
-# just under it is served, through a NATS message well over the 1 MiB default
+# a body over 12 MiB (`max_request_bytes` of the listener, which the data
+# plane shares) is refused 413 `too_large` before it is read; one just under
+# it is served, through a NATS message well over the 1 MiB default
 # (deploy/nats/nats.conf allows 16 MiB). Its cost is linear in its size: the
 # api's peak stays under 200 MB, streamed under 256 MB (it was ~9.5 GB at
 # 12 MiB before hale 0.25.1; FRICTION.md).
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near.json"
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "stream": True, "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near-stream.json"
-# (the api answers before reading, so curl may fail sending the rest)
 big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
-case "$big" in *'"code": "request_too_large"'*413) echo "a 13 MiB body is refused 413 request_too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
+case "$big" in *'"kind":"too_large"'*413) echo "a 13 MiB body is refused 413 too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
 near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
 [ "$near" = "200" ] || { echo "a body just under 12 MiB was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
 peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
@@ -219,6 +225,45 @@ streamed=$(curl -s -o "$work/near-stream.out" -w '%{http_code}' -X POST "$api/v1
 peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
 [ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 12 MiB"; exit 1; }
 echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
+
+# one streamed inference held open does not hold the api: an admin read, the
+# node link, the event stream and a cancel all complete promptly beside it
+# (only the moments a request touches Postgres take turns)
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "'$(printf 'y%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}' >/dev/null
+wait_for up
+curl -s -N --max-time 40 -D "$work/held.head" -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/held.sse" &
+held_curl=$!
+for i in $(seq 1 100); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "1" ] && break
+  sleep 0.1
+done
+held_id=$(tr -d '\r' <"$work/held.head" | awk -F': ' 'tolower($1) == "x-request-id" {print $2}')
+[ -n "$held_id" ] || { echo "the held stream has no request id"; cat "$work/held.head"; exit 1; }
+sleep 1
+within() { # <label> <max ms> <command...>
+  local label=$1 max=$2; shift 2
+  local t=$(date +%s%N)
+  "$@" >/dev/null || { echo "$label failed beside a held stream"; exit 1; }
+  local ms=$(( ($(date +%s%N) - t) / 1000000 ))
+  [ "$ms" -lt "$max" ] || { echo "$label took $ms ms beside a held stream"; exit 1; }
+  echo "$label: $ms ms beside a held stream"
+}
+within "an admin read" 2000 curl -fsS --max-time 10 "$api/admin/v1/projects"
+within "a change-log read" 2000 curl -fsS --max-time 10 "$api/admin/v1/changes?limit=1"
+within "the node link" 2000 curl -fsS --max-time 10 "$api/node/v1/assignment" -H "authorization: Bearer $token"
+within "the event stream" 2000 curl -fsS --max-time 10 "$api/admin/v1/events?type=change"
+t0=$(date +%s%N)
+python3 scripts/nats-publish.py "${NATS_URL#nats://}" "voice.node.laptop.cancel" '{"type": "cancel", "request_id": "'"$held_id"'"}'
+for i in $(seq 1 40); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+released_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$released_ms" -lt 2000 ] || { echo "a cancel took $released_ms ms to release the held stream"; exit 1; }
+echo "a cancel released the held stream in $released_ms ms"
+kill "$held_curl" 2>/dev/null || true
+curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+wait_for up
 
 # a caller that goes away mid-stream: the api stops at once, tells the seat
 # to stop, and answers the next caller

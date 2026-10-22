@@ -1,0 +1,181 @@
+// The control plane's failures and its callers.
+//
+// The admin plane and the probes are served by `http::Rest` from the
+// surface's routes (surface.hl); a handler that cannot do what it was asked
+// fails with a `CtlError`, and the transport answers by the variant's class
+// (hale's error classes): the status, and the `Hale-Error-Class` header
+// beside it. The body is the variant by codec, `{"NotFound": {...}}`, the
+// `Problem` in it. The data plane (/v1, /node/v1) is not a surface's: it
+// keeps the OpenAI error shape and `ApiError` (data_plane.hl), which a
+// caller of an open standard expects.
+
+/// What was wrong, in the words of the contract's error object: the `code`,
+/// the `message`, the request field at fault (`param`, when there is one) and,
+/// for a store failure, the incident the api logged it under.
+type Problem {
+    code: ErrorCode;
+    message: String = "";
+    has_param: Bool = false;
+    param: String = "";
+    has_incident: Bool = false;
+    incident: String = "";
+}
+
+/// A control-plane handler's failure. Each variant's class is its status:
+/// `invalid` 422, `not_found` 404, `conflict` 409, `unavailable` 503.
+type CtlError = enum {
+    @invalid Invalid(Problem),
+    @not_found NotFound(Problem),
+    @conflict Conflict(Problem),
+    @unavailable Unavailable(Problem),
+    // readiness: the store does not answer. The body is the `Health` the
+    // probe states.
+    @unavailable NotReady(Health)
+};
+
+/// A request that is well formed and wrong (`invalid_request`), naming the
+/// request field when there is one.
+fn bad(message: String, param: String) -> CtlError {
+    return CtlError::Invalid(
+        Problem {
+            code: ErrorCode::invalid_request,
+            message: message,
+            has_param: len(param) > 0,
+            param: param,
+        },
+    );
+}
+
+/// A request for something voice does not do (`unsupported`).
+fn no_support(message: String, param: String) -> CtlError {
+    return CtlError::Invalid(
+        Problem {
+            code: ErrorCode::unsupported,
+            message: message,
+            has_param: len(param) > 0,
+            param: param,
+        },
+    );
+}
+
+/// What the request names does not exist.
+fn missing(message: String) -> CtlError {
+    return CtlError::NotFound(Problem { code: ErrorCode::not_found, message: message });
+}
+
+/// The request conflicts with the state it meets.
+fn clash(message: String) -> CtlError {
+    return CtlError::Conflict(Problem { code: ErrorCode::conflict, message: message });
+}
+
+/// A store that could not answer an admin request. A full list is the
+/// caller's to fix; a store that is down is a failure inside the api, which
+/// is logged under an incident the answer quotes (store_incident).
+fn store_down(e: st::StoreError) -> CtlError {
+    if e.kind == "full" { return bad(e.message, ""); }
+    let id = store_incident(e);
+    return CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::internal_error,
+            message: "the store could not complete the request (" + id + ")",
+            has_incident: true,
+            incident: id,
+        },
+    );
+}
+
+/// Under a head, no ratified limits read yet: the organization's head has
+/// not answered.
+fn limits_unread() -> CtlError {
+    return CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::metering_unavailable,
+            message: "the project's rate limits are not read yet: they are the organization's, and its head has not answered",
+        },
+    );
+}
+
+/// A project whose ratified practices are ambiguous, with no limit read for
+/// it before.
+fn limit_unknown(p: PracticeLimit) -> CtlError {
+    return CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::metering_unavailable,
+            message: "project " + p.project + "'s rate limit is not known: " + p.why + " ("
+                + p.name + ")",
+        },
+    );
+}
+
+/// A failure inside the api itself.
+fn entropy_down(message: String) -> CtlError {
+    return CtlError::Unavailable(Problem { code: ErrorCode::internal_error, message: message });
+}
+
+/// The class a failure is, as the transport names it in `Hale-Error-Class`.
+fn ctl_class(e: CtlError) -> String {
+    return match e {
+        CtlError::Invalid(p) -> "invalid",
+        CtlError::NotFound(p) -> "not_found",
+        CtlError::Conflict(p) -> "conflict",
+        CtlError::Unavailable(p) -> "unavailable",
+        CtlError::NotReady(h) -> "unavailable"
+    };
+}
+
+/// The status a failure answers with: its class's.
+fn ctl_status(e: CtlError) -> Int {
+    return match e {
+        CtlError::Invalid(p) -> 422,
+        CtlError::NotFound(p) -> 404,
+        CtlError::Conflict(p) -> 409,
+        CtlError::Unavailable(p) -> 503,
+        CtlError::NotReady(h) -> 503
+    };
+}
+
+/// What the failure says: its problem (a readiness failure's is the
+/// unavailable store).
+fn ctl_problem(e: CtlError) -> Problem {
+    return match e {
+        CtlError::Invalid(p) -> p,
+        CtlError::NotFound(p) -> p,
+        CtlError::Conflict(p) -> p,
+        CtlError::Unavailable(p) -> p,
+        CtlError::NotReady(h) -> Problem {
+            code: ErrorCode::internal_error,
+            message: "not ready",
+        }
+    };
+}
+
+/// A control-plane failure as a response, for the paths the data plane
+/// serves beside the rows (the event stream): the status of the variant's
+/// class, the `Hale-Error-Class` header the transport adds to a row's, and
+/// the variant by codec as the body.
+fn ctl_response(e: CtlError) -> std::http::Response {
+    return std::http::Response {
+        status: ctl_status(e),
+        content_type: "application/json",
+        headers: "Hale-Error-Class: " + ctl_class(e),
+        body: CtlError::api_encode(e),
+    };
+}
+
+/// Who the admin plane's callers are. Admin authentication is middleware
+/// that comes later; until then the api listens on loopback and every admin
+/// request holds the `admin` role: a request with no credential, and one
+/// with any bearer token, is the operator.
+locus AdminBearer {
+    fn principal(token: String) -> std::api::Principal {
+        return std::api::Principal { mode: "bearer", name: "operator" };
+    }
+    fn refused() -> String { return "no such token"; }
+}
+
+/// What the admin plane's callers hold: the operator holds `admin`.
+locus AdminRoles {
+    fn holds(p: std::api::Principal, r: String) -> Bool {
+        return r == "admin" && p.name == "operator";
+    }
+}

@@ -142,7 +142,7 @@ locus Nodes {
 
 /// The streamed answers: the standard event stream, and Chat Completions
 /// chunks, as Server-Sent Events.
-fn streamed_with_sse(e: api::Endpoints, key: String, nodes: Nodes) {
+fn streamed_with_sse(e: api::DataPlane, key: String, nodes: Nodes) {
     let r = ask(
         e,
         "/v1/responses",
@@ -304,7 +304,7 @@ const FRAGMENTED_CALL: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"in
 
 /// A stream whose seat dies once it has begun ends with the evidence; a
 /// caller that goes away ends the stream at once, the seat told to stop.
-fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes, laptop: String) {
+fn streamed_failures(e: api::DataPlane, key: String, nodes: Nodes, laptop: String) {
     beat(e, laptop);
     e.inference.idle = 2s;
     e.inference.keep_alive = 1s;
@@ -387,7 +387,7 @@ fn streamed_failures(e: api::Endpoints, key: String, nodes: Nodes, laptop: Strin
 /// A seat has the first-output span to its first output, then the idle
 /// span between events; a stream a seat that accepted keeps quiet is opened
 /// by its keep-alive, which finds a caller that has gone.
-fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes, laptop: String) {
+fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: String) {
     beat(e, laptop);
     e.inference.first = 6s;
     e.inference.idle = 1s;
@@ -468,21 +468,47 @@ fn first_output_span(e: api::Endpoints, key: String, nodes: Nodes, laptop: Strin
     e.inference.keep_alive = 15s;
 }
 
+/// A request-count limit on `scope`, per `window` seconds.
+fn req_limit(scope: st::LimitScope, window: Int, n: Int) -> st::Limit {
+    return st::Limit { scope: scope, window_seconds: window, has_requests: true, requests: n };
+}
+
+/// The limits of the project `work` set through the admin receiver.
+fn put_limits(e: api::DataPlane, ls: st::Limits, what: String) {
+    let projects = api::Projects { store: e.store };
+    let mut req = api::LimitsRequest { project: "work" };
+    for l in ls.items {
+        push(req.limits, l) or discard;
+    }
+    projects.set_limits(req) or {
+        std::test::assert(false, what + ": " + api::ctl_problem(err).message);
+    };
+}
+
+fn work_limits(r: api::Projects) -> api::LimitSet fallible(api::CtlError) {
+    return r.limits(api::ProjectRef { project: "work" }) or raise;
+}
+
 /// Rate limits: the stored ones enforced, then a ratified practice in
 /// their place under a head (admission.hl, governance.hl).
-fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
+fn rate_limits(e: api::DataPlane, key: String, laptop: String) {
     beat(e, laptop);
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
     let hi = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
-    expect(
-        admin(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 2}, {\"scope\": \"model\", \"model\": \"other-1\", \"window_seconds\": 60, \"requests\": 0}]}",
-        ),
-        200,
-        "a limit of two a minute, and none for another model",
-    );
+    let mut two = st::Limits { };
+    push(two.items, req_limit(st::LimitScope::project, 60, 2)) or discard;
+    push(
+        two.items,
+        st::Limit {
+            scope: st::LimitScope::model,
+            model: "other-1",
+            window_seconds: 60,
+            has_requests: true,
+            requests: 0,
+        },
+    ) or discard;
+    put_limits(e, two, "a limit of two a minute, and none for another model");
     let one = ask(e, "/v1/responses", key, hi);
     expect(one, 200, "the first is served");
     std::test::assert(
@@ -526,57 +552,51 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
         429,
         "a stream too, before it begins",
     );
-    let stored = admin(e, "GET", "/admin/v1/projects/work/limits", "");
-    std::test::assert_eq_str(
-        std::json::find_string_field(stored.body, "source"),
-        "stored",
+    let stored = work_limits(projects) or api::LimitSet { source: api::LimitSource::practice };
+    std::test::assert(
+        stored.source == api::LimitSource::stored,
         "the stored limits are the source",
     );
-    expect(
-        admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"),
-        200,
-        "the limit lifted",
-    );
+    put_limits(e, st::Limits { }, "the limit lifted");
     expect(ask(e, "/v1/responses", key, hi), 200, "and served again");
 
     // a key's own limit
-    let keys = std::json::find_field_raw(
-        admin(e, "GET", "/admin/v1/projects/work/keys", "").body,
-        "data",
-    );
-    let kid = std::json::find_string_field(std::json::array_first(keys).element, "id");
-    std::test::assert(len(kid) > 0, "the key's id: " + keys);
-    expect(
-        admin(
-            e,
-            "PATCH",
-            "/admin/v1/projects/work/keys/" + kid,
-            "{\"limits\": [{\"scope\": \"key\", \"window_seconds\": 60, \"requests\": 1}]}",
-        ),
-        200,
-        "a key limited to one a minute",
-    );
+    let klist = keys.list(api::ProjectRef { project: "work" }) or api::KeyList { };
+    let mut kid = "";
+    for k in klist.data {
+        if len(kid) == 0 {
+            kid = k.id;
+        }
+    }
+    std::test::assert(len(kid) > 0, "the key's id");
+    let mut kl = api::KeyUpdate { project: "work", key: kid, has_limits: true };
+    push(kl.limits, req_limit(st::LimitScope::key, 60, 1)) or discard;
+    keys.update(kl) or {
+        std::test::assert(false, "a key limited to one a minute: " + api::ctl_problem(err).message);
+    };
     expect(ask(e, "/v1/responses", key, hi), 200, "its first is served");
     expect(ask(e, "/v1/responses", key, hi), 429, "its second is past the key's limit");
-    expect(
-        admin(e, "PATCH", "/admin/v1/projects/work/keys/" + kid, "{\"limits\": []}"),
-        200,
-        "the key's limit lifted",
-    );
+    keys.update(
+        api::KeyUpdate { project: "work", key: kid, has_limits: true },
+    ) or {
+        std::test::assert(false, "the key's limit lifted: " + api::ctl_problem(err).message);
+    };
 
     // a request limit and a token limit on the same window each have a
     // counter of their own: the token limit counts no requests, and the
     // remaining requests go down by one a request
-    expect(
-        admin(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 30, \"requests\": 3}, {\"scope\": \"project\", \"window_seconds\": 30, \"input_tokens\": 1000}]}",
-        ),
-        200,
-        "three a window, and a token limit beside it",
-    );
+    let mut beside = st::Limits { };
+    push(beside.items, req_limit(st::LimitScope::project, 30, 3)) or discard;
+    push(
+        beside.items,
+        st::Limit {
+            scope: st::LimitScope::project,
+            window_seconds: 30,
+            has_input_tokens: true,
+            input_tokens: 1000,
+        },
+    ) or discard;
+    put_limits(e, beside, "three a window, and a token limit beside it");
     let mut left = 2;
     while left >= 0 {
         let a = ask(e, "/v1/responses", key, hi);
@@ -593,16 +613,10 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
     }
     expect(ask(e, "/v1/responses", key, hi), 429, "the fourth is past the limit, and only then");
     // and two request limits on one window: the tighter one's headers
-    expect(
-        admin(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 4}, {\"scope\": \"project\", \"window_seconds\": 45, \"requests\": 2}]}",
-        ),
-        200,
-        "four and two a window",
-    );
+    let mut tighter = st::Limits { };
+    push(tighter.items, req_limit(st::LimitScope::project, 45, 4)) or discard;
+    push(tighter.items, req_limit(st::LimitScope::project, 45, 2)) or discard;
+    put_limits(e, tighter, "four and two a window");
     let tight = ask(e, "/v1/responses", key, hi);
     expect(tight, 200, "the first served");
     std::test::assert(
@@ -614,25 +628,14 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
     );
     expect(ask(e, "/v1/responses", key, hi), 200, "the second served");
     expect(ask(e, "/v1/responses", key, hi), 429, "the third past the tighter limit");
-    expect(
-        admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"),
-        200,
-        "the limits lifted",
-    );
+    put_limits(e, st::Limits { }, "the limits lifted");
 
     // under a head, the organization's ratified practice is the limit, and
     // the stored ones are not: one a minute, though five are stored
-    expect(
-        admin(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 5}]}",
-        ),
-        200,
-        "five stored",
-    );
-    e.projects.governed = true;
+    let mut five = st::Limits { };
+    push(five.items, req_limit(st::LimitScope::project, 60, 5)) or discard;
+    put_limits(e, five, "five stored");
+    let governed = api::Projects { store: e.store, governed: true, held: e.held };
     e.inference.governed = true;
     let read = api::PracticeLimits { };
     read.push(
@@ -646,28 +649,29 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
     api::hold_limits(e.inference.held, 1, read);
     expect(ask(e, "/v1/responses", key, hi), 200, "the first under the practice is served");
     expect(ask(e, "/v1/responses", key, hi), 429, "the second is past the ratified limit");
-    let ratified = admin(e, "GET", "/admin/v1/projects/work/limits", "");
+    let ratified = work_limits(governed) or api::LimitSet { };
     std::test::assert(
-        std::json::find_string_field(ratified.body, "source") == "practice"
-            && std::json::find_string_field(
-                std::json::find_field_raw(ratified.body, "practice"),
-                "name",
-            ) == "operating/limits/work",
-        "the limit shown is the practice's, and says so: " + ratified.body,
+        ratified.source == api::LimitSource::practice
+            && ratified.has_practice
+            && ratified.practice.name == "operating/limits/work",
+        "the limit shown is the practice's, and says so",
     );
-    std::test::assert_eq_int(
-        std::json::find_int_field(
-            std::json::array_first(std::json::find_field_raw(ratified.body, "limits")).element,
-            "requests",
-        ),
-        1,
-        "its limit",
-    );
-    let refused = admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}");
-    expect(refused, 409, "the admin plane cannot set what the organization decides");
+    let mut shown_requests = -1;
+    for l in ratified.limits {
+        shown_requests = l.requests;
+    }
+    std::test::assert_eq_int(shown_requests, 1, "its limit");
+    let mut refused = "";
+    governed.set_limits(api::LimitsRequest { project: "work" }) or {
+        refused = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    };
     std::test::assert(
-        std::str::contains(refused.body, "organization's practice"),
-        "and says why: " + refused.body,
+        std::str::starts_with(refused, "conflict "),
+        "the admin plane cannot set what the organization decides: " + refused,
+    );
+    std::test::assert(
+        std::str::contains(refused, "organization's practice"),
+        "and says why: " + refused,
     );
 
     // a later generation replaces the limits whole: a project it has no
@@ -694,11 +698,11 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
             && std::str::contains(ambiguous.body, "are in force"),
         "saying why: " + ambiguous.body,
     );
-    expect(
-        admin(e, "GET", "/admin/v1/projects/work/limits", ""),
-        503,
-        "and its limits are not shown",
-    );
+    let mut shown = 0;
+    work_limits(governed) or {
+        shown = api::ctl_status(err);
+    };
+    std::test::assert_eq_int(shown, 503, "and its limits are not shown");
 
     // no read landed yet: the limits fail closed
     e.inference.held.remove("held") or discard;
@@ -710,37 +714,21 @@ fn rate_limits(e: api::Endpoints, key: String, laptop: String) {
         "metering_unavailable, retrying in a second: " + closed.headers + " " + closed.body,
     );
     std::test::assert(!std::str::contains(closed.headers, "x-ratelimit"), "and states no limit");
-    expect(
-        admin(e, "GET", "/admin/v1/projects/work/limits", ""),
-        503,
-        "nor can the admin plane read them",
-    );
+    let mut unread = 0;
+    work_limits(governed) or {
+        unread = api::ctl_status(err);
+    };
+    std::test::assert_eq_int(unread, 503, "nor can the admin plane read them");
 
-    e.projects.governed = false;
     e.inference.governed = false;
-    expect(
-        admin(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}"),
-        200,
-        "ungoverned again, the stored limits lifted",
-    );
-}
-
-fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+    put_limits(e, st::Limits { }, "ungoverned again, the stored limits lifted");
 }
 
 /// A heartbeat from the node `token` names, its seat up. A node is up for
 /// three heartbeat intervals (15 s) after its last; the stream tests wait
 /// out seconds of seat silence, so they beat before relying on the laptop
 /// being eligible, however slow the machine.
-fn beat(e: api::Endpoints, token: String) {
+fn beat(e: api::DataPlane, token: String) {
     expect(
         plane(
             e,
@@ -753,7 +741,7 @@ fn beat(e: api::Endpoints, token: String) {
     );
 }
 
-fn plane(e: api::Endpoints, path: String, token: String, body: String) -> std::http::Response {
+fn plane(e: api::DataPlane, path: String, token: String, body: String) -> std::http::Response {
     return e.handle(
         std::http::Request {
             method: "POST",
@@ -764,7 +752,7 @@ fn plane(e: api::Endpoints, path: String, token: String, body: String) -> std::h
     );
 }
 
-fn ask(e: api::Endpoints, path: String, key: String, body: String) -> std::http::Response {
+fn ask(e: api::DataPlane, path: String, key: String, body: String) -> std::http::Response {
     return e.handle(
         std::http::Request {
             method: "POST",
@@ -783,21 +771,27 @@ const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", 
 const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
 
 /// A node with one static seat, registered and reporting it up.
-fn bring_up(e: api::Endpoints, id: String) -> String {
-    let token = std::json::find_string_field(
-        admin(e, "POST", "/admin/v1/nodes", "{\"id\": \"" + id + "\"}").body,
-        "enrollment_token",
-    );
-    expect(
-        admin(
-            e,
-            "POST",
-            "/admin/v1/nodes/" + id + "/seats",
-            "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\", \"as\": \"echo\"}], \"config\": {\"text\": \"hello from voice\"}}",
-        ),
-        201,
-        "a seat on " + id,
-    );
+fn bring_up(e: api::DataPlane, id: String) -> String {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: id }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let token = made.enrollment_token;
+    std::test::assert(made.has_enrollment_token && len(token) > 0, "a node " + id);
+    let mut sc = api::SeatCreate {
+        node: id,
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1", has_engine_name: true, engine_name: "echo" })
+    or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat on " + id + ": " + api::ctl_problem(err).message);
+    };
     let reg = plane(
         e,
         "/node/v1/register",
@@ -830,110 +824,91 @@ fn told(tail: api::AdminEvents) -> String {
     return out.end().body;
 }
 
+/// The id of the one record a page holds.
+fn only_id(l: api::UsageList) -> String {
+    let mut id = "";
+    for r in l.data {
+        id = r.id;
+    }
+    return id;
+}
+
 /// A request served is one row in the ledger: read back by id, listed,
 /// filtered, summed, and told to the subscriber that was connected when it
 /// was served (and to none that connected after).
-fn ledger(e: api::Endpoints, tail: api::AdminEvents, id: String) {
-    let g = admin(e, "GET", "/admin/v1/usage/" + id, "");
-    expect(g, 200, "the ledger has the request");
-    std::test::assert_eq_str(std::json::find_string_field(g.body, "id"), id, "its id");
+fn ledger(e: api::DataPlane, tail: api::AdminEvents, id: String) {
+    let usage = api::Usage { store: e.store };
+    let g = usage.get(api::UsageRef { request_id: id }) or api::UsageRecord { };
+    std::test::assert_eq_str(g.id, id, "the ledger has the request, its id");
+    std::test::assert_eq_str(g.project, "work", "its project");
+    std::test::assert_eq_str(g.requested_model, "echo-1", "the model asked for");
+    std::test::assert_eq_str(g.status, "served", "served");
+    std::test::assert_eq_str(g.endpoint, "responses", "on the endpoint it came by");
+    std::test::assert_eq_int(g.input_tokens, 3, "tokens in");
+    std::test::assert_eq_int(g.output_tokens, 4, "tokens out");
+    std::test::assert_eq_int(g.price_micros, 69, "its price");
+    std::test::assert(g.has_served, "what served it");
+    std::test::assert_eq_str(g.served.node, "laptop", "the node");
+    std::test::assert_eq_str(g.served.seat, "laptop/static", "the seat");
+    std::test::assert_eq_str(g.served.account, "static", "the account");
     std::test::assert_eq_str(
-        std::json::find_string_field(g.body, "project"),
-        "work",
-        "its project",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(g.body, "requested_model"),
-        "echo-1",
-        "the model asked for",
-    );
-    std::test::assert_eq_str(std::json::find_string_field(g.body, "status"), "served", "served");
-    std::test::assert_eq_str(
-        std::json::find_string_field(g.body, "endpoint"),
-        "responses",
-        "on the endpoint it came by",
-    );
-    std::test::assert_eq_int(std::json::find_int_field(g.body, "input_tokens"), 3, "tokens in");
-    std::test::assert_eq_int(std::json::find_int_field(g.body, "output_tokens"), 4, "tokens out");
-    std::test::assert_eq_int(std::json::find_int_field(g.body, "price_micros"), 69, "its price");
-    let served = std::json::find_field_raw(g.body, "served");
-    std::test::assert_eq_str(std::json::find_string_field(served, "node"), "laptop", "the node");
-    std::test::assert_eq_str(
-        std::json::find_string_field(served, "seat"),
-        "laptop/static",
-        "the seat",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(served, "account"),
-        "static",
-        "the account",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(
-            std::json::find_field_raw(g.body, "metadata"),
-            "dna.attempt_id",
-        ),
+        std::json::find_string_field(g.metadata.text, "dna.attempt_id"),
         "w-1",
         "the caller's metadata, untouched",
     );
-    std::test::assert(
-        std::json::find_int_field(std::json::find_field_raw(g.body, "timing"), "wall_ms") >= 0,
-        "its timing",
-    );
-    expect(admin(e, "GET", "/admin/v1/usage/resp_none", ""), 404, "no such record");
+    std::test::assert(g.timing.wall_ms >= 0, "its timing");
+    let mut missing = "";
+    usage.get(api::UsageRef { request_id: "resp_none" }) or {
+        missing = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(missing, "not_found", "no such record");
 
-    let l = admin(e, "GET", "/admin/v1/usage", "");
-    expect(l, 200, "the ledger, listed");
-    std::test::assert_eq_str(
-        std::json::find_string_field(
-            std::json::array_first(std::json::find_field_raw(l.body, "data")).element,
-            "id",
-        ),
-        id,
-        "newest first",
-    );
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(l.body, "next_cursor")),
-        "null",
-        "one page",
-    );
+    let l = usage.list(api::UsageAsk { }) or api::UsageList { };
+    let mut newest = "";
+    for r in l.data {
+        if len(newest) == 0 {
+            newest = r.id;
+        }
+    }
+    std::test::assert_eq_str(newest, id, "the ledger, listed, newest first");
+    std::test::assert(!l.has_next_cursor, "one page");
+    let mine = usage.list(api::UsageAsk { metadata: "dna.attempt_id=w-1" }) or api::UsageList { };
     std::test::assert(
-        std::str::contains(
-            admin(e, "GET", "/admin/v1/usage?metadata=dna.attempt_id%3Dw-1", "").body,
-            id,
-        ),
+        count(mine.data) == 1 && only_id(mine) == id,
         "filtered by the metadata it has",
     );
-    std::test::assert(
-        !std::str::contains(
-            admin(e, "GET", "/admin/v1/usage?metadata=dna.attempt_id%3Dw-2", "").body,
-            id,
-        ),
-        "and not by one it has not",
-    );
-    std::test::assert(
-        !std::str::contains(admin(e, "GET", "/admin/v1/usage?project=other", "").body, id),
-        "nor by another project",
-    );
-    expect(admin(e, "GET", "/admin/v1/usage?cursor=oops", ""), 400, "a cursor that is not one");
+    let not_mine = usage.list(
+        api::UsageAsk { metadata: "dna.attempt_id=w-2" },
+    ) or api::UsageList { };
+    std::test::assert_eq_int(count(not_mine.data), 0, "and not by one it has not");
+    let other = usage.list(api::UsageAsk { project: "other" }) or api::UsageList { };
+    std::test::assert_eq_int(count(other.data), 0, "nor by another project");
+    let mut oops = "";
+    usage.list(api::UsageAsk { cursor: "oops" }) or {
+        oops = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(oops, "invalid", "a cursor that is not one");
 
-    let sum = admin(e, "GET", "/admin/v1/usage/summary?group_by=project,model", "");
-    expect(sum, 200, "the summary");
-    let row = std::json::array_first(std::json::find_field_raw(sum.body, "data")).element;
+    let sum = usage.summary(api::UsageSummaryAsk { group_by: "project,model" })
+    or api::UsageSummary { };
+    let mut row = api::UsageGroupOut { };
+    for g in sum.data {
+        row = g;
+    }
     std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(row, "group"), "project"),
+        std::json::find_string_field(row.group.text, "project"),
         "work",
         "grouped by project",
     );
     std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(row, "group"), "model"),
+        std::json::find_string_field(row.group.text, "model"),
         "echo",
         "and by the model that served",
     );
-    std::test::assert_eq_int(std::json::find_int_field(row, "requests"), 1, "one request");
-    std::test::assert_eq_int(std::json::find_int_field(row, "input_tokens"), 3, "summed in");
-    std::test::assert_eq_int(std::json::find_int_field(row, "output_tokens"), 4, "summed out");
-    std::test::assert_eq_int(std::json::find_int_field(row, "price_micros"), 69, "and its spend");
+    std::test::assert_eq_int(row.requests, 1, "one request");
+    std::test::assert_eq_int(row.input_tokens, 3, "summed in");
+    std::test::assert_eq_int(row.output_tokens, 4, "summed out");
+    std::test::assert_eq_int(row.price_micros, 69, "and its spend");
 
     // the subscriber that was connected is told; one that connects now is not
     let body = told(tail);
@@ -984,10 +959,12 @@ fn ledger(e: api::Endpoints, tail: api::AdminEvents, id: String) {
 }
 
 /// A node revoked is told as the node it now is, beside its change.
-fn node_told(e: api::Endpoints) {
+fn node_told(e: api::DataPlane) {
     let tail = api::AdminEvents { store: e.store, nodes: e.nodes, changes: e.changes };
     tail.look(api::EventStream { }, true);
-    expect(admin(e, "DELETE", "/admin/v1/nodes/desktop", ""), 200, "a node revoked");
+    e.nodes.revoke(api::NodeRef { node: "desktop" }) or {
+        std::test::assert(false, "a node revoked: " + api::ctl_problem(err).message);
+    };
     let body = told(tail);
     std::test::assert(
         std::str::contains(body, "event: node\ndata: {")
@@ -1038,12 +1015,14 @@ fn node_told(e: api::Endpoints) {
 }
 
 /// The requests a project made, as the summary adds them up.
-fn requests_of_work(e: api::Endpoints) -> Int {
-    let sum = admin(e, "GET", "/admin/v1/usage/summary?group_by=project", "");
-    return std::json::find_int_field(
-        std::json::array_first(std::json::find_field_raw(sum.body, "data")).element,
-        "requests",
-    );
+fn requests_of_work(e: api::DataPlane) -> Int {
+    let usage = api::Usage { store: e.store };
+    let sum = usage.summary(api::UsageSummaryAsk { group_by: "project" }) or api::UsageSummary { };
+    let mut n = 0;
+    for g in sum.data {
+        n = g.requests;
+    }
+    return n;
 }
 
 /// The place an event-stream answer ends at (its `id: u…` line).
@@ -1070,15 +1049,20 @@ fn occurrences(s: String, what: String) -> Int {
 /// A subscriber more than a page of changes behind is told every one of
 /// them over its reconnections, each answer making progress.
 fn change_backlog() {
-    let e = api::Endpoints { };
-    expect(admin(e, "POST", "/admin/v1/models", "{\"id\": \"m\"}"), 201, "a model");
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "m" }) or {
+        std::test::assert(false, "a model: " + api::ctl_problem(err).message);
+    };
     let first = e.handle(
         std::http::Request { method: "GET", path: "/admin/v1/events?type=change" },
     );
     let mut place = place_of(first.body);
     let mut i = 1;
     while i <= 1500 {
-        admin(e, "PATCH", "/admin/v1/models/m", "{\"context_length\": " + to_string(i) + "}");
+        catalog.update(
+            api::CatalogModelUpdate { model: "m", has_context_length: true, context_length: i },
+        ) or discard;
         i = i + 1;
     }
     let mut told = 0;
@@ -1104,19 +1088,27 @@ fn change_backlog() {
 
 fn main() {
     let nodes = Nodes { };
-    let e = api::Endpoints { link: nodes };
-    admin(
-        e,
-        "POST",
-        "/admin/v1/models",
-        "{\"id\": \"echo-1\", \"price\": {\"input_per_mtok_micros\": 3000000, \"output_per_mtok_micros\": 15000000}}",
-    );
-    admin(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
-    admin(e, "POST", "/admin/v1/projects", "{\"id\": \"work\", \"name\": \"Work\"}");
-    let key = std::json::find_string_field(
-        admin(e, "POST", "/admin/v1/projects/work/keys", "{\"name\": \"ci\"}").body,
-        "secret",
-    );
+    let e = api::DataPlane { link: nodes };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "echo-1",
+            has_price: true,
+            price: st::ModelPrice {
+                input_per_mtok_micros: 3000000,
+                output_per_mtok_micros: 15000000,
+            },
+        },
+    ) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let made = keys.create(
+        api::KeyCreate { project: "work", name: "ci" },
+    ) or api::Key { status: api::KeyStatus::revoked };
+    let key = made.secret;
     let laptop = bring_up(e, "laptop");
     let listed = e.handle(
         std::http::Request {
@@ -1135,13 +1127,10 @@ fn main() {
         "[\"internal\"]",
         "with the data classes its seats carry",
     );
-    std::test::assert(
-        std::json::find_bool_field(
-            admin(e, "GET", "/admin/v1/models/echo-1", "").body,
-            "available",
-        ),
-        "on the admin plane too",
-    );
+    let admin_view = catalog.get(
+        api::ModelRef { model: "echo-1" },
+    ) or api::CatalogModel { kind: api::ModelKind::hosted };
+    std::test::assert(admin_view.available, "on the admin plane too");
 
     // a response
     let tail = api::AdminEvents { store: e.store, nodes: e.nodes, changes: e.changes };
@@ -1533,7 +1522,10 @@ fn main() {
 
     // seats that are not eligible are not offered
     plane(e, "/node/v1/draining", laptop, "");
-    admin(e, "PATCH", "/admin/v1/nodes/desktop/seats/static", "{\"enabled\": false}");
+    let seats = api::Seats { store: e.store, link: e.link };
+    seats.update(
+        api::SeatUpdate { node: "desktop", seat: "static", has_enabled: true, enabled: false },
+    ) or discard;
     let none = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
     expect(none, 503, "a draining node, and a seat whose new assignment its node has not applied");
     std::test::assert_eq_str(

@@ -2,19 +2,9 @@
 // the contract says and then refused `no_eligible_seat`, since no node can
 // connect yet.
 import ".." as api;
+import "../../store" as st;
 
-fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
-}
-
-fn ask(e: api::Endpoints, path: String, key: String, body: String) -> std::http::Response {
+fn ask(e: api::DataPlane, path: String, key: String, body: String) -> std::http::Response {
     return e.handle(
         std::http::Request {
             method: "POST",
@@ -38,7 +28,7 @@ fn expect(r: std::http::Response, status: Int, code: String, what: String) {
 
 /// A streamed request is admitted as any request: a refusal is answered
 /// whole, before any stream (the streams themselves: serve_test.hl).
-fn streamed_refused(e: api::Endpoints, key: String) {
+fn streamed_refused(e: api::DataPlane, key: String) {
     expect(
         ask(
             e,
@@ -64,26 +54,36 @@ fn streamed_refused(e: api::Endpoints, key: String) {
 }
 
 fn main() {
-    let e = api::Endpoints { };
-    admin(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
-    admin(e, "POST", "/admin/v1/models", "{\"id\": \"other-1\"}");
-    admin(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}");
-    admin(
-        e,
-        "POST",
-        "/admin/v1/accounts",
-        "{\"id\": \"paid\", \"name\": \"Paid\", \"billing\": \"metered\"}",
-    );
-    admin(
-        e,
-        "POST",
-        "/admin/v1/projects",
-        "{\"id\": \"work\", \"name\": \"Work\", \"models\": [\"echo-1\"], \"accounts\": [\"static\"]}",
-    );
-    let key = std::json::find_string_field(
-        admin(e, "POST", "/admin/v1/projects/work/keys", "{\"name\": \"ci\"}").body,
-        "secret",
-    );
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "other-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    accounts.create(
+        api::AccountCreate {
+            id: "paid",
+            name: "Paid",
+            has_billing: true,
+            billing: api::Billing::metered,
+        },
+    ) or discard;
+    let mut work = api::ProjectCreate {
+        id: "work",
+        name: "Work",
+        has_models: true,
+        has_accounts: true,
+    };
+    push(work.models, "echo-1") or discard;
+    push(work.accounts, "static") or discard;
+    projects.create(work) or discard;
+    let made = keys.create(api::KeyCreate { project: "work", name: "ci" }) or {
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    std::test::assert(made.has_secret, "a key");
+    let key = made.secret;
 
     let hi = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
     expect(
@@ -155,13 +155,18 @@ fn main() {
     let none = ask(e, "/v1/responses", key, hi);
     expect(none, 503, "no_eligible_seat", "no seat serves the model");
     std::test::assert(std::str::contains(none.body, "no seat serves model echo-1"), "and says so");
-    admin(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}");
-    admin(
-        e,
-        "POST",
-        "/admin/v1/nodes/laptop/seats",
-        "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": {\"text\": \"hi\"}}",
-    );
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    nodes.create(api::NodeCreate { id: "laptop" }) or discard;
+    let mut seat = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hi\"}") or std::json::Value::null(),
+    };
+    push(seat.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(seat) or discard;
     let offline = ask(
         e,
         "/v1/responses",

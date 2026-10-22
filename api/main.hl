@@ -1,7 +1,7 @@
 /// The voice api. Every endpoint in ../spec/openapi.yaml is routed: the
 /// ones with a row in the surface (surface.hl) by their handlers, over the
 /// store (store.hl: Postgres when the api is given a database, the process
-/// otherwise). See endpoints.hl. `api migrate` brings a database's schema up to date
+/// otherwise). See front.hl and data_plane.hl. `api migrate` brings a database's schema up to date
 /// and exits.
 ///
 /// Attached to an organization (Hale's DNA), the api tells it each
@@ -19,6 +19,10 @@ import "../lib/pond/pq" as pq;
 import "../lib/pond/migrations" as migs;
 main locus Api {
     params {
+        // first, so its listener is born before the steps that follow it: one listener serves the control plane (the surface's rows) and,
+        // for every path no row serves, the data plane (front.hl); fn main
+        // builds it over the store it was given
+        front: Front;
         host: String = "127.0.0.1";
         port: Int = 8080;
         nats: String = "nats://127.0.0.1:4222";
@@ -79,36 +83,31 @@ main locus Api {
         pulse: pinned;
         teller: pinned;
         governance: pinned;
+        front: cooperative(pool = edge) where async_io;
     }
-    run() {
-        serve(
+    birth() {
+        announce(
             self.host,
             self.port,
             self.broker,
             self.node_nats,
             self.ui,
             self.database,
-            self.first_s,
-            self.idle_s,
             self.org,
             self.head,
-            self.held,
         );
     }
 }
 
-fn serve(
+fn announce(
     host: String,
     port: Int,
     b: broker::Broker,
     node_nats: String,
     ui: String,
     database: String,
-    first_s: Int,
-    idle_s: Int,
     org: String,
-    head: String,
-    held: HeldLimits
+    head: String
 ) {
     log_info("serving", std::log::kv("url", "http://" + host + ":" + to_string(port)));
     log_info(
@@ -134,76 +133,10 @@ fn serve(
     if len(database) > 0 {
         let d = st::parse_dsn(database);
         log_info("the store is Postgres", std::log::kv("at", d.host + ":" + to_string(d.port)));
-        let endpoints = Endpoints {
-            ui: ui,
-            store: st::PgStore { url: database },
-            link: NatsLink {
-                url: b.url,
-                node_url: node_nats,
-                user: b.user,
-                vault: b.vault,
-                subjects: b.root,
-                inbox: b.inbox,
-            },
-            held: held,
-            node_user: b.node_user,
-            node_secret: std::secret::Credential { vault: b.node_vault },
-        };
-        endpoints.inference.first = first_s * 1s;
-        endpoints.inference.idle = idle_s * 1s;
-        endpoints.inference.pulse = len(org) > 0;
-        endpoints.projects.governed = len(head) > 0;
-        endpoints.inference.governed = len(head) > 0;
-        std::http::Server {
-            host: host,
-            port: port,
-            handler: endpoints,
-            max_request_bytes: MAX_REQUEST_BYTES,
-            too_large: too_large(),
-        };
     } else {
         log_info("the store is in memory, lost on restart", "");
-        let endpoints = Endpoints {
-            ui: ui,
-            link: NatsLink {
-                url: b.url,
-                node_url: node_nats,
-                user: b.user,
-                vault: b.vault,
-                subjects: b.root,
-                inbox: b.inbox,
-            },
-            held: held,
-            node_user: b.node_user,
-            node_secret: std::secret::Credential { vault: b.node_vault },
-        };
-        endpoints.inference.first = first_s * 1s;
-        endpoints.inference.idle = idle_s * 1s;
-        endpoints.inference.pulse = len(org) > 0;
-        endpoints.projects.governed = len(head) > 0;
-        endpoints.inference.governed = len(head) > 0;
-        std::http::Server {
-            host: host,
-            port: port,
-            handler: endpoints,
-            max_request_bytes: MAX_REQUEST_BYTES,
-            too_large: too_large(),
-        };
     }
 }
-
-/// A request body is at most 12 MiB (openapi.yaml): one wrapped for a node
-/// stays inside the node protocol's 16 MiB message. hale's Server reads it
-/// in memory linear in its size (since 0.25.1).
-const MAX_REQUEST_BYTES: Int = 12582912;
-
-/// The answer to a body over the cap, in the contract's envelope
-/// (`TooLarge`); the Server sends it before reading the body.
-fn too_large() -> std::http::Response {
-    return std::http::Response { status: 413, content_type: "application/json", body: TOO_LARGE };
-}
-
-const TOO_LARGE: String = "{\"error\": {\"message\": \"a request body is at most 12 MiB\", \"type\": \"invalid_request\", \"code\": \"request_too_large\", \"param\": null}}";
 
 /// The migrations, in order: each a file of `dir`, store.md's SQL.
 const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n6 usage_seq 0006_usage_seq.sql\n";
@@ -525,30 +458,103 @@ fn main() {
             "",
         );
     }
-    let id = st::random_id(6);
-    Api {
-        host: host,
-        port: port,
-        nats: b.url,
-        broker: b,
-        node_nats: node_nats,
-        ui: ui,
-        database: database,
-        first_s: first_s,
-        idle_s: idle_s,
-        instance: "api-" + id,
-        head: head,
-        application: application,
-        issuer: issuer,
-        client: client,
-        client_vault: client_vault,
-        limits_every_s: limits_every_s,
-        org: org,
-        nerves_url: nerves_url,
-        nerves_user: nerves_user,
-        nerves_vault: nerves_vault,
-        probe_port: probe_port,
+    let link = NatsLink {
+        url: b.url,
+        node_url: node_nats,
+        user: b.user,
+        vault: b.vault,
+        subjects: b.root,
+        inbox: b.inbox,
     };
+    let node_secret = std::secret::Credential { vault: b.node_vault };
+    let id = st::random_id(6);
+    let held = HeldLimits { };
+    if len(database) > 0 {
+        Api {
+            front: Front {
+                bind: host + ":" + to_string(port),
+                cors: own_origins(host, port),
+                ui: ui,
+                store: st::PgStore { url: database },
+                rows_store: st::PgStore { url: database },
+                link: link,
+                held: held,
+                first_s: first_s,
+                idle_s: idle_s,
+                pulse: len(org) > 0,
+                governed: len(head) > 0,
+                node_user: b.node_user,
+                node_secret: node_secret,
+            },
+            host: host,
+            port: port,
+            nats: b.url,
+            broker: b,
+            node_nats: node_nats,
+            ui: ui,
+            database: database,
+            first_s: first_s,
+            idle_s: idle_s,
+            instance: "api-" + id,
+            head: head,
+            application: application,
+            issuer: issuer,
+            client: client,
+            client_vault: client_vault,
+            limits_every_s: limits_every_s,
+            org: org,
+            nerves_url: nerves_url,
+            nerves_user: nerves_user,
+            nerves_vault: nerves_vault,
+            probe_port: probe_port,
+        };
+    } else {
+        Api {
+            front: Front {
+                bind: host + ":" + to_string(port),
+                cors: own_origins(host, port),
+                ui: ui,
+                link: link,
+                held: held,
+                first_s: first_s,
+                idle_s: idle_s,
+                pulse: len(org) > 0,
+                governed: len(head) > 0,
+                node_user: b.node_user,
+                node_secret: node_secret,
+            },
+            host: host,
+            port: port,
+            nats: b.url,
+            broker: b,
+            node_nats: node_nats,
+            ui: ui,
+            database: database,
+            first_s: first_s,
+            idle_s: idle_s,
+            instance: "api-" + id,
+            head: head,
+            application: application,
+            issuer: issuer,
+            client: client,
+            client_vault: client_vault,
+            limits_every_s: limits_every_s,
+            org: org,
+            nerves_url: nerves_url,
+            nerves_user: nerves_user,
+            nerves_vault: nerves_vault,
+            probe_port: probe_port,
+        };
+    }
+}
+
+/// The origins the app is reached under: the host it listens on and the
+/// loopback's two names, on its port. A page writes to its own origin with
+/// no body (an archive, a token rotation), which the transport refuses from
+/// an origin `cors` does not list.
+fn own_origins(host: String, port: Int) -> String {
+    let p = ":" + to_string(port);
+    return "http://" + host + p + ",http://localhost" + p + ",http://127.0.0.1" + p;
 }
 
 /// The environment's `name`, or `otherwise` when it is unset.

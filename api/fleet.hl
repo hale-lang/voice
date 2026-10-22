@@ -29,52 +29,6 @@ type AssignedReads { items: bounded[AssignedRead; 16]; }
 /// nodes' messages carry it.
 type AssignmentRead { version: Int = 0; max_in_flight: Int = 1; seats: bounded[AssignedRead; 16]; }
 
-/// `AssignedSeat`, as the surface describes it: its config a
-/// `std::json::Value`.
-type AssignedSeat {
-    id: String = "";
-    engine: String = "";
-    account: String = "";
-    serves: bounded[st::SeatModel; 16];
-    data_classes: bounded[String; 32];
-    concurrency: Int = 1;
-    enabled: Bool = true;
-    config: std::json::Value = std::json::Value::null();
-}
-
-/// `Assignment`, as the surface describes it.
-type Assignment { version: Int = 0; max_in_flight: Int = 1; seats: bounded[AssignedSeat; 16]; }
-
-/// A `RegisteredRead` as the surface's typed `Registered`.
-fn registered_of_read(r: RegisteredRead) -> Registered fallible(ApiError) {
-    return Registered {
-        protocol: r.protocol,
-        heartbeat_interval_ms: r.heartbeat_interval_ms,
-        nats_url: r.nats_url,
-        nats_subject: r.nats_subject,
-        assignment: assignment_of_read(r.assignment) or raise,
-    };
-}
-
-/// An `AssignmentRead` as the surface's typed `Assignment`.
-fn assignment_of_read(r: AssignmentRead) -> Assignment fallible(ApiError) {
-    let mut out = Assignment { version: r.version, max_in_flight: r.max_in_flight };
-    for s in r.seats {
-        let mut a = AssignedSeat {
-            id: s.id,
-            engine: s.engine,
-            account: s.account,
-            concurrency: s.concurrency,
-            enabled: s.enabled,
-            config: stored_value(s.config, "seat " + s.id + "'s config") or raise,
-        };
-        a.serves = s.serves;
-        a.data_classes = s.data_classes;
-        push(out.seats, a) or discard;
-    }
-    return out;
-}
-
 /// `Engine` (protocol.yaml): one engine a node offers. Its `config_schema` is a JSON
 /// Schema, free-form; `models` is `null`, any name, when it is not set.
 type NodeEngine {
@@ -95,11 +49,6 @@ fn no_capabilities() -> NodeCapabilities {
     return NodeCapabilities { max_in_flight: 0 };
 }
 
-/// The value of an empty JSON object.
-fn empty_object() -> std::json::Value {
-    return std::json::Value::parse("{}") or std::json::Value::null();
-}
-
 /// `Registration`. `local` is the node's own controls.
 type Registration {
     protocol: Int = 0;
@@ -115,15 +64,6 @@ type RegisteredRead {
     nats_url: String = "";
     nats_subject: String = "";
     assignment: AssignmentRead = AssignmentRead { };
-}
-
-/// `Registered`, as the surface describes it.
-type Registered {
-    protocol: Int = 2;
-    heartbeat_interval_ms: Int = 5000;
-    nats_url: String = "";
-    nats_subject: String = "";
-    assignment: Assignment = Assignment { };
 }
 
 /// `SeatState`. `reason` "" is `null`.
@@ -232,20 +172,6 @@ locus NodePlane {
     /// what it declared before (a restarted node takes over from its
     /// ghost), and it gets the heartbeat interval, where NATS is and its
     /// assignment.
-    // The surface's rows answer the typed `Registered` and `Assignment`;
-    // the REST router answers the `_read` methods', their configs as
-    // stored.
-
-    /// `registerNode`.
-    fn register(r: Registration, ctx: std::api::Context) -> Registered fallible(ApiError) {
-        return registered_of_read(self.register_read(r, ctx) or raise) or raise;
-    }
-
-    /// `getAssignment`.
-    fn assignment(ctx: std::api::Context) -> Assignment fallible(ApiError) {
-        return assignment_of_read(self.assignment_read(ctx) or raise) or raise;
-    }
-
     fn register_read(r: Registration, ctx: std::api::Context) -> RegisteredRead fallible(ApiError) {
         if r.protocol != 2 { fail invalid("this coordinator speaks protocol 2", "protocol"); }
         let caps = NodeCapabilities::api_encode(r.capabilities);
@@ -262,7 +188,7 @@ locus NodePlane {
             },
         ) or fail store_failed(err);
         self.store.put_beat(n.id, now, 0) or fail store_failed(err);
-        let a = assignment_of(self.store, n) or raise;
+        let a = assignment_of(self.store, n) or fail store_failed(err);
         let mut out = RegisteredRead {
             heartbeat_interval_ms: HEARTBEAT_MS,
             nats_url: self.link.place(),
@@ -278,7 +204,7 @@ locus NodePlane {
     /// `getAssignment`.
     fn assignment_read(ctx: std::api::Context) -> AssignmentRead fallible(ApiError) {
         let n = self.own(ctx) or raise;
-        return assignment_of(self.store, n) or raise;
+        return assignment_of(self.store, n) or fail store_failed(err);
     }
 
     /// `nodeHeartbeat`: alive, its load, and its seats. A node that says
@@ -289,7 +215,7 @@ locus NodePlane {
         self.store.put_beat(n.id, now_seconds(), h.in_flight) or fail store_failed(err);
         self.put_states(n.id, h.seats) or raise;
         if h.assignment_version >= 0 && h.assignment_version < n.assignment_version {
-            tell_assignment(self.store, self.link, n.id) or raise;
+            tell_assignment(self.store, self.link, n.id) or fail store_failed(err);
         }
     }
 
@@ -308,7 +234,7 @@ locus NodePlane {
         ) or fail store_failed(err);
         self.put_states(n.id, s.seats) or raise;
         if s.assignment_version < n.assignment_version {
-            tell_assignment(self.store, self.link, n.id) or raise;
+            tell_assignment(self.store, self.link, n.id) or fail store_failed(err);
         }
     }
 
@@ -395,8 +321,8 @@ fn is_seat_status(s: String) -> Bool {
 
 /// The node's whole desired state: every seat configured on it, and its
 /// cap: the coordinator's, at most the node's declared one.
-fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(ApiError) {
-    let f = store.fleet(n.id) or fail store_failed(err);
+fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(st::StoreError) {
+    let f = store.fleet(n.id) or raise;
     let declared = if f.present {
         (declared_engines(f.capabilities) or DeclaredEngines { }).max_in_flight
     } else {
@@ -407,7 +333,7 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(Ap
     if cap < 1 { cap = 1; }
     let mut out = AssignmentRead { version: n.assignment_version, max_in_flight: cap };
     if n.revoked { return out; }
-    let seats = store.seats() or fail store_failed(err);
+    let seats = store.seats() or raise;
     for s in seats.rows {
         if s.node == n.id {
             let mut a = AssignedRead {
@@ -428,11 +354,11 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(Ap
 
 /// `pending` until it first registers, `up` while its last sign of life
 /// is younger than three heartbeat intervals, `down` after; `revoked`.
-fn node_status(store: st::Store, n: st::NodeRow, now: Time) -> String fallible(ApiError) {
+fn node_status(store: st::Store, n: st::NodeRow, now: Time) -> String fallible(st::StoreError) {
     if n.revoked { return "revoked"; }
-    let f = store.fleet(n.id) or fail store_failed(err);
+    let f = store.fleet(n.id) or raise;
     if !f.present { return "pending"; }
-    let b = store.beat(n.id) or fail store_failed(err);
+    let b = store.beat(n.id) or raise;
     if b.present && (std::time::nanos(now) - std::time::nanos(b.at)) <= 3 * HEARTBEAT_MS * 1000000 {
         return "up";
     }
@@ -535,8 +461,8 @@ fn locally_paused(local: String, seat: String) -> Bool {
 
 /// The node's effective cap: the smallest of its declared, the
 /// coordinator's and its local cap; -1 until it first registers.
-fn effective_cap(store: st::Store, n: st::NodeRow) -> Int fallible(ApiError) {
-    let f = store.fleet(n.id) or fail store_failed(err);
+fn effective_cap(store: st::Store, n: st::NodeRow) -> Int fallible(st::StoreError) {
+    let f = store.fleet(n.id) or raise;
     if !f.present { return -1; }
     let mut cap = (declared_engines(f.capabilities) or DeclaredEngines { }).max_in_flight;
     if n.max_in_flight > 0 && n.max_in_flight < cap { cap = n.max_in_flight; }
@@ -823,10 +749,10 @@ fn assign_message(a: AssignmentRead) -> String {
 /// reads its assignment when it next connects to NATS, and says the
 /// version it applied in every heartbeat, which sends it again when it is
 /// behind.
-fn tell_assignment(store: st::Store, link: Link, node: String) fallible(ApiError) {
-    let n = store.node(node) or fail store_failed(err);
+fn tell_assignment(store: st::Store, link: Link, node: String) fallible(st::StoreError) {
+    let n = store.node(node) or raise;
     if !n.present || n.revoked { return; }
-    let f = store.fleet(node) or fail store_failed(err);
+    let f = store.fleet(node) or raise;
     if !f.present { return; }
     let a = assignment_of(store, n) or raise;
     link.assign(node, assign_message(a));

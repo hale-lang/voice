@@ -1,0 +1,225 @@
+// A Mac's node: the seats it finds, the capabilities and launchd plist it
+// writes, and the rows it records on the api (mac.hl). Everything here runs
+// on Linux: `ollama` and `claude` are scripts on a PATH of the test's own,
+// and the api answers in process.
+import ".." as node;
+import "../../api" as api;
+
+/// The admin calls, answered by an api in process.
+locus InProcess {
+    params { e: api::Endpoints; }
+    fn send(method: String, path: String, body: String) -> node::Reply {
+        let r = self.e.handle(
+            std::http::Request {
+                method: method,
+                path: path,
+                headers: "Content-Type: application/json",
+                body: body,
+            },
+        );
+        return node::Reply { status: r.status, body: r.body };
+    }
+}
+
+fn script(dir: String, name: String, text: String) {
+    std::io::fs::write_file(dir + "/" + name, "#!/bin/sh\n" + text + "\n") or discard;
+    std::process::run("chmod\n+x\n" + dir + "/" + name) or discard;
+}
+
+fn seats_of(o: node::Offers) -> String {
+    let mut out = "";
+    let items = o.items;
+    for s in items {
+        out = out + s.seat + ">" + s.model + " ";
+    }
+    return out;
+}
+
+fn get(e: api::Endpoints, path: String, key: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "GET",
+            path: path,
+            headers: if len(key) > 0 { "Authorization: Bearer " + key } else { "" }
+        },
+    );
+}
+
+fn main() {
+    let root = std::str::trim(
+        (std::process::run("mktemp\n-d\n-t\nvoice-mac-test-XXXXXX") or std::process::ProcessOutput {
+            code: 1,
+            signal: 0,
+            stdout: "",
+            stderr: "",
+        }).stdout);
+    std::test::assert(len(root) > 0, "a scratch directory");
+    let bin = root + "/bin";
+    let empty = root + "/empty";
+    std::io::fs::mkdir(bin) or discard;
+    std::io::fs::mkdir(empty) or discard;
+    script(
+        bin,
+        "ollama",
+        "echo 'NAME             ID            SIZE     MODIFIED'\necho 'llama3.2:latest  a80c4f17acd5  2.0 GB   2 days ago'\necho 'qwen2.5:7b       845dbda0ea48  4.7 GB   3 weeks ago'",
+    );
+    script(bin, "claude", "echo claude 2.0");
+    // "empty" holds only what a shell needs to look
+    let base = bin + ":/usr/bin:/bin";
+    let bare = empty + ":/usr/bin:/bin";
+
+    // ---- discovery
+    let both = node::discover(
+        node::Discovery {
+            node: "mac",
+            path: base,
+            claude_login: true,
+            claude_vault: "claude-mac-token",
+        },
+    );
+    std::test::assert_eq_str(
+        seats_of(both),
+        "ollama-llama3-2-latest>llama3.2:latest ollama-qwen2-5-7b>qwen2.5:7b claude>claude-mac ",
+        "each Ollama model is a seat, and the claude CLI with its login is one",
+    );
+    let first = at(both.items, 0) or node::Offer { };
+    std::test::assert_eq_str(
+        first.config,
+        "{\"base_url\": \"http://127.0.0.1:11434/v1\", \"model\": \"llama3.2:latest\"}",
+        "an Ollama seat points at the local server with its model",
+    );
+    let claude = at(both.items, 2) or node::Offer { };
+    std::test::assert_eq_str(
+        claude.config,
+        "{\"token_vault\": \"claude-mac-token\"}",
+        "the claude seat names its token",
+    );
+    let no_login = node::discover(
+        node::Discovery {
+            node: "mac",
+            path: base,
+            claude_login: false,
+            claude_vault: "claude-mac-token",
+        },
+    );
+    std::test::assert(
+        !std::str::contains(seats_of(no_login), "claude>"),
+        "the claude CLI without a login is not offered",
+    );
+    let nothing = node::discover(
+        node::Discovery {
+            node: "mac",
+            path: bare,
+            claude_login: true,
+            claude_vault: "claude-mac-token",
+        },
+    );
+    std::test::assert_eq_str(
+        seats_of(nothing),
+        "static>static-mac ",
+        "neither present: the static seat",
+    );
+    let caps = node::capabilities_for(both);
+    std::test::assert_eq_str(
+        node::capabilities_problem(caps),
+        "",
+        "the capabilities are valid: " + caps,
+    );
+    std::test::assert(
+        std::str::contains(caps, "\"id\": \"ollama\", \"kind\": \"openai-compatible\"")
+            && std::str::contains(caps, "\"id\": \"claude\", \"kind\": \"claude-cli\""),
+        "one engine for each kind",
+    );
+    std::test::assert_eq_str(
+        node::capabilities_problem(node::capabilities_for(nothing)),
+        "",
+        "the static fallback is valid too",
+    );
+
+    // ---- the launchd plist
+    let plist = node::launchd_plist(
+        node::Agent {
+            label: "net.hale-lang.voice-node.mac",
+            node_bin: "/Users/me/voice/node/node",
+            id: "mac",
+            api: "https://voice.example.net",
+            token_vault: "node-mac-enrollment",
+            data: "/Users/me/.voice/node-data",
+            capabilities: "/Users/me/.voice/node-data/capabilities.json",
+            port: 8081,
+            vault_dir: "/Users/me/.voice/vault",
+            path: "/opt/homebrew/bin:/usr/bin",
+            log: "/Users/me/Library/Logs/voice-node-mac.log"
+        },
+    );
+    std::test::assert(
+        std::str::contains(plist, "<key>Label</key><string>net.hale-lang.voice-node.mac</string>")
+            && std::str::contains(plist, "<string>--id</string><string>mac</string>")
+            && std::str::contains(
+                plist,
+                "<string>--token-vault</string><string>node-mac-enrollment</string>",
+            )
+            && std::str::contains(
+                plist,
+                "<key>HALE_VAULT_DIR</key><string>/Users/me/.voice/vault</string>",
+            )
+            && std::str::contains(plist, "<key>KeepAlive</key><true/>")
+            && std::str::contains(
+                plist,
+                "<key>StandardErrorPath</key><string>/Users/me/Library/Logs/voice-node-mac.log</string>",
+            ),
+        "the plist runs the node with its flags, vault and log: " + plist,
+    );
+    std::test::assert(
+        std::str::contains(node::launchd_plist(node::Agent { id: "a&b" }), "a&amp;b"),
+        "values are escaped",
+    );
+
+    // ---- the rows on the api
+    let e = api::Endpoints { };
+    let admin = InProcess { e: e };
+    let p = node::provision(admin, "mac", both, false);
+    std::test::assert(p.ok, "provisioned: " + p.why);
+    std::test::assert(
+        std::str::starts_with(p.token, "vn-"),
+        "the node's enrollment token is handed back",
+    );
+    std::test::assert(std::str::starts_with(p.key, "vk-"), "and the key, once: " + p.key);
+    let account = get(e, "/admin/v1/accounts/local-mac", "");
+    std::test::assert_eq_str(
+        std::json::find_string_field(account.body, "billing"),
+        "none",
+        "the local account bills nothing: " + account.body,
+    );
+    let model = get(e, "/admin/v1/models/llama3.2:latest", "");
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(model.body, "price")),
+        "null",
+        "a model is free: " + model.body,
+    );
+    let seats = get(e, "/admin/v1/nodes/mac/seats", "");
+    std::test::assert(
+        std::str::contains(seats.body, "\"ref\": \"mac/ollama-llama3-2-latest\"")
+            && std::str::contains(seats.body, "\"ref\": \"mac/claude\"")
+            && std::str::contains(seats.body, "\"account\": \"local-mac\""),
+        "the seats are rows on the node, under the local account: " + seats.body,
+    );
+    let listed = get(e, "/v1/models", p.key);
+    std::test::assert(
+        listed.status == 200
+            && std::str::contains(listed.body, "llama3.2:latest")
+            && std::str::contains(listed.body, "qwen2.5:7b"),
+        "the printed key lists the offered models: " + listed.body,
+    );
+    let again = node::provision(admin, "mac", both, true);
+    std::test::assert(
+        again.ok && len(again.key) == 0 && len(again.token) == 0,
+        "installing again changes nothing, and shows no second key: " + again.why,
+    );
+    let renewed = node::provision(admin, "mac", both, false);
+    std::test::assert(
+        renewed.ok && std::str::starts_with(renewed.token, "vn-") && len(renewed.key) == 0,
+        "a node whose token is lost is given a new one: " + renewed.why,
+    );
+    std::process::run("rm\n-rf\n" + root) or discard;
+}

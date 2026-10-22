@@ -41,6 +41,10 @@ docker compose up --build -d
 curl localhost:8080/healthz
 ```
 
+To run voice as an organism of a hale habitat instead, graft it from the
+toolchain's nursery with `hale habitat graft voice`; it needs no checkout or
+build of its own (hale's habitat chapter, in `docs/src/habitat.md`, has the rest).
+
 This starts Postgres, NATS, the api (on `localhost:8080`, with the admin UI
 at `/`), the brain and a node. The node waits for an enrollment token.
 

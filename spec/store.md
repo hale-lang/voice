@@ -509,3 +509,14 @@ create table route_table (
   body    jsonb not null
 );
 ```
+
+### Migration 6: the ledger's order
+
+Each usage row is numbered as it is written, so a page of the ledger is
+"older than" a row and the admin event stream follows "newer than" the last
+row it told.
+
+```sql
+alter table usage add column seq bigserial;
+create unique index usage_seq on usage (seq);
+```

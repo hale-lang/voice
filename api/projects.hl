@@ -8,11 +8,13 @@ locus Projects {
         // under a head the limits are the organization's practice: the
         // admin plane reads them through the head and cannot set them
         governed: Bool = false;
+        // the ratified limits as the reader last read them (governance.hl)
+        held: HeldLimits = HeldLimits { };
     }
 
     /// `listProjects`.
-    fn list(q: ProjectQuery) -> ProjectList fallible(ApiError) {
-        let rows = self.store.projects() or fail store_failed(err);
+    fn list(q: ProjectQuery) -> ProjectList fallible(CtlError) {
+        let rows = self.store.projects() or fail store_down(err);
         let mut out = ProjectList { };
         for r in rows.rows {
             if q.include_archived || !r.archived {
@@ -24,9 +26,9 @@ locus Projects {
     }
 
     /// `createProject`, with its budget and limits when the body sets them.
-    fn create(c: ProjectCreate) -> Project fallible(ApiError) {
+    fn create(c: ProjectCreate) -> Project fallible(CtlError) {
         if !is_slug(c.id) {
-            fail invalid(
+            fail bad(
                 "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
                 "id"
             );
@@ -62,20 +64,20 @@ locus Projects {
         let added = self.store.insert_project(
             row,
             change("create", "projects/" + c.id, "", project_json(v)),
-        ) or fail store_failed(err);
-        if !added { fail conflict("project " + c.id + " exists; a project id is never reused"); }
+        ) or fail store_down(err);
+        if !added { fail clash("project " + c.id + " exists; a project id is never reused"); }
         return v;
     }
 
     /// `getProject`.
-    fn get(r: ProjectRef) -> Project fallible(ApiError) {
+    fn get(r: ProjectRef) -> Project fallible(CtlError) {
         let row = self.known(r.project) or raise;
         return self.view(row) or raise;
     }
 
     /// `updateProject`: the fields the request sets.
-    fn update(u: ProjectUpdate) -> Project fallible(ApiError) {
-        self.store.hold("projects/" + u.project) or fail store_failed(err);
+    fn update(u: ProjectUpdate) -> Project fallible(CtlError) {
+        self.store.hold("projects/" + u.project) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;
@@ -85,7 +87,7 @@ locus Projects {
     }
 
     /// `update`, holding the resource from its read to its write.
-    fn update_held(u: ProjectUpdate) -> Project fallible(ApiError) {
+    fn update_held(u: ProjectUpdate) -> Project fallible(CtlError) {
         let mut row = self.known(u.project) or raise;
         let before = self.view(row) or raise;
         if u.has_name {
@@ -103,14 +105,14 @@ locus Projects {
         self.store.update_project(
             row,
             change("update", "projects/" + row.id, project_json(before), project_json(after)),
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         return after;
     }
 
     /// `archiveProject`: its keys are revoked and it refuses new requests;
     /// the id stays taken. Archiving an archived project changes nothing.
-    fn archive(r: ProjectRef) -> Project fallible(ApiError) {
-        self.store.hold("projects/" + r.project) or fail store_failed(err);
+    fn archive(r: ProjectRef) -> Project fallible(CtlError) {
+        self.store.hold("projects/" + r.project) or fail store_down(err);
         let out = self.archive_held(r) or {
             self.store.let_go();
             fail err;
@@ -120,14 +122,14 @@ locus Projects {
     }
 
     /// `archive`, holding the resource from its read to its write.
-    fn archive_held(r: ProjectRef) -> Project fallible(ApiError) {
+    fn archive_held(r: ProjectRef) -> Project fallible(CtlError) {
         let mut row = self.known(r.project) or raise;
         if row.archived { return self.view(row) or raise; }
         let before = self.view(row) or raise;
         row.archived = true;
         row.archived_at = now_seconds();
         let mut after = self.view(row) or raise;
-        let keys = self.store.keys(row.id) or fail store_failed(err);
+        let keys = self.store.keys(row.id) or fail store_down(err);
         let mut revoked = st::Revocations { };
         for k in keys.rows {
             if !k.revoked {
@@ -151,21 +153,21 @@ locus Projects {
             row,
             change("archive", "projects/" + row.id, project_json(before), project_json(after)),
             revoked,
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         return after;
     }
 
     /// `getBudget`: the budget in its current window; 404 when the project
     /// has none.
-    fn budget(r: ProjectRef) -> Budget fallible(ApiError) {
+    fn budget(r: ProjectRef) -> Budget fallible(CtlError) {
         let row = self.known(r.project) or raise;
-        if !row.budgeted { fail not_found("project " + r.project + " has no budget"); }
+        if !row.budgeted { fail missing("project " + r.project + " has no budget"); }
         return budget_view(row.budget, now_seconds());
     }
 
     /// `setBudget`: replaces the allowance and the period.
-    fn set_budget(b: BudgetRequest) -> Budget fallible(ApiError) {
-        self.store.hold("projects/" + b.project) or fail store_failed(err);
+    fn set_budget(b: BudgetRequest) -> Budget fallible(CtlError) {
+        self.store.hold("projects/" + b.project) or fail store_down(err);
         let out = self.set_budget_held(b) or {
             self.store.let_go();
             fail err;
@@ -175,7 +177,7 @@ locus Projects {
     }
 
     /// `set_budget`, holding the resource from its read to its write.
-    fn set_budget_held(b: BudgetRequest) -> Budget fallible(ApiError) {
+    fn set_budget_held(b: BudgetRequest) -> Budget fallible(CtlError) {
         let mut row = self.known(b.project) or raise;
         let set = budget_set_of(
             b.allowance_micros,
@@ -198,27 +200,44 @@ locus Projects {
                 before,
                 budget_json(after),
             ),
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         return after;
     }
 
     /// `getLimits`: the project- and model-scope limits.
-    fn limits(r: ProjectRef) -> LimitSet fallible(ApiError) {
+    fn limits(r: ProjectRef) -> LimitSet fallible(CtlError) {
         let row = self.known(r.project) or raise;
+        if self.governed { return self.ratified(r.project) or raise; }
         let mut out = LimitSet { };
         out.limits = row.limits.items;
         return out;
     }
 
+    /// `project`'s limits as the organization ratified them (under a head),
+    /// as last read: its practice's limit, or none, and where it was read
+    /// from.
+    fn ratified(project: String) -> LimitSet fallible(CtlError) {
+        if !limits_landed(self.held) { fail limits_unread(); }
+        let pl = held_limit(self.held, project);
+        if pl.closed { fail limit_unknown(pl); }
+        let mut out = LimitSet { source: LimitSource::practice };
+        if len(pl.project) > 0 {
+            push(out.limits, pl.limit) or discard;
+            out.has_practice = true;
+            out.practice = PracticeRef { name: pl.name, id: pl.id };
+        }
+        return out;
+    }
+
     /// `setLimits`: replaces them.
-    fn set_limits(l: LimitsRequest) -> LimitSet fallible(ApiError) {
+    fn set_limits(l: LimitsRequest) -> LimitSet fallible(CtlError) {
         if self.governed {
-            fail conflict(
+            fail clash(
                 "limits are the organization's practice: propose `operating/limits/" + l.project
                     + "` and the Board decides it"
             );
         }
-        self.store.hold("projects/" + l.project) or fail store_failed(err);
+        self.store.hold("projects/" + l.project) or fail store_down(err);
         let out = self.set_limits_held(l) or {
             self.store.let_go();
             fail err;
@@ -228,7 +247,7 @@ locus Projects {
     }
 
     /// `set_limits`, holding the resource from its read to its write.
-    fn set_limits_held(l: LimitsRequest) -> LimitSet fallible(ApiError) {
+    fn set_limits_held(l: LimitsRequest) -> LimitSet fallible(CtlError) {
         let mut row = self.known(l.project) or raise;
         check_limits(l.limits, "project,model", "limits") or raise;
         let before = limits_json(row.limits.items);
@@ -241,23 +260,23 @@ locus Projects {
                 "{\"limits\": " + before + "}",
                 "{\"limits\": " + limits_json(row.limits.items) + "}",
             ),
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         let mut out = LimitSet { };
         out.limits = row.limits.items;
         return out;
     }
 
-    fn known(id: String) -> st::ProjectRow fallible(ApiError) {
-        let row = self.store.project(id) or fail store_failed(err);
-        if !row.present { fail not_found("no project " + id); }
+    fn known(id: String) -> st::ProjectRow fallible(CtlError) {
+        let row = self.store.project(id) or fail store_down(err);
+        if !row.present { fail missing("no project " + id); }
         return row;
     }
 
     /// A project's restrictions hold every key it has that is not revoked:
     /// narrowing them below what a key names is refused, naming the keys,
     /// so a key is never left wider than its project.
-    fn keys_within(p: st::ProjectRow) -> Bool fallible(ApiError) {
-        let keys = self.store.keys(p.id) or fail store_failed(err);
+    fn keys_within(p: st::ProjectRow) -> Bool fallible(CtlError) {
+        let keys = self.store.keys(p.id) or fail store_down(err);
         let mut models = "";
         let mut accounts = "";
         for k in keys.rows {
@@ -269,14 +288,14 @@ locus Projects {
             }
         }
         if len(models) > 0 {
-            fail invalid(
+            fail bad(
                 "`models` would leave out models that keys " + models
                     + " name; narrow those keys first",
                 "models"
             );
         }
         if len(accounts) > 0 {
-            fail invalid(
+            fail bad(
                 "`accounts` would leave out accounts that keys " + accounts
                     + " name; narrow those keys first",
                 "accounts"
@@ -285,8 +304,8 @@ locus Projects {
         return true;
     }
 
-    fn view(r: st::ProjectRow) -> Project fallible(ApiError) {
-        let keys = self.store.keys(r.id) or fail store_failed(err);
+    fn view(r: st::ProjectRow) -> Project fallible(CtlError) {
+        let keys = self.store.keys(r.id) or fail store_down(err);
         let mut v = Project {
             id: r.id,
             name: r.name,
@@ -315,9 +334,9 @@ locus Keys {
     params { store: st::Store; }
 
     /// `listKeys`. Secrets are never returned after creation.
-    fn list(r: ProjectRef) -> KeyList fallible(ApiError) {
+    fn list(r: ProjectRef) -> KeyList fallible(CtlError) {
         self.project_of(r.project) or raise;
-        let rows = self.store.keys(r.project) or fail store_failed(err);
+        let rows = self.store.keys(r.project) or fail store_down(err);
         let now = now_seconds();
         let mut out = KeyList { };
         for k in rows.rows {
@@ -328,8 +347,8 @@ locus Keys {
 
     /// `createKey`: the secret is in this answer and nowhere else; the
     /// store keeps its digest.
-    fn create(c: KeyCreate) -> Key fallible(ApiError) {
-        self.store.hold("projects/" + c.project) or fail store_failed(err);
+    fn create(c: KeyCreate) -> Key fallible(CtlError) {
+        self.store.hold("projects/" + c.project) or fail store_down(err);
         let out = self.create_held(c) or {
             self.store.let_go();
             fail err;
@@ -339,10 +358,10 @@ locus Keys {
     }
 
     /// `create`, holding the resource from its read to its write.
-    fn create_held(c: KeyCreate) -> Key fallible(ApiError) {
+    fn create_held(c: KeyCreate) -> Key fallible(CtlError) {
         let p = self.project_of(c.project) or raise;
         if p.archived {
-            fail invalid(
+            fail bad(
                 "project " + c.project + " is archived, and an archived project takes no key",
                 ""
             );
@@ -355,10 +374,10 @@ locus Keys {
         check_limits(c.limits, "key", "limits") or raise;
         let now = now_seconds();
         if c.has_expires_at && std::time::unix(c.expires_at) <= std::time::unix(now) {
-            fail invalid("`expires_at` is in the past", "expires_at");
+            fail bad("`expires_at` is in the past", "expires_at");
         }
-        let secret_hex = random_hex(20) or fail entropy_failed(err.message);
-        let id_hex = random_hex(8) or fail entropy_failed(err.message);
+        let secret_hex = random_hex(20) or fail entropy_down(err.message);
+        let id_hex = random_hex(8) or fail entropy_down(err.message);
         let secret = "vk-" + secret_hex;
         let id = "k_" + id_hex;
         let mut row = st::KeyRow {
@@ -378,21 +397,22 @@ locus Keys {
         let added = self.store.insert_key(
             row,
             change("create", key_target(row), "", key_json(v)),
-        ) or fail store_failed(err);
-        if !added { fail entropy_failed("key id " + id + " was drawn twice; ask again"); }
+        ) or fail store_down(err);
+        if !added { fail entropy_down("key id " + id + " was drawn twice; ask again"); }
+        v.has_secret = true;
         v.secret = secret;
         return v;
     }
 
     /// `getKey`.
-    fn get(r: KeyRef) -> Key fallible(ApiError) {
+    fn get(r: KeyRef) -> Key fallible(CtlError) {
         let k = self.known(r.project, r.key) or raise;
         return key_view(k, now_seconds());
     }
 
     /// `updateKey`: the fields the request sets.
-    fn update(u: KeyUpdate) -> Key fallible(ApiError) {
-        self.store.hold("projects/" + u.project) or fail store_failed(err);
+    fn update(u: KeyUpdate) -> Key fallible(CtlError) {
+        self.store.hold("projects/" + u.project) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;
@@ -402,7 +422,7 @@ locus Keys {
     }
 
     /// `update`, holding the resource from its read to its write.
-    fn update_held(u: KeyUpdate) -> Key fallible(ApiError) {
+    fn update_held(u: KeyUpdate) -> Key fallible(CtlError) {
         let mut k = self.known(u.project, u.key) or raise;
         let p = self.project_of(u.project) or raise;
         let now = now_seconds();
@@ -433,13 +453,13 @@ locus Keys {
         self.store.update_key(
             k,
             change("update", key_target(k), key_json(before), key_json(after)),
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         return after;
     }
 
     /// `revokeKey`: at once; revoking a revoked key changes nothing.
-    fn revoke(r: KeyRef) -> Key fallible(ApiError) {
-        self.store.hold("projects/" + r.project) or fail store_failed(err);
+    fn revoke(r: KeyRef) -> Key fallible(CtlError) {
+        self.store.hold("projects/" + r.project) or fail store_down(err);
         let out = self.revoke_held(r) or {
             self.store.let_go();
             fail err;
@@ -449,7 +469,7 @@ locus Keys {
     }
 
     /// `revoke`, holding the resource from its read to its write.
-    fn revoke_held(r: KeyRef) -> Key fallible(ApiError) {
+    fn revoke_held(r: KeyRef) -> Key fallible(CtlError) {
         let mut k = self.known(r.project, r.key) or raise;
         let now = now_seconds();
         if k.revoked { return key_view(k, now); }
@@ -460,22 +480,22 @@ locus Keys {
         self.store.update_key(
             k,
             change("revoke", key_target(k), key_json(before), key_json(after)),
-        ) or fail store_failed(err);
+        ) or fail store_down(err);
         return after;
     }
 
-    fn project_of(id: String) -> st::ProjectRow fallible(ApiError) {
-        let p = self.store.project(id) or fail store_failed(err);
-        if !p.present { fail not_found("no project " + id); }
+    fn project_of(id: String) -> st::ProjectRow fallible(CtlError) {
+        let p = self.store.project(id) or fail store_down(err);
+        if !p.present { fail missing("no project " + id); }
         return p;
     }
 
     /// The key `id` under `project`; a key of another project is not found.
-    fn known(project: String, id: String) -> st::KeyRow fallible(ApiError) {
+    fn known(project: String, id: String) -> st::KeyRow fallible(CtlError) {
         self.project_of(project) or raise;
-        let k = self.store.key(id) or fail store_failed(err);
+        let k = self.store.key(id) or fail store_down(err);
         if !k.present || k.project != project {
-            fail not_found("no key " + id + " in project " + project);
+            fail missing("no key " + id + " in project " + project);
         }
         return k;
     }
@@ -553,12 +573,12 @@ fn within(
     project: st::Restriction,
     key: st::Restriction,
     field: String
-) -> Bool fallible(ApiError) {
+) -> Bool fallible(CtlError) {
     if project.any { return true; }
     if key.any { return true; }
     for n in key.names.items {
         if !has_name(project.names.items, n) {
-            fail invalid(
+            fail bad(
                 "`" + field + "` names " + n + ", which the project does not allow",
                 field
             );
@@ -567,8 +587,8 @@ fn within(
     return true;
 }
 
-fn check_name(name: String) -> Bool fallible(ApiError) {
-    if len(name) == 0 || len(name) > 128 { fail invalid("`name` is 1 to 128 characters", "name"); }
+fn check_name(name: String) -> Bool fallible(CtlError) {
+    if len(name) == 0 || len(name) > 128 { fail bad("`name` is 1 to 128 characters", "name"); }
     return true;
 }
 

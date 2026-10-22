@@ -45,20 +45,30 @@ type ChangeList {
     next_cursor: String = "";
 }
 
+/// `listChanges`' query: the times are RFC 3339 text, read when the handler
+/// runs so a bad one is refused by name.
+type ChangeAsk {
+    target: String = "";
+    from: String = "";
+    to: String = "";
+    limit: Int = -1;
+    cursor: String = "";
+}
+
 locus Changes {
     params { store: st::Store; }
 
-    /// `listChanges`: newest first.
-    /// `listChanges`, as the surface's typed rows answer it; the REST
-    /// router answers `list_read`, before and after as stored.
-    fn list(q: st::ChangeQuery) -> ChangeList fallible(ApiError) {
+    /// `listChanges`: newest first, `before` and `after` as free-form JSON.
+    /// The event stream reads `list_read`, which holds them as stored.
+    fn list(a: ChangeAsk) -> ChangeList fallible(CtlError) {
+        let q = change_query_of(a) or raise;
         return change_list_of_read(self.list_read(q) or raise) or raise;
     }
 
-    fn list_read(q: st::ChangeQuery) -> ChangeReadList fallible(ApiError) {
-        let rows = self.store.changes(q) or fail store_failed(err);
+    fn list_read(q: st::ChangeQuery) -> ChangeReadList fallible(CtlError) {
+        let rows = self.store.changes(q) or fail store_down(err);
         if !rows.cursor_known {
-            fail invalid("`cursor` names no change; pass a page's `next_cursor`", "cursor");
+            fail bad("`cursor` names no change; pass a page's `next_cursor`", "cursor");
         }
         let mut out = ChangeReadList { };
         let mut last = "";
@@ -87,7 +97,7 @@ locus Changes {
 }
 
 /// A `ChangeRead` as the surface's typed `Change`.
-fn change_of_read(c: ChangeRead) -> Change fallible(ApiError) {
+fn change_of_read(c: ChangeRead) -> Change fallible(CtlError) {
     return Change {
         id: c.id,
         at: c.at,
@@ -111,7 +121,7 @@ fn change_of_read(c: ChangeRead) -> Change fallible(ApiError) {
 }
 
 /// A `ChangeReadList` as the surface's typed `ChangeList`.
-fn change_list_of_read(l: ChangeReadList) -> ChangeList fallible(ApiError) {
+fn change_list_of_read(l: ChangeReadList) -> ChangeList fallible(CtlError) {
     let mut out = ChangeList { has_next_cursor: l.has_next_cursor, next_cursor: l.next_cursor };
     for c in l.data {
         push(out.data, change_of_read(c) or raise) or discard;
@@ -130,40 +140,33 @@ fn change(action: String, target: String, before: String, after: String) -> st::
     };
 }
 
-// ---- the wire ----------------------------------------------------------
+// ---- the query ---------------------------------------------------------
 
-/// `GET /admin/v1/changes`'s query.
-fn read_change_query(p: std::http::RouteParams) -> st::ChangeQuery fallible(ApiError) {
-    let mut q = st::ChangeQuery {
-        target: std::http::query_param(p, "target"),
-        cursor: std::http::query_param(p, "cursor"),
-    };
-    let from = std::http::query_param(p, "from");
-    if len(from) > 0 {
+/// `GET /admin/v1/changes`'s query as the store takes it.
+fn change_query_of(a: ChangeAsk) -> st::ChangeQuery fallible(CtlError) {
+    let mut q = st::ChangeQuery { target: a.target, cursor: a.cursor };
+    if len(a.from) > 0 {
         q.has_from = true;
-        q.from = rfc3339(from) or fail invalid(
+        q.from = rfc3339(a.from) or fail bad(
             "`from` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
             "from"
         );
     }
-    let to = std::http::query_param(p, "to");
-    if len(to) > 0 {
+    if len(a.to) > 0 {
         q.has_to = true;
-        q.to = rfc3339(to) or fail invalid(
+        q.to = rfc3339(a.to) or fail bad(
             "`to` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
             "to"
         );
     }
-    let limit = std::http::query_param(p, "limit");
-    if len(limit) > 0 {
-        let n = std::str::parse_int(limit) or 0;
-        if !is_integer(limit) || n < 1 || n > 1000 {
-            fail invalid("`limit` is 1 to 1000", "limit");
-        }
-        q.limit = n;
+    if a.limit != -1 {
+        if a.limit < 1 || a.limit > 1000 { fail bad("`limit` is 1 to 1000", "limit"); }
+        q.limit = a.limit;
     }
     return q;
 }
+
+// ---- the event stream's JSON ----------------------------------------------
 
 fn change_json(c: ChangeRead) -> String {
     return "{\"id\": " + jq(c.id) + ", \"at\": " + jtime(c.at) + ", \"principal\": "
@@ -173,12 +176,3 @@ fn change_json(c: ChangeRead) -> String {
         + ", \"after\": " + jraw_if(c.has_after, c.after) + "}";
 }
 
-fn change_list_json(l: ChangeReadList) -> String {
-    let entries_list = st::JsonList { };
-    for c in l.data {
-        entries_list.add(change_json(c));
-    }
-    let entries = entries_list.text();
-    return "{\"data\": [" + entries + "], \"next_cursor\": "
-        + jstring_or_null(l.has_next_cursor, l.next_cursor) + "}";
-}

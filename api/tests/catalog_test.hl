@@ -1,196 +1,161 @@
-// The catalog on the admin plane: GET/POST /admin/v1/models and
-// GET/PATCH/DELETE /admin/v1/models/{model}, through the router.
+// The catalog on the admin plane: the rows of `Catalog` (list, create, get,
+// update, remove), called on a receiver over a store.
 import ".." as api;
+import "../../store" as st;
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+fn blank() -> api::CatalogModel {
+    return api::CatalogModel { kind: api::ModelKind::hosted, id: "refused" };
 }
 
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
-}
-
-fn field(r: std::http::Response, name: String) -> String {
-    return std::json::find_string_field(r.body, name);
-}
-
-fn code(r: std::http::Response) -> String {
-    return std::json::find_string_field(std::json::find_field_raw(r.body, "error"), "code");
+fn ids(l: api::CatalogList) -> String {
+    let mut out = ",";
+    for m in l.data {
+        out = out + m.id + ",";
+    }
+    return out;
 }
 
 fn main() {
-    let e = api::Endpoints { };
+    let store = st::MemoryStore { };
+    let catalog = api::Catalog { store: store };
 
-    let empty = call(e, "GET", "/admin/v1/models", "");
-    expect(empty, 200, "an empty catalog");
-    std::test::assert_eq_str(std::str::trim(empty.body), "{\"data\": []}", "no models yet");
+    let empty = catalog.list() or api::CatalogList { };
+    std::test::assert_eq_int(count(empty.data), 0, "no models yet");
 
-    let made = call(
-        e,
-        "POST",
-        "/admin/v1/models",
-        "{\"id\": \"echo-1\", \"context_length\": 8192, \"max_output_tokens\": 1024, \"price\": {\"input_per_mtok_micros\": 3000000, \"output_per_mtok_micros\": 15000000}}",
-    );
-    expect(made, 201, "create");
-    std::test::assert_eq_str(field(made, "id"), "echo-1", "its id");
-    std::test::assert_eq_str(field(made, "owned_by"), "local", "owned_by defaults to local");
-    std::test::assert_eq_str(field(made, "kind"), "local", "kind defaults to local");
-    std::test::assert_eq_int(
-        std::json::find_int_field(made.body, "context_length"),
-        8192,
-        "context_length",
-    );
-    let price = std::json::find_field_raw(made.body, "price");
-    std::test::assert_eq_int(
-        std::json::find_int_field(price, "output_per_mtok_micros"),
-        15000000,
-        "the price",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(price, "currency"),
-        "USD",
-        "currency defaults to USD",
-    );
+    let made = catalog.create(
+        api::CatalogModelCreate {
+            id: "echo-1",
+            context_length: 8192,
+            max_output_tokens: 1024,
+            has_price: true,
+            price: st::ModelPrice {
+                input_per_mtok_micros: 3000000,
+                output_per_mtok_micros: 15000000,
+            },
+        },
+    ) or blank();
+    std::test::assert_eq_str(made.id, "echo-1", "its id");
+    std::test::assert_eq_str(made.owned_by, "local", "owned_by defaults to local");
+    std::test::assert(made.kind == api::ModelKind::local, "kind defaults to local");
+    std::test::assert(made.has_context_length, "a context length is stated");
+    std::test::assert_eq_int(made.context_length, 8192, "context_length");
+    std::test::assert(made.has_price, "it has a price");
+    std::test::assert_eq_int(made.price.output_per_mtok_micros, 15000000, "the price");
+    std::test::assert_eq_str(made.price.currency, "USD", "currency defaults to USD");
+    std::test::assert(!made.available, "no seat serves it, so it is not available");
+    std::test::assert_eq_int(count(made.seats), 0, "no seats");
     std::test::assert(
-        !std::json::find_bool_field(made.body, "available"),
-        "no seat serves it, so it is not available",
+        std::str::ends_with(std::time::iso8601(made.created_at), "Z"),
+        "created_at is UTC",
     );
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(made.body, "seats")),
-        "[]",
-        "no seats",
-    );
-    std::test::assert(std::str::ends_with(field(made, "created_at"), "Z"), "created_at is UTC");
 
-    expect(call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}"), 409, "an id is taken once");
-    let free = call(
-        e,
-        "POST",
-        "/admin/v1/models",
-        "{\"id\": \"claude-sonnet-5\", \"owned_by\": \"anthropic\", \"kind\": \"hosted\", \"price\": null}",
-    );
-    expect(free, 201, "a hosted model");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(free.body, "price")),
-        "null",
-        "a null price is free",
-    );
+    let mut failed = "";
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "an id is taken once");
+    let free = catalog.create(
+        api::CatalogModelCreate {
+            id: "claude-sonnet-5",
+            owned_by: "anthropic",
+            has_kind: true,
+            kind: api::ModelKind::hosted,
+        },
+    ) or blank();
+    std::test::assert(free.kind == api::ModelKind::hosted, "a hosted model");
+    std::test::assert(!free.has_price, "no price is free");
     std::test::assert(
-        !std::str::contains(free.body, "context_length"),
+        !free.has_context_length && !free.has_max_output_tokens,
         "an unset count is left out",
     );
 
-    // refused bodies
-    let no_id = call(e, "POST", "/admin/v1/models", "{\"kind\": \"local\"}");
-    expect(no_id, 400, "id is required");
-    std::test::assert_eq_str(code(no_id), "invalid_request", "invalid_request");
-    std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(no_id.body, "error"), "param"),
-        "id",
-        "names the field",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/models", "{\"id\": \"m\", \"kind\": \"remote\"}"),
-        400,
-        "kind is local or hosted",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/models", "{\"id\": \"m\", \"context_length\": 0}"),
-        400,
-        "a count is at least 1",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/models", "{\"id\": \"m\", \"context_length\": 1.5}"),
-        400,
-        "a count is an integer",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/models",
-            "{\"id\": \"m\", \"price\": {\"input_per_mtok_micros\": 1}}",
-        ),
-        400,
-        "a price has both rates",
-    );
-    let huge = call(
-        e,
-        "POST",
-        "/admin/v1/models",
-        "{\"id\": \"m\", \"price\": {\"input_per_mtok_micros\": 99999999999999999999, \"output_per_mtok_micros\": 1}}",
-    );
-    expect(huge, 400, "an amount out of range");
-    std::test::assert(std::str::contains(huge.body, "out of range"), "says so, not zero");
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/models",
-            "{\"id\": \"m\", \"context_length\": 99999999999999999999}",
-        ),
-        400,
-        "a count out of range",
-    );
-    expect(call(e, "POST", "/admin/v1/models", "not json"), 400, "a body is one JSON object");
+    // refused requests
+    let mut code_is_invalid = false;
+    let mut param = "";
+    failed = "";
+    catalog.create(api::CatalogModelCreate { id: "" }) or {
+        failed = api::ctl_class(err);
+        code_is_invalid = api::ctl_problem(err).code == api::ErrorCode::invalid_request;
+        param = api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid", "id is required");
+    std::test::assert(code_is_invalid, "invalid_request");
+    std::test::assert_eq_str(param, "id", "names the field");
+    failed = "";
+    catalog.create(api::CatalogModelCreate { id: "m", context_length: -1 }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid context_length", "a count is at least 1");
+    failed = "";
+    catalog.create(api::CatalogModelCreate { id: "m", max_output_tokens: -1 }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid max_output_tokens", "so is an output count");
+    failed = "";
+    catalog.get(api::ModelRef { model: "m" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "a refused create made nothing");
 
     // read, change, remove
-    expect(call(e, "GET", "/admin/v1/models/echo-1", ""), 200, "get");
-    let missing = call(e, "GET", "/admin/v1/models/nope", "");
-    expect(missing, 404, "an unknown model");
-    std::test::assert_eq_str(code(missing), "not_found", "not_found");
+    let got = catalog.get(api::ModelRef { model: "echo-1" }) or blank();
+    std::test::assert_eq_str(got.id, "echo-1", "get");
+    let mut code_is_not_found = false;
+    failed = "";
+    catalog.get(api::ModelRef { model: "nope" }) or {
+        failed = api::ctl_class(err);
+        code_is_not_found = api::ctl_problem(err).code == api::ErrorCode::not_found;
+    };
+    std::test::assert_eq_str(failed, "not_found", "an unknown model");
+    std::test::assert(code_is_not_found, "not_found");
 
-    let changed = call(
-        e,
-        "PATCH",
-        "/admin/v1/models/echo-1",
-        "{\"max_output_tokens\": 2048, \"price\": null}",
-    );
-    expect(changed, 200, "patch");
-    std::test::assert_eq_int(
-        std::json::find_int_field(changed.body, "max_output_tokens"),
-        2048,
-        "the field set changes",
-    );
-    std::test::assert_eq_int(
-        std::json::find_int_field(changed.body, "context_length"),
-        8192,
-        "a field not set stays",
-    );
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(changed.body, "price")),
-        "null",
-        "price set to null",
-    );
-    expect(
-        call(e, "PATCH", "/admin/v1/models/echo-1", "{\"id\": \"echo-2\"}"),
-        400,
-        "the id cannot change",
-    );
-    expect(call(e, "PATCH", "/admin/v1/models/nope", "{}"), 404, "patch an unknown model");
+    let changed = catalog.update(
+        api::CatalogModelUpdate {
+            model: "echo-1",
+            has_max_output_tokens: true,
+            max_output_tokens: 2048,
+            clear_price: true,
+        },
+    ) or blank();
+    std::test::assert_eq_int(changed.max_output_tokens, 2048, "the field set changes");
+    std::test::assert_eq_int(changed.context_length, 8192, "a field not set stays");
+    std::test::assert(!changed.has_price, "price set to null");
+    let kept = catalog.update(
+        api::CatalogModelUpdate { model: "echo-1", has_owned_by: true, owned_by: "me" },
+    ) or blank();
+    std::test::assert_eq_str(kept.owned_by, "me", "another field set");
+    std::test::assert_eq_int(kept.max_output_tokens, 2048, "the last change stays");
+    failed = "";
+    catalog.update(api::CatalogModelUpdate { model: "echo-1", has_id: true, id: "echo-2" }) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid id", "the id cannot change");
+    failed = "";
+    catalog.update(api::CatalogModelUpdate { model: "nope" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "patch an unknown model");
 
-    let listed = call(e, "GET", "/admin/v1/models", "");
-    std::test::assert(
-        std::str::contains(listed.body, "\"echo-1\"")
-            && std::str::contains(listed.body, "\"claude-sonnet-5\""),
-        "both are listed",
-    );
+    let listed = catalog.list() or api::CatalogList { };
+    std::test::assert_eq_str(ids(listed), ",echo-1,claude-sonnet-5,", "both are listed");
 
-    expect(call(e, "DELETE", "/admin/v1/models/echo-1", ""), 200, "remove");
-    expect(call(e, "GET", "/admin/v1/models/echo-1", ""), 404, "a removed model is gone");
-    expect(call(e, "DELETE", "/admin/v1/models/echo-1", ""), 404, "and cannot be removed twice");
-    expect(
-        call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}"),
-        409,
-        "its id is never reused",
-    );
-    let after = call(e, "GET", "/admin/v1/models", "");
-    std::test::assert(!std::str::contains(after.body, "\"echo-1\""), "nor listed");
+    let removed = catalog.remove(api::ModelRef { model: "echo-1" }) or blank();
+    std::test::assert_eq_str(removed.id, "echo-1", "remove");
+    failed = "";
+    catalog.get(api::ModelRef { model: "echo-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "a removed model is gone");
+    failed = "";
+    catalog.remove(api::ModelRef { model: "echo-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "and cannot be removed twice");
+    failed = "";
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "its id is never reused");
+    let after = catalog.list() or api::CatalogList { };
+    std::test::assert_eq_str(ids(after), ",claude-sonnet-5,", "nor listed");
 }

@@ -1,11 +1,14 @@
-// The REST router answers read types that carry stored JSON as text
-// (SeatRead, NodeRead, AssignmentRead, RegisteredRead, ChangeRead); the
-// surface describes their typed twins (SeatView, Node, Assignment,
-// Registered, Change). For a value within the 64 KiB a JSON value holds,
-// the router's JSON and the typed twin's api_encode say the same thing:
-// the same members with the same values, key order, spacing and absent
-// nulls apart. A field added to one twin and not the other fails here,
-// rather than sitting at its default on one side.
+// The read types carry stored JSON as text (SeatRead, NodeRead,
+// ChangeRead); the rows answer their typed twins (SeatView, Node, Change).
+// The *_json writers of those read types are the change log's and the event
+// stream's JSON. For a value within the 64 KiB a JSON value holds, the
+// writer's JSON and the typed twin's api_encode say the same thing: the
+// same members with the same values, key order, spacing and absent nulls
+// apart. A field added to one twin and not the other fails here, rather than
+// sitting at its default on one side. (The assignment and registration
+// twins, and the router's page of changes, went with the hand-written
+// router; the node plane's own assignment and registration are
+// node_plane_test's.)
 import ".." as api;
 import "../../store" as st;
 
@@ -166,26 +169,6 @@ fn full_node() -> api::NodeRead {
     return n;
 }
 
-/// An assignment whose seat has every field off its default.
-fn full_assignment() -> api::AssignmentRead {
-    let mut s = api::AssignedRead {
-        id: "static",
-        engine: "static",
-        account: "static",
-        concurrency: 3,
-        enabled: false,
-        config: CONFIG,
-    };
-    push(
-        s.serves,
-        st::SeatModel { model: "echo-1", has_engine_name: true, engine_name: "echo" },
-    ) or discard;
-    push(s.data_classes, "secret") or discard;
-    let mut a = api::AssignmentRead { version: 7, max_in_flight: 3 };
-    push(a.seats, s) or discard;
-    return a;
-}
-
 /// A change with every field off its default and off null, a principal
 /// among them (the store keeps none yet).
 fn full_change() -> api::ChangeRead {
@@ -241,41 +224,12 @@ fn main() {
         ),
         "a node",
     );
-    let assigned = full_assignment();
     same(
-        api::assignment_json(assigned),
-        api::Assignment::api_encode(api::assignment_of_read(assigned) or api::Assignment { }),
-        "an assignment",
-    );
-    // the router nests `nats`; the twin has its two fields flat, a wire
-    // difference the fit lists
-    // a protocol off its default, so its copy is seen (the router writes
-    // the row's, which is 2 in every answer it makes)
-    let r = api::RegisteredRead {
-        protocol: 3,
-        heartbeat_interval_ms: 7000,
-        nats_url: "nats://nats:4222",
-        nats_subject: "voice.node.laptop",
-        assignment: assigned,
-    };
-    let rest = api::registered_json(r);
-    let flat = std::str::replace(
-        rest,
-        "\"nats\": {\"url\": \"nats://nats:4222\", \"subject\": \"voice.node.laptop\"}",
-        "\"nats_url\": \"nats://nats:4222\", \"nats_subject\": \"voice.node.laptop\"",
-    );
-    std::test::assert(flat != rest, "the router's answer nests nats: " + rest);
-    same(
-        flat,
-        api::Registered::api_encode(api::registered_of_read(r) or api::Registered { }),
-        "a registration's answer",
-    );
-    let mut page = api::ChangeReadList { has_next_cursor: true, next_cursor: "chg_1" };
-    push(page.data, full_change()) or discard;
-    same(
-        api::change_list_json(page),
-        api::ChangeList::api_encode(api::change_list_of_read(page) or api::ChangeList { }),
-        "a page of changes",
+        api::change_json(full_change()),
+        api::Change::api_encode(
+            api::change_of_read(full_change()) or api::Change { action: api::ChangeAction::create },
+        ),
+        "a change",
     );
 
     // every presence flag down: the router writes null where the codec
@@ -304,14 +258,13 @@ fn main() {
     bare_node.has_last_heartbeat_at = false;
     bare_node.has_revoked_at = false;
     bare_node.enrollment_token = "";
-    // the router writes the token only in the answers that carry one
-    let bare_encoded = api::Node::api_encode(
+    // neither writes the token unless the answer carries one
+    let bare_typed = api::Node::api_encode(
         api::node_of_read(bare_node) or api::Node { status: api::NodeStatus::pending },
     );
-    let bare_typed = std::str::replace(bare_encoded, ",\"enrollment_token\":\"\"", "");
     std::test::assert(
-        bare_typed != bare_encoded,
-        "the codec writes the empty token, which the router leaves out: " + bare_encoded,
+        !std::str::contains(bare_typed, "enrollment_token"),
+        "the codec leaves out an absent token: " + bare_typed,
     );
     same(
         api::node_json(bare_node),
@@ -321,16 +274,9 @@ fn main() {
         ),
         "a node with nothing reported",
     );
-    let mut last = api::ChangeReadList { };
     let mut bare_change = full_change();
     bare_change.has_principal = false;
     bare_change.has_before = false;
-    push(last.data, full_change()) or discard;
-    let typed_last = api::ChangeList::api_encode(
-        api::change_list_of_read(last) or api::ChangeList { },
-    );
-    // the last page's absent cursor, then a change's absent fields
-    same(api::change_list_json(last), absent_as_null(typed_last, "next_cursor"), "a last page");
     same(
         api::change_json(bare_change),
         absent_as_null(

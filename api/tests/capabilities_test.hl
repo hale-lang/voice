@@ -1,18 +1,8 @@
 // GET /v1/capabilities: what the presented key may do.
 import ".." as api;
+import "../../store" as st;
 
-fn admin(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
-}
-
-fn caps(e: api::Endpoints, key: String) -> std::http::Response {
+fn caps(e: api::DataPlane, key: String) -> std::http::Response {
     return e.handle(
         std::http::Request {
             method: "GET",
@@ -26,41 +16,48 @@ fn raw(r: std::http::Response, name: String) -> String {
     return std::str::trim(std::json::find_field_raw(r.body, name));
 }
 
+/// A request limit of `n` per minute at `scope`.
+fn per_minute(scope: st::LimitScope, n: Int) -> st::Limit {
+    return st::Limit { scope: scope, window_seconds: 60, has_requests: true, requests: n };
+}
+
 fn main() {
-    let e = api::Endpoints { };
-    admin(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}");
-    admin(e, "POST", "/admin/v1/models", "{\"id\": \"other-1\"}");
-    admin(
-        e,
-        "POST",
-        "/admin/v1/accounts",
-        "{\"id\": \"static\", \"name\": \"Static\", \"limits\": [{\"scope\": \"account\", \"window_seconds\": 60, \"requests\": 5}]}",
-    );
-    admin(
-        e,
-        "POST",
-        "/admin/v1/accounts",
-        "{\"id\": \"paid\", \"name\": \"Paid\", \"limits\": [{\"scope\": \"account\", \"window_seconds\": 60, \"requests\": 7}]}",
-    );
-    admin(
-        e,
-        "POST",
-        "/admin/v1/projects",
-        "{\"id\": \"work\", \"name\": \"Work\", \"data_classes\": [\"public\", \"internal\"], \"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 600}]}",
-    );
-    let open = std::json::find_string_field(
-        admin(e, "POST", "/admin/v1/projects/work/keys", "{\"name\": \"ci\"}").body,
-        "secret",
-    );
-    let narrow = std::json::find_string_field(
-        admin(
-            e,
-            "POST",
-            "/admin/v1/projects/work/keys",
-            "{\"name\": \"narrow\", \"models\": [\"echo-1\"], \"accounts\": [\"static\"], \"limits\": [{\"scope\": \"key\", \"window_seconds\": 60, \"requests\": 9}]}",
-        ).body,
-        "secret",
-    );
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "other-1" }) or discard;
+    let mut static_account = api::AccountCreate { id: "static", name: "Static" };
+    let mut account_limit = per_minute(st::LimitScope::account, 5);
+    push(static_account.limits, account_limit) or discard;
+    accounts.create(static_account) or discard;
+    let mut paid = api::AccountCreate { id: "paid", name: "Paid" };
+    account_limit = per_minute(st::LimitScope::account, 7);
+    push(paid.limits, account_limit) or discard;
+    accounts.create(paid) or discard;
+    let mut work = api::ProjectCreate { id: "work", name: "Work" };
+    push(work.data_classes, "public") or discard;
+    push(work.data_classes, "internal") or discard;
+    push(work.limits, per_minute(st::LimitScope::project, 600)) or discard;
+    projects.create(work) or discard;
+    let made_open = keys.create(api::KeyCreate { project: "work", name: "ci" }) or {
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    let open = made_open.secret;
+    let mut narrow_key = api::KeyCreate {
+        project: "work",
+        name: "narrow",
+        has_models: true,
+        has_accounts: true,
+    };
+    push(narrow_key.models, "echo-1") or discard;
+    push(narrow_key.accounts, "static") or discard;
+    push(narrow_key.limits, per_minute(st::LimitScope::key, 9)) or discard;
+    let made_narrow = keys.create(narrow_key) or { api::Key { status: api::KeyStatus::revoked } };
+    let narrow = made_narrow.secret;
+    std::test::assert(made_open.has_secret && made_narrow.has_secret, "two keys");
 
     std::test::assert_eq_int(
         e.handle(std::http::Request { method: "GET", path: "/v1/capabilities" }).status,
@@ -108,7 +105,7 @@ fn main() {
         "its own limit and its accounts' only",
     );
 
-    admin(e, "DELETE", "/admin/v1/accounts/paid", "");
+    accounts.archive(api::AccountRef { account: "paid" }) or discard;
     let after_archive = raw(caps(e, open), "limits");
     std::test::assert(
         std::str::contains(after_archive, "\"static\"")
@@ -116,12 +113,13 @@ fn main() {
         "an archived account's limits no longer apply",
     );
 
-    admin(
-        e,
-        "PUT",
-        "/admin/v1/projects/work/budget",
-        "{\"allowance_micros\": 1000, \"period\": \"day\"}",
-    );
+    projects.set_budget(
+        api::BudgetRequest {
+            project: "work",
+            allowance_micros: 1000,
+            period: st::Period::day,
+        },
+    ) or discard;
     std::test::assert_eq_int(
         std::json::find_int_field(raw(caps(e, open), "budget"), "remaining_micros"),
         1000,

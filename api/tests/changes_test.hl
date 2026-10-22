@@ -1,200 +1,172 @@
-// The change log: GET /admin/v1/changes, written by every admin write.
+// The change log: the Changes row (GET /admin/v1/changes), written by every
+// admin write.
 import ".." as api;
+import "../../store" as st;
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+/// A failed call, as `class param`; "" when it succeeded.
+fn why(err: api::CtlError) -> String {
+    return api::ctl_class(err) + " " + api::ctl_problem(err).param;
 }
 
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+fn nothing() -> api::Change {
+    return api::Change { action: api::ChangeAction::delete };
 }
 
-/// The `i`-th change of a page, newest first.
-fn nth(page: String, i: Int) -> String {
-    let mut it = std::json::array_first(std::json::find_field_raw(page, "data"));
-    let mut n = 0;
-    while n < i && !it.done {
-        it = std::json::array_next(it);
-        n = n + 1;
-    }
-    return it.element;
+fn nth(page: api::ChangeList, i: Int) -> api::Change {
+    return at(page.data, i) or nothing();
+}
+
+/// A field of a change's `before` or `after`, which are free-form JSON.
+fn text_of(v: std::json::Value, name: String) -> String {
+    return std::json::find_string_field(v.text, name);
 }
 
 fn main() {
-    let e = api::Endpoints { };
-    std::test::assert_eq_str(
-        std::str::trim(call(e, "GET", "/admin/v1/changes", "").body),
-        "{\"data\": [], \"next_cursor\": null}",
-        "nothing yet",
-    );
+    let store = st::MemoryStore { };
+    let projects = api::Projects { store: store };
+    let keys = api::Keys { store: store };
+    let nodes = api::Nodes { store: store, link: api::NatsLink { } };
+    let changes = api::Changes { store: store };
+    let start = changes.list(api::ChangeAsk { }) or api::ChangeList { has_next_cursor: true };
+    std::test::assert(count(start.data) == 0 && !start.has_next_cursor, "nothing yet");
 
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"work\", \"name\": \"Work\"}"),
-        201,
-        "a project",
-    );
-    let key = call(e, "POST", "/admin/v1/projects/work/keys", "{\"name\": \"ci\"}");
-    let secret = std::json::find_string_field(key.body, "secret");
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/budget",
-            "{\"allowance_micros\": 50000000, \"period\": \"month\"}",
-        ),
-        200,
-        "a budget",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/budget",
-            "{\"allowance_micros\": 75000000, \"period\": \"month\"}",
-        ),
-        200,
-        "raised",
-    );
-    expect(call(e, "PATCH", "/admin/v1/projects/work", "{\"name\": \"The work\"}"), 200, "renamed");
-    let node = call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}");
-    let token = std::json::find_string_field(node.body, "enrollment_token");
-    expect(call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}"), 409, "a refused write");
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let key = keys.create(api::KeyCreate { project: "work", name: "ci" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    };
+    std::test::assert(key.has_secret, "a key");
+    projects.set_budget(
+        api::BudgetRequest {
+            project: "work",
+            allowance_micros: 50000000,
+            period: st::Period::month,
+        },
+    ) or discard;
+    projects.set_budget(
+        api::BudgetRequest {
+            project: "work",
+            allowance_micros: 75000000,
+            period: st::Period::month,
+        },
+    ) or discard;
+    projects.update(
+        api::ProjectUpdate { project: "work", has_name: true, name: "The work" },
+    ) or discard;
+    let node = nodes.create(api::NodeCreate { id: "laptop" }) or api::Node {
+        status: api::NodeStatus::revoked,
+    };
+    std::test::assert(node.has_enrollment_token, "a node");
+    let mut failed = "";
+    nodes.create(api::NodeCreate { id: "laptop" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "conflict ", "a refused write");
 
-    let all = call(e, "GET", "/admin/v1/changes", "");
-    expect(all, 200, "list");
-    let newest = nth(all.body, 0);
-    std::test::assert_eq_str(
-        std::json::find_string_field(newest, "target"),
-        "nodes/laptop",
-        "newest first",
-    );
-    std::test::assert_eq_str(std::json::find_string_field(newest, "action"), "create", "a create");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(newest, "before")),
-        "null",
+    let all = changes.list(api::ChangeAsk { }) or api::ChangeList { };
+    let newest = nth(all, 0);
+    std::test::assert_eq_str(newest.target, "nodes/laptop", "newest first");
+    std::test::assert(newest.action == api::ChangeAction::create, "a create");
+    std::test::assert(
+        !newest.has_before && newest.before.text == "null",
         "nothing before a create",
     );
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(newest, "principal")),
-        "null",
-        "nobody: admin authentication is off",
-    );
+    std::test::assert(!newest.has_principal, "nobody: admin authentication is off");
+    let mut text = "";
+    for c in all.data {
+        text = text + c.before.text + c.after.text;
+    }
     std::test::assert(
-        !std::str::contains(all.body, token) && !std::str::contains(all.body, secret),
+        !std::str::contains(text, node.enrollment_token)
+            && !std::str::contains(text, key.secret),
         "never a secret or a token",
     );
     std::test::assert(
-        !std::str::contains(all.body, "enrollment_token")
-            && !std::str::contains(all.body, "\"secret\""),
+        !std::str::contains(text, "enrollment_token") && !std::str::contains(text, "\"secret\""),
         "nor their fields",
     );
-    std::test::assert(
-        len(std::json::find_string_field(nth(all.body, 5), "id")) > 0,
-        "six changes, the refused write none",
-    );
-    std::test::assert(len(nth(all.body, 6)) == 0, "and no seventh");
+    std::test::assert(len(nth(all, 5).id) > 0, "six changes, the refused write none");
+    std::test::assert_eq_int(count(all.data), 6, "and no seventh");
 
-    let renamed = nth(all.body, 1);
-    std::test::assert_eq_str(
-        std::json::find_string_field(renamed, "action"),
-        "update",
-        "an update",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(renamed, "before"), "name"),
-        "Work",
-        "the project as it was",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(renamed, "after"), "name"),
-        "The work",
-        "and as it became",
-    );
-    let raised = nth(all.body, 2);
-    std::test::assert_eq_str(
-        std::json::find_string_field(raised, "target"),
-        "projects/work/budget",
-        "the budget's own target",
-    );
+    let renamed = nth(all, 1);
+    std::test::assert(renamed.action == api::ChangeAction::update, "an update");
+    std::test::assert_eq_str(text_of(renamed.before, "name"), "Work", "the project as it was");
+    std::test::assert_eq_str(text_of(renamed.after, "name"), "The work", "and as it became");
+    let raised = nth(all, 2);
+    std::test::assert_eq_str(raised.target, "projects/work/budget", "the budget's own target");
     std::test::assert_eq_int(
-        std::json::find_int_field(std::json::find_field_raw(raised, "before"), "allowance_micros"),
+        std::json::find_int_field(raised.before.text, "allowance_micros"),
         50000000,
         "its allowance before",
     );
     std::test::assert_eq_int(
-        std::json::find_int_field(std::json::find_field_raw(raised, "after"), "allowance_micros"),
+        std::json::find_int_field(raised.after.text, "allowance_micros"),
         75000000,
         "and after",
     );
 
     // filters and pages
-    let projects = call(e, "GET", "/admin/v1/changes?target=projects/work", "");
-    std::test::assert(!std::str::contains(projects.body, "nodes/laptop"), "under a target");
+    let under = changes.list(api::ChangeAsk { target: "projects/work" }) or api::ChangeList { };
+    let mut targets = "";
+    for c in under.data {
+        targets = targets + c.target + " ";
+    }
+    std::test::assert(!std::str::contains(targets, "nodes/laptop"), "under a target");
+    std::test::assert(std::str::contains(targets, "projects/work/keys/"), "its children included");
+    let page = changes.list(api::ChangeAsk { limit: 2 }) or api::ChangeList { };
     std::test::assert(
-        std::str::contains(projects.body, "projects/work/keys/"),
-        "its children included",
+        page.has_next_cursor && len(page.next_cursor) > 0,
+        "a page that stops early names where to go on",
     );
-    let page = call(e, "GET", "/admin/v1/changes?limit=2", "");
-    let cursor = std::json::find_string_field(page.body, "next_cursor");
-    std::test::assert(len(cursor) > 0, "a page that stops early names where to go on");
-    std::test::assert(len(nth(page.body, 2)) == 0, "two to a page");
-    let next = call(e, "GET", "/admin/v1/changes?limit=2&cursor=" + cursor, "");
+    std::test::assert_eq_int(count(page.data), 2, "two to a page");
+    let next = changes.list(
+        api::ChangeAsk { limit: 2, cursor: page.next_cursor },
+    ) or api::ChangeList { };
     std::test::assert_eq_str(
-        std::json::find_string_field(nth(next.body, 0), "target"),
+        nth(next, 0).target,
         "projects/work/budget",
         "the next page goes on from it",
     );
-    let last = call(e, "GET", "/admin/v1/changes?limit=10&cursor=" + cursor, "");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(last.body, "next_cursor")),
-        "null",
-        "the last page names none",
-    );
-    std::test::assert_eq_str(
-        std::str::trim(call(e, "GET", "/admin/v1/changes?from=2099-01-01T00:00:00Z", "").body),
-        "{\"data\": [], \"next_cursor\": null}",
-        "from a time",
-    );
-    expect(call(e, "GET", "/admin/v1/changes?limit=0", ""), 400, "a limit is 1 to 1000");
-    expect(call(e, "GET", "/admin/v1/changes?to=yesterday", ""), 400, "a time is RFC 3339");
-    std::test::assert_eq_str(
-        std::str::trim(
-            call(e, "GET", "/admin/v1/changes?from=2099-01-01T05:00:00%2B05:00", "").body,
-        ),
-        "{\"data\": [], \"next_cursor\": null}",
-        "with an offset",
-    );
-    expect(
-        call(e, "GET", "/admin/v1/changes?from=2099-02-30T00:00:00Z", ""),
-        400,
-        "a day the month has",
-    );
-    let lost = call(e, "GET", "/admin/v1/changes?cursor=chg_nothing", "");
-    expect(lost, 400, "a cursor that names no change");
-    std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(lost.body, "error"), "param"),
-        "cursor",
-        "names the cursor",
-    );
+    let last = changes.list(
+        api::ChangeAsk { limit: 10, cursor: page.next_cursor },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert(!last.has_next_cursor, "the last page names none");
+    std::test::assert_eq_int(count(last.data), 4, "with the rest");
+    let future = changes.list(api::ChangeAsk { from: "2099-01-01T00:00:00Z" }) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert(count(future.data) == 0 && !future.has_next_cursor, "from a time");
+    failed = "";
+    changes.list(api::ChangeAsk { limit: 0 }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid limit", "a limit is 1 to 1000");
+    failed = "";
+    changes.list(api::ChangeAsk { limit: 1001 }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid limit", "and at most 1000");
+    failed = "";
+    changes.list(api::ChangeAsk { to: "yesterday" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid to", "a time is RFC 3339");
+    let offset = changes.list(
+        api::ChangeAsk { from: "2099-01-01T05:00:00+05:00" },
+    ) or api::ChangeList {
+        has_next_cursor: true,
+    };
+    std::test::assert(count(offset.data) == 0 && !offset.has_next_cursor, "with an offset");
+    failed = "";
+    changes.list(api::ChangeAsk { from: "2099-02-30T00:00:00Z" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid from", "a day the month has");
+    failed = "";
+    changes.list(api::ChangeAsk { cursor: "chg_nothing" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid cursor", "a cursor that names no change, by name");
 
     // a node's change holds the node, not its seats
-    expect(
-        call(e, "PATCH", "/admin/v1/nodes/laptop", "{\"name\": \"Laptop\"}"),
-        200,
-        "rename the node",
-    );
-    let renamed_node = nth(call(e, "GET", "/admin/v1/changes?target=nodes/laptop", "").body, 0);
+    nodes.update(api::NodeUpdate { node: "laptop", has_name: true, name: "Laptop" }) or discard;
+    let by_node = changes.list(api::ChangeAsk { target: "nodes/laptop" }) or api::ChangeList { };
     std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(renamed_node, "after"), "name"),
+        text_of(nth(by_node, 0).after, "name"),
         "Laptop",
         "the node as it became",
     );
-    std::test::assert(!std::str::contains(renamed_node, "\"seats\""), "without its seats");
+    std::test::assert(
+        !std::str::contains(nth(by_node, 0).after.text, "\"seats\""),
+        "without its seats",
+    );
 }

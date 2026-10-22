@@ -1,126 +1,159 @@
-// Nodes and seats on the admin plane: /admin/v1/nodes, /admin/v1/nodes/{node},
-// its token, and /admin/v1/nodes/{node}/seats/{seat}, through the router.
+// Nodes and seats on the admin plane: the Nodes and Seats rows
+// (GET/POST /admin/v1/nodes, /admin/v1/nodes/{node}, its token, and
+// /admin/v1/nodes/{node}/seats/{seat}), called as the surface calls them.
 import ".." as api;
+import "../../store" as st;
 
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
+/// A failed call, as `class param: message`; "" when it succeeded.
+fn why(err: api::CtlError) -> String {
+    let p = api::ctl_problem(err);
+    return api::ctl_class(err) + " " + p.param + ": " + p.message;
 }
 
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+/// What a failed call falls back to; each assertion on it then fails.
+fn no_node() -> api::Node {
+    return api::Node { status: api::NodeStatus::revoked, has_max_in_flight: true };
 }
 
-fn raw(r: std::http::Response, name: String) -> String {
-    return std::str::trim(std::json::find_field_raw(r.body, name));
+fn no_seat() -> api::SeatView {
+    return api::SeatView { status: api::SeatStatus::offline, enabled: true, concurrency: 0 };
 }
 
-fn version(e: api::Endpoints, node: String) -> Int {
-    return std::json::find_int_field(
-        call(e, "GET", "/admin/v1/nodes/" + node, "").body,
-        "assignment_version",
-    );
+fn model(id: String) -> st::SeatModel {
+    return st::SeatModel { model: id };
+}
+
+fn static_seat(node: String, id: String, account: String) -> api::SeatCreate {
+    let mut c = api::SeatCreate { node: node, id: id, engine: "static", account: account };
+    push(c.serves, model("echo-1")) or discard;
+    return c;
+}
+
+fn version(nodes: api::Nodes, node: String) -> Int {
+    let n = nodes.get(api::NodeRef { node: node }) or no_node();
+    return n.assignment_version;
 }
 
 fn main() {
-    let e = api::Endpoints { };
-    expect(call(e, "POST", "/admin/v1/models", "{\"id\": \"echo-1\"}"), 201, "a model");
-    expect(
-        call(e, "POST", "/admin/v1/accounts", "{\"id\": \"static\", \"name\": \"Static\"}"),
-        201,
-        "an account",
-    );
+    let store = st::MemoryStore { };
+    let catalog = api::Catalog { store: store };
+    let accounts = api::Accounts { store: store };
+    let nodes = api::Nodes { store: store, link: api::NatsLink { } };
+    let seats = api::Seats { store: store, link: api::NatsLink { } };
+    let changes = api::Changes { store: store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
 
     // nodes
-    let made = call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\", \"name\": \"Laptop\"}");
-    expect(made, 201, "create");
-    let token = std::json::find_string_field(made.body, "enrollment_token");
+    let made = nodes.create(api::NodeCreate { id: "laptop", name: "Laptop" }) or no_node();
     std::test::assert(
-        std::str::starts_with(token, "vn-") && len(token) == 43,
+        made.has_enrollment_token
+            && std::str::starts_with(made.enrollment_token, "vn-")
+            && len(made.enrollment_token) == 43,
         "a token, shown once",
     );
-    std::test::assert_eq_str(
-        std::json::find_string_field(made.body, "status"),
-        "pending",
-        "pending until it connects",
-    );
-    std::test::assert_eq_str(raw(made, "capabilities"), "null", "it has declared nothing");
-    std::test::assert_eq_str(raw(made, "max_in_flight"), "null", "no coordinator cap");
-    std::test::assert_eq_int(
-        std::json::find_int_field(made.body, "assignment_version"),
-        1,
-        "its first assignment",
-    );
-    let got = call(e, "GET", "/admin/v1/nodes/laptop", "");
+    let token = made.enrollment_token;
+    std::test::assert(made.status == api::NodeStatus::pending, "pending until it connects");
+    std::test::assert(!made.has_capabilities, "it has declared nothing");
+    std::test::assert(!made.has_max_in_flight, "no coordinator cap");
+    std::test::assert_eq_int(made.assignment_version, 1, "its first assignment");
+    let got = nodes.get(api::NodeRef { node: "laptop" }) or no_node();
+    std::test::assert_eq_str(got.id, "laptop", "get");
     std::test::assert(
-        !std::str::contains(got.body, "enrollment_token") && !std::str::contains(got.body, token),
+        !got.has_enrollment_token && got.enrollment_token != token,
         "never the token again",
     );
-    expect(call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}"), 409, "an id is taken once");
-    expect(call(e, "POST", "/admin/v1/nodes", "{\"id\": \"Laptop\"}"), 400, "an id is a slug");
-    expect(
-        call(e, "POST", "/admin/v1/nodes", "{\"id\": \"x\", \"max_in_flight\": 0}"),
-        400,
-        "a cap is at least 1",
+    let listed_nodes = nodes.list() or api::NodeList { };
+    let first_node = at(listed_nodes.data, 0) or no_node();
+    std::test::assert(
+        count(listed_nodes.data) == 1
+            && first_node.id == "laptop"
+            && !first_node.has_enrollment_token,
+        "nor in the list",
     );
-    expect(call(e, "GET", "/admin/v1/nodes/nope", ""), 404, "an unknown node");
 
-    let capped = call(e, "PATCH", "/admin/v1/nodes/laptop", "{\"max_in_flight\": 4}");
-    expect(capped, 200, "set a cap");
-    std::test::assert_eq_int(std::json::find_int_field(capped.body, "max_in_flight"), 4, "the cap");
-    std::test::assert_eq_int(
-        std::json::find_int_field(capped.body, "assignment_version"),
-        2,
-        "a new assignment",
-    );
+    let mut failed = "";
+    nodes.create(api::NodeCreate { id: "laptop" }) or { failed = why(err); };
     std::test::assert_eq_str(
-        std::json::find_string_field(capped.body, "name"),
-        "Laptop",
-        "a field not set stays",
+        failed,
+        "conflict : node laptop exists; a node id is never reused",
+        "an id is taken once",
     );
-    let uncapped = call(e, "PATCH", "/admin/v1/nodes/laptop", "{\"max_in_flight\": null}");
-    std::test::assert_eq_str(raw(uncapped, "max_in_flight"), "null", "the cap lifted");
+    failed = "";
+    nodes.create(api::NodeCreate { id: "Laptop" }) or { failed = why(err); };
+    std::test::assert(std::str::starts_with(failed, "invalid id: "), "an id is a slug: " + failed);
+    failed = "";
+    nodes.create(api::NodeCreate { id: "x", has_max_in_flight: true, max_in_flight: 0 }) or {
+        failed = why(err);
+    };
+    std::test::assert(std::str::starts_with(failed, "invalid "), "a cap is at least 1: " + failed);
+    failed = "";
+    nodes.get(api::NodeRef { node: "nope" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "not_found : no node nope", "an unknown node");
 
-    let rotated = call(e, "POST", "/admin/v1/nodes/laptop/token", "");
-    expect(rotated, 200, "rotate the token");
-    let token2 = std::json::find_string_field(rotated.body, "enrollment_token");
-    std::test::assert(std::str::starts_with(token2, "vn-") && token2 != token, "a new token");
+    let capped = nodes.update(
+        api::NodeUpdate { node: "laptop", has_max_in_flight: true, max_in_flight: 4 },
+    ) or no_node();
+    std::test::assert(capped.has_max_in_flight && capped.max_in_flight == 4, "set a cap");
+    std::test::assert_eq_int(capped.assignment_version, 2, "a new assignment");
+    std::test::assert_eq_str(capped.name, "Laptop", "a field not set stays");
+    let uncapped = nodes.update(
+        api::NodeUpdate { node: "laptop", clear_max_in_flight: true },
+    ) or no_node();
+    std::test::assert(!uncapped.has_max_in_flight, "the cap lifted");
+    failed = "";
+    nodes.update(api::NodeUpdate { node: "laptop", has_id: true, id: "other" }) or {
+        failed = why(err);
+    };
+    std::test::assert_eq_str(
+        failed,
+        "invalid id: a node's `id` cannot change",
+        "the id cannot change",
+    );
+
+    let rotated = nodes.rotate_token(api::NodeRef { node: "laptop" }) or no_node();
+    std::test::assert(
+        rotated.has_enrollment_token
+            && std::str::starts_with(rotated.enrollment_token, "vn-")
+            && rotated.enrollment_token != token,
+        "a new token",
+    );
 
     // seats
-    let seat = call(
-        e,
-        "POST",
-        "/admin/v1/nodes/laptop/seats",
-        "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}, {\"model\": \"gone-1\", \"as\": \"g\"}], \"concurrency\": 4, \"config\": {\"text\": \"hello from voice\", \"chunk_chars\": 8}}",
-    );
-    expect(seat, 201, "a seat");
+    let mut create = static_seat("laptop", "static", "static");
+    create.serves = api::SeatCreate { node: "", id: "", engine: "", account: "" }.serves;
+    push(create.serves, model("echo-1")) or discard;
+    push(
+        create.serves,
+        st::SeatModel { model: "gone-1", has_engine_name: true, engine_name: "g" },
+    ) or discard;
+    create.concurrency = 4;
+    create.config = std::json::Value::parse(
+        "{\"text\": \"hello from voice\", \"chunk_chars\": 8}",
+    ) or std::json::Value::null();
+    let seat = seats.create(create) or no_seat();
+    std::test::assert_eq_str(seat.ref, "laptop/static", "its full name");
+    std::test::assert(seat.status == api::SeatStatus::offline, "its node has not connected");
     std::test::assert_eq_str(
-        std::json::find_string_field(seat.body, "ref"),
-        "laptop/static",
-        "its full name",
-    );
-    std::test::assert_eq_str(
-        std::json::find_string_field(seat.body, "status"),
-        "offline",
-        "its node has not connected",
-    );
-    std::test::assert_eq_str(
-        raw(seat, "data_classes"),
-        "[\"internal\"]",
+        at(seat.data_classes, 0) or "",
+        "internal",
         "data classes default to internal",
     );
+    std::test::assert_eq_int(count(seat.data_classes), 1, "and only that");
     std::test::assert_eq_str(
-        std::json::find_string_field(raw(seat, "config"), "text"),
+        std::json::find_string_field(seat.config.text, "text"),
         "hello from voice",
         "its config, as written",
     );
-    let problems = raw(seat, "problems");
+    std::test::assert_eq_int(
+        std::json::find_int_field(seat.config.text, "chunk_chars"),
+        8,
+        "all of it",
+    );
+    let mut problems = "";
+    for p in seat.problems {
+        problems = problems + p + "\n";
+    }
     std::test::assert(
         std::str::contains(problems, "has not connected"),
         "the node has declared no engines",
@@ -129,152 +162,132 @@ fn main() {
         std::str::contains(problems, "model gone-1 is not in the catalog"),
         "a model not in the catalog",
     );
-    std::test::assert_eq_int(version(e, "laptop"), 5, "a seat is a new assignment");
-    let logged = call(e, "GET", "/admin/v1/changes?target=nodes/laptop/seats", "");
+    std::test::assert_eq_int(version(nodes, "laptop"), 5, "a seat is a new assignment");
+    let logged = changes.list(
+        api::ChangeAsk { target: "nodes/laptop/seats" },
+    ) or api::ChangeList { };
     std::test::assert_eq_str(
-        std::json::find_string_field(
-            std::json::array_first(std::json::find_field_raw(logged.body, "data")).element,
-            "target",
-        ),
+        (at(logged.data, 0) or api::Change { action: api::ChangeAction::delete }).target,
         "nodes/laptop/seats/static",
         "the change names the seat's path",
     );
-    std::test::assert(
-        std::str::contains(call(e, "GET", "/admin/v1/models/echo-1", "").body, "laptop/static"),
-        "the model lists the seat",
-    );
-    std::test::assert(
-        std::str::contains(call(e, "GET", "/admin/v1/accounts/static", "").body, "laptop/static"),
+    let echo = catalog.get(
+        api::ModelRef { model: "echo-1" },
+    ) or api::CatalogModel { kind: api::ModelKind::hosted };
+    std::test::assert_eq_str(at(echo.seats, 0) or "", "laptop/static", "the model lists the seat");
+    let account = accounts.get(api::AccountRef { account: "static" }) or api::Account {
+        billing: api::Billing::none,
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert_eq_str(
+        at(account.seats, 0) or "",
+        "laptop/static",
         "and so does its account",
     );
 
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/laptop/seats",
-            "{\"id\": \"static\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}]}",
-        ),
-        409,
+    failed = "";
+    seats.create(static_seat("laptop", "static", "static")) or { failed = why(err); };
+    std::test::assert_eq_str(
+        failed,
+        "conflict : node laptop has a seat static",
         "a seat id is the node's once",
     );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/laptop/seats",
-            "{\"id\": \"x\", \"engine\": \"static\", \"account\": \"nope\", \"serves\": [{\"model\": \"echo-1\"}]}",
-        ),
-        400,
-        "an account that exists",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/laptop/seats",
-            "{\"id\": \"x\", \"engine\": \"static\", \"account\": \"static\", \"serves\": []}",
-        ),
-        400,
-        "at least one model",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/laptop/seats",
-            "{\"id\": \"x\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": \"text\"}",
-        ),
-        400,
-        "a config is an object",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/nope/seats",
-            "{\"id\": \"x\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}]}",
-        ),
-        404,
-        "on a node that exists",
-    );
-
-    let listed = call(e, "GET", "/admin/v1/nodes/laptop/seats", "");
-    std::test::assert(std::str::contains(listed.body, "laptop/static"), "list");
+    failed = "";
+    seats.create(static_seat("laptop", "x", "nope")) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid account: no account nope", "an account that exists");
+    failed = "";
+    let mut none = static_seat("laptop", "x", "static");
+    none.serves = api::SeatCreate { node: "", id: "", engine: "", account: "" }.serves;
+    seats.create(none) or { failed = why(err); };
     std::test::assert(
-        std::str::contains(call(e, "GET", "/admin/v1/nodes/laptop", "").body, "laptop/static"),
+        std::str::starts_with(failed, "invalid serves: "),
+        "at least one model: " + failed,
+    );
+    failed = "";
+    seats.create(static_seat("nope", "x", "static")) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "not_found : no node nope", "on a node that exists");
+
+    let listed = seats.list(api::NodeRef { node: "laptop" }) or api::SeatList { };
+    std::test::assert_eq_str(
+        (at(listed.data, 0) or no_seat()).ref,
+        "laptop/static",
+        "list",
+    );
+    let shown = nodes.get(api::NodeRef { node: "laptop" }) or no_node();
+    std::test::assert_eq_str(
+        (at(shown.seats, 0) or no_seat()).ref,
+        "laptop/static",
         "the node shows its seats",
     );
 
-    let off = call(
-        e,
-        "PATCH",
-        "/admin/v1/nodes/laptop/seats/static",
-        "{\"enabled\": false, \"serves\": [{\"model\": \"echo-1\"}]}",
+    let mut patch = api::SeatUpdate {
+        node: "laptop",
+        seat: "static",
+        has_enabled: true,
+        enabled: false,
+    };
+    patch.has_serves = true;
+    push(patch.serves, model("echo-1")) or discard;
+    let off = seats.update(patch) or no_seat();
+    std::test::assert(!off.enabled, "disabled");
+    std::test::assert(
+        count(off.serves) == 1 && (at(off.serves, 0) or model("")).model == "echo-1",
+        "serves replaced",
     );
-    expect(off, 200, "patch");
-    std::test::assert(!std::json::find_bool_field(off.body, "enabled"), "disabled");
-    std::test::assert(!std::str::contains(off.body, "gone-1"), "serves replaced");
-    std::test::assert_eq_int(
-        std::json::find_int_field(off.body, "concurrency"),
-        4,
-        "a field not set stays",
-    );
-    expect(
-        call(e, "PATCH", "/admin/v1/nodes/laptop/seats/static", "{\"id\": \"other\"}"),
-        400,
+    std::test::assert_eq_int(off.concurrency, 4, "a field not set stays");
+    failed = "";
+    seats.update(api::SeatUpdate { node: "laptop", seat: "static", has_id: true, id: "other" }) or {
+        failed = why(err);
+    };
+    std::test::assert_eq_str(
+        failed,
+        "invalid id: a seat's `id` cannot change",
         "the id cannot change",
     );
-    expect(call(e, "GET", "/admin/v1/nodes/laptop/seats/nope", ""), 404, "an unknown seat");
+    failed = "";
+    seats.get(api::SeatRef { node: "laptop", seat: "nope" }) or { failed = why(err); };
+    std::test::assert_eq_str(
+        failed,
+        "not_found : no seat nope on node laptop",
+        "an unknown seat",
+    );
 
-    expect(call(e, "DELETE", "/admin/v1/accounts/static", ""), 200, "archive the account");
+    accounts.archive(api::AccountRef { account: "static" }) or discard;
+    let broken = seats.get(api::SeatRef { node: "laptop", seat: "static" }) or no_seat();
+    let mut why_broken = "";
+    for p in broken.problems {
+        why_broken = why_broken + p + "\n";
+    }
     std::test::assert(
-        std::str::contains(
-            call(e, "GET", "/admin/v1/nodes/laptop/seats/static", "").body,
-            "account static is archived",
-        ),
+        std::str::contains(why_broken, "account static is archived"),
         "the seat shows the problem",
     );
 
-    let removed = call(e, "DELETE", "/admin/v1/nodes/laptop/seats/static", "");
-    expect(removed, 200, "remove");
-    std::test::assert_eq_str(
-        std::json::find_string_field(removed.body, "ref"),
-        "laptop/static",
-        "the removed seat",
-    );
-    expect(call(e, "GET", "/admin/v1/nodes/laptop/seats/static", ""), 404, "gone");
+    let removed = seats.remove(
+        api::SeatRef { node: "laptop", seat: "static" },
+    ) or no_seat();
+    std::test::assert_eq_str(removed.ref, "laptop/static", "the removed seat");
+    failed = "";
+    seats.get(api::SeatRef { node: "laptop", seat: "static" }) or { failed = why(err); };
+    std::test::assert(std::str::starts_with(failed, "not_found"), "gone: " + failed);
 
     // revoking
-    let revoked = call(e, "DELETE", "/admin/v1/nodes/laptop", "");
-    expect(revoked, 200, "revoke");
-    std::test::assert_eq_str(
-        std::json::find_string_field(revoked.body, "status"),
-        "revoked",
-        "revoked",
-    );
+    let revoked = nodes.revoke(api::NodeRef { node: "laptop" }) or no_node();
+    std::test::assert(revoked.status == api::NodeStatus::revoked, "revoked");
+    std::test::assert(revoked.has_revoked_at, "when");
+    failed = "";
+    nodes.rotate_token(api::NodeRef { node: "laptop" }) or { failed = why(err); };
     std::test::assert(
-        std::str::ends_with(std::json::find_string_field(revoked.body, "revoked_at"), "Z"),
-        "when",
+        std::str::starts_with(failed, "conflict"),
+        "a revoked node gets no token: " + failed,
     );
-    expect(
-        call(e, "POST", "/admin/v1/nodes/laptop/token", ""),
-        409,
-        "a revoked node gets no token",
-    );
-    expect(
-        call(
-            e,
-            "POST",
-            "/admin/v1/nodes/laptop/seats",
-            "{\"id\": \"y\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}]}",
-        ),
-        409,
-        "nor a seat",
-    );
-    expect(
-        call(e, "POST", "/admin/v1/nodes", "{\"id\": \"laptop\"}"),
-        409,
-        "its id is never reused",
+    failed = "";
+    seats.create(static_seat("laptop", "y", "static")) or { failed = why(err); };
+    std::test::assert(std::str::starts_with(failed, "conflict"), "nor a seat: " + failed);
+    failed = "";
+    nodes.create(api::NodeCreate { id: "laptop" }) or { failed = why(err); };
+    std::test::assert(
+        std::str::starts_with(failed, "conflict"),
+        "its id is never reused: " + failed,
     );
 }

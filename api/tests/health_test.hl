@@ -1,41 +1,44 @@
-// GET /healthz and GET /readyz.
+// GET /healthz and GET /readyz: the Probes rows.
 import ".." as api;
 import "../../store" as st;
 
 fn main() {
-    let e = api::Endpoints { };
-    let live = e.handle(std::http::Request { method: "GET", path: "/healthz" });
-    std::test::assert_eq_int(live.status, 200, "alive");
-    std::test::assert_eq_str(live.content_type, "application/json", "JSON");
-    std::test::assert_eq_str(std::json::find_string_field(live.body, "status"), "ok", "ok");
-    std::test::assert(len(std::json::find_string_field(live.body, "version")) > 0, "a version");
-    std::test::assert(!std::str::contains(live.body, "checks"), "liveness checks nothing");
+    let p = api::Probes { store: st::MemoryStore { } };
+    let live = p.liveness();
+    std::test::assert(live.status == api::HealthStatus::ok, "alive");
+    std::test::assert(len(live.version) > 0, "a version");
+    std::test::assert_eq_int(count(live.checks), 0, "liveness checks nothing");
+    let wire = api::Health::api_encode(live);
+    std::test::assert_eq_str(std::json::find_string_field(wire, "status"), "ok", "ok on the wire");
+    std::test::assert(!std::str::contains(wire, "\"store\""), "liveness names no dependency");
 
-    let ready = e.handle(std::http::Request { method: "GET", path: "/readyz" });
-    std::test::assert_eq_int(ready.status, 200, "ready");
-    std::test::assert_eq_str(std::json::find_string_field(ready.body, "status"), "ok", "ok");
-    std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(ready.body, "checks"), "store"),
-        "ok",
-        "the store answers",
-    );
+    // a readiness failure is the class the transport answers 503 for, and
+    // quotes the health it states
+    let down = api::Health { status: api::HealthStatus::unavailable, version: "x" };
+    let refused = api::CtlError::NotReady(down);
+    std::test::assert_eq_str(api::ctl_class(refused), "unavailable", "not ready is unavailable");
+    std::test::assert_eq_int(api::ctl_status(refused), 503, "503");
 
     // the handlers, called as their rows are
-    let p = api::Probes { store: st::MemoryStore { } };
-    let r = p.readiness();
+    let r = p.readiness() or api::Health { status: api::HealthStatus::unavailable };
     let store = at(r.checks, 0) or api::Check { status: api::HealthStatus::unavailable };
+    std::test::assert_eq_str(
+        std::json::find_string_field(api::Health::api_encode(r), "status"),
+        "ok",
+        "ready",
+    );
     std::test::assert(
         count(r.checks) == 1 && store.name == "store" && store.status == api::HealthStatus::ok,
         "a memory store is always ready",
     );
 
     // `checks` is a map of values: each check its state alone, keyed by
-    // its name, on the codec's wire as on the router's
-    let wire = api::Health::api_encode(r);
+    // its name, on the codec's wire
+    let ready_wire = api::Health::api_encode(r);
     std::test::assert_eq_str(
-        std::json::find_string_field(std::json::find_field_raw(wire, "checks"), "store"),
+        std::json::find_string_field(std::json::find_field_raw(ready_wire, "checks"), "store"),
         "ok",
-        "the codec writes the check's state under its name: " + wire,
+        "the codec writes the check's state under its name: " + ready_wire,
     );
     let back = api::Health::api_decode(
         "{\"status\": \"unavailable\", \"checks\": {\"store\": \"unavailable\", \"nats\": \"ok\"}}",

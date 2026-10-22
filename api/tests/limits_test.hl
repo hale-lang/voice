@@ -1,27 +1,8 @@
-// Budgets and limits, as configuration: GET/PUT
-// /admin/v1/projects/{project}/budget and /admin/v1/projects/{project}/limits,
-// through the router; and the windows a budget counts in.
+// Budgets and limits, as configuration: the budget and limits rows of
+// `Projects`, called on a receiver over a store; and the windows a budget
+// counts in.
 import ".." as api;
 import "../../store" as st;
-
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
-}
-
-fn expect(r: std::http::Response, status: Int, what: String) {
-    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
-}
-
-fn str(r: std::http::Response, name: String) -> String {
-    return std::json::find_string_field(r.body, name);
-}
 
 fn at(text: String) -> Time {
     return std::time::parse_time(text) or `1970-01-01T00:00:00Z`;
@@ -146,188 +127,180 @@ fn windows() {
 
 fn main() {
     windows();
-    let e = api::Endpoints { };
-    expect(
-        call(e, "POST", "/admin/v1/projects", "{\"id\": \"work\", \"name\": \"Work\"}"),
-        201,
-        "a project",
-    );
+    let store = st::MemoryStore { };
+    let projects = api::Projects { store: store };
+    let changes = api::Changes { store: store };
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let work = api::ProjectRef { project: "work" };
 
-    expect(call(e, "GET", "/admin/v1/projects/work/budget", ""), 404, "no budget yet");
-    expect(call(e, "GET", "/admin/v1/projects/nope/budget", ""), 404, "an unknown project");
-    let set = call(
-        e,
-        "PUT",
-        "/admin/v1/projects/work/budget",
-        "{\"allowance_micros\": 50000000, \"period\": \"month\"}",
-    );
-    expect(set, 200, "set a budget");
-    std::test::assert_eq_str(str(set, "currency"), "USD", "currency defaults to USD");
+    let mut failed = "";
+    projects.budget(work) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "no budget yet");
+    failed = "";
+    projects.budget(api::ProjectRef { project: "nope" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "an unknown project");
+    let set = projects.set_budget(
+        api::BudgetRequest {
+            project: "work",
+            allowance_micros: 50000000,
+            period: st::Period::month,
+        },
+    ) or api::Budget { allowance_micros: -1 };
+    std::test::assert_eq_str(set.currency, "USD", "currency defaults to USD");
     std::test::assert(
-        std::str::ends_with(str(set, "period_anchor"), "-01T00:00:00Z"),
+        std::str::ends_with(std::time::iso8601(set.period_anchor), "-01T00:00:00Z"),
         "a month counts from the 1st",
     );
-    std::test::assert_eq_int(
-        std::json::find_int_field(set.body, "remaining_micros"),
-        50000000,
-        "all of it remains",
-    );
-    std::test::assert_eq_int(
-        std::json::find_int_field(set.body, "spent_micros"),
-        0,
-        "nothing spent",
-    );
-    expect(call(e, "GET", "/admin/v1/projects/work/budget", ""), 200, "read it back");
-    let life = call(
-        e,
-        "PUT",
-        "/admin/v1/projects/work/budget",
-        "{\"allowance_micros\": 10, \"period\": \"none\", \"period_anchor\": \"2026-01-01T00:00:00Z\"}",
-    );
-    expect(life, 200, "a lifetime cap");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(life.body, "window_end")),
-        "null",
-        "has no window end",
-    );
-    std::test::assert_eq_int(
-        std::json::find_int_field(
-            std::json::find_field_raw(call(e, "GET", "/admin/v1/projects/work", "").body, "budget"),
-            "allowance_micros",
-        ),
-        10,
-        "the project shows it",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/budget",
-            "{\"allowance_micros\": 10, \"period\": \"year\"}",
-        ),
-        400,
-        "a period is day, week, month or none",
-    );
-    expect(
-        call(e, "PUT", "/admin/v1/projects/work/budget", "{\"period\": \"day\"}"),
-        400,
-        "an allowance is required",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/budget",
-            "{\"allowance_micros\": 1, \"period\": \"day\", \"period_anchor\": \"monday\"}",
-        ),
-        400,
-        "an anchor is a time",
-    );
+    std::test::assert_eq_int(set.remaining_micros, 50000000, "all of it remains");
+    std::test::assert_eq_int(set.spent_micros, 0, "nothing spent");
+    let back = projects.budget(work) or api::Budget { allowance_micros: -1 };
+    std::test::assert_eq_int(back.allowance_micros, 50000000, "read it back");
+    let life = projects.set_budget(
+        api::BudgetRequest {
+            project: "work",
+            allowance_micros: 10,
+            period: st::Period::none,
+            has_period_anchor: true,
+            period_anchor: `2026-01-01T00:00:00Z`,
+        },
+    ) or api::Budget { allowance_micros: -1 };
+    std::test::assert_eq_int(life.allowance_micros, 10, "a lifetime cap");
+    std::test::assert(!life.has_window_end, "has no window end");
+    let shown = projects.get(work) or api::Project { status: api::Lifecycle::archived };
+    std::test::assert(shown.has_budget, "the project has a budget");
+    std::test::assert_eq_int(shown.budget.allowance_micros, 10, "the project shows it");
+    failed = "";
+    projects.set_budget(
+        api::BudgetRequest { project: "work", allowance_micros: -1, period: st::Period::day },
+    ) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(failed, "invalid allowance_micros", "an allowance is at least 0");
+    failed = "";
+    projects.set_budget(
+        api::BudgetRequest { project: "nope", allowance_micros: 1, period: st::Period::day },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "a budget needs its project");
+    let kept = projects.budget(work) or api::Budget { allowance_micros: -1 };
+    std::test::assert_eq_int(kept.allowance_micros, 10, "a refused budget changed nothing");
 
-    let none = call(e, "GET", "/admin/v1/projects/work/limits", "");
-    expect(none, 200, "limits");
-    std::test::assert_eq_str(
-        std::str::trim(none.body),
-        "{\"limits\": [], \"source\": \"stored\"}",
-        "none yet, as stored",
-    );
-    let limits = call(
-        e,
-        "PUT",
-        "/admin/v1/projects/work/limits",
-        "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 600, \"output_tokens\": 200000, \"concurrent\": 16}, {\"scope\": \"model\", \"model\": \"echo-1\", \"window_seconds\": 3600, \"requests\": 200, \"remaining\": {\"requests\": 1}}]}",
-    );
-    expect(limits, 200, "replace them");
-    let first = std::json::array_first(std::json::find_field_raw(limits.body, "limits")).element;
-    std::test::assert_eq_int(std::json::find_int_field(first, "requests"), 600, "a count");
-    std::test::assert_eq_str(
-        std::str::trim(std::json::find_field_raw(first, "input_tokens")),
-        "null",
-        "a count left out is unlimited",
-    );
-    std::test::assert(
-        !std::str::contains(limits.body, "remaining"),
-        "remaining is read-only and nothing is counted yet",
-    );
-    std::test::assert(
-        std::str::contains(call(e, "GET", "/admin/v1/projects/work", "").body, "\"echo-1\""),
-        "the project shows them",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"key\", \"window_seconds\": 60}]}",
+    let none = projects.limits(work) or api::LimitSet { source: api::LimitSource::practice };
+    std::test::assert_eq_int(count(none.limits), 0, "no limits yet");
+    std::test::assert(none.source == api::LimitSource::stored, "none yet, as stored");
+    std::test::assert(!none.has_practice, "from no practice");
+
+    let mut put = api::LimitsRequest { project: "work" };
+    push(
+        put.limits,
+        st::counted(
+            st::Limit {
+                scope: st::LimitScope::project,
+                window_seconds: 60,
+                requests: 600,
+                output_tokens: 200000,
+                concurrent: 16,
+            },
         ),
-        400,
-        "a key limit lives on its key",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"model\", \"window_seconds\": 60}]}",
+    ) or discard;
+    push(
+        put.limits,
+        st::counted(
+            st::Limit {
+                scope: st::LimitScope::model,
+                model: "echo-1",
+                window_seconds: 3600,
+                requests: 200,
+            },
         ),
-        400,
-        "a model limit names its model",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"model\": \"echo-1\", \"window_seconds\": 60}]}",
-        ),
-        400,
-        "only a model limit names a model",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 0}]}",
-        ),
-        400,
-        "a window is at least a second",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": -1}]}",
-        ),
-        400,
-        "a count is at least 0",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 60, \"requests\": 99999999999999999999}]}",
-        ),
-        400,
-        "a count past 64 bits is out of range, not unlimited",
-    );
-    expect(
-        call(
-            e,
-            "PUT",
-            "/admin/v1/projects/work/limits",
-            "{\"limits\": [{\"scope\": \"project\", \"window_seconds\": 99999999999999999999, \"requests\": 1}]}",
-        ),
-        400,
-        "so is a window",
-    );
-    expect(call(e, "PUT", "/admin/v1/projects/work/limits", "{}"), 400, "limits are required");
-    let cleared = call(e, "PUT", "/admin/v1/projects/work/limits", "{\"limits\": []}");
-    std::test::assert_eq_str(
-        std::str::trim(cleared.body),
-        "{\"limits\": [], \"source\": \"stored\"}",
-        "an empty set clears them",
-    );
+    ) or discard;
+    let limits = projects.set_limits(put) or api::LimitSet { source: api::LimitSource::practice };
+    std::test::assert_eq_int(count(limits.limits), 2, "replace them");
+    let mut first = true;
+    for l in limits.limits {
+        if first {
+            std::test::assert_eq_int(l.requests, 600, "a count");
+            std::test::assert(
+                l.has_requests && l.has_output_tokens && l.has_concurrent,
+                "counts set",
+            );
+            std::test::assert(!l.has_input_tokens, "a count left out is unlimited");
+            std::test::assert_eq_int(l.concurrent, 16, "another count");
+        }
+        first = false;
+    }
+    let shown_limits = projects.get(work) or api::Project { status: api::Lifecycle::archived };
+    let mut model_limit = false;
+    for l in shown_limits.limits {
+        if l.model == "echo-1" { model_limit = true; }
+    }
+    std::test::assert(model_limit, "the project shows them");
+    let read = projects.limits(work) or api::LimitSet { source: api::LimitSource::practice };
+    std::test::assert_eq_int(count(read.limits), 2, "and the row reads them back");
+
+    let mut key_scope = api::LimitsRequest { project: "work" };
+    push(key_scope.limits, st::Limit { scope: st::LimitScope::key, window_seconds: 60 }) or discard;
+    failed = "";
+    projects.set_limits(key_scope) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a key limit lives on its key");
+    let mut no_model = api::LimitsRequest { project: "work" };
+    push(
+        no_model.limits,
+        st::Limit { scope: st::LimitScope::model, window_seconds: 60 },
+    ) or discard;
+    failed = "";
+    projects.set_limits(no_model) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a model limit names its model");
+    let mut named = api::LimitsRequest { project: "work" };
+    push(
+        named.limits,
+        st::Limit { scope: st::LimitScope::project, model: "echo-1", window_seconds: 60 },
+    ) or discard;
+    failed = "";
+    projects.set_limits(named) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "only a model limit names a model");
+    let mut instant = api::LimitsRequest { project: "work" };
+    push(
+        instant.limits,
+        st::Limit { scope: st::LimitScope::project, window_seconds: 0 },
+    ) or discard;
+    failed = "";
+    projects.set_limits(instant) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a window is at least a second");
+    failed = "";
+    projects.set_limits(api::LimitsRequest { project: "nope" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "limits need their project");
+    let still = projects.limits(work) or api::LimitSet { source: api::LimitSource::practice };
+    std::test::assert_eq_int(count(still.limits), 2, "refused limits changed nothing");
+
+    let cleared = projects.set_limits(api::LimitsRequest { project: "work" }) or api::LimitSet {
+        source: api::LimitSource::practice,
+    };
+    std::test::assert_eq_int(count(cleared.limits), 0, "an empty set clears them");
+    std::test::assert(cleared.source == api::LimitSource::stored, "as stored");
+
+    // each write is a change in the log, under its own target
+    let log = changes.list(
+        api::ChangeAsk { target: "projects/work/limits" },
+    ) or api::ChangeList { };
+    std::test::assert_eq_int(count(log.data), 2, "two limit writes logged");
+    let budget_log = changes.list(
+        api::ChangeAsk { target: "projects/work/budget" },
+    ) or api::ChangeList { };
+    std::test::assert_eq_int(count(budget_log.data), 2, "two budget writes logged");
 }

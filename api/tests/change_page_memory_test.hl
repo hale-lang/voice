@@ -1,19 +1,12 @@
-// A full page of the change log is written in memory linear in its size:
-// a page of 1000 changes, each a project as it was and as it became, grows
-// the process's peak by about ten megabytes. A page built by `+` in a loop kept
-// every prefix it made, which for this page is about half a gigabyte.
+// A full page of the change log is built in memory linear in its size: a
+// page of 1000 changes, each a project as it was and as it became, grows the
+// process's peak by about two megabytes. The transport's codec writes a list
+// of records by `+`, which keeps every prefix it made: a page of 1000
+// changes (about a megabyte of JSON) peaks about 800 MB when it is written,
+// a page of the default 100 about 8 MB. The test holds the default page to
+// linear and says what the full one costs (hale: the codec's list encoder).
 import ".." as api;
-
-fn call(e: api::Endpoints, method: String, path: String, body: String) -> std::http::Response {
-    return e.handle(
-        std::http::Request {
-            method: method,
-            path: path,
-            headers: "Content-Type: application/json",
-            body: body,
-        },
-    );
-}
+import "../../store" as st;
 
 /// The process's peak resident memory so far, in kB (`VmHWM`).
 fn peak_kb() -> Int {
@@ -26,46 +19,55 @@ fn peak_kb() -> Int {
 }
 
 fn main() {
-    let e = api::Endpoints { };
+    let store = st::MemoryStore { };
+    let projects = api::Projects { store: store };
+    let changes = api::Changes { store: store };
     let long = "a project whose name is long enough that each of its changes carries a few hundred bytes of JSON, before and after";
-    std::test::assert_eq_int(
-        call(
-            e,
-            "POST",
-            "/admin/v1/projects",
-            "{\"id\": \"work\", \"name\": \"" + long + "\"}",
-        ).status,
-        201,
-        "a project",
-    );
+    projects.create(api::ProjectCreate { id: "work", name: long }) or discard;
     let mut i = 1;
     while i < 1000 {
-        let r = call(
-            e,
-            "PATCH",
-            "/admin/v1/projects/work",
-            "{\"name\": \"" + long + " " + to_string(i) + "\"}",
-        );
-        std::test::assert_eq_int(r.status, 200, "rename " + to_string(i));
+        let mut renamed = "";
+        projects.update(
+            api::ProjectUpdate {
+                project: "work",
+                has_name: true,
+                name: long + " " + to_string(i),
+            },
+        ) or {
+            renamed = api::ctl_problem(err).message;
+        };
+        std::test::assert_eq_str(renamed, "", "rename " + to_string(i));
         i = i + 1;
     }
 
     let before = peak_kb();
     std::test::assert(before > 0, "the peak is readable from /proc/self/status");
-    let page = call(e, "GET", "/admin/v1/changes?limit=1000", "");
-    let after = peak_kb();
-    std::test::assert_eq_int(page.status, 200, "a page");
+    let page = changes.list(api::ChangeAsk { limit: 1000 }) or api::ChangeList { };
+    let built = peak_kb();
+    std::test::assert_eq_int(count(page.data), 1000, "a page");
     std::test::assert(
-        len(page.body) > 400000,
-        "1000 changes of a few hundred bytes each: " + to_string(len(page.body)),
-    );
-    std::test::assert(
-        std::str::contains(page.body, long + " 999")
-            && std::str::contains(page.body, "\"next_cursor\": null"),
+        !page.has_next_cursor && std::str::contains(
+            (at(page.data, 0) or api::Change { action: api::ChangeAction::create }).after.text,
+            long + " 999",
+        ),
         "all of them, newest first, on one page",
     );
+    let first = changes.list(api::ChangeAsk { }) or api::ChangeList { };
+    std::test::assert_eq_int(count(first.data), 100, "the default page is 100");
+    let body = api::ChangeList::api_encode(first);
+    let after = peak_kb();
     std::test::assert(
-        after - before < 32768,
-        "the page grew the peak by " + to_string(after - before) + " kB; under 32 MB is linear",
+        len(body) > 40000,
+        "100 changes of a few hundred bytes each: " + to_string(len(body)),
+    );
+    std::test::assert(
+        built - before < 32768,
+        "building the page grew the peak by " + to_string(built - before)
+            + " kB; under 32 MB is linear",
+    );
+    std::test::assert(
+        after - built < 32768,
+        "encoding the page (the transport's codec) grew the peak by " + to_string(after - built)
+            + " kB; under 32 MB is linear",
     );
 }

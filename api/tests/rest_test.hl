@@ -1,0 +1,298 @@
+// The api's front, over a real listener: `http::Rest` serves the surface's
+// rows from their routes and hands every path no row serves to the data
+// plane on the same listener (front.hl). The listener binds port 0 and the
+// test reads the port back from the exposure. One route per status class,
+// the transport's own answers (404 and 405 of a row's path, OPTIONS, HEAD,
+// a malformed body), and one data-plane route each for inference, the node
+// link's registration and the admin event stream.
+import ".." as api;
+
+fn call(method: String, url: String, headers: String, body: String) -> std::http::ClientResponse {
+    let u = std::http::parse_url(url) or std::http::Url { };
+    let req = std::http::ClientRequest {
+        method: method,
+        url: u,
+        headers: headers,
+        body: std::bytes::from_string(body),
+    };
+    return std::http::request(req) or std::http::ClientResponse {
+        status: -1,
+        headers: "",
+        body: b"",
+    };
+}
+
+fn text(r: std::http::ClientResponse) -> String {
+    return std::str::from_bytes(r.body);
+}
+
+fn field(body: String, name: String) -> String {
+    return std::json::find_string_field(body, name);
+}
+
+type Done { ok: Bool; }
+type Go { address: String; }
+
+locus Driver {
+    bus {
+        publish "rest.done" of type Done;
+        subscribe "rest.go" as on_go of type Go;
+    }
+    fn on_go(g: Go) {
+        let base = "http://" + g.address;
+        let json = "Content-Type: application/json";
+
+        // ---- 200 and 201: a row answers, its body the answer by codec
+        let live = call("GET", base + "/healthz", "", "");
+        std::test::assert_eq_int(live.status, 200, "liveness: " + text(live));
+        std::test::assert_eq_str(field(text(live), "status"), "ok", "ok");
+        let none = call("GET", base + "/admin/v1/projects", "", "");
+        std::test::assert_eq_int(none.status, 200, "an empty list: " + text(none));
+        std::test::assert_eq_str(text(none), "{\"data\":[]}", "no projects yet");
+        let made = call(
+            "POST",
+            base + "/admin/v1/projects",
+            json,
+            "{\"id\": \"work\", \"name\": \"Work\"}",
+        );
+        std::test::assert_eq_int(made.status, 201, "created: " + text(made));
+        std::test::assert_eq_str(field(text(made), "status"), "active", "an active project");
+        std::test::assert(
+            !std::str::contains(text(made), "\"models\"")
+                && !std::str::contains(text(made), "\"budget\""),
+            "an optional field that is not set is left out: " + text(made),
+        );
+        let got = call("GET", base + "/admin/v1/projects/work", "", "");
+        std::test::assert_eq_int(got.status, 200, "get: " + text(got));
+
+        // ---- 404 (not_found), 409 (conflict), 422 (invalid): a handler's class
+        let missing = call("GET", base + "/admin/v1/projects/nope", "", "");
+        std::test::assert_eq_int(missing.status, 404, "an unknown project");
+        std::test::assert(
+            std::str::contains(std::str::lower(missing.headers), "hale-error-class: not_found"),
+            "names its class: " + missing.headers,
+        );
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(missing), "NotFound"), "code"),
+            "not_found",
+            "the variant by codec: " + text(missing),
+        );
+        let again = call(
+            "POST",
+            base + "/admin/v1/projects",
+            json,
+            "{\"id\": \"work\", \"name\": \"Again\"}",
+        );
+        std::test::assert_eq_int(again.status, 409, "an id is taken once: " + text(again));
+        std::test::assert(
+            std::str::contains(std::str::lower(again.headers), "hale-error-class: conflict"),
+            "conflict",
+        );
+        let invalid = call(
+            "POST",
+            base + "/admin/v1/projects",
+            json,
+            "{\"id\": \"Work\", \"name\": \"W\"}",
+        );
+        std::test::assert_eq_int(invalid.status, 422, "an id is lowercase: " + text(invalid));
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(invalid), "Invalid"), "param"),
+            "id",
+            "naming the field",
+        );
+        // a refused field is refused by name, not ignored
+        let refused = call(
+            "PATCH",
+            base + "/admin/v1/projects/work",
+            json,
+            "{\"budget\": {\"allowance_micros\": 1, \"period\": \"day\"}}",
+        );
+        std::test::assert_eq_int(
+            refused.status,
+            422,
+            "a budget has its own endpoint: " + text(refused),
+        );
+
+        // ---- 400: the transport's own refusal of a body that is not the request
+        let wrong = call("POST", base + "/admin/v1/projects", json, "{\"id\": 5, \"name\": \"W\"}");
+        std::test::assert_eq_int(wrong.status, 400, "a field of the wrong type: " + text(wrong));
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(wrong), "refusal"), "kind"),
+            "malformed",
+            "malformed",
+        );
+        let absent = call("POST", base + "/admin/v1/projects", json, "{\"name\": \"W\"}");
+        std::test::assert_eq_int(absent.status, 400, "a field the request needs: " + text(absent));
+
+        // ---- a path and a query bind the request's fields
+        let page = call("GET", base + "/admin/v1/projects?include_archived=true", "", "");
+        std::test::assert_eq_int(page.status, 200, "a query parameter: " + text(page));
+        let bad_limit = call("GET", base + "/admin/v1/changes?limit=0", "", "");
+        std::test::assert_eq_int(
+            bad_limit.status,
+            422,
+            "a query the handler judges: " + text(bad_limit),
+        );
+        let changes = call("GET", base + "/admin/v1/changes?limit=1", "", "");
+        std::test::assert_eq_int(changes.status, 200, "one change: " + text(changes));
+        std::test::assert(
+            std::str::contains(text(changes), "projects/work"),
+            "the create is logged",
+        );
+
+        // ---- 405, OPTIONS and HEAD of a row's path are the transport's
+        let wrong_method = call("PUT", base + "/healthz", "", "");
+        std::test::assert_eq_int(wrong_method.status, 405, "another method on a row's path");
+        std::test::assert(
+            std::str::contains(wrong_method.headers, "Allow: GET, HEAD, OPTIONS"),
+            "Allow: " + wrong_method.headers,
+        );
+        let opts = call("OPTIONS", base + "/admin/v1/projects/work", "", "");
+        std::test::assert_eq_int(opts.status, 204, "OPTIONS is answered");
+        std::test::assert(
+            std::str::contains(opts.headers, "Allow: DELETE, GET, HEAD, PATCH, OPTIONS"),
+            "with what the path takes: " + opts.headers,
+        );
+        let head = call("HEAD", base + "/admin/v1/projects/work", "", "");
+        std::test::assert_eq_int(head.status, 200, "HEAD of a GET route");
+        std::test::assert_eq_int(len(head.body), 0, "has no body");
+
+        // ---- the data plane, on the same listener and connection
+        let unknown = call("GET", base + "/nope", "", "");
+        std::test::assert_eq_int(unknown.status, 404, "a path nothing serves");
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(unknown), "error"), "code"),
+            "not_found",
+            "in the data plane's envelope: " + text(unknown),
+        );
+        // inference, streamed: its own key, its own OpenAI-shaped refusal
+        let nokey = call(
+            "POST",
+            base + "/v1/chat/completions",
+            json,
+            "{\"model\": \"echo-1\", \"stream\": true, \"messages\": []}",
+        );
+        std::test::assert_eq_int(nokey.status, 401, "a caller without a key: " + text(nokey));
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(nokey), "error"), "code"),
+            "invalid_key",
+            "refused by the data plane, not the exposure's bearer",
+        );
+        let model = call("POST", base + "/admin/v1/models", json, "{\"id\": \"echo-1\"}");
+        std::test::assert_eq_int(model.status, 201, "a model: " + text(model));
+        let key = call("POST", base + "/admin/v1/projects/work/keys", json, "{\"name\": \"ci\"}");
+        std::test::assert_eq_int(key.status, 201, "a key: " + text(key));
+        let secret = field(text(key), "secret");
+        std::test::assert(std::str::starts_with(secret, "vk-"), "its secret, shown once");
+        let auth = "Authorization: Bearer " + secret + "\r\n" + json;
+        let seatless = call(
+            "POST",
+            base + "/v1/chat/completions",
+            auth,
+            "{\"model\": \"echo-1\", \"stream\": true, \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}]}",
+        );
+        std::test::assert_eq_int(seatless.status, 503, "no seat serves it: " + text(seatless));
+        std::test::assert_eq_str(
+            field(std::json::find_field_raw(text(seatless), "error"), "code"),
+            "no_eligible_seat",
+            "an admitted request reaches the seats",
+        );
+        let models = call("GET", base + "/v1/models", "Authorization: Bearer " + secret, "");
+        std::test::assert_eq_int(
+            models.status,
+            200,
+            "the caller plane's model list: " + text(models),
+        );
+        // the node link: a node registers under its enrollment token
+        let node = call("POST", base + "/admin/v1/nodes", json, "{\"id\": \"laptop\"}");
+        std::test::assert_eq_int(node.status, 201, "a node: " + text(node));
+        let token = field(text(node), "enrollment_token");
+        let account = call(
+            "POST",
+            base + "/admin/v1/accounts",
+            json,
+            "{\"id\": \"static\", \"name\": \"Static\"}",
+        );
+        std::test::assert_eq_int(account.status, 201, "an account: " + text(account));
+        let bad_config = call(
+            "POST",
+            base + "/admin/v1/nodes/laptop/seats",
+            json,
+            "{\"id\": \"s\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": \"text\"}",
+        );
+        std::test::assert_eq_int(
+            bad_config.status,
+            422,
+            "a config is an object: " + text(bad_config),
+        );
+        let bad_account = call(
+            "POST",
+            base + "/admin/v1/projects",
+            json,
+            "{\"id\": \"lab\", \"name\": \"Lab\", \"accounts\": [\"Not An Id\"]}",
+        );
+        std::test::assert_eq_int(
+            bad_account.status,
+            422,
+            "accounts are account ids: " + text(bad_account),
+        );
+        let anon = call("POST", base + "/node/v1/register", json, "{}");
+        std::test::assert_eq_int(anon.status, 401, "a node needs its token: " + text(anon));
+        let registered = call(
+            "POST",
+            base + "/node/v1/register",
+            "Authorization: Bearer " + token + "\r\n" + json,
+            "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": {\"max_in_flight\": 2, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}, \"local\": {\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}}",
+        );
+        std::test::assert_eq_int(registered.status, 200, "registered: " + text(registered));
+        std::test::assert(
+            std::str::contains(text(registered), "assignment"),
+            "with its assignment",
+        );
+        // the admin event stream
+        let events = call("GET", base + "/admin/v1/events?type=change", "", "");
+        std::test::assert_eq_int(events.status, 200, "the event stream opens");
+        std::test::assert(
+            std::str::contains(std::str::lower(events.headers), "text/event-stream"),
+            "as server-sent events: " + events.headers,
+        );
+        let bad_type = call("GET", base + "/admin/v1/events?type=other", "", "");
+        std::test::assert_eq_int(bad_type.status, 422, "a type the stream does not carry");
+        "rest.done" <- Done { ok: true };
+    }
+}
+
+main locus App {
+    params {
+        front: api::Front = api::Front { bind: "127.0.0.1:0" };
+        driver: Driver = Driver { };
+        finished: Bool = false;
+    }
+    bus {
+        subscribe "rest.done" as on_done of type Done;
+        publish "rest.go" of type Go;
+    }
+    placement {
+        front: cooperative(pool = edge) where async_io;
+        driver: cooperative(pool = client) where async_io;
+    }
+    run() {
+        let mut i = 0;
+        while std::str::ends_with(self.front.web.address, ":0") && i < 3000 {
+            std::time::sleep(10ms);
+            i = i + 1;
+        }
+        "rest.go" <- Go { address: std::str::clone(self.front.web.address) };
+        i = 0;
+        while !self.finished && i < 3000 {
+            std::time::sleep(10ms);
+            i = i + 1;
+        }
+        std::test::assert(self.finished, "the client ran to its end");
+    }
+    fn on_done(d: Done) {
+        self.finished = d.ok;
+    }
+}
+
+fn main() { App { }; }

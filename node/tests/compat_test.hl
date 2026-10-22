@@ -43,14 +43,36 @@ fn answer(s: std::io::tcp::Stream, status: String, body: String) {
     ) or discard;
 }
 
+/// The request off the connection, whole: the client may send its head and
+/// its body in separate writes.
+fn read_request(s: std::io::tcp::Stream) -> String {
+    let mut req = s.recv(65536) or "";
+    let he = std::str::index_of(req, "\r\n\r\n");
+    if he < 0 { return req; }
+    let lowered = std::str::lower(req[0..he]);
+    let at = std::str::index_of(lowered, "content-length:");
+    if at < 0 { return req; }
+    let rest = lowered[(at + 15)..len(lowered)];
+    let end = std::str::index_of(rest, "\r\n");
+    let want = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or 0;
+    while len(req) < he + 4 + want {
+        let more = s.recv(65536) or "";
+        if len(more) == 0 { break; }
+        req = req + more;
+    }
+    return req;
+}
+
 /// The stub upstream: one connection, one canned answer. The streamed one
 /// sends its SSE in several chunked writes, an event cut across two of
 /// them, with a pause between, and notes the time of its last write.
 fn stub_conn(s: std::io::tcp::Stream) {
-    let req = s.recv(65536) or "";
+    let req = read_request(s);
     if !std::str::starts_with(req, "POST ") { answer(s, "405 Method Not Allowed", "{}"); return; }
-    if std::str::starts_with(req, "POST /v1/chat/completions ") {
-        if std::str::contains(req, "Authorization: Bearer stub-key")
+    // /v2 is the same stream with no key asked (a keyless seat, read as it arrives)
+    let open = std::str::starts_with(req, "POST /v2/chat/completions ");
+    if std::str::starts_with(req, "POST /v1/chat/completions ") || open {
+        if (std::str::contains(req, "Authorization: Bearer stub-key") || open)
             && std::str::contains(req, "\"stream\":true")
             && std::str::contains(req, "\"model\":\"stub-7b\"")
         {
@@ -88,6 +110,22 @@ fn stub_conn(s: std::io::tcp::Stream) {
         ) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /nohead/chat/completions ") {
+        // accepts, reads the request, and never answers
+        std::time::sleep(5s);
+        return;
+    }
+    if std::str::starts_with(req, "POST /silent/chat/completions ") {
+        // one event, then silence with the connection open
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + chunk(
+                    "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                ),
+        ) or discard;
+        std::time::sleep(5s);
+        return;
+    }
     if std::str::starts_with(req, "POST /cut/chat/completions ") {
         // closes mid-stream: one event, no terminal chunk, no [DONE]
         s.send(
@@ -95,6 +133,15 @@ fn stub_conn(s: std::io::tcp::Stream) {
                 + chunk(
                     "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
                 ),
+        ) or discard;
+        return;
+    }
+    if std::str::starts_with(req, "POST /closed/chat/completions ") {
+        // close-framed: one partial event, then the connection closes
+        // cleanly, with no finish reason and no [DONE]
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
         ) or discard;
         return;
     }
@@ -225,8 +272,11 @@ main locus App {
         );
 
         // streamed: the first event is published before the stub's last write
-        let up = node::upstream_for("resp_k0", "voice-1", ask, keyed);
-        up.open(node::compat_request(ask, keyed));
+        // (a keyed upstream is read whole until hale lets a reveal into a reader)
+        let unkeyed = node::compat_config(
+            "{\"base_url\": \"" + self.base + "/v2\", \"model\": \"stub-7b\"}",
+        );
+        let up = node::upstream_over_wire("resp_k0", "voice-1", ask, unkeyed);
         let mut first_at = -1;
         while !up.done {
             let d = up.next_data();
@@ -289,6 +339,70 @@ main locus App {
             2,
             "tokens estimated when the upstream gives no usage",
         );
+        // a silent upstream gives control back every second: the session
+        // services a cancel (and an assignment, and a refusal) between reads,
+        // so a cancelled request is released within about a second, however
+        // long the upstream stays quiet (the exchange's deadline is 30 min)
+        let quiet = node::upstream_over_wire(
+            "resp_q",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/silent\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let began = std::time::monotonic_ns();
+        let mut reads = 0;
+        let mut cancelled = false;
+        let mut said = "";
+        while !quiet.done && !cancelled {
+            let d = quiet.next_data();
+            if len(d) > 0 { said = said + d; }
+            reads = reads + 1;
+            // the session's `interject` finds the cancel after the first quiet read
+            if reads == 3 { cancelled = true; }
+        }
+        let waited = (std::time::monotonic_ns() - began) / 1000000;
+        std::test::assert(std::str::contains(said, "Hel"), "the event that came is read: " + said);
+        std::test::assert(
+            !quiet.done && len(quiet.failure) == 0,
+            "a quiet upstream is not an ended or failed one",
+        );
+        std::test::assert(
+            waited >= 900 && waited < 3000,
+            "two quiet reads gave control back in about a second each: " + to_string(waited)
+                + " ms",
+        );
+        // an upstream that accepts and never sends a head: the opening is
+        // driven a second at a time too, so a cancel is found within about a
+        // second, not when the exchange's deadline ends it
+        let nohead = node::upstream_over_wire(
+            "resp_n",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/nohead\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let n_began = std::time::monotonic_ns();
+        let mut n_reads = 0;
+        let mut n_cancelled = false;
+        while !nohead.done && !n_cancelled {
+            nohead.next_data();
+            n_reads = n_reads + 1;
+            // the session's `interject` finds the cancel after the first quiet read
+            if n_reads == 2 { n_cancelled = true; }
+        }
+        let n_waited = (std::time::monotonic_ns() - n_began) / 1000000;
+        std::test::assert(
+            !nohead.done && len(nohead.failure) == 0,
+            "an upstream with no head yet is not an ended or failed one: " + nohead.failure,
+        );
+        std::test::assert(
+            n_waited >= 900 && n_waited < 3000,
+            "two quiet reads gave control back in about a second each: " + to_string(n_waited)
+                + " ms",
+        );
         let cut = node::run_compat(
             "resp_k6",
             "voice-1",
@@ -303,13 +417,29 @@ main locus App {
             "a stream that closes before its end fails the run",
         );
         std::test::assert(std::str::contains(cut.failure, "early"), "and says so: " + cut.failure);
+        let closed = node::run_compat(
+            "resp_k7",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/closed\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        std::test::assert_eq_str(
+            closed.outcome,
+            "failed",
+            "a body that closes cleanly before the model finished fails the run: " + closed.failure,
+        );
+        std::test::assert(
+            std::str::contains(closed.failure, "before the model finished"),
+            "and says so: " + closed.failure,
+        );
         // a tool call split across chunks: events as they arrive, whole at the end
         let ask_tools = "{\"model\": \"voice-1\", \"input\": \"weather in Oslo?\", " + TOOLS_TAIL;
         let tc = node::compat_config(
             "{\"base_url\": \"" + self.base + "/tools\", \"model\": \"stub-7b\"}",
         );
-        let tup = node::upstream_for("resp_t1", "voice-1", ask_tools, tc);
-        tup.open(node::compat_request(ask_tools, tc));
+        let tup = node::upstream_over_wire("resp_t1", "voice-1", ask_tools, tc);
         let mut events = "";
         let mut fragments = 0;
         while !tup.done {

@@ -33,10 +33,14 @@ to a seat over NATS, streamed back, and metered.
 
 ## Getting started
 
-You need Docker with Compose.
+You need Docker with Compose. The image is built with a Linux hale toolchain
+from `.hale-toolchain/`, which `scripts/hale-toolchain.sh` makes: hale built at
+the commit in `hale.pin` (needs Rust and LLVM 18, see `scripts/build-hale.sh`),
+or `scripts/hale-toolchain.sh --release v0.28.0` for a released tarball.
 
 ```sh
 git clone https://github.com/hale-lang/voice && cd voice
+scripts/hale-toolchain.sh
 docker compose up --build -d
 curl localhost:8080/healthz
 ```
@@ -81,8 +85,18 @@ lists every configuration change you just made.
 
 ## Developing
 
-With the [Hale toolchain](https://github.com/hale-lang/hale) (the version
-in [`Dockerfile`](./Dockerfile)):
+With the [Hale toolchain](https://github.com/hale-lang/hale) built at the
+commit in [`hale.pin`](./hale.pin) (voice uses hale features merged on main and
+not yet released; CI, the image and the Mac node all build that one commit).
+`scripts/build-hale.sh` builds and installs it into `~/.hale/bin` (it needs
+Rust and LLVM 18; the script's header lists the packages), and CI caches the
+result per commit:
+
+```sh
+scripts/build-hale.sh                   # hale at the pin, into ~/.hale/bin
+```
+
+Then:
 
 ```sh
 hale build api && hale test api

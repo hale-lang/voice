@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { MaybeOptionalInit, FetchResponse } from 'openapi-fetch';
 import type { PathsWithMethod, RequiredKeysOf } from 'openapi-typescript-helpers';
-import { api } from './client';
+import { api, describe } from './client';
 import type { paths } from './schema';
 
 type Method = 'post' | 'put' | 'patch' | 'delete';
@@ -29,8 +29,7 @@ export function useWrite() {
       const fn = { post: api.POST, put: api.PUT, patch: api.PATCH, delete: api.DELETE }[method] as (p: P, ...i: typeof init) => Promise<{ data?: unknown; error?: unknown; response: Response }>;
       const r = await fn(path, ...init);
       if (r.error !== undefined) {
-        const e = r.error as { error?: { message?: string; code?: string } };
-        setError(e?.error?.code ? `${e.error.code}: ${e.error.message ?? ''}` : (e?.error?.message ?? `${r.response.status}`));
+        setError(describe(r.error, r.response.status));
         return null;
       }
       if (r.response.status === 202) {

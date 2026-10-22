@@ -38,8 +38,17 @@ export function useGet<P extends GetPaths>(path: P, ...init: InitParam<MaybeOpti
   });
 }
 
-function describe(error: unknown, status: number): string {
-  const e = error as { error?: { message?: string; code?: string } } | undefined;
-  const msg = e?.error?.message ?? `${status}`;
-  return e?.error?.code ? `${e.error.code}: ${msg}` : msg;
+/**
+ * What a failure says. The control plane answers a class's variant,
+ * `{"NotFound": {"code", "message"}}` (a transport refusal is
+ * `{"refusal": {"kind", "reason"}}`); the data plane keeps the OpenAI-shaped
+ * `{"error": {...}}`.
+ */
+export function describe(error: unknown, status: number): string {
+  const body = (error ?? {}) as Record<string, unknown>;
+  const problem = (body.error ?? Object.values(body).find((v) => v && typeof v === 'object' && 'message' in (v as object))) as { message?: string; code?: string } | undefined;
+  const refusal = body.refusal as { kind?: string; reason?: string } | undefined;
+  if (problem?.message !== undefined) return problem.code ? `${problem.code}: ${problem.message}` : problem.message;
+  if (refusal) return `${refusal.kind ?? 'refused'}: ${refusal.reason ?? ''}`;
+  return `${status}`;
 }

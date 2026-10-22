@@ -203,6 +203,117 @@ type SeatStateRows { rows: bounded[SeatStateRow; 16]; }
 /// names no change, and the page is then empty.
 type ChangeRows { rows: bounded[ChangeRow; 1000]; more: Bool = false; cursor_known: Bool = true; }
 
+/// A `usage` row: one request, as the ledger holds it. `record` is the
+/// whole `UsageRecord` as the API answers it; the other fields are the
+/// ones a read filters, groups or sums by, and only a write carries them
+/// all: a read fills `seq`, `id`, `created_at` and `record`.
+type UsageRow {
+    // the order rows were written in, numbered by the store
+    seq: Int = 0;
+    id: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    project: String = "";
+    key: String = "";
+    // "" when no account served
+    account: String = "";
+    requested_model: String = "";
+    // the model, node and seat that served, "" when none did
+    served_model: String = "";
+    node: String = "";
+    seat: String = "";
+    status: String = "";
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+    // `Served` as JSON, `null` when none
+    served: String = "null";
+    record: String = "{}";
+    present: Bool = false;
+}
+
+/// Which usage, newest first: of `project`, `key`, `account` and `model`
+/// (requested or served) where not "", with every `metadata` pair
+/// (`name=value`), in [from, to] where set, older than `cursor` (a row's
+/// `seq`) when above 0, at most `limit`.
+type UsageQuery {
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    account: String = "";
+    metadata: Names = Names { };
+    has_from: Bool = false;
+    from: Time = `1970-01-01T00:00:00Z`;
+    has_to: Bool = false;
+    to: Time = `1970-01-01T00:00:00Z`;
+    limit: Int = 100;
+    cursor: Int = 0;
+}
+
+type UsageRows { rows: bounded[UsageRow; 1000]; more: Bool = false; }
+
+/// What the rows matching `q` add up to, grouped by `by`: any of
+/// project, key, model, account, seat, node, day, hour (`valid_group`).
+type UsageSummaryQuery {
+    by: Names = Names { };
+    q: UsageQuery = UsageQuery { };
+}
+
+/// One group: `group` is a JSON object keyed by the `by` fields. Rows of
+/// another currency are another group.
+type UsageGroup {
+    group: String = "{}";
+    requests: Int = 0;
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+}
+
+type UsageGroups { rows: bounded[UsageGroup; 1000]; }
+
+/// True for a field a summary groups by.
+fn valid_group(f: String) -> Bool {
+    return f == "project" || f == "key" || f == "model" || f == "account" || f == "seat"
+        || f == "node" || f == "day" || f == "hour";
+}
+
+/// The value of group field `f` in `r`.
+fn group_value(r: UsageRow, f: String) -> String {
+    if f == "project" { return r.project; }
+    if f == "key" { return r.key; }
+    if f == "model" {
+        return if len(r.served_model) > 0 { r.served_model } else { r.requested_model };
+    }
+    if f == "account" { return r.account; }
+    if f == "seat" { return r.seat; }
+    if f == "node" { return r.node; }
+    let t = std::time::iso8601(r.created_at);
+    if f == "day" { return t[0..10] + "T00:00:00Z"; }
+    return t[0..13] + ":00:00Z";
+}
+
+/// True when `r` is one `q` asks for (all but the cursor and the limit).
+fn usage_matches(r: UsageRow, q: UsageQuery) -> Bool {
+    if len(q.project) > 0 && r.project != q.project { return false; }
+    if len(q.key) > 0 && r.key != q.key { return false; }
+    if len(q.account) > 0 && r.account != q.account { return false; }
+    if len(q.model) > 0 && r.requested_model != q.model && r.served_model != q.model {
+        return false;
+    }
+    let at = std::time::unix(r.created_at);
+    if q.has_from && at < std::time::unix(q.from) { return false; }
+    if q.has_to && at > std::time::unix(q.to) { return false; }
+    let meta = std::json::find_field_raw(r.record, "metadata");
+    for pair in q.metadata.items {
+        let eq = std::str::index_of(pair, "=");
+        if eq < 0 { return false; }
+        let v = std::json::find_string_field(meta, pair[0..eq]);
+        if v != pair[(eq + 1)..len(pair)] { return false; }
+    }
+    return true;
+}
+
 interface Store {
     /// What answers: `memory`, `postgres`. Readiness names it.
     fn kind() -> String;
@@ -271,6 +382,17 @@ interface Store {
     /// The change log, as `q` asks; the store numbers each change it
     /// appends.
     fn changes(q: ChangeQuery) -> ChangeRows fallible(StoreError);
+
+    /// Append a request's usage to the ledger. A row with the id the
+    /// ledger has is left as it is.
+    fn insert_usage(row: UsageRow) fallible(StoreError);
+    fn usage(id: String) -> UsageRow fallible(StoreError);
+    /// Usage, as `q` asks.
+    fn usage_rows(q: UsageQuery) -> UsageRows fallible(StoreError);
+    /// Up to `limit` rows written after `seq`, oldest first.
+    fn usage_after(seq: Int, limit: Int) -> UsageRows fallible(StoreError);
+    /// Totals over the matching rows, grouped.
+    fn usage_summary(q: UsageSummaryQuery) -> UsageGroups fallible(StoreError);
 
     /// The route table the brain last wrote (internal.yaml `RouteTable`),
     /// as JSON; "" when none has been.
@@ -341,6 +463,15 @@ locus IdOrder { capacity { heap rows of String; } }
 @form(vec)
 locus ChangeLog { capacity { heap rows of ChangeRow; } }
 
+@form(vec)
+locus UsageLog { capacity { heap rows of UsageRow; } }
+
+/// A request id's place in the usage log.
+type UsageSlot { id: String = ""; seq: Int = 0; present: Bool = false; }
+
+@form(hashmap)
+locus UsageSlots { capacity { pool rows of UsageSlot indexed_by id; } }
+
 /// The rows in the process. Bounded as the lists it answers are.
 ///
 /// Its writes are `@unbounded`, which `hale verify` asks of a hashmap write
@@ -362,6 +493,8 @@ locus MemoryStore {
         seat_rows: SeatTable = SeatTable { };
         seat_order: IdOrder = IdOrder { };
         log: ChangeLog = ChangeLog { };
+        usage_log: UsageLog = UsageLog { };
+        usage_slots: UsageSlots = UsageSlots { };
         fleet_rows: FleetTable = FleetTable { };
         // a node's last beat, by its place in `node_order`: scalars set in
         // place, so a heartbeat allocates nothing
@@ -703,6 +836,90 @@ locus MemoryStore {
         c.seq = self.log.len() + 1;
         c.id = "chg_" + pad(c.seq, 6);
         self.log.push(c);
+    }
+
+    // ---- the usage ledger
+
+    @unbounded
+    fn insert_usage(row: UsageRow) fallible(StoreError) {
+        if (self.usage_slots.get(row.id) or UsageSlot { }).present { return; }
+        let mut r = row;
+        r.seq = self.usage_log.len() + 1;
+        r.present = true;
+        self.usage_log.push(r);
+        self.usage_slots.set(UsageSlot { id: r.id, seq: r.seq, present: true });
+    }
+
+    fn usage(id: String) -> UsageRow fallible(StoreError) {
+        let slot = self.usage_slots.get(id) or UsageSlot { };
+        if !slot.present { return UsageRow { }; }
+        return self.usage_log.get(slot.seq - 1) or UsageRow { };
+    }
+
+    fn usage_rows(q: UsageQuery) -> UsageRows fallible(StoreError) {
+        let mut out = UsageRows { };
+        let limit = if q.limit < 1 { 100 } else if q.limit > 1000 { 1000 } else { q.limit };
+        let mut i = self.usage_log.len() - 1;
+        while i >= 0 {
+            let r = self.usage_log.get(i) or UsageRow { };
+            if (q.cursor <= 0 || r.seq < q.cursor) && usage_matches(r, q) {
+                if count(out.rows) >= limit {
+                    out.more = true;
+                    return out;
+                }
+                push(out.rows, r) or discard;
+            }
+            i = i - 1;
+        }
+        return out;
+    }
+
+    fn usage_after(seq: Int, limit: Int) -> UsageRows fallible(StoreError) {
+        let mut out = UsageRows { };
+        let mut i = if seq < 0 { 0 } else { seq };
+        while i < self.usage_log.len() && count(out.rows) < limit {
+            push(out.rows, self.usage_log.get(i) or UsageRow { }) or discard;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    fn usage_summary(s: UsageSummaryQuery) -> UsageGroups fallible(StoreError) {
+        let mut out = UsageGroups { };
+        for f in s.by.items {
+            if !valid_group(f) { fail StoreError { kind: "invalid", message: "no group " + f }; }
+        }
+        let mut i = 0;
+        while i < self.usage_log.len() {
+            let r = self.usage_log.get(i) or UsageRow { };
+            i = i + 1;
+            if !usage_matches(r, s.q) { continue; }
+            let mut g = "";
+            for f in s.by.items {
+                g = g + (if len(g) > 0 { ", " } else { "" }) + "\"" + f + "\": \""
+                    + std::json::escape_string(group_value(r, f)) + "\"";
+            }
+            g = "{" + g + "}";
+            let mut n = 0;
+            let mut found = -1;
+            while n < count(out.rows) {
+                let u = at(out.rows, n) or UsageGroup { };
+                if u.group == g && u.currency == r.currency { found = n; break; }
+                n = n + 1;
+            }
+            if found < 0 {
+                push(out.rows, UsageGroup { group: g, currency: r.currency })
+                or fail StoreError { kind: "full", message: "a summary has at most 1000 groups" };
+                found = count(out.rows) - 1;
+            }
+            let mut u = at(out.rows, found) or UsageGroup { };
+            u.requests = u.requests + 1;
+            u.input_tokens = u.input_tokens + r.input_tokens;
+            u.output_tokens = u.output_tokens + r.output_tokens;
+            u.price_micros = u.price_micros + r.price_micros;
+            set(out.rows, found, u) or discard;
+        }
+        return out;
     }
 
     /// No brain writes to the memory store.

@@ -266,7 +266,9 @@ create index on usage (account, created_at desc);
 ```
 
 Summaries (`GET /admin/v1/usage/summary`) are aggregates over `usage`, and
-the admin event stream's `usage` events are its rows as they are inserted.
+the admin event stream's `usage` events are its rows past the subscriber's
+place. `seq` (migration 0006) numbers rows in the order they were written: a
+page is "older than" a row, and the stream follows "newer than" the last.
 
 ## The transactions
 
@@ -506,4 +508,15 @@ create table route_table (
   at      timestamptz not null,
   body    jsonb not null
 );
+```
+
+### Migration 6: the ledger's order
+
+Each usage row is numbered as it is written, so a page of the ledger is
+"older than" a row and the admin event stream follows "newer than" the last
+row it told.
+
+```sql
+alter table usage add column seq bigserial;
+create unique index usage_seq on usage (seq);
 ```

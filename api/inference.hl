@@ -213,7 +213,9 @@ locus Inference {
                 },
             ) or discard;
             if o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
-                if o.output { self.unfinished(r, request_id, k, m, c, "failed", started); }
+                if o.output {
+                    self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
+                }
                 fail ApiError {
                     status: 502,
                     kind: "model_error",
@@ -327,7 +329,16 @@ locus Inference {
                         // and what it spent on the caller is told
                         self.link.finish();
                         if st.output || o.output {
-                            self.unfinished(r, request_id, k, m, c, "cancelled", started);
+                            self.unfinished(
+                                r,
+                                request_id,
+                                k,
+                                m,
+                                c,
+                                "cancelled",
+                                started,
+                                attempts.items,
+                            );
                         }
                         return out.end();
                     }
@@ -384,7 +395,7 @@ locus Inference {
                 || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable)
             {
                 if st.output || o.output {
-                    self.unfinished(r, request_id, k, m, c, "failed", started);
+                    self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
                 }
                 if out.opened {
                     fail_stream(
@@ -441,7 +452,7 @@ locus Inference {
         };
     }
 
-    /// A request that seat `c` began and did not finish: its usage told,
+    /// A request that seat `c` began and did not finish: its row written, its usage told,
     /// `status` saying how it ended (`cancelled`, `failed`).
     fn unfinished(
         r: InferenceRequest,
@@ -450,8 +461,21 @@ locus Inference {
         m: st::ModelRow,
         c: Candidate,
         status: String,
-        started: Int
+        started: Int,
+        attempts: bounded[Attempt; 8]
     ) {
+        self.record(
+            unfinished_row(
+                r,
+                request_id,
+                k,
+                m,
+                c,
+                status,
+                (std::time::monotonic_ns() - started) / 1000000,
+                attempts,
+            ),
+        );
         if self.pulse {
             UsageToTell <- unfinished_usage(
                 r,
@@ -567,10 +591,22 @@ locus Inference {
         return out;
     }
 
-    /// A request a seat served: its usage told to the organization, when
+    /// A request's row in the ledger, where its response completes. A
+    /// store that fails here cannot undo the answer, so the loss is logged.
+    fn record(row: st::UsageRow) {
+        self.store.insert_usage(row) or {
+            log_error(
+                "usage not recorded",
+                fields2(std::log::kv("request", row.id), std::log::kv("error", err.message)),
+            );
+        };
+    }
+
+    /// A request a seat served: its row written, and its usage told to the organization, when
     /// voice is attached to one: handed to the teller (teller.hl), never
     /// waited on.
     fn settled(r: InferenceRequest, s: Served) {
+        self.record(served_usage(r, s));
         if self.pulse { UsageToTell <- usage_event(r, s); }
     }
 
@@ -1177,16 +1213,18 @@ fn error_voice_json(v: ErrorVoice) -> String {
     return "{" + out.text() + "}";
 }
 
+/// `Served`, as JSON.
+fn served_by_json(s: ServedBy) -> String {
+    return "{\"model\": " + jq(s.model) + ", \"quantization\": "
+        + jstring_or_null(s.has_quantization, s.quantization) + ", \"node\": " + jq(s.node)
+        + ", \"seat\": " + jq(s.seat) + ", \"account\": " + jq(s.account) + ", \"engine\": "
+        + jq(s.engine) + ", \"provider\": " + jstring_or_null(s.has_provider, s.provider) + "}";
+}
+
 fn voice_json(v: VoiceExtension) -> String {
     let attempts = attempts_json(v.attempts);
-    let s = v.served;
     return "{\"request_id\": " + jq(v.request_id) + ", \"project\": " + jq(v.project)
-        + ", \"key\": " + jq(v.key)
-        + ", \"served\": {\"model\": " + jq(s.model) + ", \"quantization\": "
-        + jstring_or_null(s.has_quantization, s.quantization) + ", \"node\": " + jq(s.node)
-        + ", \"seat\": " + jq(s.seat)
-        + ", \"account\": " + jq(s.account) + ", \"engine\": " + jq(s.engine) + ", \"provider\": "
-        + jstring_or_null(s.has_provider, s.provider) + "}"
+        + ", \"key\": " + jq(v.key) + ", \"served\": " + served_by_json(v.served)
         + ", \"price_micros\": " + to_string(v.price_micros) + ", \"currency\": " + jq(v.currency)
         + ", \"timing\": {\"wall_ms\": " + to_string(v.wall_ms)
         + ", \"queue_ms\": 0, \"load_ms\": 0}, \"attempts\": " + attempts + "}";

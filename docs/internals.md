@@ -172,13 +172,36 @@ most 12 MiB; a larger one is answered `413 request_too_large` in the
 contract's envelope before it is read, and a chunked one (hale's Server
 reads `Content-Length` bodies only) is refused `400`.
 
-Usage and the admin event stream answer their happy path:
-a canned body from [`api/canned/`](../api/canned/), one file per
-`operationId`. Each is replaced by a row as it is made real.
+### Usage and the admin event stream
+
+Every request a seat served, streamed or not, is one row in the store's
+ledger (`usage`, store.md), written where its response completes
+(`Inference.settled`); a request a seat began and did not finish
+(`cancelled`, `failed` after output) is a row too, with no tokens and no
+price. The row holds the whole `UsageRecord` beside the columns a read
+filters and sums by: `GET /admin/v1/usage` pages it newest first (cursor =
+the row's order), `/usage/{request_id}` reads one, `/usage/summary`
+totals requests, tokens and spend by any of project, key, model, account,
+seat, node, day and hour (SQL `group by` on Postgres). Rows of another
+currency are another group, and requests refused before a seat served
+them are not in the ledger.
+
+`GET /admin/v1/events` answers from the rows past a subscriber's place
+(`AdminEvents`, admin_events.hl): the ledger rows written (`usage`, the
+record), the changes appended (`change`), and each node whose status
+moved (`node`: registered, lost, drained, revoked). A place is the event
+id the answer ends with (`u<ledger row>.c<change>.n<node marks>`), which
+the browser sends back as `Last-Event-ID`; a connection with none is at
+the head and is told nothing of what came before, so a subscriber that
+connects late sees only what follows. Events are read from rows, so they
+come from any api instance and nothing is held between connections. The
+HTTP server answers one request at a time, so an answer is short and the
+browser reconnects at the `retry` it is given (2 s); the stream stays open
+once the router moves onto `http::Rest`. `?type=` (repeatable) narrows it.
 
 ```sh
 hale build api
-api/api --port 8080          # --host, --canned DIR
+api/api --port 8080          # --host
 curl -X POST localhost:8080/admin/v1/models -H 'content-type: application/json' -d '{"id": "echo-1"}'
 curl -X POST localhost:8080/admin/v1/projects -H 'content-type: application/json' -d '{"id": "work", "name": "Work"}'
 curl -X POST localhost:8080/admin/v1/projects/work/keys -H 'content-type: application/json' -d '{"name": "laptop"}'   # its "secret"
@@ -187,8 +210,8 @@ curl localhost:8080/admin/v1/changes
 hale test api
 ```
 
-Every canned body, and a live call to every endpoint, validates against the
-spec (`spec/validate`).
+A live call to every endpoint validates against the spec
+(`spec/validate`).
 
 ### The surface's bundle
 
@@ -716,7 +739,7 @@ Hale runtime's `perror` when a client hangs up while the api writes
 lists for hale.
 
 ```text
-time=2026-10-19T04:12:09Z level=info logger=voice.api msg=serving url=http://127.0.0.1:8080 canned=api/canned
+time=2026-10-19T04:12:09Z level=info logger=voice.api msg=serving url=http://127.0.0.1:8080
 time=2026-10-19T04:12:09Z level=warn logger=voice.api msg="NATS unreachable" nats=nats://127.0.0.1:4222 error=...
 ```
 

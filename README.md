@@ -98,8 +98,10 @@ hale build brain && hale test brain
 ## Status
 
 Configuration, the caller's endpoints, the node plane, the brain and
-inference on a node's static seat are real. Usage reporting and the admin
-event stream still answer a canned body.
+inference on a node's static seat are real, and so are usage reporting and
+the admin event stream: each served request is a row in the store's ledger,
+which the admin usage reads sum, and the stream tells the rows and changes
+that follow a subscriber's connection.
 
 ## More
 

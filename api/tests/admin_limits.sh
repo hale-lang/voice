@@ -140,7 +140,7 @@ voice_port=$(free_port); V=http://127.0.0.1:$voice_port
 # environment alone (the habitat's variables), no flag, the reading interval
 # voice's own knob
 VOICE_LIMITS_EVERY_S=1 HALE_DNA_HEAD_URL="$H" HALE_DNA_APPLICATION_ID="$application" HALE_DNA_OIDC_ISSUER="$issuer" HALE_DNA_OIDC_CLIENT=voice-api HALE_DNA_OIDC_CLIENT_VAULT=oidc-service-voice-api \
-  "$voice/api/api" --port "$voice_port" --canned "$voice/api/canned" >"$root/voice.log" 2>&1 &
+  "$voice/api/api" --port "$voice_port" >"$root/voice.log" 2>&1 &
 jobs_started+=($!)
 until_ok 20 "voice's api answering" curl -sf -o /dev/null "$V/healthz"
 curl -sf -X POST -H 'Content-Type: application/json' -d '{"id": "personal", "name": "Personal"}' "$V/admin/v1/projects" >/dev/null || fail "no project personal"

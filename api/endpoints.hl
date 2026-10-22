@@ -2,8 +2,9 @@
 /// endpoint with a row in the surface (surface.hl) is routed to its
 /// handler: the router matches method and path, decodes the request
 /// (wire.hl), calls the row's handler on its receiver and encodes what it
-/// answers or fails with. The rest still answer their canned happy path;
-/// each is replaced by a row as it is made real.
+/// answers or fails with. The usage ledger and the admin event stream are
+/// read from the store (usage.hl, admin_events.hl) and have no row yet:
+/// they join the surface when the router moves onto `http::Rest`.
 ///
 /// One locus serves them all (the styleguide's one-locus-many-endpoints
 /// shape) and holds the store and the receivers, which borrow it.
@@ -12,7 +13,6 @@
 /// before `usage/:request_id`).
 locus Endpoints {
     params {
-        canned: String = "canned";
         ui: String = "";
         // the configuration and the fleet as reported: in the process
         // unless the api is given a database (main.hl)
@@ -34,6 +34,7 @@ locus Endpoints {
         nodes: Nodes = Nodes { store: self.store, link: self.link };
         seats: Seats = Seats { store: self.store, link: self.link };
         changes: Changes = Changes { store: self.store };
+        usage: Usage = Usage { store: self.store };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
         // grafted, the nodes' account on the habitat's broker (lib/broker),
         // handed to a node in its registration's answer; "" standalone
@@ -217,12 +218,20 @@ locus Endpoints {
         }
 
         // usage
-        if std::http::is_route(c, "GET", "/admin/v1/usage") { return self.json("listUsage", 200); }
+        if std::http::is_route(c, "GET", "/admin/v1/usage") {
+            let q = read_usage_query(c.params, req.path, true) or raise;
+            return json_answer(200, self.usage.list_json(q) or raise);
+        }
         if std::http::is_route(c, "GET", "/admin/v1/usage/summary") {
-            return self.json("summarizeUsage", 200);
+            let by = read_group_by(c.params) or raise;
+            let q = read_usage_query(c.params, req.path, false) or raise;
+            return json_answer(200, self.usage.summary_json(by, q) or raise);
         }
         if std::http::is_route(c, "GET", "/admin/v1/usage/:request_id") {
-            return self.json("getUsage", 200);
+            return json_answer(
+                200,
+                self.usage.get_json(std::http::path_param(c.params, "request_id")) or raise,
+            );
         }
 
         // the catalog
@@ -431,12 +440,15 @@ locus Endpoints {
 
         // events
         if std::http::is_route(c, "GET", "/admin/v1/events") {
-            return canned_body(
-                self.canned,
-                "streamAdminEvents.stream.sse",
-                200,
-                "text/event-stream",
-                "",
+            let events = AdminEvents {
+                store: self.store,
+                nodes: self.nodes,
+                changes: self.changes,
+                types: read_event_types(req.path) or raise,
+            };
+            return events.follow(
+                EventStream { conn_fd: req.conn_fd },
+                std::http::header(req, "Last-Event-ID"),
             );
         }
 
@@ -451,11 +463,6 @@ locus Endpoints {
             return serve_static(self.ui, req);
         }
         return no_route(req);
-    }
-
-    /// `<name>.json` with `status`.
-    fn json(name: String, status: Int) -> std::http::Response {
-        return canned_body(self.canned, name + ".json", status, "application/json", "");
     }
 
     /// An inference request: the caller's key, then the row's handler,

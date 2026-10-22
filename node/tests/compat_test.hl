@@ -110,6 +110,11 @@ fn stub_conn(s: std::io::tcp::Stream) {
         ) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /nohead/chat/completions ") {
+        // accepts, reads the request, and never answers
+        std::time::sleep(5s);
+        return;
+    }
     if std::str::starts_with(req, "POST /silent/chat/completions ") {
         // one event, then silence with the connection open
         s.send(
@@ -366,6 +371,36 @@ main locus App {
         std::test::assert(
             waited >= 900 && waited < 3000,
             "two quiet reads gave control back in about a second each: " + to_string(waited)
+                + " ms",
+        );
+        // an upstream that accepts and never sends a head: the opening is
+        // driven a second at a time too, so a cancel is found within about a
+        // second, not when the exchange's deadline ends it
+        let nohead = node::upstream_over_wire(
+            "resp_n",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/nohead\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let n_began = std::time::monotonic_ns();
+        let mut n_reads = 0;
+        let mut n_cancelled = false;
+        while !nohead.done && !n_cancelled {
+            nohead.next_data();
+            n_reads = n_reads + 1;
+            // the session's `interject` finds the cancel after the first quiet read
+            if n_reads == 2 { n_cancelled = true; }
+        }
+        let n_waited = (std::time::monotonic_ns() - n_began) / 1000000;
+        std::test::assert(
+            !nohead.done && len(nohead.failure) == 0,
+            "an upstream with no head yet is not an ended or failed one: " + nohead.failure,
+        );
+        std::test::assert(
+            n_waited >= 900 && n_waited < 3000,
+            "two quiet reads gave control back in about a second each: " + to_string(n_waited)
                 + " ms",
         );
         let cut = node::run_compat(

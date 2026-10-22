@@ -3,7 +3,9 @@ answers a POST with the head of a chunked `text/event-stream` and one event,
 then sends nothing and holds the connection open. Each request is a line in
 the file named by the second argument.
 
-    python3 scripts/silent-upstream.py PORT REQUESTS_FILE
+    python3 scripts/silent-upstream.py PORT REQUESTS_FILE [nohead]
+
+With `nohead` it reads the request and never answers: not a byte of a head.
 """
 import socket
 import sys
@@ -11,6 +13,7 @@ import threading
 import time
 
 port, log = int(sys.argv[1]), sys.argv[2]
+nohead = len(sys.argv) > 3 and sys.argv[3] == "nohead"
 
 EVENT = b'data: {"model":"stub-7b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"}}]}\n\n'
 
@@ -25,11 +28,12 @@ def serve(conn):
             buf += data
         with open(log, "a") as f:
             f.write("%.3f\n" % time.time())
-        conn.sendall(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
-            b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-            + b"%x\r\n" % len(EVENT) + EVENT + b"\r\n"
-        )
+        if not nohead:
+            conn.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + b"%x\r\n" % len(EVENT) + EVENT + b"\r\n"
+            )
         # silent from here, until the client goes away
         while conn.recv(4096):
             pass

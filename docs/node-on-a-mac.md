@@ -1,38 +1,36 @@
 # One Mac serving models to a habitat
 
 A Mac is not a host the habitat applies compose to. It joins as a voice
-node, running natively under launchd from a toolchain built at the commit
-in `hale.pin`, and serves its seats to voice's api on a
+node, running natively under launchd from the released
+`aarch64-apple-darwin` toolchain, and serves its seats to voice's api on a
 Linux host over the network. Its seats are what the Mac actually has: each
 model a local Ollama holds, and the `claude` CLI (`claude-cli`) when it is
 logged in. CI's `node (macOS)` job builds and tests the node on
-`macos-14` with the same pinned toolchain, so the steps below start from a node
+`macos-14` with the same toolchain, so the steps below start from a node
 known to build and run there. See [internals.md](./internals.md) for the node itself.
 
 ## 1. The toolchain
 
-The node is built from source with a toolchain built at the commit in
-`hale.pin` (voice uses hale features that are merged and not yet released);
-there is no prebuilt node binary. Apple silicon only; Xcode's command line
-tools (`xcode-select --install`) supply the C compiler, Homebrew supplies
-Rust and LLVM 18 for the build.
+The node is built from source with the released toolchain; there is no
+prebuilt node binary. Apple silicon only; Xcode's command line tools
+(`xcode-select --install`) supply the C compiler.
 
 ```sh
-git clone https://github.com/hale-lang/voice && cd voice
-brew install rustup llvm@18 zstd && rustup-init -y     # once
-scripts/build-hale.sh                  # hale at the pin, with its dylibs, into ~/.hale/bin
+v=v0.29.0
+name=hale-$v-aarch64-apple-darwin.tar.gz
+base=https://github.com/hale-lang/hale/releases/download/$v
+mkdir -p ~/.hale/bin && cd "$(mktemp -d)"
+curl -fsSLO $base/$name && curl -fsSLO $base/$name.sha256
+shasum -a 256 -c $name.sha256          # must say OK
+tar xzf $name -C ~/.hale/bin           # hale and the *.dylib files beside it: hale loads them from its own directory
 export PATH="$HOME/.hale/bin:$PATH"    # and in ~/.zshrc
 hale --version
 ```
 
-To use a released toolchain instead, download its `aarch64-apple-darwin`
-tarball from hale's releases, check its `.sha256`, and untar it into
-`~/.hale/bin` (hale loads the `*.dylib` files from its own directory); a
-release lacks hale features newer than itself, so a node may not build with it.
-
 ## 2. Build the node
 
 ```sh
+git clone https://github.com/hale-lang/voice && cd voice
 hale build node                         # writes node/node
 node/node                               # no --id: prints the usage and exits 2
 ```

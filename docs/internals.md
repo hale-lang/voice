@@ -335,6 +335,12 @@ curl localhost:8080/healthz        # the api; see "The api" for a key
 curl localhost:8081/node/v1/status # the node's local API
 ```
 
+The api hands a node the NATS address in `--node-nats` (`NatsLink.place`),
+not the one it dials itself. In Compose it is `nats`, which resolves only in
+the Compose network; for a node on another machine, set `VOICE_NODE_HOST` to
+the name that machine reaches this host by and `VOICE_NATS_BIND=0.0.0.0` to
+publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises, a host port other than 4222).
+
 The node `local` serves once it exists on the api and is started with its
 token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
 seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up

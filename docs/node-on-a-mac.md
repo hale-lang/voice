@@ -84,7 +84,13 @@ Flags: `--port` (the node's local API, 8081), `--data`, `--vault`,
 (write everything, load nothing).
 
 The node serves requests that reach it over NATS, so the Mac needs a route to
-the habitat's broker as well as to the api. A launch agent runs while the user
+the habitat's broker as well as to the api. The node dials the NATS address the
+api hands it at enrollment, which is the api's `--node-nats`. Under the
+repository's `compose.yaml` that is `nats://nats:4222` unless the host sets
+`VOICE_NODE_HOST` (the name the Mac reaches the host by) and `VOICE_NATS_BIND`
+(the interface NATS is published on, `127.0.0.1` by default), and
+`VOICE_NATS_PORT` when the published port is not 4222; the name `nats` resolves
+only inside Compose. A launch agent runs while the user
 is logged in; the Mac must not sleep (`caffeinate` or Energy settings) for the
 node to stay in service.
 

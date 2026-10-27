@@ -26,10 +26,18 @@ fn measured_hardware(data: String, file: String) -> String {
             true,
         ) + "]"
     } else {
-        nvidia_accelerators(
-            run_out("nvidia-smi\n--query-gpu=name,memory.total\n--format=csv,noheader,nounits"),
-            memory,
-        )
+        let smi = run_out(
+            "nvidia-smi\n--query-gpu=name,memory.total\n--format=csv,noheader,nounits",
+        );
+        let gpus = gpu_count(smi);
+        if gpus > ACCELERATORS_MAX {
+            log_warn(
+                "the machine has more GPUs than a node declares; it declares the first "
+                    + to_string(ACCELERATORS_MAX),
+                std::log::kv("gpus", to_string(gpus)),
+            );
+        }
+        nvidia_accelerators(smi, memory)
     };
     return hardware_json(
         os,
@@ -120,13 +128,33 @@ fn df_available(df: String) -> Int {
     return 0;
 }
 
+/// The most accelerators a node declares (`Hardware.accelerators`).
+const ACCELERATORS_MAX: Int = 16;
+
+/// The GPUs `nvidia-smi` lists: its lines that name one.
+@bounded_by(smi)
+fn gpu_count(smi: String) -> Int {
+    let mut n = 0;
+    let v = std::str::bytes_view(smi);
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        if std::str::index_of(std::str::trim(std::str::slice(v, start, nl)), ",") > 0 { n = n + 1; }
+        start = nl + 1;
+    }
+    return n;
+}
+
 /// `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits`:
-/// one GPU a line, its memory in MiB. A GPU that reports no memory of its
-/// own (`[N/A]`, as NVIDIA GB10 does) shares the machine's, `memory`.
+/// one GPU a line, its memory in MiB, the first `ACCELERATORS_MAX` of
+/// them. A GPU that reports no memory of its own (`[N/A]`: NVML does not
+/// report memory for an integrated GPU that shares the system's, such as
+/// NVIDIA GB10) shares the machine's, `memory`.
 @bounded_by(smi)
 fn nvidia_accelerators(smi: String, memory: Int) -> String {
     let out = std::bytes::BytesBuilder { initial_cap: 256 };
     let mut first = true;
+    let mut kept = 0;
     let v = std::str::bytes_view(smi);
     let mut start = 0;
     while start < v.n {
@@ -134,7 +162,8 @@ fn nvidia_accelerators(smi: String, memory: Int) -> String {
         let line = std::str::trim(std::str::slice(v, start, nl));
         start = nl + 1;
         let comma = std::str::index_of(line, ",");
-        if comma > 0 {
+        if comma > 0 && kept < ACCELERATORS_MAX {
+            kept = kept + 1;
             let mib = std::str::parse_int(std::str::trim(line[(comma + 1)..len(line)])) or - 1;
             if !first { out.append_str(", "); }
             first = false;

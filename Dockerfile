@@ -47,6 +47,8 @@ COPY api api
 COPY brain brain
 COPY node node
 COPY deploy/node deploy/node
+# the recipe fixtures the api's tests share with the contract check
+COPY spec/validate/recipes spec/validate/recipes
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build api && hale build brain && hale build node
 

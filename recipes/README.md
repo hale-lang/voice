@@ -11,5 +11,5 @@ recipes on the admin plane (`POST /admin/v1/recipes`). These are read by the
 api at start (`--recipes`), listed as `shipped`, and cannot be changed or
 removed through the API. A shipped recipe never changes either: other
 weights are another id. CI holds every file here to the contract
-(`spec/validate/recipes.mjs`), and the api holds it to the same rules when
+(`spec/validate/curated.mjs`), and the api holds it to the same rules when
 it reads it.

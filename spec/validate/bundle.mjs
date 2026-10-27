@@ -47,6 +47,9 @@ const MAP = {
   Recipe: 'Recipe',
   RecipeCreate: 'RecipeCreate',
   RecipeList: 'GET /admin/v1/recipes',
+  Runtime: 'Runtime',
+  RuntimeCreate: 'RuntimeCreate',
+  RuntimeList: 'GET /admin/v1/runtimes',
   Placement: 'Placement',
   PlacementCreate: 'PlacementCreate',
   PlacementList: 'GET /admin/v1/placements',
@@ -139,7 +142,8 @@ function cflat(s) {
     if (rest.length === 1) { const r = cflat(rest[0]); return { s: r.s, nullable: nullable || r.nullable }; }
   }
   if (s.allOf) {
-    const merged = { type: 'object', properties: {}, required: [] };
+    // the parts, and what the schema says beside them
+    const merged = { type: 'object', properties: { ...(s.properties || {}) }, required: [...(s.required || [])] };
     for (const part of s.allOf) {
       const p = cflat(part).s;
       Object.assign(merged.properties, p.properties || {});

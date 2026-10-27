@@ -95,13 +95,22 @@ code conforms to them.
   [`recipes/`](./recipes/README.md), reviewed like code, which the operator
   can use but not change. Every recipe is held to the same rules, whichever
   way it came ([`store.md`](./spec/store.md), migration 8).
+- `axiom` **A node runs only a runtime the operator allows.** A runtime
+  ([`openapi.yaml`](./spec/openapi.yaml): `Runtime`) is a server program
+  the node knows how to start, from one artifact pinned by its digest (a
+  container image, never a tag, or a tarball by sha256), so it names no
+  command. The operator allows runtimes on the admin plane; voice ships
+  defaults in [`runtimes/`](./runtimes/README.md), held to the same rules.
+  Installing a node is installing the node: what serves a model is pulled
+  by the node, as pinned.
 - `axiom` **The operator places a model; the coordinator picks its form.**
   A placement ([`openapi.yaml`](./spec/openapi.yaml): `Placement`) puts a
   local model on a set of nodes, the first its leader, which holds the
-  seat. The coordinator picks the variant of the model's recipe that the
-  nodes can run and that fits them as they declared their hardware, and
-  keeps why for every variant; one the operator names is taken only if it
-  fits. One node today, but nothing assumes it: a model split across nodes
+  seat. The coordinator picks the variant of the model's recipe and the
+  runtime that serves it: a runtime that reads the variant's format on the
+  nodes' platform and accelerator, a variant that fits them as they
+  declared their hardware. It keeps why for every variant; a variant or
+  runtime the operator names is taken only if it fits. One node today, but nothing assumes it: a model split across nodes
   changes the judging, not the shape.
 - `derived` **Projects and keys** name the accounts they may spend. A request may name
   one account; it is then served on that account or refused, never moved to

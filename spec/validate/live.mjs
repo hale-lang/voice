@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -31,6 +31,10 @@ await setup('/admin/v1/models', { id: 'echo-1', context_length: 8192, max_output
 // a recipe the operator allows, pinned (the one the delete withdraws)
 const recipe = id => ({ id, license: { name: 'apache-2.0', url: 'https://www.apache.org/licenses/LICENSE-2.0' }, variants: [{ id: 'gguf-q4_k_m', format: 'gguf', quantization: 'q4_k_m', source: { hub: 'huggingface', repo: 'example/live-GGUF', revision: '0123456789abcdef0123456789abcdef01234567' }, files: [{ path: 'live-Q4_K_M.gguf', bytes: 4920000000, sha256: 'a'.repeat(64) }], memory_bytes: 5600000000 }] });
 await setup('/admin/v1/recipes', recipe('live-sample'));
+// a runtime the operator allows, pinned (the one the delete withdraws; the
+// placement below is served by one voice ships)
+const runtime = id => ({ id, license: { name: 'mit', url: 'https://opensource.org/license/mit' }, server: 'llama-server', formats: ['gguf'], accelerator: 'cuda', platforms: [{ os: 'linux', arch: 'arm64' }], artifact: { kind: 'container', image: 'ghcr.io/ggml-org/llama.cpp', digest: 'sha256:' + 'c'.repeat(64) } });
+await setup('/admin/v1/runtimes', runtime('live-sample'));
 await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
 await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
@@ -48,7 +52,7 @@ const hardware = { os: 'linux', arch: 'arm64', memory_bytes: 137438953472, model
 await setup('/admin/v1/recipes', recipe('live-placed'));
 await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
 await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
-await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'] });
+await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], runtime: 'llama-server-b11913-cuda' });
 const auth = { authorization: `Bearer ${key.secret}` };
 
 // the bodies the real handlers take; anything else gets the generic one
@@ -56,6 +60,7 @@ const bodies = {
   createCatalogModel: { id: 'live-1', kind: 'hosted', owned_by: 'anthropic', price: null },
   updateCatalogModel: { max_output_tokens: 2048 },
   createRecipe: recipe('live-2'),
+  createRuntime: runtime('live-2'),
   createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'] },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },

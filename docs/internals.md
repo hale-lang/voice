@@ -303,7 +303,10 @@ is what to review. Friction met along the way is in
 ## The node
 
 [`node/`](../node/) is voice's own node. It reads and checks its
-capabilities file at start (refusing a kind it cannot run) and serves its
+capabilities file at start (refusing a kind it cannot run), measures the
+machine's hardware once (`hardware.hl`: `uname`, `/proc/meminfo` or
+`sysctl`, `nvidia-smi`, `df` under its data directory) and declares it with
+the engines, and serves its
 local API from `node.yaml` (status, capabilities, local controls). It
 registers on the api's node plane with its enrollment token, applies the
 assignment that comes back (refusing a seat outside what it offers, and

@@ -506,9 +506,16 @@ for i in $(seq 1 100); do
   sleep 0.2
 done
 routed mini/steady
-t0=$(date +%s%N)
-out=$(responds)
-ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+# with a brain, two idle seats are ranked with a little jitter, so either
+# may be offered first: ask again each tick until laptop's is (mini's
+# answers at once)
+for try in $(seq 1 12); do
+  t0=$(date +%s%N)
+  out=$(responds)
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  echo "$out" | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["voice"]["attempts"][0]["seat"] == "laptop/static" else 1)' 2>/dev/null && break
+  sleep 1
+done
 echo "$out" | python3 -c '
 import json, sys
 r = json.load(sys.stdin)

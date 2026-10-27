@@ -4,8 +4,8 @@
 // state: the store's `operator_token` row (spec/store.md, migration 7) when
 // it has a database, so every api over that database answers to the same
 // token; a standalone api's (its store in memory) a file of its state
-// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`), mode 600 in
-// a directory of mode 700, so a restart keeps it. It is never logged and
+// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`), private
+// from its first byte (operator_token_file), so a restart keeps it. It is never logged and
 // never read from the environment. `api admin-token` prints it (minting it
 // when no api has yet): under Compose, `docker compose exec api voice-api
 // admin-token`.
@@ -39,19 +39,102 @@ fn state_dir_or(given: String) -> String {
     return std::env::var("HOME") + "/.local/state/voice-api";
 }
 
+/// The permission bits of `path` (`stat -c %a`), -1 when it cannot be read.
+fn mode_of(path: String) -> Int {
+    let out = std::process::run("stat\n-L\n-c\n%a\n" + path) or {
+        return -1;
+    };
+    if out.code != 0 { return -1; }
+    let text = std::str::trim(out.stdout);
+    let mut mode = 0;
+    let mut i = 0;
+    while i < len(text) {
+        let d = std::str::byte_at(std::str::bytes_view(text), i) - 48;
+        if d < 0 || d > 7 { return -1; }
+        mode = mode * 8 + d;
+        i = i + 1;
+    }
+    return if len(text) == 0 { -1 } else { mode };
+}
+
+/// The state directory, made private when it is new; refused when it
+/// cannot be told private, or when another user may write in it (group or
+/// world write), where the token's file could be swapped.
+fn private_state(state: String) -> Bool fallible(TokenError) {
+    if !std::io::fs::file_exists(state) {
+        std::process::run("mkdir\n-p\n-m\n700\n" + state) or discard;
+    }
+    let mode = mode_of(state);
+    if mode < 0 {
+        fail TokenError { message: "the state directory " + state + " could not be made or read" };
+    }
+    if (mode & 18) != 0 {
+        fail TokenError {
+            message: "the state directory " + state + " is writable by other users (mode "
+                + to_string(mode) + "): make it 700 or name another with --state",
+        };
+    }
+    return true;
+}
+
+/// The token kept at `path`: "" when there is none; refused when the file
+/// is readable by other users.
+fn kept_token(path: String) -> String fallible(TokenError) {
+    if !std::io::fs::file_exists(path) { return ""; }
+    let mode = mode_of(path);
+    if mode < 0 || (mode & 63) != 0 {
+        fail TokenError {
+            message: "the operator token's file " + path
+                + " is readable by other users, or its mode cannot be read: make it 600",
+        };
+    }
+    return std::str::trim(std::io::fs::read_file(path) or "");
+}
+
 /// A standalone api's operator token, from its state directory: the one
-/// kept there, or one minted and kept now.
+/// kept there, or one minted and kept now. The new token is written into a
+/// file `mktemp` creates with mode 600, so no byte of it is ever readable
+/// by another user, and published under its name by a hard link, which
+/// fails when the name is taken: of two first starts at once one link
+/// wins, and the other reads back the winner's whole token, so every caller
+/// returns the same one.
 fn operator_token_file(state: String) -> String fallible(TokenError) {
+    private_state(state) or raise;
     let path = state + "/" + OPERATOR_TOKEN_FILE;
-    let kept = std::str::trim(std::io::fs::read_file(path) or "");
+    let kept = kept_token(path) or raise;
     if len(kept) > 0 { return kept; }
     let fresh = mint_operator_token() or raise;
-    std::process::run("mkdir\n-p\n-m\n700\n" + state) or discard;
-    std::io::fs::write_file(path, fresh) or fail TokenError {
-        message: "the operator token could not be kept in " + path,
+    return publish_operator_token(state, fresh) or raise;
+}
+
+/// Publish `fresh` as the state directory's operator token unless another
+/// is there: the token kept under the name afterwards, `fresh` or the
+/// winner's.
+fn publish_operator_token(state: String, fresh: String) -> String fallible(TokenError) {
+    let path = state + "/" + OPERATOR_TOKEN_FILE;
+    let draft = std::io::fs::mktemp(state + "/.operator-token-", "") or fail TokenError {
+        message: "the operator token could not be written in " + state,
     };
-    std::process::run("chmod\n600\n" + path) or discard;
-    return fresh;
+    let mut written = true;
+    std::io::fs::write_file(draft, fresh) or { written = false; };
+    let mut linked = false;
+    if written && mode_of(draft) == 384 {
+        let ln = std::process::run("ln\n" + draft + "\n" + path) or std::process::ProcessOutput {
+            code: 1,
+            signal: 0,
+            stdout: "",
+            stderr: "",
+        };
+        linked = ln.code == 0;
+    }
+    std::io::fs::unlink(draft) or discard;
+    if linked { return fresh; }
+    // another caller's token won the name: read back its whole value
+    let won = kept_token(path) or raise;
+    if len(won) == 0 {
+        fail TokenError { message: "the operator token could not be kept in " + path };
+    }
+    return won;
 }
 
 /// The operator token over a database: the row kept, or one minted and

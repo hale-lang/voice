@@ -37,7 +37,11 @@ compares digests in constant time. The api mints the token on its first
 start: over Postgres into the `operator_token` row (store.md, migration 7),
 the first api to start winning, so every instance answers to the same token;
 standalone, into `operator-token` in its state directory (`--state`, by
-default `$XDG_STATE_HOME/voice-api`), mode 600 in a directory of mode 700.
+default `$XDG_STATE_HOME/voice-api`, made 700 when new). The file is written
+private from its first byte (a `mktemp` draft, mode 600) and published by a
+hard link that fails when the name is taken, so concurrent first starts keep
+one token and every caller reads it back; a state directory others may
+write in, or a token file others may read, is refused.
 It is never read from the environment and never logged.
 `voice-api admin-token [--database URL] [--state DIR]` prints it, minting it
 when no api has yet; under Compose, `docker compose exec api voice-api

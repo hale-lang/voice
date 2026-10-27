@@ -1,0 +1,130 @@
+// The operator token: the admin plane's one credential (/admin/v1).
+//
+// The api mints it on its first start and keeps it where it keeps its
+// state: the store's `operator_token` row (spec/store.md, migration 7) when
+// it has a database, so every api over that database answers to the same
+// token; a standalone api's (its store in memory) a file of its state
+// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`), mode 600 in
+// a directory of mode 700, so a restart keeps it. It is never logged and
+// never read from the environment. `api admin-token` prints it (minting it
+// when no api has yet): under Compose, `docker compose exec api voice-api
+// admin-token`.
+//
+// `AdminBearer` (ctl.hl) admits a request whose `Authorization: Bearer`
+// is the token, comparing digests in constant time; the event stream and
+// the route table, which the data plane serves, ask it too.
+
+/// The file a standalone api keeps its operator token in, in its state
+/// directory.
+const OPERATOR_TOKEN_FILE: String = "operator-token";
+
+type TokenError { message: String = ""; }
+
+/// A new operator token: `va-` and 32 random bytes from the kernel, in hex.
+/// Minted once per process at most: the bearer holds the digest of the
+/// token it read.
+@unbounded
+fn mint_operator_token() -> String fallible(TokenError) {
+    let b = std::os::getrandom(32) or fail TokenError { message: "no randomness from the kernel" };
+    return "va-" + std::hex::encode(b);
+}
+
+/// The state directory: `--state`, else `$XDG_STATE_HOME/voice-api`, else
+/// `$HOME/.local/state/voice-api`.
+fn state_dir_or(given: String) -> String {
+    if len(given) > 0 { return given; }
+    if std::env::var_exists("XDG_STATE_HOME") && len(std::env::var("XDG_STATE_HOME")) > 0 {
+        return std::env::var("XDG_STATE_HOME") + "/voice-api";
+    }
+    return std::env::var("HOME") + "/.local/state/voice-api";
+}
+
+/// A standalone api's operator token, from its state directory: the one
+/// kept there, or one minted and kept now.
+fn operator_token_file(state: String) -> String fallible(TokenError) {
+    let path = state + "/" + OPERATOR_TOKEN_FILE;
+    let kept = std::str::trim(std::io::fs::read_file(path) or "");
+    if len(kept) > 0 { return kept; }
+    let fresh = mint_operator_token() or raise;
+    std::process::run("mkdir\n-p\n-m\n700\n" + state) or discard;
+    std::io::fs::write_file(path, fresh) or fail TokenError {
+        message: "the operator token could not be kept in " + path,
+    };
+    std::process::run("chmod\n600\n" + path) or discard;
+    return fresh;
+}
+
+/// The operator token over a database: the row kept, or one minted and
+/// kept now.
+@unbounded
+fn operator_token_kept(store: st::Store) -> String fallible(TokenError) {
+    let fresh = mint_operator_token() or raise;
+    let token = store.operator_token(fresh) or fail TokenError {
+        message: "the store could not keep the operator token: " + err.message,
+    };
+    if len(token) == 0 { fail TokenError { message: "the store kept no operator token" }; }
+    return token;
+}
+
+/// The digest an operator token is compared as: SHA-256, in hex.
+fn operator_digest(token: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(token)));
+}
+
+/// True when `token`'s digest is `want` (a digest of `operator_digest`),
+/// compared in time that does not depend on where they differ; an empty
+/// `want` (no token kept yet) admits nothing.
+fn operator_matches(want: String, token: String) -> Bool {
+    if len(want) != 64 || len(token) == 0 { return false; }
+    let got = operator_digest(token);
+    let a = std::str::bytes_view(want);
+    let b = std::str::bytes_view(got);
+    let mut diff = 0;
+    let mut i = 0;
+    while i < 64 {
+        diff = diff | (std::str::byte_at(a, i) ^ std::str::byte_at(b, i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+/// The bearer of an `Authorization` header, "" when it names none.
+fn bearer_of(authorization: String) -> String {
+    if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { return ""; }
+    return std::str::trim(authorization[7..len(authorization)]);
+}
+
+/// Why a request without the operator token is refused.
+const OPERATOR_REFUSED: String = "the admin plane takes the operator token: Authorization: Bearer va-... (voice-api admin-token prints it)";
+
+/// The data plane's refusal of an admin path without the operator token,
+/// as the exposure refuses a row's: 401, `unauthenticated`.
+fn operator_refusal() -> std::http::Response {
+    return std::http::Response {
+        status: 401,
+        content_type: "application/json",
+        headers: "WWW-Authenticate: Bearer",
+        body: "{\"refusal\": {\"kind\": \"unauthenticated\", \"reason\": \"" + OPERATOR_REFUSED
+            + "\"}}",
+    };
+}
+
+/// The operator token as the api starts: minted when none is kept. Over a
+/// database "" (the bearer reads the row it kept); standalone, the token
+/// kept in the state directory, for the store in memory. The process ends
+/// when it cannot be kept.
+fn operator_token_at_start(database: String, state: String) -> String {
+    if len(database) > 0 {
+        operator_token_kept(st::PgStore { url: database }) or {
+            log_error("the operator token could not be kept", std::log::kv("why", err.message));
+            std::process::exit(1);
+            return "";
+        };
+        return "";
+    }
+    return operator_token_file(state_dir_or(state)) or {
+        log_error("the operator token could not be kept", std::log::kv("why", err.message));
+        std::process::exit(1);
+        return "";
+    };
+}

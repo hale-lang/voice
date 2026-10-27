@@ -91,12 +91,18 @@ fi
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
 HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
-  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" >"$work/api.log" 2>&1 &
+  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
+# the admin plane takes the operator token the api minted on its start
+# (api/operator.hl), kept in its database or its state directory; it goes
+# into a file and a header file, never onto a command line
+api/api admin-token "${store[@]}" --state "$work/state" >"$work/admin.token"
+printf 'Authorization: Bearer %s\n' "$(cat "$work/admin.token")" >"$work/admin.h"
+grep -q '^Authorization: Bearer va-' "$work/admin.h" || { echo "no operator token"; exit 1; }
 
-post() { curl -fsS -X POST "$api$1" -H 'content-type: application/json' -d "$2"; }
+post() { curl -fsS -X POST "$api$1" -H @"$work/admin.h" -H 'content-type: application/json' -d "$2"; }
 field() { python3 -c "import json,sys; print(json.load(sys.stdin)[sys.argv[1]])" "$1"; }
 
 post /admin/v1/models '{"id": "echo-1", "price": {"input_per_mtok_micros": 3000000, "output_per_mtok_micros": 15000000}}' >/dev/null
@@ -113,13 +119,13 @@ pids+=($laptop_pid)
 # the node has applied the assignment the last change to its seats made: the
 # seat's status is only that of the assignment before it until then
 applied() {
-  curl -fsS "$api/admin/v1/nodes/laptop" | python3 -c 'import json,sys; n=json.load(sys.stdin); sys.exit(0 if n.get("applied_version") == n["assignment_version"] else 1)'
+  curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop" | python3 -c 'import json,sys; n=json.load(sys.stdin); sys.exit(0 if n.get("applied_version") == n["assignment_version"] else 1)'
 }
 
-seat_status() { curl -fsS "$api/admin/v1/nodes/laptop/seats/static" | field status; }
+seat_status() { curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop/seats/static" | field status; }
 wait_for() {
   for i in $(seq 1 100); do [ "$(seat_status)" = "$1" ] && applied && return 0; sleep 0.2; done
-  echo "the seat never became $1: $(curl -fsS "$api/admin/v1/nodes/laptop")"; echo "--- api"; cat "$work/api.log"; echo "--- node"; cat "$work/node.log"
+  echo "the seat never became $1: $(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop")"; echo "--- api"; cat "$work/api.log"; echo "--- node"; cat "$work/node.log"
   return 1
 }
 wait_for up
@@ -184,7 +190,7 @@ PY
   done
   grep -q 'Permissions Violation' <<<"$(as_node sub 'heart.zz.reply.>' --count 1 --timeout 3s)" || { echo "the nodes' account may read others' replies"; exit 1; }
   grep -q 'Authorization Violation' <<<"$(docker run --rm --network host natsio/nats-box:latest nats -s "nats://127.0.0.1:${NATS_PORT}" pub heart.zz.reply.x y 2>&1 || true)" || { echo "the broker took a client with no account"; exit 1; }
-  curl -fsS -X DELETE "$api/admin/v1/nodes/probe" >/dev/null
+  curl -H @"$work/admin.h" -fsS -X DELETE "$api/admin/v1/nodes/probe" >/dev/null
   echo "grafted, a node is handed the nodes' account at registration, connects with it, and is refused outside its grants"
 fi
 
@@ -229,7 +235,7 @@ echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
 # one streamed inference held open does not hold the api: an admin read, the
 # node link, the event stream and a cancel all complete promptly beside it
 # (only the moments a request touches Postgres take turns)
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "'$(printf 'y%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "'$(printf 'y%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}' >/dev/null
 wait_for up
 curl -s -N --max-time 40 -D "$work/held.head" -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/held.sse" &
 held_curl=$!
@@ -248,10 +254,10 @@ within() { # <label> <max ms> <command...>
   [ "$ms" -lt "$max" ] || { echo "$label took $ms ms beside a held stream"; exit 1; }
   echo "$label: $ms ms beside a held stream"
 }
-within "an admin read" 2000 curl -fsS --max-time 10 "$api/admin/v1/projects"
-within "a change-log read" 2000 curl -fsS --max-time 10 "$api/admin/v1/changes?limit=1"
+within "an admin read" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/projects"
+within "a change-log read" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/changes?limit=1"
 within "the node link" 2000 curl -fsS --max-time 10 "$api/node/v1/assignment" -H "authorization: Bearer $token"
-within "the event stream" 2000 curl -fsS --max-time 10 "$api/admin/v1/events?type=change"
+within "the event stream" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/events?type=change"
 t0=$(date +%s%N)
 python3 scripts/nats-publish.py "${NATS_URL#nats://}" "voice.node.laptop.cancel" '{"type": "cancel", "request_id": "'"$held_id"'"}'
 for i in $(seq 1 40); do
@@ -262,13 +268,13 @@ released_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 [ "$released_ms" -lt 2000 ] || { echo "a cancel took $released_ms ms to release the held stream"; exit 1; }
 echo "a cancel released the held stream in $released_ms ms"
 kill "$held_curl" 2>/dev/null || true
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
 # a caller that goes away mid-stream: the api stops at once, tells the seat
 # to stop, and answers the next caller
 slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
 wait_for up
 curl -s -N --max-time 2 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/left.sse" || true
 t0=$(date +%s%N)
@@ -285,12 +291,12 @@ echo "a caller that left after 2 s of a 20 s stream: the seat stopped within $st
 told_as cancelled
 last_event | python3 -c 'import json,sys; e=json.load(sys.stdin); assert e["seat"] == "laptop/static" and "output_tokens" not in e and e["price_micros"] == 0, e' || exit 1
 echo "the stream the caller left is told as cancelled"
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
 # a seat slower to its first output than the idle span is waited for: it has
 # the first-output span until then
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "slow to start", "first_output_ms": 12000}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "slow to start", "first_output_ms": 12000}}' >/dev/null
 wait_for up
 t0=$(date +%s%N)
 late=$(curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true)
@@ -308,7 +314,7 @@ echo "a seat 12 s to its first output, past the 10 s idle span, served in $ms ms
 # answers it with a reset. That is before the first-output span (30 s) ends:
 # the seat is cancelled, and /healthz, waiting behind the stream, answers by
 # then
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never sent", "first_output_ms": 60000}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never sent", "first_output_ms": 60000}}' >/dev/null
 wait_for up
 curl -s -N --max-time 2 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/quiet.sse" || true
 t0=$(date +%s%N)
@@ -322,7 +328,7 @@ stopped_ms=$(( ($(date +%s%N) - t0) / 1000000 ))
 [ "$stopped_ms" -lt 20000 ] || { echo "the quiet seat served on $stopped_ms ms after its caller left: the keep-alive did not find it gone"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
 python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < 20 else 1)' "$health_s" || { echo "/healthz waited $health_s s behind a caller that left a quiet seat"; exit 1; }
 echo "a caller that left a quiet seat after 2 s: found by its keep-alive, the seat stopped within $stopped_ms ms, /healthz answered in $health_s s"
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
 # an upstream that goes silent does not pin a request the api cancelled: the
@@ -343,7 +349,7 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
   echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/$name-caps.json"
   node/node --id "$name" --api "$api" --token "$qtoken" --data "$work/$name-data" --capabilities "$work/$name-caps.json" --port "$nport" >"$work/$name.log" 2>&1 &
   pids+=($!)
-  for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/$name/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
+  for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/$name/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
   # the cancel names the request the node was offered: read off its subject
   python3 scripts/nats-cancel.py "${NATS_URL#nats://}" "voice.node.$name" 2 >"$work/$name.cancelled" &
   local watcher=$!
@@ -384,12 +390,12 @@ if [ -n "${DATABASE_URL:-}" ]; then
   for i in $(seq 1 50); do grep -q 'standing by' "$work/brain2.log" && break; sleep 0.2; done
   grep -q 'standing by' "$work/brain2.log" || { echo "the second brain did not stand by"; cat "$work/brain2.log"; exit 1; }
   echo "one brain works, the other stands by"
-  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static echo-1 "$work/admin.token")
   kill "$first"
   for i in $(seq 1 50); do grep -q 'working' "$work/brain2.log" && break; sleep 0.2; done
   grep -q 'working' "$work/brain2.log" || { echo "the standby did not take over"; cat "$work/brain2.log"; exit 1; }
   echo "the standby took over"
-  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static echo-1 "$work/admin.token")
   # a brain that stops without its connection dropping (SIGSTOP stands in
   # for a host gone silent) loses the lock: Postgres ends its idle session
   # after 10 s, and the standby takes over
@@ -397,7 +403,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain3.log" 2>&1 &
   pids+=($!)
   for i in $(seq 1 50); do grep -q 'standing by' "$work/brain3.log" && break; sleep 0.2; done
-  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  before=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   kill -STOP "$second"
   t0=$(date +%s)
   for i in $(seq 1 150); do grep -q 'working' "$work/brain3.log" && break; sleep 0.2; done
@@ -405,9 +411,9 @@ if [ -n "${DATABASE_URL:-}" ]; then
   grep -q 'working' "$work/brain3.log" || { echo "the standby did not take over from a stopped brain"; cat "$work/brain3.log"; exit 1; }
   echo "the standby took over from a stopped brain in $(( $(date +%s) - t0 )) s"
   sleep 1.5
-  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  after=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   [ "$after" -gt "$before" ] || { echo "the route table's version went from $before to $after"; exit 1; }
-  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static)
+  (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static echo-1 "$work/admin.token")
   # a NATS address that never answers holds no tick: the table goes on
   # every second and one brain keeps the lock
   for p in "${pids[@]}"; do case "$(ps -o comm= -p "$p" 2>/dev/null)" in brain*) kill "$p" 2>/dev/null || true ;; esac; done
@@ -416,9 +422,9 @@ if [ -n "${DATABASE_URL:-}" ]; then
   for i in $(seq 1 100); do grep -q 'working' "$work/brain4.log" && break; sleep 0.2; done
   grep -q 'working' "$work/brain4.log" || { echo "a brain with an unanswering NATS did not work"; cat "$work/brain4.log"; exit 1; }
   sleep 1
-  before=$(curl -fsS "$api/admin/v1/routes" | field version)
+  before=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   sleep 5
-  after=$(curl -fsS "$api/admin/v1/routes" | field version)
+  after=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   [ $(( after - before )) -ge 3000 ] || { echo "with NATS not answering the table went from $before to $after in 5 s"; cat "$work/brain4.log"; exit 1; }
   ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
   echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
@@ -440,7 +446,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
 fi
 
 # a change on the coordinator reaches the node over NATS
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello again"}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello again"}}' >/dev/null
 for i in $(seq 1 50); do
   out=$(curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true)
   case "$out" in *'hello again'*) echo "the new assignment serves"; break ;; esac
@@ -455,7 +461,7 @@ responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key"
 # version it applied
 if [ -n "$container" ]; then
   docker rm -f "$container" >/dev/null
-  curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "after the blip"}}' >/dev/null
+  curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "after the blip"}}' >/dev/null
   docker run -d --rm --name "$container" -p "127.0.0.1:${NATS_PORT}:4222" -v "$PWD/$nats_conf:/etc/nats/voice.conf:ro" nats:2.11-alpine -c /etc/nats/voice.conf >/dev/null
   t0=$(date +%s)
   for i in $(seq 1 100); do
@@ -463,7 +469,7 @@ if [ -n "$container" ]; then
     case "$out" in *'after the blip'*) break ;; esac
     sleep 0.2
   done
-  case "$out" in *'after the blip'*) echo "the assignment sent while NATS was down arrived $(( $(date +%s) - t0 )) s after it came back" ;; *) echo "the node never recovered the lost assignment: $out"; curl -fsS "$api/admin/v1/nodes/laptop"; cat "$work/node.log"; exit 1 ;; esac
+  case "$out" in *'after the blip'*) echo "the assignment sent while NATS was down arrived $(( $(date +%s) - t0 )) s after it came back" ;; *) echo "the node never recovered the lost assignment: $out"; curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop"; cat "$work/node.log"; exit 1 ;; esac
 else
   echo "NATS is not this script's own, so the NATS outage step is skipped"
 fi
@@ -481,9 +487,9 @@ chmod 600 "$work/vault/node-mini-enrollment"
 HALE_VAULT_DIR="$work/vault" node/node --id mini --api "$api" --token-vault node-mini-enrollment --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
 mini_pid=$!
 pids+=($mini_pid)
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
 for i in $(seq 1 100); do
-  [ "$(seat_status)" = "up" ] && [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
+  [ "$(seat_status)" = "up" ] && [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
   sleep 0.2
 done
 t0=$(date +%s%N)
@@ -503,14 +509,14 @@ echo "a node enrolled with its token from the vault; one given it in the open wa
 echo "failed over from laptop/static to mini/steady in $ms ms"
 
 # every seat fails: a 502 that names the request and every attempt
-curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 100}}' >/dev/null
-for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 100}}' >/dev/null
+for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" 502)
 # a seat that answers with a tool call (the static engine's drill), as a
 # chat completion's tool_calls; the node says what it has in flight
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "unused", "tool_call": {"name": "weather", "arguments": "{\"city\": \"Oslo\"}"}, "first_output_ms": 3000}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "unused", "tool_call": {"name": "weather", "arguments": "{\"city\": \"Oslo\"}"}, "first_output_ms": 3000}}' >/dev/null
 wait_for up
-curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"enabled": false}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"enabled": false}' >/dev/null
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" tool) &
 asked=$!
 sleep 1.5
@@ -518,7 +524,7 @@ busy=$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'im
 wait $asked
 [ "$busy" = "1" ] || { echo "the node did not count the request it was serving: in_flight $busy"; exit 1; }
 echo "the node counted its request in flight"
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
 # the node's own API, with its seat, against node.yaml
@@ -528,7 +534,7 @@ wait_for up
 # complete answer (laptop for a response, then mini for a chat completion)
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "max_in_flight": null, "reason": null}' >/dev/null
 slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
-curl -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
 wait_for up
 curl -s -N -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/killed.sse" &
 streaming=$!
@@ -536,8 +542,8 @@ sleep 1.5
 kill -9 "$laptop_pid"
 wait "$streaming" || true
 (cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/responses "$work/killed.sse" failed) || { head -c 400 "$work/killed.sse"; exit 1; }
-curl -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d "{\"enabled\": true, ${slow:1:-1}}" >/dev/null
-for i in $(seq 1 100); do [ "$(curl -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d "{\"enabled\": true, ${slow:1:-1}}" >/dev/null
+for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
 curl -s -N -X POST "$api/v1/chat/completions" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}], "stream": true}' >"$work/killed-chat.sse" &
 streaming=$!
 # the dead laptop takes its 5 s ack wait first, then mini streams

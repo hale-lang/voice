@@ -140,15 +140,18 @@ voice_port=$(free_port); V=http://127.0.0.1:$voice_port
 # environment alone (the habitat's variables), no flag, the reading interval
 # voice's own knob
 VOICE_LIMITS_EVERY_S=1 HALE_DNA_HEAD_URL="$H" HALE_DNA_APPLICATION_ID="$application" HALE_DNA_OIDC_ISSUER="$issuer" HALE_DNA_OIDC_CLIENT=voice-api HALE_DNA_OIDC_CLIENT_VAULT=oidc-service-voice-api \
-  "$voice/api/api" --port "$voice_port" >"$root/voice.log" 2>&1 &
+  "$voice/api/api" --port "$voice_port" --state "$root/voice-state" >"$root/voice.log" 2>&1 &
 jobs_started+=($!)
 until_ok 20 "voice's api answering" curl -sf -o /dev/null "$V/healthz"
-curl -sf -X POST -H 'Content-Type: application/json' -d '{"id": "personal", "name": "Personal"}' "$V/admin/v1/projects" >/dev/null || fail "no project personal"
-key=$(curl -sf -X POST -H 'Content-Type: application/json' -d '{"name": "fixture"}' "$V/admin/v1/projects/personal/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["secret"])')
-shown() { curl -s "$V/admin/v1/projects/personal/limits"; }
+# the admin plane takes the operator token the api minted into its state
+# directory (api/operator.hl), as a header from a file
+printf 'Authorization: Bearer %s\n' "$("$voice/api/api" admin-token --state "$root/voice-state")" >"$root/admin.h"
+curl -H @"$root/admin.h" -sf -X POST -H 'Content-Type: application/json' -d '{"id": "personal", "name": "Personal"}' "$V/admin/v1/projects" >/dev/null || fail "no project personal"
+key=$(curl -H @"$root/admin.h" -sf -X POST -H 'Content-Type: application/json' -d '{"name": "fixture"}' "$V/admin/v1/projects/personal/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["secret"])')
+shown() { curl -H @"$root/admin.h" -s "$V/admin/v1/projects/personal/limits"; }
 ratified() { shown | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("source") == "practice" and d["practice"]["name"] == "operating/limits/personal" and [l.get("requests") for l in d["limits"]] == [int(sys.argv[1])] else 1)' "$1"; }
 until_ok 90 "the ratified limit of 2 read through the head" ratified 2
-code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{"limits": []}' "$V/admin/v1/projects/personal/limits")
+code=$(curl -H @"$root/admin.h" -s -o /dev/null -w '%{http_code}' -X PUT -H 'Content-Type: application/json' -d '{"limits": []}' "$V/admin/v1/projects/personal/limits")
 [[ $code == 409 ]] || fail "the admin plane set the organization's limit ($code)"
 # no seat serves echo-1 here: a request the limit admits is 503
 # no_eligible_seat, and one past it 429 before any seat is looked for

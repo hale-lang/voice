@@ -520,3 +520,22 @@ row it told.
 alter table usage add column seq bigserial;
 create unique index usage_seq on usage (seq);
 ```
+
+### Migration 7: the operator token
+
+The admin plane's one credential (`/admin/v1`), minted by the first api to
+start over the store and kept in one row, so every api instance answers to
+the same token and a restart keeps it. `voice-api admin-token` reads it.
+An api mints it as the first writer wins, and reads back the row kept:
+
+```sql
+create table operator_token (
+  id    boolean primary key default true check (id),
+  token text not null
+);
+```
+
+```sql
+insert into operator_token (token) values ($fresh)
+on conflict (id) do nothing;
+```

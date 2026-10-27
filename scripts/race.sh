@@ -51,14 +51,19 @@ for port in "$A_PORT" "$B_PORT"; do
   for i in $(seq 1 50); do curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
 done
 
-python3 - "$A_PORT" "$B_PORT" "$N" <<'PY'
+# the admin plane takes the operator token both instances read from the
+# database (api/operator.hl); it goes to the client in a file
+api/api admin-token --database "$DATABASE_URL" >"$work/admin.token"
+
+python3 - "$A_PORT" "$B_PORT" "$N" "$work/admin.token" <<'PY'
 import json, sys, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 a, b, n = f"http://127.0.0.1:{sys.argv[1]}", f"http://127.0.0.1:{sys.argv[2]}", int(sys.argv[3])
+operator = open(sys.argv[4]).read().strip()
 
 def call(base, method, path, body=None):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json"})
+    req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json", "authorization": f"Bearer {operator}"})
     with urllib.request.urlopen(req, timeout=60) as r:
         return r.status, json.loads(r.read() or b"null")
 

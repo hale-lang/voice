@@ -139,7 +139,7 @@ fn announce(
 }
 
 /// The migrations, in order: each a file of `dir`, store.md's SQL.
-const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n6 usage_seq 0006_usage_seq.sql\n";
+const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n6 usage_seq 0006_usage_seq.sql\n7 operator_token 0007_operator_token.sql\n";
 
 /// `api migrate --database URL [--migrations DIR]`: every migration not yet
 /// applied, each in its own transaction under Postgres's advisory lock
@@ -235,8 +235,11 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 }
 
 /// `api [--host H] [--port N] [--nats URL] [--node-nats URL]
-/// [--ui DIR] [--database URL] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
-/// [--migrations DIR]`. The migrations directory defaults to
+/// [--ui DIR] [--database URL] [--state DIR] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
+/// [--migrations DIR]`, or `api admin-token [--database URL] [--state DIR]`
+/// (admin_token.hl), which prints the admin plane's operator token
+/// (operator.hl): kept in the database, or, standalone, in the state
+/// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`). The migrations directory defaults to
 /// `migrations` beside the binary; with no `--ui` the app is
 /// not served. `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
@@ -251,6 +254,7 @@ fn main() {
     // the one sink: every logger's lines are written here (log.hl)
     let sink = logfmt::RecordSink { };
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
+    let token_asked = std::env::args_count() > 1 && std::env::arg(1) == "admin-token";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") {
         std::env::var("VOICE_DATABASE_URL")
     } else {
@@ -262,6 +266,7 @@ fn main() {
     let mut nats = "nats://127.0.0.1:4222";
     let mut node_nats = "";
     let mut ui = "";
+    let mut state = "";
     let mut first_s = 120;
     let mut idle_s = 30;
     let mut head = "";
@@ -294,7 +299,7 @@ fn main() {
             std::process::exit(2);
         }
     }
-    let mut i = if migrating { 2 } else { 1 };
+    let mut i = if migrating || token_asked { 2 } else { 1 };
     while i + 1 < std::env::args_count() {
         let flag = std::env::arg(i);
         let value = std::env::arg(i + 1);
@@ -316,6 +321,8 @@ fn main() {
             migrations = value;
         } else if flag == "--ui" {
             ui = value;
+        } else if flag == "--state" {
+            state = value;
         } else if flag == "--seat-first-s" {
             first_s = std::str::parse_int(value) or - 1;
             if first_s < 1 {
@@ -353,7 +360,7 @@ fn main() {
     // grafted, the habitat's database when none is given (store/pg_store.hl)
     let given = database;
     database = st::database_or_habitat(database);
-    if len(given) == 0 && len(database) > 0 {
+    if len(given) == 0 && len(database) > 0 && !token_asked {
         log_info(
             "grafted: the store's database is the one the habitat provisioned",
             std::log::kv("from", st::HABITAT_DATABASE_ENV),
@@ -373,6 +380,11 @@ fn main() {
         }
     }
     if migrating { std::process::exit(migrate(database, migrations)); }
+    if token_asked { std::process::exit(admin_token(database, state)); }
+    // the operator token, minted on the api's first start and read on every
+    // later one (operator.hl): in the database, or, standalone, in the
+    // state directory, whence it is handed to the store in memory
+    let operator = operator_token_at_start(database, state);
     // grafted, the habitat hands over the head and this service's client
     // there; each one it hands over replaces its flag
     let handed = head_handover(
@@ -514,6 +526,7 @@ fn main() {
                 bind: host + ":" + to_string(port),
                 cors: own_origins(host, port),
                 ui: ui,
+                store: st::MemoryStore { operator: operator },
                 link: link,
                 held: held,
                 first_s: first_s,

@@ -12,6 +12,10 @@ built on.
 
 The UI talks to voice only through [`../openapi.yaml`](../spec/openapi.yaml):
 `/admin/v1` for administration, `/v1` where it shows what a caller sees.
+`/admin/v1` takes the operator token (`voice-api admin-token` prints it): the
+UI asks for it once, keeps it in the browser, and sends it on every admin
+request, the event stream included (read with `fetch`, since `EventSource`
+sends no header); a token the api refuses is forgotten and asked for again.
 It never talks to a node; `../spec/node.yaml` is for the machine a node runs on.
 
 **The api is the trust boundary.** Voice's backend is Hale, and the

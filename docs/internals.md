@@ -22,8 +22,26 @@ same listener and connection: the OpenAI-compatible inference wire
 `/v1/models` and `/v1/capabilities`, the node link (`/node/v1/*`), the admin
 event stream, the route table (`/admin/v1/routes`, the brain's JSON as it is
 stored) and the app. The data plane authenticates its own callers (a project
-key, a node's token) and keeps the OpenAI error shape, which never moves;
-the exposure's gate judges only the rows.
+key, a node's token, the operator token on the event stream and the route
+table) and keeps the OpenAI error shape, which never moves; the exposure's
+gate judges only the rows.
+
+The admin plane takes the **operator token**
+([`api/operator.hl`](../api/operator.hl)): the exposure's bearer source,
+`AdminBearer` ([`api/ctl.hl`](../api/ctl.hl)), names a request whose
+`Authorization: Bearer` is the token the operator, who holds `admin`, and
+every other request nobody, refused `unauthenticated` (401); a request with
+no credential is the anonymous caller a probe is, which an admin row refuses
+`unauthorized` (403). The bearer holds only the token's SHA-256 digest and
+compares digests in constant time. The api mints the token on its first
+start: over Postgres into the `operator_token` row (store.md, migration 7),
+the first api to start winning, so every instance answers to the same token;
+standalone, into `operator-token` in its state directory (`--state`, by
+default `$XDG_STATE_HOME/voice-api`), mode 600 in a directory of mode 700.
+It is never read from the environment and never logged.
+`voice-api admin-token [--database URL] [--state DIR]` prints it, minting it
+when no api has yet; under Compose, `docker compose exec api voice-api
+admin-token`.
 
 A control-plane failure is a classed variant of `CtlError`
 ([`api/ctl.hl`](../api/ctl.hl)): `Invalid` 422, `NotFound` 404, `Conflict`
@@ -223,12 +241,13 @@ narrows it.
 
 ```sh
 hale build api
-api/api --port 8080          # --host
-curl -X POST localhost:8080/admin/v1/models -H 'content-type: application/json' -d '{"id": "echo-1"}'
-curl -X POST localhost:8080/admin/v1/projects -H 'content-type: application/json' -d '{"id": "work", "name": "Work"}'
-curl -X POST localhost:8080/admin/v1/projects/work/keys -H 'content-type: application/json' -d '{"name": "laptop"}'   # its "secret"
+api/api --port 8080          # --host, --state
+api/api admin-token | sed 's/^/Authorization: Bearer /' > admin.h   # the operator token
+curl -X POST localhost:8080/admin/v1/models -H @admin.h -H 'content-type: application/json' -d '{"id": "echo-1"}'
+curl -X POST localhost:8080/admin/v1/projects -H @admin.h -H 'content-type: application/json' -d '{"id": "work", "name": "Work"}'
+curl -X POST localhost:8080/admin/v1/projects/work/keys -H @admin.h -H 'content-type: application/json' -d '{"name": "laptop"}'   # its "secret"
 curl localhost:8080/v1/models -H 'Authorization: Bearer vk-...'
-curl localhost:8080/admin/v1/changes
+curl localhost:8080/admin/v1/changes -H @admin.h
 hale test api
 ```
 
@@ -342,7 +361,8 @@ the name that machine reaches this host by and `VOICE_NATS_BIND=0.0.0.0` to
 publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises, a host port other than 4222).
 
 The node `local` serves once it exists on the api and is started with its
-token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`), give it a
+token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`, under the
+operator token `docker compose exec api voice-api admin-token` prints), give it a
 seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
 -d node`. The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
@@ -719,8 +739,12 @@ that dies with its api instance is recorded as abandoned by the brain.
   and the reply subjects they are handed. NATS and the nodes are on the
   private network; only the api is exposed. Revoking a node refuses its
   token, and the coordinator publishes nothing further to its subject.
-- **Admins** authenticate through middleware in front of the admin APIs:
-  OIDC later, nothing in the MVP, which listens on loopback only.
+- **Admins** present the operator token (`Authorization: Bearer va-...`) on
+  every admin-plane call: the api mints it on its first start and keeps it
+  in Postgres (standalone, in its state directory), never in the
+  environment or a log; `voice-api admin-token` prints it. The api is
+  published on the host's address under a habitat placement, so nothing of
+  the admin plane rests on loopback. OIDC principals come later.
 - **Provider credentials** stay with the engines on their nodes. A CLI
   engine's login is named in the node's capabilities file and never
   declared; voice never reads it.

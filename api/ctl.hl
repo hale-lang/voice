@@ -162,15 +162,48 @@ fn ctl_response(e: CtlError) -> std::http::Response {
     };
 }
 
-/// Who the admin plane's callers are. Admin authentication is middleware
-/// that comes later; until then the api listens on loopback and every admin
-/// request holds the `admin` role: a request with no credential, and one
-/// with any bearer token, is the operator.
+/// Who the admin plane's callers are: a request whose bearer is the
+/// operator token (operator.hl) is the operator, and every other is
+/// nobody, refused `unauthenticated` by the exposure (and, on the event
+/// stream and the route table, by the data plane). The token is read from
+/// the store once, at the front's birth or at the first request, and only
+/// its digest is held.
 locus AdminBearer {
-    fn principal(token: String) -> std::api::Principal {
-        return std::api::Principal { mode: "bearer", name: "operator" };
+    params {
+        gate: st::Lock = st::Lock { };
+        store: st::Store = st::MemoryStore { };
+        // the operator token's digest, "" until it is read
+        digest: String = "";
     }
-    fn refused() -> String { return "no such token"; }
+
+    /// Read the operator token from the store, minting it when none is
+    /// kept; true when it is held.
+    fn load() -> Bool {
+        if len(self.digest) > 0 { return true; }
+        self.gate.enter();
+        let token = operator_token_kept(self.store) or {
+            self.gate.leave();
+            log_error("the operator token could not be read", std::log::kv("why", err.message));
+            return false;
+        };
+        self.gate.leave();
+        self.digest = operator_digest(token);
+        return true;
+    }
+
+    fn principal(token: String) -> std::api::Principal {
+        if self.load() && operator_matches(self.digest, token) {
+            return std::api::Principal { mode: "bearer", name: "operator" };
+        }
+        return std::api::Principal { mode: "bearer", name: "" };
+    }
+
+    fn refused() -> String { return OPERATOR_REFUSED; }
+
+    /// True when an `Authorization` header carries the operator token.
+    fn admits(authorization: String) -> Bool {
+        return self.load() && operator_matches(self.digest, bearer_of(authorization));
+    }
 }
 
 /// What the admin plane's callers hold: the operator holds `admin`.

@@ -2,9 +2,26 @@ import createClient, { type MaybeOptionalInit } from 'openapi-fetch';
 import type { PathsWithMethod, RequiredKeysOf } from 'openapi-typescript-helpers';
 import { useQuery } from '@tanstack/react-query';
 import type { paths, components } from './schema';
+import { operatorToken, forgetOperatorToken } from './token';
 
 /** The one way the UI reaches voice: spec/openapi.yaml, typed. */
 export const api = createClient<paths>({ baseUrl: '' });
+
+// Every admin request carries the operator token the admin plane takes
+// (token.ts); a token it refuses (401) is forgotten, and the UI asks for it
+// again. The probes take none.
+const isAdmin = (url: string) => new URL(url, window.location.href).pathname.startsWith('/admin/');
+api.use({
+  onRequest({ request }) {
+    const t = operatorToken();
+    if (t && isAdmin(request.url)) request.headers.set('Authorization', `Bearer ${t}`);
+    return request;
+  },
+  onResponse({ request, response }) {
+    if (response.status === 401 && isAdmin(request.url)) forgetOperatorToken();
+    return response;
+  },
+});
 
 export type Schemas = components['schemas'];
 export type Node = Schemas['Node'];

@@ -1,14 +1,17 @@
 // Call every operation on a running api and validate status, content type,
-// headers and body against the bundled spec.  usage: node live.mjs <bundled.json> <base-url>
+// headers and body against the bundled spec.  usage: node live.mjs <bundled.json> <base-url> <token-file>
 //
 // The api starts empty, so the sample world is made first, through the
-// admin plane, and every call presents the key it yields. Operations that
+// admin plane under the operator token (read from `token-file`, which
+// `voice-api admin-token` writes, never from a command line), and every
+// caller call presents the key it yields. Operations that
 // create get fresh ids, and the ones that delete run last, so each call
 // finds what it names.
 import fs from 'fs';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
-const [bundlePath, base] = process.argv.slice(2);
+const [bundlePath, base, tokenFile] = process.argv.slice(2);
+const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
 const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0' };
@@ -19,7 +22,7 @@ const strip = s => { const c = structuredClone(s); delete c.$schema; return c; }
 // the sample world: a model, an account, a project with its budget and a
 // key under it, and a node with a seat
 const setup = async (path, body) => {
-  const r = await fetch(base + path, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json' } });
+  const r = await fetch(base + path, { method: 'POST', body: JSON.stringify(body), headers: { 'content-type': 'application/json', ...operator } });
   const text = await r.text();
   if (r.status !== 201) { console.log('FAIL setup', path, r.status, text.slice(0, 200)); process.exit(1); }
   return JSON.parse(text);
@@ -91,7 +94,8 @@ for (const [p, m, op] of [...calls, ...last]) {
   const code = Object.keys(op.responses).find(c => c.startsWith('2'));
   const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]) + (queries[op.operationId] ?? '');
   const content = op.responses[code].content;
-  const who = p.startsWith('/node/') ? nodeAuth : auth;
+  // each plane's credential; an operation that takes none (the probes) is sent none
+  const who = Array.isArray(op.security) && op.security.length === 0 ? {} : p.startsWith('/node/') ? nodeAuth : p.startsWith('/admin/') ? operator : auth;
   if (op.operationId === 'streamAdminEvents') {
     // connect for a place, make a change, and ask again from that place
     n++;
@@ -165,5 +169,10 @@ if (nf.status !== 404 || nfb?.error?.code !== 'not_found') fail('unknown route',
 const anon = await fetch(base + '/v1/models'); n++;
 const anonb = await anon.json().catch(() => null);
 if (anon.status !== 401 || anonb?.error?.code !== 'invalid_key') fail('no key', `${anon.status} ${JSON.stringify(anonb)}`);
+// the admin plane without the operator token, or with a project key, is refused
+for (const [label, headers] of [['no token', {}], ['a project key', auth]]) {
+  const r = await fetch(base + '/admin/v1/projects', { headers }); n++;
+  if (r.status !== 401 && r.status !== 403) fail(`admin with ${label}`, `${r.status}`);
+}
 console.log(`${n} live calls, ${fails} failures`);
 process.exit(fails ? 1 : 0);

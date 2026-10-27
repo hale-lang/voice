@@ -1,0 +1,59 @@
+// The machine's hardware as the node reads it, from each command's output
+// as each platform writes it, and what the operator holds back.
+import ".." as node;
+
+fn main() {
+    std::test::assert_eq_str(node::os_of("Darwin\n"), "darwin", "macOS");
+    std::test::assert_eq_str(node::os_of("Linux\n"), "linux", "Linux");
+    std::test::assert_eq_str(node::arch_of("aarch64\n"), "arm64", "Linux on arm");
+    std::test::assert_eq_str(node::arch_of("arm64\n"), "arm64", "Apple silicon");
+    std::test::assert_eq_str(node::arch_of("x86_64\n"), "x86_64", "a PC");
+
+    let meminfo = "MemTotal:       131416892 kB\nMemFree:        120000000 kB\n";
+    std::test::assert_eq_int(node::meminfo_total(meminfo), 131416892 * 1024, "MemTotal, in bytes");
+    std::test::assert_eq_int(node::meminfo_total(""), 0, "no meminfo");
+
+    let df = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/nvme0n1p2  3843514416 123456789 3524512000       4% /\n";
+    std::test::assert_eq_int(node::df_available(df), 3524512000 * 1024, "df's available, in bytes");
+    std::test::assert_eq_int(node::df_available(""), 0, "no df");
+
+    let memory = 131416892 * 1024;
+    let gb10 = node::nvidia_accelerators("NVIDIA GB10, [N/A]\n", memory);
+    std::test::assert(
+        std::str::contains(gb10, "\"name\": \"NVIDIA GB10\"")
+            && std::str::contains(gb10, "\"memory_bytes\": " + to_string(memory))
+            && std::str::contains(gb10, "\"unified\": true"),
+        "a GPU with no memory of its own shares the machine's",
+    );
+    let two = node::nvidia_accelerators(
+        "NVIDIA GeForce RTX 4090, 24564\nNVIDIA GeForce RTX 4090, 24564\n",
+        memory,
+    );
+    std::test::assert(
+        std::str::contains(two, "\"memory_bytes\": " + to_string(24564 * 1048576))
+            && std::str::contains(two, "\"unified\": false")
+            && std::str::contains(two, "}, {"),
+        "two GPUs, each with its own memory",
+    );
+    std::test::assert_eq_str(node::nvidia_accelerators("", memory), "[]", "no nvidia-smi, no GPU");
+
+    let plain = "{\"max_in_flight\": 1, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+    std::test::assert_eq_int(node::model_memory(plain, 1000), 1000, "models may use it all");
+    let held = "{\"max_in_flight\": 1, \"hardware\": {\"model_memory_bytes\": 600}, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+    std::test::assert_eq_int(node::model_memory(held, 1000), 600, "the operator holds some back");
+    std::test::assert_eq_int(node::model_memory(held, 500), 500, "and can only lower it");
+    std::test::assert_eq_str(node::capabilities_problem(held), "", "a file that holds memory back");
+    let bad = "{\"max_in_flight\": 1, \"hardware\": {\"model_memory_bytes\": \"lots\"}, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+    std::test::assert(len(node::capabilities_problem(bad)) > 0, "not a number is refused");
+
+    let caps = node::with_hardware(
+        "{\"max_in_flight\": 1, \"engines\": []}",
+        "{\"os\": \"linux\"}",
+    );
+    std::test::assert(std::json::valid_object(caps), "the capabilities stay one object");
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(caps, "hardware"), "os"),
+        "linux",
+        "with the hardware in them",
+    );
+}

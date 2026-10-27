@@ -558,3 +558,21 @@ create table recipe (
 );
 alter table catalog_model add column recipe text;
 ```
+
+### Migration 9: placements
+
+A local model put on nodes (`createPlacement`): the `Placement` the api
+decided, with the variant it chose and each variant's fit, as of the
+hardware the nodes declared when it was made. `model` is kept beside the
+body so a model's placements are found without reading every body. A
+removed placement keeps its row, so its id is never reused.
+
+```sql
+create table placement (
+  id         text primary key,
+  model      text not null,              -- the catalog model it places
+  body       jsonb not null,             -- Placement, as the api decided it
+  created_at timestamptz not null default now(),
+  removed_at timestamptz
+);
+```

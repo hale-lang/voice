@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -37,6 +37,18 @@ const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
 const nodeToken = (await setup('/admin/v1/nodes', { id: 'laptop', name: 'Laptop' })).enrollment_token;
 await setup('/admin/v1/nodes/laptop/seats', { id: 'static', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1' }], config: { text: 'hello from voice' } });
 sample.key = key.id;
+// the node registers with the hardware it measured, and a local model
+// whose recipe fits it is placed there (the one the delete withdraws);
+// a second model is left for the create
+const hardware = { os: 'linux', arch: 'arm64', memory_bytes: 137438953472, model_memory_bytes: 120000000000, accelerators: [{ kind: 'cuda', name: 'NVIDIA GB10', memory_bytes: 137438953472, unified: true }], disk_free_bytes: 3500000000000 };
+{
+  const r = await fetch(base + '/node/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${nodeToken}` }, body: JSON.stringify({ protocol: 2, version: 'live', capabilities: { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object' } }], hardware }, local: { paused: false, paused_seats: [], max_in_flight: null, reason: null } }) });
+  if (r.status !== 200) { console.log('FAIL setup register', r.status, (await r.text()).slice(0, 200)); process.exit(1); }
+}
+await setup('/admin/v1/recipes', recipe('live-placed'));
+await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
+await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
+await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'] });
 const auth = { authorization: `Bearer ${key.secret}` };
 
 // the bodies the real handlers take; anything else gets the generic one
@@ -44,6 +56,7 @@ const bodies = {
   createCatalogModel: { id: 'live-1', kind: 'hosted', owned_by: 'anthropic', price: null },
   updateCatalogModel: { max_output_tokens: 2048 },
   createRecipe: recipe('live-2'),
+  createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'] },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },

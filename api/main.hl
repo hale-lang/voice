@@ -139,7 +139,7 @@ fn announce(
 }
 
 /// The migrations, in order: each a file of `dir`, store.md's SQL.
-const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n6 usage_seq 0006_usage_seq.sql\n7 operator_token 0007_operator_token.sql\n8 recipes 0008_recipes.sql\n9 placements 0009_placements.sql\n";
+const MIGRATIONS: String = "1 store 0001_store.sql\n2 node_draining 0002_node_draining.sql\n3 limit_holder 0003_limit_holder.sql\n4 instance_reclaimed 0004_instance_reclaimed.sql\n5 route_table 0005_route_table.sql\n6 usage_seq 0006_usage_seq.sql\n7 operator_token 0007_operator_token.sql\n8 recipes 0008_recipes.sql\n9 placements 0009_placements.sql\n10 runtimes 0010_runtimes.sql\n";
 
 /// `api migrate --database URL [--migrations DIR]`: every migration not yet
 /// applied, each in its own transaction under Postgres's advisory lock
@@ -235,14 +235,15 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 }
 
 /// `api [--host H] [--port N] [--nats URL] [--node-nats URL]
-/// [--ui DIR] [--recipes DIR] [--database URL] [--state DIR] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
+/// [--ui DIR] [--recipes DIR] [--runtimes DIR] [--database URL] [--state DIR] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
 /// [--migrations DIR]`, or `api admin-token [--database URL] [--state DIR]`
 /// (admin_token.hl), which prints the admin plane's operator token
 /// (operator.hl): kept in the database, or, standalone, in the state
 /// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`). The migrations directory defaults to
 /// `migrations` beside the binary; with no `--ui` the app is
 /// not served. `--recipes` is the directory of the recipes voice ships
-/// (`recipes`, the repository's, by default).
+/// (`recipes`, the repository's, by default), and `--runtimes` the
+/// runtimes' (`runtimes`).
 /// `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
 /// is `postgres://user:password@host:port/database`; without either, a
@@ -256,10 +257,16 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 /// rules every recipe is (recipes.hl), as their bodies, one a line. A
 /// missing directory holds none; a file the rules refuse is left out, and
 /// said. Read once, at start, of at most `SHIPPED_MAX` files.
+fn shipped_recipes(dir: String) -> String { return shipped(dir, "recipe"); }
+
+/// The runtimes in `dir` that voice ships, as `shipped_recipes` reads
+/// recipes (runtimes.hl).
+fn shipped_runtimes(dir: String) -> String { return shipped(dir, "runtime"); }
+
 @unbounded
-fn shipped_recipes(dir: String) -> String {
+fn shipped(dir: String, kind: String) -> String {
     let n = std::io::fs::list_dir_count(dir) or 0;
-    let shelf = Shelf { };
+    let shelf = Shelf { kind: kind };
     let mut i = 0;
     while i < n {
         shelf.read(dir, std::io::fs::list_dir_at(dir, i) or "");
@@ -268,10 +275,11 @@ fn shipped_recipes(dir: String) -> String {
     return shelf.text();
 }
 
-/// The shipped recipes as they are read, a file a call, so each file's
-/// work is the call's own.
+/// The shipped recipes or runtimes as they are read, a file a call, so
+/// each file's work is the call's own.
 locus Shelf {
     params {
+        kind: String = "recipe";
         out: std::bytes::BytesBuilder = std::bytes::BytesBuilder { initial_cap: 4096 };
         kept: Int = 0;
     }
@@ -279,19 +287,15 @@ locus Shelf {
     fn read(dir: String, name: String) {
         if !std::str::ends_with(name, ".json") { return; }
         let file = std::io::fs::read_file(dir + "/" + name) or "";
-        let lic = std::json::find_field_raw(file, "license");
         let id = std::json::find_string_field(file, "id");
-        let body = recipe_body(
-            id,
-            RecipeLicense {
-                name: std::json::find_string_field(lic, "name"),
-                url: std::json::find_string_field(lic, "url"),
-            },
-            std::str::trim(std::json::find_field_raw(file, "variants")),
-        );
+        let body = if self.kind == "runtime" {
+            shipped_runtime_body(file)
+        } else {
+            shipped_recipe_body(file)
+        };
         let mut problem = "";
         if std::str::starts_with(body, "!") {
-            problem = body[1..len(body)];
+            problem = refusal_message(body);
         } else if id + ".json" != name {
             problem = "its id is " + id;
         } else if self.kept >= SHIPPED_MAX {
@@ -299,7 +303,7 @@ locus Shelf {
         }
         if len(problem) > 0 {
             log_error(
-                "a shipped recipe is refused",
+                "a shipped " + self.kind + " is refused",
                 std::log::kv("file", name) + std::log::kv("problem", problem),
             );
             return;
@@ -312,6 +316,36 @@ locus Shelf {
         let b = self.out.snapshot() or b"";
         return std::str::from_bytes(b);
     }
+}
+
+/// A shipped recipe file's body, held to the rules (recipes.hl).
+fn shipped_recipe_body(file: String) -> String {
+    let lic = std::json::find_field_raw(file, "license");
+    return recipe_body(
+        std::json::find_string_field(file, "id"),
+        License {
+            name: std::json::find_string_field(lic, "name"),
+            url: std::json::find_string_field(lic, "url"),
+        },
+        std::str::trim(std::json::find_field_raw(file, "variants")),
+    );
+}
+
+/// A shipped runtime file's body, held to the rules (runtimes.hl). A file
+/// with a field `RuntimeCreate` does not name is refused, as the contract
+/// check refuses it.
+fn shipped_runtime_body(file: String) -> String {
+    let extra = only_keys(file, ",id,license,server,formats,accelerator,platforms,artifact,");
+    if len(extra) > 0 { return "!" + extra + "\ta runtime has no field " + extra; }
+    let c = RuntimeCreate::api_decode(file) or RuntimeCreate {
+        id: "",
+        license: License { },
+        server: "",
+        accelerator: RuntimeAccelerator::cpu,
+        artifact: RuntimeArtifact { },
+    };
+    if len(c.id) == 0 { return "!id\tthe file is not a runtime"; }
+    return runtime_body(c);
 }
 
 fn main() {
@@ -331,6 +365,7 @@ fn main() {
     let mut node_nats = "";
     let mut ui = "";
     let mut recipes = "recipes";
+    let mut runtimes = "runtimes";
     let mut state = "";
     let mut first_s = 120;
     let mut idle_s = 30;
@@ -388,6 +423,8 @@ fn main() {
             ui = value;
         } else if flag == "--recipes" {
             recipes = value;
+        } else if flag == "--runtimes" {
+            runtimes = value;
         } else if flag == "--state" {
             state = value;
         } else if flag == "--seat-first-s" {
@@ -549,6 +586,7 @@ fn main() {
     let id = st::random_id(6);
     let held = HeldLimits { };
     let shipped = shipped_recipes(recipes);
+    let shipped_rt = shipped_runtimes(runtimes);
     if len(database) > 0 {
         Api {
             front: Front {
@@ -556,6 +594,7 @@ fn main() {
                 cors: own_origins(host, port),
                 ui: ui,
                 shipped: shipped,
+                shipped_runtimes: shipped_rt,
                 store: st::PgStore { url: database },
                 rows_store: st::PgStore { url: database },
                 link: link,
@@ -596,6 +635,7 @@ fn main() {
                 cors: own_origins(host, port),
                 ui: ui,
                 shipped: shipped,
+                shipped_runtimes: shipped_rt,
                 store: st::MemoryStore { operator: operator },
                 link: link,
                 held: held,

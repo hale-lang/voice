@@ -576,3 +576,20 @@ create table placement (
   removed_at timestamptz
 );
 ```
+
+### Migration 10: runtimes
+
+The runtimes the operator allows (`createRuntime`): each one's
+`RuntimeCreate` as the api checked it. The runtimes voice ships are files
+the api reads, not rows, and an id the operator has held, live or
+withdrawn, is the operator's for good. A placement names the runtime it
+chose in its body.
+
+```sql
+create table runtime (
+  id         text primary key,
+  body       jsonb not null,             -- RuntimeCreate, as the api checked it
+  created_at timestamptz not null default now(),
+  removed_at timestamptz
+);
+```

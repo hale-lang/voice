@@ -1,7 +1,9 @@
 // Placements: a local model put on nodes, by the operator. The coordinator
-// picks the form of its weights (a variant of the model's recipe) that the
-// nodes can run and that fits them, as they declared their hardware
-// (protocol.yaml `Hardware`), and keeps why, for every variant. A placement
+// picks the form of its weights (a variant of the model's recipe) and the
+// runtime that serves it (runtimes.hl): a runtime that reads the variant's
+// format on the nodes' platform and accelerator, a variant that fits them
+// as they declared their hardware (protocol.yaml `Hardware`). It keeps
+// why, for every variant. A placement
 // is a decision: the managed engines on its nodes act on it.
 //
 // One node today, the leader, which holds the seat; the fit is judged on
@@ -17,6 +19,8 @@ type PlacementCreate {
     nodes: bounded[String; 1];
     has_variant: Bool = false;
     variant: String = "";
+    has_runtime: Bool = false;
+    runtime: String = "";
 }
 
 /// Who chose a placement's variant (`Placement.chosen_by`).
@@ -30,7 +34,14 @@ fn placement_chooser_name(v: PlacementChooser) -> String {
 }
 
 /// `VariantFit`: one variant, judged against the nodes.
-type VariantFit { variant: String = ""; fits: Bool = false; reason: String = ""; }
+type VariantFit {
+    variant: String = "";
+    // the runtime that would serve it there, left out when none runs it
+    has_runtime: Bool = false;
+    runtime: String = "";
+    fits: Bool = false;
+    reason: String = "";
+}
 
 /// `Placement`.
 type Placement {
@@ -39,6 +50,7 @@ type Placement {
     nodes: bounded[String; 1];
     recipe: String = "";
     variant: String = "";
+    runtime: String = "";
     chosen_by: PlacementChooser = PlacementChooser::coordinator;
     leader: String = "";
     fit: bounded[VariantFit; 8];
@@ -52,8 +64,10 @@ locus Placements {
         store: st::Store;
         // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
         gate: st::Lock = st::Lock { };
-        // the recipes a model's weights come from (recipes.hl), behind the same gate
+        // the recipes a model's weights come from (recipes.hl), and the
+        // runtimes that serve them (runtimes.hl), behind the same gate
         recipes: Recipes = Recipes { store: self.store, gate: self.gate };
+        runtimes: Runtimes = Runtimes { store: self.store, gate: self.gate };
     }
 
     /// `listPlacements`: those not withdrawn.
@@ -135,6 +149,17 @@ locus Placements {
             created_at: now_seconds()
         };
         push(out.nodes, leader) or discard;
+        let all = self.runtimes.usable_in_gate() or raise;
+        let mut usable = RuntimeList { };
+        for r in all.data {
+            if !c.has_runtime || r.id == c.runtime { push(usable.data, r) or discard; }
+        }
+        if c.has_runtime && count(usable.data) == 0 {
+            fail bad(
+                "no runtime " + c.runtime + ": voice ships none, nor has the operator allowed one",
+                "runtime"
+            );
+        }
         let mut best = -1;
         let mut best_rank = 0;
         let mut best_memory = 0;
@@ -143,9 +168,10 @@ locus Placements {
         let mut it = std::json::array_first(recipe.variants.text);
         while !it.done {
             let v = it.element;
-            let judged = judge_variant(v, hw);
+            let judged = judge_variant(v, hw, usable);
             push(out.fit, judged) or discard;
-            let rank = format_rank(std::json::find_string_field(v, "format"), hw);
+            let rank = format_rank(std::json::find_string_field(v, "format"), hw)
+                + (if judged.has_runtime && runs_on_cpu(usable, judged.runtime) { 10 } else { 0 });
             let memory = std::json::find_int_field(v, "memory_bytes");
             if c.has_variant && judged.variant == c.variant { named = i; }
             if judged.fits
@@ -170,6 +196,7 @@ locus Placements {
                 );
             }
             out.variant = c.variant;
+            out.runtime = chosen.runtime;
             out.chosen_by = PlacementChooser::operator;
         } else {
             if best < 0 {
@@ -181,6 +208,8 @@ locus Placements {
             }
             let chosen = at(out.fit, best) or VariantFit { };
             out.variant = chosen.variant;
+            out.runtime = chosen.runtime;
+            if c.has_runtime { out.chosen_by = PlacementChooser::operator; }
         }
 
         let body = placement_json(out);
@@ -238,6 +267,7 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
         model: r.model,
         recipe: std::json::find_string_field(b, "recipe"),
         variant: std::json::find_string_field(b, "variant"),
+        runtime: std::json::find_string_field(b, "runtime"),
         chosen_by: if std::json::find_string_field(b, "chosen_by") == "operator" {
             PlacementChooser::operator
         } else {
@@ -260,6 +290,8 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
             out.fit,
             VariantFit {
                 variant: std::json::find_string_field(it.element, "variant"),
+                has_runtime: std::json::string_field(it.element, "runtime").kind == "string",
+                runtime: std::json::find_string_field(it.element, "runtime"),
                 fits: std::json::find_bool_field(it.element, "fits"),
                 reason: std::json::find_string_field(it.element, "reason"),
             },
@@ -279,32 +311,65 @@ fn placement_json(p: Placement) -> String {
     let fits = st::JsonList { };
     for f in p.fit {
         fits.add(
-            "{\"variant\": " + jq(f.variant) + ", \"fits\": "
+            "{\"variant\": " + jq(f.variant) + ", \"runtime\": "
+                + (if f.has_runtime { jq(f.runtime) } else { "null" }) + ", \"fits\": "
                 + (if f.fits { "true" } else { "false" })
                 + ", \"reason\": " + jq(f.reason) + "}",
         );
     }
     return "{\"id\": " + jq(p.id) + ", \"model\": " + jq(p.model) + ", \"nodes\": [" + nodes.text()
         + "]"
-        + ", \"recipe\": " + jq(p.recipe) + ", \"variant\": " + jq(p.variant) + ", \"chosen_by\": "
+        + ", \"recipe\": " + jq(p.recipe) + ", \"variant\": " + jq(p.variant) + ", \"runtime\": "
+        + jq(p.runtime) + ", \"chosen_by\": "
         + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"fit\": ["
         + fits.text() + "], \"created_at\": " + jtime(p.created_at) + "}";
 }
 
 // ---- the fit ----------------------------------------------------------
 
-/// What runs a format on a machine, as its hardware says: Apple silicon
-/// (Metal) runs MLX, then GGUF; a CUDA GPU runs safetensors, then GGUF;
-/// any machine runs GGUF on its processors. "" when it runs none.
-fn runs_on(format: String, hw: String) -> String {
+/// The runtime among `rts` that reads `format` on a machine, as its
+/// hardware says: one for its platform, on one of its accelerators before
+/// one on its processors; "" when none does.
+@bounded_by(rts)
+fn runtime_for(format: String, hw: String, rts: RuntimeList) -> String {
+    let os = std::json::find_string_field(hw, "os");
+    let arch = std::json::find_string_field(hw, "arch");
     let accel = accelerator_kinds(hw);
-    if std::str::contains(accel, ",metal,") && (format == "mlx" || format == "gguf") {
-        return "metal";
+    let mut cpu = "";
+    for r in rts.data {
+        let mut reads = false;
+        for f in r.formats {
+            if model_format_name(f) == format { reads = true; }
+        }
+        let mut here = false;
+        for p in r.platforms {
+            if host_os_name(p.os) == os && host_arch_name(p.arch) == arch { here = true; }
+        }
+        if reads && here {
+            let on = runtime_accelerator_name(r.accelerator);
+            if on == "cpu" {
+                if len(cpu) == 0 { cpu = r.id; }
+            } else if std::str::contains(accel, "," + on + ",") {
+                return r.id;
+            }
+        }
     }
-    if std::str::contains(accel, ",cuda,") && (format == "safetensors" || format == "gguf") {
-        return "cuda";
+    return cpu;
+}
+
+/// True when the runtime `id` runs on processors, not an accelerator.
+fn runs_on_cpu(rts: RuntimeList, id: String) -> Bool {
+    for r in rts.data {
+        if r.id == id { return r.accelerator == RuntimeAccelerator::cpu; }
     }
-    if format == "gguf" { return "cpu"; }
+    return false;
+}
+
+/// The accelerator the runtime `id` runs on, by name.
+fn runtime_on(rts: RuntimeList, id: String) -> String {
+    for r in rts.data {
+        if r.id == id { return runtime_accelerator_name(r.accelerator); }
+    }
     return "";
 }
 
@@ -331,28 +396,34 @@ fn accelerator_kinds(hw: String) -> String {
     return std::str::from_bytes(b);
 }
 
-/// One variant judged against a machine's hardware: its format runs there,
-/// it fits what models may use of the memory, and its files fit the disk.
+/// One variant judged against a machine's hardware and the runtimes that
+/// may serve it: a runtime reads its format there, it fits what models may
+/// use of the memory, and its files fit the disk.
 @bounded_by(v)
-fn judge_variant(v: String, hw: String) -> VariantFit {
+fn judge_variant(v: String, hw: String, rts: RuntimeList) -> VariantFit {
     let id = std::json::find_string_field(v, "id");
     let format = std::json::find_string_field(v, "format");
-    let on = runs_on(format, hw);
-    if len(on) == 0 {
+    let rt = runtime_for(format, hw, rts);
+    if len(rt) == 0 {
         return VariantFit {
             variant: id,
             fits: false,
-            reason: format + " runs on none of the node's processors",
+            reason: "no runtime reads " + format + " on " + std::json::find_string_field(hw, "os")
+                + "/"
+                + std::json::find_string_field(hw, "arch") + " with " + accelerators_said(hw),
         };
     }
+    let runs = rt + " runs " + format + " on " + runtime_on(rts, rt);
     let need = std::json::find_int_field(v, "memory_bytes");
     let room = std::json::find_int_field(hw, "model_memory_bytes");
     let memory = gb(need) + " of " + gb(room) + " for models";
     if need > room {
         return VariantFit {
             variant: id,
+            has_runtime: true,
+            runtime: rt,
             fits: false,
-            reason: format + " runs on " + on + "; needs " + memory,
+            reason: runs + "; needs " + memory,
         };
     }
     let mut size = 0;
@@ -366,15 +437,26 @@ fn judge_variant(v: String, hw: String) -> VariantFit {
     if size > free {
         return VariantFit {
             variant: id,
+            has_runtime: true,
+            runtime: rt,
             fits: false,
-            reason: format + " runs on " + on + "; " + memory + "; needs " + disk,
+            reason: runs + "; " + memory + "; needs " + disk,
         };
     }
     return VariantFit {
         variant: id,
+        has_runtime: true,
+        runtime: rt,
         fits: true,
-        reason: format + " runs on " + on + "; " + memory + "; " + disk,
+        reason: runs + "; " + memory + "; " + disk,
     };
+}
+
+/// A machine's accelerators, as a reason says them.
+fn accelerators_said(hw: String) -> String {
+    let kinds = accelerator_kinds(hw);
+    if kinds == "," { return "no accelerator"; }
+    return std::str::replace(kinds[1..(len(kinds) - 1)], ",", " and ");
 }
 
 /// Every variant's reason, for a refusal.

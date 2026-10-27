@@ -1,0 +1,126 @@
+// Runtimes on the admin plane: the shipped ones as the api reads them, and
+// the operator's (list, create, get, remove), called on a receiver over a
+// store. The fixtures are the contract check's (spec/validate/runtimes):
+// the api takes what it takes, and refuses every one it refuses.
+import ".." as api;
+import "../../store" as st;
+
+fn here(path: String) -> String {
+    return if std::io::fs::file_exists(path) { path } else { "../" + path };
+}
+
+fn blank() -> api::Runtime { return api::Runtime { id: "refused" }; }
+
+/// A container runtime for linux/arm64 with CUDA, reading GGUF.
+fn container(id: String, digest: String) -> api::RuntimeCreate {
+    let mut c = api::RuntimeCreate {
+        id: id,
+        license: api::License { name: "mit", url: "https://opensource.org/license/mit" },
+        server: "llama-server",
+        accelerator: api::RuntimeAccelerator::cuda,
+        artifact: api::RuntimeArtifact {
+            kind: api::ArtifactKind::container,
+            has_image: true,
+            image: "ghcr.io/ggml-org/llama.cpp",
+            has_digest: true,
+            digest: digest,
+        },
+    };
+    push(c.formats, api::ModelFormat::gguf) or discard;
+    push(
+        c.platforms,
+        api::RuntimePlatform { os: api::HostOs::linux, arch: api::HostArch::arm64 },
+    ) or discard;
+    return c;
+}
+
+fn main() {
+    let ok = api::shipped_runtimes(here("spec/validate/runtimes/ok"));
+    std::test::assert(
+        std::str::contains(ok, "\"id\": \"fixture-runtime\"")
+            && std::str::contains(ok, "\"id\": \"fixture-archive\""),
+        "the shipped fixtures are read",
+    );
+    std::test::assert_eq_str(
+        api::shipped_runtimes(here("spec/validate/runtimes/refused")),
+        "",
+        "every runtime the contract refuses, the api refuses",
+    );
+    let defaults = api::shipped_runtimes(here("runtimes"));
+    std::test::assert(
+        std::str::contains(defaults, "\"id\": \"vllm-26.09\"")
+            && std::str::contains(defaults, "\"id\": \"llama-server-b11913-cuda\"")
+            && std::str::contains(defaults, "\"id\": \"llama-server-b11913-metal\""),
+        "voice's own three are read",
+    );
+
+    let store = st::MemoryStore { };
+    let runtimes = api::Runtimes { store: store, shipped: ok };
+    let digest = "sha256:" + std::str::repeat("b", 64);
+    let made = runtimes.create(container("mine-1", digest)) or blank();
+    std::test::assert_eq_str(made.id, "mine-1", "the operator allows a runtime");
+    std::test::assert(
+        made.origin == api::Origin::operator && made.has_created_at,
+        "as the operator's",
+    );
+    std::test::assert_eq_str(made.artifact.digest, digest, "pinned by its digest");
+    let read = runtimes.get(api::RuntimeRef { runtime: "mine-1" }) or blank();
+    std::test::assert(read.server == "llama-server" && count(read.formats) == 1, "it reads back");
+    let shipped = runtimes.get(api::RuntimeRef { runtime: "fixture-archive" }) or blank();
+    std::test::assert(
+        shipped.origin == api::Origin::shipped
+            && shipped.artifact.kind == api::ArtifactKind::archive,
+        "a shipped archive reads back",
+    );
+    let listed = runtimes.list() or api::RuntimeList { };
+    std::test::assert_eq_int(count(listed.data), 3, "voice's two and the operator's one");
+
+    let mut failed = "";
+    runtimes.create(container("mine-2", "latest")) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a tag is not a digest");
+    let mut tagged = container("mine-2", digest);
+    tagged.artifact.image = "ghcr.io/ggml-org/llama.cpp:server-cuda";
+    failed = "";
+    runtimes.create(tagged) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "nor is an image with a tag");
+    let mut unknown = container("mine-2", digest);
+    unknown.server = "ollama";
+    failed = "";
+    runtimes.create(unknown) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a server the node cannot start");
+    failed = "";
+    runtimes.create(container("fixture-runtime", digest)) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "a shipped id is taken");
+
+    failed = "";
+    runtimes.remove(api::RuntimeRef { runtime: "fixture-runtime" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "a shipped runtime cannot be removed");
+    let gone = runtimes.remove(api::RuntimeRef { runtime: "mine-1" }) or blank();
+    std::test::assert_eq_str(gone.id, "mine-1", "the operator's is withdrawn");
+    failed = "";
+    runtimes.create(container("mine-1", digest)) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "its id is never reused");
+
+    // an id the operator has held stays the operator's when a release ships it
+    let held = st::MemoryStore { };
+    let before = api::Runtimes { store: held };
+    before.create(container("fixture-runtime", digest)) or discard;
+    let after = api::Runtimes { store: held, shipped: ok };
+    let theirs = after.get(api::RuntimeRef { runtime: "fixture-runtime" }) or blank();
+    std::test::assert(
+        theirs.origin == api::Origin::operator && theirs.artifact.digest == digest,
+        "a shipped id the operator holds is the operator's",
+    );
+}

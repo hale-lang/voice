@@ -1,0 +1,388 @@
+// Runtimes: what serves a local model on a node, pinned, as the operator
+// allows it. Voice ships some in runtimes/, read at start and never
+// changed; the operator allows more on the admin plane, kept in the store.
+// A placement chooses one that reads its variant's format on its nodes'
+// platform and accelerator (placements.hl).
+//
+// A node starts only a server it knows how to (`server`), from the pinned
+// artifact and nothing else, so a runtime names no command. Every runtime
+// is held to the same rules, whichever way it came, and the body kept is
+// rebuilt from the fields checked. As with recipes, an id the operator has
+// held, live or withdrawn, is the operator's for good.
+
+type RuntimeRef { runtime: String; }
+
+/// A weight format (`RuntimeCreate.formats`, `RecipeVariant.format`).
+type ModelFormat = enum { safetensors, gguf, mlx };
+
+fn model_format_name(v: ModelFormat) -> String {
+    return match v {
+        ModelFormat::safetensors -> "safetensors",
+        ModelFormat::gguf -> "gguf",
+        ModelFormat::mlx -> "mlx"
+    };
+}
+
+/// What a runtime runs on (`RuntimeCreate.accelerator`).
+type RuntimeAccelerator = enum { cuda, metal, cpu };
+
+fn runtime_accelerator_name(v: RuntimeAccelerator) -> String {
+    return match v {
+        RuntimeAccelerator::cuda -> "cuda",
+        RuntimeAccelerator::metal -> "metal",
+        RuntimeAccelerator::cpu -> "cpu"
+    };
+}
+
+/// One platform a runtime runs on.
+type RuntimePlatform { os: HostOs = HostOs::linux; arch: HostArch = HostArch::x86_64; }
+
+/// Where a runtime comes from (`RuntimeCreate.artifact.kind`).
+type ArtifactKind = enum { container, archive };
+
+/// `RuntimeCreate.artifact`: an image by digest, or a tarball by sha256.
+type RuntimeArtifact {
+    kind: ArtifactKind = ArtifactKind::container;
+    has_image: Bool = false;
+    image: String = "";
+    has_digest: Bool = false;
+    digest: String = "";
+    has_url: Bool = false;
+    url: String = "";
+    has_sha256: Bool = false;
+    sha256: String = "";
+    has_bytes: Bool = false;
+    bytes: Int = 0;
+}
+
+/// `RuntimeCreate`. `server` is one the node knows how to start (`SERVERS`).
+type RuntimeCreate {
+    id: String;
+    license: License;
+    server: String;
+    formats: bounded[ModelFormat; 3];
+    accelerator: RuntimeAccelerator;
+    platforms: bounded[RuntimePlatform; 4];
+    artifact: RuntimeArtifact;
+}
+
+/// `Runtime`. A shipped runtime has no `created_at`.
+type Runtime {
+    id: String = "";
+    license: License = License { };
+    server: String = "";
+    formats: bounded[ModelFormat; 3];
+    accelerator: RuntimeAccelerator = RuntimeAccelerator::cpu;
+    platforms: bounded[RuntimePlatform; 4];
+    artifact: RuntimeArtifact = RuntimeArtifact { };
+    origin: Origin = Origin::operator;
+    has_created_at: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// Voice's own (at most `SHIPPED_MAX`) and the operator's (the store's 64).
+type RuntimeList { data: bounded[Runtime; 128]; }
+
+/// The server programs a node knows how to start and stop.
+const SERVERS: String = ",vllm,llama-server,";
+
+locus Runtimes {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+        // the shipped runtimes' bodies, checked, one a line (`shipped_runtimes`)
+        shipped: String = "";
+    }
+
+    /// `listRuntimes`: voice's own the operator has not held, then the
+    /// operator's not withdrawn.
+    fn list() -> RuntimeList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn list_in_gate() -> RuntimeList fallible(CtlError) {
+        let mut out = RuntimeList { };
+        let rows = self.store.runtimes() or fail store_down(err);
+        let v = std::str::bytes_view(self.shipped);
+        let mut start = 0;
+        while start < v.n {
+            let nl = st::line_end(v, start);
+            let line = std::str::slice(v, start, nl);
+            start = nl + 1;
+            if len(line) > 0 && !runtime_held(rows, std::json::find_string_field(line, "id")) {
+                let r = runtime_view(line, Origin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
+                push(out.data, r) or discard;
+            }
+        }
+        for row in rows.rows {
+            if !row.removed {
+                let r = runtime_view(row.body, Origin::operator, true, row.created_at) or raise;
+                push(out.data, r) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// `createRuntime`.
+    fn create(c: RuntimeCreate) -> Runtime fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.create_in_gate(c) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn create_in_gate(c: RuntimeCreate) -> Runtime fallible(CtlError) {
+        let body = runtime_body(c);
+        if std::str::starts_with(body, "!") {
+            fail bad(refusal_message(body), recipe_param(body));
+        }
+        if len(shipped_line(self.shipped, c.id)) > 0 {
+            fail clash("voice ships runtime " + c.id + "; another build is another id");
+        }
+        let row = st::RuntimeRow { id: c.id, body: body, created_at: now_seconds() };
+        let v = runtime_view(body, Origin::operator, true, row.created_at) or raise;
+        let added = self.store.insert_runtime(
+            row,
+            checked_change("create", "runtimes/" + c.id, "", runtime_json(v)) or raise,
+        ) or fail store_down(err);
+        if !added { fail clash("runtime " + c.id + " exists; a runtime id is never reused"); }
+        return v;
+    }
+
+    /// `getRuntime`.
+    fn get(r: RuntimeRef) -> Runtime fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r.runtime) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn get_in_gate(id: String) -> Runtime fallible(CtlError) {
+        let row = self.store.runtime(id) or fail store_down(err);
+        if row.present {
+            if row.removed { fail missing("no runtime " + id + "; it was withdrawn"); }
+            return runtime_view(row.body, Origin::operator, true, row.created_at) or raise;
+        }
+        let shipped = shipped_line(self.shipped, id);
+        if len(shipped) == 0 { fail missing("no runtime " + id); }
+        return runtime_view(shipped, Origin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
+    }
+
+    /// `removeRuntime`: an operator's runtime no placement uses.
+    fn remove(r: RuntimeRef) -> Runtime fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.remove_in_gate(r.runtime) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn remove_in_gate(id: String) -> Runtime fallible(CtlError) {
+        let v = self.get_in_gate(id) or raise;
+        if v.origin == Origin::shipped {
+            fail clash("voice ships runtime " + id + "; it cannot be removed");
+        }
+        let placed = self.store.placements() or fail store_down(err);
+        for p in placed.rows {
+            if !p.removed && std::json::find_string_field(p.body, "runtime") == id {
+                fail clash("placement " + p.id + " uses runtime " + id);
+            }
+        }
+        self.store.remove_runtime(
+            st::RuntimeRow { id: id, removed: true, removed_at: now_seconds() },
+            checked_change("delete", "runtimes/" + id, runtime_json(v), "") or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+
+    /// Every runtime a placement may choose, inside the gate (placements.hl):
+    /// the list, shipped first.
+    fn usable_in_gate() -> RuntimeList fallible(CtlError) {
+        return self.list_in_gate() or raise;
+    }
+}
+
+/// True when the store holds a row for `id`, live or withdrawn.
+fn runtime_held(rows: st::RuntimeRows, id: String) -> Bool {
+    for r in rows.rows {
+        if r.id == id { return true; }
+    }
+    return false;
+}
+
+/// The shipped line whose `id` is `id`, "" for none: recipes' and
+/// runtimes' alike.
+fn shipped_line(lines: String, id: String) -> String {
+    let v = std::str::bytes_view(lines);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        if len(line) > 0 && std::json::find_string_field(line, "id") == id { return line; }
+    }
+    return "";
+}
+
+/// A body as the surface's `Runtime`.
+fn runtime_view(body: String, origin: Origin, dated: Bool, at: Time) -> Runtime fallible(CtlError) {
+    let c = RuntimeCreate::api_decode(body) or fail CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::internal_error,
+            message: "a runtime's stored body is not a runtime (`" + err.field + "`)",
+        },
+    );
+    let mut out = Runtime {
+        id: c.id,
+        license: c.license,
+        server: c.server,
+        accelerator: c.accelerator,
+        artifact: c.artifact,
+        origin: origin,
+        has_created_at: dated,
+        created_at: at
+    };
+    for f in c.formats {
+        push(out.formats, f) or discard;
+    }
+    for p in c.platforms {
+        push(out.platforms, p) or discard;
+    }
+    return out;
+}
+
+/// `RuntimeCreate` checked, as the body to keep; or `!<param>\t<problem>`.
+@bounded_by(c)
+fn runtime_body(c: RuntimeCreate) -> String {
+    let head = id_and_license(c.id, c.license);
+    if len(head) > 0 { return head; }
+    if !std::str::contains(SERVERS, "," + c.server + ",") {
+        return "!server\t`server` is one a node knows how to start: vllm or llama-server";
+    }
+    if count(c.formats) == 0 { return "!formats\ta runtime reads at least one format"; }
+    if count(c.platforms) == 0 { return "!platforms\ta runtime runs on at least one platform"; }
+    let a = c.artifact;
+    if a.kind == ArtifactKind::container {
+        if !a.has_image || !image_name(a.image) {
+            return "!artifact\t`artifact.image` is a registry and a repository, with no tag (registry/repo)";
+        }
+        if !a.has_digest || !std::str::starts_with(a.digest, "sha256:")
+            || !hex(a.digest[7..len(a.digest)], 64)
+        {
+            return "!artifact\t`artifact.digest` is sha256: and 64 hex digits, never a tag";
+        }
+        if a.has_url || a.has_sha256 || a.has_bytes {
+            return "!artifact\ta container is its image and digest, nothing more";
+        }
+    } else {
+        if !a.has_url || !std::str::starts_with(a.url, "https://") || len(a.url) > 512 {
+            return "!artifact\t`artifact.url` is an https URL, at most 512 characters";
+        }
+        if !a.has_sha256 || !hex(a.sha256, 64) {
+            return "!artifact\t`artifact.sha256` is 64 hex digits";
+        }
+        if !a.has_bytes || a.bytes < 1 { return "!artifact\t`artifact.bytes` is at least 1"; }
+        if a.has_image || a.has_digest {
+            return "!artifact\tan archive is its url, sha256 and size, nothing more";
+        }
+    }
+    let r = Runtime {
+        id: c.id,
+        license: c.license,
+        server: c.server,
+        accelerator: c.accelerator,
+        artifact: a,
+    };
+    return runtime_create_json(r, c.formats, c.platforms);
+}
+
+/// A registry host (with a port, perhaps) and a repository path, lowercase,
+/// with no tag and no digest.
+@bounded_by(s)
+fn image_name(s: String) -> Bool {
+    let n = len(s);
+    let slash = std::str::index_of(s, "/");
+    if n == 0 || n > 256 || slash < 1 || slash == n - 1 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 46 || b == 45 || b == 47
+            || b == 95 || (b == 58 && i < slash);
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A `RuntimeCreate`'s JSON: the body kept, and a shipped file's form.
+@bounded_by(formats)
+fn runtime_create_json(
+    r: Runtime,
+    formats: bounded[ModelFormat; 3],
+    platforms: bounded[RuntimePlatform; 4]
+) -> String {
+    let fs = st::JsonList { };
+    for f in formats {
+        fs.add(jq(model_format_name(f)));
+    }
+    let ps = st::JsonList { };
+    for p in platforms {
+        ps.add(
+            "{\"os\": " + jq(host_os_name(p.os)) + ", \"arch\": " + jq(host_arch_name(p.arch))
+                + "}",
+        );
+    }
+    let a = r.artifact;
+    let artifact = if a.kind == ArtifactKind::container {
+        "{\"kind\": \"container\", \"image\": " + jq(a.image) + ", \"digest\": " + jq(a.digest)
+            + "}"
+    } else {
+        "{\"kind\": \"archive\", \"url\": " + jq(a.url) + ", \"sha256\": " + jq(a.sha256)
+            + ", \"bytes\": "
+            + to_string(a.bytes) + "}"
+    };
+    return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
+        + ", \"url\": "
+        + jq(r.license.url) + "}, \"server\": " + jq(r.server) + ", \"formats\": [" + fs.text()
+        + "], \"accelerator\": " + jq(runtime_accelerator_name(r.accelerator))
+        + ", \"platforms\": ["
+        + ps.text() + "], \"artifact\": " + artifact + "}";
+}
+
+/// The change log's JSON for `r`: the `Runtime` the api answers.
+fn runtime_json(r: Runtime) -> String {
+    let body = runtime_create_json(r, r.formats, r.platforms);
+    return body[0..(len(body) - 1)] + ", \"origin\": " + jq(origin_name(r.origin))
+        + ", \"created_at\": "
+        + jtime_or_null(r.has_created_at, r.created_at) + "}";
+}
+
+fn host_os_name(v: HostOs) -> String {
+    return match v {
+        HostOs::linux -> "linux",
+        HostOs::darwin -> "darwin"
+    };
+}
+
+fn host_arch_name(v: HostArch) -> String {
+    return match v {
+        HostArch::arm64 -> "arm64",
+        HostArch::x86_64 -> "x86_64"
+    };
+}

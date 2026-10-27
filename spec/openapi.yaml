@@ -193,6 +193,8 @@ tags:
     description: Admin plane. The model catalog.
   - name: recipes
     description: Admin plane. Where local models' weights come from, as the operator allows them.
+  - name: runtimes
+    description: Admin plane. What serves a local model on a node, pinned, as the operator allows it.
   - name: placements
     description: Admin plane. Which nodes a local model is to run on, and in which form.
   - name: accounts
@@ -1340,6 +1342,122 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/runtimes:
+    get:
+      tags: [runtimes]
+      operationId: listRuntimes
+      summary: List the runtimes
+      description: The runtimes voice ships (`origin` `shipped`) and the ones the operator allowed (`operator`). A model is placed only where one of these runs it.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The runtimes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Runtime'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [runtimes]
+      operationId: createRuntime
+      summary: Allow a runtime
+      description: |
+        The operator allows what may serve local models: one server program
+        voice knows how to start, from one artifact pinned by its digest,
+        for the platforms and the accelerator it runs on and the formats it
+        reads. A runtime never changes; another build is another runtime.
+        An id voice ships, or the operator has held, is taken.
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuntimeCreate'
+      responses:
+        '201':
+          description: The runtime, allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Runtime'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/runtimes/{runtime}:
+    parameters:
+      - $ref: '#/components/parameters/RuntimeId'
+    get:
+      tags: [runtimes]
+      operationId: getRuntime
+      summary: Describe a runtime
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The runtime.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Runtime'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [runtimes]
+      operationId: removeRuntime
+      summary: Withdraw a runtime
+      description: |
+        Refused for a runtime voice ships, and for one a placement uses.
+        Its id is never reused.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The withdrawn runtime.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Runtime'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/placements:
     get:
       tags: [placements]
@@ -1372,10 +1490,12 @@ paths:
       summary: Place a model on nodes
       description: |
         The operator puts a local model on nodes; the coordinator picks the
-        form of its weights (a variant of its recipe) that the nodes can
-        run and that fits them, as they declare their hardware, and says
-        why. A variant the operator names is taken only if it fits. Refused
-        when none fits, with each variant's reason.
+        form of its weights (a variant of its recipe) and the runtime that
+        serves it: a runtime that reads the variant's format on the nodes'
+        platform and accelerator, and a variant that fits them as they
+        declared their hardware. It says why for each variant. A variant or
+        runtime the operator names is taken only if it fits. Refused when
+        none fits, with each variant's reason.
 
         A placement is a decision: nothing serves from it until the nodes
         run managed engines, which act on it.
@@ -2374,6 +2494,11 @@ components:
       schema: { $ref: '#/components/schemas/AccountIdValue' }
     RecipeId:
       name: recipe
+      in: path
+      required: true
+      schema: { type: string }
+    RuntimeId:
+      name: runtime
       in: path
       required: true
       schema: { type: string }
@@ -3552,16 +3677,16 @@ components:
       allOf:
         - $ref: '#/components/schemas/RecipeCreate'
         - type: object
-          required: [origin, created_at]
+          required: [origin]
           properties:
             origin:
               type: string
               enum: [shipped, operator]
               description: '`shipped`: in voice''s `recipes/`, read-only. `operator`: allowed through `createRecipe`.'
             created_at:
-              type: [string, 'null']
+              type: string
               format: date-time
-              description: When the operator allowed it; null for a shipped recipe.
+              description: When the operator allowed it; left out for a shipped recipe.
 
     RecipeVariant:
       type: object
@@ -3631,6 +3756,104 @@ components:
           minimum: 1
           description: What serving the variant needs, weights and the engine's own, before any context.
 
+    # ---- runtimes --------------------------------------------------------
+
+    RuntimeCreate:
+      type: object
+      description: |
+        What serves a local model on a node, pinned: what the operator
+        allows (`createRuntime`), and the form of a file voice ships in
+        `runtimes/<id>.json`. A node starts only a `server` it knows, from
+        this artifact and nothing else, so a runtime names no command.
+      required: [id, license, server, formats, accelerator, platforms, artifact]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+          description: Stable; never reused for another build. A shipped runtime's is its file's name without `.json`.
+          examples: [vllm-26.09, llama-server-b11913-cuda]
+        license:
+          type: object
+          required: [name, url]
+          additionalProperties: false
+          properties:
+            name: { type: string, minLength: 1, maxLength: 64 }
+            url: { type: string, format: uri, maxLength: 512 }
+        server:
+          type: string
+          enum: [vllm, llama-server]
+          description: The server program, which the node knows how to start and stop.
+        formats:
+          type: array
+          minItems: 1
+          maxItems: 3
+          description: The weight formats it reads.
+          items:
+            type: string
+            enum: [safetensors, gguf, mlx]
+        accelerator:
+          type: string
+          enum: [cuda, metal, cpu]
+          description: What it runs on; `cpu` runs on any machine.
+        platforms:
+          type: array
+          minItems: 1
+          maxItems: 4
+          items:
+            type: object
+            required: [os, arch]
+            additionalProperties: false
+            properties:
+              os: { type: string, enum: [linux, darwin] }
+              arch: { type: string, enum: [arm64, x86_64] }
+        artifact:
+          type: object
+          description: |
+            Where it comes from. `container`: an image, pulled by its
+            digest, never a tag; for several platforms, a manifest list's
+            digest. `archive`: a tarball, fetched from `url` and used only
+            when its sha256 matches.
+          required: [kind]
+          additionalProperties: false
+          properties:
+            kind: { type: string, enum: [container, archive] }
+            image:
+              type: string
+              maxLength: 256
+              pattern: '^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+$'
+              examples: [nvcr.io/nvidia/vllm]
+            digest:
+              type: string
+              pattern: '^sha256:[0-9a-f]{64}$'
+            url:
+              type: string
+              maxLength: 512
+              pattern: '^https://'
+            sha256:
+              type: string
+              pattern: '^[0-9a-f]{64}$'
+            bytes: { type: integer, minimum: 1 }
+          allOf:
+            - if: { properties: { kind: { const: container } } }
+              then: { required: [image, digest] }
+            - if: { properties: { kind: { const: archive } } }
+              then: { required: [url, sha256, bytes] }
+
+    Runtime:
+      allOf:
+        - $ref: '#/components/schemas/RuntimeCreate'
+        - type: object
+          required: [origin]
+          properties:
+            origin:
+              type: string
+              enum: [shipped, operator]
+              description: '`shipped`: in voice''s `runtimes/`, read-only. `operator`: allowed through `createRuntime`.'
+            created_at:
+              type: string
+              format: date-time
+              description: When the operator allowed it; left out for a shipped runtime.
+
     # ---- placements ------------------------------------------------------
 
     PlacementCreate:
@@ -3657,12 +3880,15 @@ components:
         variant:
           type: string
           description: The operator's choice of form, taken only if it fits; left out, the coordinator picks.
+        runtime:
+          type: string
+          description: The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks.
 
     Placement:
       allOf:
         - $ref: '#/components/schemas/PlacementCreate'
         - type: object
-          required: [recipe, variant, chosen_by, leader, fit, created_at]
+          required: [recipe, variant, runtime, chosen_by, leader, fit, created_at]
           properties:
             recipe:
               type: string
@@ -3670,6 +3896,9 @@ components:
             variant:
               type: string
               description: The form chosen.
+            runtime:
+              type: string
+              description: The runtime chosen to serve it.
             chosen_by:
               type: string
               enum: [coordinator, operator]
@@ -3684,14 +3913,17 @@ components:
 
     VariantFit:
       type: object
-      required: [variant, fits, reason]
+      required: [variant, runtime, fits, reason]
       properties:
         variant: { type: string }
+        runtime:
+          type: [string, 'null']
+          description: The runtime that would serve it there; null when none runs it.
         fits: { type: boolean }
         reason:
           type: string
           description: Why it fits or does not, in a line.
-          examples: ['gguf runs on cuda; 5.6 GB of 128 GB for models; 4.9 GB of 3.5 TB free']
+          examples: ['llama-server-b11913-cuda runs gguf on cuda; 5.6 GB of 128.0 GB for models; 4.9 GB of 3.5 TB free']
 
     # ---- admin plane: accounts -------------------------------------------
 

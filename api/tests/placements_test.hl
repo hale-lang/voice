@@ -1,10 +1,11 @@
 // Placements on the admin plane: a local model put on a node, the variant
-// chosen by what the node declared it has, and refused when none fits.
+// and the runtime chosen by what the node declared it has and the runtimes
+// there are, and refused when none fits.
 import ".." as api;
 import "../../store" as st;
 
 fn fixtures(sub: String) -> String {
-    let here = "spec/validate/recipes/" + sub;
+    let here = "spec/validate/" + sub;
     return if std::io::fs::file_exists(here) { here } else { "../" + here };
 }
 
@@ -33,9 +34,16 @@ fn hardware(accel: String, model_memory: Int, disk: Int) -> String {
 
 fn main() {
     let store = st::MemoryStore { };
-    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(fixtures("ok")) };
+    let recipes = api::Recipes {
+        store: store,
+        shipped: api::shipped_recipes(fixtures("recipes/ok")),
+    };
     let catalog = api::Catalog { store: store, recipes: recipes };
-    let placements = api::Placements { store: store, recipes: recipes };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(fixtures("runtimes/ok")),
+    };
+    let placements = api::Placements { store: store, recipes: recipes, runtimes: runtimes };
     let gb10 = "[{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 128000000000, \"unified\": true}]";
 
     catalog.create(
@@ -43,7 +51,8 @@ fn main() {
     ) or discard;
     catalog.create(api::CatalogModelCreate { id: "bare" }) or discard;
     node(store, "spark", hardware(gb10, 128000000000, 3500000000000));
-    node(store, "small", hardware("[]", 4000000000, 3500000000000));
+    node(store, "small", hardware(gb10, 4000000000, 3500000000000));
+    node(store, "bare-cpu", hardware("[]", 128000000000, 3500000000000));
     node(store, "full", hardware(gb10, 128000000000, 1000000000));
     store.insert_node(
         st::NodeRow {
@@ -60,6 +69,11 @@ fn main() {
     let p = placements.create(one) or blank();
     std::test::assert_eq_str(p.id, "on-spark", "a model is placed");
     std::test::assert_eq_str(p.variant, "gguf-q4_k_m", "on the variant that fits");
+    std::test::assert_eq_str(
+        p.runtime,
+        "fixture-runtime",
+        "served by the runtime that reads it there",
+    );
     std::test::assert(
         p.chosen_by == api::PlacementChooser::coordinator,
         "chosen by the coordinator",
@@ -67,7 +81,7 @@ fn main() {
     std::test::assert_eq_str(p.leader, "spark", "led by its node");
     let fit = at(p.fit, 0) or api::VariantFit { };
     std::test::assert(
-        fit.fits && std::str::contains(fit.reason, "gguf runs on cuda"),
+        fit.fits && std::str::contains(fit.reason, "fixture-runtime runs gguf on cuda"),
         "and says why: " + fit.reason,
     );
     let read = placements.get(api::PlacementRef { placement: "on-spark" }) or blank();
@@ -128,6 +142,49 @@ fn main() {
         failed = api::ctl_class(err);
     };
     std::test::assert_eq_str(failed, "invalid", "a model with no recipe has no weights to place");
+
+    let mut cpu = api::PlacementCreate { id: "on-cpu", model: "fixture" };
+    push(cpu.nodes, "bare-cpu") or discard;
+    why = "";
+    placements.create(cpu) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(why, "no runtime reads gguf on linux/arm64 with no accelerator"),
+        "no runtime runs it there: " + why,
+    );
+    let mut unknown = api::PlacementCreate {
+        id: "unknown-rt",
+        model: "fixture",
+        has_runtime: true,
+        runtime: "nope",
+    };
+    push(unknown.nodes, "full") or discard;
+    failed = "";
+    placements.create(unknown) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a runtime there is not");
+    let mut mac = api::PlacementCreate {
+        id: "wrong-rt",
+        model: "fixture",
+        has_runtime: true,
+        runtime: "fixture-archive",
+    };
+    push(mac.nodes, "small") or discard;
+    why = "";
+    placements.create(mac) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(why, "no runtime reads gguf"),
+        "a runtime for another platform: " + why,
+    );
+    failed = "";
+    runtimes.remove(api::RuntimeRef { runtime: "fixture-runtime" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "a shipped runtime stays");
 
     failed = "";
     catalog.remove(api::ModelRef { model: "fixture" }) or {

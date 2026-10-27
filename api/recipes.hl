@@ -16,33 +16,33 @@
 
 type RecipeRef { recipe: String; }
 
-/// `RecipeCreate.license`.
-type RecipeLicense { name: String = ""; url: String = ""; }
+/// A recipe's or a runtime's `license`.
+type License { name: String = ""; url: String = ""; }
 
 /// `RecipeCreate`: what the operator allows, and a shipped file's form.
 /// `variants` is free-form JSON, checked here field by field.
 type RecipeCreate {
     id: String;
-    license: RecipeLicense;
+    license: License;
     variants: std::json::Value = std::json::Value::null();
 }
 
-/// Where a recipe came from (`Recipe.origin`).
-type RecipeOrigin = enum { shipped, operator };
+/// Where a recipe or a runtime came from (`Recipe.origin`, `Runtime.origin`).
+type Origin = enum { shipped, operator };
 
-fn recipe_origin_name(v: RecipeOrigin) -> String {
+fn origin_name(v: Origin) -> String {
     return match v {
-        RecipeOrigin::shipped -> "shipped",
-        RecipeOrigin::operator -> "operator"
+        Origin::shipped -> "shipped",
+        Origin::operator -> "operator"
     };
 }
 
 /// `Recipe`. A shipped recipe has no `created_at`.
 type Recipe {
     id: String = "";
-    license: RecipeLicense = RecipeLicense { };
+    license: License = License { };
     variants: std::json::Value = std::json::Value::null();
-    origin: RecipeOrigin = RecipeOrigin::operator;
+    origin: Origin = Origin::operator;
     has_created_at: Bool = false;
     created_at: Time = `1970-01-01T00:00:00Z`;
 }
@@ -89,7 +89,7 @@ locus Recipes {
             if len(line) > 0 && !held(rows, std::json::find_string_field(line, "id")) {
                 let r = recipe_view(
                     line,
-                    RecipeOrigin::shipped,
+                    Origin::shipped,
                     false,
                     `1970-01-01T00:00:00Z`,
                 ) or raise;
@@ -100,7 +100,7 @@ locus Recipes {
             if !row.removed {
                 let r = recipe_view(
                     row.body,
-                    RecipeOrigin::operator,
+                    Origin::operator,
                     true,
                     row.created_at,
                 ) or raise;
@@ -124,13 +124,13 @@ locus Recipes {
     fn create_in_gate(c: RecipeCreate) -> Recipe fallible(CtlError) {
         let body = recipe_body(c.id, c.license, c.variants.text);
         if std::str::starts_with(body, "!") {
-            fail bad(body[1..len(body)], recipe_param(body));
+            fail bad(refusal_message(body), recipe_param(body));
         }
         if len(self.shipped_body(c.id)) > 0 {
             fail clash("voice ships recipe " + c.id + "; another is another id");
         }
         let row = st::RecipeRow { id: c.id, body: body, created_at: now_seconds() };
-        let v = recipe_view(body, RecipeOrigin::operator, true, row.created_at) or raise;
+        let v = recipe_view(body, Origin::operator, true, row.created_at) or raise;
         let added = self.store.insert_recipe(
             row,
             checked_change("create", "recipes/" + c.id, "", recipe_json(v)) or raise,
@@ -154,11 +154,11 @@ locus Recipes {
         let row = self.store.recipe(id) or fail store_down(err);
         if row.present {
             if row.removed { fail missing("no recipe " + id + "; it was withdrawn"); }
-            return recipe_view(row.body, RecipeOrigin::operator, true, row.created_at) or raise;
+            return recipe_view(row.body, Origin::operator, true, row.created_at) or raise;
         }
         let shipped = self.shipped_body(id);
         if len(shipped) == 0 { fail missing("no recipe " + id); }
-        return recipe_view(shipped, RecipeOrigin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
+        return recipe_view(shipped, Origin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
     }
 
     /// `removeRecipe`: an operator's recipe no model in the catalog names.
@@ -174,7 +174,7 @@ locus Recipes {
 
     fn remove_in_gate(id: String) -> Recipe fallible(CtlError) {
         let v = self.get_in_gate(id) or raise;
-        if v.origin == RecipeOrigin::shipped {
+        if v.origin == Origin::shipped {
             fail clash("voice ships recipe " + id + "; it cannot be removed");
         }
         let models = self.store.models() or fail store_down(err);
@@ -223,14 +223,14 @@ fn held(rows: st::RecipeRows, id: String) -> Bool {
 /// A body as the surface's `Recipe`.
 fn recipe_view(
     body: String,
-    origin: RecipeOrigin,
+    origin: Origin,
     dated: Bool,
     at: Time
 ) -> Recipe fallible(CtlError) {
     let lic = std::json::find_field_raw(body, "license");
     return Recipe {
         id: std::json::find_string_field(body, "id"),
-        license: RecipeLicense {
+        license: License {
             name: std::json::find_string_field(lic, "name"),
             url: std::json::find_string_field(lic, "url"),
         },
@@ -249,7 +249,7 @@ fn recipe_json(r: Recipe) -> String {
     return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
         + ", \"url\": "
         + jq(r.license.url) + "}, \"variants\": " + r.variants.text + ", \"origin\": "
-        + jq(recipe_origin_name(r.origin)) + ", \"created_at\": "
+        + jq(origin_name(r.origin)) + ", \"created_at\": "
         + jtime_or_null(r.has_created_at, r.created_at) + "}";
 }
 
@@ -259,21 +259,9 @@ fn recipe_json(r: Recipe) -> String {
 // checked, or `!<param>\t<problem>` (the param is the field at fault).
 
 @bounded_by(variants)
-fn recipe_body(id: String, license: RecipeLicense, variants: String) -> String {
-    if !slug(id, ".-", true) {
-        return "!id\t`id` is lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 63";
-    }
-    if len(license.name) < 1 || len(license.name) > 64 {
-        return "!license\t`license.name` is 1 to 64 characters";
-    }
-    if !(
-        std::str::starts_with(license.url, "https://")
-            || std::str::starts_with(license.url, "http://")
-    )
-        || len(license.url) > 512
-    {
-        return "!license\t`license.url` is an http or https URL, at most 512 characters";
-    }
+fn recipe_body(id: String, license: License, variants: String) -> String {
+    let head = id_and_license(id, license);
+    if len(head) > 0 { return head; }
     if std::json::string_field("{\"v\": " + variants + "}", "v").kind != "array" {
         return "!variants\t`variants` is a list";
     }
@@ -302,6 +290,32 @@ fn recipe_body(id: String, license: RecipeLicense, variants: String) -> String {
         return "!variants\ta recipe is at most 48 KiB (" + to_string(len(body)) + " bytes)";
     }
     return body;
+}
+
+/// A curated id and license refused, as `!<param>\t<problem>`; "" when both
+/// are well formed. Recipes' and runtimes' alike.
+fn id_and_license(id: String, license: License) -> String {
+    if !slug(id, ".-", true) {
+        return "!id\t`id` is lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 63";
+    }
+    if len(license.name) < 1 || len(license.name) > 64 {
+        return "!license\t`license.name` is 1 to 64 characters";
+    }
+    if !(
+        std::str::starts_with(license.url, "https://")
+            || std::str::starts_with(license.url, "http://")
+    )
+        || len(license.url) > 512
+    {
+        return "!license\t`license.url` is an http or https URL, at most 512 characters";
+    }
+    return "";
+}
+
+/// The problem of a refused body, without its param.
+fn refusal_message(refused: String) -> String {
+    let tab = std::str::index_of(refused, "\t");
+    return if tab > 0 { refused[(tab + 1)..len(refused)] } else { refused };
 }
 
 /// The param and the problem of a refused body.

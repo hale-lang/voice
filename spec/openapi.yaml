@@ -191,6 +191,8 @@ tags:
     description: Admin plane. Per-request usage and summaries from the ledger.
   - name: models
     description: Admin plane. The model catalog.
+  - name: recipes
+    description: Admin plane. Where local models' weights come from, as the operator allows them.
   - name: accounts
     description: Admin plane. Accounts that pay for serving, and their limits.
   - name: nodes
@@ -1218,6 +1220,121 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/recipes:
+    get:
+      tags: [recipes]
+      operationId: listRecipes
+      summary: List the recipes
+      description: The recipes voice ships (`origin` `shipped`) and the ones the operator added (`operator`). A local model may name only one of these.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The recipes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Recipe'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [recipes]
+      operationId: createRecipe
+      summary: Allow a recipe
+      description: |
+        The operator allows a model's weights: from one revision of one
+        source, every file pinned by its digest, in a format that holds only
+        tensors. A recipe never changes; other weights are another recipe.
+        An id voice ships is taken.
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecipeCreate'
+      responses:
+        '201':
+          description: The recipe, allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/recipes/{recipe}:
+    parameters:
+      - $ref: '#/components/parameters/RecipeId'
+    get:
+      tags: [recipes]
+      operationId: getRecipe
+      summary: Describe a recipe
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The recipe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [recipes]
+      operationId: removeRecipe
+      summary: Withdraw a recipe
+      description: |
+        Refused for a recipe voice ships, and for one a model in the catalog
+        names. Its id is never reused.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The withdrawn recipe.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Recipe'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/accounts:
     get:
       tags: [accounts]
@@ -2136,6 +2253,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/AccountIdValue' }
+    RecipeId:
+      name: recipe
+      in: path
+      required: true
+      schema: { type: string }
     NodeId:
       name: node
       in: path
@@ -3236,10 +3358,16 @@ components:
           oneOf:
             - $ref: '#/components/schemas/ModelPrice'
             - type: 'null'
+        recipe:
+          type: string
+          description: |
+            The recipe a local model's weights come from (`Recipe`): one
+            voice ships or the operator allowed. Refused for a hosted model
+            and for a recipe there is not. Fixed at creation, like the id.
 
     CatalogModelUpdate:
       type: object
-      description: Only the fields present change. The id cannot change.
+      description: Only the fields present change. The id and the recipe cannot change.
       properties:
         owned_by: { type: string }
         kind:
@@ -3266,6 +3394,118 @@ components:
               type: boolean
               description: As on `/v1/models`.
             created_at: { type: string, format: date-time }
+
+    # ---- recipes ---------------------------------------------------------
+
+    RecipeCreate:
+      type: object
+      description: |
+        Where a local model's weights come from, pinned: what the operator
+        allows (`createRecipe`), and the form of a file voice ships in
+        `recipes/<id>.json`. A recipe says only what the weights are; what
+        callers name, the price and the limits are the catalog's.
+      required: [id, license, variants]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9.-]{0,62}$'
+          description: Stable; never reused for other weights. A shipped recipe's is its file's name without `.json`.
+          examples: [qwen3-8b]
+        license:
+          type: object
+          required: [name, url]
+          additionalProperties: false
+          properties:
+            name: { type: string, minLength: 1, maxLength: 64, examples: [apache-2.0] }
+            url: { type: string, format: uri, maxLength: 512 }
+        variants:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: '#/components/schemas/RecipeVariant' }
+
+    Recipe:
+      allOf:
+        - $ref: '#/components/schemas/RecipeCreate'
+        - type: object
+          required: [origin, created_at]
+          properties:
+            origin:
+              type: string
+              enum: [shipped, operator]
+              description: '`shipped`: in voice''s `recipes/`, read-only. `operator`: allowed through `createRecipe`.'
+            created_at:
+              type: [string, 'null']
+              format: date-time
+              description: When the operator allowed it; null for a shipped recipe.
+
+    RecipeVariant:
+      type: object
+      description: |
+        One form of the weights: a format and a quantization, from one
+        revision of one source, every file pinned by its digest. A variant
+        is what is placed: `memory_bytes` is its whole need, whatever nodes
+        it is placed across.
+      required: [id, format, quantization, source, files, memory_bytes]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_.-]{0,62}$'
+          description: Distinct within its recipe.
+          examples: [gguf-q4_k_m, mlx-4bit]
+        format:
+          type: string
+          enum: [safetensors, gguf, mlx]
+          description: Formats that hold only tensors; none runs code when loaded.
+        quantization:
+          type: string
+          minLength: 1
+          maxLength: 64
+          examples: [bf16, q4_k_m, 4bit]
+        source:
+          type: object
+          required: [hub, repo, revision]
+          additionalProperties: false
+          properties:
+            hub:
+              type: string
+              enum: [huggingface]
+            repo:
+              type: string
+              maxLength: 128
+              pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
+            revision:
+              type: string
+              pattern: '^[0-9a-f]{40}$'
+              description: A commit, never a branch or a tag.
+        files:
+          type: array
+          minItems: 1
+          maxItems: 128
+          description: |
+            Every file the variant needs, and nothing else: a file is
+            fetched only when it is listed here, and used only when its
+            digest matches. Each holds tensors, a tokenizer or settings
+            (`.safetensors`, `.gguf`, `.json`, `.txt`, `.model`, `.tiktoken`,
+            `.jinja`); a pickled checkpoint or code is never listed.
+          items:
+            type: object
+            required: [path, bytes, sha256]
+            additionalProperties: false
+            properties:
+              path:
+                type: string
+                maxLength: 256
+                pattern: '^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/-]+\.(safetensors|gguf|json|txt|model|tiktoken|jinja)$'
+              bytes: { type: integer, minimum: 1 }
+              sha256:
+                type: string
+                pattern: '^[0-9a-f]{64}$'
+        memory_bytes:
+          type: integer
+          minimum: 1
+          description: What serving the variant needs, weights and the engine's own, before any context.
 
     # ---- admin plane: accounts -------------------------------------------
 

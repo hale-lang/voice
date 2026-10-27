@@ -284,7 +284,7 @@ locus PgStore {
         ) or raise;
         let a = model_args(row);
         let n = self.step(
-            "INSERT INTO catalog_model (id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at) VALUES ($1, $2, $3, $4::int, $5::int, $6::jsonb, $7::timestamptz, $8::timestamptz) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO catalog_model (id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at, recipe) VALUES ($1, $2, $3, $4::int, $5::int, $6::jsonb, $7::timestamptz, $8::timestamptz, $9) ON CONFLICT (id) DO NOTHING",
             a,
         ) or raise;
         if n == 0 {
@@ -308,9 +308,110 @@ locus PgStore {
         self.begin() or raise;
         let a = model_args(row);
         self.step(
-            "UPDATE catalog_model SET owned_by = $2, kind = $3, context_length = $4::int, max_output_tokens = $5::int, price = $6::jsonb, created_at = $7::timestamptz, removed_at = $8::timestamptz WHERE id = $1",
+            "UPDATE catalog_model SET owned_by = $2, kind = $3, context_length = $4::int, max_output_tokens = $5::int, price = $6::jsonb, created_at = $7::timestamptz, removed_at = $8::timestamptz, recipe = $9 WHERE id = $1",
             a,
         ) or raise;
+        self.commit_with(change) or raise;
+    }
+
+    // ---- recipes
+
+    fn recipe(id: String) -> RecipeRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.recipe_locked(id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn recipe_locked(id: String) -> RecipeRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        let j = self.row(
+            "SELECT row_to_json(t) FROM (" + RECIPE_COLUMNS + " WHERE id = $1) t",
+            a,
+        ) or raise;
+        return recipe_row(j);
+    }
+
+    fn recipes() -> RecipeRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.recipes_locked() or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn recipes_locked() -> RecipeRows fallible(StoreError) {
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (" + RECIPE_COLUMNS + " ORDER BY created_at, id) t",
+            db::Args { },
+        ) or raise;
+        let mut out = RecipeRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, recipe_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn insert_recipe(row: RecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.insert_recipe_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn insert_recipe_locked(row: RecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        self.room(
+            "SELECT count(*) FROM recipe",
+            db::Args { },
+            256,
+            "voice holds at most 256 recipes",
+        ) or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.body);
+        a.add(std::time::iso8601(row.created_at));
+        let n = self.step(
+            "INSERT INTO recipe (id, body, created_at) VALUES ($1, $2::jsonb, $3::timestamptz) ON CONFLICT (id) DO NOTHING",
+            a,
+        ) or raise;
+        if n == 0 {
+            self.rollback();
+            return false;
+        }
+        self.commit_with(change) or raise;
+        return true;
+    }
+
+    fn remove_recipe(row: RecipeRow, change: ChangeRow) fallible(StoreError) {
+        self.lock.enter();
+        self.remove_recipe_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn remove_recipe_locked(row: RecipeRow, change: ChangeRow) fallible(StoreError) {
+        self.begin() or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(std::time::iso8601(row.removed_at));
+        self.step("UPDATE recipe SET removed_at = $2::timestamptz WHERE id = $1", a) or raise;
         self.commit_with(change) or raise;
     }
 
@@ -1670,7 +1771,7 @@ fn restriction_param(n: Int) -> String {
         + " END";
 }
 
-const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at FROM catalog_model";
+const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at, recipe FROM catalog_model";
 
 const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
 
@@ -1839,6 +1940,21 @@ fn model_row(j: String) -> ModelRow {
         created_at: pg_time(pg_text(j, "created_at")),
         removed: removed,
         removed_at: pg_time(pg_text(j, "removed_at")),
+        recipe: pg_text(j, "recipe"),
+        present: true
+    };
+}
+
+const RECIPE_COLUMNS: String = "SELECT id, body, created_at, removed_at FROM recipe";
+
+fn recipe_row(j: String) -> RecipeRow {
+    if len(j) == 0 { return RecipeRow { }; }
+    return RecipeRow {
+        id: pg_text(j, "id"),
+        body: std::str::trim(std::json::find_field_raw(j, "body")),
+        created_at: pg_time(pg_text(j, "created_at")),
+        removed: len(raw_or_empty(j, "removed_at")) > 0,
+        removed_at: pg_time(pg_text(j, "removed_at")),
         present: true
     };
 }
@@ -1853,6 +1969,7 @@ fn model_args(r: ModelRow) -> db::Args {
     if r.priced { a.add(jprice(true, r.price)); } else { a.add_null(); }
     a.add(std::time::iso8601(r.created_at));
     if r.removed { a.add(std::time::iso8601(r.removed_at)); } else { a.add_null(); }
+    if len(r.recipe) > 0 { a.add(r.recipe); } else { a.add_null(); }
     return a;
 }
 

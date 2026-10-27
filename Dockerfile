@@ -47,6 +47,8 @@ COPY api api
 COPY brain brain
 COPY node node
 COPY deploy/node deploy/node
+# the recipe fixtures the api's tests share with the contract check
+COPY spec/validate/recipes spec/validate/recipes
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build api && hale build brain && hale build node
 
@@ -59,3 +61,4 @@ COPY --from=build /src/brain/brain /usr/local/bin/voice-brain
 COPY --from=build /src/node/node /usr/local/bin/voice-node
 COPY store/migrations /usr/share/voice/migrations
 COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui
+COPY recipes /usr/share/voice/recipes

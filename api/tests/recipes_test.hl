@@ -1,0 +1,163 @@
+// Recipes on the admin plane: the shipped ones as the api reads them, and
+// the operator's (list, create, get, remove), called on a receiver over a
+// store. The fixtures are the contract check's (spec/validate/recipes):
+// the api takes what it takes, and refuses every one it refuses.
+import ".." as api;
+import "../../store" as st;
+
+fn fixtures(sub: String) -> String {
+    let here = "spec/validate/recipes/" + sub;
+    return if std::io::fs::file_exists(here) { here } else { "../" + here };
+}
+
+fn blank() -> api::Recipe { return api::Recipe { id: "refused" }; }
+
+fn variants(path: String, revision: String) -> std::json::Value {
+    let text = "[{\"id\": \"q4\", \"format\": \"gguf\", \"quantization\": \"q4_k_m\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/m\", \"revision\": \""
+        + revision + "\"}, \"files\": [{\"path\": \"" + path + "\", \"bytes\": 1, \"sha256\": \""
+        + std::str::repeat("a", 64) + "\"}], \"memory_bytes\": 2}]";
+    return std::json::Value::parse(text) or std::json::Value::null();
+}
+
+fn license() -> api::RecipeLicense {
+    return api::RecipeLicense { name: "mit", url: "https://opensource.org/license/mit" };
+}
+
+fn main() {
+    let shipped = api::shipped_recipes(fixtures("ok"));
+    std::test::assert(
+        std::str::contains(shipped, "\"id\": \"fixture-1\""),
+        "the shipped fixture is read",
+    );
+    std::test::assert_eq_str(
+        api::shipped_recipes(fixtures("refused")),
+        "",
+        "every recipe the contract refuses, the api refuses",
+    );
+    std::test::assert_eq_str(
+        api::shipped_recipes("no/such/dir"),
+        "",
+        "a missing directory ships none",
+    );
+
+    let store = st::MemoryStore { };
+    let recipes = api::Recipes { store: store, shipped: shipped };
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+
+    let made = recipes.create(
+        api::RecipeCreate {
+            id: "mine-1",
+            license: license(),
+            variants: variants("m.gguf", revision),
+        },
+    ) or blank();
+    std::test::assert_eq_str(made.id, "mine-1", "the operator allows a recipe");
+    std::test::assert(
+        made.origin == api::RecipeOrigin::operator && made.has_created_at,
+        "as the operator's",
+    );
+    std::test::assert(
+        std::str::contains(made.variants.text, "\"sha256\": \"" + std::str::repeat("a", 64) + "\""),
+        "its files as written",
+    );
+
+    let listed = recipes.list() or api::RecipeList { };
+    std::test::assert_eq_int(count(listed.data), 2, "voice's and the operator's");
+    let first = at(listed.data, 0) or blank();
+    std::test::assert(
+        first.id == "fixture-1"
+            && first.origin == api::RecipeOrigin::shipped
+            && !first.has_created_at,
+        "a shipped one has no time",
+    );
+
+    let mut failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "mine-1",
+            license: license(),
+            variants: variants("m.gguf", revision),
+        },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "an id is taken once");
+    failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "fixture-1",
+            license: license(),
+            variants: variants("m.gguf", revision),
+        },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "and a shipped id is taken");
+    failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "mine-2",
+            license: license(),
+            variants: variants("model.py", revision),
+        },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "code is never listed");
+    failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "mine-2",
+            license: license(),
+            variants: variants("m.gguf", "main"),
+        },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "a branch is not a revision");
+
+    // a model that names a recipe holds it
+    let catalog = api::Catalog { store: store, recipes: recipes };
+    catalog.create(api::CatalogModelCreate { id: "mine", has_recipe: true, recipe: "mine-1" }) or {
+        failed = "the operator's recipe could not be named";
+    };
+    std::test::assert(
+        failed != "the operator's recipe could not be named",
+        "a model names the operator's recipe",
+    );
+    failed = "";
+    recipes.remove(api::RecipeRef { recipe: "mine-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "a recipe a model names stays");
+    failed = "";
+    recipes.remove(api::RecipeRef { recipe: "fixture-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "a shipped one cannot be removed");
+
+    catalog.remove(api::ModelRef { model: "mine" }) or discard;
+    let gone = recipes.remove(api::RecipeRef { recipe: "mine-1" }) or blank();
+    std::test::assert_eq_str(gone.id, "mine-1", "with no model naming it, it is withdrawn");
+    failed = "";
+    recipes.get(api::RecipeRef { recipe: "mine-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "not_found", "and gone");
+    failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "mine-1",
+            license: license(),
+            variants: variants("m.gguf", revision),
+        },
+    ) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "its id is never reused");
+    failed = "";
+    catalog.create(api::CatalogModelCreate { id: "late", has_recipe: true, recipe: "mine-1" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "invalid", "nor named again");
+}

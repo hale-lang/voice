@@ -84,13 +84,15 @@ code conforms to them.
   never holds the credential; the engine does, on its node.
 - `derived` **The catalog** of models is configured on the coordinator. Seats refer to
   its ids, so one model routes across every seat that serves it.
-- `axiom` **A local model's weights come only from a curated recipe.** A
-  recipe ([`openapi.yaml`](./spec/openapi.yaml): `Recipe`) is one file in
-  [`recipes/`](./recipes/README.md), reviewed like code and shipped with a
-  release. It pins a source's commit and every file's digest, and lists only
-  formats that hold tensors, never pickled checkpoints or code. The api
-  reads recipes at start and never takes one over the API; a catalog model
-  names one by id ([`store.md`](./spec/store.md), migration 8).
+- `axiom` **A local model's weights come only from a recipe the operator
+  allows.** A recipe ([`openapi.yaml`](./spec/openapi.yaml): `Recipe`) pins
+  one revision of one source and every file's digest, and lists only files
+  that hold tensors, a tokenizer or settings, never a pickle or code. The
+  operator is the authority: they allow recipes on the admin plane, and a
+  catalog model names one by id. Voice ships some defaults in
+  [`recipes/`](./recipes/README.md), reviewed like code, which the operator
+  can use but not change. Every recipe is held to the same rules, whichever
+  way it came ([`store.md`](./spec/store.md), migration 8).
 - `derived` **Projects and keys** name the accounts they may spend. A request may name
   one account; it is then served on that account or refused, never moved to
   another. A key for client work names the work account, so everything it

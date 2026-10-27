@@ -540,13 +540,21 @@ insert into operator_token (token) values ($fresh)
 on conflict (id) do nothing;
 ```
 
-### Migration 8: a model's recipe
+### Migration 8: recipes
 
-A local model may name the curated recipe its weights come from
-(`Recipe`, openapi.yaml), by id. The recipes are files the api ships, not
-rows, so the id is not a foreign key; the api refuses one it does not ship.
-It is fixed at creation, like the model's id.
+The recipes the operator allows (`createRecipe`): each one's `RecipeCreate`
+as the api checked it. The recipes voice ships are files the api reads, not
+rows. A removed recipe keeps its row, so its id is never reused. A local
+model may name a recipe by id; the api refuses one that is neither shipped
+nor allowed, and the id is not a foreign key because a shipped recipe has
+no row. A model's recipe is fixed at creation, like its id.
 
 ```sql
+create table recipe (
+  id         text primary key,
+  body       jsonb not null,             -- RecipeCreate, as the api checked it
+  created_at timestamptz not null default now(),
+  removed_at timestamptz
+);
 alter table catalog_model add column recipe text;
 ```

@@ -661,12 +661,44 @@ locus Inference {
         }
 
         let seats = self.store.seats() or fail metering_failed(err);
+        let table = self.store.route_table() or fail metering_failed(err);
         let mut out = Candidates { };
+        if len(table) > 0 {
+            // the brain judged which seats are up: offer the model's seats
+            // in the table's order, held only to what this request may spend
+            let mut it = std::json::array_first(model_routes(table, r.model));
+            while !it.done {
+                let ref = st::pg_text(it.element, "seat");
+                it = std::json::array_next(it);
+                for s in seats.rows {
+                    if s.ref == ref && allowed(s, p, k, r) {
+                        for sm in s.serves.items {
+                            if sm.model == r.model {
+                                push(
+                                    out.items,
+                                    Candidate {
+                                        seat: s,
+                                        engine_name: if sm.has_engine_name {
+                                            sm.engine_name
+                                        } else {
+                                            ""
+                                        },
+                                    },
+                                ) or discard;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for s in seats.rows {
             for sm in s.serves.items {
                 if sm.model == r.model {
                     out.serving = out.serving + 1;
-                    let eligible = self.eligible(s, p, k, r) or raise;
+                    // with no table (the store in memory, or before a brain
+                    // has written one) the api judges each seat itself
+                    let mut eligible = false;
+                    if len(table) == 0 { eligible = self.eligible(s, p, k, r) or raise; }
                     if eligible {
                         push(
                             out.items,
@@ -708,11 +740,31 @@ locus Inference {
         k: st::KeyRow,
         r: InferenceRequest
     ) -> Bool fallible(ApiError) {
-        if !s.enabled || !has_name(s.data_classes.items, r.data_class) { return false; }
-        if len(r.account) > 0 && s.account != r.account { return false; }
-        if !allows(p.accounts, s.account) || !allows(k.accounts, s.account) { return false; }
+        if !allowed(s, p, k, r) { return false; }
         return seat_ready(self.store, s) or fail metering_failed(err);
     }
+}
+
+/// True when `r` may be offered to `s`: enabled, carrying its data class,
+/// spending an account the key may spend (the one it names, if it names
+/// one).
+fn allowed(s: st::SeatRow, p: st::ProjectRow, k: st::KeyRow, r: InferenceRequest) -> Bool {
+    if !s.enabled || !has_name(s.data_classes.items, r.data_class) { return false; }
+    if len(r.account) > 0 && s.account != r.account { return false; }
+    return allows(p.accounts, s.account) && allows(k.accounts, s.account);
+}
+
+/// The route table's seats for `model` (internal.yaml `ModelRoutes.seats`),
+/// best first, as a JSON array; "[]" when the table has no entry for it.
+fn model_routes(table: String, model: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(table, "models"));
+    while !it.done {
+        if st::pg_text(it.element, "model") == model {
+            return std::json::find_field_raw(it.element, "seats");
+        }
+        it = std::json::array_next(it);
+    }
+    return "[]";
 }
 
 /// Why an offer did not serve, in a line.

@@ -123,8 +123,30 @@ applied() {
 }
 
 seat_status() { curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop/seats/static" | field status; }
+# with a brain, the api offers a seat once the route table lists it: wait
+# for a table written after the seat came up (one written before may have
+# left it out); with no table (no brain, or the store in memory) the api
+# judges the seat itself
+routed() {
+  local t="" since=""
+  for i in $(seq 1 50); do
+    t=$(curl -H @"$work/admin.h" -s "$api/admin/v1/routes" || true)
+    case "$t" in *route_table_unavailable*) return 0 ;; esac
+    v=$(printf '%s' "$t" | python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' 2>/dev/null || true)
+    [ -z "$since" ] && since="$v"
+    case "$t" in *'"seat": "'"$1"'"'*) [ "$v" != "$since" ] && return 0 ;; esac
+    sleep 0.2
+  done
+  echo "the route table never listed $1: $t"; exit 1
+}
 wait_for() {
-  for i in $(seq 1 100); do [ "$(seat_status)" = "$1" ] && applied && return 0; sleep 0.2; done
+  for i in $(seq 1 100); do
+    if [ "$(seat_status)" = "$1" ] && applied; then
+      [ "$1" = "up" ] && routed laptop/static
+      return 0
+    fi
+    sleep 0.2
+  done
   echo "the seat never became $1: $(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop")"; echo "--- api"; cat "$work/api.log"; echo "--- node"; cat "$work/node.log"
   return 1
 }
@@ -492,9 +514,17 @@ for i in $(seq 1 100); do
   [ "$(seat_status)" = "up" ] && [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
   sleep 0.2
 done
-t0=$(date +%s%N)
-out=$(responds)
-ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+routed mini/steady
+# with a brain, two idle seats are ranked with a little jitter, so either
+# may be offered first: ask again each tick until laptop's is (mini's
+# answers at once)
+for try in $(seq 1 12); do
+  t0=$(date +%s%N)
+  out=$(responds)
+  ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+  echo "$out" | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["voice"]["attempts"][0]["seat"] == "laptop/static" else 1)' 2>/dev/null && break
+  sleep 1
+done
 echo "$out" | python3 -c '
 import json, sys
 r = json.load(sys.stdin)
@@ -544,6 +574,7 @@ wait "$streaming" || true
 (cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/responses "$work/killed.sse" failed) || { head -c 400 "$work/killed.sse"; exit 1; }
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d "{\"enabled\": true, ${slow:1:-1}}" >/dev/null
 for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
+routed mini/steady
 curl -s -N -X POST "$api/v1/chat/completions" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}], "stream": true}' >"$work/killed-chat.sse" &
 streaming=$!
 # the dead laptop takes its 5 s ack wait first, then mini streams

@@ -151,9 +151,10 @@ forwarded. [`docs/internals.md`](./docs/internals.md) documents the architecture
   Postgres's.** Limits, budgets, reservations and metering stay
   transactions in Postgres: admission and accounting must be durable and
   consistent, and the route only has to be fresh. Today the table is a row
-  in Postgres with NATS carrying its version, and the api does not yet
-  route from it ([`docs/internals.md`](./docs/internals.md), "The route
-  table"); both move to the axiom above.
+  in Postgres with NATS carrying its version, and the api reads it on each
+  request and offers the seats in its order
+  ([`docs/internals.md`](./docs/internals.md), "The route table"); both
+  move to the axiom above.
 
 ## Phases
 

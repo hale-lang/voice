@@ -1,0 +1,474 @@
+// Recipes: where a local model's weights come from, pinned, as the operator
+// allows them. Voice ships some in recipes/, read at start and never
+// changed; the operator allows more on the admin plane, kept in the store.
+// A catalog model may name only a recipe one of the two holds (catalog.hl).
+//
+// An id the operator has held, live or withdrawn, is the operator's for
+// good: a release that later ships a recipe of that id does not replace
+// the one a model names, nor bring a withdrawn one back; the shipped one
+// is not offered.
+//
+// Every recipe is held to the same rules, whichever way it came: one
+// revision (a commit) of one source, every file listed with its digest,
+// each file a kind that holds tensors, a tokenizer or settings, never a
+// pickle or code. The body kept is rebuilt from the fields checked, so
+// nothing unchecked is stored.
+
+type RecipeRef { recipe: String; }
+
+/// `RecipeCreate.license`.
+type RecipeLicense { name: String = ""; url: String = ""; }
+
+/// `RecipeCreate`: what the operator allows, and a shipped file's form.
+/// `variants` is free-form JSON, checked here field by field.
+type RecipeCreate {
+    id: String;
+    license: RecipeLicense;
+    variants: std::json::Value = std::json::Value::null();
+}
+
+/// Where a recipe came from (`Recipe.origin`).
+type RecipeOrigin = enum { shipped, operator };
+
+fn recipe_origin_name(v: RecipeOrigin) -> String {
+    return match v {
+        RecipeOrigin::shipped -> "shipped",
+        RecipeOrigin::operator -> "operator"
+    };
+}
+
+/// `Recipe`. A shipped recipe has no `created_at`.
+type Recipe {
+    id: String = "";
+    license: RecipeLicense = RecipeLicense { };
+    variants: std::json::Value = std::json::Value::null();
+    origin: RecipeOrigin = RecipeOrigin::operator;
+    has_created_at: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// Voice's own (at most `SHIPPED_MAX`) and the operator's (the store's 256).
+type RecipeList { data: bounded[Recipe; 320]; }
+
+/// The most recipes voice ships.
+const SHIPPED_MAX: Int = 64;
+
+/// The most a recipe's body may be: a change holds it whole, and the change
+/// log reads a change back as a JSON value of at most 64 KiB.
+const RECIPE_MAX: Int = 49152;
+
+locus Recipes {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+        // the shipped recipes' bodies, checked, one a line (`shipped_recipes`)
+        shipped: String = "";
+    }
+
+    /// `listRecipes`: voice's own, then the operator's not removed.
+    fn list() -> RecipeList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn list_in_gate() -> RecipeList fallible(CtlError) {
+        let mut out = RecipeList { };
+        let rows = self.store.recipes() or fail store_down(err);
+        let v = std::str::bytes_view(self.shipped);
+        let mut start = 0;
+        while start < v.n {
+            let nl = st::line_end(v, start);
+            let line = std::str::slice(v, start, nl);
+            start = nl + 1;
+            if len(line) > 0 && !held(rows, std::json::find_string_field(line, "id")) {
+                let r = recipe_view(
+                    line,
+                    RecipeOrigin::shipped,
+                    false,
+                    `1970-01-01T00:00:00Z`,
+                ) or raise;
+                push(out.data, r) or discard;
+            }
+        }
+        for row in rows.rows {
+            if !row.removed {
+                let r = recipe_view(
+                    row.body,
+                    RecipeOrigin::operator,
+                    true,
+                    row.created_at,
+                ) or raise;
+                push(out.data, r) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// `createRecipe`.
+    fn create(c: RecipeCreate) -> Recipe fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.create_in_gate(c) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn create_in_gate(c: RecipeCreate) -> Recipe fallible(CtlError) {
+        let body = recipe_body(c.id, c.license, c.variants.text);
+        if std::str::starts_with(body, "!") {
+            fail bad(body[1..len(body)], recipe_param(body));
+        }
+        if len(self.shipped_body(c.id)) > 0 {
+            fail clash("voice ships recipe " + c.id + "; another is another id");
+        }
+        let row = st::RecipeRow { id: c.id, body: body, created_at: now_seconds() };
+        let v = recipe_view(body, RecipeOrigin::operator, true, row.created_at) or raise;
+        let added = self.store.insert_recipe(
+            row,
+            checked_change("create", "recipes/" + c.id, "", recipe_json(v)) or raise,
+        ) or fail store_down(err);
+        if !added { fail clash("recipe " + c.id + " exists; a recipe id is never reused"); }
+        return v;
+    }
+
+    /// `getRecipe`.
+    fn get(r: RecipeRef) -> Recipe fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r.recipe) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn get_in_gate(id: String) -> Recipe fallible(CtlError) {
+        let row = self.store.recipe(id) or fail store_down(err);
+        if row.present {
+            if row.removed { fail missing("no recipe " + id + "; it was withdrawn"); }
+            return recipe_view(row.body, RecipeOrigin::operator, true, row.created_at) or raise;
+        }
+        let shipped = self.shipped_body(id);
+        if len(shipped) == 0 { fail missing("no recipe " + id); }
+        return recipe_view(shipped, RecipeOrigin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
+    }
+
+    /// `removeRecipe`: an operator's recipe no model in the catalog names.
+    fn remove(r: RecipeRef) -> Recipe fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.remove_in_gate(r.recipe) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn remove_in_gate(id: String) -> Recipe fallible(CtlError) {
+        let v = self.get_in_gate(id) or raise;
+        if v.origin == RecipeOrigin::shipped {
+            fail clash("voice ships recipe " + id + "; it cannot be removed");
+        }
+        let models = self.store.models() or fail store_down(err);
+        for m in models.rows {
+            if !m.removed && m.recipe == id {
+                fail clash("model " + m.id + " names recipe " + id);
+            }
+        }
+        self.store.remove_recipe(
+            st::RecipeRow { id: id, removed: true, removed_at: now_seconds() },
+            checked_change("delete", "recipes/" + id, recipe_json(v), "") or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+
+    /// True when a catalog model may name `id`: shipped, or allowed and not
+    /// removed. Called inside the gate (catalog.hl).
+    fn known_in_gate(id: String) -> Bool fallible(CtlError) {
+        let row = self.store.recipe(id) or fail store_down(err);
+        if row.present { return !row.removed; }
+        return len(self.shipped_body(id)) > 0;
+    }
+
+    /// The shipped recipe `id`'s body, "" for none.
+    fn shipped_body(id: String) -> String {
+        let v = std::str::bytes_view(self.shipped);
+        let mut start = 0;
+        while start < v.n {
+            let nl = st::line_end(v, start);
+            let line = std::str::slice(v, start, nl);
+            start = nl + 1;
+            if len(line) > 0 && std::json::find_string_field(line, "id") == id { return line; }
+        }
+        return "";
+    }
+}
+
+/// True when the store holds a row for `id`, live or withdrawn.
+fn held(rows: st::RecipeRows, id: String) -> Bool {
+    for r in rows.rows {
+        if r.id == id { return true; }
+    }
+    return false;
+}
+
+/// A body as the surface's `Recipe`.
+fn recipe_view(
+    body: String,
+    origin: RecipeOrigin,
+    dated: Bool,
+    at: Time
+) -> Recipe fallible(CtlError) {
+    let lic = std::json::find_field_raw(body, "license");
+    return Recipe {
+        id: std::json::find_string_field(body, "id"),
+        license: RecipeLicense {
+            name: std::json::find_string_field(lic, "name"),
+            url: std::json::find_string_field(lic, "url"),
+        },
+        variants: stored_value(
+            std::json::find_field_raw(body, "variants"),
+            "a recipe's variants",
+        ) or raise,
+        origin: origin,
+        has_created_at: dated,
+        created_at: at
+    };
+}
+
+/// The change log's JSON for `r`: the `Recipe` the api answers.
+fn recipe_json(r: Recipe) -> String {
+    return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
+        + ", \"url\": "
+        + jq(r.license.url) + "}, \"variants\": " + r.variants.text + ", \"origin\": "
+        + jq(recipe_origin_name(r.origin)) + ", \"created_at\": "
+        + jtime_or_null(r.has_created_at, r.created_at) + "}";
+}
+
+// ---- the rules --------------------------------------------------------
+//
+// `recipe_body` answers the body to keep, rebuilt from the fields it
+// checked, or `!<param>\t<problem>` (the param is the field at fault).
+
+@bounded_by(variants)
+fn recipe_body(id: String, license: RecipeLicense, variants: String) -> String {
+    if !slug(id, ".-", true) {
+        return "!id\t`id` is lowercase letters, digits, dots and dashes, starting with a letter or digit, at most 63";
+    }
+    if len(license.name) < 1 || len(license.name) > 64 {
+        return "!license\t`license.name` is 1 to 64 characters";
+    }
+    if !(
+        std::str::starts_with(license.url, "https://")
+            || std::str::starts_with(license.url, "http://")
+    )
+        || len(license.url) > 512
+    {
+        return "!license\t`license.url` is an http or https URL, at most 512 characters";
+    }
+    if std::json::string_field("{\"v\": " + variants + "}", "v").kind != "array" {
+        return "!variants\t`variants` is a list";
+    }
+    let out = st::JsonList { };
+    let mut seen = "\n";
+    let mut n = 0;
+    let mut it = std::json::array_first(variants);
+    while !it.done {
+        n = n + 1;
+        if n > 8 { return "!variants\ta recipe has at most 8 variants"; }
+        let v = variant_body(it.element, n);
+        if std::str::starts_with(v, "!") { return v; }
+        let vid = std::json::find_string_field(v, "id");
+        if std::str::contains(seen, "\n" + vid + "\n") {
+            return "!variants\ttwo variants are named " + vid;
+        }
+        seen = seen + vid + "\n";
+        out.add(v);
+        it = std::json::array_next(it);
+    }
+    if n == 0 { return "!variants\ta recipe has at least one variant"; }
+    let body = "{\"id\": " + jq(id) + ", \"license\": {\"name\": " + jq(license.name)
+        + ", \"url\": "
+        + jq(license.url) + "}, \"variants\": [" + out.text() + "]}";
+    if len(body) > RECIPE_MAX {
+        return "!variants\ta recipe is at most 48 KiB (" + to_string(len(body)) + " bytes)";
+    }
+    return body;
+}
+
+/// The param and the problem of a refused body.
+fn recipe_param(refused: String) -> String {
+    let tab = std::str::index_of(refused, "\t");
+    return if tab > 1 { refused[1..tab] } else { "" };
+}
+
+@bounded_by(v)
+fn variant_body(v: String, n: Int) -> String {
+    let at = "variants[" + to_string(n - 1) + "]";
+    let keys = only_keys(v, ",id,format,quantization,source,files,memory_bytes,");
+    if len(keys) > 0 { return "!variants\t" + at + " has no field " + keys; }
+    let id = text_of(v, "id");
+    if !slug(id, "_.-", true) {
+        return "!variants\t" + at
+            + ".id is lowercase letters, digits, dots, dashes and underscores, at most 63";
+    }
+    let format = text_of(v, "format");
+    if format != "safetensors" && format != "gguf" && format != "mlx" {
+        return "!variants\t" + at + ".format is safetensors, gguf or mlx";
+    }
+    let q = text_of(v, "quantization");
+    if len(q) < 1 || len(q) > 64 {
+        return "!variants\t" + at + ".quantization is 1 to 64 characters";
+    }
+    let src = std::json::find_field_raw(v, "source");
+    let skeys = only_keys(src, ",hub,repo,revision,");
+    if len(skeys) > 0 { return "!variants\t" + at + ".source has no field " + skeys; }
+    if text_of(src, "hub") != "huggingface" {
+        return "!variants\t" + at + ".source.hub is huggingface";
+    }
+    let repo = text_of(src, "repo");
+    let slash = std::str::index_of(repo, "/");
+    if len(repo) > 128
+        || slash < 1
+        || !slug(repo[0..slash], "._-", false)
+        || !slug(repo[(slash + 1)..len(repo)], "._-", false)
+    {
+        return "!variants\t" + at + ".source.repo is owner/name";
+    }
+    let revision = text_of(src, "revision");
+    if !hex(revision, 40) {
+        return "!variants\t" + at
+            + ".source.revision is a commit (40 hex digits), never a branch or a tag";
+    }
+    let memory = count_of(v, "memory_bytes");
+    if memory < 1 { return "!variants\t" + at + ".memory_bytes is at least 1"; }
+    let files = std::json::find_field_raw(v, "files");
+    let fout = st::JsonList { };
+    let mut k = 0;
+    let mut it = std::json::array_first(files);
+    while !it.done {
+        k = k + 1;
+        if k > 128 { return "!variants\t" + at + " lists at most 128 files"; }
+        let f = it.element;
+        let fat = at + ".files[" + to_string(k - 1) + "]";
+        let fkeys = only_keys(f, ",path,bytes,sha256,");
+        if len(fkeys) > 0 { return "!variants\t" + fat + " has no field " + fkeys; }
+        let path = text_of(f, "path");
+        if !safe_path(path) {
+            return "!variants\t" + fat
+                + ".path is a relative path to tensors, a tokenizer or settings "
+                + "(.safetensors, .gguf, .json, .txt, .model, .tiktoken, .jinja), never a pickle or code";
+        }
+        let bytes = count_of(f, "bytes");
+        if bytes < 1 { return "!variants\t" + fat + ".bytes is at least 1"; }
+        let sha = text_of(f, "sha256");
+        if !hex(sha, 64) { return "!variants\t" + fat + ".sha256 is 64 hex digits"; }
+        fout.add(
+            "{\"path\": " + jq(path) + ", \"bytes\": " + to_string(bytes) + ", \"sha256\": "
+                + jq(sha) + "}",
+        );
+        it = std::json::array_next(it);
+    }
+    if k == 0 { return "!variants\t" + at + " lists at least one file"; }
+    return "{\"id\": " + jq(id) + ", \"format\": " + jq(format) + ", \"quantization\": " + jq(q)
+        + ", \"source\": {\"hub\": \"huggingface\", \"repo\": " + jq(repo) + ", \"revision\": "
+        + jq(revision) + "}, \"files\": [" + fout.text() + "], \"memory_bytes\": "
+        + to_string(memory) + "}";
+}
+
+/// A string member's text; "" when it is absent or not a string.
+fn text_of(obj: String, name: String) -> String {
+    let f = std::json::string_field(obj, name);
+    return if f.kind == "string" { f.text } else { "" };
+}
+
+/// A whole-number member at least 1; 0 when it is anything else.
+fn count_of(obj: String, name: String) -> Int {
+    if std::json::string_field(obj, name).kind != "number" { return 0; }
+    let raw = std::str::trim(std::json::find_field_raw(obj, name));
+    if std::str::contains(raw, ".")
+        || std::str::contains(raw, "e")
+        || std::str::contains(raw, "E")
+    {
+        return 0;
+    }
+    return std::str::parse_int(raw) or 0;
+}
+
+/// The first member of `obj` that `allowed` (",a,b,") does not name; "" when
+/// none, or when `obj` is not an object.
+@bounded_by(obj)
+fn only_keys(obj: String, allowed: String) -> String {
+    let mut it = std::json::object_first(obj);
+    while !it.done {
+        let k = std::json::obj_key_string(it, obj);
+        if !std::str::contains(allowed, "," + k + ",") { return k; }
+        it = std::json::object_next(it, obj);
+    }
+    return "";
+}
+
+/// 1 to 63 letters, digits and `extra`, starting with a letter or digit;
+/// lowercase only when `lower`.
+@bounded_by(s)
+fn slug(s: String, extra: String, lower: Bool) -> Bool {
+    let n = len(s);
+    if n == 0 || n > 63 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let alnum = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || (!lower && b >= 65 && b <= 90);
+        if !alnum && (i == 0 || !std::str::contains(extra, s[i..(i + 1)])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Exactly `n` lowercase hex digits.
+@bounded_by(s)
+fn hex(s: String, n: Int) -> Bool {
+    if len(s) != n { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A relative path that does not climb, of letters, digits and `._/-`,
+/// ending in a kind of file that holds no code.
+@bounded_by(p)
+fn safe_path(p: String) -> Bool {
+    let n = len(p);
+    if n == 0 || n > 256 || std::str::starts_with(p, "/") { return false; }
+    if p == ".." || std::str::starts_with(p, "../") || std::str::ends_with(p, "/..")
+        || std::str::contains(p, "/../")
+    {
+        return false;
+    }
+    let v = std::str::bytes_view(p);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+            || b == 46 || b == 95 || b == 47 || b == 45;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return std::str::ends_with(p, ".safetensors") || std::str::ends_with(p, ".gguf")
+        || std::str::ends_with(p, ".json") || std::str::ends_with(p, ".txt")
+        || std::str::ends_with(p, ".model") || std::str::ends_with(p, ".tiktoken")
+        || std::str::ends_with(p, ".jinja");
+}

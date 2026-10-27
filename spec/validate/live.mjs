@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -28,6 +28,9 @@ const setup = async (path, body) => {
   return JSON.parse(text);
 };
 await setup('/admin/v1/models', { id: 'echo-1', context_length: 8192, max_output_tokens: 1024, price: { input_per_mtok_micros: 3000000, output_per_mtok_micros: 15000000, currency: 'USD' } });
+// a recipe the operator allows, pinned (the one the delete withdraws)
+const recipe = id => ({ id, license: { name: 'apache-2.0', url: 'https://www.apache.org/licenses/LICENSE-2.0' }, variants: [{ id: 'gguf-q4_k_m', format: 'gguf', quantization: 'q4_k_m', source: { hub: 'huggingface', repo: 'example/live-GGUF', revision: '0123456789abcdef0123456789abcdef01234567' }, files: [{ path: 'live-Q4_K_M.gguf', bytes: 4920000000, sha256: 'a'.repeat(64) }], memory_bytes: 5600000000 }] });
+await setup('/admin/v1/recipes', recipe('live-sample'));
 await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
 await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
@@ -40,6 +43,7 @@ const auth = { authorization: `Bearer ${key.secret}` };
 const bodies = {
   createCatalogModel: { id: 'live-1', kind: 'hosted', owned_by: 'anthropic', price: null },
   updateCatalogModel: { max_output_tokens: 2048 },
+  createRecipe: recipe('live-2'),
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },

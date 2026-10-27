@@ -26,6 +26,20 @@ type ModelRow {
     max_output_tokens: Int = 0;
     priced: Bool = false;
     price: ModelPrice = ModelPrice { };
+    // the curated recipe its weights come from, "" for none
+    recipe: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    removed: Bool = false;
+    removed_at: Time = `1970-01-01T00:00:00Z`;
+    present: Bool = false;
+}
+
+/// A `recipe` row: one the operator allowed (voice's own are files, not
+/// rows). `body` is its `RecipeCreate` as the api checked and wrote it. A
+/// removed row keeps its id, which is never reused.
+type RecipeRow {
+    id: String = "";
+    body: String = "{}";
     created_at: Time = `1970-01-01T00:00:00Z`;
     removed: Bool = false;
     removed_at: Time = `1970-01-01T00:00:00Z`;
@@ -176,6 +190,9 @@ type ChangeQuery {
 
 /// Every catalog row, removed ones included, in the order they were added.
 type ModelRows { rows: bounded[ModelRow; 256]; }
+
+/// Every recipe row, removed ones included, in the order they were added.
+type RecipeRows { rows: bounded[RecipeRow; 256]; }
 
 /// Every project row, archived ones included, in the order they were added.
 type ProjectRows { rows: bounded[ProjectRow; 64]; }
@@ -334,6 +351,14 @@ interface Store {
     /// Replace the row with `row.id`.
     fn update_model(row: ModelRow, change: ChangeRow) fallible(StoreError);
 
+    /// The recipe row for `id`; `present` is false when there is none.
+    fn recipe(id: String) -> RecipeRow fallible(StoreError);
+    fn recipes() -> RecipeRows fallible(StoreError);
+    /// Add a row; false, and nothing written, when its id is taken.
+    fn insert_recipe(row: RecipeRow, change: ChangeRow) -> Bool fallible(StoreError);
+    /// Mark the row with `row.id` removed, at `row.removed_at`.
+    fn remove_recipe(row: RecipeRow, change: ChangeRow) fallible(StoreError);
+
     fn project(id: String) -> ProjectRow fallible(StoreError);
     fn projects() -> ProjectRows fallible(StoreError);
     fn insert_project(row: ProjectRow, change: ChangeRow) -> Bool fallible(StoreError);
@@ -442,6 +467,9 @@ locus WindowTable { capacity { pool rows of WindowRow indexed_by account; } }
 locus ModelTable { capacity { pool rows of ModelRow indexed_by id; } }
 
 @form(hashmap)
+locus RecipeTable { capacity { pool rows of RecipeRow indexed_by id; } }
+
+@form(hashmap)
 locus ProjectTable { capacity { pool rows of ProjectRow indexed_by id; } }
 
 @form(hashmap)
@@ -487,6 +515,8 @@ locus MemoryStore {
     params {
         model_rows: ModelTable = ModelTable { };
         model_order: IdOrder = IdOrder { };
+        recipe_rows: RecipeTable = RecipeTable { };
+        recipe_order: IdOrder = IdOrder { };
         project_rows: ProjectTable = ProjectTable { };
         project_order: IdOrder = IdOrder { };
         key_rows: KeyTable = KeyTable { };
@@ -558,6 +588,48 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.model_rows.set(r);
+        self.append(change);
+    }
+
+    // ---- recipes
+
+    fn recipe(id: String) -> RecipeRow fallible(StoreError) {
+        return self.recipe_rows.get(id) or RecipeRow { };
+    }
+
+    fn recipes() -> RecipeRows fallible(StoreError) {
+        let mut out = RecipeRows { };
+        let mut i = 0;
+        while i < self.recipe_order.len() {
+            let id = self.recipe_order.get(i) or "";
+            push(out.rows, self.recipe_rows.get(id) or RecipeRow { }) or discard;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    @unbounded
+    fn insert_recipe(row: RecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        let cur = self.recipe_rows.get(row.id) or RecipeRow { };
+        if cur.present { return false; }
+        if self.recipe_order.len() >= 256 {
+            fail StoreError { kind: "full", message: "voice holds at most 256 recipes" };
+        }
+        let mut r = row;
+        r.present = true;
+        self.recipe_rows.set(r);
+        self.recipe_order.push(r.id);
+        self.append(change);
+        return true;
+    }
+
+    @unbounded
+    fn remove_recipe(row: RecipeRow, change: ChangeRow) fallible(StoreError) {
+        let mut r = self.recipe_rows.get(row.id) or RecipeRow { };
+        if !r.present { return; }
+        r.removed = true;
+        r.removed_at = row.removed_at;
+        self.recipe_rows.set(r);
         self.append(change);
     }
 

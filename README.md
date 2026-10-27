@@ -48,6 +48,16 @@ build of its own (hale's habitat chapter, in `docs/src/habitat.md`, has the rest
 This starts Postgres, NATS, the api (on `localhost:8080`, with the admin UI
 at `/`), the brain and a node. The node waits for an enrollment token.
 
+The admin plane (`/admin/v1`, and the admin UI) takes the **operator token**,
+which the api mints on its first start and keeps in Postgres. It is never in
+the environment or a log; print it with
+
+```sh
+docker compose exec api voice-api admin-token
+```
+
+The UI asks for it once and keeps it in the browser.
+
 ## End to end
 
 Set up a model, the account that pays for it, a project with a key, and a
@@ -55,18 +65,20 @@ node with a seat. Then ask.
 
 ```sh
 api=localhost:8080; json='content-type: application/json'
+# the operator token, as a header in a file (kept off the command line)
+docker compose exec api voice-api admin-token | sed 's/^/Authorization: Bearer /' > admin.h
 
 # a model, the account that serves it, and a project with a key
-curl -X POST $api/admin/v1/models   -H "$json" -d '{"id": "echo-1"}'
-curl -X POST $api/admin/v1/accounts -H "$json" -d '{"id": "static", "name": "Static"}'
-curl -X POST $api/admin/v1/projects -H "$json" -d '{"id": "work", "name": "Work"}'
-curl -X POST $api/admin/v1/projects/work/keys -H "$json" -d '{"name": "laptop"}'
+curl -X POST $api/admin/v1/models   -H @admin.h -H "$json" -d '{"id": "echo-1"}'
+curl -X POST $api/admin/v1/accounts -H @admin.h -H "$json" -d '{"id": "static", "name": "Static"}'
+curl -X POST $api/admin/v1/projects -H @admin.h -H "$json" -d '{"id": "work", "name": "Work"}'
+curl -X POST $api/admin/v1/projects/work/keys -H @admin.h -H "$json" -d '{"name": "laptop"}'
 #   -> "secret": "vk-..."
 
 # the node, and a seat on it running the static engine
-curl -X POST $api/admin/v1/nodes -H "$json" -d '{"id": "local"}'
+curl -X POST $api/admin/v1/nodes -H @admin.h -H "$json" -d '{"id": "local"}'
 #   -> "enrollment_token": "vn-..."
-curl -X POST $api/admin/v1/nodes/local/seats -H "$json" -d '{
+curl -X POST $api/admin/v1/nodes/local/seats -H @admin.h -H "$json" -d '{
   "id": "static", "engine": "static", "account": "static",
   "serves": [{"model": "echo-1"}], "config": {"text": "hello from voice"}}'
 VOICE_ENROLLMENT_TOKEN=vn-... docker compose up -d node

@@ -54,12 +54,13 @@ child runs with no tools, no MCP servers and no settings.
 
 ## 4. Install the node
 
-With the api reachable (the admin API is open to the network the api listens
-on, or pass `--admin-key`), one command finds the seats, records them on the
-api and installs the launchd user agent:
+With the api reachable and its **operator token** in a file (the admin plane
+takes it: `docker compose exec api voice-api admin-token > admin.token` on the
+api's host, then copy the file to the Mac, mode 600), one command finds the
+seats, records them on the api and installs the launchd user agent:
 
 ```sh
-node/node install --id mac --api https://voice.example.net
+node/node install --id mac --api https://voice.example.net --admin-token-file admin.token
 ```
 
 It:
@@ -80,8 +81,9 @@ It:
   `~/Library/Logs/voice-node-<id>.log`.
 
 Flags: `--port` (the node's local API, 8081), `--data`, `--vault`,
-`--node-bin` (default: the running binary), `--admin-key`, `--no-start`
-(write everything, load nothing).
+`--node-bin` (default: the running binary), `--admin-token-file` (the operator
+token, read from a file; `--admin-key` takes it on the command line instead),
+`--no-start` (write everything, load nothing).
 
 The node serves requests that reach it over NATS, so the Mac needs a route to
 the habitat's broker as well as to the api. The node dials the NATS address the
@@ -103,7 +105,7 @@ curl -sS http://127.0.0.1:8081/node/v1/status
 ## 5. Check it from the api
 
 ```sh
-curl -sS https://voice.example.net/admin/v1/nodes/mac -H "Authorization: Bearer $ADMIN_KEY"
+curl -sS https://voice.example.net/admin/v1/nodes/mac -H "Authorization: Bearer $(cat admin.token)"
 curl -sS https://voice.example.net/v1/responses -H "Authorization: Bearer vk-..." \
   -H 'Content-Type: application/json' -d '{"model": "llama3.2:latest", "input": "hi"}'
 ```

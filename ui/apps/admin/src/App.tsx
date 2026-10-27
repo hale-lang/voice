@@ -1,5 +1,5 @@
 import { useIsFetching, useQueryClient } from '@tanstack/react-query';
-import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago } from '@hale/components';
+import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button } from '@hale/components';
 import { useRoute, href } from './route';
 import { useGet } from './api/client';
 import { Overview } from './screens/Overview';
@@ -12,6 +12,7 @@ import { Accounts } from './screens/Accounts';
 import { Catalog } from './screens/Catalog';
 import { Projects } from './screens/Projects';
 import { useAdminEvents } from './api/events';
+import { useOperatorToken, keepOperatorToken } from './api/token';
 import { useEffect, useState, type ReactNode } from 'react';
 
 const NAV = [
@@ -27,6 +28,32 @@ const NAV = [
 ];
 
 export function App() {
+  const token = useOperatorToken();
+  if (!token) return <OperatorToken />;
+  return <Admin />;
+}
+
+/**
+ * The admin plane takes the operator token: asked for once, kept in this
+ * browser (api/token.ts), and asked for again when the api refuses it.
+ */
+function OperatorToken() {
+  const [value, setValue] = useState('');
+  return (
+    <Shell rail={<RailHeader app="voice" sub="admin" />} evidence={null}>
+      <Form
+        onSubmit={() => keepOperatorToken(value.trim())}
+        actions={<Button type="submit" tone="primary">continue</Button>}
+      >
+        <Field label="operator token" required help="voice-api admin-token prints it: docker compose exec api voice-api admin-token">
+          <TextInput mono value={value} onChange={setValue} required pattern="\s*va-[0-9a-f]+\s*" placeholder="va-..." />
+        </Field>
+      </Form>
+    </Shell>
+  );
+}
+
+function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
@@ -43,7 +70,7 @@ export function App() {
         <>
           <RailHeader app="voice" sub="admin" />
           <RailNav items={NAV.map((n) => ({ ...n, active: n.key === section }))} />
-          <RailPrincipal>no principal · MVP</RailPrincipal>
+          <RailPrincipal>operator · <a href="#" onClick={(e) => { e.preventDefault(); keepOperatorToken(null); }}>forget token</a></RailPrincipal>
         </>
       }
       inspector={inspector}

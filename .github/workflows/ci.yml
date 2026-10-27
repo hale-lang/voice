@@ -23,7 +23,7 @@ jobs:
         run: hale fmt --check api store lib
       - name: No print outside the logger (std::log; its sink, lib/logfmt, and tests apart)
         run: |
-          if grep -rnE --include='*.hl' --exclude-dir=tests --exclude-dir=logfmt --exclude=install.hl '\b(e?print(ln)?)\s*\(' api brain node store lib | grep -vE '^[^:]+:[0-9]+:\s*//'; then
+          if grep -rnE --include='*.hl' --exclude-dir=tests --exclude-dir=logfmt --exclude=install.hl --exclude=admin_token.hl '\b(e?print(ln)?)\s*\(' api brain node store lib | grep -vE '^[^:]+:[0-9]+:\s*//'; then
             echo "a bare print outside std::log (docs/internals.md, Logs)"; exit 1
           fi
       - name: Verify
@@ -51,9 +51,11 @@ jobs:
         run: cd spec/validate && npm run bundle-negative
       - name: Every endpoint answers its happy path, live
         run: |
-          api/api --port 8080 &
+          api/api --port 8080 --state build/api-state &
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
-          cd spec/validate && npm ci && npm run live -- http://127.0.0.1:8080
+          # the admin plane's operator token, which the api minted on its start
+          api/api admin-token --state build/api-state > build/admin.token
+          cd spec/validate && npm ci && npm run live -- http://127.0.0.1:8080 ../../build/admin.token
 
   brain:
     name: brain
@@ -141,21 +143,24 @@ jobs:
           printf '#!/bin/sh\necho "NAME ID SIZE MODIFIED"\necho "llama3.2:latest abc 2GB now"\n' > build/fake-bin/ollama
           chmod +x build/fake-bin/ollama
           export PATH="$PWD/build/fake-bin:$PATH"
-          api/api --port 8080 --nats "" &
+          api/api --port 8080 --nats "" --state build/api-state &
           api_pid=$!
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
-          node/node install --id ci-mac --api http://127.0.0.1:8080 --node-bin "$PWD/node/node" \
+          # the admin plane's operator token (voice-api admin-token)
+          api/api admin-token --state build/api-state > build/admin.token
+          printf 'Authorization: Bearer %s\n' "$(cat build/admin.token)" > build/admin.h
+          node/node install --id ci-mac --api http://127.0.0.1:8080 --admin-token-file build/admin.token --node-bin "$PWD/node/node" \
             --data "$PWD/build/ci-node-data" --vault "$PWD/build/ci-vault" --port 8082 --no-start | tee install.txt
           grep -q 'seat ci-mac/ollama-llama3-2-latest serves llama3.2:latest' install.txt
           grep -q '^key     vk-' install.txt
           plist="$HOME/Library/LaunchAgents/net.hale-lang.voice-node.ci-mac.plist"
           plutil -lint "$plist"
           grep -q 'ci-node-data' "$plist"
-          curl -fsS http://127.0.0.1:8080/admin/v1/nodes/ci-mac/seats | grep -q '"ref": *"ci-mac/ollama-llama3-2-latest"'
+          curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac/seats | grep -q '"ref": *"ci-mac/ollama-llama3-2-latest"'
           node/node uninstall --id ci-mac
           test ! -e "$plist"
           # the agent itself: a runner may have no user session to load it into
-          if node/node install --id ci-mac2 --api http://127.0.0.1:8080 --node-bin "$PWD/node/node" \
+          if node/node install --id ci-mac2 --api http://127.0.0.1:8080 --admin-token-file build/admin.token --node-bin "$PWD/node/node" \
                --data "$PWD/build/ci-node-data2" --vault "$PWD/build/ci-vault2" --port 8083; then
             launchctl print "gui/$(id -u)/net.hale-lang.voice-node.ci-mac2" | grep -q 'state'
           else

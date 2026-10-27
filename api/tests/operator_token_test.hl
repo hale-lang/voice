@@ -1,0 +1,272 @@
+// The operator token (operator.hl): the admin plane takes it and nothing
+// else. Over a real listener, a request to an admin row and to the admin
+// paths the data plane serves (the event stream, the route table) with no
+// token, with a wrong one and with a project key is refused, and with the
+// token admitted; the probes and the caller plane are not touched. Then the
+// token as a standalone api keeps it: minted once in the state directory,
+// mode 600, and read back the same.
+import ".." as api;
+import "../../store" as st;
+
+/// The operator token the front's store keeps.
+const OPERATOR: String = "va-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn call(method: String, url: String, headers: String, body: String) -> std::http::ClientResponse {
+    let u = std::http::parse_url(url) or std::http::Url { };
+    let req = std::http::ClientRequest {
+        method: method,
+        url: u,
+        headers: headers,
+        body: std::bytes::from_string(body),
+    };
+    return std::http::request(req) or std::http::ClientResponse {
+        status: -1,
+        headers: "",
+        body: b"",
+    };
+}
+
+fn text(r: std::http::ClientResponse) -> String {
+    return std::str::from_bytes(r.body);
+}
+
+fn refusal_kind(r: std::http::ClientResponse) -> String {
+    return std::json::find_string_field(std::json::find_field_raw(text(r), "refusal"), "kind");
+}
+
+type Done { ok: Bool; }
+type Go { address: String; }
+
+locus Driver {
+    bus {
+        publish "operator.done" of type Done;
+        subscribe "operator.go" as on_go of type Go;
+    }
+    fn on_go(g: Go) {
+        let base = "http://" + g.address;
+        let json = "Content-Type: application/json";
+        let right = "Authorization: Bearer " + OPERATOR;
+        let wrong = "Authorization: Bearer va-" + OPERATOR[3..66] + "0";
+
+        // ---- an admin row: refused with no token and with a wrong one
+        let none = call("GET", base + "/admin/v1/projects", "", "");
+        std::test::assert(
+            none.status == 401 || none.status == 403,
+            "no token is refused: " + to_string(none.status) + " " + text(none),
+        );
+        std::test::assert(
+            std::str::contains(text(none), "\"refusal\""),
+            "by the exposure: " + text(none),
+        );
+        let bad = call("GET", base + "/admin/v1/projects", wrong, "");
+        std::test::assert_eq_int(bad.status, 401, "a wrong token is refused: " + text(bad));
+        std::test::assert_eq_str(refusal_kind(bad), "unauthenticated", "as unauthenticated");
+        std::test::assert(
+            std::str::contains(text(bad), "voice-api admin-token"),
+            "saying where the token is: " + text(bad),
+        );
+        let written = call(
+            "POST",
+            base + "/admin/v1/projects",
+            wrong + "\r\n" + json,
+            "{\"id\": \"work\", \"name\": \"Work\"}",
+        );
+        std::test::assert_eq_int(
+            written.status,
+            401,
+            "a write with a wrong token: " + text(written),
+        );
+
+        // ---- admitted with the token
+        let listed = call("GET", base + "/admin/v1/projects", right, "");
+        std::test::assert_eq_int(listed.status, 200, "the token is admitted: " + text(listed));
+        std::test::assert_eq_str(text(listed), "{\"data\":[]}", "and nothing was written before");
+        let made = call(
+            "POST",
+            base + "/admin/v1/projects",
+            right + "\r\n" + json,
+            "{\"id\": \"work\", \"name\": \"Work\"}",
+        );
+        std::test::assert_eq_int(made.status, 201, "a write with the token: " + text(made));
+
+        // ---- a project key is a caller, not the operator
+        let key = call(
+            "POST",
+            base + "/admin/v1/projects/work/keys",
+            right + "\r\n" + json,
+            "{\"name\": \"ci\"}",
+        );
+        std::test::assert_eq_int(key.status, 201, "a key: " + text(key));
+        let secret = std::json::find_string_field(text(key), "secret");
+        let as_key = call(
+            "GET",
+            base + "/admin/v1/projects",
+            "Authorization: Bearer " + secret,
+            "",
+        );
+        std::test::assert_eq_int(
+            as_key.status,
+            401,
+            "a project key on the admin plane: " + text(as_key),
+        );
+        let caller = call("GET", base + "/v1/models", "Authorization: Bearer " + secret, "");
+        std::test::assert_eq_int(
+            caller.status,
+            200,
+            "and on the caller plane, as ever: " + text(caller),
+        );
+
+        // ---- the admin paths of the data plane
+        let ev_none = call("GET", base + "/admin/v1/events?type=change", "", "");
+        std::test::assert_eq_int(
+            ev_none.status,
+            401,
+            "the event stream with no token: " + text(ev_none),
+        );
+        std::test::assert_eq_str(refusal_kind(ev_none), "unauthenticated", "refused as a row is");
+        let ev_bad = call("GET", base + "/admin/v1/events?type=change", wrong, "");
+        std::test::assert_eq_int(ev_bad.status, 401, "with a wrong token: " + text(ev_bad));
+        let ev = call("GET", base + "/admin/v1/events?type=change", right, "");
+        std::test::assert_eq_int(ev.status, 200, "with the token: " + text(ev));
+        let rt_none = call("GET", base + "/admin/v1/routes", "", "");
+        std::test::assert_eq_int(
+            rt_none.status,
+            401,
+            "the route table with no token: " + text(rt_none),
+        );
+        let rt = call("GET", base + "/admin/v1/routes", right, "");
+        std::test::assert_eq_int(rt.status, 503, "with the token, no brain wrote one: " + text(rt));
+
+        // ---- the probes take none
+        let live = call("GET", base + "/healthz", "", "");
+        std::test::assert_eq_int(live.status, 200, "liveness: " + text(live));
+        "operator.done" <- Done { ok: true };
+    }
+}
+
+main locus App {
+    params {
+        front: api::Front = api::Front {
+            bind: "127.0.0.1:0",
+            store: st::MemoryStore { operator: OPERATOR },
+        };
+        driver: Driver = Driver { };
+        finished: Bool = false;
+    }
+    bus {
+        subscribe "operator.done" as on_done of type Done;
+        publish "operator.go" of type Go;
+    }
+    placement {
+        front: cooperative(pool = edge) where async_io;
+        driver: cooperative(pool = client) where async_io;
+    }
+    run() {
+        let mut i = 0;
+        while std::str::ends_with(self.front.web.address, ":0") && i < 3000 {
+            std::time::sleep(10ms);
+            i = i + 1;
+        }
+        "operator.go" <- Go { address: std::str::clone(self.front.web.address) };
+        i = 0;
+        while !self.finished && i < 3000 {
+            std::time::sleep(10ms);
+            i = i + 1;
+        }
+        std::test::assert(self.finished, "the client ran to its end");
+    }
+    fn on_done(d: Done) {
+        self.finished = d.ok;
+    }
+}
+
+/// A standalone api's token: minted once into the state directory, mode
+/// 600 in a directory of mode 700, and the same when read again.
+fn kept_in_the_state_directory() {
+    let file = std::io::fs::mktemp("/tmp/voice-operator-", "") or "";
+    std::test::assert(len(file) > 0, "a scratch name");
+    let base = file + ".d";
+    let state = base + "/state";
+    let first = api::operator_token_file(state) or "";
+    std::test::assert(std::str::starts_with(first, "va-") && len(first) == 67, "minted: " + first);
+    let again = api::operator_token_file(state) or "";
+    std::test::assert_eq_str(again, first, "and read back the same");
+    let modes = std::process::run(
+        "stat\n-c\n%a\n" + state + "\n" + state + "/operator-token",
+    ) or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+    std::test::assert_eq_str(
+        std::str::trim(modes.stdout),
+        "700\n600",
+        "kept private: " + modes.stdout,
+    );
+    // the portable reading the api checks with (ls -ldL) agrees with stat
+    std::test::assert_eq_int(api::mode_of(state), 448, "read as 700");
+    std::test::assert_eq_int(api::mode_of(state + "/operator-token"), 384, "and 600");
+    std::test::assert_eq_int(api::mode_of(state + "/none"), -1, "nothing to read is -1");
+    // a second token minted after the first is kept loses: its caller reads
+    // back the first, whole
+    std::test::assert_eq_str(
+        api::publish_operator_token(state, "va-second") or "",
+        first,
+        "a later mint reads back the token kept",
+    );
+
+    // an existing state directory others may read (0755): the token's file
+    // is still private from its first byte
+    let open_dir = base + "/open";
+    std::process::run("mkdir\n-p\n-m\n755\n" + open_dir) or discard;
+    let in_open = api::operator_token_file(open_dir) or "";
+    std::test::assert(std::str::starts_with(in_open, "va-"), "kept in a 0755 directory");
+    let open_mode = std::process::run(
+        "stat\n-c\n%a\n" + open_dir + "/operator-token",
+    ) or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: "",
+        stderr: "",
+    };
+    std::test::assert_eq_str(std::str::trim(open_mode.stdout), "600", "its file is 600");
+    std::test::assert_eq_int(api::mode_of(open_dir), 493, "its directory read as 755");
+    let drafts = std::process::run(
+        "sh\n-c\nls -A \"$1\" | grep -c operator-token-\nsh\n" + open_dir,
+    ) or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: "",
+        stderr: "",
+    };
+    std::test::assert_eq_str(std::str::trim(drafts.stdout), "0", "and no draft is left");
+
+    // a state directory others may write in is refused, and so is a token
+    // file others may read
+    let shared = base + "/shared";
+    std::process::run("mkdir\n-p\n-m\n777\n" + shared) or discard;
+    std::process::run("chmod\n777\n" + shared) or discard;
+    let mut refused = "";
+    api::operator_token_file(shared) or { refused = err.message; };
+    std::test::assert(
+        std::str::contains(refused, "writable by other users"),
+        "a 0777 directory: " + refused,
+    );
+    std::test::assert(!std::io::fs::file_exists(shared + "/operator-token"), "nothing kept there");
+    std::process::run("chmod\n644\n" + open_dir + "/operator-token") or discard;
+    refused = "";
+    api::operator_token_file(open_dir) or { refused = err.message; };
+    std::test::assert(
+        std::str::contains(refused, "readable by other users"),
+        "a 0644 token file: " + refused,
+    );
+    std::process::run("rm\n-rf\n" + base + "\n" + file) or discard;
+
+    // the digest compare
+    let want = api::operator_digest(OPERATOR);
+    std::test::assert(api::operator_matches(want, OPERATOR), "the token matches");
+    std::test::assert(!api::operator_matches(want, OPERATOR + "x"), "a longer one does not");
+    std::test::assert(!api::operator_matches(want, ""), "nor none");
+    std::test::assert(!api::operator_matches("", OPERATOR), "and no token kept admits nothing");
+}
+
+fn main() {
+    kept_in_the_state_directory();
+    App { };
+}

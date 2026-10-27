@@ -6,6 +6,10 @@
 // a malformed body), and one data-plane route each for inference, the node
 // link's registration and the admin event stream.
 import ".." as api;
+import "../../store" as st;
+
+/// The operator token the front's store keeps (operator.hl).
+const OPERATOR: String = "va-rest-test";
 
 fn call(method: String, url: String, headers: String, body: String) -> std::http::ClientResponse {
     let u = std::http::parse_url(url) or std::http::Url { };
@@ -41,18 +45,21 @@ locus Driver {
     fn on_go(g: Go) {
         let base = "http://" + g.address;
         let json = "Content-Type: application/json";
+        // the admin plane's calls carry the operator token (operator.hl)
+        let admin = "Authorization: Bearer " + OPERATOR;
+        let admin_json = admin + "\r\n" + json;
 
         // ---- 200 and 201: a row answers, its body the answer by codec
         let live = call("GET", base + "/healthz", "", "");
         std::test::assert_eq_int(live.status, 200, "liveness: " + text(live));
         std::test::assert_eq_str(field(text(live), "status"), "ok", "ok");
-        let none = call("GET", base + "/admin/v1/projects", "", "");
+        let none = call("GET", base + "/admin/v1/projects", admin, "");
         std::test::assert_eq_int(none.status, 200, "an empty list: " + text(none));
         std::test::assert_eq_str(text(none), "{\"data\":[]}", "no projects yet");
         let made = call(
             "POST",
             base + "/admin/v1/projects",
-            json,
+            admin_json,
             "{\"id\": \"work\", \"name\": \"Work\"}",
         );
         std::test::assert_eq_int(made.status, 201, "created: " + text(made));
@@ -62,11 +69,11 @@ locus Driver {
                 && !std::str::contains(text(made), "\"budget\""),
             "an optional field that is not set is left out: " + text(made),
         );
-        let got = call("GET", base + "/admin/v1/projects/work", "", "");
+        let got = call("GET", base + "/admin/v1/projects/work", admin, "");
         std::test::assert_eq_int(got.status, 200, "get: " + text(got));
 
         // ---- 404 (not_found), 409 (conflict), 422 (invalid): a handler's class
-        let missing = call("GET", base + "/admin/v1/projects/nope", "", "");
+        let missing = call("GET", base + "/admin/v1/projects/nope", admin, "");
         std::test::assert_eq_int(missing.status, 404, "an unknown project");
         std::test::assert(
             std::str::contains(std::str::lower(missing.headers), "hale-error-class: not_found"),
@@ -80,7 +87,7 @@ locus Driver {
         let again = call(
             "POST",
             base + "/admin/v1/projects",
-            json,
+            admin_json,
             "{\"id\": \"work\", \"name\": \"Again\"}",
         );
         std::test::assert_eq_int(again.status, 409, "an id is taken once: " + text(again));
@@ -91,7 +98,7 @@ locus Driver {
         let invalid = call(
             "POST",
             base + "/admin/v1/projects",
-            json,
+            admin_json,
             "{\"id\": \"Work\", \"name\": \"W\"}",
         );
         std::test::assert_eq_int(invalid.status, 422, "an id is lowercase: " + text(invalid));
@@ -104,7 +111,7 @@ locus Driver {
         let refused = call(
             "PATCH",
             base + "/admin/v1/projects/work",
-            json,
+            admin_json,
             "{\"budget\": {\"allowance_micros\": 1, \"period\": \"day\"}}",
         );
         std::test::assert_eq_int(
@@ -114,26 +121,31 @@ locus Driver {
         );
 
         // ---- 400: the transport's own refusal of a body that is not the request
-        let wrong = call("POST", base + "/admin/v1/projects", json, "{\"id\": 5, \"name\": \"W\"}");
+        let wrong = call(
+            "POST",
+            base + "/admin/v1/projects",
+            admin_json,
+            "{\"id\": 5, \"name\": \"W\"}",
+        );
         std::test::assert_eq_int(wrong.status, 400, "a field of the wrong type: " + text(wrong));
         std::test::assert_eq_str(
             field(std::json::find_field_raw(text(wrong), "refusal"), "kind"),
             "malformed",
             "malformed",
         );
-        let absent = call("POST", base + "/admin/v1/projects", json, "{\"name\": \"W\"}");
+        let absent = call("POST", base + "/admin/v1/projects", admin_json, "{\"name\": \"W\"}");
         std::test::assert_eq_int(absent.status, 400, "a field the request needs: " + text(absent));
 
         // ---- a path and a query bind the request's fields
-        let page = call("GET", base + "/admin/v1/projects?include_archived=true", "", "");
+        let page = call("GET", base + "/admin/v1/projects?include_archived=true", admin, "");
         std::test::assert_eq_int(page.status, 200, "a query parameter: " + text(page));
-        let bad_limit = call("GET", base + "/admin/v1/changes?limit=0", "", "");
+        let bad_limit = call("GET", base + "/admin/v1/changes?limit=0", admin, "");
         std::test::assert_eq_int(
             bad_limit.status,
             422,
             "a query the handler judges: " + text(bad_limit),
         );
-        let changes = call("GET", base + "/admin/v1/changes?limit=1", "", "");
+        let changes = call("GET", base + "/admin/v1/changes?limit=1", admin, "");
         std::test::assert_eq_int(changes.status, 200, "one change: " + text(changes));
         std::test::assert(
             std::str::contains(text(changes), "projects/work"),
@@ -147,13 +159,13 @@ locus Driver {
             std::str::contains(wrong_method.headers, "Allow: GET, HEAD, OPTIONS"),
             "Allow: " + wrong_method.headers,
         );
-        let opts = call("OPTIONS", base + "/admin/v1/projects/work", "", "");
+        let opts = call("OPTIONS", base + "/admin/v1/projects/work", admin, "");
         std::test::assert_eq_int(opts.status, 204, "OPTIONS is answered");
         std::test::assert(
             std::str::contains(opts.headers, "Allow: DELETE, GET, HEAD, PATCH, OPTIONS"),
             "with what the path takes: " + opts.headers,
         );
-        let head = call("HEAD", base + "/admin/v1/projects/work", "", "");
+        let head = call("HEAD", base + "/admin/v1/projects/work", admin, "");
         std::test::assert_eq_int(head.status, 200, "HEAD of a GET route");
         std::test::assert_eq_int(len(head.body), 0, "has no body");
 
@@ -175,16 +187,16 @@ locus Driver {
         let tmp = call(
             "POST",
             base + "/admin/v1/projects",
-            json,
+            admin_json,
             "{\"id\": \"tmp\", \"name\": \"Tmp\"}",
         );
         std::test::assert_eq_int(tmp.status, 201, "a project to archive: " + text(tmp));
-        let none_made = call("GET", base + "/admin/v1/projects/x", "", "");
+        let none_made = call("GET", base + "/admin/v1/projects/x", admin, "");
         std::test::assert_eq_int(none_made.status, 404, "and nothing was made");
         let cross = call(
             "DELETE",
             base + "/admin/v1/projects/tmp",
-            "Origin: http://evil.example",
+            admin + "\r\nOrigin: http://evil.example",
             "",
         );
         std::test::assert_eq_int(
@@ -192,19 +204,20 @@ locus Driver {
             403,
             "a write with no body from another origin: " + text(cross),
         );
-        let still = call("GET", base + "/admin/v1/projects/tmp", "", "");
+        let still = call("GET", base + "/admin/v1/projects/tmp", admin, "");
         std::test::assert_eq_str(field(text(still), "status"), "active", "nothing archived");
         let mine = call(
             "DELETE",
             base + "/admin/v1/projects/tmp",
-            "Origin: http://app.example",
+            admin + "\r\nOrigin: http://app.example",
             "",
         );
         std::test::assert_eq_int(mine.status, 200, "the app's own origin archives: " + text(mine));
         let json_write = call(
             "PATCH",
             base + "/admin/v1/projects/tmp",
-            "Content-Type: application/json; charset=utf-8\r\nOrigin: http://app.example",
+            admin
+                + "\r\nContent-Type: application/json; charset=utf-8\r\nOrigin: http://app.example",
             "{\"name\": \"Work again\"}",
         );
         std::test::assert_eq_int(json_write.status, 200, "and writes JSON: " + text(json_write));
@@ -230,9 +243,14 @@ locus Driver {
             "invalid_key",
             "refused by the data plane, not the exposure's bearer",
         );
-        let model = call("POST", base + "/admin/v1/models", json, "{\"id\": \"echo-1\"}");
+        let model = call("POST", base + "/admin/v1/models", admin_json, "{\"id\": \"echo-1\"}");
         std::test::assert_eq_int(model.status, 201, "a model: " + text(model));
-        let key = call("POST", base + "/admin/v1/projects/work/keys", json, "{\"name\": \"ci\"}");
+        let key = call(
+            "POST",
+            base + "/admin/v1/projects/work/keys",
+            admin_json,
+            "{\"name\": \"ci\"}",
+        );
         std::test::assert_eq_int(key.status, 201, "a key: " + text(key));
         let secret = field(text(key), "secret");
         std::test::assert(std::str::starts_with(secret, "vk-"), "its secret, shown once");
@@ -256,20 +274,20 @@ locus Driver {
             "the caller plane's model list: " + text(models),
         );
         // the node link: a node registers under its enrollment token
-        let node = call("POST", base + "/admin/v1/nodes", json, "{\"id\": \"laptop\"}");
+        let node = call("POST", base + "/admin/v1/nodes", admin_json, "{\"id\": \"laptop\"}");
         std::test::assert_eq_int(node.status, 201, "a node: " + text(node));
         let token = field(text(node), "enrollment_token");
         let account = call(
             "POST",
             base + "/admin/v1/accounts",
-            json,
+            admin_json,
             "{\"id\": \"static\", \"name\": \"Static\"}",
         );
         std::test::assert_eq_int(account.status, 201, "an account: " + text(account));
         let bad_config = call(
             "POST",
             base + "/admin/v1/nodes/laptop/seats",
-            json,
+            admin_json,
             "{\"id\": \"s\", \"engine\": \"static\", \"account\": \"static\", \"serves\": [{\"model\": \"echo-1\"}], \"config\": \"text\"}",
         );
         std::test::assert_eq_int(
@@ -280,7 +298,7 @@ locus Driver {
         let bad_account = call(
             "POST",
             base + "/admin/v1/projects",
-            json,
+            admin_json,
             "{\"id\": \"lab\", \"name\": \"Lab\", \"accounts\": [\"Not An Id\"]}",
         );
         std::test::assert_eq_int(
@@ -302,13 +320,13 @@ locus Driver {
             "with its assignment",
         );
         // the admin event stream
-        let events = call("GET", base + "/admin/v1/events?type=change", "", "");
+        let events = call("GET", base + "/admin/v1/events?type=change", admin, "");
         std::test::assert_eq_int(events.status, 200, "the event stream opens");
         std::test::assert(
             std::str::contains(std::str::lower(events.headers), "text/event-stream"),
             "as server-sent events: " + events.headers,
         );
-        let bad_type = call("GET", base + "/admin/v1/events?type=other", "", "");
+        let bad_type = call("GET", base + "/admin/v1/events?type=other", admin, "");
         std::test::assert_eq_int(bad_type.status, 422, "a type the stream does not carry");
         "rest.done" <- Done { ok: true };
     }
@@ -316,7 +334,11 @@ locus Driver {
 
 main locus App {
     params {
-        front: api::Front = api::Front { bind: "127.0.0.1:0", cors: "http://app.example" };
+        front: api::Front = api::Front {
+            bind: "127.0.0.1:0",
+            cors: "http://app.example",
+            store: st::MemoryStore { operator: OPERATOR },
+        };
         driver: Driver = Driver { };
         finished: Bool = false;
     }

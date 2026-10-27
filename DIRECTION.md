@@ -92,10 +92,12 @@ code conforms to them.
 Only what a process needs before its API answers is set at boot: addresses,
 the data directory, tokens.
 
-Admin authentication is middleware in front of the admin APIs, not part of
-them. The MVP runs without it, on loopback; OIDC drops in later with no change
-to the endpoints. Project keys and nodes' enrollment tokens are enforced from
-the start, because the MVP exists to prove them.
+The coordinator's admin plane takes an operator token, which the api mints on
+its first start and keeps in its store (`voice-api admin-token` prints it):
+under a habitat placement the api is published on the host's address, so
+nothing rests on loopback. OIDC principals drop in later with no change to the
+endpoints. Project keys and nodes' enrollment tokens are enforced from the
+start, because the MVP exists to prove them.
 
 ## Agents
 

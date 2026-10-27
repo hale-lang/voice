@@ -262,7 +262,7 @@ const RULES = [
   [/\.(created_by|principal|exhausted_until|output_tokens_before_failure|quantization)$/, 'optional', 'a field the api leaves null or absent for now'],
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
-  [/^(AccountUpdate|CatalogModelUpdate|NodeUpdate|SeatUpdate|ProjectUpdate)\.(id|budget|limits)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
+  [/^(AccountUpdate|CatalogModelUpdate|NodeUpdate|SeatUpdate|ProjectUpdate)\.(id|budget|limits|recipe)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
   [/^UsageSummary\.data\[\]\.refused$/, 'wire', 'a summary counts the requests the ledger holds, and refusals are not written to it'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard

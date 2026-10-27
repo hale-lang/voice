@@ -539,3 +539,14 @@ create table operator_token (
 insert into operator_token (token) values ($fresh)
 on conflict (id) do nothing;
 ```
+
+### Migration 8: a model's recipe
+
+A local model may name the curated recipe its weights come from
+(`Recipe`, openapi.yaml), by id. The recipes are files the api ships, not
+rows, so the id is not a foreign key; the api refuses one it does not ship.
+It is fixed at creation, like the model's id.
+
+```sql
+alter table catalog_model add column recipe text;
+```

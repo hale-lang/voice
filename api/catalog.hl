@@ -10,6 +10,8 @@ locus Catalog {
         store: st::Store;
         // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
         gate: st::Lock = st::Lock { };
+        // the ids of the curated recipes the api ships, one a line (`recipes`)
+        recipes: String = "";
     }
 
     /// `listCatalogModels`: every model not removed.
@@ -51,6 +53,14 @@ locus Catalog {
     fn create_in_gate(m: CatalogModelCreate) -> CatalogModel fallible(CtlError) {
         if len(m.id) == 0 || len(m.id) > 128 { fail bad("`id` is 1 to 128 characters", "id"); }
         check_model_fields(m.context_length, m.max_output_tokens) or raise;
+        if m.has_recipe {
+            if m.has_kind && m.kind == ModelKind::hosted {
+                fail bad("a hosted model has no recipe", "recipe");
+            }
+            if !std::str::contains("\n" + self.recipes, "\n" + m.recipe + "\n") {
+                fail bad("no recipe " + m.recipe + " ships with this api", "recipe");
+            }
+        }
         let row = st::ModelRow {
             id: m.id,
             owned_by: if len(m.owned_by) > 0 { m.owned_by } else { "local" },
@@ -59,6 +69,7 @@ locus Catalog {
             max_output_tokens: m.max_output_tokens,
             priced: m.has_price,
             price: m.price,
+            recipe: if m.has_recipe { m.recipe } else { "" },
             created_at: now_seconds()
         };
         let v = self.view(row) or raise;
@@ -101,6 +112,7 @@ locus Catalog {
     /// `update`, inside the gate.
     fn update_in_gate(u: CatalogModelUpdate) -> CatalogModel fallible(CtlError) {
         if u.has_id { fail bad("a model's `id` cannot change", "id"); }
+        if u.has_recipe { fail bad("a model's `recipe` cannot change", "recipe"); }
         self.store.hold("models/" + u.model) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
@@ -123,6 +135,9 @@ locus Catalog {
             row.price = u.price;
         }
         check_model_fields(row.context_length, row.max_output_tokens) or raise;
+        if len(row.recipe) > 0 && row.kind == "hosted" {
+            fail bad("a model with a recipe is local", "kind");
+        }
         let after = self.view(row) or raise;
         self.store.update_model(
             row,
@@ -315,6 +330,8 @@ fn catalog_view(r: st::ModelRow) -> CatalogModel {
         max_output_tokens: r.max_output_tokens,
         has_price: r.priced,
         price: r.price,
+        has_recipe: len(r.recipe) > 0,
+        recipe: r.recipe,
         available: false,
         created_at: r.created_at
     };

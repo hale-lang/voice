@@ -397,10 +397,12 @@ Each second the one that works:
   ([`internal.yaml`](../spec/internal.yaml)), saying once if it cannot.
 
 A tick at the bounds (256 seats each serving 16 of 256 models) computes the
-table in milliseconds. `GET /admin/v1/routes` reads the table from Postgres. The api does
-not route from the table yet: it picks a seat from the fleet's state in the
-store, the same state the brain reads, until it serves requests
-concurrently. Each api instance heartbeats its row in `api_instance` when
+table in milliseconds. `GET /admin/v1/routes` reads the table from Postgres, and so does the
+api on each request: it offers the model's seats in the table's order,
+keeping those the request may spend (its account, the key's and project's
+accounts, its data class). With no table (the store in memory, or before
+any brain has written one) the api judges each seat from the fleet's state
+itself. Each api instance heartbeats its row in `api_instance` when
 it has a database.
 
 The store, its rows and its migrations are the seed
@@ -579,8 +581,8 @@ numbers and the caller's `metadata`.
 
 ## The route table
 
-The brain turns the state of the fleet into a ranked table the api is to
-route from (it does not yet; see "The brain"). It is one row in Postgres, rewritten every second; NATS carries only
+The brain turns the state of the fleet into a ranked table the api
+routes from (see "The brain"). It is one row in Postgres, rewritten every second; NATS carries only
 the notice of its new version.
 
 - **Contents.** Per model, the seats that can serve it (up, on a node that
@@ -589,8 +591,9 @@ the notice of its new version.
   seats. Per model, the accounts that are exhausted and until when.
 - **Written** by the brain to Postgres every second, with a version that
   only grows, and its version **published** on `voice.route`. Api
-  instances read the table when a newer version is announced and keep it
-  in memory; a new instance reads it when it starts.
+  instances read the table from Postgres on each request; holding it in
+  memory and reading it again only when a newer version is announced is
+  still to come.
 - **Not exact, and it need not be.** Two instances can pick the same last
   slot; the node accepts one and refuses the other, which moves on. An
   instance decrements its own copy when it sends, so it does not pick a

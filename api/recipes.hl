@@ -3,6 +3,11 @@
 // changed; the operator allows more on the admin plane, kept in the store.
 // A catalog model may name only a recipe one of the two holds (catalog.hl).
 //
+// An id the operator has held, live or withdrawn, is the operator's for
+// good: a release that later ships a recipe of that id does not replace
+// the one a model names, nor bring a withdrawn one back; the shipped one
+// is not offered.
+//
 // Every recipe is held to the same rules, whichever way it came: one
 // revision (a commit) of one source, every file listed with its digest,
 // each file a kind that holds tensors, a tokenizer or settings, never a
@@ -74,13 +79,14 @@ locus Recipes {
 
     fn list_in_gate() -> RecipeList fallible(CtlError) {
         let mut out = RecipeList { };
+        let rows = self.store.recipes() or fail store_down(err);
         let v = std::str::bytes_view(self.shipped);
         let mut start = 0;
         while start < v.n {
             let nl = st::line_end(v, start);
             let line = std::str::slice(v, start, nl);
             start = nl + 1;
-            if len(line) > 0 {
+            if len(line) > 0 && !held(rows, std::json::find_string_field(line, "id")) {
                 let r = recipe_view(
                     line,
                     RecipeOrigin::shipped,
@@ -90,9 +96,8 @@ locus Recipes {
                 push(out.data, r) or discard;
             }
         }
-        let rows = self.store.recipes() or fail store_down(err);
         for row in rows.rows {
-            if !row.removed && len(self.shipped_body(row.id)) == 0 {
+            if !row.removed {
                 let r = recipe_view(
                     row.body,
                     RecipeOrigin::operator,
@@ -146,18 +151,14 @@ locus Recipes {
     }
 
     fn get_in_gate(id: String) -> Recipe fallible(CtlError) {
-        let shipped = self.shipped_body(id);
-        if len(shipped) > 0 {
-            return recipe_view(
-                shipped,
-                RecipeOrigin::shipped,
-                false,
-                `1970-01-01T00:00:00Z`,
-            ) or raise;
-        }
         let row = self.store.recipe(id) or fail store_down(err);
-        if !row.present || row.removed { fail missing("no recipe " + id); }
-        return recipe_view(row.body, RecipeOrigin::operator, true, row.created_at) or raise;
+        if row.present {
+            if row.removed { fail missing("no recipe " + id + "; it was withdrawn"); }
+            return recipe_view(row.body, RecipeOrigin::operator, true, row.created_at) or raise;
+        }
+        let shipped = self.shipped_body(id);
+        if len(shipped) == 0 { fail missing("no recipe " + id); }
+        return recipe_view(shipped, RecipeOrigin::shipped, false, `1970-01-01T00:00:00Z`) or raise;
     }
 
     /// `removeRecipe`: an operator's recipe no model in the catalog names.
@@ -172,10 +173,10 @@ locus Recipes {
     }
 
     fn remove_in_gate(id: String) -> Recipe fallible(CtlError) {
-        if len(self.shipped_body(id)) > 0 {
+        let v = self.get_in_gate(id) or raise;
+        if v.origin == RecipeOrigin::shipped {
             fail clash("voice ships recipe " + id + "; it cannot be removed");
         }
-        let v = self.get_in_gate(id) or raise;
         let models = self.store.models() or fail store_down(err);
         for m in models.rows {
             if !m.removed && m.recipe == id {
@@ -192,9 +193,9 @@ locus Recipes {
     /// True when a catalog model may name `id`: shipped, or allowed and not
     /// removed. Called inside the gate (catalog.hl).
     fn known_in_gate(id: String) -> Bool fallible(CtlError) {
-        if len(self.shipped_body(id)) > 0 { return true; }
         let row = self.store.recipe(id) or fail store_down(err);
-        return row.present && !row.removed;
+        if row.present { return !row.removed; }
+        return len(self.shipped_body(id)) > 0;
     }
 
     /// The shipped recipe `id`'s body, "" for none.
@@ -209,6 +210,14 @@ locus Recipes {
         }
         return "";
     }
+}
+
+/// True when the store holds a row for `id`, live or withdrawn.
+fn held(rows: st::RecipeRows, id: String) -> Bool {
+    for r in rows.rows {
+        if r.id == id { return true; }
+    }
+    return false;
 }
 
 /// A body as the surface's `Recipe`.

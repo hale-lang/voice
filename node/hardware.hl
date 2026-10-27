@@ -1,0 +1,177 @@
+// What the machine has (`Hardware`, ../spec/protocol.yaml), measured once
+// when the node declares its capabilities: the machine describing itself,
+// so a model can be placed where it fits. The operator may hold memory back
+// from models in the capabilities file (`hardware.model_memory_bytes`),
+// which only lowers what the node offers.
+//
+// Each measurement is a command's output read by a fn of its own, so the
+// readings are tested on outputs as each platform writes them.
+
+/// `Hardware` as JSON, for the machine the node runs on, its weights kept
+/// under `data`, and the operator's capabilities file `file`.
+@unbounded
+fn measured_hardware(data: String, file: String) -> String {
+    let os = os_of(run_out("uname\n-s"));
+    let arch = arch_of(run_out("uname\n-m"));
+    let memory = if os == "darwin" {
+        std::str::parse_int(std::str::trim(run_out("sysctl\n-n\nhw.memsize"))) or 0
+    } else {
+        meminfo_total(std::io::fs::read_file("/proc/meminfo") or "")
+    };
+    let accelerators = if os == "darwin" && arch == "arm64" {
+        "[" + accelerator_json(
+            "metal",
+            std::str::trim(run_out("sysctl\n-n\nmachdep.cpu.brand_string")),
+            memory,
+            true,
+        ) + "]"
+    } else {
+        nvidia_accelerators(
+            run_out("nvidia-smi\n--query-gpu=name,memory.total\n--format=csv,noheader,nounits"),
+            memory,
+        )
+    };
+    return hardware_json(
+        os,
+        arch,
+        memory,
+        model_memory(file, memory),
+        accelerators,
+        df_available(run_out("df\n-Pk\n" + data)),
+    );
+}
+
+/// A command's standard output, "" when it cannot run or fails.
+@unbounded
+fn run_out(argv: String) -> String {
+    let o = std::process::run(argv) or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: "",
+        stderr: "",
+    };
+    return if o.code == 0 { o.stdout } else { "" };
+}
+
+fn hardware_json(
+    os: String,
+    arch: String,
+    memory: Int,
+    model: Int,
+    accelerators: String,
+    disk: Int
+) -> String {
+    return "{\"os\": \"" + os + "\", \"arch\": \"" + arch + "\", \"memory_bytes\": "
+        + to_string(memory)
+        + ", \"model_memory_bytes\": " + to_string(model) + ", \"accelerators\": " + accelerators
+        + ", \"disk_free_bytes\": " + to_string(disk) + "}";
+}
+
+/// One accelerator; once a GPU, at start.
+@unbounded
+fn accelerator_json(kind: String, name: String, memory: Int, unified: Bool) -> String {
+    return "{\"kind\": \"" + kind + "\", \"name\": \"" + std::json::escape_string(name)
+        + "\", \"memory_bytes\": " + to_string(memory) + ", \"unified\": "
+        + (if unified { "true" } else { "false" }) + "}";
+}
+
+/// `uname -s`: `darwin` for macOS, `linux` otherwise.
+fn os_of(uname: String) -> String {
+    return if std::str::trim(uname) == "Darwin" { "darwin" } else { "linux" };
+}
+
+/// `uname -m`: `arm64` for Linux's `aarch64` and macOS's `arm64`,
+/// `x86_64` otherwise.
+fn arch_of(uname: String) -> String {
+    let m = std::str::trim(uname);
+    return if m == "aarch64" || m == "arm64" { "arm64" } else { "x86_64" };
+}
+
+/// `/proc/meminfo`'s `MemTotal`, in bytes (it writes kB); 0 when absent.
+fn meminfo_total(meminfo: String) -> Int {
+    let at = std::str::index_of(meminfo, "MemTotal:");
+    if at < 0 { return 0; }
+    let rest = meminfo[(at + 9)..len(meminfo)];
+    let nl = std::str::index_of(rest, "\n");
+    let line = std::str::trim(if nl >= 0 { rest[0..nl] } else { rest });
+    let sp = std::str::index_of(line, " ");
+    let kb = std::str::parse_int(if sp >= 0 { line[0..sp] } else { line }) or 0;
+    return kb * 1024;
+}
+
+/// `df -Pk DIR`: the second line's fourth column, kilobytes available, in
+/// bytes; 0 when it cannot be read.
+@bounded_by(df)
+fn df_available(df: String) -> Int {
+    let nl = std::str::index_of(df, "\n");
+    if nl < 0 { return 0; }
+    let line = std::str::trim(df[(nl + 1)..len(df)]);
+    let mut col = 0;
+    let mut i = 0;
+    let n = len(line);
+    let v = std::str::bytes_view(line);
+    while i < n {
+        while i < n && std::str::byte_at(v, i) == 32 { i = i + 1; }
+        let start = i;
+        while i < n && std::str::byte_at(v, i) != 32 && std::str::byte_at(v, i) != 10 { i = i + 1; }
+        if col == 3 { return (std::str::parse_int(line[start..i]) or 0) * 1024; }
+        col = col + 1;
+    }
+    return 0;
+}
+
+/// `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits`:
+/// one GPU a line, its memory in MiB. A GPU that reports no memory of its
+/// own (`[N/A]`, as NVIDIA GB10 does) shares the machine's, `memory`.
+@bounded_by(smi)
+fn nvidia_accelerators(smi: String, memory: Int) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
+    let mut first = true;
+    let v = std::str::bytes_view(smi);
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        let line = std::str::trim(std::str::slice(v, start, nl));
+        start = nl + 1;
+        let comma = std::str::index_of(line, ",");
+        if comma > 0 {
+            let mib = std::str::parse_int(std::str::trim(line[(comma + 1)..len(line)])) or - 1;
+            if !first { out.append_str(", "); }
+            first = false;
+            out.append_str(
+                if mib >= 0 {
+                    accelerator_json("cuda", std::str::trim(line[0..comma]), mib * 1048576, false)
+                } else {
+                    accelerator_json("cuda", std::str::trim(line[0..comma]), memory, true)
+                },
+            );
+        }
+    }
+    let b = out.snapshot() or b"";
+    return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// What models may use of `memory`: the capabilities file's
+/// `hardware.model_memory_bytes` when it is lower, `memory` otherwise.
+fn model_memory(file: String, memory: Int) -> Int {
+    let held = held_back(file);
+    return if held >= 0 && held < memory { held } else { memory };
+}
+
+/// The capabilities file's `hardware.model_memory_bytes`: -1 when it says
+/// none, -2 when it says something other than a whole number of at least 0.
+fn held_back(file: String) -> Int {
+    let hw = std::json::find_field_raw(file, "hardware");
+    if len(std::str::trim(hw)) == 0 { return -1; }
+    let f = std::json::string_field(hw, "model_memory_bytes");
+    if f.kind == "missing" { return -1; }
+    if f.kind != "number" { return -2; }
+    let raw = std::str::trim(std::json::find_field_raw(hw, "model_memory_bytes"));
+    let n = std::str::parse_int(raw) or - 2;
+    return if n < 0 { -2 } else { n };
+}
+
+/// The declared capabilities with the machine's `hardware` in them.
+fn with_hardware(capabilities: String, hardware: String) -> String {
+    return capabilities[0..(len(capabilities) - 1)] + ", \"hardware\": " + hardware + "}";
+}

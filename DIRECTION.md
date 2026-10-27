@@ -62,7 +62,9 @@ code conforms to them.
   A node's operator lists, in a file on the machine
   ([`node.yaml`](./spec/node.yaml)), the engines it offers
   (the static engine, or a CLI with the login it runs under) and its hard
-  limits. The node declares them when it connects. **A seat** is one of
+  limits. The node declares them when it connects, with the machine's
+  hardware as it measures it (platform, memory, accelerators, free disk),
+  of which the file can hold memory back from models but never add. **A seat** is one of
   those engines, spending one account, and is configured on the coordinator,
   which sends each node its seats as an assignment
   ([`protocol.yaml`](./spec/protocol.yaml)). The node refuses a seat outside

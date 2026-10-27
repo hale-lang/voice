@@ -415,6 +415,108 @@ locus PgStore {
         self.commit_with(change) or raise;
     }
 
+    // ---- placements
+
+    fn placement(id: String) -> PlacementRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.placement_locked(id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn placement_locked(id: String) -> PlacementRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        let j = self.row(
+            "SELECT row_to_json(t) FROM (" + PLACEMENT_COLUMNS + " WHERE id = $1) t",
+            a,
+        ) or raise;
+        return placement_row(j);
+    }
+
+    fn placements() -> PlacementRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.placements_locked() or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn placements_locked() -> PlacementRows fallible(StoreError) {
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (" + PLACEMENT_COLUMNS + " ORDER BY created_at, id) t",
+            db::Args { },
+        ) or raise;
+        let mut out = PlacementRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, placement_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn insert_placement(row: PlacementRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.insert_placement_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn insert_placement_locked(row: PlacementRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        self.room(
+            "SELECT count(*) FROM placement",
+            db::Args { },
+            256,
+            "voice holds at most 256 placements",
+        ) or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.body);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(row.model);
+        let n = self.step(
+            "INSERT INTO placement (id, body, created_at, model) VALUES ($1, $2::jsonb, $3::timestamptz, $4) ON CONFLICT (id) DO NOTHING",
+            a,
+        ) or raise;
+        if n == 0 {
+            self.rollback();
+            return false;
+        }
+        self.commit_with(change) or raise;
+        return true;
+    }
+
+    fn remove_placement(row: PlacementRow, change: ChangeRow) fallible(StoreError) {
+        self.lock.enter();
+        self.remove_placement_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn remove_placement_locked(row: PlacementRow, change: ChangeRow) fallible(StoreError) {
+        self.begin() or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(std::time::iso8601(row.removed_at));
+        self.step("UPDATE placement SET removed_at = $2::timestamptz WHERE id = $1", a) or raise;
+        self.commit_with(change) or raise;
+    }
+
     // ---- projects
 
     fn project(id: String) -> ProjectRow fallible(StoreError) {
@@ -1941,6 +2043,21 @@ fn model_row(j: String) -> ModelRow {
         removed: removed,
         removed_at: pg_time(pg_text(j, "removed_at")),
         recipe: pg_text(j, "recipe"),
+        present: true
+    };
+}
+
+const PLACEMENT_COLUMNS: String = "SELECT id, model, body, created_at, removed_at FROM placement";
+
+fn placement_row(j: String) -> PlacementRow {
+    if len(j) == 0 { return PlacementRow { }; }
+    return PlacementRow {
+        id: pg_text(j, "id"),
+        model: pg_text(j, "model"),
+        body: std::str::trim(std::json::find_field_raw(j, "body")),
+        created_at: pg_time(pg_text(j, "created_at")),
+        removed: len(raw_or_empty(j, "removed_at")) > 0,
+        removed_at: pg_time(pg_text(j, "removed_at")),
         present: true
     };
 }

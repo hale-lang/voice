@@ -193,6 +193,8 @@ tags:
     description: Admin plane. The model catalog.
   - name: recipes
     description: Admin plane. Where local models' weights come from, as the operator allows them.
+  - name: placements
+    description: Admin plane. Which nodes a local model is to run on, and in which form.
   - name: accounts
     description: Admin plane. Accounts that pay for serving, and their limits.
   - name: nodes
@@ -1199,7 +1201,8 @@ paths:
       description: |
         Callers naming it get `model_not_found`. Seats that still serve it
         keep the entry and show it as a problem until it is removed from
-        them. Usage history keeps the id.
+        them. Usage history keeps the id. Refused while a placement places
+        it.
       security:
         - operatorToken: []
       responses:
@@ -1217,6 +1220,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/AdminNotFound'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -1332,6 +1337,120 @@ paths:
           $ref: '#/components/responses/AdminNotFound'
         '409':
           $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/placements:
+    get:
+      tags: [placements]
+      operationId: listPlacements
+      summary: List the placements
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The placements.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Placement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags: [placements]
+      operationId: createPlacement
+      summary: Place a model on nodes
+      description: |
+        The operator puts a local model on nodes; the coordinator picks the
+        form of its weights (a variant of its recipe) that the nodes can
+        run and that fits them, as they declare their hardware, and says
+        why. A variant the operator names is taken only if it fits. Refused
+        when none fits, with each variant's reason.
+
+        A placement is a decision: nothing serves from it until the nodes
+        run managed engines, which act on it.
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlacementCreate'
+      responses:
+        '201':
+          description: The placement, decided.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Placement'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/placements/{placement}:
+    parameters:
+      - $ref: '#/components/parameters/PlacementId'
+    get:
+      tags: [placements]
+      operationId: getPlacement
+      summary: Describe a placement
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The placement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Placement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags: [placements]
+      operationId: removePlacement
+      summary: Withdraw a placement
+      description: Its id is never reused. A different form or set of nodes is a new placement.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The withdrawn placement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Placement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -2255,6 +2374,11 @@ components:
       schema: { $ref: '#/components/schemas/AccountIdValue' }
     RecipeId:
       name: recipe
+      in: path
+      required: true
+      schema: { type: string }
+    PlacementId:
+      name: placement
       in: path
       required: true
       schema: { type: string }
@@ -3506,6 +3630,68 @@ components:
           type: integer
           minimum: 1
           description: What serving the variant needs, weights and the engine's own, before any context.
+
+    # ---- placements ------------------------------------------------------
+
+    PlacementCreate:
+      type: object
+      required: [id, model, nodes]
+      properties:
+        id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
+          description: Chosen at creation, stable forever, never reused.
+          examples: [qwen3-8b-on-spark]
+        model:
+          type: string
+          description: A local catalog model that names a recipe.
+        nodes:
+          type: array
+          minItems: 1
+          maxItems: 1
+          description: |
+            The nodes it runs on, the first of them its leader, which holds
+            the seat that serves it. One node today; a model too large for
+            one is placed across several when engines can split it.
+          items: { $ref: '#/components/schemas/NodeIdValue' }
+        variant:
+          type: string
+          description: The operator's choice of form, taken only if it fits; left out, the coordinator picks.
+
+    Placement:
+      allOf:
+        - $ref: '#/components/schemas/PlacementCreate'
+        - type: object
+          required: [recipe, variant, chosen_by, leader, fit, created_at]
+          properties:
+            recipe:
+              type: string
+              description: The model's recipe.
+            variant:
+              type: string
+              description: The form chosen.
+            chosen_by:
+              type: string
+              enum: [coordinator, operator]
+            leader:
+              type: string
+              description: The node that holds the seat, the first of `nodes`.
+            fit:
+              type: array
+              description: Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made.
+              items: { $ref: '#/components/schemas/VariantFit' }
+            created_at: { type: string, format: date-time }
+
+    VariantFit:
+      type: object
+      required: [variant, fits, reason]
+      properties:
+        variant: { type: string }
+        fits: { type: boolean }
+        reason:
+          type: string
+          description: Why it fits or does not, in a line.
+          examples: ['gguf runs on cuda; 5.6 GB of 128 GB for models; 4.9 GB of 3.5 TB free']
 
     # ---- admin plane: accounts -------------------------------------------
 

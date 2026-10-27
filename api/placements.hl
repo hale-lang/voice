@@ -1,0 +1,398 @@
+// Placements: a local model put on nodes, by the operator. The coordinator
+// picks the form of its weights (a variant of the model's recipe) that the
+// nodes can run and that fits them, as they declared their hardware
+// (protocol.yaml `Hardware`), and keeps why, for every variant. A placement
+// is a decision: the managed engines on its nodes act on it.
+//
+// One node today, the leader, which holds the seat; the fit is judged on
+// the set, so a model split across nodes changes the judging, not the
+// shape.
+
+type PlacementRef { placement: String; }
+
+/// `PlacementCreate`. With no `variant` the coordinator picks.
+type PlacementCreate {
+    id: String;
+    model: String;
+    nodes: bounded[String; 1];
+    has_variant: Bool = false;
+    variant: String = "";
+}
+
+/// Who chose a placement's variant (`Placement.chosen_by`).
+type PlacementChooser = enum { coordinator, operator };
+
+fn placement_chooser_name(v: PlacementChooser) -> String {
+    return match v {
+        PlacementChooser::coordinator -> "coordinator",
+        PlacementChooser::operator -> "operator"
+    };
+}
+
+/// `VariantFit`: one variant, judged against the nodes.
+type VariantFit { variant: String = ""; fits: Bool = false; reason: String = ""; }
+
+/// `Placement`.
+type Placement {
+    id: String = "";
+    model: String = "";
+    nodes: bounded[String; 1];
+    recipe: String = "";
+    variant: String = "";
+    chosen_by: PlacementChooser = PlacementChooser::coordinator;
+    leader: String = "";
+    fit: bounded[VariantFit; 8];
+    created_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type PlacementList { data: bounded[Placement; 256]; }
+
+locus Placements {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+        // the recipes a model's weights come from (recipes.hl), behind the same gate
+        recipes: Recipes = Recipes { store: self.store, gate: self.gate };
+    }
+
+    /// `listPlacements`: those not withdrawn.
+    fn list() -> PlacementList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn list_in_gate() -> PlacementList fallible(CtlError) {
+        let rows = self.store.placements() or fail store_down(err);
+        let mut out = PlacementList { };
+        for r in rows.rows {
+            if !r.removed {
+                let v = placement_of(r) or raise;
+                push(out.data, v) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// `createPlacement`.
+    fn create(c: PlacementCreate) -> Placement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.create_in_gate(c) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn create_in_gate(c: PlacementCreate) -> Placement fallible(CtlError) {
+        if !is_slug(c.id) {
+            fail bad(
+                "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                "id"
+            );
+        }
+        if count(c.nodes) != 1 { fail bad("`nodes` names one node, its leader", "nodes"); }
+        let m = self.store.model(c.model) or fail store_down(err);
+        if !m.present || m.removed { fail bad("no model " + c.model + " in the catalog", "model"); }
+        if len(m.recipe) == 0 {
+            fail bad(
+                "model " + c.model + " names no recipe, so there are no weights to place",
+                "model"
+            );
+        }
+        let recipe = self.recipes.get_in_gate(m.recipe) or raise;
+        let leader = at(c.nodes, 0) or "";
+        let n = self.store.node(leader) or fail store_down(err);
+        if !n.present || n.revoked { fail bad("no node " + leader, "nodes"); }
+        let f = self.store.fleet(leader) or fail store_down(err);
+        let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
+        if len(hw) == 0 || !std::json::valid_object(hw) {
+            fail bad(
+                "node " + leader + " has declared no hardware, so nothing can be judged to fit it",
+                "nodes"
+            );
+        }
+        let existing = self.store.placements() or fail store_down(err);
+        for r in existing.rows {
+            if !r.removed && r.model == c.model
+                && std::json::find_string_field(r.body, "leader") == leader
+            {
+                fail clash("model " + c.model + " is placed on node " + leader + " by " + r.id);
+            }
+        }
+
+        let mut out = Placement {
+            id: c.id,
+            model: c.model,
+            recipe: m.recipe,
+            leader: leader,
+            created_at: now_seconds()
+        };
+        push(out.nodes, leader) or discard;
+        let mut best = -1;
+        let mut best_rank = 0;
+        let mut best_memory = 0;
+        let mut named = -1;
+        let mut i = 0;
+        let mut it = std::json::array_first(recipe.variants.text);
+        while !it.done {
+            let v = it.element;
+            let judged = judge_variant(v, hw);
+            push(out.fit, judged) or discard;
+            let rank = format_rank(std::json::find_string_field(v, "format"), hw);
+            let memory = std::json::find_int_field(v, "memory_bytes");
+            if c.has_variant && judged.variant == c.variant { named = i; }
+            if judged.fits
+                && (best < 0 || rank < best_rank || (rank == best_rank && memory > best_memory))
+            {
+                best = i;
+                best_rank = rank;
+                best_memory = memory;
+            }
+            i = i + 1;
+            it = std::json::array_next(it);
+        }
+        if c.has_variant {
+            if named < 0 {
+                fail bad("recipe " + m.recipe + " has no variant " + c.variant, "variant");
+            }
+            let chosen = at(out.fit, named) or VariantFit { };
+            if !chosen.fits {
+                fail bad(
+                    "variant " + c.variant + " does not fit node " + leader + ": " + chosen.reason,
+                    "variant"
+                );
+            }
+            out.variant = c.variant;
+            out.chosen_by = PlacementChooser::operator;
+        } else {
+            if best < 0 {
+                fail bad(
+                    "no variant of recipe " + m.recipe + " fits node " + leader + ": "
+                        + reasons(out.fit),
+                    "nodes",
+                );
+            }
+            let chosen = at(out.fit, best) or VariantFit { };
+            out.variant = chosen.variant;
+        }
+
+        let body = placement_json(out);
+        let added = self.store.insert_placement(
+            st::PlacementRow { id: c.id, model: c.model, body: body, created_at: out.created_at },
+            checked_change("create", "placements/" + c.id, "", body) or raise,
+        ) or fail store_down(err);
+        if !added { fail clash("placement " + c.id + " exists; a placement id is never reused"); }
+        return out;
+    }
+
+    /// `getPlacement`.
+    fn get(r: PlacementRef) -> Placement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r.placement) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn get_in_gate(id: String) -> Placement fallible(CtlError) {
+        let row = self.store.placement(id) or fail store_down(err);
+        if !row.present || row.removed { fail missing("no placement " + id); }
+        return placement_of(row) or raise;
+    }
+
+    /// `removePlacement`.
+    fn remove(r: PlacementRef) -> Placement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.remove_in_gate(r.placement) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn remove_in_gate(id: String) -> Placement fallible(CtlError) {
+        let v = self.get_in_gate(id) or raise;
+        self.store.remove_placement(
+            st::PlacementRow { id: id, removed: true, removed_at: now_seconds() },
+            checked_change("delete", "placements/" + id, placement_json(v), "") or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+}
+
+/// A row as the surface's `Placement`. The body is what `create` decided.
+fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
+    let b = r.body;
+    let mut out = Placement {
+        id: r.id,
+        model: r.model,
+        recipe: std::json::find_string_field(b, "recipe"),
+        variant: std::json::find_string_field(b, "variant"),
+        chosen_by: if std::json::find_string_field(b, "chosen_by") == "operator" {
+            PlacementChooser::operator
+        } else {
+            PlacementChooser::coordinator
+        },
+        leader: std::json::find_string_field(b, "leader"),
+        created_at: r.created_at
+    };
+    let mut nodes = std::json::array_first(std::json::find_field_raw(b, "nodes"));
+    while !nodes.done {
+        push(
+            out.nodes,
+            std::json::string_field("{\"n\": " + nodes.element + "}", "n").text,
+        ) or discard;
+        nodes = std::json::array_next(nodes);
+    }
+    let mut it = std::json::array_first(std::json::find_field_raw(b, "fit"));
+    while !it.done {
+        push(
+            out.fit,
+            VariantFit {
+                variant: std::json::find_string_field(it.element, "variant"),
+                fits: std::json::find_bool_field(it.element, "fits"),
+                reason: std::json::find_string_field(it.element, "reason"),
+            },
+        ) or discard;
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The change log's JSON for `p`, and the body kept: the `Placement` the api answers.
+@bounded_by(p)
+fn placement_json(p: Placement) -> String {
+    let nodes = st::JsonList { };
+    for n in p.nodes {
+        nodes.add(jq(n));
+    }
+    let fits = st::JsonList { };
+    for f in p.fit {
+        fits.add(
+            "{\"variant\": " + jq(f.variant) + ", \"fits\": "
+                + (if f.fits { "true" } else { "false" })
+                + ", \"reason\": " + jq(f.reason) + "}",
+        );
+    }
+    return "{\"id\": " + jq(p.id) + ", \"model\": " + jq(p.model) + ", \"nodes\": [" + nodes.text()
+        + "]"
+        + ", \"recipe\": " + jq(p.recipe) + ", \"variant\": " + jq(p.variant) + ", \"chosen_by\": "
+        + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"fit\": ["
+        + fits.text() + "], \"created_at\": " + jtime(p.created_at) + "}";
+}
+
+// ---- the fit ----------------------------------------------------------
+
+/// What runs a format on a machine, as its hardware says: Apple silicon
+/// (Metal) runs MLX, then GGUF; a CUDA GPU runs safetensors, then GGUF;
+/// any machine runs GGUF on its processors. "" when it runs none.
+fn runs_on(format: String, hw: String) -> String {
+    let accel = accelerator_kinds(hw);
+    if std::str::contains(accel, ",metal,") && (format == "mlx" || format == "gguf") {
+        return "metal";
+    }
+    if std::str::contains(accel, ",cuda,") && (format == "safetensors" || format == "gguf") {
+        return "cuda";
+    }
+    if format == "gguf" { return "cpu"; }
+    return "";
+}
+
+/// A format's place in the machine's preference, lower first: the form
+/// made for the accelerator before the one that runs anywhere.
+fn format_rank(format: String, hw: String) -> Int {
+    let accel = accelerator_kinds(hw);
+    if std::str::contains(accel, ",metal,") { return if format == "mlx" { 0 } else { 1 }; }
+    if std::str::contains(accel, ",cuda,") { return if format == "safetensors" { 0 } else { 1 }; }
+    return 0;
+}
+
+/// The kinds of the machine's accelerators, as `,cuda,metal,`.
+@bounded_by(hw)
+fn accelerator_kinds(hw: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 32 };
+    out.append_str(",");
+    let mut it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    while !it.done {
+        out.append_str(std::json::find_string_field(it.element, "kind") + ",");
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b",";
+    return std::str::from_bytes(b);
+}
+
+/// One variant judged against a machine's hardware: its format runs there,
+/// it fits what models may use of the memory, and its files fit the disk.
+@bounded_by(v)
+fn judge_variant(v: String, hw: String) -> VariantFit {
+    let id = std::json::find_string_field(v, "id");
+    let format = std::json::find_string_field(v, "format");
+    let on = runs_on(format, hw);
+    if len(on) == 0 {
+        return VariantFit {
+            variant: id,
+            fits: false,
+            reason: format + " runs on none of the node's processors",
+        };
+    }
+    let need = std::json::find_int_field(v, "memory_bytes");
+    let room = std::json::find_int_field(hw, "model_memory_bytes");
+    let memory = gb(need) + " of " + gb(room) + " for models";
+    if need > room {
+        return VariantFit {
+            variant: id,
+            fits: false,
+            reason: format + " runs on " + on + "; needs " + memory,
+        };
+    }
+    let mut size = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
+    while !it.done {
+        size = size + std::json::find_int_field(it.element, "bytes");
+        it = std::json::array_next(it);
+    }
+    let free = std::json::find_int_field(hw, "disk_free_bytes");
+    let disk = gb(size) + " of " + gb(free) + " free";
+    if size > free {
+        return VariantFit {
+            variant: id,
+            fits: false,
+            reason: format + " runs on " + on + "; " + memory + "; needs " + disk,
+        };
+    }
+    return VariantFit {
+        variant: id,
+        fits: true,
+        reason: format + " runs on " + on + "; " + memory + "; " + disk,
+    };
+}
+
+/// Every variant's reason, for a refusal.
+@bounded_by(fit)
+fn reasons(fit: bounded[VariantFit; 8]) -> String {
+    let out = st::JsonList { };
+    for f in fit {
+        out.add(f.variant + ": " + f.reason);
+    }
+    return std::str::replace(out.text(), ", ", "; ");
+}
+
+/// Bytes as gigabytes (10^9) to a tenth, or terabytes past 1000 GB.
+fn gb(n: Int) -> String {
+    if n >= 1000000000000 {
+        let t = (n + 50000000000) / 100000000000;
+        return to_string(t / 10) + "." + to_string(t % 10) + " TB";
+    }
+    let t = (n + 50000000) / 100000000;
+    return to_string(t / 10) + "." + to_string(t % 10) + " GB";
+}

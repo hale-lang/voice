@@ -95,6 +95,14 @@ code conforms to them.
   [`recipes/`](./recipes/README.md), reviewed like code, which the operator
   can use but not change. Every recipe is held to the same rules, whichever
   way it came ([`store.md`](./spec/store.md), migration 8).
+- `axiom` **The operator places a model; the coordinator picks its form.**
+  A placement ([`openapi.yaml`](./spec/openapi.yaml): `Placement`) puts a
+  local model on a set of nodes, the first its leader, which holds the
+  seat. The coordinator picks the variant of the model's recipe that the
+  nodes can run and that fits them as they declared their hardware, and
+  keeps why for every variant; one the operator names is taken only if it
+  fits. One node today, but nothing assumes it: a model split across nodes
+  changes the judging, not the shape.
 - `derived` **Projects and keys** name the accounts they may spend. A request may name
   one account; it is then served on that account or refused, never moved to
   another. A key for client work names the work account, so everything it

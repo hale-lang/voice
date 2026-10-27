@@ -456,6 +456,19 @@ case "$out" in *'hello again'*) ;; *) echo "the node never applied the new assig
 
 responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true; }
 
+# with a brain, the api offers a seat once the route table lists it, a
+# tick after it is up; with no table (no brain, or the store in memory)
+# the api judges the seat itself
+routed() {
+  local t=""
+  for i in $(seq 1 50); do
+    t=$(curl -H @"$work/admin.h" -s "$api/admin/v1/routes" || true)
+    case "$t" in *'"seat": "'"$1"'"'*|*route_table_unavailable*) return 0 ;; esac
+    sleep 0.2
+  done
+  echo "the route table never listed $1: $t"; exit 1
+}
+
 # an assign lost while NATS is down reaches the node when it is back: the
 # node reads its assignment on reconnecting, and its heartbeat says the
 # version it applied
@@ -492,6 +505,7 @@ for i in $(seq 1 100); do
   [ "$(seat_status)" = "up" ] && [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
   sleep 0.2
 done
+routed mini/steady
 t0=$(date +%s%N)
 out=$(responds)
 ms=$(( ($(date +%s%N) - t0) / 1000000 ))
@@ -544,6 +558,7 @@ wait "$streaming" || true
 (cd spec/validate && node sse-check.mjs ../../build/openapi.bundled.json /v1/responses "$work/killed.sse" failed) || { head -c 400 "$work/killed.sse"; exit 1; }
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d "{\"enabled\": true, ${slow:1:-1}}" >/dev/null
 for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break; sleep 0.2; done
+routed mini/steady
 curl -s -N -X POST "$api/v1/chat/completions" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}], "stream": true}' >"$work/killed-chat.sse" &
 streaming=$!
 # the dead laptop takes its 5 s ack wait first, then mini streams

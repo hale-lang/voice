@@ -95,6 +95,30 @@ jobs:
         run: hale test node
       - name: Build
         run: hale build node
+      - name: The node installs as a systemd unit, runs as the account that installed it, and is removed (docs/adding-a-node.md)
+        run: |
+          hale build api
+          api/api --port 8080 --nats "" --state build/api-state &
+          api_pid=$!
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
+          api/api admin-token --state build/api-state > build/admin.token
+          printf 'Authorization: Bearer %s\n' "$(cat build/admin.token)" > build/admin.h
+          sudo node/node install --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          systemd-analyze verify /etc/systemd/system/voice-node-ci-linux.service
+          systemctl is-active voice-node-ci-linux
+          getent group docker | grep -qw "$USER"
+          for i in $(seq 1 50); do curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"hardware"' && break; sleep 0.5; done
+          curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"os": *"linux"'
+          test "$(ps -o user= -p "$(pgrep -f 'voice-node --id ci-linux')")" = "$USER"
+          # installing again over the running node restarts it on what was installed
+          before=$(pgrep -f 'voice-node --id ci-linux')
+          sudo node/node install --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8083
+          for i in $(seq 1 50); do pgrep -f 'voice-node --id ci-linux.*--port 8083' >/dev/null && break; sleep 0.2; done
+          test "$(pgrep -f 'voice-node --id ci-linux')" != "$before"
+          pgrep -f 'voice-node --id ci-linux.*--port 8083'
+          sudo node/node uninstall --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
+          test ! -e /etc/systemd/system/voice-node-ci-linux.service
+          kill $api_pid
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -108,7 +132,7 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/healthz >/dev/null 2>&1 && break; sleep 0.2; done
           cd spec/validate && npm ci && npm run node-live -- http://127.0.0.1:8081
 
-  # The proof the node builds and runs on macOS (docs/node-on-a-mac.md): the
+  # The proof the node builds and runs on macOS (docs/adding-a-node.md): the
   # released aarch64-apple-darwin toolchain, no Postgres, no NATS, no compose.
   node-macos:
     name: node (macOS)
@@ -144,38 +168,30 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/node/v1/capabilities >/tmp/caps.json 2>/dev/null && break; sleep 0.2; done
           kill $pid
           grep -q claude-cli /tmp/caps.json && grep -q openai-compatible /tmp/caps.json
-      - name: The node installs as a launchd user agent and is removed (docs/node-on-a-mac.md)
+      - name: The node installs as a LaunchDaemon, runs as the account that installed it, and is removed (docs/adding-a-node.md)
         run: |
           hale build api
-          # a fake ollama: its models are the seats the node offers
-          mkdir -p build/fake-bin
-          printf '#!/bin/sh\necho "NAME ID SIZE MODIFIED"\necho "llama3.2:latest abc 2GB now"\n' > build/fake-bin/ollama
-          chmod +x build/fake-bin/ollama
-          export PATH="$PWD/build/fake-bin:$PATH"
           api/api --port 8080 --nats "" --state build/api-state &
           api_pid=$!
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
-          # the admin plane's operator token (voice-api admin-token)
           api/api admin-token --state build/api-state > build/admin.token
           printf 'Authorization: Bearer %s\n' "$(cat build/admin.token)" > build/admin.h
-          node/node install --id ci-mac --api http://127.0.0.1:8080 --admin-token-file build/admin.token --node-bin "$PWD/node/node" \
-            --data "$PWD/build/ci-node-data" --vault "$PWD/build/ci-vault" --port 8082 --no-start | tee install.txt
-          grep -q 'seat ci-mac/ollama-llama3-2-latest serves llama3.2:latest' install.txt
-          grep -q '^key     vk-' install.txt
-          plist="$HOME/Library/LaunchAgents/net.hale-lang.voice-node.ci-mac.plist"
+          sudo node/node install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          plist=/Library/LaunchDaemons/net.hale-lang.voice-node.ci-mac.plist
           plutil -lint "$plist"
-          grep -q 'ci-node-data' "$plist"
-          curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac/seats | grep -q '"ref": *"ci-mac/ollama-llama3-2-latest"'
-          node/node uninstall --id ci-mac
+          grep -q "<string>$USER</string>" "$plist"
+          test "$(stat -f %Lp ~/.voice/vault/node-ci-mac-enrollment)" = 600
+          grep -q '"managed"' ~/.voice/node-data/capabilities.json
+          # it runs, as this account, and registers with the hardware it measured
+          for i in $(seq 1 50); do curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac | grep -q '"hardware"' && break; sleep 0.5; done
+          curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac | grep -q '"kind": *"metal"'
+          test "$(ps -o user= -p "$(pgrep -f 'voice-node --id ci-mac')")" = "$USER"
+          # installing again changes nothing; uninstalling revokes it and removes the daemon
+          sudo node/node install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          sudo node/node uninstall --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
           test ! -e "$plist"
-          # the agent itself: a runner may have no user session to load it into
-          if node/node install --id ci-mac2 --api http://127.0.0.1:8080 --admin-token-file build/admin.token --node-bin "$PWD/node/node" \
-               --data "$PWD/build/ci-node-data2" --vault "$PWD/build/ci-vault2" --port 8083; then
-            launchctl print "gui/$(id -u)/net.hale-lang.voice-node.ci-mac2" | grep -q 'state'
-          else
-            echo "::warning::launchctl could not load a user agent on this runner"
-          fi
-          node/node uninstall --id ci-mac2
+          test ! -e ~/.voice/node-data
+          curl -sS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac | grep -q '"revoked_at": *"'
           kill $api_pid
 
   e2e:

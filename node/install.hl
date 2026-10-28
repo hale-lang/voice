@@ -1,7 +1,21 @@
-// `node install` and `node uninstall`: a Mac's node as a launchd user agent
-// (mac.hl, docs/node-on-a-mac.md). This file is the commands' own output:
-// what they print is their product (the key is shown here once), so it is
-// the one place in the node that writes to stdout outside the logger.
+// `node install` and `node uninstall`: a machine joins as a voice node, a
+// system service on macOS and Linux alike (service.hl,
+// docs/adding-a-node.md). The habitat runs them on a host it manages
+// (hale.toml `[dna.host.node]`); an operator can run them by hand.
+//
+// `install` adds a node and nothing else: it records the node on the api
+// (the operator token, from a file, is used for that alone), keeps its
+// enrollment token in the node's vault, writes the capabilities voice
+// decides (the managed engine, which runs the models placed on the node,
+// and the claude CLI when the machine holds its login), copies the node
+// program where the service runs it, and installs and starts the service
+// as the account that ran it with sudo. Models come to the node through
+// placements, never through its install. It prints no secret, and running
+// it again changes nothing that is already right.
+//
+// This file is the commands' own output: what they print is their product,
+// so it is the one place in the node that writes to stdout outside the
+// logger.
 
 /// The admin calls over HTTP, to the api at `api`.
 locus HttpAdmin {
@@ -30,37 +44,277 @@ locus HttpAdmin {
     }
 }
 
-const LABEL_PREFIX: String = "net.hale-lang.voice-node.";
+type Reply { status: Int = 0; body: String = ""; }
 
+/// The admin calls an install makes: bound to HTTP, or a test's stand-in.
+interface AdminCalls {
+    fn send(method: String, path: String, body: String) -> Reply;
+}
+
+/// What enrolling did: the node's enrollment token, "" when the node
+/// already holds one.
+type Enrolled { ok: Bool = false; why: String = ""; token: String = ""; }
+
+/// Record the node on the api, or find it there: a new node's enrollment
+/// token, a fresh one when the node has none of its own (`token_known`
+/// false), or none when it holds one.
 @unbounded
-fn home_dir() -> String {
-    return if std::env::var_exists("HOME") { std::env::var("HOME") } else { "" };
+fn enroll(admin: AdminCalls, node: String, token_known: Bool) -> Enrolled {
+    let n = admin.send("POST", "/admin/v1/nodes", "{\"id\": " + quote(node) + "}");
+    if n.status == 201 {
+        return Enrolled {
+            ok: true,
+            token: std::json::find_string_field(n.body, "enrollment_token"),
+        };
+    }
+    if n.status != 409 { return Enrolled { why: "the node was not recorded: " + reason_of(n) }; }
+    if token_known { return Enrolled { ok: true }; }
+    let t = admin.send("POST", "/admin/v1/nodes/" + node + "/token", "");
+    if t.status != 200 {
+        return Enrolled { why: "the node's token was not renewed: " + reason_of(t) };
+    }
+    return Enrolled { ok: true, token: std::json::find_string_field(t.body, "enrollment_token") };
+}
+
+fn reason_of(r: Reply) -> String {
+    if r.status == 0 { return r.body; }
+    return to_string(r.status) + " " + r.body;
 }
 
 @unbounded
-fn uid() -> String {
-    return std::str::trim((std::process::run("id\n-u") or std::process::ProcessOutput {
-        code: 1,
-        signal: 0,
-        stdout: "501",
-        stderr: "",
-    }).stdout);
+fn quote(s: String) -> String { return "\"" + std::json::escape_string(s) + "\""; }
+
+/// The capabilities voice decides for a node: the managed engine, and the
+/// claude CLI when the machine holds its login.
+@unbounded
+fn node_capabilities(claude: Bool) -> String {
+    return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}"
+        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" }) + "]}";
 }
+
+const SERVICE_PREFIX: String = "net.hale-lang.voice-node.";
+
+const INSTALL_USAGE: String = "usage: sudo node install --id ID --api URL --operator-token-file FILE [--port N] [--no-start]\n       sudo node uninstall --id ID [--operator-token-file FILE] [--purge]";
+
+/// `node install`.
+@unbounded
+fn install() {
+    let id = option("--id", "");
+    let api = option("--api", "");
+    let token_file = option("--operator-token-file", "");
+    if !is_slug(id) || len(api) == 0 || len(token_file) == 0 {
+        log_error(INSTALL_USAGE, "");
+        std::process::exit(2);
+    }
+    let a = installing_account();
+    let mac = os_of(run_out("uname\n-s")) == "darwin";
+    let voice = a.home + "/.voice";
+    let data = voice + "/node-data";
+    let vault = voice + "/vault";
+    let enrollment = "node-" + id + "-enrollment";
+    let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+    let key = std::str::trim(std::io::fs::read_file(token_file) or "");
+    if len(key) == 0 { fail_install("no operator token in " + token_file); }
+    run_out("mkdir\n-p\n" + data);
+    run_out("mkdir\n-p\n-m\n700\n" + vault);
+    run_out("mkdir\n-p\n" + voice + "/bin");
+
+    let e = enroll(
+        HttpAdmin { api: api, key: key },
+        id,
+        std::io::fs::file_exists(vault + "/" + enrollment),
+    );
+    if !e.ok { fail_install(e.why); }
+    if len(e.token) > 0 {
+        std::io::fs::write_file(vault + "/" + enrollment, e.token) or fail_install(
+            "the enrollment token could not be kept",
+        );
+    }
+    run_out("chmod\n600\n" + vault + "/" + enrollment);
+
+    let claude = std::io::fs::file_exists(vault + "/claude-" + id + "-token")
+        && len(std::str::trim(run_out("sh\n-c\nPATH=\"$0\" command -v claude\n" + path))) > 0;
+    std::io::fs::write_file(data + "/capabilities.json", node_capabilities(claude)) or fail_install(
+        "the capabilities file could not be written",
+    );
+
+    // the node program where the service runs it, so it does not hang on
+    // a build cache or a checkout
+    let node_bin = voice + "/bin/voice-node";
+    run_out("cp\n-f\n" + std::env::arg(0) + "\n" + node_bin + ".new");
+    run_out("chmod\n755\n" + node_bin + ".new");
+    std::io::fs::rename(node_bin + ".new", node_bin) or fail_install(
+        "the node program could not be put at " + node_bin,
+    );
+    run_out("chown\n-R\n" + a.user + "\n" + voice);
+
+    let s = Service {
+        name: SERVICE_PREFIX + id,
+        user: a.user,
+        home: a.home,
+        node_bin: node_bin,
+        id: id,
+        api: api,
+        token_vault: enrollment,
+        data: data,
+        capabilities: data + "/capabilities.json",
+        port: std::str::parse_int(option("--port", "8081")) or 8081,
+        vault_dir: vault,
+        path: path,
+        log: voice + "/node-" + id + ".log"
+    };
+    let start = !flag_given("--no-start");
+    if mac {
+        std::io::fs::write_file(daemon_plist_path(s.name), launchd_daemon_plist(s)) or fail_install(
+            "the LaunchDaemon's plist could not be written: run it with sudo",
+        );
+        if start {
+            run_out("launchctl\nbootout\nsystem/" + s.name);
+            let o = std::process::run("launchctl\nbootstrap\nsystem\n" + daemon_plist_path(s.name))
+            or std::process::ProcessOutput {
+                code: 1,
+                signal: 0,
+                stdout: "",
+                stderr: "launchctl did not run",
+            };
+            if o.code != 0 {
+                fail_install("launchctl could not start the node: " + std::str::trim(o.stderr));
+            }
+        }
+        println(
+            "node " + id + " installed: LaunchDaemon " + s.name + ", as " + a.user + ", log "
+                + s.log,
+        );
+    } else {
+        std::io::fs::write_file(unit_path("voice-node-" + id), systemd_unit(s)) or fail_install(
+            "the systemd unit could not be written: run it with sudo",
+        );
+        // container runtimes run under docker, as the node's account
+        if len(run_out("getent\ngroup\ndocker")) > 0 {
+            run_out("usermod\n-aG\ndocker\n" + a.user);
+        } else {
+            println(
+                "note: docker is not installed; a model whose runtime is a container (vLLM, llama.cpp on CUDA) needs it",
+            );
+        }
+        if start {
+            run_out("systemctl\ndaemon-reload");
+            // restart, not start: an install over a running node replaces
+            // its program and its unit, and the new ones are what run
+            let unit = "voice-node-" + id;
+            let e = std::process::run("systemctl\nenable\n" + unit)
+            or std::process::ProcessOutput {
+                code: 1,
+                signal: 0,
+                stdout: "",
+                stderr: "systemctl did not run",
+            };
+            if e.code != 0 {
+                fail_install("systemd could not enable the node: " + std::str::trim(e.stderr));
+            }
+            let o = std::process::run("systemctl\nrestart\n" + unit)
+            or std::process::ProcessOutput {
+                code: 1,
+                signal: 0,
+                stdout: "",
+                stderr: "systemctl did not run",
+            };
+            if o.code != 0 {
+                fail_install("systemd could not start the node: " + std::str::trim(o.stderr));
+            }
+        }
+        println(
+            "node " + id + " installed: systemd unit voice-node-" + id + ", as " + a.user
+                + ", log journalctl -u voice-node-" + id,
+        );
+    }
+}
+
+/// `node uninstall`: the service stopped and removed; with the operator
+/// token, the node revoked on the api; with `--purge`, its data and vault
+/// entry removed too.
+@unbounded
+fn uninstall() {
+    let id = option("--id", "");
+    if !is_slug(id) {
+        log_error(INSTALL_USAGE, "");
+        std::process::exit(2);
+    }
+    let a = installing_account();
+    let name = SERVICE_PREFIX + id;
+    if os_of(run_out("uname\n-s")) == "darwin" {
+        run_out("launchctl\nbootout\nsystem/" + name);
+        run_out("rm\n-f\n" + daemon_plist_path(name));
+    } else {
+        run_out("systemctl\ndisable\n--now\nvoice-node-" + id);
+        run_out("rm\n-f\n" + unit_path("voice-node-" + id));
+        run_out("systemctl\ndaemon-reload");
+    }
+    let token_file = option("--operator-token-file", "");
+    let api = option("--api", "");
+    if len(token_file) > 0 && len(api) > 0 {
+        let key = std::str::trim(std::io::fs::read_file(token_file) or "");
+        let r = HttpAdmin { api: api, key: key }.send("DELETE", "/admin/v1/nodes/" + id, "");
+        if r.status != 200 && r.status != 404 {
+            fail_install("the node was not revoked: " + reason_of(r));
+        }
+    }
+    if flag_given("--purge") {
+        run_out("rm\n-rf\n" + a.home + "/.voice/node-data");
+        run_out("rm\n-f\n" + a.home + "/.voice/vault/node-" + id + "-enrollment");
+    }
+    println("node " + id + " uninstalled");
+}
+
+/// The account a node is installed for: the one that ran the command with
+/// sudo. Installing writes a system service, so it runs as root, and the
+/// node then runs as that account, never as root.
+type Account { user: String = ""; home: String = ""; }
 
 @unbounded
-fn absolute(path: String) -> String {
-    if std::str::starts_with(path, "/") { return path; }
-    let here = std::str::trim((std::process::run("pwd") or std::process::ProcessOutput {
-        code: 1,
-        signal: 0,
-        stdout: ".",
-        stderr: "",
-    }).stdout);
-    return here + "/" + path;
+fn installing_account() -> Account {
+    if std::str::trim(run_out("id\n-u")) != "0" {
+        fail_install("the node installs as a system service: run it with sudo");
+    }
+    let user = if std::env::var_exists("SUDO_USER") { std::env::var("SUDO_USER") } else { "" };
+    if len(user) == 0 || user == "root" {
+        fail_install("run it with sudo from the account the node runs as, not as root itself");
+    }
+    let home = home_of(user, os_of(run_out("uname\n-s")) == "darwin");
+    if !std::str::starts_with(home, "/") { fail_install("no home for account " + user); }
+    return Account { user: user, home: home };
 }
 
-fn plist_path(label: String) -> String {
-    return home_dir() + "/Library/LaunchAgents/" + label + ".plist";
+/// An account's home, from the system's account database, no shell
+/// between: `dscl` on macOS, `getent passwd` on Linux.
+@unbounded
+fn home_of(user: String, mac: Bool) -> String {
+    if mac {
+        return home_in_dscl(run_out("dscl\n.\n-read\n/Users/" + user + "\nNFSHomeDirectory"));
+    }
+    return home_in_passwd(run_out("getent\npasswd\n" + user));
+}
+
+/// `dscl . -read /Users/<u> NFSHomeDirectory`: `NFSHomeDirectory: /Users/u`.
+fn home_in_dscl(out: String) -> String {
+    let at = std::str::index_of(out, ":");
+    return if at < 0 { "" } else { std::str::trim(out[(at + 1)..len(out)]) };
+}
+
+/// A passwd line, `name:x:uid:gid:gecos:home:shell`: its sixth field.
+@bounded_by(line)
+fn home_in_passwd(line: String) -> String {
+    let mut rest = std::str::trim(line);
+    let mut i = 0;
+    while i < 5 {
+        let at = std::str::index_of(rest, ":");
+        if at < 0 { return ""; }
+        rest = rest[(at + 1)..len(rest)];
+        i = i + 1;
+    }
+    let at = std::str::index_of(rest, ":");
+    return if at < 0 { rest } else { rest[0..at] };
 }
 
 fn fail_install(why: String) {
@@ -87,127 +341,4 @@ fn flag_given(name: String) -> Bool {
         i = i + 1;
     }
     return false;
-}
-
-const INSTALL_USAGE: String = "usage: node install --id ID --api URL [--admin-token-file FILE | --admin-key K] [--port N] [--data DIR] [--vault DIR] [--node-bin FILE] [--no-start]\n       node uninstall --id ID";
-
-/// `node install`: find the seats, record them on the api, write the
-/// capabilities and the plist, and start the agent.
-@unbounded
-fn install() {
-    let id = option("--id", "");
-    let api = option("--api", "");
-    if len(id) == 0 || len(api) == 0 || len(home_dir()) == 0 {
-        log_error(INSTALL_USAGE, "");
-        std::process::exit(2);
-    }
-    let home = home_dir();
-    let data = absolute(option("--data", home + "/.voice/node-data"));
-    let vault = absolute(option("--vault", home + "/.voice/vault"));
-    let node_bin = absolute(option("--node-bin", std::env::arg(0)));
-    let port = std::str::parse_int(option("--port", "8081")) or 8081;
-    let label = LABEL_PREFIX + id;
-    let enrollment = "node-" + id + "-enrollment";
-    let claude_vault = "claude-" + id + "-token";
-    let path = "/opt/homebrew/bin:/usr/local/bin:"
-        + (if std::env::var_exists("PATH") { std::env::var("PATH") } else { "/usr/bin:/bin" });
-
-    std::process::run("mkdir\n-p\n-m\n700\n" + vault) or discard;
-    std::process::run("mkdir\n-p\n" + data) or discard;
-    std::process::run("mkdir\n-p\n" + home + "/Library/Logs") or discard;
-    std::process::run("mkdir\n-p\n" + home + "/Library/LaunchAgents") or discard;
-
-    let offers = discover(
-        Discovery {
-            node: id,
-            path: path,
-            claude_login: std::io::fs::file_exists(vault + "/" + claude_vault),
-            claude_vault: claude_vault
-        },
-    );
-    let capabilities = capabilities_for(offers);
-    let problem = capabilities_problem(capabilities);
-    if len(problem) > 0 {
-        fail_install("the capabilities for this machine are not valid: " + problem);
-    }
-    std::io::fs::write_file(data + "/capabilities.json", capabilities) or fail_install(
-        "the capabilities file could not be written",
-    );
-
-    // the api's operator token (`voice-api admin-token`), from a file so it
-    // is on no command line, or as `--admin-key`
-    let token_file = option("--admin-token-file", "");
-    let key = if len(token_file) > 0 {
-        std::str::trim(std::io::fs::read_file(token_file) or "")
-    } else {
-        option("--admin-key", "")
-    };
-    if len(token_file) > 0 && len(key) == 0 {
-        fail_install("no operator token in " + token_file);
-    }
-    let admin = HttpAdmin { api: api, key: key };
-    let p = provision(admin, id, offers, std::io::fs::file_exists(vault + "/" + enrollment));
-    if !p.ok { fail_install(p.why); }
-    // The key is shown the moment it is issued, before any step that can
-    // still fail: the api never shows it again.
-    if len(p.key) > 0 { println("key     " + p.key + "   (shown once: keep it)"); }
-    if len(p.token) > 0 {
-        std::io::fs::write_file(vault + "/" + enrollment, p.token) or fail_install(
-            "the enrollment token could not be kept",
-        );
-        std::process::run("chmod\n600\n" + vault + "/" + enrollment) or discard;
-    }
-
-    let agent = Agent {
-        label: label,
-        node_bin: node_bin,
-        id: id,
-        api: api,
-        token_vault: enrollment,
-        data: data,
-        capabilities: data + "/capabilities.json",
-        port: port,
-        vault_dir: vault,
-        path: path,
-        log: home + "/Library/Logs/voice-node-" + id + ".log"
-    };
-    std::io::fs::write_file(plist_path(label), launchd_plist(agent)) or fail_install(
-        "the launchd plist could not be written",
-    );
-    if !flag_given("--no-start") {
-        std::process::run("launchctl\nbootout\ngui/" + uid() + "/" + label) or discard;
-        let started = std::process::run(
-            "launchctl\nbootstrap\ngui/" + uid() + "\n" + plist_path(label),
-        ) or std::process::ProcessOutput {
-            code: 1,
-            signal: 0,
-            stdout: "",
-            stderr: "launchctl did not run",
-        };
-        if started.code != 0 {
-            fail_install("launchctl could not start the agent: " + std::str::trim(started.stderr));
-        }
-    }
-    println("node    " + id + " (agent " + label + ", log " + agent.log + ")");
-    print(p.lines);
-    println("account " + p.account + " (free)");
-    println("project " + p.project);
-    if len(p.key) == 0 {
-        println("key     already issued for project " + p.project + " (not shown again)");
-    }
-}
-
-/// `node uninstall`: stop the agent and remove its plist. The node's data,
-/// vault and rows on the api are left.
-@unbounded
-fn uninstall() {
-    let id = option("--id", "");
-    if len(id) == 0 {
-        log_error(INSTALL_USAGE, "");
-        std::process::exit(2);
-    }
-    let label = LABEL_PREFIX + id;
-    std::process::run("launchctl\nbootout\ngui/" + uid() + "/" + label) or discard;
-    std::process::run("rm\n-f\n" + plist_path(label)) or discard;
-    println("removed " + label);
 }

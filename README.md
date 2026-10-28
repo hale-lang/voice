@@ -123,7 +123,7 @@ that follow a subscriber's connection.
 
 - [`docs/internals.md`](./docs/internals.md): how each piece works, the
   request path, state, security, failure and deployment.
-- [`docs/node-on-a-mac.md`](./docs/node-on-a-mac.md): one Mac serving
-  models (Ollama, the claude CLI) to a habitat, under launchd.
+- [`docs/adding-a-node.md`](./docs/adding-a-node.md): a Mac or a Linux
+  machine joining as a node, in one command.
 - [`DIRECTION.md`](./DIRECTION.md): where voice is going.
 - [`FRICTION.md`](./FRICTION.md): what writing voice in Hale has run into.

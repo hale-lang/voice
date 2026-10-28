@@ -12,10 +12,10 @@ voice node --host <h>`, through `[dna.host.node]` in
 ## What it needs
 
 - A GPU: NVIDIA on Linux (with its driver and container toolkit), Apple
-  silicon on macOS. Every runtime voice ships runs on one
-  (`[dna.host.node] requires`).
-- On Linux, docker: voice runs a model's runtime there as a container. The
-  install says when docker is missing. A Mac runs its runtime itself.
+  silicon on macOS. Every runtime voice ships runs on one.
+- On Linux, docker: voice runs a model's runtime there as a container. A
+  Mac runs its runtime itself. (`[dna.host.node] requires` says both, per
+  platform, so a habitat refuses a host that lacks them before installing.)
 - The hale toolchain at the release voice declares (`[dna] toolchain` in
   [`hale.toml`](../hale.toml)), and voice's source at the revision the api
   runs. A habitat provisions both on a host before it runs the install, and

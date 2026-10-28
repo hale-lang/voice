@@ -38,7 +38,7 @@ It:
   `claude-<id>-token` and `claude` is on PATH;
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
-  (`/Library/LaunchDaemons/net.hale-lang.voice-node.<id>.plist`, so a
+  (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a
   headless Mac serves with no one logged in; log `~/.voice/node-<id>.log`), a
   systemd unit on Linux (`voice-node-<id>.service`; `journalctl -u
   voice-node-<id>`), adding the account to the `docker` group.

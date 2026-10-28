@@ -67,6 +67,8 @@ locus Runner {
         // said them: a seat outside them is never started
         assigned: String = "";
         heard: Bool = false;
+        // the memory the GPU gives a server (hardware.hl), 0 for none
+        gpu_memory: Int = 0;
     }
 
     bus {
@@ -160,6 +162,10 @@ locus Runner {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
         }
+        let share = gpu_share(
+            std::json::find_int_field(std::json::find_field_raw(config, "variant"), "memory_bytes"),
+            self.gpu_memory,
+        );
         let port = free_port(PORT_FROM + count(self.runs.items));
         if port < 0 {
             self.tell(seat, "down", "no free port on loopback for its server", "");
@@ -210,7 +216,7 @@ locus Runner {
                     "/models/" + first,
                     8080,
                     "0.0.0.0",
-                    std::json::find_string_field(config, "model"),
+                    std::json::find_string_field(config, "model"), share,
                 ),
             );
         } else {
@@ -241,7 +247,7 @@ locus Runner {
                     models + "/" + first,
                     port,
                     "127.0.0.1",
-                    std::json::find_string_field(config, "model"),
+                    std::json::find_string_field(config, "model"), share,
                 );
         }
         // started apart from the node, its output to a file of its own: sh
@@ -382,6 +388,17 @@ locus Runner {
     }
 }
 
+/// The share of a GPU's `gpu` bytes a server needs for a variant of `need`
+/// bytes and its cache (2 GiB beside the weights), as vLLM takes it: from
+/// 0.05 to 0.90, two places; "" when the GPU's memory is not known.
+fn gpu_share(need: Int, gpu: Int) -> String {
+    if gpu <= 0 { return ""; }
+    let mut pct = ((need + 2147483648) * 100 + gpu - 1) / gpu;
+    if pct < 5 { pct = 5; }
+    if pct > 90 { pct = 90; }
+    return if pct < 10 { "0.0" + to_string(pct) } else { "0." + to_string(pct) };
+}
+
 /// The program a server is (`RuntimeCreate.server`).
 fn server_program(server: String) -> String {
     return if server == "vllm" { "vllm" } else { "llama-server" };
@@ -396,11 +413,16 @@ fn server_args(
     first: String,
     port: Int,
     host: String,
-    name: String
+    name: String,
+    share: String
 ) -> String {
     if server == "vllm" {
+        // vLLM takes the share of the GPU's memory it is given, all of it
+        // but a tenth by default: on a machine that shares its memory
+        // with the GPU, that would starve the machine
         return "vllm\nserve\n" + dir + "\n--host\n" + host + "\n--port\n" + to_string(port)
-            + "\n--served-model-name\n" + name;
+            + "\n--served-model-name\n" + name
+            + (if len(share) > 0 { "\n--gpu-memory-utilization\n" + share } else { "" });
     }
     return "-m\n" + first + "\n--host\n" + host + "\n--port\n" + to_string(port) + "\n--alias\n"
         + name;
@@ -423,6 +445,9 @@ fn container_argv(
         + "\n-p\n127.0.0.1:" + to_string(port)
         + ":8080\n-v\n" + models
         + ":/models:ro\n-v\n" + blobs + ":" + blobs + ":ro\n"
+    // offline: a server reads the weights it was given and nothing from
+    // the hub; and room in shared memory, which vLLM's workers need
+        + "-e\nHF_HUB_OFFLINE=1\n-e\nTRANSFORMERS_OFFLINE=1\n--shm-size\n8g\n"
         + (if cuda { "--gpus\nall\n" } else { "" })
         + image + "\n" + args;
 }

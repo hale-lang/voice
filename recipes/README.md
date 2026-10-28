@@ -6,6 +6,10 @@ The recipes voice ships: defaults an operator can use, one file per recipe,
 source and every file's digest, and lists only files that hold tensors, a
 tokenizer or settings, never a pickle or code.
 
+| Recipe | Variants | Served by |
+|---|---|---|
+| `qwen3-0.6b` | `safetensors-bf16` (1.5 GB), `gguf-q8_0` (0.6 GB) | vLLM on CUDA; llama.cpp on Metal |
+
 The operator is the authority on which weights may run: they allow more
 recipes on the admin plane (`POST /admin/v1/recipes`). These are read by the
 api at start (`--recipes`), listed as `shipped`, and cannot be changed or

@@ -1,0 +1,148 @@
+// The managed engine's fetch, against a hub in process: a file that
+// redirects to a CDN and is kept only once its sha256 matches; one resumed
+// from a part already on disk; one whose bytes are not the pin's, refused
+// and let go; a hub that answers 404; and what a managed config needs.
+import ".." as node;
+
+const REVISION: String = "0123456789abcdef0123456789abcdef01234567";
+
+/// The weights the hub serves: a pattern, so a part can be checked.
+fn payload(tag: String) -> String {
+    return std::str::repeat(tag + "0123456789abcdef", 12000);
+}
+
+fn sha(s: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(s)));
+}
+
+/// The hub: `/resolve/` answers 302 to the CDN, as Hugging Face does; the
+/// CDN takes a `Range` and answers 206 from where it starts.
+locus Hub {
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let resolve = "/org/model/resolve/" + REVISION + "/";
+        if std::str::starts_with(req.path, resolve) {
+            let file = req.path[len(resolve)..len(req.path)];
+            if file == "missing.gguf" {
+                return std::http::Response { status: 404, body: "no such file" };
+            }
+            return std::http::Response { status: 302, headers: "Location: /cdn/" + file, body: "" };
+        }
+        if std::str::starts_with(req.path, "/cdn/") {
+            let file = req.path[5..len(req.path)];
+            let body = if file == "a.gguf" {
+                payload("a")
+            } else if file == "b.gguf" {
+                payload("b")
+            } else {
+                "not the weights"
+            };
+            let range = std::http::header(req, "Range");
+            if std::str::starts_with(range, "bytes=") {
+                let from = std::str::parse_int(range[6..(len(range) - 1)]) or 0;
+                return std::http::Response { status: 206, body: body[from..len(body)] };
+            }
+            return std::http::Response { status: 200, body: body };
+        }
+        return std::http::Response { status: 404, body: "" };
+    }
+}
+
+main locus App {
+    params {
+        srv: std::http::Server = std::http::Server { port: 0, handler: Hub { } };
+    }
+    placement { srv: cooperative(pool = io) where async_io; }
+    run() {
+        let port = std::io::tcp::__local_port(self.srv.listen_fd);
+        let base = "http://127.0.0.1:" + to_string(port);
+        let data = "/tmp/voice-fetch-test-" + to_string(std::process::pid());
+        std::io::fs::mkdir(data) or discard;
+        std::io::fs::mkdir(data + "/blobs") or discard;
+        let file = "{\"max_in_flight\": 1, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"local\": {\"hub_url\": \""
+            + base + "/\"}}]}";
+        let f = node::Blobs { data: data, file: file };
+        let hub = base + "/org/model/resolve/" + REVISION + "/";
+        std::test::assert_eq_str(
+            node::hub_url(file),
+            base,
+            "the node's own hub, without its slash",
+        );
+        std::test::assert_eq_str(
+            node::hub_url("{\"engines\": []}"),
+            "https://huggingface.co",
+            "Hugging Face's by default",
+        );
+
+        // a file the hub redirects to its CDN, kept under its digest
+        let a = payload("a");
+        let got = f.blob("s", hub + "a.gguf", "a.gguf", sha(a), len(a), true, 0, len(a));
+        std::test::assert_eq_str(got, "", "a file is fetched through the redirect and verified");
+        std::test::assert(
+            std::io::fs::file_exists(data + "/blobs/" + sha(a)),
+            "and kept as blobs/<sha256>",
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(data + "/blobs/" + sha(a) + ".part"),
+            "its part let go",
+        );
+
+        // a part already on disk is resumed from where it ends
+        let b = payload("b");
+        let part = data + "/blobs/" + sha(b) + ".part";
+        let w = std::io::file::open(part, "w") or { return; };
+        w.write_bytes(std::bytes::from_string(b[0..5000])) or discard;
+        let resumed = f.blob("s", hub + "b.gguf", "b.gguf", sha(b), len(b), true, 0, len(b));
+        std::test::assert_eq_str(resumed, "", "a part is resumed and the whole verified");
+        std::test::assert_eq_int(
+            std::io::fs::file_size(data + "/blobs/" + sha(b)) or 0,
+            len(b),
+            "whole",
+        );
+
+        // a part that is not the start of the file: the whole does not verify
+        let c = payload("a") + "x";
+        let cpart = data + "/blobs/" + sha(c) + ".part";
+        let cw = std::io::file::open(cpart, "w") or { return; };
+        cw.write_bytes(std::bytes::from_string("garbage")) or discard;
+        let wrong = f.blob("s", hub + "a.gguf", "c.gguf", sha(c), len(c), true, 0, 0);
+        std::test::assert(len(wrong) > 0, "a part that is not the file does not make it: " + wrong);
+
+        // bytes that are not the pin's: refused, nothing kept
+        let bad = f.blob("s", hub + "bad.gguf", "bad.gguf", sha(a), 15, true, 0, 0);
+        std::test::assert(
+            std::str::contains(bad, "not the " + sha(a) + " pinned: refused"),
+            "a digest that does not match: " + bad,
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(data + "/blobs/" + sha(a) + "x.part"),
+            "and nothing of it kept",
+        );
+        let big = f.blob("s", hub + "bad.gguf", "bad.gguf", sha("short"), 5, true, 0, 0);
+        std::test::assert(
+            std::str::contains(big, "more than the 5 bytes pinned: refused"),
+            "more bytes than pinned: " + big,
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(data + "/blobs/" + sha("short") + ".part"),
+            "stopped, and let go",
+        );
+        let gone = f.blob("s", hub + "missing.gguf", "missing.gguf", sha("x"), 10, true, 0, 0);
+        std::test::assert(
+            std::str::contains(gone, "answered 404"),
+            "a hub without the file: " + gone,
+        );
+
+        // a managed config: a placement, a pinned source, files, a runtime
+        let ok = "{\"placement\": \"p\", \"variant\": {\"source\": {\"repo\": \"org/model\", \"revision\": \""
+            + REVISION
+            + "\"}, \"files\": [{\"path\": \"a.gguf\"}]}, \"runtime\": {\"artifact\": {\"kind\": \"container\"}}}";
+        std::test::assert_eq_str(node::managed_problem(ok), "", "a placed seat's config");
+        std::test::assert(
+            len(node::managed_problem("{\"placement\": \"p\"}")) > 0,
+            "one with nothing to fetch",
+        );
+        std::process::run("rm\n-rf\n" + data) or discard;
+    }
+}
+
+fn main() { App { }; }

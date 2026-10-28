@@ -306,7 +306,11 @@ is what to review. Friction met along the way is in
 capabilities file at start (refusing a kind it cannot run), measures the
 machine's hardware once (`hardware.hl`: `uname`, `/proc/meminfo` or
 `sysctl`, `nvidia-smi`, `df` under its data directory) and declares it with
-the engines, and serves its
+the engines. A managed seat (a placement's) is fetched on a thread of its
+own (`fetch.hl`): each of its files from the hub, following the hub's
+redirect to its CDN and resuming a part already on disk, into
+`blobs/<sha256>`, kept only once its size and sha256 match; the seat is
+`fetching` with how far, then `down` until the run slice runs it. It serves its
 local API from `node.yaml` (status, capabilities, local controls). It
 registers on the api's node plane with its enrollment token, applies the
 assignment that comes back (refusing a seat outside what it offers, and

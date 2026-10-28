@@ -4,7 +4,9 @@
 // format on the nodes' platform and accelerator, a variant that fits them
 // as they declared their hardware (protocol.yaml `Hardware`). It keeps
 // why, for every variant. A placement
-// is a decision: the managed engines on its nodes act on it.
+// creates the seat that serves it on its leader, on the leader's managed
+// engine, its config the chosen variant and runtime, pinned
+// (protocol.yaml `ManagedConfig`); the node fetches and verifies them.
 //
 // One node today, the leader, which holds the seat; the fit is judged on
 // the set, so a model split across nodes changes the judging, not the
@@ -16,6 +18,7 @@ type PlacementRef { placement: String; }
 type PlacementCreate {
     id: String;
     model: String;
+    account: String = "";
     nodes: bounded[String; 1];
     has_variant: Bool = false;
     variant: String = "";
@@ -47,12 +50,14 @@ type VariantFit {
 type Placement {
     id: String = "";
     model: String = "";
+    account: String = "";
     nodes: bounded[String; 1];
     recipe: String = "";
     variant: String = "";
     runtime: String = "";
     chosen_by: PlacementChooser = PlacementChooser::coordinator;
     leader: String = "";
+    seat: String = "";
     fit: bounded[VariantFit; 8];
     created_at: Time = `1970-01-01T00:00:00Z`;
 }
@@ -68,6 +73,9 @@ locus Placements {
         // runtimes that serve them (runtimes.hl), behind the same gate
         recipes: Recipes = Recipes { store: self.store, gate: self.gate };
         runtimes: Runtimes = Runtimes { store: self.store, gate: self.gate };
+        // the seats a placement creates and removes (nodes.hl): the api's
+        // own, which tell the node its assignment, behind the same gate
+        seats: Seats;
     }
 
     /// `listPlacements`: those not withdrawn.
@@ -125,6 +133,16 @@ locus Placements {
         let n = self.store.node(leader) or fail store_down(err);
         if !n.present || n.revoked { fail bad("no node " + leader, "nodes"); }
         let f = self.store.fleet(leader) or fail store_down(err);
+        let managed = managed_engine(f.capabilities);
+        if len(managed) == 0 {
+            fail bad(
+                "node " + leader + " offers no managed engine, so no model can be placed on it",
+                "nodes"
+            );
+        }
+        if len(c.account) == 0 {
+            fail bad("`account` names the account the seat spends", "account");
+        }
         let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
         if len(hw) == 0 || !std::json::valid_object(hw) {
             fail bad(
@@ -144,6 +162,7 @@ locus Placements {
         let mut out = Placement {
             id: c.id,
             model: c.model,
+            account: c.account,
             recipe: m.recipe,
             leader: leader,
             created_at: now_seconds()
@@ -212,12 +231,36 @@ locus Placements {
             if c.has_runtime { out.chosen_by = PlacementChooser::operator; }
         }
 
+        // the seat first: its own checks (the account, the node's room)
+        // refuse before anything is kept
+        out.seat = leader + "/" + c.id;
+        let mut seat = SeatCreate {
+            node: leader,
+            id: c.id,
+            engine: managed,
+            account: c.account,
+            config: std::json::Value::parse(
+                managed_config(
+                    c.id,
+                    variant_body_of(recipe.variants.text, out.variant),
+                    runtime_body_of(all, out.runtime),
+                ),
+            ) or fail bad("the placement's seat config is too large to keep", "model"),
+        };
+        push(seat.serves, st::SeatModel { model: c.model }) or discard;
+        self.seats.create_read(seat) or raise;
         let body = placement_json(out);
         let added = self.store.insert_placement(
             st::PlacementRow { id: c.id, model: c.model, body: body, created_at: out.created_at },
             checked_change("create", "placements/" + c.id, "", body) or raise,
-        ) or fail store_down(err);
-        if !added { fail clash("placement " + c.id + " exists; a placement id is never reused"); }
+        ) or {
+            self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
+            fail store_down(err);
+        };
+        if !added {
+            self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
+            fail clash("placement " + c.id + " exists; a placement id is never reused");
+        }
         return out;
     }
 
@@ -251,6 +294,7 @@ locus Placements {
 
     fn remove_in_gate(id: String) -> Placement fallible(CtlError) {
         let v = self.get_in_gate(id) or raise;
+        self.seats.remove_read(SeatRef { node: v.leader, seat: v.id }) or discard;
         self.store.remove_placement(
             st::PlacementRow { id: id, removed: true, removed_at: now_seconds() },
             checked_change("delete", "placements/" + id, placement_json(v), "") or raise,
@@ -265,6 +309,7 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
     let mut out = Placement {
         id: r.id,
         model: r.model,
+        account: std::json::find_string_field(b, "account"),
         recipe: std::json::find_string_field(b, "recipe"),
         variant: std::json::find_string_field(b, "variant"),
         runtime: std::json::find_string_field(b, "runtime"),
@@ -274,6 +319,7 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
             PlacementChooser::coordinator
         },
         leader: std::json::find_string_field(b, "leader"),
+        seat: std::json::find_string_field(b, "seat"),
         created_at: r.created_at
     };
     let mut nodes = std::json::array_first(std::json::find_field_raw(b, "nodes"));
@@ -317,12 +363,59 @@ fn placement_json(p: Placement) -> String {
                 + ", \"reason\": " + jq(f.reason) + "}",
         );
     }
-    return "{\"id\": " + jq(p.id) + ", \"model\": " + jq(p.model) + ", \"nodes\": [" + nodes.text()
+    return "{\"id\": " + jq(p.id) + ", \"model\": " + jq(p.model) + ", \"account\": "
+        + jq(p.account)
+        + ", \"nodes\": [" + nodes.text()
         + "]"
         + ", \"recipe\": " + jq(p.recipe) + ", \"variant\": " + jq(p.variant) + ", \"runtime\": "
         + jq(p.runtime) + ", \"chosen_by\": "
-        + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"fit\": ["
+        + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"seat\": "
+        + jq(p.seat) + ", \"fit\": ["
         + fits.text() + "], \"created_at\": " + jtime(p.created_at) + "}";
+}
+
+// ---- the seat ---------------------------------------------------------
+
+/// The id of the engine of kind `managed` a node's capabilities declare,
+/// "" for none.
+@bounded_by(capabilities)
+fn managed_engine(capabilities: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "engines"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "kind") == "managed" {
+            return std::json::find_string_field(it.element, "id");
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// The variant `id` of a recipe's `variants`, as JSON.
+@bounded_by(variants)
+fn variant_body_of(variants: String, id: String) -> String {
+    let mut it = std::json::array_first(variants);
+    while !it.done {
+        if std::json::find_string_field(it.element, "id") == id {
+            return std::str::trim(it.element);
+        }
+        it = std::json::array_next(it);
+    }
+    return "{}";
+}
+
+/// The runtime `id` among `rts`, as its `RuntimeCreate` JSON.
+@bounded_by(rts)
+fn runtime_body_of(rts: RuntimeList, id: String) -> String {
+    for r in rts.data {
+        if r.id == id { return runtime_create_json(r, r.formats, r.platforms); }
+    }
+    return "{}";
+}
+
+/// A managed seat's config (protocol.yaml `ManagedConfig`).
+fn managed_config(placement: String, variant: String, runtime: String) -> String {
+    return "{\"placement\": " + jq(placement) + ", \"variant\": " + variant + ", \"runtime\": "
+        + runtime + "}";
 }
 
 // ---- the fit ----------------------------------------------------------
@@ -469,8 +562,13 @@ fn reasons(fit: bounded[VariantFit; 8]) -> String {
     return std::str::replace(out.text(), ", ", "; ");
 }
 
-/// Bytes as gigabytes (10^9) to a tenth, or terabytes past 1000 GB.
+/// Bytes as gigabytes (10^9) to a tenth, terabytes past 1000 GB, or
+/// megabytes under 1 GB.
 fn gb(n: Int) -> String {
+    if n < 1000000000 {
+        let m = (n + 50000) / 100000;
+        return to_string(m / 10) + "." + to_string(m % 10) + " MB";
+    }
     if n >= 1000000000000 {
         let t = (n + 50000000000) / 100000000000;
         return to_string(t / 10) + "." + to_string(t % 10) + " TB";

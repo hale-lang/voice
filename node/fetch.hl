@@ -1,0 +1,411 @@
+// The managed engine's fetch: a managed seat's weights (its variant's
+// files, from the hub at the variant's revision) and its runtime's archive,
+// each into the data directory's content-addressed store, `blobs/<sha256>`,
+// and kept only when its sha256 matches the pin (protocol.yaml
+// `ManagedConfig`). A file already there is not fetched again; one cut off
+// is resumed from where it stopped.
+//
+// It is a locus of its own, on its own thread, so a download of many
+// gigabytes never keeps the session from answering on NATS. The session
+// asks for a seat's fetch (`FetchWanted`) and hears how far it is
+// (`FetchUpdated`). Where the hub is and the token it takes are the
+// node's own, in its managed engine's `local` object in the capabilities
+// file: `hub_url` (https://huggingface.co by default) and
+// `hub_token_vault`, a vault entry the token is sent from on the wire and
+// only to the hub's own origin (std::http drops it on a redirect to
+// another). A container runtime's image is pulled when the seat runs, not
+// here.
+
+/// One managed seat to fetch: its id and its config, as assigned.
+type FetchJob { seat: String = ""; config: String = ""; }
+
+topic FetchWanted { payload: FetchJob; }
+
+/// How far a seat's fetch is: `fetching` with its bytes, or `down` with why
+/// (a file that did not verify, no room, or fetched and not yet run).
+type FetchState {
+    seat: String = "";
+    status: String = "fetching";
+    reason: String = "";
+    done: Int = 0;
+    total: Int = 0;
+}
+
+topic FetchUpdated { payload: FetchState; }
+
+/// The managed seats' fetches as the session holds them: a record, so it
+/// is stored whole, its strings copied into the session's own storage.
+type FetchStates { items: bounded[FetchState; 16]; }
+
+/// The hub a variant's files come from unless the node names another.
+const HUB_URL: String = "https://huggingface.co";
+
+/// How often a fetch says how far it is: every this many bytes.
+const REPORT_BYTES: Int = 67108864;
+
+/// Why a managed seat's config cannot be fetched, "" when it can: a
+/// placement, a variant with a source and files, a runtime with an
+/// artifact. The coordinator checked every field when it was allowed.
+fn managed_problem(config: String) -> String {
+    if !std::json::valid_object(config) { return "config must be a JSON object"; }
+    if len(std::json::find_string_field(config, "placement")) == 0 {
+        return "config needs placement";
+    }
+    let v = std::json::find_field_raw(config, "variant");
+    let src = std::json::find_field_raw(v, "source");
+    if len(std::json::find_string_field(src, "repo")) == 0
+        || len(std::json::find_string_field(src, "revision")) != 40
+    {
+        return "config.variant needs a source: a repo and a revision";
+    }
+    if std::json::array_first(std::json::find_field_raw(v, "files")).done {
+        return "config.variant lists no files";
+    }
+    let a = std::json::find_field_raw(std::json::find_field_raw(config, "runtime"), "artifact");
+    let kind = std::json::find_string_field(a, "kind");
+    if kind != "container" && kind != "archive" { return "config.runtime needs an artifact"; }
+    return "";
+}
+
+locus Fetcher {
+    params {
+        data: String = "node-data";
+        // the operator's capabilities file, whose managed engine's `local`
+        // says where the hub is and which vault entry holds its token
+        file: String = "";
+        // seats to fetch, one a line: the seat's id, a tab, its config escaped
+        queue: String = "";
+        // the store the files go into, which fetches and verifies each
+        blobs: Blobs = Blobs { data: self.data, file: self.file };
+    }
+
+    bus {
+        subscribe FetchWanted as on_wanted;
+    }
+
+    run() {
+        while true {
+            self.step();
+        }
+    }
+
+    /// One turn: the next seat's fetch, or a sleep, where asks arrive.
+    @unbounded
+    fn step() {
+        if len(self.queue) == 0 {
+            std::time::sleep(200ms);
+            return;
+        }
+        let nl = std::str::index_of(self.queue, "\n");
+        let line = self.queue[0..nl];
+        self.queue = self.queue[(nl + 1)..len(self.queue)];
+        let tab = std::str::index_of(line, "\t");
+        self.fetch(line[0..tab], std::json::unescape_string(line[(tab + 1)..len(line)]));
+    }
+
+    /// A seat to fetch, queued once.
+    @unbounded
+    fn on_wanted(j: FetchJob) {
+        if std::str::contains("\n" + self.queue, "\n" + j.seat + "\t") { return; }
+        self.queue = self.queue + j.seat + "\t" + std::json::escape_string(j.config) + "\n";
+    }
+
+    /// Fetch every file a seat's config names that the store does not hold,
+    /// and say how far, then why it is down: it is fetched and not yet run.
+    @unbounded
+    fn fetch(seat: String, config: String) {
+        let blobs = self.data + "/blobs";
+        if !std::io::fs::file_exists(blobs) { std::io::fs::mkdir(blobs) or discard; }
+        let variant = std::json::find_field_raw(config, "variant");
+        let src = std::json::find_field_raw(variant, "source");
+        let base = hub_url(self.file) + "/" + std::json::find_string_field(src, "repo")
+            + "/resolve/"
+            + std::json::find_string_field(src, "revision") + "/";
+        let artifact = std::json::find_field_raw(
+            std::json::find_field_raw(config, "runtime"),
+            "artifact",
+        );
+        let archive = std::json::find_string_field(artifact, "kind") == "archive";
+
+        let mut total = 0;
+        let mut done = 0;
+        let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+        while !it.done {
+            let bytes = std::json::find_int_field(it.element, "bytes");
+            total = total + bytes;
+            if held(blobs, std::json::find_string_field(it.element, "sha256")) {
+                done = done + bytes;
+            }
+            it = std::json::array_next(it);
+        }
+        if archive {
+            let bytes = std::json::find_int_field(artifact, "bytes");
+            total = total + bytes;
+            if held(blobs, std::json::find_string_field(artifact, "sha256")) {
+                done = done + bytes;
+            }
+        }
+        let free = df_available(run_out("df\n-Pk\n" + self.data));
+        if total - done > free {
+            self.blobs.tell(
+                seat,
+                "down",
+                "needs " + gib(total - done) + " more, and " + gib(free) + " is free",
+                done,
+                total,
+            );
+            return;
+        }
+        self.blobs.tell(seat, "fetching", "", done, total);
+
+        it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+        while !it.done {
+            let f = it.element;
+            let sha = std::json::find_string_field(f, "sha256");
+            let bytes = std::json::find_int_field(f, "bytes");
+            if !held(blobs, sha) {
+                let problem = self.blobs.blob(
+                    seat,
+                    base + std::json::find_string_field(f, "path"),
+                    std::json::find_string_field(f, "path"),
+                    sha,
+                    bytes,
+                    true,
+                    done,
+                    total,
+                );
+                if len(problem) > 0 {
+                    self.blobs.tell(seat, "down", problem, done, total);
+                    return;
+                }
+                done = done + bytes;
+            }
+            it = std::json::array_next(it);
+        }
+        if archive && !held(blobs, std::json::find_string_field(artifact, "sha256")) {
+            let bytes = std::json::find_int_field(artifact, "bytes");
+            let problem = self.blobs.blob(
+                seat,
+                std::json::find_string_field(artifact, "url"),
+                "the runtime's archive",
+                std::json::find_string_field(artifact, "sha256"),
+                bytes,
+                false,
+                done,
+                total,
+            );
+            if len(problem) > 0 {
+                self.blobs.tell(seat, "down", problem, done, total);
+                return;
+            }
+            done = done + bytes;
+        }
+        self.blobs.tell(
+            seat,
+            "down",
+            "its weights and runtime are fetched and verified; this node does not run them yet",
+            done,
+            total,
+        );
+    }
+
+}
+
+/// The data directory's store of fetched files, `blobs/<sha256>`: each one
+/// fetched (resumed when a part of it is there) and kept only once its
+/// size and its sha256 match its pin. No loop of its own: the fetcher's
+/// thread calls it.
+locus Blobs {
+    params {
+        data: String = "node-data";
+        // the operator's capabilities file (`hub_token_vault`)
+        file: String = "";
+        // why the last chunk could not be read or written
+        why: String = "";
+    }
+
+    bus {
+        publish FetchUpdated;
+    }
+
+    /// One file into the store: fetched (resumed when a part of it is
+    /// there), then kept as `blobs/<sha>` only when its size and its sha256
+    /// match; "" when it is, else why not. A part that could still finish
+    /// is kept; one that cannot be the file is removed.
+    @unbounded
+    fn blob(
+        seat: String,
+        url: String,
+        name: String,
+        sha: String,
+        bytes: Int,
+        hub: Bool,
+        done: Int,
+        total: Int
+    ) -> String {
+        let dest = self.data + "/blobs/" + sha;
+        let part = dest + ".part";
+        let fetched = self.download(seat, url, name, part, bytes, hub, done, total);
+        if len(fetched) > 0 { return fetched; }
+        let size = std::io::fs::file_size(part) or 0;
+        if size < bytes {
+            return name + ": the download stopped at " + to_string(size) + " of " + to_string(bytes)
+                + " bytes";
+        }
+        if size > bytes {
+            std::io::fs::unlink(part) or discard;
+            return name + " is " + to_string(size) + " bytes, not the " + to_string(bytes)
+                + " pinned: refused";
+        }
+        let digest = std::crypto::sha256_file(part) or {
+            return name + " could not be read back to verify it: " + err.detail;
+        };
+        let got = std::hex::encode(digest);
+        if got != sha {
+            std::io::fs::unlink(part) or discard;
+            return name + "'s sha256 is " + got + ", not the " + sha + " pinned: refused";
+        }
+        std::io::fs::rename(part, dest) or { return name + " could not be kept: " + err.detail; };
+        return "";
+    }
+
+    /// The body at `url` written to `part`, from where `part` ends; ""
+    /// when it ended, else why not. Its reader and its file are its own,
+    /// so both close when it returns.
+    @unbounded
+    fn download(
+        seat: String,
+        url: String,
+        name: String,
+        part: String,
+        bytes: Int,
+        hub: Bool,
+        done: Int,
+        total: Int
+    ) -> String {
+        let mut offset = if std::io::fs::file_exists(part) {
+            std::io::fs::file_size(part) or 0
+        } else {
+            0
+        };
+        if offset >= bytes {
+            if offset == bytes { return ""; }
+            std::io::fs::unlink(part) or discard;
+            offset = 0;
+        }
+        let u = std::http::parse_url(url) or { return name + ": " + url + " is not a URL"; };
+        let vault = hub_token_vault(self.file);
+        let r = std::http::BodyReader {
+            req: std::http::ClientRequest {
+                url: u,
+                headers: if offset > 0 { "Range: bytes=" + to_string(offset) + "-" } else { "" },
+                body: b"",
+                follow_redirects: 5,
+            },
+            bearer: if hub && len(vault) > 0 {
+                std::secret::Credential { vault: vault }
+            } else {
+                std::secret::Credential { }
+            },
+            timeout_ms: 0,
+        };
+        if r.status == 0 { return name + ": the request failed"; }
+        if offset > 0 && r.status == 200 {
+            // the server sent it whole: start the part over
+            std::io::fs::unlink(part) or discard;
+            offset = 0;
+        } else if r.status != 200 && r.status != 206 {
+            return name + ": " + url_host(url) + " answered " + to_string(r.status);
+        }
+        let f = std::io::file::open(part, if offset > 0 { "a" } else { "w" }) or {
+            return name + ": " + part + " could not be written: " + err.detail;
+        };
+        let mut got = offset;
+        let mut next = got + REPORT_BYTES;
+        while true {
+            let n = self.pump(r, f);
+            if n == -1 { return ""; }
+            if n < 0 { return name + ": " + self.why; }
+            got = got + n;
+            if got > bytes {
+                // more than the pin is never the file: stop, and let it go
+                std::io::fs::unlink(part) or discard;
+                return name + ": more than the " + to_string(bytes) + " bytes pinned: refused";
+            }
+            if got >= next {
+                self.tell(seat, "fetching", "", done + got, total);
+                next = got + REPORT_BYTES;
+            }
+        }
+        return "";
+    }
+
+    /// One piece of the body, read and written: its length, -1 at the end,
+    /// -2 when it could not be read or written (`why` says). A call of its
+    /// own, so a piece is let go once it is written.
+    fn pump(r: std::http::BodyReader, f: std::io::file::File) -> Int {
+        let b = r.chunk() or {
+            if err.kind == "end" { return -1; }
+            self.why = err.kind + ": " + err.detail;
+            return -2;
+        };
+        f.write_bytes(b) or {
+            self.why = "could not be written: " + err.detail;
+            return -2;
+        };
+        return len(b);
+    }
+
+    fn tell(seat: String, status: String, reason: String, done: Int, total: Int) {
+        FetchUpdated <- FetchState {
+            seat: seat,
+            status: status,
+            reason: reason,
+            done: done,
+            total: total,
+        };
+    }
+}
+
+/// True when the store holds `blobs/<sha>`: kept only once it verified.
+fn held(blobs: String, sha: String) -> Bool {
+    return len(sha) == 64 && std::io::fs::file_exists(blobs + "/" + sha);
+}
+
+/// The managed engine's `local` object in the capabilities file.
+@bounded_by(file)
+fn managed_local(file: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(file, "engines"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "kind") == "managed" {
+            return std::json::find_field_raw(it.element, "local");
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// Where the hub is: the managed engine's `local.hub_url`, without a
+/// trailing slash, or Hugging Face's.
+fn hub_url(file: String) -> String {
+    let u = std::json::find_string_field(managed_local(file), "hub_url");
+    if len(u) == 0 { return HUB_URL; }
+    return if std::str::ends_with(u, "/") { u[0..(len(u) - 1)] } else { u };
+}
+
+/// The vault entry the hub's token is in, "" for none.
+fn hub_token_vault(file: String) -> String {
+    return std::json::find_string_field(managed_local(file), "hub_token_vault");
+}
+
+/// A URL's host, for a reason.
+fn url_host(url: String) -> String {
+    let u = std::http::parse_url(url) or { return url; };
+    return u.host;
+}
+
+/// Bytes as GiB, to a tenth.
+fn gib(n: Int) -> String {
+    let t = (n * 10 + 536870912) / 1073741824;
+    return to_string(t / 10) + "." + to_string(t % 10) + " GiB";
+}

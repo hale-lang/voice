@@ -46,13 +46,13 @@ sample.key = key.id;
 // a second model is left for the create
 const hardware = { os: 'linux', arch: 'arm64', memory_bytes: 137438953472, model_memory_bytes: 120000000000, accelerators: [{ kind: 'cuda', name: 'NVIDIA GB10', memory_bytes: 137438953472, unified: true }], disk_free_bytes: 3500000000000 };
 {
-  const r = await fetch(base + '/node/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${nodeToken}` }, body: JSON.stringify({ protocol: 2, version: 'live', capabilities: { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object' } }], hardware }, local: { paused: false, paused_seats: [], max_in_flight: null, reason: null } }) });
+  const r = await fetch(base + '/node/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${nodeToken}` }, body: JSON.stringify({ protocol: 2, version: 'live', capabilities: { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object' } }, { id: 'managed', kind: 'managed', models: null, config_schema: { type: 'object' } }], hardware }, local: { paused: false, paused_seats: [], max_in_flight: null, reason: null } }) });
   if (r.status !== 200) { console.log('FAIL setup register', r.status, (await r.text()).slice(0, 200)); process.exit(1); }
 }
 await setup('/admin/v1/recipes', recipe('live-placed'));
 await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
 await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
-await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], runtime: 'llama-server-b11913-cuda' });
+await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], account: 'claude-work', runtime: 'llama-server-b11913-cuda' });
 const auth = { authorization: `Bearer ${key.secret}` };
 
 // the bodies the real handlers take; anything else gets the generic one
@@ -61,7 +61,7 @@ const bodies = {
   updateCatalogModel: { max_output_tokens: 2048 },
   createRecipe: recipe('live-2'),
   createRuntime: runtime('live-2'),
-  createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'] },
+  createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'], account: 'claude-work' },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },

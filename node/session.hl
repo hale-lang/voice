@@ -39,6 +39,8 @@ locus Session {
         assignment: String = "";
         seats: NodeSeats = NodeSeats { };
         local: String = "";
+        // each managed seat's fetch as the fetcher last told it (fetch.hl)
+        fetches: FetchStates = FetchStates { };
         subscribed: Bool = false;
         // the request being served, and whether it was cancelled
         serving: String = "";
@@ -55,7 +57,9 @@ locus Session {
         subscribe AssignmentRead as on_assignment;
         subscribe LocalApplied as on_local;
         subscribe PlaneReport as on_plane;
+        subscribe FetchUpdated as on_fetch;
         publish SeatsApplied;
+        publish FetchWanted;
         publish NatsConnected;
         publish LoadChanged;
     }
@@ -117,6 +121,7 @@ locus Session {
     fn on_local(l: LocalText) {
         self.local = l.local;
         self.seats = apply_assignment(self.assignment, self.capabilities, self.local);
+        self.overlay();
         self.applied();
     }
 
@@ -164,7 +169,55 @@ locus Session {
     fn adopt(assignment: String) {
         self.assignment = assignment;
         self.seats = apply_assignment(assignment, self.capabilities, self.local);
+        // a managed seat the fetcher is told of; one it has, it fetches once
+        for s in self.seats.items {
+            if s.status == "fetching" { FetchWanted <- FetchJob { seat: s.id, config: s.config }; }
+        }
+        self.overlay();
         self.applied();
+    }
+
+    /// How far the fetcher says a managed seat is. Both records are
+    /// stored whole, so what the message carried is copied as it is kept
+    /// (FRICTION.md: a bounded field is never assigned whole).
+    fn on_fetch(f: FetchState) {
+        let mut next = FetchStates { };
+        let mut found = false;
+        for held in self.fetches.items {
+            if held.seat == f.seat {
+                push(next.items, f) or discard;
+                found = true;
+            } else {
+                push(next.items, held) or discard;
+            }
+        }
+        if !found { push(next.items, f) or discard; }
+        self.fetches = next;
+        self.overlay();
+        self.applied();
+    }
+
+    /// The fetcher's word on each managed seat still waiting on it.
+    fn overlay() {
+        let mut next = self.seats;
+        let mut i = 0;
+        while i < count(next.items) {
+            let mut s = at(next.items, i) or NodeSeat { };
+            if s.status == "fetching" {
+                for f in self.fetches.items {
+                    if f.seat == s.id {
+                        s.status = f.status;
+                        s.reason = f.reason;
+                        s.has_progress = true;
+                        s.done_bytes = f.done;
+                        s.total_bytes = f.total;
+                    }
+                }
+                set(next.items, i, s) or discard;
+            }
+            i = i + 1;
+        }
+        self.seats = next;
     }
 
     fn applied() {

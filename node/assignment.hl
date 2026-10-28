@@ -10,11 +10,15 @@ type NodeSeat {
     // the engine's JSON config, as assigned
     config: String = "{}";
     concurrency: Int = 1;
-    // starting | up | down | disabled | paused | refused
+    // starting | fetching | up | down | disabled | paused | refused
     status: String = "starting";
     // why, for refused, paused and down; "" for none
     reason: String = "";
     in_flight: Int = 0;
+    // a managed seat's fetch, in bytes, while there is one (fetch.hl)
+    has_progress: Bool = false;
+    done_bytes: Int = 0;
+    total_bytes: Int = 0;
 }
 
 /// The assignment as applied: its seats, its version and its cap.
@@ -48,7 +52,9 @@ fn apply_assignment(assignment: String, capabilities: String, local: String) -> 
         if len(kind) == 0 {
             seat.status = "refused";
             seat.reason = "this node offers no engine " + seat.engine;
-        } else if kind != "static" && kind != "openai-compatible" && kind != "claude-cli" {
+        } else if kind != "static" && kind != "openai-compatible" && kind != "claude-cli"
+            && kind != "managed"
+        {
             seat.status = "refused";
             seat.reason = "engine " + seat.engine + " is of kind " + kind
                 + ", which this build does not run";
@@ -60,6 +66,11 @@ fn apply_assignment(assignment: String, capabilities: String, local: String) -> 
         } else if paused || names_seat(held, seat.id) {
             seat.status = "paused";
             seat.reason = "held by a local control on the node";
+        } else if kind == "managed" {
+            // up only once its weights and runtime are fetched, verified
+            // and running; until the fetcher says how far it is, waiting
+            seat.status = "fetching";
+            seat.reason = "waiting to fetch";
         } else {
             seat.status = "up";
         }
@@ -118,7 +129,14 @@ fn states_json(seats: NodeSeats, busy: String) -> String {
         out.append_str(
             "{\"id\": " + q(s.id) + ", \"status\": " + q(s.status) + ", \"reason\": "
                 + (if len(s.reason) > 0 { q(s.reason) } else { "null" }) + ", \"in_flight\": "
-                + (if s.id == busy { "1" } else { "0" }) + "}",
+                + (if s.id == busy { "1" } else { "0" })
+                + (if s.has_progress {
+                    ", \"progress\": {\"done_bytes\": " + to_string(s.done_bytes)
+                        + ", \"total_bytes\": "
+                        + to_string(s.total_bytes) + "}"
+                } else {
+                    ""
+                }) + "}",
         );
     }
     let b = out.snapshot() or b"";
@@ -129,5 +147,6 @@ fn states_json(seats: NodeSeats, busy: String) -> String {
 fn seat_problem(kind: String, config: String) -> String {
     if kind == "openai-compatible" { return compat_config(config).problem; }
     if kind == "claude-cli" { return claude_config(config).problem; }
+    if kind == "managed" { return managed_problem(config); }
     return static_config(config).problem;
 }

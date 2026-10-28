@@ -104,7 +104,13 @@ type SeatState {
     has_reason: Bool = false;
     reason: String = "";
     in_flight: Int = 0;
+    // a managed seat's fetch, while there is one
+    has_progress: Bool = false;
+    progress: FetchProgress = FetchProgress { };
 }
+
+/// `FetchProgress` (protocol.yaml): how far a managed seat's fetch is.
+type FetchProgress { done_bytes: Int = 0; total_bytes: Int = 0; }
 
 type SeatStateList { items: bounded[SeatState; 16]; }
 
@@ -332,6 +338,9 @@ locus NodePlane {
                 status: seat_state_name(st.status),
                 reason: st.reason,
                 in_flight: st.in_flight,
+                has_progress: st.has_progress,
+                done_bytes: st.progress.done_bytes,
+                total_bytes: st.progress.total_bytes,
             };
             self.store.put_seat_state(row) or fail store_failed(err);
         }
@@ -341,6 +350,7 @@ locus NodePlane {
 
 fn is_seat_status(s: String) -> Bool {
     return s == "starting"
+        || s == "fetching"
         || s == "up"
         || s == "down"
         || s == "disabled"
@@ -516,17 +526,25 @@ fn seat_state_list(body: String, name: String) -> SeatStateList fallible(ApiErro
         let status = required_string(e, "status") or raise;
         if !is_seat_status(status) {
             fail invalid(
-                "a seat's status is starting, up, down, disabled, paused or refused",
+                "a seat's status is starting, fetching, up, down, disabled, paused or refused",
                 name
             );
         }
-        let st = SeatState {
+        let mut st = SeatState {
             id: required_string(e, "id") or raise,
             status: seat_state_of(status),
             has_reason: kind_of(e, "reason") == "string",
             reason: nullable_string(e, "reason") or raise,
             in_flight: required_amount(e, "in_flight") or raise
         };
+        if kind_of(e, "progress") == "object" {
+            let p = std::json::find_field_raw(e, "progress");
+            st.has_progress = true;
+            st.progress = FetchProgress {
+                done_bytes: required_amount(p, "done_bytes") or raise,
+                total_bytes: required_amount(p, "total_bytes") or raise,
+            };
+        }
         push(out.items, st) or fail invalid("at most 16 seat states", name);
         it = std::json::array_next(it);
     }

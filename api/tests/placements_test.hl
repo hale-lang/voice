@@ -20,7 +20,8 @@ fn node(store: st::Store, id: String, hardware: String) {
     store.put_fleet(
         st::FleetRow {
             node: id,
-            capabilities: "{\"max_in_flight\": 4, \"engines\": [], \"hardware\": " + hardware + "}",
+            capabilities: "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": "
+                + hardware + "}",
             present: true,
         },
     ) or discard;
@@ -43,7 +44,16 @@ fn main() {
         store: store,
         shipped: api::shipped_runtimes(fixtures("runtimes/ok")),
     };
-    let placements = api::Placements { store: store, recipes: recipes, runtimes: runtimes };
+    let seats = api::Seats { store: store, link: api::NatsLink { } };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: seats,
+    };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
     let gb10 = "[{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 128000000000, \"unified\": true}]";
 
     catalog.create(
@@ -64,7 +74,7 @@ fn main() {
         api::change("create", "nodes/unmeasured", "", "{}"),
     ) or discard;
 
-    let mut one = api::PlacementCreate { id: "on-spark", model: "fixture" };
+    let mut one = api::PlacementCreate { id: "on-spark", model: "fixture", account: "local" };
     push(one.nodes, "spark") or discard;
     let p = placements.create(one) or blank();
     std::test::assert_eq_str(p.id, "on-spark", "a model is placed");
@@ -79,6 +89,17 @@ fn main() {
         "chosen by the coordinator",
     );
     std::test::assert_eq_str(p.leader, "spark", "led by its node");
+    std::test::assert_eq_str(p.seat, "spark/on-spark", "and holds its seat there");
+    let seat = store.seat("spark", "on-spark") or st::SeatRow { };
+    std::test::assert(
+        seat.present && seat.engine == "managed" && seat.account == "local",
+        "on the managed engine",
+    );
+    std::test::assert(
+        std::str::contains(seat.config, "\"placement\": \"on-spark\"")
+            && std::str::contains(seat.config, "\"runtime\": {\"id\": \"fixture-runtime\""),
+        "its config the variant and runtime, pinned",
+    );
     let fit = at(p.fit, 0) or api::VariantFit { };
     std::test::assert(
         fit.fits && std::str::contains(fit.reason, "fixture-runtime runs gguf on cuda"),
@@ -88,14 +109,14 @@ fn main() {
     std::test::assert(read.variant == p.variant && count(read.fit) == 1, "it reads back");
 
     let mut failed = "";
-    let mut again = api::PlacementCreate { id: "twice", model: "fixture" };
+    let mut again = api::PlacementCreate { id: "twice", model: "fixture", account: "local" };
     push(again.nodes, "spark") or discard;
     placements.create(again) or {
         failed = api::ctl_class(err);
     };
     std::test::assert_eq_str(failed, "conflict", "a model is placed once on a node");
 
-    let mut small = api::PlacementCreate { id: "on-small", model: "fixture" };
+    let mut small = api::PlacementCreate { id: "on-small", model: "fixture", account: "local" };
     push(small.nodes, "small") or discard;
     let mut why = "";
     placements.create(small) or {
@@ -105,7 +126,7 @@ fn main() {
         std::str::contains(why, "needs 5.6 GB of 4.0 GB for models"),
         "too little memory: " + why,
     );
-    let mut full = api::PlacementCreate { id: "on-full", model: "fixture" };
+    let mut full = api::PlacementCreate { id: "on-full", model: "fixture", account: "local" };
     push(full.nodes, "full") or discard;
     why = "";
     placements.create(full) or {
@@ -119,6 +140,7 @@ fn main() {
     let mut named = api::PlacementCreate {
         id: "named",
         model: "fixture",
+        account: "local",
         has_variant: true,
         variant: "nope",
     };
@@ -128,14 +150,14 @@ fn main() {
         failed = api::ctl_class(err);
     };
     std::test::assert_eq_str(failed, "invalid", "a variant the recipe has not");
-    let mut unmeasured = api::PlacementCreate { id: "blind", model: "fixture" };
+    let mut unmeasured = api::PlacementCreate { id: "blind", model: "fixture", account: "local" };
     push(unmeasured.nodes, "unmeasured") or discard;
     failed = "";
     placements.create(unmeasured) or {
         failed = api::ctl_class(err);
     };
     std::test::assert_eq_str(failed, "invalid", "a node that declared no hardware");
-    let mut bare = api::PlacementCreate { id: "bare", model: "bare" };
+    let mut bare = api::PlacementCreate { id: "bare", model: "bare", account: "local" };
     push(bare.nodes, "spark") or discard;
     failed = "";
     placements.create(bare) or {
@@ -143,7 +165,7 @@ fn main() {
     };
     std::test::assert_eq_str(failed, "invalid", "a model with no recipe has no weights to place");
 
-    let mut cpu = api::PlacementCreate { id: "on-cpu", model: "fixture" };
+    let mut cpu = api::PlacementCreate { id: "on-cpu", model: "fixture", account: "local" };
     push(cpu.nodes, "bare-cpu") or discard;
     why = "";
     placements.create(cpu) or {
@@ -156,6 +178,7 @@ fn main() {
     let mut unknown = api::PlacementCreate {
         id: "unknown-rt",
         model: "fixture",
+        account: "local",
         has_runtime: true,
         runtime: "nope",
     };
@@ -168,6 +191,7 @@ fn main() {
     let mut mac = api::PlacementCreate {
         id: "wrong-rt",
         model: "fixture",
+        account: "local",
         has_runtime: true,
         runtime: "fixture-archive",
     };
@@ -193,6 +217,33 @@ fn main() {
     std::test::assert_eq_str(failed, "conflict", "a placed model stays in the catalog");
     let gone = placements.remove(api::PlacementRef { placement: "on-spark" }) or blank();
     std::test::assert_eq_str(gone.id, "on-spark", "a placement is withdrawn");
+    std::test::assert(
+        !(store.seat("spark", "on-spark") or st::SeatRow { }).present,
+        "and its seat with it",
+    );
+    // a placement from before placements made seats records none: its
+    // withdrawal leaves a seat of its id alone
+    store.insert_placement(
+        st::PlacementRow {
+            id: "legacy",
+            model: "fixture",
+            body: "{\"id\": \"legacy\", \"model\": \"fixture\", \"leader\": \"spark\", \"variant\": \"gguf-q4_k_m\"}",
+        },
+        api::change("create", "placements/legacy", "", "{}"),
+    ) or discard;
+    let mut own = api::SeatCreate {
+        node: "spark",
+        id: "legacy",
+        engine: "managed",
+        account: "local",
+    };
+    push(own.serves, st::SeatModel { model: "fixture" }) or discard;
+    seats.create(own) or discard;
+    placements.remove(api::PlacementRef { placement: "legacy" }) or discard;
+    std::test::assert(
+        (store.seat("spark", "legacy") or st::SeatRow { }).present,
+        "a seat it did not make stays",
+    );
     let listed = placements.list() or api::PlacementList { };
     std::test::assert_eq_int(count(listed.data), 0, "and no longer listed");
     let removed = catalog.remove(api::ModelRef { model: "fixture" }) or api::CatalogModel {

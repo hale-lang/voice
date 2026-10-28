@@ -343,3 +343,21 @@ each gap classed in `api/gaps.json`.
 **hale 0.27.0.** `std::http::request` returns a `ClientResponse` with the body read to its end. The openai-compatible engine (node/compat.hl) asks a chat-completions upstream for a stream, but over https the whole stream is read first and its events are published afterward: the caller sees no first token until the model has finished, and a tool call's argument fragments arrive all at once. Filed as [hale-lang/hale#1698](https://github.com/hale-lang/hale/issues/1698), modelled on the server side's chunked/SSE writer (#1596): a client that hands back the body as it arrives.
 
 **Working shape:** an http upstream is spoken to over `std::io::tcp` and relayed chunk by chunk (`Upstream.open` and `next_data`); an https upstream goes through `std::http::request` and is played from the finished body (`compat_play`), the same events in the same order, only late.
+
+## A payload's record stored into a bounded field with `set` or `push` dangles
+
+**hale 0.29.0, and the stdlib/http-credential-redirects branch.** spec/semantics.md
+says a payload's String or row is copied into a resident's own storage as it is
+stored. The node's session kept each `FetchUpdated` it received with
+`push(self.fetches, f)` and `set(self.fetches, i, f)` into a `bounded[FetchState; 16]`
+field, and `set(self.seats.items, i, s)` for a seat whose strings came from it.
+Once the handler returned, those strings read as other bytes (a seat's status
+`2`, its reason `l`); the node then reported a status the api refused, and its
+heartbeat with it, so the coordinator took it for offline. `hale check` is silent.
+
+**Working shape:** wrap the list in a record (`type FetchStates { items:
+bounded[FetchState; 16]; }`), build the next one in a local, and assign the
+record whole (`self.fetches = next;`, `self.seats = next;`), which copies what it
+holds (node/session.hl, `on_fetch`, `overlay`). To be filed upstream with a
+reproduction.
+

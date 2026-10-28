@@ -5,6 +5,7 @@
 # the compiler: `hale` statically links LLVM and needs only clang, libc and
 # OpenSSL headers beside it (see hale's own Dockerfile).
 
+# the release hale.toml declares ([dna] toolchain); CI checks they agree
 ARG HALE_VERSION=v0.30.1
 
 # The admin UI, built once and served by the api from its own origin.

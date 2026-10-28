@@ -11,16 +11,20 @@ voice node --host <h>`, through `[dna.host.node]` in
 
 ## What it needs
 
-- The hale toolchain, at the release voice's pin names
-  ([`Dockerfile`](../Dockerfile), `HALE_VERSION`), and voice's source at
-  the revision the api runs.
+- A GPU: NVIDIA on Linux (with its driver and container toolkit), Apple
+  silicon on macOS. Every runtime voice ships runs on one
+  (`[dna.host.node] requires`).
+- On Linux, docker: voice runs a model's runtime there as a container. The
+  install says when docker is missing. A Mac runs its runtime itself.
+- The hale toolchain at the release voice declares (`[dna] toolchain` in
+  [`hale.toml`](../hale.toml)), and voice's source at the revision the api
+  runs. A habitat provisions both on a host before it runs the install, and
+  runs it with hale at an absolute path; nothing the install leaves running
+  needs hale, which may not be on PATH.
 - The api's URL, reachable from the machine, and the operator token in a
   file (`voice-api admin-token` on the api's host, copied with mode 600).
 - sudo: the node runs as a system service. It runs as the account that ran
   the install, never as root.
-- On Linux, docker (and NVIDIA's container toolkit on a CUDA machine): voice
-  runs a model's runtime there as a container. The install says when docker
-  is missing.
 
 ## Install
 

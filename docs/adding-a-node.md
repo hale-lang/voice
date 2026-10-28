@@ -53,10 +53,21 @@ the api.
 
 ## Put a model on it
 
+Voice ships the recipe `qwen3-0.6b` (Qwen3-0.6B: safetensors for vLLM on
+CUDA, GGUF for llama.cpp on Metal), so a first model is three calls: a
+catalog model naming it, an account that bills nothing, and the placement.
+
 ```sh
+curl -X POST $api/admin/v1/models   -H @admin.h -H "$json" -d '{"id": "qwen3-0.6b", "recipe": "qwen3-0.6b"}'
+curl -X POST $api/admin/v1/accounts -H @admin.h -H "$json" -d '{"id": "local", "name": "Local"}'
 curl -X POST $api/admin/v1/placements -H @admin.h -H "$json" \
-  -d '{"id": "qwen-on-spark", "model": "qwen3-8b", "nodes": ["spark"], "account": "local"}'
+  -d '{"id": "qwen-on-spark", "model": "qwen3-0.6b", "nodes": ["spark"], "account": "local"}'
 ```
+
+On the Spark it is served by NVIDIA's vLLM (`vllm-26.09`), given the share
+of the GPU's memory the model needs rather than vLLM's nine tenths; on a
+Mac, by llama.cpp on Metal. A project with a key that may use the model
+then asks it as any model (`POST /v1/chat/completions`).
 
 The coordinator picks the form of the weights and the runtime that fit the
 node, the node fetches and verifies them, starts the runtime in voice's

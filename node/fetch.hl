@@ -13,22 +13,25 @@
 // file: `hub_url` (https://huggingface.co by default) and
 // `hub_token_vault`, a vault entry the token is sent from on the wire and
 // only to the hub's own origin (std::http drops it on a redirect to
-// another). A container runtime's image is pulled when the seat runs, not
-// here.
+// another). A container runtime's image is pulled here too, by its
+// digest; once all of it is there, the runner starts the seat (run.hl).
 
 /// One managed seat to fetch: its id and its config, as assigned.
 type FetchJob { seat: String = ""; config: String = ""; }
 
 topic FetchWanted { payload: FetchJob; }
 
-/// How far a seat's fetch is: `fetching` with its bytes, or `down` with why
-/// (a file that did not verify, no room, or fetched and not yet run).
+/// How far a managed seat is: `fetching` with its bytes, `starting` while
+/// its server loads, `up` with its endpoint, or `down` with why (a file
+/// that did not verify, no room, a server that ended).
 type FetchState {
     seat: String = "";
     status: String = "fetching";
     reason: String = "";
     done: Int = 0;
     total: Int = 0;
+    // once its server answers (run.hl), its API's base on loopback
+    endpoint: String = "";
 }
 
 topic FetchUpdated { payload: FetchState; }
@@ -133,6 +136,7 @@ locus Fetcher {
 
     bus {
         subscribe FetchWanted as on_wanted;
+        publish RunWanted;
     }
 
     run() {
@@ -273,13 +277,30 @@ locus Fetcher {
             }
             done = done + bytes;
         }
-        self.blobs.tell(
-            seat,
-            "down",
-            "its weights and runtime are fetched and verified; this node does not run them yet",
-            done,
-            total,
-        );
+        if std::json::find_string_field(artifact, "kind") == "container" {
+            let image = std::json::find_string_field(artifact, "image") + "@"
+                + std::json::find_string_field(artifact, "digest");
+            let pulled = std::process::run(
+                "docker\npull\n" + image,
+            ) or std::process::ProcessOutput {
+                code: 127,
+                signal: 0,
+                stdout: "",
+                stderr: "docker could not be run",
+            };
+            if pulled.code != 0 {
+                self.blobs.tell(
+                    seat,
+                    "down",
+                    "its runtime's image could not be pulled: " + std::str::trim(pulled.stderr),
+                    done,
+                    total,
+                );
+                return;
+            }
+        }
+        self.blobs.tell(seat, "starting", "fetched and verified; starting its server", done, total);
+        RunWanted <- RunJob { seat: seat, config: config };
     }
 
 }

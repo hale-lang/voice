@@ -1,0 +1,510 @@
+// The managed engine's run: a managed seat whose weights and runtime the
+// fetcher verified (fetch.hl) is started here, in voice's sandbox, and the
+// seat is `up` once its server answers its health check. The session then
+// serves the seat through the openai-compatible path, to the server's
+// port on loopback (session.hl).
+//
+// Voice decides how a runtime runs; nothing here is configured:
+// - a container runtime runs under docker, its image by digest, the
+//   weights mounted read-only, its port published on loopback only, and
+//   the GPUs given to it when it runs on CUDA;
+// - an archive runtime is unpacked once into `runtimes/<sha256>` and runs
+//   under macOS's sandbox: it may write only its own directory, and reach
+//   and listen on loopback only. On Linux voice runs runtimes as
+//   containers, so an archive runtime there is refused.
+//
+// The weights are laid out under the names the recipe gives them, in
+// `models/<seat>`, as links into the store, so a server finds a model of
+// several files where it expects them. A server's port is the node's to
+// pick. A server that ends takes its seat `down`, with what it said last;
+// a seat that leaves the assignment has its server stopped. A server left
+// running by a node that stopped is stopped when the node starts again.
+
+/// A managed seat to run, once its fetch verified.
+type RunJob { seat: String = ""; config: String = ""; }
+
+topic RunWanted { payload: RunJob; }
+
+/// The managed seats the assignment holds, one a line: the runner stops
+/// the server of any other.
+type ManagedSeats { ids: String = ""; }
+
+topic ManagedAssigned { payload: ManagedSeats; }
+
+/// One running server.
+type Run {
+    seat: String = "";
+    // starting until its health check answers, then up
+    phase: String = "starting";
+    port: Int = 0;
+    // the server's health check, and its API's base, both on loopback
+    health: String = "";
+    endpoint: String = "";
+    // the container's name, "" for an archive's process
+    container: String = "";
+    // the process, and the file it writes to
+    pid: Int = 0;
+    log: String = "";
+}
+
+type Runs { items: bounded[Run; 16]; }
+
+/// The label a node's containers carry, its id the value.
+const OWNER_LABEL: String = "net.hale-lang.voice.node";
+
+/// Where the node looks for ports for its servers.
+const PORT_FROM: Int = 47100;
+
+locus Runner {
+    params {
+        id: String = "";
+        data: String = "node-data";
+        // seats to start, one a line: the seat, a tab, its config escaped
+        queue: String = "";
+        runs: Runs = Runs { };
+        cleaned: Bool = false;
+        // the assignment's managed seats, one a line, once the session has
+        // said them: a seat outside them is never started
+        assigned: String = "";
+        heard: Bool = false;
+    }
+
+    bus {
+        subscribe RunWanted as on_wanted;
+        subscribe ManagedAssigned as on_assigned;
+        publish FetchUpdated;
+    }
+
+    run() {
+        while true {
+            self.step();
+        }
+    }
+
+    /// One turn: what a node that stopped left running is stopped, the
+    /// next seat started, every server looked at, then a sleep, where
+    /// asks arrive.
+    @unbounded
+    fn step() {
+        if !self.cleaned {
+            self.clean();
+            self.cleaned = true;
+        }
+        if len(self.queue) > 0 {
+            let nl = std::str::index_of(self.queue, "\n");
+            let line = self.queue[0..nl];
+            self.queue = self.queue[(nl + 1)..len(self.queue)];
+            let tab = std::str::index_of(line, "\t");
+            self.start(line[0..tab], std::json::unescape_string(line[(tab + 1)..len(line)]));
+        }
+        self.look();
+        std::time::sleep(500ms);
+    }
+
+    @unbounded
+    fn on_wanted(j: RunJob) {
+        // a fetch that finished after its seat was withdrawn starts nothing
+        if !self.holds(j.seat) { return; }
+        if std::str::contains("\n" + self.queue, "\n" + j.seat + "\t") { return; }
+        for r in self.runs.items {
+            if r.seat == j.seat { return; }
+        }
+        self.queue = self.queue + j.seat + "\t" + std::json::escape_string(j.config) + "\n";
+    }
+
+    /// The assignment's managed seats: the server of any other is stopped.
+    @unbounded
+    fn on_assigned(m: ManagedSeats) {
+        self.assigned = m.ids;
+        self.heard = true;
+        // seats waiting to start that the assignment no longer holds
+        let mut queue = "";
+        let qv = std::str::bytes_view(self.queue);
+        let mut at_ = 0;
+        while at_ < qv.n {
+            let nl = line_end(qv, at_);
+            let line = std::str::slice(qv, at_, nl);
+            at_ = nl + 1;
+            let tab = std::str::index_of(line, "\t");
+            if tab > 0 && self.holds(line[0..tab]) { queue = queue + line + "\n"; }
+        }
+        self.queue = queue;
+        let mut next = Runs { };
+        for r in self.runs.items {
+            if std::str::contains("\n" + m.ids, "\n" + r.seat + "\n") {
+                push(next.items, r) or discard;
+            } else {
+                self.stop(r);
+            }
+        }
+        self.runs = next;
+    }
+
+    /// True when the assignment holds managed seat `seat` (or the session
+    /// has not said yet).
+    fn holds(seat: String) -> Bool {
+        return !self.heard || std::str::contains("\n" + self.assigned, "\n" + seat + "\n");
+    }
+
+    /// Start a seat's server: its weights laid out, its runtime ready, its
+    /// process begun; the seat is `starting` until it answers.
+    @unbounded
+    fn start(seat: String, config: String) {
+        if !self.holds(seat) { return; }
+        let runtime = std::json::find_field_raw(config, "runtime");
+        let artifact = std::json::find_field_raw(runtime, "artifact");
+        let server = std::json::find_string_field(runtime, "server");
+        let models = self.data + "/models/" + seat;
+        let first = self.lay_out(models, std::json::find_field_raw(config, "variant"));
+        if len(first) == 0 {
+            self.tell(seat, "down", "its weights could not be laid out under " + models, "");
+            return;
+        }
+        let port = free_port(PORT_FROM + count(self.runs.items));
+        if port < 0 {
+            self.tell(seat, "down", "no free port on loopback for its server", "");
+            return;
+        }
+        let mut r = Run {
+            seat: seat,
+            port: port,
+            health: "http://127.0.0.1:" + to_string(port) + "/health",
+            endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
+        };
+        let mut argv = "";
+        if std::json::find_string_field(artifact, "kind") == "container" {
+            // named so no two nodes' seats meet (ids hold no dots), and
+            // labelled with the node that owns it; one of that name that is
+            // not this node's is not this node's to remove
+            r.container = "voice." + self.id + "." + seat;
+            let owner = std::str::trim(
+                run_out(
+                    "docker\ninspect\n-f\n{{index .Config.Labels \"" + OWNER_LABEL + "\"}}\n"
+                        + r.container,
+                ),
+            );
+            if len(run_out("docker\ninspect\n-f\n{{.Id}}\n" + r.container)) > 0
+                && owner != self.id
+            {
+                self.tell(
+                    seat,
+                    "down",
+                    "a container named " + r.container + " is there, and it is not this node's",
+                    "",
+                );
+                return;
+            }
+            run_out("docker\nrm\n-f\n" + r.container);
+            argv = container_argv(
+                r.container,
+                self.id,
+                port,
+                models,
+                self.data + "/blobs",
+                std::json::find_string_field(runtime, "accelerator") == "cuda",
+                std::json::find_string_field(artifact, "image") + "@"
+                    + std::json::find_string_field(artifact, "digest"),
+                server_args(
+                    server,
+                    "/models",
+                    "/models/" + first,
+                    8080,
+                    "0.0.0.0",
+                    std::json::find_string_field(config, "model"),
+                ),
+            );
+        } else {
+            if os_of(run_out("uname\n-s")) != "darwin" {
+                self.tell(
+                    seat,
+                    "down",
+                    "an archive runtime runs only on macOS; on Linux voice runs runtimes as containers",
+                    "",
+                );
+                return;
+            }
+            let dir = self.unpacked(std::json::find_string_field(artifact, "sha256"));
+            let bin = find_program(dir, server_program(server));
+            if len(bin) == 0 {
+                self.tell(
+                    seat,
+                    "down",
+                    "its runtime's archive holds no " + server_program(server),
+                    "",
+                );
+                return;
+            }
+            argv = "sandbox-exec\n-p\n" + sandbox_profile(dir) + "\n" + bin + "\n"
+                + server_args(
+                    server,
+                    models,
+                    models + "/" + first,
+                    port,
+                    "127.0.0.1",
+                    std::json::find_string_field(config, "model"),
+                );
+        }
+        // started apart from the node, its output to a file of its own: sh
+        // starts it in the background and says its pid, the command handed
+        // to sh as its arguments, never as text it reads
+        std::io::fs::mkdir(self.data + "/run") or discard;
+        r.log = self.data + "/run/" + seat + ".log";
+        let started = std::process::run_with(
+            "sh\n-c\n\"$@\" > \"$0\" 2>&1 & echo $!\n" + r.log + "\n" + argv,
+            std::process::SpawnOptions { cwd: self.data },
+        ) or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+        let pid = std::str::parse_int(std::str::trim(started.stdout)) or 0;
+        if started.code != 0 || pid <= 0 {
+            self.tell(seat, "down", "its server could not be started", "");
+            return;
+        }
+        r.pid = pid;
+        if len(r.container) == 0 {
+            let pidf = std::io::file::open(self.data + "/run/" + seat + ".pid", "w") or { return; };
+            // the pid and when the process began: a pid alone is not this
+            // process once it has ended and the number is given again
+            pidf.write_line(to_string(pid) + "\t" + started_at(pid)) or discard;
+        }
+        push(self.runs.items, r) or discard;
+        self.tell(seat, "starting", "its server is loading the model", "");
+    }
+
+    /// Every server looked at: one that ended taking its seat down, with
+    /// what it wrote last, one that answers its health check taking it up.
+    @unbounded
+    fn look() {
+        let mut next = Runs { };
+        for r0 in self.runs.items {
+            let mut r = r0;
+            if !alive(r.pid) {
+                std::io::fs::unlink(self.data + "/run/" + r.seat + ".pid") or discard;
+                let wrote = last_of(std::io::fs::read_file(r.log) or "", 1500);
+                self.tell(r.seat, "down", "its server ended: " + last_line(wrote), "");
+            } else {
+                if r.phase == "starting" && healthy(r.health) {
+                    r.phase = "up";
+                    self.tell(r.seat, "up", "", r.endpoint);
+                }
+                push(next.items, r) or discard;
+            }
+        }
+        self.runs = next;
+    }
+
+    /// Stop a server: its container removed, or its process ended.
+    fn stop(r: Run) {
+        if len(r.container) > 0 {
+            run_out("docker\nrm\n-f\n" + r.container);
+        } else {
+            run_out("kill\n" + to_string(r.pid));
+            std::io::fs::unlink(self.data + "/run/" + r.seat + ".pid") or discard;
+        }
+    }
+
+    /// What a node that stopped left running, stopped: its containers by
+    /// their names, its processes by the pids it wrote.
+    @unbounded
+    fn clean() {
+        let names = run_out("docker\nps\n-aq\n--filter\nlabel=" + OWNER_LABEL + "=" + self.id);
+        let v = std::str::bytes_view(names);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let c = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(c) > 0 { run_out("docker\nrm\n-f\n" + c); }
+        }
+        let dir = self.data + "/run";
+        let n = std::io::fs::list_dir_count(dir) or 0;
+        let mut i = 0;
+        while i < n {
+            let name = std::io::fs::list_dir_at(dir, i) or "";
+            i = i + 1;
+            if std::str::ends_with(name, ".pid") {
+                let line = std::str::trim(std::io::fs::read_file(dir + "/" + name) or "");
+                let tab = std::str::index_of(line, "\t");
+                if tab > 0 {
+                    let pid = line[0..tab];
+                    let began = line[(tab + 1)..len(line)];
+                    // only the process this node started: the same pid, begun when it was
+                    let p = std::str::parse_int(pid) or 0;
+                    if p > 0 && len(began) > 0 && started_at(p) == began {
+                        run_out("kill\n" + pid);
+                    }
+                }
+                std::io::fs::unlink(dir + "/" + name) or discard;
+            }
+        }
+    }
+
+    /// The variant's files, linked under the names the recipe gives them in
+    /// `dir`; the first a server loads (a GGUF's first file) or "" when
+    /// they could not be laid out.
+    @unbounded
+    fn lay_out(dir: String, variant: String) -> String {
+        run_out("rm\n-rf\n" + dir);
+        run_out("mkdir\n-p\n" + dir);
+        let mut first = "";
+        let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+        while !it.done {
+            let path = std::json::find_string_field(it.element, "path");
+            let sha = std::json::find_string_field(it.element, "sha256");
+            let slash = last_slash(path);
+            if slash > 0 { run_out("mkdir\n-p\n" + dir + "/" + path[0..slash]); }
+            run_out("ln\n-sfn\n" + self.data + "/blobs/" + sha + "\n" + dir + "/" + path);
+            if !std::io::fs::file_exists(dir + "/" + path) { return ""; }
+            if len(first) == 0 && std::str::ends_with(path, ".gguf") { first = path; }
+            it = std::json::array_next(it);
+        }
+        return if len(first) > 0 { first } else { "." };
+    }
+
+    /// An archive runtime unpacked, once, into `runtimes/<sha256>`.
+    @unbounded
+    fn unpacked(sha: String) -> String {
+        let dir = self.data + "/runtimes/" + sha;
+        if std::io::fs::file_exists(dir) { return dir; }
+        let tmp = dir + ".part";
+        run_out("rm\n-rf\n" + tmp);
+        run_out("mkdir\n-p\n" + tmp);
+        run_out("tar\nxzf\n" + self.data + "/blobs/" + sha + "\n-C\n" + tmp);
+        std::io::fs::rename(tmp, dir) or discard;
+        return dir;
+    }
+
+    fn tell(seat: String, status: String, reason: String, endpoint: String) {
+        FetchUpdated <- FetchState {
+            seat: seat,
+            status: status,
+            reason: reason,
+            endpoint: endpoint,
+        };
+    }
+}
+
+/// The program a server is (`RuntimeCreate.server`).
+fn server_program(server: String) -> String {
+    return if server == "vllm" { "vllm" } else { "llama-server" };
+}
+
+/// A server's arguments, one a line: the model it serves (a GGUF's first
+/// file, or the directory of a model of several), where it listens, and
+/// the catalog model it goes by.
+fn server_args(
+    server: String,
+    dir: String,
+    first: String,
+    port: Int,
+    host: String,
+    name: String
+) -> String {
+    if server == "vllm" {
+        return "vllm\nserve\n" + dir + "\n--host\n" + host + "\n--port\n" + to_string(port)
+            + "\n--served-model-name\n" + name;
+    }
+    return "-m\n" + first + "\n--host\n" + host + "\n--port\n" + to_string(port) + "\n--alias\n"
+        + name;
+}
+
+/// `docker run` for a container runtime: its port on loopback only, the
+/// weights and the store they link into mounted read-only at the paths the
+/// links name, the GPUs when it runs on CUDA.
+fn container_argv(
+    name: String,
+    owner: String,
+    port: Int,
+    models: String,
+    blobs: String,
+    cuda: Bool,
+    image: String,
+    args: String
+) -> String {
+    return "docker\nrun\n--rm\n--name\n" + name + "\n--label\n" + OWNER_LABEL + "=" + owner
+        + "\n-p\n127.0.0.1:" + to_string(port)
+        + ":8080\n-v\n" + models
+        + ":/models:ro\n-v\n" + blobs + ":" + blobs + ":ro\n"
+        + (if cuda { "--gpus\nall\n" } else { "" })
+        + image + "\n" + args;
+}
+
+/// macOS's sandbox for an archive runtime: it writes only `dir` and the
+/// system's temporary folders, and reaches and listens on loopback only.
+fn sandbox_profile(dir: String) -> String {
+    return "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath \""
+        + dir + "\") (literal \"/dev/null\") (regex #\"^/private/var/folders/\"))"
+        + "(deny network-outbound)(allow network-outbound (remote ip \"localhost:*\"))"
+        + "(deny network-bind)(allow network-bind (local ip \"localhost:*\"))";
+}
+
+/// `program` at the top of `dir` or one directory down, "" for none.
+@bounded_by(dir)
+fn find_program(dir: String, program: String) -> String {
+    if std::io::fs::file_exists(dir + "/" + program) { return dir + "/" + program; }
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let mut i = 0;
+    while i < n {
+        let sub = dir + "/" + (std::io::fs::list_dir_at(dir, i) or "");
+        i = i + 1;
+        if std::io::fs::file_exists(sub + "/" + program) { return sub + "/" + program; }
+    }
+    return "";
+}
+
+/// When process `pid` began, as `ps` says it; "" for none.
+fn started_at(pid: Int) -> String {
+    return std::str::trim(run_out("ps\n-o\nlstart=\n-p\n" + to_string(pid)));
+}
+
+/// True while process `pid` runs: there, and not a zombie left to reap.
+fn alive(pid: Int) -> Bool {
+    let state = std::str::trim(run_out("ps\n-o\nstat=\n-p\n" + to_string(pid)));
+    return len(state) > 0 && !std::str::starts_with(state, "Z");
+}
+
+/// True when a server's health check answers 200.
+fn healthy(url: String) -> Bool {
+    let r = std::http::get(url) or { return false; };
+    return r.status == 200;
+}
+
+/// A port on loopback no one listens on, from `from`; -1 for none.
+fn free_port(from: Int) -> Int {
+    let mut port = from;
+    while port < from + 200 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+/// The last `n` bytes of `s`.
+fn last_of(s: String, n: Int) -> String {
+    return if len(s) > n { s[(len(s) - n)..len(s)] } else { s };
+}
+
+/// The last line of `s` that says something.
+@bounded_by(s)
+fn last_line(s: String) -> String {
+    let t = std::str::trim(s);
+    let mut i = len(t) - 1;
+    while i > 0 {
+        if t[i..(i + 1)] == "\n" { return t[(i + 1)..len(t)]; }
+        i = i - 1;
+    }
+    return t;
+}
+
+/// The place of the last `/` in `path`, -1 for none.
+@bounded_by(path)
+fn last_slash(path: String) -> Int {
+    let mut i = len(path) - 1;
+    while i >= 0 {
+        if path[i..(i + 1)] == "/" { return i; }
+        i = i - 1;
+    }
+    return -1;
+}

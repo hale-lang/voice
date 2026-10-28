@@ -60,6 +60,7 @@ locus Session {
         subscribe FetchUpdated as on_fetch;
         publish SeatsApplied;
         publish FetchWanted;
+        publish ManagedAssigned;
         publish NatsConnected;
         publish LoadChanged;
     }
@@ -183,11 +184,18 @@ locus Session {
     }
 
     /// Every managed seat that may run told to the fetcher, which fetches
-    /// what it does not hold once (a seat held by a local control waits).
+    /// what it does not hold once, and to the runner, which stops the
+    /// server of any other (a seat a local control holds waits).
+    @unbounded
     fn schedule() {
+        let mut managed = "";
         for s in self.seats.items {
-            if s.status == "fetching" { FetchWanted <- FetchJob { seat: s.id, config: s.config }; }
+            if s.managed {
+                FetchWanted <- FetchJob { seat: s.id, config: s.config };
+                managed = managed + s.id + "\n";
+            }
         }
+        ManagedAssigned <- ManagedSeats { ids: managed };
     }
 
     /// True when the assignment holds a managed seat `seat`.
@@ -222,20 +230,23 @@ locus Session {
         self.applied();
     }
 
-    /// The fetcher's word on each managed seat still waiting on it.
+    /// The fetcher's and the runner's word on each managed seat.
     fn overlay() {
         let mut next = self.seats;
         let mut i = 0;
         while i < count(next.items) {
             let mut s = at(next.items, i) or NodeSeat { };
-            if s.status == "fetching" {
+            if s.managed {
                 for f in self.fetches.items {
                     if f.seat == s.id {
                         s.status = f.status;
                         s.reason = f.reason;
                         s.has_progress = true;
-                        s.done_bytes = f.done;
-                        s.total_bytes = f.total;
+                        if f.total > 0 {
+                            s.done_bytes = f.done;
+                            s.total_bytes = f.total;
+                        }
+                        s.endpoint = f.endpoint;
                     }
                 }
                 set(next.items, i, s) or discard;
@@ -345,8 +356,17 @@ locus Session {
         let model = std::json::find_string_field(msg, "model");
         let request = std::str::trim(std::json::find_field_raw(msg, "body"));
         let mut first = -1;
-        let compat = engine_kind(self.capabilities, seat.engine) == "openai-compatible";
-        let cc = compat_config(seat.config);
+        let kind = engine_kind(self.capabilities, seat.engine);
+        let compat = kind == "openai-compatible" || kind == "managed";
+        // a managed seat is served by its own server, on loopback (run.hl)
+        let cc = if kind == "managed" {
+            compat_config(
+                "{\"base_url\": " + q(seat.endpoint) + ", \"model\": "
+                    + q(std::json::find_string_field(seat.config, "model")) + "}",
+            )
+        } else {
+            compat_config(seat.config)
+        };
         let cli = engine_kind(self.capabilities, seat.engine) == "claude-cli";
         let mut run = StaticRun { };
         if cli {

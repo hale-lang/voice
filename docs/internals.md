@@ -310,7 +310,17 @@ the engines. A managed seat (a placement's) is fetched on a thread of its
 own (`fetch.hl`): each of its files from the hub, following the hub's
 redirect to its CDN and resuming a part already on disk, into
 `blobs/<sha256>`, kept only once its size and sha256 match; the seat is
-`fetching` with how far, then `down` until the run slice runs it. It serves its
+`fetching` with how far. Then the runner (`run.hl`, its own thread too)
+lays the weights out under their recipe's names in `models/<seat>`, as
+links into the store, and starts the runtime in voice's sandbox: a
+container under docker, the weights read-only, its port on loopback, the
+GPUs given to it on CUDA; or, on macOS, an archive unpacked into
+`runtimes/<sha256>` and run under `sandbox-exec`, writing only its own
+directory and reaching only loopback. The seat is `starting` until the
+server's health check answers, then `up`, and the session serves it
+through the openai-compatible path to that port. A seat that leaves the
+assignment has its server stopped; one a stopped node left running is
+stopped when the node starts. It serves its
 local API from `node.yaml` (status, capabilities, local controls). It
 registers on the api's node plane with its enrollment token, applies the
 assignment that comes back (refusing a seat outside what it offers, and

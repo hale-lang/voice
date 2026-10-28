@@ -1,0 +1,119 @@
+// The install, without a machine to install on: enrolling against an api
+// that answers as the real one does, the capabilities voice decides, the
+// LaunchDaemon's plist and the systemd unit, and an account's home.
+import ".." as node;
+
+/// An api with node `taken` already recorded.
+locus FakeApi {
+    params { calls: String = ""; }
+    fn send(method: String, path: String, body: String) -> node::Reply {
+        self.calls = self.calls + method + " " + path + "\n";
+        if method == "POST" && path == "/admin/v1/nodes" {
+            if std::str::contains(body, "\"taken\"") {
+                return node::Reply { status: 409, body: "{}" };
+            }
+            return node::Reply {
+                status: 201,
+                body: "{\"id\": \"new\", \"enrollment_token\": \"vn-new\"}",
+            };
+        }
+        if method == "POST" && path == "/admin/v1/nodes/taken/token" {
+            return node::Reply { status: 200, body: "{\"enrollment_token\": \"vn-rotated\"}" };
+        }
+        return node::Reply { status: 500, body: "unexpected" };
+    }
+}
+
+/// An api that refuses the operator token.
+locus RefusingApi {
+    fn send(method: String, path: String, body: String) -> node::Reply {
+        return node::Reply { status: 401, body: "{\"Unauthorized\": {}}" };
+    }
+}
+
+fn main() {
+    let api = FakeApi { };
+    let fresh = node::enroll(api, "new", false);
+    std::test::assert(
+        fresh.ok && fresh.token == "vn-new",
+        "a new node is recorded, its token kept",
+    );
+    let again = node::enroll(api, "taken", true);
+    std::test::assert(
+        again.ok && len(again.token) == 0,
+        "installing again with the token kept changes nothing",
+    );
+    let lost = node::enroll(api, "taken", false);
+    std::test::assert(
+        lost.ok && lost.token == "vn-rotated",
+        "a node whose token is gone is given a new one",
+    );
+    let refused = node::enroll(RefusingApi { }, "new", false);
+    std::test::assert(
+        !refused.ok && std::str::contains(refused.why, "401"),
+        "an api that refuses says so: " + refused.why,
+    );
+
+    std::test::assert_eq_str(
+        node::capabilities_problem(node::node_capabilities(false)),
+        "",
+        "the managed engine alone",
+    );
+    let both = node::node_capabilities(true);
+    std::test::assert(
+        node::capabilities_problem(both) == "" && std::str::contains(both, "\"claude-cli\""),
+        "and the claude CLI when the machine holds its login",
+    );
+
+    let s = node::Service {
+        name: "net.hale-lang.voice-node.spark",
+        user: "riley",
+        home: "/home/riley",
+        node_bin: "/home/riley/.voice/bin/voice-node",
+        id: "spark",
+        api: "http://10.73.20.5:8080",
+        token_vault: "node-spark-enrollment",
+        data: "/home/riley/.voice/node-data",
+        capabilities: "/home/riley/.voice/node-data/capabilities.json",
+        port: 8081,
+        vault_dir: "/home/riley/.voice/vault",
+        path: "/usr/bin:/bin",
+        log: "/home/riley/.voice/node-spark.log",
+    };
+    let plist = node::launchd_daemon_plist(s);
+    std::test::assert(
+        std::str::contains(plist, "<key>UserName</key><string>riley</string>")
+            && std::str::contains(plist, "<string>--token-vault</string>")
+            && std::str::contains(plist, "<string>node-spark-enrollment</string>")
+            && std::str::contains(plist, "<key>KeepAlive</key><true/>"),
+        "the LaunchDaemon runs the node as its account, kept running",
+    );
+    let unit = node::systemd_unit(s);
+    std::test::assert(
+        std::str::contains(unit, "User=riley\n")
+            && std::str::contains(
+                unit,
+                "ExecStart=\"/home/riley/.voice/bin/voice-node\" \"--id\" \"spark\"",
+            )
+            && std::str::contains(unit, "Restart=always")
+            && std::str::contains(unit, "After=network-online.target docker.service"),
+        "the systemd unit runs it as its account, after docker, restarted: " + unit,
+    );
+    std::test::assert_eq_str(
+        node::unit_value("50% \"x\""),
+        "\"50%% \\\"x\\\"\"",
+        "a unit's value is quoted and escaped",
+    );
+
+    std::test::assert_eq_str(
+        node::home_in_dscl("NFSHomeDirectory: /Users/riley\n"),
+        "/Users/riley",
+        "a Mac's home",
+    );
+    std::test::assert_eq_str(
+        node::home_in_passwd("riley:x:1000:1000:Riley,,,:/home/riley:/bin/bash\n"),
+        "/home/riley",
+        "a Linux home",
+    );
+    std::test::assert_eq_str(node::home_in_passwd(""), "", "no account, no home");
+}

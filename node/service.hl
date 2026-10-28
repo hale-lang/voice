@@ -1,0 +1,116 @@
+// The node as a system service: started at boot, kept running, as the
+// account that installed it. A LaunchDaemon on macOS (no login needed, so
+// a headless Mac serves too), a systemd unit on Linux. Both are strings
+// of their inputs, so a test reads them without a machine to install on.
+
+/// How the service runs the node.
+type Service {
+    // the launchd label, the systemd unit's name
+    name: String = "";
+    // the account it runs as, and that account's home
+    user: String = "";
+    home: String = "";
+    node_bin: String = "";
+    id: String = "";
+    api: String = "";
+    token_vault: String = "";
+    data: String = "";
+    capabilities: String = "";
+    port: Int = 8081;
+    vault_dir: String = "";
+    path: String = "";
+    log: String = "";
+}
+
+/// The node's flags, as the service starts it.
+fn node_args(s: Service) -> String {
+    return "--id\n" + s.id + "\n--api\n" + s.api + "\n--token-vault\n" + s.token_vault
+        + "\n--data\n"
+        + s.data + "\n--capabilities\n" + s.capabilities + "\n--port\n" + to_string(s.port);
+}
+
+// ---- macOS ---------------------------------------------------------------
+
+/// A plist string; once a flag, when an install writes the plist.
+@unbounded
+fn plist_string(s: String) -> String {
+    return "<string>" + xml(s) + "</string>";
+}
+
+@unbounded
+fn xml(s: String) -> String {
+    return std::str::replace(
+        std::str::replace(std::str::replace(s, "&", "&amp;"), "<", "&lt;"),
+        ">",
+        "&gt;",
+    );
+}
+
+/// Where the LaunchDaemon's plist is.
+fn daemon_plist_path(name: String) -> String {
+    return "/Library/LaunchDaemons/" + name + ".plist";
+}
+
+/// The LaunchDaemon's plist: the node as `user`, its flags, the vault and
+/// PATH it needs (PATH must reach `docker` and `claude`), started at boot
+/// and kept running, its output in `log`.
+@unbounded
+fn launchd_daemon_plist(s: Service) -> String {
+    let mut args = "";
+    let v = std::str::bytes_view(node_args(s));
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        args = args + "\n    " + plist_string(std::str::slice(v, start, nl));
+        start = nl + 1;
+    }
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        + "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+        + "<plist version=\"1.0\"><dict>\n  <key>Label</key>" + plist_string(s.name)
+        + "\n  <key>UserName</key>" + plist_string(s.user)
+        + "\n  <key>ProgramArguments</key><array>\n    " + plist_string(s.node_bin) + args
+        + "\n  </array>\n  <key>EnvironmentVariables</key><dict>\n    <key>HALE_VAULT_DIR</key>"
+        + plist_string(s.vault_dir) + "\n    <key>HOME</key>" + plist_string(s.home)
+        + "\n    <key>PATH</key>" + plist_string(s.path)
+        + "\n  </dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>StandardOutPath</key>"
+        + plist_string(s.log) + "\n  <key>StandardErrorPath</key>" + plist_string(s.log)
+        + "\n</dict></plist>\n";
+}
+
+// ---- Linux ---------------------------------------------------------------
+
+/// Where the systemd unit is.
+fn unit_path(name: String) -> String {
+    return "/etc/systemd/system/" + name + ".service";
+}
+
+/// A systemd unit's value: quoted, its specials escaped.
+@unbounded
+fn unit_value(s: String) -> String {
+    return "\"" + std::str::replace(
+        std::str::replace(std::str::replace(s, "\\", "\\\\"), "\"", "\\\""),
+        "%",
+        "%%",
+    ) + "\"";
+}
+
+/// The systemd unit: the node as `user`, after the network and docker,
+/// restarted when it stops, started at boot, its output in the journal.
+@unbounded
+fn systemd_unit(s: Service) -> String {
+    let mut exec = unit_value(s.node_bin);
+    let v = std::str::bytes_view(node_args(s));
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        exec = exec + " " + unit_value(std::str::slice(v, start, nl));
+        start = nl + 1;
+    }
+    return "[Unit]\nDescription=voice node " + s.id + "\nWants=network-online.target\n"
+        + "After=network-online.target docker.service\n\n[Service]\nUser=" + s.user + "\n"
+        + "Environment=" + unit_value("HALE_VAULT_DIR=" + s.vault_dir) + "\n"
+        + "Environment=" + unit_value("HOME=" + s.home) + "\n"
+        + "Environment=" + unit_value("PATH=" + s.path) + "\n"
+        + "ExecStart=" + exec
+        + "\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
+}

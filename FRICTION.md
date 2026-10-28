@@ -361,3 +361,24 @@ record whole (`self.fetches = next;`, `self.seats = next;`), which copies what i
 holds (node/session.hl, `on_fetch`, `overlay`). To be filed upstream with a
 reproduction.
 
+## A write to a local record is lost once the record was handed by value to a call
+
+**hale 0.30.1** (not 0.30.0). In `Nodes.rotate_token_held` (api/nodes.hl),
+`let mut after = self.view(row) or raise;` was passed by value to
+`node_change_json(after)` (inside `checked_change(...) or raise`, an
+argument to `self.store.update_node(...)`), and then written:
+`after.enrollment_token = token; return after;`. On 0.30.1 the caller
+receives `after` without the write: `enrollment_token` empty. `hale check`
+and `hale verify` are silent, and voice's `nodes_test` ("a new token") and
+`node_plane_test` caught it. The create path, `v.enrollment_token = token`
+after `node_change_json(v)`, still works, and a reduction with plain
+records, one fallible call and one pass by value did not reproduce it, so
+the trigger is narrower than that. Likely from hale-lang/hale#1767/#1770
+("a method's write through a record parameter lands in its caller's
+arena"). Reported to the compiler session with the voice reproduction
+(revert the copy below; `hale test api/tests/nodes_test.hl` fails on
+0.30.1, passes on 0.30.0).
+
+**Working shape:** write into a fresh copy and return that
+(`let mut out = after; out.enrollment_token = token; return out;`).
+

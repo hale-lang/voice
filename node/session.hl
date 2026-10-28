@@ -122,6 +122,8 @@ locus Session {
     fn on_local(l: LocalText) {
         self.local = l.local;
         self.seats = apply_assignment(self.assignment, self.capabilities, self.local);
+        // a managed seat the controls released is fetched now
+        self.schedule();
         self.overlay();
         self.applied();
     }
@@ -170,8 +172,22 @@ locus Session {
     fn adopt(assignment: String) {
         self.assignment = assignment;
         self.seats = apply_assignment(assignment, self.capabilities, self.local);
-        // a managed seat the fetcher is told of; one it has, it fetches once;
-        // the runner stops the server of a seat the assignment no longer holds
+        // the fetches kept are the assignment's seats' alone
+        let mut kept = FetchStates { };
+        for f in self.fetches.items {
+            if self.assigned(f.seat) { push(kept.items, f) or discard; }
+        }
+        self.fetches = kept;
+        self.schedule();
+        self.overlay();
+        self.applied();
+    }
+
+    /// Every managed seat that may run told to the fetcher, which fetches
+    /// what it does not hold once, and to the runner, which stops the
+    /// server of any other (a seat a local control holds waits).
+    @unbounded
+    fn schedule() {
         let mut managed = "";
         for s in self.seats.items {
             if s.managed {
@@ -180,312 +196,323 @@ locus Session {
             }
         }
         ManagedAssigned <- ManagedSeats { ids: managed };
-        self.overlay();
-        self.applied();
     }
 
-    /// How far the fetcher says a managed seat is. Both records are
-    /// stored whole, so what the message carried is copied as it is kept
-    /// (FRICTION.md: a bounded field is never assigned whole).
-    fn on_fetch(f: FetchState) {
-        let mut next = FetchStates { };
-        let mut found = false;
-        for held in self.fetches.items {
-            if held.seat == f.seat {
-                push(next.items, f) or discard;
-                found = true;
-            } else {
-                push(next.items, held) or discard;
+    /// True when the assignment holds a managed seat `seat`.
+    fn assigned(seat: String) -> Bool {
+        for s in self.seats.items {
+            if s.id == seat && engine_kind(self.capabilities, s.engine) == "managed" {
+                return true;
             }
         }
-        if !found { push(next.items, f) or discard; }
-        self.fetches = next;
-        self.overlay();
-        self.applied();
+        return false;
     }
+}
 
-    /// The fetcher's and the runner's word on each managed seat.
-    fn overlay() {
-        let mut next = self.seats;
-        let mut i = 0;
-        while i < count(next.items) {
-            let mut s = at(next.items, i) or NodeSeat { };
-            if s.managed {
-                for f in self.fetches.items {
-                    if f.seat == s.id {
-                        s.status = f.status;
-                        s.reason = f.reason;
-                        s.has_progress = true;
-                        if f.total > 0 {
-                            s.done_bytes = f.done;
-                            s.total_bytes = f.total;
-                        }
-                        s.endpoint = f.endpoint;
+/// How far the fetcher says a managed seat is. Both records are
+/// stored whole, so what the message carried is copied as it is kept
+/// (FRICTION.md: a bounded field is never assigned whole).
+fn on_fetch(f: FetchState) {
+    // word of a seat the assignment no longer holds is dropped
+    if !self.assigned(f.seat) { return; }
+    let mut next = FetchStates { };
+    let mut found = false;
+    for held in self.fetches.items {
+        if held.seat == f.seat {
+            push(next.items, f) or discard;
+            found = true;
+        } else {
+            push(next.items, held) or discard;
+        }
+    }
+    if !found { push(next.items, f) or discard; }
+    self.fetches = next;
+    self.overlay();
+    self.applied();
+}
+
+/// The fetcher's and the runner's word on each managed seat.
+fn overlay() {
+    let mut next = self.seats;
+    let mut i = 0;
+    while i < count(next.items) {
+        let mut s = at(next.items, i) or NodeSeat { };
+        if s.managed {
+            for f in self.fetches.items {
+                if f.seat == s.id {
+                    s.status = f.status;
+                    s.reason = f.reason;
+                    s.has_progress = true;
+                    if f.total > 0 {
+                        s.done_bytes = f.done;
+                        s.total_bytes = f.total;
                     }
+                    s.endpoint = f.endpoint;
                 }
-                set(next.items, i, s) or discard;
             }
-            i = i + 1;
+            set(next.items, i, s) or discard;
         }
-        self.seats = next;
+        i = i + 1;
     }
+    self.seats = next;
+}
 
-    fn applied() {
-        SeatsApplied <- AppliedSeats {
-            version: self.seats.version,
-            states: states_json(self.seats, self.busy),
-        };
-        self.report();
+fn applied() {
+    SeatsApplied <- AppliedSeats {
+        version: self.seats.version,
+        states: states_json(self.seats, self.busy),
+    };
+    self.report();
+}
+
+/// One message on the node's subject.
+fn on_message() {
+    let subject = self.client.last.subject;
+    let body = std::str::from_bytes(self.client.last.data);
+    if subject == self.subject + ".assign" {
+        let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
+        if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
+    } else if subject == self.subject + ".serve" {
+        self.serve(body, self.client.last.reply);
     }
+}
 
-    /// One message on the node's subject.
-    fn on_message() {
+/// While a request is served: the messages that arrived. A `cancel`
+/// for it stops it, a `serve` is refused at once, an `assign` is
+/// adopted.
+fn interject() {
+    self.looked = std::time::monotonic_ns();
+    let mut n = 0;
+    while n < 16 && self.client.read_msg(1ms) {
+        n = n + 1;
         let subject = self.client.last.subject;
         let body = std::str::from_bytes(self.client.last.data);
-        if subject == self.subject + ".assign" {
+        if subject == self.subject + ".cancel" {
+            if std::json::find_string_field(body, "request_id") == self.serving {
+                self.cancelled = true;
+            }
+        } else if subject == self.subject + ".serve" {
+            let ack = "{\"request_id\": " + q(std::json::find_string_field(body, "request_id"))
+                + ", \"outcome\": \"refused\", \"reason\": \"the node is serving another request\"}";
+            self.client.pub_msg(
+                self.client.last.reply,
+                "",
+                std::bytes::from_string(ack),
+            ) or discard;
+        } else if subject == self.subject + ".assign" {
             let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
             if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
-        } else if subject == self.subject + ".serve" {
-            self.serve(body, self.client.last.reply);
         }
     }
+}
 
-    /// While a request is served: the messages that arrived. A `cancel`
-    /// for it stops it, a `serve` is refused at once, an `assign` is
-    /// adopted.
-    fn interject() {
-        self.looked = std::time::monotonic_ns();
-        let mut n = 0;
-        while n < 16 && self.client.read_msg(1ms) {
-            n = n + 1;
-            let subject = self.client.last.subject;
-            let body = std::str::from_bytes(self.client.last.data);
-            if subject == self.subject + ".cancel" {
-                if std::json::find_string_field(body, "request_id") == self.serving {
-                    self.cancelled = true;
-                }
-            } else if subject == self.subject + ".serve" {
-                let ack = "{\"request_id\": " + q(std::json::find_string_field(body, "request_id"))
-                    + ", \"outcome\": \"refused\", \"reason\": \"the node is serving another request\"}";
-                self.client.pub_msg(
-                    self.client.last.reply,
-                    "",
-                    std::bytes::from_string(ack),
-                ) or discard;
-            } else if subject == self.subject + ".assign" {
-                let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
-                if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
-            }
-        }
+/// Wait `ms`, in short slices that read what arrives meanwhile, until
+/// the request is cancelled.
+fn pause(ms: Int) {
+    let until = std::time::monotonic_ns() + ms * 1000000;
+    while !self.cancelled && std::time::monotonic_ns() < until {
+        let left = (until - std::time::monotonic_ns()) / 1000000;
+        std::time::sleep((if left > 50 { 50 } else if left > 0 { left } else { 0 }) * 1ms);
+        self.interject();
     }
+}
 
-    /// Wait `ms`, in short slices that read what arrives meanwhile, until
-    /// the request is cancelled.
-    fn pause(ms: Int) {
-        let until = std::time::monotonic_ns() + ms * 1000000;
-        while !self.cancelled && std::time::monotonic_ns() < until {
-            let left = (until - std::time::monotonic_ns()) / 1000000;
-            std::time::sleep((if left > 50 { 50 } else if left > 0 { left } else { 0 }) * 1ms);
-            self.interject();
-        }
+/// Answer a `serve` at once, then serve it on its seat.
+fn serve(msg: String, inbox: String) {
+    let id = std::json::find_string_field(msg, "request_id");
+    let reply_to = std::json::find_string_field(msg, "reply_to");
+    let seat = seat_of(self.seats, std::json::find_string_field(msg, "seat"));
+    let mut refusal = "";
+    if len(seat.id) == 0 {
+        refusal = "no seat " + std::json::find_string_field(msg, "seat")
+            + " is assigned to this node";
+    } else if seat.status != "up" {
+        refusal = "seat " + seat.id + " is " + seat.status
+            + (if len(seat.reason) > 0 { ": " + seat.reason } else { "" });
+    } else if request_has_tools(std::str::trim(std::json::find_field_raw(msg, "body")))
+        && !seat_carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
+    {
+        refusal = "seat " + seat.id + " does not carry tools: its engine answers text only";
+    } else if node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data)) < 1 {
+        refusal = "the node takes no requests: its cap is 0";
     }
-
-    /// Answer a `serve` at once, then serve it on its seat.
-    fn serve(msg: String, inbox: String) {
-        let id = std::json::find_string_field(msg, "request_id");
-        let reply_to = std::json::find_string_field(msg, "reply_to");
-        let seat = seat_of(self.seats, std::json::find_string_field(msg, "seat"));
-        let mut refusal = "";
-        if len(seat.id) == 0 {
-            refusal = "no seat " + std::json::find_string_field(msg, "seat")
-                + " is assigned to this node";
-        } else if seat.status != "up" {
-            refusal = "seat " + seat.id + " is " + seat.status
-                + (if len(seat.reason) > 0 { ": " + seat.reason } else { "" });
-        } else if request_has_tools(std::str::trim(std::json::find_field_raw(msg, "body")))
-            && !seat_carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
-        {
-            refusal = "seat " + seat.id + " does not carry tools: its engine answers text only";
-        } else if node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data)) < 1 {
-            refusal = "the node takes no requests: its cap is 0";
-        }
-        let ack = "{\"request_id\": " + q(id) + ", \"outcome\": "
-            + (
-                if len(refusal) > 0 {
-                    "\"refused\", \"reason\": " + q(refusal)
-                } else {
-                    "\"accepted\", \"reason\": null"
-                }
-            )
-            + "}";
-        self.client.pub_msg(inbox, "", std::bytes::from_string(ack)) or discard;
-        if len(refusal) > 0 { return; }
-
-        self.serving = id;
-        self.busy = seat.id;
-        self.cancelled = false;
-        self.loaded();
-        self.looked = std::time::monotonic_ns();
-        let t0 = std::time::monotonic_ns();
-        let model = std::json::find_string_field(msg, "model");
-        let request = std::str::trim(std::json::find_field_raw(msg, "body"));
-        let mut first = -1;
-        let kind = engine_kind(self.capabilities, seat.engine);
-        let compat = kind == "openai-compatible" || kind == "managed";
-        // a managed seat is served by its own server, on loopback (run.hl)
-        let cc = if kind == "managed" {
-            compat_config(
-                "{\"base_url\": " + q(seat.endpoint) + ", \"model\": "
-                    + q(std::json::find_string_field(seat.config, "model")) + "}",
-            )
-        } else {
-            compat_config(seat.config)
-        };
-        let cli = engine_kind(self.capabilities, seat.engine) == "claude-cli";
-        let mut run = StaticRun { };
-        if cli {
-            // the CLI's output is relayed as it arrives, like an http upstream's
-            let cr = claude_run_for(id, model, request, claude_config(seat.config));
-            cr.open();
-            while !cr.done && !self.cancelled {
-                let d = cr.next_data();
-                if len(d) > 0 {
-                    let lines = cr.feed(d);
-                    let lv = std::str::bytes_view(lines);
-                    let mut at = 0;
-                    while at < lv.n {
-                        let e = line_end(lv, at);
-                        let ev = std::str::slice(lv, at, e);
-                        at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
-                            first = (std::time::monotonic_ns() - t0) / 1000000;
-                        }
-                        self.client.pub_msg(
-                            reply_to + ".event",
-                            "",
-                            std::bytes::from_string(
-                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
-                                    + "}",
-                            ),
-                        ) or discard;
-                    }
-                }
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
-            }
-            run = cr.finish();
-        } else if compat {
-            // the upstream, http or https, is relayed as it arrives: each
-            // event leaves as soon as it is read
-            let up = upstream_over_wire(id, model, request, cc);
-            while !up.done && !self.cancelled {
-                let d = up.next_data();
-                if len(d) > 0 {
-                    let lines = up.feed(d);
-                    let lv = std::str::bytes_view(lines);
-                    let mut at = 0;
-                    while at < lv.n {
-                        let e = line_end(lv, at);
-                        let ev = std::str::slice(lv, at, e);
-                        at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
-                            first = (std::time::monotonic_ns() - t0) / 1000000;
-                        }
-                        self.client.pub_msg(
-                            reply_to + ".event",
-                            "",
-                            std::bytes::from_string(
-                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
-                                    + "}",
-                            ),
-                        ) or discard;
-                    }
-                }
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
-            }
-            run = up.finish();
-        } else {
-            let engine_model = std::json::string_field(msg, "engine_model");
-            run = run_static(
-                id,
-                model,
-                if engine_model.kind == "string" { engine_model.text } else { model },
-                request,
-                static_config(seat.config),
-            );
-        }
-        let v = std::str::bytes_view(run.script);
-        let mut start = 0;
-        while start < v.n && !self.cancelled {
-            let at = line_end(v, start);
-            let line = std::str::slice(v, start, at);
-            start = at + 1;
-            if std::str::starts_with(line, "pause ") {
-                self.pause(std::str::parse_int(line[6..len(line)]) or 0);
+    let ack = "{\"request_id\": " + q(id) + ", \"outcome\": "
+        + (
+            if len(refusal) > 0 {
+                "\"refused\", \"reason\": " + q(refusal)
             } else {
-                if first < 0 && std::str::contains(line, "response.output_text.delta") {
-                    first = (std::time::monotonic_ns() - t0) / 1000000;
-                }
-                self.client.pub_msg(
-                    reply_to + ".event",
-                    "",
-                    std::bytes::from_string(
-                        "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}",
-                    ),
-                ) or discard;
-                // a look costs up to a millisecond when nothing waits, so
-                // a run of events looks every 50 ms, not after each
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
+                "\"accepted\", \"reason\": null"
             }
+        )
+        + "}";
+    self.client.pub_msg(inbox, "", std::bytes::from_string(ack)) or discard;
+    if len(refusal) > 0 { return; }
+
+    self.serving = id;
+    self.busy = seat.id;
+    self.cancelled = false;
+    self.loaded();
+    self.looked = std::time::monotonic_ns();
+    let t0 = std::time::monotonic_ns();
+    let model = std::json::find_string_field(msg, "model");
+    let request = std::str::trim(std::json::find_field_raw(msg, "body"));
+    let mut first = -1;
+    let kind = engine_kind(self.capabilities, seat.engine);
+    let compat = kind == "openai-compatible" || kind == "managed";
+    // a managed seat is served by its own server, on loopback (run.hl)
+    let cc = if kind == "managed" {
+        compat_config(
+            "{\"base_url\": " + q(seat.endpoint) + ", \"model\": "
+                + q(std::json::find_string_field(seat.config, "model")) + "}",
+        )
+    } else {
+        compat_config(seat.config)
+    };
+    let cli = engine_kind(self.capabilities, seat.engine) == "claude-cli";
+    let mut run = StaticRun { };
+    if cli {
+        // the CLI's output is relayed as it arrives, like an http upstream's
+        let cr = claude_run_for(id, model, request, claude_config(seat.config));
+        cr.open();
+        while !cr.done && !self.cancelled {
+            let d = cr.next_data();
+            if len(d) > 0 {
+                let lines = cr.feed(d);
+                let lv = std::str::bytes_view(lines);
+                let mut at = 0;
+                while at < lv.n {
+                    let e = line_end(lv, at);
+                    let ev = std::str::slice(lv, at, e);
+                    at = e + 1;
+                    if first < 0 && std::str::contains(ev, "response.output_text.delta") {
+                        first = (std::time::monotonic_ns() - t0) / 1000000;
+                    }
+                    self.client.pub_msg(
+                        reply_to + ".event",
+                        "",
+                        std::bytes::from_string(
+                            "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
+                                + "}",
+                        ),
+                    ) or discard;
+                }
+            }
+            if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
         }
-        let elapsed = (std::time::monotonic_ns() - t0) / 1000000;
-        let result = if self.cancelled {
-            cancelled_result(id)
-        } else if run.outcome == "failed" {
-            failed_result(id, "engine_failed", run.failure, true)
+        run = cr.finish();
+    } else if compat {
+        // the upstream, http or https, is relayed as it arrives: each
+        // event leaves as soon as it is read
+        let up = upstream_over_wire(id, model, request, cc);
+        while !up.done && !self.cancelled {
+            let d = up.next_data();
+            if len(d) > 0 {
+                let lines = up.feed(d);
+                let lv = std::str::bytes_view(lines);
+                let mut at = 0;
+                while at < lv.n {
+                    let e = line_end(lv, at);
+                    let ev = std::str::slice(lv, at, e);
+                    at = e + 1;
+                    if first < 0 && std::str::contains(ev, "response.output_text.delta") {
+                        first = (std::time::monotonic_ns() - t0) / 1000000;
+                    }
+                    self.client.pub_msg(
+                        reply_to + ".event",
+                        "",
+                        std::bytes::from_string(
+                            "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
+                                + "}",
+                        ),
+                    ) or discard;
+                }
+            }
+            if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
+        }
+        run = up.finish();
+    } else {
+        let engine_model = std::json::string_field(msg, "engine_model");
+        run = run_static(
+            id,
+            model,
+            if engine_model.kind == "string" { engine_model.text } else { model },
+            request,
+            static_config(seat.config),
+        );
+    }
+    let v = std::str::bytes_view(run.script);
+    let mut start = 0;
+    while start < v.n && !self.cancelled {
+        let at = line_end(v, start);
+        let line = std::str::slice(v, start, at);
+        start = at + 1;
+        if std::str::starts_with(line, "pause ") {
+            self.pause(std::str::parse_int(line[6..len(line)]) or 0);
         } else {
-            result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
-        };
-        self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
-        self.serving = "";
-        self.busy = "";
-        self.cancelled = false;
-        self.loaded();
+            if first < 0 && std::str::contains(line, "response.output_text.delta") {
+                first = (std::time::monotonic_ns() - t0) / 1000000;
+            }
+            self.client.pub_msg(
+                reply_to + ".event",
+                "",
+                std::bytes::from_string(
+                    "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}",
+                ),
+            ) or discard;
+            // a look costs up to a millisecond when nothing waits, so
+            // a run of events looks every 50 ms, not after each
+            if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
+        }
     }
+    let elapsed = (std::time::monotonic_ns() - t0) / 1000000;
+    let result = if self.cancelled {
+        cancelled_result(id)
+    } else if run.outcome == "failed" {
+        failed_result(id, "engine_failed", run.failure, true)
+    } else {
+        result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
+    };
+    self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
+    self.serving = "";
+    self.busy = "";
+    self.cancelled = false;
+    self.loaded();
+}
 
-    /// A request began or ended: the plane's next heartbeat, and the
-    /// status, say so.
-    fn loaded() {
-        LoadChanged <- Load {
-            in_flight: if len(self.busy) > 0 { 1 } else { 0 },
-            states: states_json(self.seats, self.busy),
-        };
-        self.report();
-    }
+/// A request began or ended: the plane's next heartbeat, and the
+/// status, say so.
+fn loaded() {
+    LoadChanged <- Load {
+        in_flight: if len(self.busy) > 0 { 1 } else { 0 },
+        states: states_json(self.seats, self.busy),
+    };
+    self.report();
+}
 
-    /// What the admin API shows: the connection, the assignment applied,
-    /// the effective cap and every seat with its state.
-    fn report() {
-        let local = read_local(self.data);
-        let state = if self.plane_state == "refused" {
-            "refused"
-        } else if self.plane_state == "registered" && self.nats_state == "connected" {
-            "connected"
-        } else {
-            "connecting"
-        };
-        let coordinator = "{\"url\": " + q(self.api) + ", \"state\": " + q(state)
-            + ", \"connected_at\": "
-            + (if len(self.connected_at) > 0 { q(self.connected_at) } else { "null" })
-            + ", \"last_error\": "
-            + (if len(self.last_error) > 0 { q(self.last_error) } else { "null" }) + "}";
-        let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": "
-            + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
-            + ", \"max_in_flight\": "
-            + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local))
-            + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": "
-            + status_seats(self.assignment, self.seats, self.busy) + "}";
-        std::io::fs::write_file(self.data + "/session.json", body) or discard;
-    }
+/// What the admin API shows: the connection, the assignment applied,
+/// the effective cap and every seat with its state.
+fn report() {
+    let local = read_local(self.data);
+    let state = if self.plane_state == "refused" {
+        "refused"
+    } else if self.plane_state == "registered" && self.nats_state == "connected" {
+        "connected"
+    } else {
+        "connecting"
+    };
+    let coordinator = "{\"url\": " + q(self.api) + ", \"state\": " + q(state)
+        + ", \"connected_at\": "
+        + (if len(self.connected_at) > 0 { q(self.connected_at) } else { "null" })
+        + ", \"last_error\": "
+        + (if len(self.last_error) > 0 { q(self.last_error) } else { "null" }) + "}";
+    let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": "
+        + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
+        + ", \"max_in_flight\": "
+        + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local))
+        + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": "
+        + status_seats(self.assignment, self.seats, self.busy) + "}";
+    std::io::fs::write_file(self.data + "/session.json", body) or discard;
+}
 }
 
 /// The assigned seats, each with its state on this node (node.yaml

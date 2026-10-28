@@ -58,13 +58,65 @@ fn managed_problem(config: String) -> String {
     {
         return "config.variant needs a source: a repo and a revision";
     }
-    if std::json::array_first(std::json::find_field_raw(v, "files")).done {
-        return "config.variant lists no files";
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
+    if it.done { return "config.variant lists no files"; }
+    // every pin is checked before any of it names a path: a digest is the
+    // file's name in the store, a path its name under the model
+    while !it.done {
+        let path = std::json::find_string_field(it.element, "path");
+        if !hex(std::json::find_string_field(it.element, "sha256"), 64) {
+            return "config.variant's file " + path + " needs a sha256 of 64 hex digits";
+        }
+        if std::json::find_int_field(it.element, "bytes") < 1 {
+            return "config.variant's file " + path + " needs its size in bytes";
+        }
+        if !relative_path(path) {
+            return "config.variant's file path " + path + " is not a relative path";
+        }
+        it = std::json::array_next(it);
     }
     let a = std::json::find_field_raw(std::json::find_field_raw(config, "runtime"), "artifact");
     let kind = std::json::find_string_field(a, "kind");
-    if kind != "container" && kind != "archive" { return "config.runtime needs an artifact"; }
+    if kind == "archive" {
+        if !hex(std::json::find_string_field(a, "sha256"), 64)
+            || std::json::find_int_field(a, "bytes") < 1
+            || !std::str::starts_with(std::json::find_string_field(a, "url"), "https://")
+        {
+            return "config.runtime's archive needs an https url, a sha256 and its size";
+        }
+    } else if kind == "container" {
+        let d = std::json::find_string_field(a, "digest");
+        if len(std::json::find_string_field(a, "image")) == 0
+            || !std::str::starts_with(d, "sha256:")
+            || !hex(d[7..len(d)], 64)
+        {
+            return "config.runtime's container needs an image and a sha256 digest";
+        }
+    } else {
+        return "config.runtime needs an artifact";
+    }
     return "";
+}
+
+/// Exactly `n` lowercase hex digits.
+@bounded_by(s)
+fn hex(s: String, n: Int) -> Bool {
+    if len(s) != n { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A path that stays where it is put: not empty, not absolute, no `..`.
+fn relative_path(p: String) -> Bool {
+    if len(p) == 0 || std::str::starts_with(p, "/") { return false; }
+    return !(p == ".." || std::str::starts_with(p, "../") || std::str::ends_with(p, "/..")
+            || std::str::contains(p, "/../"));
 }
 
 locus Fetcher {
@@ -145,12 +197,33 @@ locus Fetcher {
                 done = done + bytes;
             }
         }
+        // what parts on disk already hold counts as fetched; a part longer
+        // than its pin is never the file, and goes
+        let mut parts = 0;
+        it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+        while !it.done {
+            parts = parts
+                + partial(
+                    blobs,
+                    std::json::find_string_field(it.element, "sha256"),
+                    std::json::find_int_field(it.element, "bytes"),
+                );
+            it = std::json::array_next(it);
+        }
+        if archive {
+            parts = parts
+                + partial(
+                    blobs,
+                    std::json::find_string_field(artifact, "sha256"),
+                    std::json::find_int_field(artifact, "bytes"),
+                );
+        }
         let free = df_available(run_out("df\n-Pk\n" + self.data));
-        if total - done > free {
+        if total - done - parts > free {
             self.blobs.tell(
                 seat,
                 "down",
-                "needs " + gib(total - done) + " more, and " + gib(free) + " is free",
+                "needs " + gib(total - done - parts) + " more, and " + gib(free) + " is free",
                 done,
                 total,
             );
@@ -365,6 +438,20 @@ locus Blobs {
             total: total,
         };
     }
+}
+
+/// The bytes a part of an unheld file already holds, 0 for none; a part
+/// longer than the file's pin is removed.
+fn partial(blobs: String, sha: String, bytes: Int) -> Int {
+    if held(blobs, sha) { return 0; }
+    let part = blobs + "/" + sha + ".part";
+    if !std::io::fs::file_exists(part) { return 0; }
+    let size = std::io::fs::file_size(part) or 0;
+    if size > bytes {
+        std::io::fs::unlink(part) or discard;
+        return 0;
+    }
+    return size;
 }
 
 /// True when the store holds `blobs/<sha>`: kept only once it verified.

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, type JsonObject, type JsonSchema } from '@hale/components';
+import { useQueryClient } from '@tanstack/react-query';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
 import { useGet, type Node, type SeatView, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -18,6 +19,14 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   const creating = nodeId === 'new';
   const seat = node?.seats.find((s) => s.id === seatId);
   const newSeat = seatId === 'new';
+  const qc = useQueryClient();
+  // a seat on its way up moves by itself: read again while one is
+  const moving = q.data?.data.some((n) => n.seats.some((s) => s.status === 'fetching' || s.status === 'starting')) ?? false;
+  useEffect(() => {
+    if (!moving) return;
+    const t = setInterval(() => void qc.invalidateQueries({ queryKey: ['/admin/v1/nodes'] }), 3000);
+    return () => clearInterval(t);
+  }, [moving, qc]);
 
   useEffect(() => {
     if (creating) setInspector(<CreateNode />);
@@ -93,7 +102,7 @@ function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh
           { key: 'account', header: 'Account', render: (s) => <Mono>{s.account}</Mono> },
           { key: 'serves', header: 'Serves', render: (s) => s.serves.map((m) => (m.as ? `${m.model} as ${m.as}` : m.model)).join(', ') },
           { key: 'assigned', header: 'Assigned', render: (s) => (s.enabled === false ? 'disabled' : `enabled · ${s.concurrency ?? 1} at once`) },
-          { key: 'reported', header: 'Reported', render: (s) => <Status tone={toneOf(s.status)} label={s.status} title={s.reason ?? undefined} /> },
+          { key: 'reported', header: 'Reported', render: (s) => <Status tone={toneOf(s.status)} label={reported(s)} title={s.reason ?? undefined} /> },
           { key: 'reason', header: 'Reason', wrap: true, render: (s) => s.reason ?? (s.problems.length ? <span className="c-wait">{s.problems.join('; ')}</span> : <span className="faint">–</span>) },
           { key: 'flight', header: 'In flight', num: true, render: (s) => s.in_flight },
         ]}
@@ -105,6 +114,34 @@ function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh
         </Button>
       </p>
     </Panel>
+  );
+}
+
+/** A seat's reported state, with how far a fetch has come. */
+function reported(s: SeatView): string {
+  const p = s.progress;
+  if (s.status !== 'fetching' || !p || p.total_bytes <= 0) return s.status;
+  return `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
+}
+
+/** What the machine has, as the node measured it: what placement fits models to. */
+function Hardware({ node }: { node: Node }) {
+  const hw = node.capabilities?.hardware;
+  if (!hw) return <span className="faint">{node.capabilities ? 'not measured: no model is placed on this node' : 'not declared yet: the node has not registered'}</span>;
+  return (
+    <Kv
+      rows={[
+        { k: 'platform', v: `${hw.os} · ${hw.arch}` },
+        { k: 'memory', v: <>{bytes(hw.memory_bytes)}{hw.model_memory_bytes < hw.memory_bytes ? <span className="muted"> · {bytes(hw.model_memory_bytes)} for models</span> : null}</> },
+        ...(hw.accelerators.length
+          ? hw.accelerators.map((a, i) => ({
+              k: hw.accelerators.length > 1 ? `accelerator ${i}` : 'accelerator',
+              v: <>{a.name} <span className="muted">· {a.kind} · {a.unified ? `unified memory` : bytes(a.memory_bytes)}</span></>,
+            }))
+          : [{ k: 'accelerator', v: <span className="c-wait">none: a model needs one</span> }]),
+        { k: 'disk free', v: bytes(hw.disk_free_bytes) },
+      ]}
+    />
   );
 }
 
@@ -216,6 +253,8 @@ function NodeInspector({ node }: { node: Node }) {
       ) : (
         <span className="faint">not declared yet: the node has not registered</span>
       )}
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Hardware</h3>
+      <Hardware node={node} />
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
       {local ? (
         <Kv
@@ -274,7 +313,8 @@ function SeatInspector({ node, seat }: { node: Node; seat: SeatView }) {
       </h2>
       <Kv
         rows={[
-          { k: 'reported', v: <Status tone={toneOf(seat.status)} label={seat.status} /> },
+          { k: 'reported', v: <Status tone={toneOf(seat.status)} label={reported(seat)} /> },
+          ...(seat.status === 'fetching' && seat.progress ? [{ k: 'fetched', v: `${bytes(seat.progress.done_bytes)} of ${bytes(seat.progress.total_bytes)}` }] : []),
           { k: 'reason', v: seat.reason ?? '–' },
           { k: 'problems', v: seat.problems.length ? <span className="c-wait">{seat.problems.join('; ')}</span> : 'none' },
           { k: 'engine', v: seat.engine },

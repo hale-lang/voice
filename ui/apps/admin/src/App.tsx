@@ -11,9 +11,12 @@ import { Changes } from './screens/Changes';
 import { Accounts } from './screens/Accounts';
 import { Catalog } from './screens/Catalog';
 import { Projects } from './screens/Projects';
+import { Recipes } from './screens/Recipes';
+import { Runtimes } from './screens/Runtimes';
+import { Placements } from './screens/Placements';
 import { useAdminEvents } from './api/events';
 import { useOperatorToken, keepOperatorToken } from './api/token';
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
 const NAV = [
   { href: href(), label: 'Overview', key: '' },
@@ -23,6 +26,9 @@ const NAV = [
   { href: href('nodes'), label: 'Nodes', key: 'nodes' },
   { href: href('accounts'), label: 'Accounts', key: 'accounts' },
   { href: href('catalog'), label: 'Catalog', key: 'catalog' },
+  { href: href('placements'), label: 'Placements', key: 'placements' },
+  { href: href('recipes'), label: 'Recipes', key: 'recipes' },
+  { href: href('runtimes'), label: 'Runtimes', key: 'runtimes' },
   { href: href('projects'), label: 'Projects', key: 'projects' },
   { href: href('changes'), label: 'Changes', key: 'changes' },
 ];
@@ -57,11 +63,12 @@ function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, projects: Projects }[section];
+  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects }[section];
   const Screen = screen ?? Overview;
 
-  // The inspector belongs to the screen; a new screen starts it empty.
-  useEffect(() => setInspector(null), [section]);
+  // The inspector belongs to the screen; a new screen starts it empty. A
+  // layout effect, so it runs before the screen's own effect fills it.
+  useLayoutEffect(() => setInspector(null), [section]);
 
   return (
     <Shell

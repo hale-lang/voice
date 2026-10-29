@@ -3,7 +3,7 @@ import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Fi
 import { useGet, type CatalogModel } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
-import { go } from '../route';
+import { go, href } from '../route';
 import { readout } from '../readout';
 
 /** The catalog: what callers may name, with its price. */
@@ -54,6 +54,8 @@ function ModelForm({ model }: { model?: CatalogModel }) {
   const [id, setId] = useState(model?.id ?? '');
   const [ownedBy, setOwnedBy] = useState(model?.owned_by ?? 'local');
   const [kind, setKind] = useState<'local' | 'hosted'>(model?.kind ?? 'local');
+  const [recipe, setRecipe] = useState(model?.recipe ?? '');
+  const recipes = useGet('/admin/v1/recipes');
   const [ctx, setCtx] = useState<number | null>(model?.context_length ?? null);
   const [maxOut, setMaxOut] = useState<number | null>(model?.max_output_tokens ?? null);
   const [priceIn, setPriceIn] = useState<number | null>(model?.price ? model.price.input_per_mtok_micros / 1e6 : null);
@@ -68,7 +70,7 @@ function ModelForm({ model }: { model?: CatalogModel }) {
           const body = { owned_by: ownedBy, kind, context_length: ctx ?? undefined, max_output_tokens: maxOut ?? undefined, price };
           const r = model
             ? await w.write('patch', '/admin/v1/models/{model}', { params: { path: { model: model.id } }, body })
-            : await w.write('post', '/admin/v1/models', { body: { id, ...body } });
+            : await w.write('post', '/admin/v1/models', { body: { id, ...body, recipe: kind === 'local' && recipe ? recipe : undefined } });
           if (r) go('catalog', model?.id ?? id);
         }}
         actions={
@@ -86,6 +88,11 @@ function ModelForm({ model }: { model?: CatalogModel }) {
         <Field label="kind" required>
           <Select value={kind} onChange={(v) => setKind(v as typeof kind)} options={[{ value: 'local' }, { value: 'hosted' }]} />
         </Field>
+        {!model && kind === 'local' && (
+          <Field label="recipe" help="the allowed weights voice installs it from, for a placement; fixed once created">
+            <Select value={recipe} onChange={setRecipe} options={(recipes.data?.data ?? []).map((r) => ({ value: r.id, label: `${r.id} · ${r.origin}` }))} empty="none (a seat names its own)" />
+          </Field>
+        )}
         <Field label="owned by" help="the provider, or local">
           <TextInput value={ownedBy} onChange={setOwnedBy} />
         </Field>
@@ -119,6 +126,7 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
       <Kv
         rows={[
           { k: 'kind', v: `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}` },
+          { k: 'recipe', v: m.recipe ? <a href={href('recipes', m.recipe)}><Mono>{m.recipe}</Mono></a> : '–' },
           { k: 'context', v: m.context_length?.toLocaleString() ?? '–' },
           { k: 'max output', v: m.max_output_tokens?.toLocaleString() ?? '–' },
           { k: 'price', v: m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },

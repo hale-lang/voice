@@ -21,8 +21,8 @@ export function subscribeAdminEvents(listener: (event: AdminEvent) => void): () 
  * (`Last-Event-ID`) after the `retry` the stream gives.
  */
 const AFFECTS: Record<string, string[]> = {
-  node: ['/admin/v1/nodes', '/admin/v1/routes'],
-  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models'],
+  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements'],
+  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements'],
   account: ['/admin/v1/accounts', '/admin/v1/routes'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
   change: ['/admin/v1/changes'],

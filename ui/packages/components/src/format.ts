@@ -10,6 +10,16 @@ export function count(n: number): string {
   return n.toLocaleString();
 }
 
+/** A size in bytes, in binary units as memory is quoted: "512 MiB", "64 GiB". */
+export function bytes(n: number | null | undefined): string {
+  if (n == null) return '–';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let v = n;
+  let u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u += 1; }
+  return `${u === 0 || v >= 100 || Number.isInteger(v) ? Math.round(v) : v.toFixed(1)} ${units[u]}`;
+}
+
 /** A relative time, short: "3s", "12m", "2h", "5d". */
 export function ago(iso: string | null | undefined, now = Date.now()): string {
   if (!iso) return '–';

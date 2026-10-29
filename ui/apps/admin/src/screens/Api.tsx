@@ -20,7 +20,7 @@ type Doc = {
   paths: Record<string, Record<string, Json>>;
   components?: { schemas?: Record<string, Schema>; parameters?: Record<string, Json>; responses?: Record<string, Json>; securitySchemes?: Record<string, Json> };
 };
-type Operation = { id: string; method: string; path: string; tag: string; op: Json };
+type Operation = { id: string; method: string; path: string; tag: string; op: Json; shared: Json[] };
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete'];
 
@@ -43,7 +43,8 @@ function operations(doc: Doc): Operation[] {
       const op = item[method] as Json | undefined;
       if (!op) continue;
       const id = (op.operationId as string | undefined) ?? `${method}-${path}`;
-      out.push({ id, method, path, tag: ((op.tags as string[] | undefined) ?? ['other'])[0]!, op });
+      // the path item's parameters apply to each of its operations
+      out.push({ id, method, path, tag: ((op.tags as string[] | undefined) ?? ['other'])[0]!, op, shared: (item.parameters as unknown as Json[] | undefined) ?? [] });
     }
   }
   return out;
@@ -147,7 +148,11 @@ function auth(doc: Doc, op: Json): ReactNode {
 
 function OperationPage({ doc, op }: { doc: Doc; op: Operation }) {
   const o = op.op;
-  const params = ((o.parameters as Json[] | undefined) ?? []).map((p) => resolve(doc, p));
+  // the path's parameters, then the operation's, which replace a path's of
+  // the same name and place (OpenAPI's path item)
+  const own = ((o.parameters as Json[] | undefined) ?? []).map((p) => resolve(doc, p));
+  const key = (p: Json) => `${p.in}:${p.name}`;
+  const params = [...op.shared.map((p) => resolve(doc, p)).filter((p) => !own.some((x) => key(x) === key(p))), ...own];
   const body = resolve(doc, o.requestBody as Json | undefined);
   const bodyContent = (body?.content as Record<string, Json> | undefined) ?? {};
   const responses = Object.entries((o.responses as Record<string, Json> | undefined) ?? {});
@@ -167,9 +172,9 @@ function OperationPage({ doc, op }: { doc: Doc; op: Operation }) {
             columns={[
               { key: 'n', header: 'Name', render: (p) => <Mono>{p.name as string}</Mono> },
               { key: 'i', header: 'In', render: (p) => p.in as string },
-              { key: 't', header: 'Type', render: (p) => <TypeOf doc={doc} schema={p.schema as Schema | undefined} /> },
+              { key: 't', header: 'Type', wrap: true, render: (p) => <Cell narrow><TypeOf doc={doc} schema={p.schema as Schema | undefined} /></Cell> },
               { key: 'r', header: 'Required', render: (p) => (p.required ? 'yes' : 'no') },
-              { key: 'd', header: 'Description', wrap: true, render: (p) => (typeof p.description === 'string' ? <Prose text={p.description} inline /> : '') },
+              { key: 'd', header: 'Description', wrap: true, render: (p) => (typeof p.description === 'string' ? <Cell><Prose text={p.description} inline /></Cell> : '') },
             ]}
           />
         </Panel>
@@ -287,12 +292,17 @@ function SchemaBlock({ doc, schema, top }: { doc: Doc; schema: Schema | undefine
       rowKey={([k]) => k}
       columns={[
         { key: 'n', header: 'Field', render: ([k]) => <Mono>{k}</Mono> },
-        { key: 't', header: 'Type', render: ([, s]) => <TypeOf doc={doc} schema={s} /> },
+        { key: 't', header: 'Type', wrap: true, render: ([, s]) => <Cell narrow><TypeOf doc={doc} schema={s} /></Cell> },
         { key: 'r', header: 'Required', render: ([k]) => (required.has(k) ? 'yes' : <span className="faint">no</span>) },
-        { key: 'd', header: 'Description', wrap: true, render: ([, s]) => (typeof resolve(doc, s).description === 'string' && !s.$ref ? <Prose text={s.description as string} inline /> : '') },
+        { key: 'd', header: 'Description', wrap: true, render: ([, s]) => (typeof resolve(doc, s).description === 'string' && !s.$ref ? <Cell><Prose text={s.description as string} inline /></Cell> : '') },
       ]}
     />
   );
+}
+
+/** A table cell's description: it wraps anywhere, so a long code span never widens the table. */
+function Cell({ children, narrow }: { children: ReactNode; narrow?: boolean }) {
+  return <div style={{ overflowWrap: 'anywhere', whiteSpace: 'normal', minWidth: narrow ? '6em' : '14em', maxWidth: narrow ? '18em' : '48em' }}>{children}</div>;
 }
 
 /**
@@ -310,7 +320,7 @@ function Prose({ text, inline }: { text: string; inline?: boolean }) {
       i += 1;
       while (i < lines.length && !lines[i]!.trim().startsWith('```')) { code.push(lines[i]!); i += 1; }
       i += 1;
-      blocks.push(<pre key={blocks.length} style={{ overflowX: 'auto' }}><code>{code.join('\n')}</code></pre>);
+      blocks.push(<pre key={blocks.length} style={{ overflowX: 'auto', maxWidth: '100%' }}><code>{code.join('\n')}</code></pre>);
     } else if (/^\s*[-*] /.test(line)) {
       const items: string[] = [];
       while (i < lines.length && /^\s*([-*] |\s{2,}\S)/.test(lines[i]!)) {

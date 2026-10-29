@@ -110,13 +110,31 @@ jobs:
           for i in $(seq 1 50); do curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"hardware"' && break; sleep 0.5; done
           curl -fsS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"os": *"linux"'
           test "$(ps -o user= -p "$(pgrep -f 'voice-node --id ci-linux')")" = "$USER"
-          # installing again over the running node restarts it on what was installed
+          # installing again over the running node restarts it on what was
+          # installed; this time as a habitat places it (hale.toml
+          # [dna.secrets]): the operator token and two Claude accounts'
+          # tokens handed over in a vault of the command's own, by name
+          hv=$(mktemp -d); chmod 700 "$hv"
+          cp build/admin.token "$hv/secret-dna_ci-operator-token"
+          printf 'tok-work' > "$hv/secret-dna_ci-claude-token--work"
+          printf 'tok-p1' > "$hv/secret-dna_ci-claude-token--personal-1"
+          chmod 600 "$hv"/*
+          handed() { sudo env HALE_VAULT_DIR="$hv" HALE_SECRET_OPERATOR_TOKEN=secret-dna_ci-operator-token HALE_SECRET_CLAUDE_TOKEN="$1" node/node "${@:2}"; }
           before=$(pgrep -f 'voice-node --id ci-linux')
-          sudo node/node install --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8083
+          handed "$(printf 'secret-dna_ci-claude-token--personal-1\nsecret-dna_ci-claude-token--work')" install --id ci-linux --api http://127.0.0.1:8080 --port 8083
           for i in $(seq 1 50); do pgrep -f 'voice-node --id ci-linux.*--port 8083' >/dev/null && break; sleep 0.2; done
           test "$(pgrep -f 'voice-node --id ci-linux')" != "$before"
           pgrep -f 'voice-node --id ci-linux.*--port 8083'
-          sudo node/node uninstall --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
+          # each account's token is the node's own now, private, by its label
+          test "$(sudo cat "$HOME/.voice/vault/claude-token--work")" = tok-work
+          test "$(sudo stat -c %a "$HOME/.voice/vault/claude-token--personal-1")" = 600
+          # placed again with one account, the other's token goes
+          handed secret-dna_ci-claude-token--work install --id ci-linux --api http://127.0.0.1:8080 --port 8083
+          sudo test -e "$HOME/.voice/vault/claude-token--work"
+          sudo test ! -e "$HOME/.voice/vault/claude-token--personal-1"
+          handed "" uninstall --id ci-linux --api http://127.0.0.1:8080 --purge
+          # the habitat's token revoked the node
+          curl -sS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"status": *"revoked"'
           test ! -e /etc/systemd/system/voice-node-ci-linux.service
           kill $api_pid
       - uses: actions/setup-node@v4

@@ -4,10 +4,12 @@
 // (hale.toml `[dna.host.node]`); an operator can run them by hand.
 //
 // `install` adds a node and nothing else: it records the node on the api
-// (the operator token, from a file, is used for that alone), keeps its
+// (the operator token, the habitat's or from a file, is used for that
+// alone), keeps its
 // enrollment token in the node's vault, writes the capabilities voice
 // decides (the managed engine, which runs the models placed on the node,
-// and the claude CLI when the machine holds its login), copies the node
+// and the claude CLI when the vault holds a Claude account's token, which
+// the habitat hands over, keep_claude_tokens), copies the node
 // program where the service runs it, and installs and starts the service
 // as the account that ran it with sudo. Models come to the node through
 // placements, never through its install. It prints no secret, and running
@@ -96,14 +98,14 @@ fn node_capabilities(claude: Bool) -> String {
 /// (`voice-node-<id>.service`) and the launchd label.
 fn service_name(id: String) -> String { return "voice-node-" + id; }
 
-const INSTALL_USAGE: String = "usage: sudo node install --id ID --api URL --operator-token-file FILE [--port N] [--no-start]\n       sudo node uninstall --id ID [--operator-token-file FILE] [--purge]";
+const INSTALL_USAGE: String = "usage: sudo node install --id ID --api URL [--operator-token-file FILE] [--port N] [--no-start]\n       sudo node uninstall --id ID [--api URL] [--operator-token-file FILE] [--purge]\n(grafted, the habitat hands over the operator token; by hand, --operator-token-file)";
 
 /// `node install`.
 @unbounded
 fn install() {
     let id = option("--id", "");
     let api = option("--api", "");
-    let token_file = option("--operator-token-file", "");
+    let token_file = operator_token_path();
     if !is_slug(id) || len(api) == 0 || len(token_file) == 0 {
         log_error(INSTALL_USAGE, "");
         std::process::exit(2);
@@ -135,7 +137,10 @@ fn install() {
     }
     run_out("chmod\n600\n" + vault + "/" + enrollment);
 
-    let claude = std::io::fs::file_exists(vault + "/claude-" + id + "-token")
+    // the Claude accounts' tokens the habitat handed over, kept in the
+    // node's vault, since the habitat's copy is gone once this returns
+    keep_claude_tokens(vault);
+    let claude = len(claude_labels(vault)) > 0
         && len(std::str::trim(run_out("sh\n-c\nPATH=\"$0\" command -v claude\n" + path))) > 0;
     std::io::fs::write_file(data + "/capabilities.json", node_capabilities(claude)) or fail_install(
         "the capabilities file could not be written",
@@ -253,7 +258,7 @@ fn uninstall() {
         run_out("rm\n-f\n" + unit_path(service_name(id)));
         run_out("systemctl\ndaemon-reload");
     }
-    let token_file = option("--operator-token-file", "");
+    let token_file = operator_token_path();
     let api = option("--api", "");
     if len(token_file) > 0 && len(api) > 0 {
         let key = std::str::trim(std::io::fs::read_file(token_file) or "");
@@ -267,6 +272,97 @@ fn uninstall() {
         run_out("rm\n-f\n" + a.home + "/.voice/vault/node-" + id + "-enrollment");
     }
     println("node " + id + " uninstalled");
+}
+
+/// Where the operator token is: grafted, the vault entry the habitat
+/// handed over for this command's run (`HALE_SECRET_OPERATOR_TOKEN` in
+/// `HALE_VAULT_DIR`, hale.toml `[dna.secrets.operator-token]`); by hand,
+/// `--operator-token-file`. "" when neither names one.
+fn operator_token_path() -> String {
+    let given = option("--operator-token-file", "");
+    if len(given) > 0 { return given; }
+    let entry = env_text("HALE_SECRET_OPERATOR_TOKEN");
+    let dir = env_text("HALE_VAULT_DIR");
+    if len(entry) == 0 || len(dir) == 0 { return ""; }
+    return dir + "/" + entry;
+}
+
+fn env_text(name: String) -> String {
+    if !std::env::var_exists(name) { return ""; }
+    return std::str::trim(std::env::var(name));
+}
+
+/// The prefix a Claude account's token has in the node's vault: its
+/// label, voice's account id, follows (`claude-token--work`), the entry a
+/// claude seat names as its `token_vault`.
+const CLAUDE_TOKEN_PREFIX: String = "claude-token--";
+
+/// Keep the Claude accounts' tokens the habitat handed over in the node's
+/// vault: each member of `[dna.secrets.claude-token]` (`HALE_SECRET_CLAUDE_TOKEN`,
+/// its entries' names one a line, each `…-claude-token--<label>` in
+/// `HALE_VAULT_DIR`), copied as `claude-token--<label>` (600), and a token
+/// of an account no longer handed over removed: placing the node again is
+/// how its accounts change. Copied by `cp`, so no token is ever a value
+/// here. Installed by hand, with nothing handed over, the vault's tokens
+/// are left as they are.
+fn keep_claude_tokens(vault: String) {
+    let dir = env_text("HALE_VAULT_DIR");
+    if len(dir) == 0 || !std::env::var_exists("HALE_SECRET_CLAUDE_TOKEN") { return; }
+    keep_handed_tokens(dir, std::env::var("HALE_SECRET_CLAUDE_TOKEN"), vault);
+}
+
+/// `keep_claude_tokens` over what was handed over: the habitat's vault
+/// directory `dir`, and `handed`, its members' entries one a line.
+// once per install, as `install` is
+@unbounded
+fn keep_handed_tokens(dir: String, handed: String, vault: String) {
+    let mut kept = "\n";
+    let mut rest = handed + "\n";
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let entry = std::str::trim(rest[0..nl]);
+        rest = rest[(nl + 1)..len(rest)];
+        let at = std::str::index_of(entry, "-" + CLAUDE_TOKEN_PREFIX);
+        if at < 0 { continue; }
+        let label = entry[(at + 1 + len(CLAUDE_TOKEN_PREFIX))..len(entry)];
+        if !is_slug(label) {
+            log_warn("a Claude token's label is not an account id", std::log::kv("label", label));
+            continue;
+        }
+        let to = vault + "/" + CLAUDE_TOKEN_PREFIX + label;
+        run_out("cp\n-f\n" + dir + "/" + entry + "\n" + to);
+        run_out("chmod\n600\n" + to);
+        kept = kept + label + "\n";
+    }
+    let had = claude_labels(vault);
+    let mut left = had;
+    while len(left) > 0 {
+        let nl = std::str::index_of(left, "\n");
+        let label = left[0..nl];
+        left = left[(nl + 1)..len(left)];
+        if !std::str::contains(kept, "\n" + label + "\n") {
+            run_out("rm\n-f\n" + vault + "/" + CLAUDE_TOKEN_PREFIX + label);
+        }
+    }
+}
+
+/// The labels of the Claude tokens in the node's vault, one a line.
+// once per install, as `install` is
+@unbounded
+fn claude_labels(vault: String) -> String {
+    let mut out = "";
+    let mut rest = run_out("ls\n-1\n" + vault);
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let name = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if std::str::starts_with(name, CLAUDE_TOKEN_PREFIX)
+            && len(name) > len(CLAUDE_TOKEN_PREFIX)
+        {
+            out = out + name[len(CLAUDE_TOKEN_PREFIX)..len(name)] + "\n";
+        }
+    }
+    return out;
 }
 
 /// The account a node is installed for: the one that ran the command with

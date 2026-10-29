@@ -21,8 +21,10 @@ voice node --host <h>`, through `[dna.host.node]` in
   runs. A habitat provisions both on a host before it runs the install, and
   runs it with hale at an absolute path; nothing the install leaves running
   needs hale, which may not be on PATH.
-- The api's URL, reachable from the machine, and the operator token in a
-  file (`voice-api admin-token` on the api's host, copied with mode 600).
+- The api's URL, reachable from the machine, and the operator token. A
+  habitat hands the install its own (hale.toml `[dna.secrets.operator-token]`);
+  by hand, a file of it (`voice-api admin-token` on the api's host, copied
+  with mode 600), named with `--operator-token-file`.
 - sudo: the node runs as a system service. It runs as the account that ran
   the install, never as root.
 
@@ -32,14 +34,23 @@ voice node --host <h>`, through `[dna.host.node]` in
 sudo hale run node install --id spark --api http://10.73.20.5:8080 --operator-token-file admin.token
 ```
 
+A habitat runs the same command for you, without the token file:
+
+```sh
+hale habitat organism place voice node --host spark
+```
+
 It:
 
 - records the node on the api, or finds it there, and keeps its enrollment
   token in `~/.voice/vault` (mode 600); the operator token is used for that
   alone and kept nowhere;
+- keeps each Claude account's token the habitat hands over in the node's
+  vault as `claude-token--<account>`, and removes one no longer handed over
+  (below);
 - writes `~/.voice/node-data/capabilities.json`: the managed engine, which
   runs the models placed on the node, and the claude CLI when the vault holds
-  `claude-<id>-token` and `claude` is on PATH;
+  a Claude account's token and `claude` is on PATH;
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a
@@ -50,6 +61,24 @@ It:
 It prints no secret. Running it again changes nothing that is already right;
 a node whose enrollment token is gone is given a new one. Exit codes: 0
 installed, 2 a bad argument, 1 failed, with one line saying why.
+
+### Claude accounts
+
+A claude seat runs `claude -p` as one Claude subscription. Each
+subscription's token is a long-lived `claude setup-token`, one per account,
+labelled with the voice account it bills:
+
+```sh
+claude setup-token                                   # once per subscription, as that account
+hale dna secret set claude-token --member work       # the token, for voice's account `work`
+hale habitat organism place voice node --host spark  # hands the node every member
+```
+
+The seat names its account's token: `{"engine": "claude", "account": "work",
+"config": {"token_vault": "claude-token--work"}}`. Adding an account later
+is setting another member and placing the node again. By hand, put the
+token in `~/.voice/vault/claude-token--<account>` (mode 600) before
+installing.
 
 The node finds NATS where the api tells it when it registers (the api's
 `--node-nats`), so the machine needs a route to that address as well as to
@@ -89,6 +118,7 @@ curl -sS http://127.0.0.1:8081/node/v1/status         # on the machine
 
 ```sh
 sudo hale run node uninstall --id spark --api $api --operator-token-file admin.token [--purge]
+hale habitat organism unplace voice node --host spark      # or, in a habitat
 ```
 
 stops and removes the service; with the operator token it revokes the node

@@ -585,6 +585,9 @@ assert seats == ["laptop/static", "mini/steady"], seats
 PY
 [ "$ms" -lt 5500 ] || { echo "two requests at once took $ms ms: served in turn, not at once"; exit 1; }
 echo "two requests served at once, one on each node, in $ms ms"
+# laptop's seat fails again, as the failover left it, for what follows
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
+wait_for up
 
 # every seat fails: a 502 that names the request and every attempt
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 100}}' >/dev/null

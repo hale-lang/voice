@@ -25,6 +25,9 @@ cd "$(dirname "$0")/.."
 API_PORT=${API_PORT:-18090}
 NODE_PORT=${NODE_PORT:-18091}
 NODE2_PORT=${NODE2_PORT:-18092}
+# each node's readings (node/readings.hl): voice's 9476 is one node's per
+# host, and this host runs several
+READINGS_PORT=${READINGS_PORT:-19476}
 SILENT_PORT=${SILENT_PORT:-14299}
 QUIET_PORT=${QUIET_PORT:-18093}
 UPSTREAM_PORT=${UPSTREAM_PORT:-14296}
@@ -112,7 +115,7 @@ key=$(post /admin/v1/projects/work/keys '{"name": "e2e"}' | field secret)
 token=$(post /admin/v1/nodes '{"id": "laptop"}' | field enrollment_token)
 post /admin/v1/nodes/laptop/seats '{"id": "static", "engine": "static", "account": "static", "serves": [{"model": "echo-1"}], "config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 
-node/node --id laptop --api "$api" --token "$token" --data "$work/node-data" --capabilities deploy/node/capabilities.json --port "$NODE_PORT" >"$work/node.log" 2>&1 &
+node/node --id laptop --api "$api" --token "$token" --data "$work/node-data" --capabilities deploy/node/capabilities.json --port "$NODE_PORT" --readings-port "$READINGS_PORT" >"$work/node.log" 2>&1 &
 laptop_pid=$!
 pids+=($laptop_pid)
 
@@ -152,6 +155,12 @@ wait_for() {
 }
 wait_for up
 echo "laptop/static is up"
+
+# the node's readings say so too, on every interface, beside the runtime's own
+readings=$(curl -fsS "http://127.0.0.1:$READINGS_PORT/metrics")
+printf '%s\n' "$readings" | grep -qx 'voice_node_seat_up{seat="static",engine="static"} 1' || { echo "the node's readings do not say laptop/static is up:"; printf '%s\n' "$readings" | grep '^voice_node' ; exit 1; }
+printf '%s\n' "$readings" | grep -q '^hale_process_' || { echo "the node's readings carry none of the runtime's own"; exit 1; }
+echo "laptop's readings say static is up"
 
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
@@ -369,7 +378,7 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
   qtoken=$(post /admin/v1/nodes '{"id": "'"$name"'"}' | field enrollment_token)
   post /admin/v1/nodes/$name/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "'"$name"'-1"}], "config": {"base_url": "http://127.0.0.1:'"$uport"'/v1", "model": "stub-7b"}}' >/dev/null
   echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/$name-caps.json"
-  node/node --id "$name" --api "$api" --token "$qtoken" --data "$work/$name-data" --capabilities "$work/$name-caps.json" --port "$nport" >"$work/$name.log" 2>&1 &
+  node/node --id "$name" --api "$api" --token "$qtoken" --data "$work/$name-data" --capabilities "$work/$name-caps.json" --port "$nport" --readings-port "$((nport + 1000))" >"$work/$name.log" 2>&1 &
   pids+=($!)
   for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/$name/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
   # the cancel names the request the node was offered: read off its subject
@@ -506,7 +515,7 @@ post /admin/v1/nodes/mini/seats '{"id": "steady", "engine": "static", "account":
 # open, on the command line, as a standalone node may still give it)
 printf '%s' "$token2" >"$work/vault/node-mini-enrollment"
 chmod 600 "$work/vault/node-mini-enrollment"
-HALE_VAULT_DIR="$work/vault" node/node --id mini --api "$api" --token-vault node-mini-enrollment --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" >"$work/node2.log" 2>&1 &
+HALE_VAULT_DIR="$work/vault" node/node --id mini --api "$api" --token-vault node-mini-enrollment --data "$work/node2-data" --capabilities deploy/node/capabilities.json --port "$NODE2_PORT" --readings-port "$((READINGS_PORT + 1))" >"$work/node2.log" 2>&1 &
 mini_pid=$!
 pids+=($mini_pid)
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null

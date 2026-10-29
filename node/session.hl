@@ -50,6 +50,10 @@ locus Session {
         // monotonic ns of the last look at NATS while serving
         looked: Int = 0;
         client: nats::NatsClient = nats::NatsClient { name: "voice-node" };
+        // the seats' readings, scraped with the runtime's (readings.hl)
+        readings: std::metrics::Registry = std::metrics::Registry { namespace: "voice_node" };
+        // the seats last read out, so one withdrawn reads as down
+        read: SeatIds = SeatIds { };
     }
 
     bus {
@@ -511,6 +515,33 @@ locus Session {
             + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": "
             + status_seats(self.assignment, self.seats, self.busy) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
+        self.read_out();
+    }
+
+    /// The seats' readings, as `report` says them: each seat up or not,
+    /// what it serves at once, and a managed seat's fetch. A seat no
+    /// longer assigned reads 0 (a series cannot be retired), and is
+    /// labelled by its id and engine only, both configured and few.
+    fn read_out() {
+        let mut now = SeatIds { };
+        for s in self.seats.items {
+            push(now.items, ReadSeat { id: s.id, engine: s.engine }) or discard;
+            let l = std::metrics::labels_two("seat", s.id, "engine", s.engine);
+            seat_reading(self.readings, "seat_up", l, if s.status == "up" { 1 } else { 0 });
+            seat_reading(self.readings, "seat_in_flight", l, if s.id == self.busy { 1 } else { 0 });
+            if s.managed {
+                seat_reading(self.readings, "seat_fetch_done_bytes", l, s.done_bytes);
+                seat_reading(self.readings, "seat_fetch_total_bytes", l, s.total_bytes);
+            }
+        }
+        for gone in self.read.items {
+            if !has_seat_id(now, gone.id) {
+                let l = std::metrics::labels_two("seat", gone.id, "engine", gone.engine);
+                seat_reading(self.readings, "seat_up", l, 0);
+                seat_reading(self.readings, "seat_in_flight", l, 0);
+            }
+        }
+        self.read = now;
     }
 }
 

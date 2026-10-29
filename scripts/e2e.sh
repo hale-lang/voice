@@ -165,6 +165,21 @@ echo "laptop's readings say static is up"
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
 
+# a served request's record carries the seat's own timing, to its first
+# output and to its end, which is what its throughput is read from; and the
+# node's readings count its tokens and time its generation
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage?limit=20" | python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin)["data"] if r["status"] == "served" and r["output_tokens"] > 0]
+assert rows, "no served request with output in the ledger"
+t = rows[0]["timing"]
+assert "first_output_ms" in t and "engine_ms" in t and t["engine_ms"] >= t["first_output_ms"] >= 0, t
+' || exit 1
+readings=$(curl -fsS "http://127.0.0.1:$READINGS_PORT/metrics")
+printf '%s\n' "$readings" | grep -qE '^voice_node_tokens_total\{seat="static",engine="static",kind="output"\} [1-9]' || { echo "the node's readings count no output tokens:"; printf '%s\n' "$readings" | grep '^voice_node'; exit 1; }
+printf '%s\n' "$readings" | grep -qE '^voice_node_generation_seconds_count\{seat="static",engine="static"\} [1-9]' || { echo "the node's readings time no generation:"; printf '%s\n' "$readings" | grep '^voice_node'; exit 1; }
+echo "a served request's record says its seat's timing, and the node's readings count its tokens"
+
 # the newest usage event on the organization's stream, as JSON
 last_event() {
   local seq

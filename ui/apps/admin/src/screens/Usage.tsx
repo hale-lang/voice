@@ -44,6 +44,8 @@ export function Usage({ route, setInspector }: ScreenProps) {
               { key: 'out', header: 'Out', num: true, render: (r) => count(r.output_tokens) },
               { key: 'price', header: 'Price', num: true, render: (r) => micros(r.price_micros, r.currency) },
               { key: 'wall', header: 'Wall', num: true, render: (r) => `${r.timing.wall_ms} ms` },
+              { key: 'first', header: 'First output', num: true, render: (r) => (r.timing.first_output_ms != null ? `${r.timing.first_output_ms} ms` : <span className="faint">–</span>) },
+              { key: 'rate', header: 'Tok/s', num: true, render: (r) => throughput(r) },
             ]}
             empty="No requests yet."
           />
@@ -104,4 +106,15 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
       />
     </>
   );
+}
+
+/**
+ * A seat's throughput on one request: its output tokens over the time it
+ * generated, from its first output to its end, as its node measured both,
+ * so reading the prompt and a cold start are not counted against it.
+ */
+function throughput(r: UsageRecord): string {
+  const { first_output_ms: first, engine_ms: end } = r.timing;
+  if (first == null || end == null || end <= first || r.output_tokens <= 0) return '–';
+  return ((1000 * r.output_tokens) / (end - first)).toFixed(1);
 }

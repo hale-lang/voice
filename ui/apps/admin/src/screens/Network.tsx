@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useId } from 'react';
+import { useInstances, INSTANCE_LAPSE_MS } from '../api/hub';
 import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/components';
 import { useGet, type UsageRecord } from '../api/client';
 import { subscribeAdminEvents } from '../api/events';
@@ -28,7 +29,17 @@ export function Network(_: ScreenProps) {
   const queries = [nodes, accounts, projects, usage];
   const failure = queries.find((q) => q.isError);
   const pending = queries.some((q) => q.isPending);
-  const fleet = useMemo<Fleet>(() => ({ nodes: nodes.data?.data ?? [], accounts: accounts.data?.data ?? [], projects: projects.data?.data ?? [], usage: usage.data?.data ?? [] }), [nodes.data, accounts.data, projects.data, usage.data]);
+  const beats = useInstances();
+  // an instance that stops beating is shown gone without a beat to say so
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 5000); return () => clearInterval(t); }, []);
+  const fleet = useMemo<Fleet>(() => ({
+    nodes: nodes.data?.data ?? [],
+    accounts: accounts.data?.data ?? [],
+    projects: projects.data?.data ?? [],
+    usage: usage.data?.data ?? [],
+    instances: beats.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })),
+  }), [nodes.data, accounts.data, projects.data, usage.data, beats, now]);
 
   return <div className={s.screen}>
     <header className={s.header}>

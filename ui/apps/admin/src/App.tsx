@@ -15,6 +15,7 @@ import { Recipes } from './screens/Recipes';
 import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
 import { useAdminEvents } from './api/events';
+import { useHub } from './api/hub';
 import { useOperatorToken, keepOperatorToken } from './api/token';
 import { useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
@@ -94,6 +95,7 @@ export type ScreenProps = { route: ReturnType<typeof useRoute>; setInspector: (n
 function EvidenceStrip() {
   const health = useGet('/readyz');
   const stream = useAdminEvents();
+  const hub = useHub();
   const fetching = useIsFetching();
   const qc = useQueryClient();
   const [now, setNow] = useState(Date.now());
@@ -111,6 +113,7 @@ function EvidenceStrip() {
         { label: 'api', value: <span className={health.isError ? 'c-fail' : undefined}>{state} {version}</span> },
         { label: 'refreshed', value: newest ? `${ago(new Date(newest).toISOString(), now)} ago` : '–' },
         { label: 'events', value: <span className={stream === 'open' ? undefined : stream === 'closed' ? 'c-wait' : 'faint'}>{stream}</span> },
+        { label: 'live', value: <span className={hub === 'open' ? undefined : hub === 'closed' ? 'c-wait' : 'faint'}>{hub}</span> },
         { label: '', value: fetching ? <span className="c-active pulse">fetching</span> : <span className="faint">idle</span> },
       ]}
     />

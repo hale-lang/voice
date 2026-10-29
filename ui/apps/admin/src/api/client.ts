@@ -32,6 +32,9 @@ export type UsageRecord = Schemas['UsageRecord'];
 export type UsageSummary = Schemas['UsageSummary'];
 export type Change = Schemas['Change'];
 export type CatalogModel = Schemas['CatalogModel'];
+export type Recipe = Schemas['Recipe'];
+export type Runtime = Schemas['Runtime'];
+export type Placement = Schemas['Placement'];
 
 type GetPaths = PathsWithMethod<paths, 'get'>;
 

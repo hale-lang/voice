@@ -4,6 +4,7 @@ import type { Tone } from '@hale/components';
 export function toneOf(status: string): Tone {
   switch (status) {
     case 'starting':
+    case 'fetching':
     case 'pending':
     case 'paused':
     case 'draining':

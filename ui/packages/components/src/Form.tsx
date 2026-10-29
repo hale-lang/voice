@@ -47,6 +47,21 @@ export function TextInput(props: { value: string; onChange: (v: string) => void;
   );
 }
 
+/** Several lines of text, such as a JSON document pasted whole. */
+export function TextArea(props: { value: string; onChange: (v: string) => void; mono?: boolean; placeholder?: string; required?: boolean; rows?: number }) {
+  return (
+    <textarea
+      className={`${s.input} ${props.mono ? s.mono : ''}`}
+      value={props.value}
+      onChange={(e) => props.onChange(e.target.value)}
+      placeholder={props.placeholder}
+      required={props.required}
+      rows={props.rows ?? 12}
+      spellCheck={false}
+    />
+  );
+}
+
 export function NumberInput(props: { value: number | null; onChange: (v: number | null) => void; min?: number; max?: number; step?: number; placeholder?: string; required?: boolean }) {
   return (
     <input

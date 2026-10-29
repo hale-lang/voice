@@ -11,8 +11,9 @@
 // configuration only: they are reserved against in the store's
 // reservation transaction, which comes with the Postgres store.
 //
-// The api serves its callers in turn, one request at a time: a request
-// holds the api until its seat answers.
+// The api serves its callers at once: each request waits on its own seat's
+// answer while others are admitted, served and streamed (data_plane.hl,
+// `infer`).
 //
 // With `"stream": true` the answer is the standard event stream, sent as
 // it comes (stream.hl). A request body is at most 12 MiB
@@ -287,11 +288,12 @@ locus Inference {
             n = n + 1;
             let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
             let t0 = std::time::monotonic_ns();
-            let mut o = self.link.offer(
+            let offer = self.link.offer(
                 c.seat.node,
                 reply_to,
                 serve_message(request_id, reply_to, c, r),
             );
+            let mut o = offer.ack();
             let mut ending = "";
             if o.ack == "accepted" {
                 st.output = false;
@@ -300,7 +302,7 @@ locus Inference {
                 let mut deadline = std::time::monotonic() + self.first;
                 let mut done = false;
                 while !done && std::time::monotonic() < deadline {
-                    let msg = self.link.next(1s);
+                    let msg = offer.next(1s);
                     if msg.kind == "event" {
                         o = take_event(o, msg.json);
                         if terminal(std::json::find_string_field(msg.json, "type")) {
@@ -332,7 +334,7 @@ locus Inference {
                     if out.gone {
                         // the caller went away: the seat is told to stop,
                         // and what it spent on the caller is told
-                        self.link.finish();
+                        offer.finish();
                         if st.output || o.output {
                             self.unfinished(
                                 r,
@@ -348,7 +350,7 @@ locus Inference {
                         return out.end();
                     }
                 }
-                self.link.finish();
+                offer.finish();
             }
             let ms = (std::time::monotonic_ns() - t0) / 1000000;
             if o.ack == "accepted"

@@ -56,7 +56,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
 }
 
 /** A list that may be none, any, or some names: `[]`, `null`, or the names. */
-type Scope = 'none' | 'any' | 'these' | 'parent';
+type Scope = 'none' | 'any' | 'these' | 'parent' | 'kept';
 const scopeOf = (v: string[] | null | undefined, empty: Scope): Scope => (v == null ? 'any' : v.length ? 'these' : empty);
 
 /** Projects in order, each followed by its children: a habitat's callers under it. */
@@ -71,10 +71,17 @@ function inTree(all: Project[]): Project[] {
   return out;
 }
 
+/** The projects that may be a parent of `of`: of no parent of their own, not archived, not `of`. */
+function parentsFor(all: Project[], of?: string): Project[] {
+  return all.filter((q) => !q.parent && q.status !== 'archived' && q.id !== of);
+}
+
 function CreateProject() {
   const w = useWrite();
+  const projects = useGet('/admin/v1/projects');
   const [id, setId] = useState('');
   const [name, setName] = useState('');
+  const [parent, setParent] = useState('');
   const [dataClasses, setDataClasses] = useState<string[]>(['internal']);
   const [accounts, setAccounts] = useState<string[]>([]);
   return (
@@ -83,7 +90,9 @@ function CreateProject() {
       <Form
         error={w.error}
         onSubmit={async () => {
-          const r = await w.write('post', '/admin/v1/projects', { body: { id, name, data_classes: dataClasses, accounts: accounts.length ? accounts : null } });
+          // a child with no accounts of its own inherits its parent's
+          const spends = parent ? (accounts.length ? { accounts } : {}) : { accounts: accounts.length ? accounts : null };
+          const r = await w.write('post', '/admin/v1/projects', { body: { id, name, data_classes: dataClasses, ...spends, ...(parent ? { parent } : {}) } });
           if (r) go('projects', id);
         }}
         actions={
@@ -99,10 +108,13 @@ function CreateProject() {
         <Field label="name" required>
           <TextInput value={name} onChange={setName} required />
         </Field>
+        <Field label="parent" help="a subproject of another; it inherits the parent's accounts unless given its own">
+          <Select value={parent} onChange={setParent} options={[{ value: '', label: 'none: a project of its own' }, ...parentsFor(projects.data?.data ?? []).map((q) => ({ value: q.id, label: q.id }))]} />
+        </Field>
         <Field label="data classes" help="what this project may send; comma-separated">
           <ListInput value={dataClasses} onChange={setDataClasses} />
         </Field>
-        <Field label="accounts" help="what it may spend; empty for any. Client work names the work account here.">
+        <Field label="accounts" help={parent ? `what it may spend; empty for ${parent}'s, inherited` : 'what it may spend; empty for any. Client work names the work account here.'}>
           <ListInput mono value={accounts} onChange={setAccounts} placeholder="claude-work" />
         </Field>
       </Form>
@@ -118,8 +130,11 @@ function ProjectInspector({ project: p }: { project: Project }) {
   const [modelScope, setModelScope] = useState<Scope>(scopeOf(p.models, 'none'));
   const [modelNames, setModelNames] = useState<string[]>(p.models ?? []);
   const known = useGet('/admin/v1/accounts');
-  // a child (a habitat's organism) may inherit its parent's accounts
-  const child = Boolean(p.parent);
+  const projects = useGet('/admin/v1/projects');
+  const [parent, setParent] = useState(p.parent ?? '');
+  // a child may inherit its parent's accounts; a parent cannot become one
+  const child = Boolean(parent);
+  const isParent = (projects.data?.data ?? []).some((q) => q.parent === p.id);
   const [allowance, setAllowance] = useState<number | null>(p.budget ? p.budget.allowance_micros / 1e6 : null);
   const [period, setPeriod] = useState<'day' | 'week' | 'month' | 'none'>(p.budget?.period ?? 'month');
   const [limits, setLimits] = useState<Limit[]>(p.limits ?? []);
@@ -130,6 +145,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
     setLimits(p.limits ?? []);
     setAccountScope(p.inherits ? 'parent' : scopeOf(p.accounts, 'none'));
     setAccountNames(p.accounts ?? []);
+    setParent(p.parent ?? '');
     setModelScope(scopeOf(p.models, 'none'));
     setModelNames(p.models ?? []);
   }, [p]);
@@ -159,9 +175,14 @@ function ProjectInspector({ project: p }: { project: Project }) {
             const r = await w.write('patch', '/admin/v1/projects/{project}', {
               params: { path: { project: p.id } },
               body: {
+                // its parent first: made a project of its own, it keeps
+                // what it spent unless given accounts here
+                ...(parent !== (p.parent ?? '') ? { parent: parent || null } : {}),
                 // a child set to its parent's inherits them; any accounts of
                 // its own narrow it
-                ...(accountScope === 'parent'
+                ...(accountScope === 'kept'
+                  ? {}
+                  : accountScope === 'parent'
                   ? { inherits: true }
                   : { accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames }),
                 models: modelScope === 'any' ? null : modelScope === 'none' ? [] : modelNames,
@@ -176,8 +197,21 @@ function ProjectInspector({ project: p }: { project: Project }) {
             </>
           }
         >
+          <Field label="parent" help={isParent ? `${p.id} is a parent, so it stays a project of its own` : 'a subproject; set it to inherit to spend the parent\u2019s accounts'}>
+            <Select
+              value={parent}
+              onChange={(v) => {
+                setParent(v);
+                // made a project of its own, it keeps what it spends now
+                // (the server copies its parent's) unless set otherwise
+                if (!v && accountScope === 'parent') setAccountScope('kept');
+                if (v && accountScope === 'kept') setAccountScope('parent');
+              }}
+              options={isParent ? [{ value: '', label: 'none: a project of its own' }] : [{ value: '', label: 'none: a project of its own' }, ...parentsFor(projects.data?.data ?? [], p.id).map((q) => ({ value: q.id, label: q.id }))]}
+            />
+          </Field>
           <Field label="accounts it may spend" help={(known.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ') || 'no account yet: create one on Accounts'}>
-            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(child ? [{ value: 'parent', label: `${p.parent}'s (inherit)` }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(child ? [{ value: 'parent', label: `${parent}'s (inherit)` }] : []), ...(accountScope === 'kept' ? [{ value: 'kept', label: 'what it spends now (kept)' }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
           </Field>
           {accountScope === 'these' && (
             <Field label="accounts">

@@ -1,0 +1,108 @@
+// A subproject: made with a parent, it inherits the parent's accounts unless
+// given its own; one level deep; moved under a parent or made a project of
+// its own again, keeping what it spent.
+import ".." as api;
+import "../../store" as st;
+
+fn main() {
+    let store = st::MemoryStore { };
+    let projects = api::Projects { store: store };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+    let mut team = api::ProjectCreate { id: "team", name: "Team", has_accounts: true };
+    push(team.accounts, "local") or discard;
+    projects.create(team) or discard;
+
+    let web = projects.create(
+        api::ProjectCreate { id: "web", name: "Web", has_parent: true, parent: "team" },
+    ) or api::Project { status: api::Lifecycle::active };
+    std::test::assert(
+        web.parent == "team" && web.inherits,
+        "a subproject inherits its parent's accounts",
+    );
+    let ml = projects.create(
+        api::ProjectCreate {
+            id: "ml",
+            name: "ML",
+            has_parent: true,
+            parent: "team",
+            has_accounts: true,
+        },
+    ) or api::Project { status: api::Lifecycle::active };
+    std::test::assert(ml.parent == "team" && !ml.inherits, "given its own, it spends those");
+
+    let mut why = "";
+    projects.create(
+        api::ProjectCreate { id: "deep", name: "Deep", has_parent: true, parent: "web" },
+    ) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(why, "is itself a child of team"),
+        "one level deep: " + why,
+    );
+    why = "";
+    projects.create(
+        api::ProjectCreate { id: "lost", name: "Lost", has_parent: true, parent: "nope" },
+    ) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert_eq_str(why, "no project nope", "a parent that is not");
+    why = "";
+    projects.update(api::ProjectUpdate { project: "team", has_parent: true, parent: "team" }) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert_eq_str(why, "a project is not its own parent", "not its own");
+    projects.create(api::ProjectCreate { id: "solo", name: "Solo" }) or discard;
+    why = "";
+    projects.update(api::ProjectUpdate { project: "team", has_parent: true, parent: "solo" }) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(why, "is the parent of"),
+        "a parent does not become a child: " + why,
+    );
+
+    // moved under a parent and set to inherit in one change
+    let moved = projects.update(
+        api::ProjectUpdate {
+            project: "solo",
+            has_parent: true,
+            parent: "team",
+            has_inherits: true,
+            inherits: true,
+        },
+    ) or api::Project { status: api::Lifecycle::active };
+    std::test::assert(
+        moved.parent == "team" && moved.inherits,
+        "moved, it may inherit in the same change",
+    );
+    // made a project of its own, it keeps what it spent
+    let own = projects.update(
+        api::ProjectUpdate { project: "web", clear_parent: true },
+    ) or api::Project { status: api::Lifecycle::active };
+    std::test::assert(len(own.parent) == 0 && !own.inherits, "a project of its own again");
+    let mut kept = "";
+    for a in own.accounts { kept = kept + a; }
+    std::test::assert_eq_str(kept, "local", "keeping the accounts it spent");
+    if len(api::habitat_project()) > 0 {
+        projects.create(
+            api::ProjectCreate { id: api::habitat_project(), name: "habitat" },
+        ) or discard;
+        why = "";
+        projects.update(
+            api::ProjectUpdate {
+                project: api::habitat_project(),
+                has_parent: true,
+                parent: "team",
+            },
+        ) or {
+            why = api::ctl_message(err);
+        };
+        std::test::assert(
+            std::str::contains(why, "is the habitat's own"),
+            "the habitat's own project stays one of its own: " + why,
+        );
+    }
+}

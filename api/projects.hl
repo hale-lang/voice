@@ -2,6 +2,10 @@
 // the admin plane, and the caller plane's bearer: the project key a
 // request presents. Every write records its change.
 
+/// What every change of a project's parent holds (store.hold), on every api
+/// instance, from its check to its write.
+const HIERARCHY: String = "projects/hierarchy";
+
 locus Projects {
     params {
         store: st::Store;
@@ -84,7 +88,24 @@ locus Projects {
         if count(row.data_classes.items) == 0 {
             push(row.data_classes.items, "internal") or discard;
         }
-        let v = self.view(row) or raise;
+        if c.has_parent {
+            // the hierarchy is held from this check to the project's write
+            self.store.hold(HIERARCHY) or fail store_down(err);
+            self.check_parent(c.id, c.parent) or {
+                self.store.let_go();
+                fail err;
+            };
+            row.parent = c.parent;
+            // with no accounts of its own, it spends its parent's
+            if !c.has_accounts {
+                row.inherits = true;
+                row.accounts = st::Restriction { any: false };
+            }
+        }
+        let v = self.view(row) or {
+            self.store.let_go();
+            fail err;
+        };
         let added = self.store.insert_project(
             row,
             checked_change("create", "projects/" + c.id, "", project_json(v)) or raise,
@@ -136,7 +157,12 @@ locus Projects {
                 "limits"
             );
         }
-        self.store.hold("projects/" + u.project) or fail store_down(err);
+        // a change of its parent holds the hierarchy too, so no two changes
+        // on any api instance make a cycle or a second level between them
+        self.store.hold(
+            "projects/" + u.project
+                + (if u.has_parent || u.clear_parent { "\n" + HIERARCHY } else { "" }),
+        ) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;
@@ -156,6 +182,19 @@ locus Projects {
         if u.has_owners { row.owners.items = u.owners; }
         if u.has_data_classes { row.data_classes.items = u.data_classes; }
         if u.has_models || u.clear_models { row.models = restriction_of(u.has_models, u.models); }
+        // its parent first, so the same change may make it inherit
+        if u.has_parent {
+            self.check_parent(row.id, u.parent) or raise;
+            row.parent = u.parent;
+        } else if u.clear_parent && len(row.parent) > 0 {
+            // made a project of its own, it keeps what it spent
+            if row.inherits {
+                let was = as_in_force(self.store, row) or fail store_down(err);
+                row.accounts = was.accounts;
+                row.inherits = false;
+            }
+            row.parent = "";
+        }
         if u.has_accounts || u.clear_accounts {
             row.accounts = accounts_restriction(u.has_accounts, u.accounts) or raise;
             // a child given accounts of its own is narrowed: it no longer
@@ -193,6 +232,43 @@ locus Projects {
             ) or raise,
         ) or fail store_down(err);
         return after;
+    }
+
+    /// Refused unless `parent` may be `id`'s: a project, not archived, not
+    /// `id` itself, and of no parent of its own, with `id` a parent of none
+    /// (one level: a habitat and its callers, a team and its projects).
+    fn check_parent(id: String, parent: String) -> Bool fallible(CtlError) {
+        if parent == id { fail bad("a project is not its own parent", "parent"); }
+        // the habitat's own project is its callers' parent: it is one of its
+        // own, so each it makes stays one level down (tenants.hl)
+        if id == habitat_project() {
+            fail bad(
+                "project " + id
+                    + " is the habitat's own, the parent of its callers: it is a project of its own",
+                "parent"
+            );
+        }
+        let p = self.store.project(parent) or fail store_down(err);
+        if !p.present { fail bad("no project " + parent, "parent"); }
+        if p.archived { fail bad("project " + parent + " is archived", "parent"); }
+        if len(p.parent) > 0 {
+            fail bad(
+                "project " + parent + " is itself a child of " + p.parent
+                    + ": a parent is a project of its own",
+                "parent"
+            );
+        }
+        let all = self.store.projects() or fail store_down(err);
+        for r in all.rows {
+            if r.parent == id {
+                fail bad(
+                    "project " + id + " is the parent of " + r.id
+                        + ": a parent is a project of its own",
+                    "parent"
+                );
+            }
+        }
+        return true;
     }
 
     /// `archiveProject`: its keys are revoked and it refuses new requests;

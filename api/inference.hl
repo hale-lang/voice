@@ -164,6 +164,8 @@ locus Inference {
         let request_id = "resp_" + id_hex;
         let mut attempts = Attempts { };
         let mut why = "";
+        // whether every seat that failed it did so for its length
+        let mut all_overflow = true;
         let mut n = 0;
         for c in candidates.items {
             // each attempt answers on a subject of its own, so a seat left
@@ -218,7 +220,13 @@ locus Inference {
                     wall_ms: ms,
                 },
             ) or discard;
-            if o.output || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable) {
+            // a seat whose window the request overflows: another may hold
+            // it, so the next is tried
+            let overflow = context_overflow(reason);
+            if !overflow { all_overflow = false; }
+            if o.output
+                || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
+            {
                 if o.output {
                     self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
                 }
@@ -231,6 +239,9 @@ locus Inference {
                     voice: attempts_voice(request_id, attempts.items),
                 };
             }
+        }
+        if all_overflow && count(attempts.items) > 0 {
+            fail too_long(why, attempts_voice(request_id, attempts.items));
         }
         fail ApiError {
             status: 502,
@@ -283,6 +294,8 @@ locus Inference {
         // attempts already told the caller (`voice:attempt`)
         let mut told = 0;
         let mut why = "";
+        // whether every seat that failed it did so for its length
+        let mut all_overflow = true;
         let mut n = 0;
         for c in candidates.items {
             n = n + 1;
@@ -397,9 +410,13 @@ locus Inference {
                     wall_ms: ms,
                 },
             ) or discard;
+            // a seat whose window the request overflows: another may hold
+            // it, so the next is tried
+            let overflow = context_overflow(reason);
+            if !overflow { all_overflow = false; }
             if st.output
                 || o.output
-                || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable)
+                || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
             {
                 if st.output || o.output {
                     self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
@@ -431,13 +448,18 @@ locus Inference {
                 };
             }
         }
+        let overflowed = all_overflow && count(attempts.items) > 0;
         if out.opened {
             let last = at(candidates.items, count(candidates.items) - 1) or Candidate { };
             fail_stream(
                 out,
                 st,
-                "upstream_failed",
-                "every eligible seat failed; the last, " + why,
+                if overflowed { "context_length_exceeded" } else { "upstream_failed" },
+                if overflowed {
+                    too_long_message(why)
+                } else {
+                    "every eligible seat failed; the last, " + why
+                },
                 failed_voice(
                     request_id,
                     k,
@@ -448,6 +470,9 @@ locus Inference {
                 ),
             );
             return out.end();
+        }
+        if all_overflow && count(attempts.items) > 0 {
+            fail too_long(why, attempts_voice(request_id, attempts.items));
         }
         fail ApiError {
             status: 502,
@@ -992,6 +1017,35 @@ fn key_hash(s: String) -> Int {
         i = i + 1;
     }
     return h % 2147483648;
+}
+
+/// True when a seat refused a request for its length: llama-server's
+/// "exceeds the available context size", vLLM's "maximum context length",
+/// or an OpenAI upstream's `context_length_exceeded`.
+fn context_overflow(reason: String) -> Bool {
+    return std::str::contains(reason, "exceeds the available context size")
+        || std::str::contains(reason, "maximum context length")
+        || std::str::contains(reason, "context_length_exceeded");
+}
+
+/// The caller's request overflowed the window of every seat that tried it:
+/// its error, to shorten or compact the conversation, not to retry it.
+fn too_long(why: String, voice: ErrorVoice) -> ApiError {
+    return ApiError {
+        status: 400,
+        kind: "invalid_request_error",
+        code: ErrorCode::context_length_exceeded,
+        message: too_long_message(why),
+        has_param: true,
+        param: "messages",
+        has_voice: true,
+        voice: voice,
+    };
+}
+
+fn too_long_message(why: String) -> String {
+    return "the request is longer than any seat's context window allows (voice.context_length on /v1/models); the last, "
+        + why;
 }
 
 /// A member of a request the coordinator keeps from the seat.

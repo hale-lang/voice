@@ -233,7 +233,19 @@ locus Inference {
                 || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
             {
                 if o.output {
-                    self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        "",
+                    );
                 }
                 fail ApiError {
                     status: 502,
@@ -363,6 +375,9 @@ locus Inference {
                                 "cancelled",
                                 started,
                                 attempts.items,
+                                candidates.peek,
+                                "the caller went away",
+                                out.text_so_far(),
                             );
                         }
                         return out.end();
@@ -424,7 +439,19 @@ locus Inference {
                 || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
             {
                 if st.output || o.output {
-                    self.unfinished(r, request_id, k, m, c, "failed", started, attempts.items);
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        out.text_so_far(),
+                    );
                 }
                 if out.opened {
                     fail_stream(
@@ -499,8 +526,38 @@ locus Inference {
         c: Candidate,
         status: String,
         started: Int,
-        attempts: bounded[Attempt; 8]
+        attempts: bounded[Attempt; 8],
+        peek: Bool,
+        why: String,
+        partial: String
     ) {
+        // a request that peeks is recorded however it ends: here, what it
+        // was asked, how it ended and why, and the text it had streamed
+        if peek {
+            self.store.put_peek(
+                st::PeekRow {
+                    request_id: request_id,
+                    project: k.project,
+                    key: k.id,
+                    model: r.model,
+                    created_at: now_seconds(),
+                    input: r.body,
+                    output: "{\"id\": " + jq(request_id) + ", \"status\": " + jq(status)
+                        + ", \"error\": " + jq(why) + ", \"output\": "
+                        + (if len(partial) > 0 {
+                            "[{\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": "
+                                + jq(partial) + "}]}]"
+                        } else {
+                            "[]"
+                        }) + "}",
+                },
+            ) or {
+                log_error(
+                    "a peeked request could not be recorded",
+                    std::log::kv("request", request_id),
+                );
+            };
+        }
         self.record(
             unfinished_row(
                 r,

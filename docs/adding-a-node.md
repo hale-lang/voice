@@ -59,8 +59,9 @@ It:
   a Claude account's token and `claude` is on PATH; and, on a machine it
   shares, the memory left for models (`hardware.model_memory_bytes`): in a
   habitat, the machine's less what the habitat said its own services may
-  take there (`HALE_DNA_HOST_RESERVED_BYTES`); outside one, less 8 GiB for
-  the coordinator when `--api` is on this machine (localhost);
+  take there (`HALE_DNA_HOST_RESERVED_BYTES`), or less 8 GiB from a hale
+  that does not say; outside one, less 8 GiB for the coordinator when
+  `--api` is on this machine (localhost);
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a

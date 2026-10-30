@@ -639,3 +639,16 @@ update project p set inherits = true
   where p.accounts = '{}'
     and exists (select 1 from api_key k where k.project = p.id and k.prefix = 'tenant');
 ```
+
+### Migration 14: a project's parent
+
+The habitat is a project like any customer, `habitat-<name>`, and each of
+its organisms' tenants a child of it, inheriting its accounts live until an
+operator narrows it. The api makes the habitat's project the first time it
+knows the habitat's name (`HALE_DNA_HABITAT_NAME`), with migration 13's grant
+as its accounts, and makes it the parent of every inheriting tenant that has
+none; migration 13's table is read for that alone.
+
+```sql
+alter table project add column parent text references project;
+```

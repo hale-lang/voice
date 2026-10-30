@@ -31,16 +31,16 @@ export function Projects({ route, setInspector }: ScreenProps) {
       <h1>Projects</h1>
       <Panel title="Projects" readout={readout(q, `${q.data.data.length} projects`)}>
         <Table<Project>
-          rows={q.data.data}
+          rows={inTree(q.data.data)}
           rowKey={(p) => p.id}
           selectedKey={selected}
           onSelect={(p) => go('projects', p.id)}
           columns={[
-            { key: 'id', header: 'Project', render: (p) => <Mono>{p.id}</Mono> },
+            { key: 'id', header: 'Project', render: (p) => (p.parent ? <><span className="faint">↳ </span><Mono>{p.id}</Mono></> : <Mono>{p.id}</Mono>) },
             { key: 'name', header: 'Name', render: (p) => p.name },
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
-            { key: 'accounts', header: 'Accounts', render: (p) => (p.inherits ? <span className="muted">the habitat's</span> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
+            { key: 'accounts', header: 'Accounts', render: (p) => (p.inherits ? <span className="muted">{p.parent}'s</span> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
             { key: 'spent', header: 'Spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
             { key: 'budget', header: 'Allowance', num: true, render: (p) => (p.budget ? `${micros(p.budget.allowance_micros, p.budget.currency)} / ${p.budget.period}` : '') },
           ]}
@@ -56,8 +56,20 @@ export function Projects({ route, setInspector }: ScreenProps) {
 }
 
 /** A list that may be none, any, or some names: `[]`, `null`, or the names. */
-type Scope = 'none' | 'any' | 'these' | 'habitat';
+type Scope = 'none' | 'any' | 'these' | 'parent';
 const scopeOf = (v: string[] | null | undefined, empty: Scope): Scope => (v == null ? 'any' : v.length ? 'these' : empty);
+
+/** Projects in order, each followed by its children: a habitat's callers under it. */
+function inTree(all: Project[]): Project[] {
+  const ids = new Set(all.map((p) => p.id));
+  const out: Project[] = [];
+  for (const p of all) {
+    if (p.parent && ids.has(p.parent)) continue;
+    out.push(p);
+    for (const c of all) if (c.parent === p.id) out.push(c);
+  }
+  return out;
+}
 
 function CreateProject() {
   const w = useWrite();
@@ -101,13 +113,13 @@ function CreateProject() {
 function ProjectInspector({ project: p }: { project: Project }) {
   const w = useWrite();
   const [mode, setMode] = useState<'view' | 'budget' | 'limits' | 'access'>('view');
-  const [accountScope, setAccountScope] = useState<Scope>(p.inherits ? 'habitat' : scopeOf(p.accounts, 'none'));
+  const [accountScope, setAccountScope] = useState<Scope>(p.inherits ? 'parent' : scopeOf(p.accounts, 'none'));
   const [accountNames, setAccountNames] = useState<string[]>(p.accounts ?? []);
   const [modelScope, setModelScope] = useState<Scope>(scopeOf(p.models, 'none'));
   const [modelNames, setModelNames] = useState<string[]>(p.models ?? []);
   const known = useGet('/admin/v1/accounts');
-  // a tenant (an organism of voice's habitat) may inherit the habitat's grant
-  const tenant = p.inherits || p.id.startsWith('tenant-');
+  // a child (a habitat's organism) may inherit its parent's accounts
+  const child = Boolean(p.parent);
   const [allowance, setAllowance] = useState<number | null>(p.budget ? p.budget.allowance_micros / 1e6 : null);
   const [period, setPeriod] = useState<'day' | 'week' | 'month' | 'none'>(p.budget?.period ?? 'month');
   const [limits, setLimits] = useState<Limit[]>(p.limits ?? []);
@@ -116,7 +128,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
     setAllowance(p.budget ? p.budget.allowance_micros / 1e6 : null);
     setPeriod(p.budget?.period ?? 'month');
     setLimits(p.limits ?? []);
-    setAccountScope(p.inherits ? 'habitat' : scopeOf(p.accounts, 'none'));
+    setAccountScope(p.inherits ? 'parent' : scopeOf(p.accounts, 'none'));
     setAccountNames(p.accounts ?? []);
     setModelScope(scopeOf(p.models, 'none'));
     setModelNames(p.models ?? []);
@@ -134,7 +146,8 @@ function ProjectInspector({ project: p }: { project: Project }) {
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
           { k: 'models', v: p.models ? (p.models.length ? p.models.join(', ') : <span className="c-wait">none</span>) : 'the whole catalog' },
-          { k: 'accounts', v: p.inherits ? <>the habitat's <a href="#/habitat">(Habitat)</a></> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
+          ...(p.parent ? [{ k: 'parent', v: <a href={`#/projects/${p.parent}`}><Mono>{p.parent}</Mono></a> }] : []),
+          { k: 'accounts', v: p.inherits ? <>{p.parent}'s, inherited</> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
           { k: 'position', v: p.position ?? '–' },
           { k: 'created', v: when(p.created_at) },
         ]}
@@ -146,9 +159,9 @@ function ProjectInspector({ project: p }: { project: Project }) {
             const r = await w.write('patch', '/admin/v1/projects/{project}', {
               params: { path: { project: p.id } },
               body: {
-                // a tenant set to the habitat's inherits it; any accounts of
+                // a child set to its parent's inherits them; any accounts of
                 // its own narrow it
-                ...(accountScope === 'habitat'
+                ...(accountScope === 'parent'
                   ? { inherits: true }
                   : { accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames }),
                 models: modelScope === 'any' ? null : modelScope === 'none' ? [] : modelNames,
@@ -164,7 +177,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
           }
         >
           <Field label="accounts it may spend" help={(known.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ') || 'no account yet: create one on Accounts'}>
-            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(tenant ? [{ value: 'habitat', label: "the habitat's (inherit)" }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(child ? [{ value: 'parent', label: `${p.parent}'s (inherit)` }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
           </Field>
           {accountScope === 'these' && (
             <Field label="accounts">

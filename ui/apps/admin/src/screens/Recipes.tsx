@@ -5,6 +5,7 @@ import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
+import { tokens } from '../context';
 
 type Variant = Recipe['variants'][number];
 
@@ -36,6 +37,7 @@ export function Recipes({ route, setInspector }: ScreenProps) {
             { key: 'id', header: 'Recipe', render: (r) => <Mono>{r.id}</Mono> },
             { key: 'origin', header: 'Origin', render: (r) => r.origin },
             { key: 'license', header: 'License', render: (r) => r.license.name },
+            { key: 'ctx', header: 'Context', num: true, render: (r) => (r.context_length ? tokens(r.context_length) : <span className="faint">–</span>) },
             { key: 'variants', header: 'Variants', render: (r) => r.variants.map((v) => `${v.id} (${v.format})`).join(', ') },
             { key: 'size', header: 'Smallest', num: true, render: (r) => bytes(Math.min(...r.variants.map(size))) },
           ]}
@@ -79,6 +81,7 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
       <Kv
         rows={[
           { k: 'origin', v: r.origin === 'shipped' ? 'shipped with voice' : 'allowed by the operator' },
+          { k: 'context', v: r.context_length ? `${r.context_length.toLocaleString()} tokens, made for` : '–' },
           { k: 'license', v: r.license.url ? <a href={r.license.url} target="_blank" rel="noreferrer">{r.license.name}</a> : r.license.name },
           ...(r.created_at ? [{ k: 'allowed', v: when(r.created_at) }] : []),
         ]}

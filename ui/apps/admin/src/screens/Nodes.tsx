@@ -7,6 +7,7 @@ import type { ScreenProps } from '../App';
 import { href, go } from '../route';
 import { readout } from '../readout';
 import { toneOf } from '../tone';
+import { ContextWindow } from '../context';
 
 type Seat = Schemas['Seat'];
 
@@ -104,6 +105,7 @@ function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh
           { key: 'assigned', header: 'Assigned', render: (s) => (s.enabled === false ? 'disabled' : `enabled · ${s.concurrency ?? 1} at once`) },
           { key: 'reported', header: 'Reported', render: (s) => <Status tone={toneOf(s.status)} label={reported(s)} title={s.reason ?? undefined} /> },
           { key: 'reason', header: 'Reason', wrap: true, render: (s) => s.reason ?? (s.problems.length ? <span className="c-wait">{s.problems.join('; ')}</span> : <span className="faint">–</span>) },
+          { key: 'ctx', header: 'Context', num: true, render: (s) => <ContextWindow served={s.context} native={nativeOf(s)} /> },
           { key: 'flight', header: 'In flight', num: true, render: (s) => s.in_flight },
         ]}
         empty="No seats assigned to this node."
@@ -301,6 +303,12 @@ function CapExplained({ node }: { node: Node }) {
   );
 }
 
+/** The context a placed seat's model is made for, from the config its placement gave it. */
+function nativeOf(s: SeatView): number | undefined {
+  const n = (s.config as { context_length?: unknown } | undefined)?.context_length;
+  return typeof n === 'number' ? n : undefined;
+}
+
 function SeatInspector({ node, seat }: { node: Node; seat: SeatView }) {
   const w = useWrite();
   const [editing, setEditing] = useState(false);
@@ -322,6 +330,7 @@ function SeatInspector({ node, seat }: { node: Node; seat: SeatView }) {
           { k: 'serves', v: seat.serves.map((m) => <div key={m.model}>{m.model}{m.as ? <span className="muted"> as {m.as}</span> : null}</div>) },
           { k: 'data classes', v: (seat.data_classes ?? ['internal']).join(', ') },
           { k: 'assigned', v: seat.enabled === false ? 'disabled' : `enabled · ${seat.concurrency ?? 1} at once` },
+          { k: 'context', v: seat.context ? <ContextWindow served={seat.context} native={nativeOf(seat)} /> : nativeOf(seat) ? <span className="faint">not said yet; made for {nativeOf(seat)!.toLocaleString()}</span> : '–' },
           { k: 'in flight', v: seat.in_flight },
           { k: 'config', v: <Mono>{JSON.stringify(seat.config ?? {})}</Mono> },
         ]}

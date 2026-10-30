@@ -5,6 +5,7 @@ import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
+import { ContextWindow } from '../context';
 
 /** The catalog: what callers may name, with its price. */
 export function Catalog({ route, setInspector }: ScreenProps) {
@@ -33,7 +34,7 @@ export function Catalog({ route, setInspector }: ScreenProps) {
           columns={[
             { key: 'id', header: 'Model', render: (m) => <Mono>{m.id}</Mono> },
             { key: 'kind', header: 'Kind', render: (m) => `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}` },
-            { key: 'ctx', header: 'Context', num: true, render: (m) => m.context_length?.toLocaleString() ?? '–' },
+            { key: 'ctx', header: 'Context', num: true, render: (m) => <ContextWindow served={m.served_context_length} native={m.context_length} /> },
             { key: 'out', header: 'Max out', num: true, render: (m) => m.max_output_tokens?.toLocaleString() ?? '–' },
             { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => (m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} · ${micros(m.price.output_per_mtok_micros, m.price.currency)}` : <span className="faint">free</span>) },
             { key: 'seats', header: 'Seats', num: true, render: (m) => m.seats.length },
@@ -96,7 +97,7 @@ function ModelForm({ model }: { model?: CatalogModel }) {
         <Field label="owned by" help="the provider, or local">
           <TextInput value={ownedBy} onChange={setOwnedBy} />
         </Field>
-        <Field label="context length">
+        <Field label="context length" help="tokens the model is made for; one made from a recipe takes the recipe's when left empty">
           <NumberInput value={ctx} onChange={setCtx} min={1} />
         </Field>
         <Field label="max output tokens" help="the default and maximum; reserved when a request sets none">
@@ -127,7 +128,8 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
         rows={[
           { k: 'kind', v: `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}` },
           { k: 'recipe', v: m.recipe ? <a href={href('recipes', m.recipe)}><Mono>{m.recipe}</Mono></a> : '–' },
-          { k: 'context', v: m.context_length?.toLocaleString() ?? '–' },
+          { k: 'context', v: m.context_length ? `${m.context_length.toLocaleString()} tokens, made for` : '–' },
+          { k: 'served', v: m.served_context_length ? <ContextWindow served={m.served_context_length} native={m.context_length} /> : <span className="faint">no seat has said</span> },
           { k: 'max output', v: m.max_output_tokens?.toLocaleString() ?? '–' },
           { k: 'price', v: m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },
           { k: 'available', v: m.available ? 'yes' : <span className="c-wait">no seat serves it</span> },

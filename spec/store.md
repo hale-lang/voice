@@ -652,3 +652,13 @@ none; migration 13's table is read for that alone.
 ```sql
 alter table project add column parent text references project;
 ```
+
+### Migration 15: the context a seat serves
+
+A managed seat's server reports the context, in tokens, it took once it
+answers (`SeatState.context` in the protocol); the seat's state keeps it,
+null until it says.
+
+```sql
+alter table seat_state add column context integer;
+```

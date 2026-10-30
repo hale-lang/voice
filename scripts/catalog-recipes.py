@@ -302,6 +302,13 @@ def recipe_id(model):
     return re.sub(r"[^a-z0-9.-]+", "-", model.split("/", 1)[1].lower()).strip("-.")[:63]
 
 
+def native_context(cfg):
+    """The longest context the model is made for, from its config (max_position_embeddings); None when it does not say."""
+    c = {**cfg, **(cfg.get("text_config") or {})}
+    n = c.get("max_position_embeddings")
+    return n if isinstance(n, int) and n > 0 else None
+
+
 def kv_bytes(cfg, ctx):
     """The KV cache for ctx tokens at 16 bits, from a model's config. None when the config does not say."""
     c = {**cfg, **(cfg.get("text_config") or {})}
@@ -508,7 +515,11 @@ def resolve(model, quants, arches, tag, registry, types, limits):
     recipe = None
     if variants:
         rid = recipe_id(model)
-        recipe = {"id": rid, "license": {"name": lic_name, "url": lic_url}, "variants": variants}
+        recipe = {"id": rid, "license": {"name": lic_name, "url": lic_url}}
+        native = native_context(cfg)
+        if native:
+            recipe["context_length"] = native
+        recipe["variants"] = variants
         size = len(api_json(recipe).encode())
         if size > limits["recipe"]:
             notes.append(f"the recipe is {size} bytes as JSON, the api allows {limits['recipe']}")

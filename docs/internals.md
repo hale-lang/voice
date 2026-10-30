@@ -265,6 +265,20 @@ hale test api
 A live call to every endpoint validates against the spec
 (`spec/validate`).
 
+
+### Peek
+
+A project or a key may **peek** (`peek` on either, set in its inspector): each
+request it sends is recorded whole, the standard request as it was served and
+the final response, reasoning included, when the request settles
+([`api/peek.hl`](../api/peek.hl)). A request is recorded when its project or
+its key peeks; admission decides it once. The operator reads recordings with
+`listPeeks` and `getPeek` (the admin UI's Peek screen); each is kept seven
+days, the older ones deleted as new ones are written. A recording's request
+and response are the JSON documents they were, as text, since they may be far
+larger than a JSON value on the typed surface holds. Off unless set: recording
+is the operator's choice per project or key, whatever its data class.
+
 ### The surface's bundle
 
 [`api/bundle/`](../api/bundle/) is `hale api export --surface Voice` of the

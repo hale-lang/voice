@@ -1,0 +1,96 @@
+// Peek: a project or key that peeks has each request it sends recorded
+// whole, its standard request as it was served and its final response
+// (reasoning and all), for the operator to read here. Off unless set on the
+// project or the key (`peek`); kept seven days (store `PEEK_DAYS`). A
+// recording's request and response are the JSON documents they were, as
+// text: they may be far larger than a JSON value here holds.
+
+/// `listPeeks`: a project's, or a key's within it; all when neither.
+type PeekAsk {
+    project: String = "";
+    key: String = "";
+    limit: Int = -1;
+}
+
+/// A recorded request, listed: its bodies are read with `getPeek`.
+type PeekSummary {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type PeekList { data: bounded[PeekSummary; 200]; }
+
+type PeekRef { request_id: String; }
+
+/// `Peek`: a recorded request whole.
+type Peek {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    // the standard request as it was served, and the final response, each
+    // a JSON document as text
+    input: String = "";
+    output: String = "";
+}
+
+locus Peeks {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `listPeeks`: newest first, at most `limit` (50 by default, 200 at most).
+    fn list(a: PeekAsk) -> PeekList fallible(CtlError) {
+        self.gate.enter();
+        let rows = self.store.peeks(a.project, a.key, if a.limit < 1 { 50 } else { a.limit }) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = PeekList { };
+        for r in rows.rows {
+            push(
+                out.data,
+                PeekSummary {
+                    request_id: r.request_id,
+                    project: r.project,
+                    key: r.key,
+                    model: r.model,
+                    created_at: r.created_at,
+                },
+            ) or discard;
+        }
+        return out;
+    }
+
+    /// `getPeek`.
+    fn get(r: PeekRef) -> Peek fallible(CtlError) {
+        self.gate.enter();
+        let row = self.store.peek(r.request_id) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        if !row.present {
+            fail missing(
+                "no recording of request " + r.request_id
+                    + ": it was not peeked, or is past seven days"
+            );
+        }
+        return Peek {
+            request_id: row.request_id,
+            project: row.project,
+            key: row.key,
+            model: row.model,
+            created_at: row.created_at,
+            input: row.input,
+            output: row.output,
+        };
+    }
+}

@@ -105,7 +105,12 @@ type Served {
 /// One seat a request could be offered, and its own name for the model.
 type Candidate { seat: st::SeatRow = st::SeatRow { }; engine_name: String = ""; }
 
-type Candidates { items: bounded[Candidate; 8]; serving: Int = 0; }
+type Candidates {
+    items: bounded[Candidate; 8];
+    serving: Int = 0;
+    // its project or its key peeks: the request is recorded whole (peek.hl)
+    peek: Bool = false;
+}
 
 locus Inference {
     params {
@@ -205,7 +210,7 @@ locus Inference {
                     attempts.items,
                     (std::time::monotonic_ns() - started) / 1000000,
                 );
-                self.settled(r, s);
+                self.settled(r, s, candidates.peek);
                 return s;
             }
             let reason = failure_of(o);
@@ -395,7 +400,7 @@ locus Inference {
                     (std::time::monotonic_ns() - started) / 1000000,
                 );
                 finish_stream(out, st, ending, s);
-                self.settled(r, s);
+                self.settled(r, s, candidates.peek);
                 return out.end();
             }
             let reason = failure_of(o);
@@ -624,8 +629,28 @@ locus Inference {
     /// A request a seat served: its row written, and its usage told to the organization, when
     /// voice is attached to one: handed to the teller (teller.hl), never
     /// waited on.
-    fn settled(r: InferenceRequest, s: Served) {
+    fn settled(r: InferenceRequest, s: Served, peek: Bool) {
         self.record(served_usage(r, s));
+        // a project or key that peeks has it recorded whole: the standard
+        // request as it was served, and the final response, reasoning and all
+        if peek {
+            self.store.put_peek(
+                st::PeekRow {
+                    request_id: s.request_id,
+                    project: s.voice.project,
+                    key: s.voice.key,
+                    model: r.model,
+                    created_at: now_seconds(),
+                    input: r.body,
+                    output: s.response,
+                },
+            ) or {
+                log_error(
+                    "a peeked request could not be recorded",
+                    std::log::kv("request", s.request_id),
+                );
+            };
+        }
         if self.pulse { UsageToTell <- usage_event(r, s); }
     }
 
@@ -700,7 +725,7 @@ locus Inference {
 
         let seats = self.store.seats() or fail metering_failed(err);
         let table = self.store.route_table() or fail metering_failed(err);
-        let mut out = Candidates { };
+        let mut out = Candidates { peek: p.peek || k.peek };
         if len(table) > 0 {
             // the brain judged which seats are up: offer the model's seats
             // in the table's order, held only to what this request may spend
@@ -993,7 +1018,7 @@ fn first_for(c: Candidates, key: String) -> Candidates {
         }
         i = i + 1;
     }
-    let mut out = Candidates { serving: c.serving };
+    let mut out = Candidates { serving: c.serving, peek: c.peek };
     let chosen = at(c.items, pick) or Candidate { };
     push(out.items, chosen) or discard;
     i = 0;

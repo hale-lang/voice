@@ -92,6 +92,8 @@ type ProjectRow {
     parent: String = "";
     // its accounts are its parent's, read when it is used, not its own
     inherits: Bool = false;
+    // each request it sends is recorded whole, prompt and output (peek.hl)
+    peek: Bool = false;
     present: Bool = false;
 }
 
@@ -112,8 +114,29 @@ type KeyRow {
     last_used_at: Time = `1970-01-01T00:00:00Z`;
     revoked: Bool = false;
     revoked_at: Time = `1970-01-01T00:00:00Z`;
+    // each request it sends is recorded whole, prompt and output (peek.hl)
+    peek: Bool = false;
     present: Bool = false;
 }
+
+/// A request recorded whole, for a project or key that peeks: its standard
+/// request as served and its final response, each the JSON it was.
+type PeekRow {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    input: String = "";
+    output: String = "";
+    present: Bool = false;
+}
+
+/// Recorded requests, newest first: their bodies left out ("") when listed.
+type PeekRows { rows: bounded[PeekRow; 200]; }
+
+/// The days a recorded request is kept.
+const PEEK_DAYS: Int = 7;
 
 /// An `account` row, with its account-scope limits. `provider` "" is `null`.
 type AccountRow {
@@ -510,6 +533,14 @@ interface Store {
     fn put_seat_state(row: SeatStateRow) fallible(StoreError);
     /// An account's provider windows, the JSON array an engine last
     /// reported, "" for none.
+    /// Record a request whole; those past `PEEK_DAYS` go.
+    fn put_peek(row: PeekRow) fallible(StoreError);
+    /// Recorded requests, newest first, at most `limit`: a project's (and a
+    /// key's, when `key` is not ""), all of them when `project` is "". Their
+    /// bodies are left out.
+    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError);
+    /// One recorded request whole; `present` false when there is none.
+    fn peek(request_id: String) -> PeekRow fallible(StoreError);
     fn windows(account: String) -> String fallible(StoreError);
     fn put_windows(account: String, json: String) fallible(StoreError);
 }
@@ -613,6 +644,8 @@ locus MemoryStore {
         beat_load: bounded[Int; 64];
         seat_state_rows: SeatStateTable = SeatStateTable { };
         window_rows: WindowTable = WindowTable { };
+        // recorded requests, newest first, the last 200 (peek.hl)
+        peek_rows: PeekRows = PeekRows { };
         // the operator token: a standalone api's is kept in its state
         // directory and handed in here (api/operator.hl)
         operator: String = "";
@@ -1270,6 +1303,40 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.seat_state_rows.set(r);
+    }
+
+    fn put_peek(row: PeekRow) fallible(StoreError) {
+        let mut next = PeekRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.peek_rows.rows {
+            if count(next.rows) < 200 && held.request_id != row.request_id {
+                push(next.rows, held) or discard;
+            }
+        }
+        self.peek_rows = next;
+    }
+
+    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+        let mut out = PeekRows { };
+        for r in self.peek_rows.rows {
+            if count(out.rows) >= limit { break; }
+            if (len(project) == 0 || r.project == project) && (len(key) == 0 || r.key == key) {
+                let mut listed = r;
+                listed.input = "";
+                listed.output = "";
+                push(out.rows, listed) or discard;
+            }
+        }
+        return out;
+    }
+
+    fn peek(request_id: String) -> PeekRow fallible(StoreError) {
+        for r in self.peek_rows.rows {
+            if r.request_id == request_id { return r; }
+        }
+        return PeekRow { };
     }
 
     fn windows(account: String) -> String fallible(StoreError) {

@@ -662,3 +662,24 @@ null until it says.
 ```sql
 alter table seat_state add column context integer;
 ```
+
+### Migration 16: peek
+
+A project or a key may peek: each request it sends is recorded whole, its
+standard request as served and its final response, for the operator to read
+(`/admin/v1/peeks`). A recording is kept seven days.
+
+```sql
+alter table project add column peek boolean not null default false;
+alter table api_key add column peek boolean not null default false;
+create table peek (
+  request_id text primary key,
+  project text not null references project,
+  key text not null,
+  model text not null,
+  created_at timestamptz not null,
+  input text not null,
+  output text not null
+);
+create index peek_by_project on peek (project, created_at desc);
+```

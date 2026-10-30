@@ -102,6 +102,8 @@ const refusals = {
   getRoutes: { json: [503, 'route_table_unavailable'] },
   // nothing here can serve a request, so the ledger holds no record to read
   getUsage: { json: [404, 'not_found', 'NotFound'] },
+  // nor, so, any request recorded whole
+  getPeek: { json: [404, 'not_found', 'NotFound'] },
 };
 
 // the query an operation needs to be answered at all

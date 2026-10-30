@@ -159,7 +159,12 @@ function CreateProject() {
 
 function ProjectInspector({ project: p }: { project: Project }) {
   const w = useWrite();
-  const [mode, setMode] = useState<'view' | 'budget' | 'limits'>('view');
+  const [mode, setMode] = useState<'view' | 'budget' | 'limits' | 'access'>('view');
+  const [accountScope, setAccountScope] = useState<Scope>(scopeOf(p.accounts, 'none'));
+  const [accountNames, setAccountNames] = useState<string[]>(p.accounts ?? []);
+  const [modelScope, setModelScope] = useState<Scope>(scopeOf(p.models, 'none'));
+  const [modelNames, setModelNames] = useState<string[]>(p.models ?? []);
+  const known = useGet('/admin/v1/accounts');
   const [allowance, setAllowance] = useState<number | null>(p.budget ? p.budget.allowance_micros / 1e6 : null);
   const [period, setPeriod] = useState<'day' | 'week' | 'month' | 'none'>(p.budget?.period ?? 'month');
   const [limits, setLimits] = useState<Limit[]>(p.limits ?? []);
@@ -168,6 +173,10 @@ function ProjectInspector({ project: p }: { project: Project }) {
     setAllowance(p.budget ? p.budget.allowance_micros / 1e6 : null);
     setPeriod(p.budget?.period ?? 'month');
     setLimits(p.limits ?? []);
+    setAccountScope(scopeOf(p.accounts, 'none'));
+    setAccountNames(p.accounts ?? []);
+    setModelScope(scopeOf(p.models, 'none'));
+    setModelNames(p.models ?? []);
   }, [p]);
   const b = p.budget;
   return (
@@ -181,12 +190,52 @@ function ProjectInspector({ project: p }: { project: Project }) {
           { k: 'name', v: p.name },
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
-          { k: 'models', v: p.models ? p.models.join(', ') : 'the whole catalog' },
-          { k: 'accounts', v: p.accounts ? p.accounts.join(', ') : 'any' },
+          { k: 'models', v: p.models ? (p.models.length ? p.models.join(', ') : <span className="c-wait">none</span>) : 'the whole catalog' },
+          { k: 'accounts', v: p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
           { k: 'position', v: p.position ?? '–' },
           { k: 'created', v: when(p.created_at) },
         ]}
       />
+      {mode === 'access' ? (
+        <Form
+          error={w.error}
+          onSubmit={async () => {
+            const r = await w.write('patch', '/admin/v1/projects/{project}', {
+              params: { path: { project: p.id } },
+              body: {
+                accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames,
+                models: modelScope === 'any' ? null : modelNames,
+              },
+            });
+            if (r) setMode('view');
+          }}
+          actions={
+            <>
+              <Button type="submit" tone="primary" disabled={w.busy}>save access</Button>
+              <Button onClick={() => setMode('view')}>cancel</Button>
+            </>
+          }
+        >
+          <Field label="accounts it may spend" help={(known.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ') || 'no account yet: create one on Accounts'}>
+            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+          </Field>
+          {accountScope === 'these' && (
+            <Field label="accounts">
+              <ListInput mono value={accountNames} onChange={setAccountNames} placeholder="local" />
+            </Field>
+          )}
+          <Field label="models it may name">
+            <Select value={modelScope} onChange={(v) => setModelScope(v as Scope)} options={[{ value: 'any', label: 'the whole catalog' }, { value: 'these', label: 'these' }]} />
+          </Field>
+          {modelScope === 'these' && (
+            <Field label="models">
+              <ListInput mono value={modelNames} onChange={setModelNames} placeholder="qwen3-0.6b" />
+            </Field>
+          )}
+        </Form>
+      ) : (
+        p.status !== 'archived' && <p><Button onClick={() => setMode('access')}>edit access</Button></p>
+      )}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Budget</h3>
       {mode === 'budget' ? (
         <Form

@@ -724,6 +724,12 @@ locus Inference {
                 }
             }
         }
+        // a conversation goes to the same seat each turn, so its cache there
+        // holds what it said: the seat its key hashes to is offered first
+        let key = std::json::find_string_field(r.body, "prompt_cache_key");
+        if len(key) > 0 && count(out.items) > 1 {
+            out = first_for(out, key);
+        }
         if count(out.items) == 0 {
             let why = if out.serving == 0 {
                 "no seat serves model " + r.model
@@ -944,6 +950,38 @@ fn standard_body(body: String) -> String {
     return std::str::from_bytes(b);
 }
 
+/// `c` with the candidate `key` hashes to first, the rest in their order.
+/// Every api instance hashes alike, so a conversation finds the same seat
+/// whichever instance takes its turn.
+fn first_for(c: Candidates, key: String) -> Candidates {
+    let n = count(c.items);
+    let pick = key_hash(key) % n;
+    let mut out = Candidates { serving: c.serving };
+    let chosen = at(c.items, pick) or Candidate { };
+    push(out.items, chosen) or discard;
+    let mut i = 0;
+    while i < n {
+        if i != pick {
+            let other = at(c.items, i) or Candidate { };
+            push(out.items, other) or discard;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// FNV-1a over `s`'s bytes, kept to 31 bits.
+fn key_hash(s: String) -> Int {
+    let v = std::str::bytes_view(s);
+    let mut h = 2166136261;
+    let mut i = 0;
+    while i < v.n {
+        h = ((h ^ std::str::byte_at(v, i)) * 16777619) % 4294967296;
+        i = i + 1;
+    }
+    return h % 2147483648;
+}
+
 /// A member of a request the coordinator keeps from the seat.
 fn coordinator_member(key: String) -> Bool {
     return key == "voice" || key == "stream" || key == "stream_options" || key == "background";
@@ -984,6 +1022,11 @@ fn chat_body(body: String) -> String fallible(ApiError) {
     if kind_of(body, "metadata") == "object" {
         out = out + ", \"metadata\": "
             + std::str::trim(std::json::find_field_raw(body, "metadata"));
+    }
+    // the conversation, which keeps it on one seat and one cache
+    if kind_of(body, "prompt_cache_key") == "string" {
+        out = out + ", \"prompt_cache_key\": "
+            + std::str::trim(std::json::find_field_raw(body, "prompt_cache_key"));
     }
     if sets(body, "tools") { out = out + ", \"tools\": " + (chat_tools(body) or raise); }
     if sets(body, "tool_choice") {

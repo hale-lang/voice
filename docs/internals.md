@@ -316,22 +316,26 @@ for it, a member of the `tenant-key` family in the vault it hands the api
 (`HALE_VAULT_DIR`, the members' prefix in `HALE_SECRET_TENANT_KEY_FAMILY`),
 labelled with the organism's name. No person mints those keys.
 
-The habitat is voice's customer, not each organism: every organism's app
-and tooling inside it is a client. The operator says once what the habitat
-may spend, its grant (`/admin/v1/habitat`, the Habitat screen); until then
-it spends **no account**.
+A project is a caller. In a habitat (named by `HALE_DNA_HABITAT_NAME`), each
+is `<habitat>-<caller>`: the habitat's own infrastructure,
+`<habitat>-habitat`, whose accounts are what the habitat may spend (set as any
+project's, `PATCH /admin/v1/projects/<habitat>-habitat`; none until the
+operator gives it some), and each organism that uses models,
+`<habitat>-<organism>`, a child of it.
 
 A key the store does not know is compared, on the sealed side, with each
-member ([`api/tenants.hl`](../api/tenants.hl)). The first time a member
-calls, voice makes its organism a project, `tenant-<organism>`, that
-**inherits** the grant, and a key for it holding the digest of the key it
-presented. An inheriting tenant's accounts are read from the grant each time
-it is used, so a change reaches every one on its next call; an operator
-narrows one by giving its project accounts of its own, and sets it to
-inherit again. Its usage, limits and budget are its own. Each later call
-finds the key by its digest and holds it to the member again, so a removed
-member stops at once and a rotated one retires its old value at the first
-use of the new.
+member ([`api/tenants.hl`](../api/tenants.hl)), whose label is the caller:
+the organism's name, or `habitat` for the habitat's own. The first time a
+member calls, voice makes its project (the habitat's own, or the organism's,
+a child of it that **inherits** its accounts) and a key for it holding the
+digest of the key it presented. An inheriting child's accounts are read from
+its parent each time it is used, so a change reaches every one on its next
+call; an operator narrows one by giving its project accounts of its own, and
+sets it to inherit again. Its usage, limits and budget are its own. Each
+later call finds the key by its digest and holds it to the member again, so
+a removed member stops at once and a rotated one retires its old value at the
+first use of the new. Outside a habitat a caller is `tenant-<label>`, with no
+parent and no account until the operator gives it some.
 
 `/v1/models` answers what the caller could be served: a model is
 `available` when a seat on an account the key may spend serves it, and

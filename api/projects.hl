@@ -51,9 +51,9 @@ locus Projects {
 
     /// `create`, inside the gate.
     fn create_in_gate(c: ProjectCreate) -> Project fallible(CtlError) {
-        if !is_slug(c.id) {
+        if !is_project_id(c.id) {
             fail bad(
-                "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 127",
                 "id"
             );
         }
@@ -158,19 +158,28 @@ locus Projects {
         if u.has_models || u.clear_models { row.models = restriction_of(u.has_models, u.models); }
         if u.has_accounts || u.clear_accounts {
             row.accounts = accounts_restriction(u.has_accounts, u.accounts) or raise;
-            // a tenant given accounts of its own is narrowed: it no longer
-            // inherits the habitat's grant
+            // a child given accounts of its own is narrowed: it no longer
+            // inherits its parent's
             row.inherits = false;
         }
         if u.has_inherits {
-            if u.inherits && !is_tenant_project(self.store, row.id) {
-                fail bad("only a tenant's project inherits the habitat's grant", "inherits");
+            // a tenant from before the habitat named its callers is made its
+            // child first
+            if u.inherits && len(row.parent) == 0 {
+                let h = ensure_habitat(self.store) or fail store_down(err);
+                if len(h) > 0 && is_legacy_tenant(row, h) { row.parent = h; }
+            }
+            if u.inherits && len(row.parent) == 0 {
+                fail bad(
+                    "a project inherits its parent's accounts, and " + row.id + " has no parent",
+                    "inherits"
+                );
             }
             row.inherits = u.inherits;
             if u.inherits { row.accounts = st::Restriction { any: false }; }
         }
-        // a tenant's keys are held to the accounts it spends: the habitat's
-        // grant when it inherits
+        // a child's keys are held to the accounts it spends: its parent's
+        // when it inherits
         let spending = as_in_force(self.store, row) or fail store_down(err);
         self.keys_within(spending) or raise;
         let after = self.view(row) or raise;
@@ -457,6 +466,8 @@ locus Projects {
             created_at: r.created_at,
             has_archived_at: r.archived,
             archived_at: r.archived_at,
+            has_parent: len(r.parent) > 0,
+            parent: r.parent,
             inherits: r.inherits
         };
         v.models = r.models.names.items;
@@ -524,8 +535,8 @@ locus Keys {
     /// `create`, holding the resource from its read to its write.
     fn create_held(c: KeyCreate) -> Key fallible(CtlError) {
         let held = self.project_of(c.project) or raise;
-        // a key is held within what its project spends: the habitat's grant
-        // for an inheriting tenant
+        // a key is held within what its project spends: its parent's for an
+        // inheriting child
         let p = as_in_force(self.store, held) or fail store_down(err);
         if p.archived {
             fail bad(
@@ -614,8 +625,8 @@ locus Keys {
     fn update_held(u: KeyUpdate) -> Key fallible(CtlError) {
         let mut k = self.known(u.project, u.key) or raise;
         let held = self.project_of(u.project) or raise;
-        // a key is held within what its project spends: the habitat's grant
-        // for an inheriting tenant
+        // a key is held within what its project spends: its parent's for an
+        // inheriting child
         let p = as_in_force(self.store, held) or fail store_down(err);
         let now = now_seconds();
         let before = key_view(k, now);
@@ -807,9 +818,15 @@ fn check_name(name: String) -> Bool fallible(CtlError) {
 }
 
 /// `^[a-z0-9][a-z0-9-]{0,62}$`: a project, account or node id.
-fn is_slug(s: String) -> Bool {
+fn is_slug(s: String) -> Bool { return is_slug_within(s, 63); }
+
+/// A project's id: a slug of up to 127, room for a habitat's caller,
+/// `<habitat>-<caller>`, each a DNS label of up to 63 (tenants.hl).
+fn is_project_id(s: String) -> Bool { return is_slug_within(s, 127); }
+
+fn is_slug_within(s: String, most: Int) -> Bool {
     let n = len(s);
-    if n == 0 || n > 63 { return false; }
+    if n == 0 || n > most { return false; }
     let v = std::str::bytes_view(s);
     let mut i = 0;
     while i < n {

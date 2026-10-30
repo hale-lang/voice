@@ -687,10 +687,10 @@ locus PgStore {
             "voice holds at most 64 projects",
         ) or raise;
         let n = self.step(
-            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits) VALUES ($1, $2, $3, "
+            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits, parent) VALUES ($1, $2, $3, "
                 + names_param(4) + ", " + names_param(5) + ", " + restriction_param(6) + ", "
                 + restriction_param(7)
-                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean) ON CONFLICT (id) DO NOTHING",
+                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean, $12) ON CONFLICT (id) DO NOTHING",
             project_args(row),
         ) or raise;
         if n == 0 {
@@ -717,7 +717,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12 WHERE id = $1",
             project_args(row),
         ) or raise;
         self.project_parts(row) or raise;
@@ -747,7 +747,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12 WHERE id = $1",
             project_args(row),
         ) or raise;
         for k in revoked.keys {
@@ -1348,26 +1348,6 @@ locus PgStore {
         };
         self.lock.leave();
         return taken;
-    }
-
-    fn put_habitat_grant(body: String, change: ChangeRow) fallible(StoreError) {
-        self.lock.enter();
-        self.put_habitat_grant_locked(body, change) or {
-            self.lock.leave();
-            fail err;
-        };
-        self.lock.leave();
-    }
-
-    fn put_habitat_grant_locked(body: String, change: ChangeRow) fallible(StoreError) {
-        self.begin() or raise;
-        let a = db::Args { };
-        a.add(body);
-        self.step(
-            "INSERT INTO habitat_grant (body) VALUES ($1::jsonb) ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body",
-            a,
-        ) or raise;
-        self.commit_with(change) or raise;
     }
 
     fn changes(q: ChangeQuery) -> ChangeRows fallible(StoreError) {
@@ -2011,7 +1991,7 @@ fn restriction_param(n: Int) -> String {
 
 const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at, recipe FROM catalog_model";
 
-const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
+const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
 
 const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
 
@@ -2268,6 +2248,7 @@ fn project_row(j: String) -> ProjectRow {
         archived: pg_text(j, "status") == "archived",
         archived_at: pg_time(pg_text(j, "archived_at")),
         inherits: std::json::find_bool_field(j, "inherits"),
+        parent: pg_text(j, "parent"),
         present: true
     };
 }
@@ -2285,6 +2266,7 @@ fn project_args(r: ProjectRow) -> db::Args {
     a.add(std::time::iso8601(r.created_at));
     if r.archived { a.add(std::time::iso8601(r.archived_at)); } else { a.add_null(); }
     a.add(if r.inherits { "true" } else { "false" });
+    if len(r.parent) > 0 { a.add(r.parent); } else { a.add_null(); }
     return a;
 }
 

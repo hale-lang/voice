@@ -93,7 +93,7 @@ fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
-HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- \
+HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
   api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
@@ -213,10 +213,11 @@ assert e["input_tokens"] > 0 and e["currency"] == "USD", e
 ' || { echo "the usage event is not as served"; nats_box stream get ZZORG 1 -j; exit 1; }
 echo "each served request is told to the organization ($told usage events on zzorg.app.voice.usage.recorded)"
 
-# an organism of voice's habitat calls with the key the habitat drew for it
-# (a member of the tenant-key family, in the vault the api reads): voice
-# makes it a project that inherits what the habitat may spend, which is no
-# account until the operator grants it some (api/tenants.hl)
+# an organism of voice's habitat (`e2e`) calls with the key the habitat drew
+# for it (a member of the tenant-key family, in the vault the api reads):
+# voice makes it a project, e2e-organism-a, a child of the habitat's own,
+# e2e-habitat, inheriting its accounts, none until the operator gives the
+# habitat some (api/tenants.hl)
 tenant_key=$(openssl rand -hex 16)
 printf '%s' "$tenant_key" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 chmod 600 "$work/vault/secret-dna_e2e-tenant-key--organism-a"
@@ -227,30 +228,31 @@ import json, sys
 m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
 assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
 PY
-curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant's project does not inherit the habitat's grant"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and not p.get("parent"), p' || { echo "the habitat's project is not as it should be"; exit 1; }
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
-# the operator grants the habitat the account, once: the tenant is served on
-# its next call, its project untouched
+# the operator gives the habitat's project the account, once: the tenant is
+# served on its next call, its own project untouched
 ask_tenant() { tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}'; }
-curl -fsS -X PUT -H @"$work/admin.h" "$api/admin/v1/habitat" -H 'content-type: application/json' -d '{"accounts": ["static"]}' >/dev/null
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" -H 'content-type: application/json' -d '{"accounts": ["static"]}' >/dev/null
 [ "$(ask_tenant)" = 200 ] || { echo "a tenant of a granted habitat was not served: $(cat "$work/tenant.out")"; exit 1; }
 # narrowed on its project to no account, it is not; set to inherit, it is again
-curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"accounts": []}' >/dev/null
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"accounts": []}' >/dev/null
 [ "$(ask_tenant)" != 200 ] || { echo "a tenant narrowed to no account was served"; exit 1; }
-curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
 [ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
 # renamed by the operator, it is still the tenant's: rotated, the old value
 # stops and the new one serves; removed, it stops
-tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
-curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a/keys/$tkey" -H 'content-type: application/json' -d '{"name": "organism a"}' >/dev/null
+tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys/$tkey" -H 'content-type: application/json' -d '{"name": "organism a"}' >/dev/null
 tenant_new=$(openssl rand -hex 16)
 printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }
 [ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
-echo "a tenant's key: its project inherits the habitat's grant, live; narrowed and inheriting again; renamed, rotated and removed"
+echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
 
 # grafted: the nodes' account on the broker, as registration hands it over.
 # laptop serves only because it connected with it (the broker takes no

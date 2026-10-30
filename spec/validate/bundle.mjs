@@ -88,7 +88,6 @@ const MAP = {
   ServedBy: 'Served',
   BudgetRequest: 'BudgetSet',
   LimitsRequest: 'LimitSet',
-  HabitatGrant: 'HabitatGrant',
 };
 
 // Exported components compared with nothing, each with why, and the only

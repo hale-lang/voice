@@ -691,10 +691,10 @@ locus PgStore {
             "voice holds at most 64 projects",
         ) or raise;
         let n = self.step(
-            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits, parent) VALUES ($1, $2, $3, "
+            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits, parent, peek) VALUES ($1, $2, $3, "
                 + names_param(4) + ", " + names_param(5) + ", " + restriction_param(6) + ", "
                 + restriction_param(7)
-                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean, $12) ON CONFLICT (id) DO NOTHING",
+                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean, $12, $13::boolean) ON CONFLICT (id) DO NOTHING",
             project_args(row),
         ) or raise;
         if n == 0 {
@@ -721,7 +721,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12 WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean WHERE id = $1",
             project_args(row),
         ) or raise;
         self.project_parts(row) or raise;
@@ -751,7 +751,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12 WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean WHERE id = $1",
             project_args(row),
         ) or raise;
         for k in revoked.keys {
@@ -890,9 +890,9 @@ locus PgStore {
             "a project holds at most 64 keys",
         ) or raise;
         let n = self.step(
-            "INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at) VALUES ($1, $2, $3, $4, decode($5, 'hex'), "
+            "INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at, peek) VALUES ($1, $2, $3, $4, decode($5, 'hex'), "
                 + restriction_param(6) + ", " + restriction_param(7)
-                + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz) ON CONFLICT (id) DO NOTHING",
+                + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz, $13::boolean) ON CONFLICT (id) DO NOTHING",
             key_args(row),
         ) or raise;
         if n == 0 {
@@ -918,7 +918,7 @@ locus PgStore {
         self.step(
             "UPDATE api_key SET project = $2, name = $3, prefix = $4, secret_digest = decode($5, 'hex'), models = "
                 + restriction_param(6) + ", accounts = " + restriction_param(7)
-                + ", status = $8, created_at = $9::timestamptz, expires_at = $10::timestamptz, last_used_at = $11::timestamptz, revoked_at = $12::timestamptz WHERE id = $1",
+                + ", status = $8, created_at = $9::timestamptz, expires_at = $10::timestamptz, last_used_at = $11::timestamptz, revoked_at = $12::timestamptz, peek = $13::boolean WHERE id = $1",
             key_args(row),
         ) or raise;
         self.key_limits(row) or raise;
@@ -1765,6 +1765,90 @@ locus PgStore {
         ) or raise;
     }
 
+    fn put_peek(row: PeekRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_peek_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_peek_locked(row: PeekRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.project);
+        a.add(row.key);
+        a.add(row.model);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(row.input);
+        a.add(row.output);
+        self.write(
+            "INSERT INTO peek (request_id, project, key, model, created_at, input, output) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7) ON CONFLICT (request_id) DO NOTHING",
+            a,
+        ) or raise;
+        let gone = db::Args { };
+        gone.add(to_string(PEEK_DAYS));
+        self.write(
+            "DELETE FROM peek WHERE created_at < now() - ($1 || ' days')::interval",
+            gone,
+        ) or raise;
+    }
+
+    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.peeks_locked(project, key, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn peeks_locked(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(key);
+        a.add(to_string(if limit > 200 { 200 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) ORDER BY created_at DESC, request_id LIMIT $3::int) t",
+            a,
+        ) or raise;
+        let mut out = PeekRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, peek_row(line)) or discard;
+        }
+        return out;
+    }
+
+    fn peek(request_id: String) -> PeekRow fallible(StoreError) {
+        self.lock.enter();
+        let out = self.peek_locked(request_id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn peek_locked(request_id: String) -> PeekRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(request_id);
+        let one = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at, input, output FROM peek WHERE request_id = $1) t",
+            a,
+        ) or raise;
+        let line = std::str::trim(one);
+        if len(line) == 0 { return PeekRow { }; }
+        return peek_row(line);
+    }
+
     fn windows(account: String) -> String fallible(StoreError) {
         self.lock.enter();
         let taken = self.windows_locked(account) or {
@@ -1997,9 +2081,9 @@ fn restriction_param(n: Int) -> String {
 
 const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at, recipe FROM catalog_model";
 
-const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
+const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.peek, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
 
-const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
+const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, k.peek, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
 
 const ACCOUNT_COLUMNS: String = "SELECT a.id, a.name, a.provider, a.billing, a.status, a.created_at, a.archived_at, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE account = a.id AND scope = 'account') AS limits FROM account a";
 
@@ -2255,6 +2339,7 @@ fn project_row(j: String) -> ProjectRow {
         archived_at: pg_time(pg_text(j, "archived_at")),
         inherits: std::json::find_bool_field(j, "inherits"),
         parent: pg_text(j, "parent"),
+        peek: std::json::find_bool_field(j, "peek"),
         present: true
     };
 }
@@ -2273,6 +2358,7 @@ fn project_args(r: ProjectRow) -> db::Args {
     if r.archived { a.add(std::time::iso8601(r.archived_at)); } else { a.add_null(); }
     a.add(if r.inherits { "true" } else { "false" });
     if len(r.parent) > 0 { a.add(r.parent); } else { a.add_null(); }
+    a.add(if r.peek { "true" } else { "false" });
     return a;
 }
 
@@ -2311,6 +2397,20 @@ fn key_row(j: String) -> KeyRow {
         last_used_at: pg_time(pg_text(j, "last_used_at")),
         revoked: pg_text(j, "status") == "revoked",
         revoked_at: pg_time(pg_text(j, "revoked_at")),
+        peek: std::json::find_bool_field(j, "peek"),
+        present: true
+    };
+}
+
+fn peek_row(j: String) -> PeekRow {
+    return PeekRow {
+        request_id: pg_text(j, "request_id"),
+        project: pg_text(j, "project"),
+        key: pg_text(j, "key"),
+        model: pg_text(j, "model"),
+        created_at: pg_time(pg_text(j, "created_at")),
+        input: pg_text(j, "input"),
+        output: pg_text(j, "output"),
         present: true
     };
 }
@@ -2329,6 +2429,7 @@ fn key_args(r: KeyRow) -> db::Args {
     add_time(a, r.expires, r.expires_at);
     add_time(a, r.used, r.last_used_at);
     add_time(a, r.revoked, r.revoked_at);
+    a.add(if r.peek { "true" } else { "false" });
     return a;
 }
 

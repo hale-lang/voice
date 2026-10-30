@@ -158,6 +158,20 @@ function ProjectInspector({ project: p }: { project: Project }) {
       <Kv
         rows={[
           { k: 'state', v: <Status tone={toneOf(p.status)} label={p.status} /> },
+          {
+            k: 'peek',
+            v: (
+              <>
+                {p.peek ? <span className="c-wait">recording each request whole </span> : <span className="muted">off </span>}
+                {p.status !== 'archived' && (
+                  <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}', { params: { path: { project: p.id } }, body: { peek: !p.peek } }); }} disabled={w.busy}>
+                    {p.peek ? 'stop' : 'peek'}
+                  </Button>
+                )}
+                {p.peek && <> <a href="#/peek">recordings</a></>}
+              </>
+            ),
+          },
           { k: 'name', v: p.name },
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
@@ -329,6 +343,18 @@ function Keys({ project }: { project: Project }) {
             { key: 'accounts', header: 'Accounts', render: (k) => (k.accounts ? k.accounts.join(', ') : <span className="muted">the project's</span>) },
             { key: 'status', header: 'State', render: (k) => <Status tone={toneOf(k.status)} label={k.status} /> },
             { key: 'used', header: 'Last used', render: (k) => <span className="muted">{k.last_used_at ? `${ago(k.last_used_at)} ago` : 'never'}</span> },
+            {
+              key: 'peek',
+              header: 'Peek',
+              render: (k) =>
+                k.status === 'active' ? (
+                  <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { peek: !k.peek } }); }} disabled={w.busy}>
+                    {k.peek ? 'recording · stop' : project.peek ? 'by the project' : 'peek'}
+                  </Button>
+                ) : (
+                  <span className="faint">–</span>
+                ),
+            },
             {
               key: 'x',
               header: '',

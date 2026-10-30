@@ -458,9 +458,17 @@ locus Upstream {
         input: Int = -1;
         output: Int = -1;
         began: Bool = false;
-        // the message item (text) is open, and is closed
+        // the message item (text) is open, and is closed, and its place
         text_open: Bool = false;
         text_closed: Bool = false;
+        text_out: Int = 0;
+        // the reasoning item: open, closed, its place, id and text so far
+        // (llama-server's and vLLM's `reasoning_content`)
+        thought_open: Bool = false;
+        thought_closed: Bool = false;
+        thought_out: Int = 0;
+        thought_item: String = "";
+        thought: String = "";
         // output items opened so far, and the finished ones as a list body
         nout: Int = 0;
         done_items: String = "";
@@ -530,14 +538,35 @@ locus Upstream {
         if fr.kind == "string" { self.finish_reason = fr.text; }
         let delta = std::json::find_field_raw(choice.element, "delta");
         let mut out = "";
+        // a model's thinking, before its answer: a reasoning item
+        let thinking = std::json::string_field(delta, "reasoning_content");
+        let thinks = if thinking.kind == "string" {
+            thinking
+        } else {
+            std::json::string_field(delta, "reasoning")
+        };
+        if thinks.kind == "string" && len(thinks.text) > 0 && !self.text_open && self.calls == 0 {
+            out = self.preamble() + self.open_thought();
+            self.thought = self.thought + thinks.text;
+            out = out
+                + line(
+                    "{\"type\":\"response.reasoning.delta\",\"item_id\":" + q(self.thought_item)
+                        + ",\"output_index\":" + to_string(self.thought_out)
+                        + ",\"content_index\":0,\"delta\":" + q(thinks.text)
+                        + ",\"sequence_number\":"
+                        + to_string(self.seq) + "}",
+                );
+            self.seq = self.seq + 1;
+        }
         let piece = std::json::string_field(delta, "content");
         if piece.kind == "string" && len(piece.text) > 0 && self.calls == 0 {
-            out = self.preamble() + self.open_text();
+            out = out + self.preamble() + self.close_thought() + self.open_text();
             self.text = self.text + piece.text;
             out = out
                 + line(
                     "{\"type\":\"response.output_text.delta\",\"item_id\":" + q(self.item_id)
-                        + ",\"output_index\":0,\"content_index\":0,\"delta\":" + q(piece.text)
+                        + ",\"output_index\":" + to_string(self.text_out)
+                        + ",\"content_index\":0,\"delta\":" + q(piece.text)
                         + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}",
                 );
             self.seq = self.seq + 1;
@@ -595,16 +624,61 @@ locus Upstream {
     fn open_text() -> String {
         if self.text_open { return ""; }
         self.text_open = true;
-        self.nout = 1;
+        self.text_out = self.nout;
+        self.nout = self.nout + 1;
+        let at = to_string(self.text_out);
         let out = line(
-            "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":"
+            "{\"type\":\"response.output_item.added\",\"output_index\":" + at + ",\"item\":"
                 + message_item(self.item_id, "in_progress", "", false) + ",\"sequence_number\":"
                 + to_string(self.seq) + "}",
         )
             + line(
                 "{\"type\":\"response.content_part.added\",\"item_id\":" + q(self.item_id)
-                    + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":"
+                    + ",\"output_index\":" + at
+                    + ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":\"\",\"annotations\":[]},\"sequence_number\":"
                     + to_string(self.seq + 1) + "}",
+            );
+        self.seq = self.seq + 2;
+        return out;
+    }
+
+    /// The events that open the reasoning item, once.
+    @unbounded
+    fn open_thought() -> String {
+        if self.thought_open { return ""; }
+        self.thought_open = true;
+        self.thought_out = self.nout;
+        self.nout = self.nout + 1;
+        self.thought_item = "rs_" + self.suffix();
+        let out = line(
+            "{\"type\":\"response.output_item.added\",\"output_index\":"
+                + to_string(self.thought_out)
+                + ",\"item\":" + reasoning_item(self.thought_item, "") + ",\"sequence_number\":"
+                + to_string(self.seq) + "}",
+        );
+        self.seq = self.seq + 1;
+        return out;
+    }
+
+    /// The events that close the reasoning item, when it is open: before
+    /// the answer or a tool call begins, or at the end.
+    @unbounded
+    fn close_thought() -> String {
+        if !self.thought_open || self.thought_closed { return ""; }
+        self.thought_closed = true;
+        let item = reasoning_item(self.thought_item, self.thought);
+        self.done_items = self.done_items + (if len(self.done_items) > 0 { "," } else { "" })
+            + item;
+        let at = to_string(self.thought_out);
+        let out = line(
+            "{\"type\":\"response.reasoning.done\",\"item_id\":" + q(self.thought_item)
+                + ",\"output_index\":" + at + ",\"content_index\":0,\"text\":" + q(self.thought)
+                + ",\"sequence_number\":" + to_string(self.seq) + "}",
+        )
+            + line(
+                "{\"type\":\"response.output_item.done\",\"output_index\":" + at + ",\"item\":"
+                    + item
+                    + ",\"sequence_number\":" + to_string(self.seq + 1) + "}",
             );
         self.seq = self.seq + 2;
         return out;
@@ -616,20 +690,24 @@ locus Upstream {
         if !self.text_open || self.text_closed { return ""; }
         self.text_closed = true;
         let item = message_item(self.item_id, state, self.text, true);
-        self.done_items = item;
+        self.done_items = self.done_items + (if len(self.done_items) > 0 { "," } else { "" })
+            + item;
+        let at = to_string(self.text_out);
         let out = line(
             "{\"type\":\"response.output_text.done\",\"item_id\":" + q(self.item_id)
-                + ",\"output_index\":0,\"content_index\":0,\"text\":" + q(self.text)
+                + ",\"output_index\":" + at + ",\"content_index\":0,\"text\":" + q(self.text)
                 + ",\"logprobs\":[],\"sequence_number\":" + to_string(self.seq) + "}",
         )
             + line(
                 "{\"type\":\"response.content_part.done\",\"item_id\":" + q(self.item_id)
-                    + ",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":"
+                    + ",\"output_index\":" + at
+                    + ",\"content_index\":0,\"part\":{\"type\":\"output_text\",\"text\":"
                     + q(self.text) + ",\"annotations\":[]},\"sequence_number\":"
                     + to_string(self.seq + 1) + "}",
             )
             + line(
-                "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + item
+                "{\"type\":\"response.output_item.done\",\"output_index\":" + at + ",\"item\":"
+                    + item
                     + ",\"sequence_number\":" + to_string(self.seq + 2) + "}",
             );
         self.seq = self.seq + 3;
@@ -684,7 +762,8 @@ locus Upstream {
                 self.done = true;
                 return "";
             }
-            out = self.preamble() + self.close_text("completed") + self.close_call();
+            out = self.preamble() + self.close_thought() + self.close_text("completed")
+                + self.close_call();
             self.call_at = idx;
             self.call_out = self.nout;
             self.nout = self.nout + 1;
@@ -749,11 +828,12 @@ locus Upstream {
         let state = if complete { "completed" } else { "incomplete" };
         let input = if self.input < 0 { tokens_of(input_chars(self.req)) } else { self.input };
         let output = if self.output < 0 {
-            tokens_of(len(self.text) + self.args_len)
+            // thinking is output too, as the upstream counts it
+            tokens_of(len(self.text) + len(self.thought) + self.args_len)
         } else {
             self.output
         };
-        let tail = self.close_text(state) + self.close_call();
+        let tail = self.close_thought() + self.close_text(state) + self.close_call();
         let end = line(
             "{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" })
                 + ",\"response\":"

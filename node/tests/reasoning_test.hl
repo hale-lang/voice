@@ -1,0 +1,85 @@
+// A model's thinking, as llama-server and vLLM stream it
+// (`reasoning_content`), is relayed as a reasoning item before its answer;
+// one whose budget ran out while it thought is incomplete, its thinking
+// kept, not a failure.
+import ".." as node;
+
+fn chunk(delta: String, finish: String) -> String {
+    return "data: {\"model\":\"qwen3\",\"choices\":[{\"index\":0,\"delta\":" + delta
+        + ",\"finish_reason\":"
+        + (if len(finish) > 0 { "\"" + finish + "\"" } else { "null" }) + "}]}\n\n";
+}
+
+fn play(sse: String) -> node::StaticRun {
+    let c = node::compat_config("{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"qwen3\"}");
+    return node::drain(
+        node::upstream_for(
+            "resp_t1",
+            "qwen3",
+            "{\"model\": \"qwen3\", \"input\": \"7*6?\"}",
+            c,
+            200,
+            sse,
+        ),
+    );
+}
+
+fn main() {
+    let thought = play(
+        chunk("{\"role\":\"assistant\"}", "") + chunk("{\"reasoning_content\":\"Seven sixes\"}", "")
+            + chunk("{\"reasoning_content\":\" make 42.\"}", "") + chunk("{\"content\":\"42\"}", "")
+            + chunk("{}", "stop") + "data: [DONE]\n\n",
+    );
+    std::test::assert_eq_str(thought.outcome, "served", "served: " + thought.failure);
+    std::test::assert(
+        std::str::contains(thought.script, "\"type\":\"response.reasoning.delta\"")
+            && std::str::contains(thought.script, "\"delta\":\"Seven sixes\""),
+        "its thinking is relayed as it comes",
+    );
+    std::test::assert(
+        std::str::contains(thought.script, "\"type\":\"response.reasoning.done\"")
+            && std::str::contains(thought.script, "\"text\":\"Seven sixes make 42.\""),
+        "and closed whole",
+    );
+    std::test::assert(
+        std::str::contains(
+            thought.script,
+            "\"type\":\"response.output_text.delta\",\"item_id\":\"msg_t1\",\"output_index\":1",
+        ),
+        "the answer is the second item",
+    );
+    let at = std::str::index_of(thought.script, "\"type\":\"response.completed\"");
+    let done = thought.script[at..len(thought.script)];
+    let rs = std::str::index_of(done, "\"type\":\"reasoning\"");
+    let msg = std::str::index_of(done, "\"type\":\"message\"");
+    std::test::assert(rs > 0 && msg > rs, "the response holds its thinking, then its answer");
+
+    let out_of_budget = play(
+        chunk("{\"reasoning_content\":\"Let me think\"}", "") + chunk("{}", "length")
+            + "data: [DONE]\n\n",
+    );
+    std::test::assert_eq_str(
+        out_of_budget.outcome,
+        "incomplete",
+        "thinking that ran out is incomplete, not failed",
+    );
+    std::test::assert(
+        out_of_budget.output_tokens > 0,
+        "its thinking counts as output when the upstream does not say",
+    );
+    std::test::assert(
+        std::str::contains(out_of_budget.script, "\"type\":\"response.incomplete\"")
+            && std::str::contains(out_of_budget.script, "\"text\":\"Let me think\""),
+        "its thinking kept",
+    );
+
+    let plain = play(chunk("{\"content\":\"hi\"}", "") + chunk("{}", "stop") + "data: [DONE]\n\n");
+    std::test::assert(
+        std::str::contains(
+            plain.script,
+            "\"type\":\"response.output_text.delta\",\"item_id\":\"msg_t1\",\"output_index\":0",
+        )
+            && !std::str::contains(plain.script, "response.reasoning"),
+        "an answer with no thinking is as it was",
+    );
+}

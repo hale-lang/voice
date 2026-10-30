@@ -267,7 +267,8 @@ locus Placements {
         out.has_cache_tokens = true;
         out.cache_tokens = pool;
         out.has_reserved_bytes = true;
-        out.reserved_bytes = need + (pool - FITTED_CONTEXT) * recipe.kv_bytes_per_token;
+        out.reserved_bytes = need
+            + (pool - fitted_context(recipe.context_length)) * recipe.kv_bytes_per_token;
 
         // the seat first: its own checks (the account, the node's room)
         // refuse before anything is kept
@@ -302,6 +303,25 @@ locus Placements {
         if !added {
             self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
             fail clash("placement " + c.id + " exists; a placement id is never reused");
+        }
+        // another api may have placed on the node since its placements were
+        // read: what they hold now, this one counted, is read again, and
+        // this one withdrawn if together they overfill it. Of two placed at
+        // once, the one that reads last sees both.
+        let now = self.store.placements() or fail store_down(err);
+        let mut total = 0;
+        for r in now.rows {
+            if !r.removed && std::json::find_string_field(r.body, "leader") == leader {
+                total = total + (self.held_by(r) or raise);
+            }
+        }
+        let memory = std::json::find_int_field(hw, "model_memory_bytes");
+        if total > memory {
+            self.remove_in_gate(c.id) or discard;
+            fail clash(
+                "node " + leader + " filled while this was placed: its placements would hold "
+                    + gb(total) + " of " + gb(memory) + " for models; place it again",
+            );
         }
         return out;
     }
@@ -436,8 +456,16 @@ fn placement_json(p: Placement) -> String {
 // ---- the prompt cache --------------------------------------------------
 
 /// The context a recipe's `memory_bytes` provides for
-/// (scripts/catalog-recipes.py, CONTEXT).
+/// (scripts/catalog-recipes.py, CONTEXT), for a model made for at least so
+/// much.
 const FITTED_CONTEXT: Int = 32768;
+
+/// The context a variant's `memory_bytes` provides for: `FITTED_CONTEXT`,
+/// or the model's own when it is made for less (catalog-recipes.py fits
+/// `min(CONTEXT, max_position_embeddings)`).
+fn fitted_context(native: Int) -> Int {
+    return if native > 0 && native < FITTED_CONTEXT { native } else { FITTED_CONTEXT };
+}
 
 /// The conversations a seat's prompt cache holds at once, each returned to
 /// what it said when it comes back (llama-server's slots).
@@ -451,19 +479,20 @@ const CONVERSATION_MAX: Int = 131072;
 /// of `spare`, the memory its variant leaves, and never more than `need`,
 /// the variant's own, past what that provides (a cache no larger than the
 /// model it serves); never less than
-/// `FITTED_CONTEXT`, which the variant's memory provides. With no per-token
-/// cost known, `FITTED_CONTEXT`.
+/// the context the variant's memory provides (`fitted_context`). With no
+/// per-token cost known, that.
 fn cache_pool(spare: Int, per_token: Int, native: Int, need: Int) -> Int {
-    if per_token <= 0 || spare <= 0 { return FITTED_CONTEXT; }
+    let base = fitted_context(native);
+    if per_token <= 0 || spare <= 0 { return base; }
     let conversation = if native > 0 && native < CONVERSATION_MAX {
         native
     } else {
         CONVERSATION_MAX
     };
     let want = CACHED * conversation;
-    if want <= FITTED_CONTEXT { return FITTED_CONTEXT; }
+    if want <= base { return base; }
     let budget = if spare / 2 < need { spare / 2 } else { need };
-    let afford = FITTED_CONTEXT + budget / per_token;
+    let afford = base + budget / per_token;
     return if afford < want { afford } else { want };
 }
 

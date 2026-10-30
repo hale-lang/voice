@@ -204,7 +204,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
               params: { path: { project: p.id } },
               body: {
                 accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames,
-                models: modelScope === 'any' ? null : modelNames,
+                models: modelScope === 'any' ? null : modelScope === 'none' ? [] : modelNames,
               },
             });
             if (r) setMode('view');
@@ -225,7 +225,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
             </Field>
           )}
           <Field label="models it may name">
-            <Select value={modelScope} onChange={(v) => setModelScope(v as Scope)} options={[{ value: 'any', label: 'the whole catalog' }, { value: 'these', label: 'these' }]} />
+            <Select value={modelScope} onChange={(v) => setModelScope(v as Scope)} options={[{ value: 'any', label: 'the whole catalog' }, { value: 'these', label: 'these' }, { value: 'none', label: 'none' }]} />
           </Field>
           {modelScope === 'these' && (
             <Field label="models">

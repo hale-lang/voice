@@ -66,11 +66,18 @@ locus Catalog {
                 );
             }
         }
+        // a model made from a recipe is as long as its weights are made for,
+        // unless the operator says otherwise
+        let mut context = m.context_length;
+        if m.has_recipe && context == 0 {
+            let r = self.recipes.get_in_gate(m.recipe) or raise;
+            context = r.context_length;
+        }
         let row = st::ModelRow {
             id: m.id,
             owned_by: if len(m.owned_by) > 0 { m.owned_by } else { "local" },
             kind: if m.has_kind { model_kind_name(m.kind) } else { "local" },
-            context_length: m.context_length,
+            context_length: context,
             max_output_tokens: m.max_output_tokens,
             priced: m.has_price,
             price: m.price,
@@ -211,6 +218,8 @@ locus Catalog {
         let mut v = catalog_view(r);
         let a = availability(self.store, r.id) or fail store_down(err);
         v.available = a.available;
+        v.has_served_context_length = a.context > 0;
+        v.served_context_length = a.context;
         for s in seats.rows {
             if seat_serves(s, r.id) { push(v.seats, s.ref) or discard; }
         }
@@ -533,6 +542,9 @@ fn capabilities_json(c: Capabilities) -> String {
 type Availability {
     available: Bool = false;
     tools: Bool = false;
+    // the least context, in tokens, a seat that could serve it took; 0 when
+    // none has said
+    context: Int = 0;
     data_classes: bounded[String; 32];
 }
 
@@ -559,6 +571,8 @@ fn availability_for(
             let ready = seat_ready(store, s) or raise;
             if ready {
                 out.available = true;
+                let c = seat_context(store, s) or raise;
+                if c > 0 && (out.context == 0 || c < out.context) { out.context = c; }
                 if !out.tools {
                     out.tools = seat_tools(store, s) or raise;
                 }
@@ -569,6 +583,16 @@ fn availability_for(
         }
     }
     return out;
+}
+
+/// The context, in tokens, seat `s`'s server took, as its node last
+/// reported; 0 when it has not said.
+fn seat_context(store: st::Store, s: st::SeatRow) -> Int fallible(st::StoreError) {
+    let states = store.seat_states(s.node) or raise;
+    for st in states.rows {
+        if st.seat == s.id { return st.context; }
+    }
+    return 0;
 }
 
 fn model_with_seats(store: st::Store, r: st::ModelRow) -> Model fallible(st::StoreError) {
@@ -586,6 +610,11 @@ fn model_for(
     let a = availability_for(store, r.id, spends) or raise;
     v.available = a.available;
     v.tools = a.tools;
+    // what a caller can count on: the least any seat that could serve it
+    // took, never more than the model is made for
+    if a.context > 0 && (v.context_length == 0 || a.context < v.context_length) {
+        v.context_length = a.context;
+    }
     v.data_classes = a.data_classes;
     return v;
 }

@@ -24,6 +24,10 @@ type License { name: String = ""; url: String = ""; }
 type RecipeCreate {
     id: String;
     license: License;
+    // the longest context, in tokens, the model is made for (its config's
+    // max_position_embeddings); left out when not known
+    has_context_length: Bool = false;
+    context_length: Int = 0;
     variants: std::json::Value = std::json::Value::null();
 }
 
@@ -41,6 +45,8 @@ fn origin_name(v: Origin) -> String {
 type Recipe {
     id: String = "";
     license: License = License { };
+    has_context_length: Bool = false;
+    context_length: Int = 0;
     variants: std::json::Value = std::json::Value::null();
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
@@ -131,7 +137,12 @@ locus Recipes {
     }
 
     fn create_in_gate(c: RecipeCreate) -> Recipe fallible(CtlError) {
-        let body = recipe_body(c.id, c.license, c.variants.text);
+        let body = recipe_body(
+            c.id,
+            c.license,
+            if c.has_context_length { c.context_length } else { 0 },
+            c.variants.text,
+        );
         if std::str::starts_with(body, "!") {
             fail bad(refusal_message(body), recipe_param(body));
         }
@@ -243,6 +254,8 @@ fn recipe_view(
             name: std::json::find_string_field(lic, "name"),
             url: std::json::find_string_field(lic, "url"),
         },
+        has_context_length: std::json::find_int_field(body, "context_length") > 0,
+        context_length: std::json::find_int_field(body, "context_length"),
         variants: stored_value(
             std::json::find_field_raw(body, "variants"),
             "a recipe's variants",
@@ -257,7 +270,8 @@ fn recipe_view(
 fn recipe_json(r: Recipe) -> String {
     return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
         + ", \"url\": "
-        + jq(r.license.url) + "}, \"variants\": " + r.variants.text + ", \"origin\": "
+        + jq(r.license.url) + "}" + context_field(r.has_context_length, r.context_length)
+        + ", \"variants\": " + r.variants.text + ", \"origin\": "
         + jq(origin_name(r.origin)) + ", \"created_at\": "
         + jtime_or_null(r.has_created_at, r.created_at) + "}";
 }
@@ -268,9 +282,12 @@ fn recipe_json(r: Recipe) -> String {
 // checked, or `!<param>\t<problem>` (the param is the field at fault).
 
 @bounded_by(variants)
-fn recipe_body(id: String, license: License, variants: String) -> String {
+fn recipe_body(id: String, license: License, context_length: Int, variants: String) -> String {
     let head = id_and_license(id, license);
     if len(head) > 0 { return head; }
+    if context_length < 0 || context_length > CONTEXT_MAX {
+        return "!context_length\t`context_length` is 1 to 16777216 tokens";
+    }
     if std::json::string_field("{\"v\": " + variants + "}", "v").kind != "array" {
         return "!variants\t`variants` is a list";
     }
@@ -299,11 +316,21 @@ fn recipe_body(id: String, license: License, variants: String) -> String {
     if n == 0 { return "!variants\ta recipe has at least one variant"; }
     let body = "{\"id\": " + jq(id) + ", \"license\": {\"name\": " + jq(license.name)
         + ", \"url\": "
-        + jq(license.url) + "}, \"variants\": [" + out.text() + "]}";
+        + jq(license.url) + "}" + context_field(context_length > 0, context_length)
+        + ", \"variants\": [" + out.text() + "]}";
     if len(body) > RECIPE_MAX {
         return "!variants\ta recipe is at most 48 KiB (" + to_string(len(body)) + " bytes)";
     }
     return body;
+}
+
+/// The most context a recipe may say a model has: 16M tokens.
+const CONTEXT_MAX: Int = 16777216;
+
+/// `, "context_length": n` when it is known, "" when not.
+fn context_field(known: Bool, n: Int) -> String {
+    if !known { return ""; }
+    return ", \"context_length\": " + to_string(n);
 }
 
 /// A curated id and license refused, as `!<param>\t<problem>`; "" when both

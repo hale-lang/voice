@@ -234,7 +234,10 @@ code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/j
 curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"accounts": null}' >/dev/null
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" = 200 ] || { echo "a granted tenant was not served: $code $(cat "$work/tenant.out")"; exit 1; }
-# rotated, the old value stops and the new one serves; removed, it stops
+# renamed by the operator, it is still the tenant's: rotated, the old value
+# stops and the new one serves; removed, it stops
+tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a/keys/$tkey" -H 'content-type: application/json' -d '{"name": "organism a"}' >/dev/null
 tenant_new=$(openssl rand -hex 16)
 printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }

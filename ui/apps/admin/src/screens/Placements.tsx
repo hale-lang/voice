@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, Select, Checkbox, Button, Confirm, when } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, Select, Checkbox, Button, Confirm, when, bytes } from '@hale/components';
 import { useGet, type Placement } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -78,6 +78,8 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
           { k: 'nodes', v: p.nodes.join(', ') },
           { k: 'seat', v: <a href={href('nodes', node ?? '', seat ?? '')}><Mono>{p.seat}</Mono></a> },
           { k: 'account', v: <Mono>{p.account}</Mono> },
+          { k: 'cache', v: p.cache_tokens ? `${p.cache_tokens.toLocaleString()} tokens, shared by the conversations it holds` : <span className="faint">32k, placed before voice sized it</span> },
+          { k: 'holds', v: p.reserved_bytes ? `${bytes(p.reserved_bytes)} of ${p.leader}'s memory for models` : '–' },
           { k: 'placed', v: when(p.created_at) },
         ]}
       />

@@ -27,43 +27,56 @@ locus Nodes {
         // when set, every seat answers as an openai-compatible one whose
         // upstream streamed this SSE (a tool call in fragments)
         compat_sse: String = "";
-        // offers finished before their result came (the link sends cancel)
-        cancelled: Int = 0;
         offers: Int = 0;
         last_body: String = "";
-        // the open offer: its script of events, how far it was read, and
-        // the result it ends with
-        script: String = "";
-        at: Int = 0;
-        result: String = "";
-        ended: Bool = true;
-        // quiet waits left before the open offer's first output
-        hold: Int = 0;
+        // offers finished before their result came (the link sends cancel):
+        // each offer is the request's own, so it notes its cancel here, a
+        // line of this file, which `cancelled` counts
+        tally: String = "/tmp/voice-serve-test-cancels-" + to_string(std::time::monotonic_ns());
+    }
+    fn cancelled() -> Int {
+        let t = std::io::fs::read_file(self.tally) or "";
+        return len(t);
     }
     fn place() -> String { return "nats://nats.test:4222"; }
     fn root() -> String { return "voice"; }
     fn assign(node: String, body: String) -> Bool { return true; }
     @unbounded
-    fn offer(to: String, reply_to: String, body: String) -> api::ServeOutcome {
+    fn offer(to: String, reply_to: String, body: String) -> api::Offer {
         self.offers = self.offers + 1;
         self.last_body = body;
         if to == self.refusing {
-            return api::ServeOutcome { ack: "refused", reason: "seat static is paused" };
+            return Scripted {
+                tally: self.tally,
+                outcome: api::ServeOutcome { ack: "refused", reason: "seat static is paused" },
+            };
         }
         let id = std::json::find_string_field(body, "request_id");
-        self.at = 0;
-        self.ended = false;
-        self.hold = if to == self.slow { self.slow_waits } else { 0 };
+        let hold = if to == self.slow { self.slow_waits } else { 0 };
+        let mut script = "";
+        let mut result = "";
         if to == self.mute {
-            self.script = "";
-            self.result = "";
-            return api::ServeOutcome { ack: "accepted" };
+            script = "";
+            result = "";
+            return Scripted {
+                tally: self.tally,
+                script: script,
+                result: result,
+                hold: hold,
+                ended: false,
+            };
         }
         if to == self.failing {
-            self.script = "";
-            self.result = "{\"type\": \"result\", \"request_id\": \"" + id
+            script = "";
+            result = "{\"type\": \"result\", \"request_id\": \"" + id
                 + "\", \"outcome\": \"failed\", \"error\": {\"code\": \"engine_failed\", \"message\": \"the engine exited\", \"retryable\": true}}";
-            return api::ServeOutcome { ack: "accepted" };
+            return Scripted {
+                tally: self.tally,
+                script: script,
+                result: result,
+                hold: hold,
+                ended: false,
+            };
         }
         let model = std::json::find_string_field(body, "model");
         let named = std::json::string_field(body, "engine_model");
@@ -96,17 +109,39 @@ locus Nodes {
                 ),
             )
         };
-        self.script = run.script;
-        self.result = node::result_message(id, run, 0, 0);
+        script = run.script;
+        result = node::result_message(id, run, 0, 0);
         if to == self.dying {
             // its events up to and including its first delta, then nothing
             let cut = std::str::index_of(run.script, "response.output_text.delta");
             let nl = std::str::index_of(run.script[cut..len(run.script)], "\n");
-            self.script = run.script[0..(cut + nl + 1)];
-            self.result = "";
+            script = run.script[0..(cut + nl + 1)];
+            result = "";
         }
-        return api::ServeOutcome { ack: "accepted" };
+        return Scripted {
+            tally: self.tally,
+            script: script,
+            result: result,
+            hold: hold,
+            ended: false,
+        };
     }
+}
+
+/// One offer of the link's, scripted: its events, how far they were read,
+/// the result they end with, and quiet waits before its first output.
+locus Scripted {
+    params {
+        // the link's tally file (`Nodes.cancelled`)
+        tally: String = "";
+        outcome: api::ServeOutcome = api::ServeOutcome { ack: "accepted" };
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = true;
+        hold: Int = 0;
+    }
+    fn ack() -> api::ServeOutcome { return self.outcome; }
     /// The script's next event, then its result.
     @unbounded
     fn next(wait: Duration) -> api::LinkMsg {
@@ -135,7 +170,10 @@ locus Nodes {
         return api::LinkMsg { kind: "none" };
     }
     fn finish() {
-        if !self.ended { self.cancelled = self.cancelled + 1; }
+        if !self.ended {
+            let had = std::io::fs::read_file(self.tally) or "";
+            std::io::fs::write_file(self.tally, had + "c") or discard;
+        }
         self.ended = true;
     }
 }
@@ -369,7 +407,7 @@ fn streamed_failures(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
 
     // the caller went away: the stream ends after its first event, and the
     // offer is finished before its result (the link sends cancel)
-    let before = nodes.cancelled;
+    let before = nodes.cancelled();
     let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
     let req = api::read_inference(
         "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
@@ -385,7 +423,7 @@ fn streamed_failures(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
             && !std::str::contains(gone.body, "response.in_progress"),
         "a gone caller is sent nothing more",
     );
-    std::test::assert_eq_int(nodes.cancelled, before + 1, "and its seat is cancelled");
+    std::test::assert_eq_int(nodes.cancelled(), before + 1, "and its seat is cancelled");
     e.inference.idle = 30s;
     e.inference.keep_alive = 15s;
 }
@@ -449,7 +487,7 @@ fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
     // the caller went away while the seat was quiet: found at the next
     // keep-alive, not at the first-output span
     beat(e, laptop);
-    let before = nodes.cancelled;
+    let before = nodes.cancelled();
     e.inference.first = 30s;
     let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
     let req = api::read_inference(
@@ -467,7 +505,7 @@ fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
         "a caller gone during a quiet gap ends the wait",
     );
     std::test::assert(!std::str::contains(gone.body, "event: "), "and is sent nothing");
-    std::test::assert_eq_int(nodes.cancelled, before + 1, "its seat cancelled");
+    std::test::assert_eq_int(nodes.cancelled(), before + 1, "its seat cancelled");
     nodes.mute = "";
     e.inference.first = 120s;
     e.inference.idle = 30s;

@@ -50,6 +50,10 @@ locus Session {
         // monotonic ns of the last look at NATS while serving
         looked: Int = 0;
         client: nats::NatsClient = nats::NatsClient { name: "voice-node" };
+        // the seats' readings, scraped with the runtime's (readings.hl)
+        readings: std::metrics::Registry = std::metrics::Registry { namespace: "voice_node" };
+        // the seats last read out, so one withdrawn reads as down
+        read: SeatIds = SeatIds { };
     }
 
     bus {
@@ -383,7 +387,7 @@ locus Session {
                         let e = line_end(lv, at);
                         let ev = std::str::slice(lv, at, e);
                         at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
+                        if first < 0 && is_output(ev) {
                             first = (std::time::monotonic_ns() - t0) / 1000000;
                         }
                         self.client.pub_msg(
@@ -413,7 +417,7 @@ locus Session {
                         let e = line_end(lv, at);
                         let ev = std::str::slice(lv, at, e);
                         at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
+                        if first < 0 && is_output(ev) {
                             first = (std::time::monotonic_ns() - t0) / 1000000;
                         }
                         self.client.pub_msg(
@@ -448,7 +452,7 @@ locus Session {
             if std::str::starts_with(line, "pause ") {
                 self.pause(std::str::parse_int(line[6..len(line)]) or 0);
             } else {
-                if first < 0 && std::str::contains(line, "response.output_text.delta") {
+                if first < 0 && is_output(line) {
                     first = (std::time::monotonic_ns() - t0) / 1000000;
                 }
                 self.client.pub_msg(
@@ -472,6 +476,16 @@ locus Session {
             result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
         };
         self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
+        if !self.cancelled && run.outcome != "failed" {
+            self.read_run(
+                seat.id,
+                seat.engine,
+                run.input_tokens,
+                run.output_tokens,
+                first,
+                elapsed,
+            );
+        }
         self.serving = "";
         self.busy = "";
         self.cancelled = false;
@@ -511,6 +525,70 @@ locus Session {
             + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": "
             + status_seats(self.assignment, self.seats, self.busy) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
+        self.read_out();
+    }
+
+    /// A run a seat finished, in its readings: the tokens it read and
+    /// wrote, and how long it generated, from its first output to its end
+    /// (readings.hl), so a seat's throughput is the one over the other.
+    fn read_run(
+        seat: String,
+        engine: String,
+        input: Int,
+        output: Int,
+        first_ms: Int,
+        elapsed_ms: Int
+    ) {
+        let l = std::metrics::labels_two("seat", seat, "engine", engine);
+        seat_tokens(self.readings, l, "input", input);
+        // output is counted with the time it took, so the two cover the same
+        // runs and their ratio is the seat's throughput
+        if output > 0 && first_ms >= 0 && elapsed_ms >= first_ms {
+            seat_tokens(self.readings, l, "output", output);
+            std::metrics::histogram(
+                self.readings,
+                "generation_seconds",
+                GENERATION_BOUNDS,
+                l,
+            ).observe(
+                std::math::int_to_float(elapsed_ms - first_ms) / 1000.0,
+            );
+            std::metrics::histogram(
+                self.readings,
+                "first_output_seconds",
+                GENERATION_BOUNDS,
+                l,
+            ).observe(
+                std::math::int_to_float(first_ms) / 1000.0,
+            );
+        }
+    }
+
+    /// The seats' readings, as `report` says them: each seat up or not,
+    /// what it serves at once, and a managed seat's fetch, labelled by its
+    /// id and engine only, both configured and few. A seat no longer
+    /// assigned, or no longer on the engine it was, reads 0 under its old
+    /// labels, since a series cannot be retired.
+    fn read_out() {
+        let mut now = SeatIds { };
+        for s in self.seats.items {
+            push(now.items, ReadSeat { id: s.id, engine: s.engine }) or discard;
+            let l = std::metrics::labels_two("seat", s.id, "engine", s.engine);
+            seat_reading(self.readings, "seat_up", l, if s.status == "up" { 1 } else { 0 });
+            seat_reading(self.readings, "seat_in_flight", l, if s.id == self.busy { 1 } else { 0 });
+            if s.managed {
+                seat_reading(self.readings, "seat_fetch_done_bytes", l, s.done_bytes);
+                seat_reading(self.readings, "seat_fetch_total_bytes", l, s.total_bytes);
+            }
+        }
+        for gone in self.read.items {
+            if !still_read(now, gone) {
+                let l = std::metrics::labels_two("seat", gone.id, "engine", gone.engine);
+                seat_reading(self.readings, "seat_up", l, 0);
+                seat_reading(self.readings, "seat_in_flight", l, 0);
+            }
+        }
+        self.read = now;
     }
 }
 
@@ -534,4 +612,14 @@ fn status_seats(assignment: String, seats: NodeSeats, busy: String) -> String {
     }
     let b = out.snapshot() or b"";
     return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// True when `event` is output: by its own `type`, text, a tool call's
+/// arguments or a refusal, as the api reads it too (api/stream.hl,
+/// `output_event`), never by what its payload or the caller's metadata
+/// says. The first is when the seat began to generate.
+fn is_output(event: String) -> Bool {
+    let kind = std::json::find_string_field(event, "type");
+    return kind == "response.output_text.delta" || kind == "response.function_call_arguments.delta"
+        || kind == "response.refusal.delta";
 }

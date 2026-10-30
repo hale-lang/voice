@@ -46,7 +46,12 @@ toolchain's nursery with `hale habitat graft voice`; it needs no checkout or
 build of its own (hale's habitat chapter, in `docs/src/habitat.md`, has the rest).
 
 This starts Postgres, NATS, the api (on `localhost:8080`, with the admin UI
-at `/`), the brain and a node. The node waits for an enrollment token.
+at `/`) and the brain: the coordinator. Nodes serve the models, each on its
+own machine, natively, where its GPU is: in a habitat, `hale habitat organism
+place voice node --host <h>` (`--host local` for the habitat's own machine);
+by hand, [docs/adding-a-node.md](docs/adding-a-node.md). For a first look
+without one, the `node` profile runs a demo node in a container, which serves
+the static engine (below).
 
 The admin plane (`/admin/v1`, and the admin UI) takes the **operator token**,
 which the api mints on its first start and keeps in Postgres. It is never in
@@ -81,7 +86,7 @@ curl -X POST $api/admin/v1/nodes -H @admin.h -H "$json" -d '{"id": "local"}'
 curl -X POST $api/admin/v1/nodes/local/seats -H @admin.h -H "$json" -d '{
   "id": "static", "engine": "static", "account": "static",
   "serves": [{"model": "echo-1"}], "config": {"text": "hello from voice"}}'
-VOICE_ENROLLMENT_TOKEN=vn-... docker compose up -d node
+VOICE_ENROLLMENT_TOKEN=vn-... docker compose --profile node up -d node
 
 # ask
 curl $api/v1/chat/completions -H 'Authorization: Bearer vk-...' -H "$json" \

@@ -49,6 +49,21 @@ export function Recipes({ route, setInspector }: ScreenProps) {
   );
 }
 
+/** A variant's files: the first few, the rest behind a disclosure (a frontier model has hundreds of shards). */
+function Files({ files }: { files: Variant['files'] }) {
+  const row = (f: Variant['files'][number]) => <div key={f.path}><Mono>{f.path}</Mono> <span className="muted">{bytes(f.bytes)}</span></div>;
+  if (files.length <= 8) return <>{files.map(row)}</>;
+  return (
+    <>
+      {files.slice(0, 8).map(row)}
+      <details>
+        <summary className="muted">{files.length - 8} more</summary>
+        {files.slice(8).map(row)}
+      </details>
+    </>
+  );
+}
+
 /** A variant's download: its files together. */
 function size(v: Variant): number {
   return v.files.reduce((n, f) => n + f.bytes, 0);
@@ -79,7 +94,7 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
               { k: 'needs', v: `${bytes(v.memory_bytes)} of memory` },
               { k: 'download', v: `${bytes(size(v))} in ${v.files.length} file${v.files.length === 1 ? '' : 's'}` },
               { k: 'source', v: <Mono>{`${v.source.repo}@${v.source.revision.slice(0, 12)}`}</Mono> },
-              { k: 'files', v: v.files.map((f) => <div key={f.path}><Mono>{f.path}</Mono> <span className="muted">{bytes(f.bytes)}</span></div>) },
+              { k: 'files', v: <Files files={v.files} /> },
             ]}
           />
         </div>

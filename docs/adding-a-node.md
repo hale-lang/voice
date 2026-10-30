@@ -7,7 +7,13 @@ the models come to it afterwards, as the operator places them
 
 A habitat adds a node on a host it manages (`hale habitat organism place
 voice node --host <h>`, through `[dna.host.node]` in
-[`hale.toml`](../hale.toml)). By hand it is the same command.
+[`hale.toml`](../hale.toml)), and on its own machine with `--host local`:
+voice on one laptop is the coordinator in the habitat's compose and the node
+beside it, native, on the laptop's GPU. By hand it is the same command.
+
+A node runs natively, never in a container: on a Mac only a native process
+reaches Metal. Compose's demo node (`docker compose --profile node up`) is
+the exception, for a first look; it serves the static engine only.
 
 ## What it needs
 
@@ -113,6 +119,12 @@ sandbox, and the seat goes `fetching`, `starting`, `up`
 curl -sS $api/admin/v1/nodes/spark -H @admin.h        # up, its hardware, its engines
 curl -sS http://127.0.0.1:8081/node/v1/status         # on the machine
 ```
+
+The node also serves its readings at `http://<machine>:9476/metrics`, on
+every interface, for a habitat's senses to scrape: its own runtime's series,
+and each seat's `voice_node_seat_up`, `voice_node_seat_in_flight` and a
+managed seat's fetch bytes. They carry no secrets. A host running several
+nodes gives each one its own port with `--readings-port`.
 
 ## Remove it
 

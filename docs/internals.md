@@ -373,13 +373,16 @@ reaches the node over NATS. CI runs it (`end to end`).
 ## Running the process model
 
 [`compose.yaml`](../compose.yaml) runs voice as the MVP will: Postgres, NATS,
-the api, the brain and a node, each its own process, from one image built
-with hale's released toolchain ([`Dockerfile`](../Dockerfile)).
+the api and the brain, each its own process, and with `--profile node` a demo
+node, from one image built with hale's released toolchain
+([`Dockerfile`](../Dockerfile)). The demo node runs in a container, without
+the host's GPU, so it serves the static engine; a node that serves models
+runs natively on its host (docs/adding-a-node.md).
 
 ```sh
-docker compose up --build
+docker compose --profile node up --build
 curl localhost:8080/healthz        # the api; see "The api" for a key
-curl localhost:8081/node/v1/status # the node's local API
+curl localhost:8081/node/v1/status # the demo node's local API
 ```
 
 The api hands a node the NATS address in `--node-nats` (`NatsLink.place`),
@@ -391,8 +394,9 @@ publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises,
 The node `local` serves once it exists on the api and is started with its
 token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`, under the
 operator token `docker compose exec api voice-api admin-token` prints), give it a
-seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
--d node`. The `migrate` service brings the schema up to date before the
+seat, and start it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose --profile
+node up -d node` (the demo node is opt-in: it runs in a container, without
+the host's GPU). The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
 so it survives a restart of the api. The brain writes the route table to
 Postgres every second and tells NATS its new version.
@@ -971,6 +975,6 @@ already there.
 
 | Deployment | Runs |
 |---|---|
-| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`, `node` |
+| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`; a demo `node` with `--profile node` |
 | Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine with logins |
 | Scaled out | `api` behind a load balancer, `brain` with a standby, `postgres`, `nats`, and `node` anywhere |

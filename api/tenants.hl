@@ -7,25 +7,25 @@
 // (`HALE_VAULT_DIR`), each member's entry named by the family's prefix
 // (`HALE_SECRET_TENANT_KEY_FAMILY`) and its label.
 //
-// A tenant is a project of voice's, `tenant-<label>`, created when the
-// tenant first calls, from the tenant defaults the operator set (none until
-// they do, so it spends no account until the operator says so), with one
-// key whose digest is that of the key it presented. Every later call finds
-// the key by its digest and holds it to the member again, so a removed
-// tenant stops at once and a rotated key's old value stops at the first use
-// of its new one. Its usage, limits and budget are its project's, as any
-// project's are.
+// The habitat is voice's customer, not each organism: the operator says
+// once what it may spend, its grant (`GET`/`PUT /admin/v1/habitat`, the
+// Habitat screen), and every organism's app and tooling inside it is a
+// client. A tenant is a project of voice's, `tenant-<label>`, created when
+// it first calls, inheriting the grant: the accounts it may spend are the
+// grant's as it is when the tenant is used, so a change reaches every
+// inheriting tenant on its next call. An operator narrows one tenant by
+// giving its project accounts of its own (it no longer inherits), and sets
+// it to inherit again. Its key's digest is that of the key it presented;
+// every later call finds the key by its digest and holds it to the member
+// again, so a removed tenant stops at once and a rotated key's old value
+// stops at the first use of its new one. Its usage, limits and budget are
+// its project's, as any project's are.
 
-/// What a tenant's project is created with (`TenantDefaults` in
-/// spec/openapi.yaml): the accounts it may spend, always a list (none by
-/// default; a tenant is opened to any account on its own project, never by
-/// default), the models it may name (absent, the default, for the whole
-/// catalog) and its data classes (`[internal]` by default).
-type TenantDefaults {
+/// What the habitat may spend (`HabitatGrant` in spec/openapi.yaml): the
+/// accounts every inheriting tenant may spend, always named; none until the
+/// operator grants some.
+type HabitatGrant {
     accounts: bounded[String; 32];
-    has_models: Bool = false;
-    models: bounded[String; 32];
-    data_classes: bounded[String; 32];
 }
 
 /// The name a tenant's key is created with; an operator may rename it.
@@ -57,17 +57,12 @@ fn vault_dir() -> String {
     return std::str::trim(std::env::var("HALE_VAULT_DIR"));
 }
 
-/// The defaults as stored, or none set: no account, the whole catalog,
-/// `[internal]`.
-fn tenant_defaults_of(body: String) -> TenantDefaults {
-    let mut d = TenantDefaults { };
-    if len(std::str::trim(body)) == 0 { return d; }
-    d.accounts = stored_names(std::json::find_field_raw(body, "accounts")).items;
-    let models = std::str::trim(std::json::find_field_raw(body, "models"));
-    d.has_models = std::str::starts_with(models, "[");
-    d.models = stored_names(models).items;
-    d.data_classes = stored_names(std::json::find_field_raw(body, "data_classes")).items;
-    return d;
+/// The grant as stored, or none set: no account.
+fn habitat_grant_of(body: String) -> HabitatGrant {
+    let mut g = HabitatGrant { };
+    if len(std::str::trim(body)) == 0 { return g; }
+    g.accounts = stored_names(std::json::find_field_raw(body, "accounts")).items;
+    return g;
 }
 
 /// A JSON list of strings, as names; none for `null` or anything else.
@@ -84,37 +79,35 @@ fn stored_names(raw: String) -> st::Names {
     return out;
 }
 
-fn tenant_defaults_json(d: TenantDefaults) -> String {
-    return "{\"accounts\": " + st::jnames(d.accounts) + ", \"models\": "
-        + jnames_or_null(d.has_models, d.models) + ", \"data_classes\": "
-        + st::jnames(d.data_classes) + "}";
+fn habitat_grant_json(g: HabitatGrant) -> String {
+    return "{\"accounts\": " + st::jnames(g.accounts) + "}";
 }
 
-/// The tenant defaults on the admin plane (`getTenantDefaults`,
-/// `setTenantDefaults`).
-locus Tenants {
+/// The habitat's grant on the admin plane (`getHabitatGrant`,
+/// `setHabitatGrant`).
+locus Habitat {
     params {
         store: st::Store;
         // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
         gate: st::Lock = st::Lock { };
     }
 
-    /// `getTenantDefaults`.
-    fn defaults() -> TenantDefaults fallible(CtlError) {
+    /// `getHabitatGrant`.
+    fn grant() -> HabitatGrant fallible(CtlError) {
         self.gate.enter();
-        let body = self.store.tenant_defaults() or {
+        let body = self.store.habitat_grant() or {
             self.gate.leave();
             fail store_down(err);
         };
         self.gate.leave();
-        return shown(tenant_defaults_of(body));
+        return habitat_grant_of(body);
     }
 
-    /// `setTenantDefaults`: what a tenant's project is created with from
-    /// now on; a tenant that has called already keeps its project as it is.
-    fn set_defaults(d: TenantDefaults) -> TenantDefaults fallible(CtlError) {
+    /// `setHabitatGrant`: what the habitat may spend, from every inheriting
+    /// tenant's next call on.
+    fn set_grant(g: HabitatGrant) -> HabitatGrant fallible(CtlError) {
         self.gate.enter();
-        let out = self.set_in_gate(d) or {
+        let out = self.set_in_gate(g) or {
             self.gate.leave();
             fail err;
         };
@@ -122,34 +115,45 @@ locus Tenants {
         return out;
     }
 
-    fn set_in_gate(d: TenantDefaults) -> TenantDefaults fallible(CtlError) {
-        accounts_restriction(true, d.accounts) or raise;
-        let v = shown(d);
-        let before = self.store.tenant_defaults() or fail store_down(err);
-        let after = tenant_defaults_json(v);
-        self.store.put_tenant_defaults(
+    fn set_in_gate(g: HabitatGrant) -> HabitatGrant fallible(CtlError) {
+        accounts_restriction(true, g.accounts) or raise;
+        let before = self.store.habitat_grant() or fail store_down(err);
+        let after = habitat_grant_json(g);
+        let had = len(std::str::trim(before)) > 0;
+        self.store.put_habitat_grant(
             after,
             checked_change(
-                if len(std::str::trim(before)) == 0 { "create" } else { "update" },
-                "tenants/defaults",
-                if len(std::str::trim(before)) == 0 {
-                    ""
-                } else {
-                    tenant_defaults_json(tenant_defaults_of(before))
-                },
+                if had { "update" } else { "create" },
+                "habitat",
+                if had { habitat_grant_json(habitat_grant_of(before)) } else { "" },
                 after,
             ) or raise,
         ) or fail store_down(err);
-        return v;
+        return g;
     }
 }
 
-/// The defaults as they are answered: an empty list of data classes is the
-/// default, `[internal]`.
-fn shown(d: TenantDefaults) -> TenantDefaults {
-    let mut v = d;
-    if count(v.data_classes) == 0 { push(v.data_classes, "internal") or discard; }
-    return v;
+/// The project as it is in force when it is used: an inheriting tenant's
+/// accounts are the habitat's grant as it is now.
+fn as_in_force(store: st::Store, p: st::ProjectRow) -> st::ProjectRow fallible(st::StoreError) {
+    if !p.inherits { return p; }
+    let g = habitat_grant_of(store.habitat_grant() or raise);
+    let mut out = p;
+    out.accounts = restriction_of(true, g.accounts);
+    return out;
+}
+
+/// True when project `id` is a tenant's: one voice made for a habitat's
+/// member, which holds a key voice made (its prefix `tenant`).
+fn is_tenant_project(store: st::Store, id: String) -> Bool {
+    if !std::str::starts_with(id, "tenant-") { return false; }
+    let keys = store.keys(id) or {
+        return false;
+    };
+    for k in keys.rows {
+        if k.prefix == TENANT_KEY_PREFIX { return true; }
+    }
+    return false;
 }
 
 /// The label of the tenant whose member `token` is, "" for none: each
@@ -197,15 +201,16 @@ fn tenant_key(store: st::Store, label: String, digest: String) -> st::KeyRow fal
     let pid = tenant_project(label);
     let mut p = store.project(pid) or fail metering_failed(err);
     if !p.present {
-        let d = tenant_defaults_of(store.tenant_defaults() or fail metering_failed(err));
+        // inheriting the habitat's grant: no account of its own, the whole
+        // catalog, internal data
         let mut row = st::ProjectRow {
             id: pid,
             name: "tenant " + label,
-            models: restriction_of(d.has_models, d.models),
-            accounts: restriction_of(true, d.accounts),
-            created_at: now_seconds()
+            accounts: st::Restriction { any: false },
+            created_at: now_seconds(),
+            inherits: true
         };
-        row.data_classes.items = shown(d).data_classes;
+        push(row.data_classes.items, "internal") or discard;
         row.position = "the habitat's organism " + label;
         let made = project_json(new_project_view(row));
         store.insert_project(
@@ -269,7 +274,8 @@ fn new_project_view(r: st::ProjectRow) -> Project {
         key_count: 0,
         has_position: len(r.position) > 0,
         position: r.position,
-        created_at: r.created_at
+        created_at: r.created_at,
+        inherits: r.inherits
     };
     v.models = r.models.names.items;
     v.accounts = r.accounts.names.items;

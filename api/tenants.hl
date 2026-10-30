@@ -100,7 +100,7 @@ fn habitat_name() -> String {
 fn habitat_project() -> String {
     let name = habitat_name();
     let id = name + "-habitat";
-    if len(name) == 0 || !is_slug(id) { return ""; }
+    if len(name) == 0 || !is_project_id(id) { return ""; }
     return id;
 }
 
@@ -125,13 +125,33 @@ fn ensure_habitat(store: st::Store) -> String fallible(st::StoreError) {
         row,
         change_of("create", "projects/" + id, "", project_json(new_project_view(row))),
     ) or raise;
+    // the tenants made before the habitat named its callers (`tenant-<x>`,
+    // migration 14) become its children, keeping their ids and whether they
+    // inherit or were narrowed
+    let all = store.projects() or raise;
+    for p in all.rows {
+        if std::str::starts_with(p.id, "tenant-") && len(p.parent) == 0 {
+            let before = project_json(new_project_view(p));
+            let mut child = p;
+            child.parent = id;
+            store.update_project(
+                child,
+                change_of(
+                    "update",
+                    "projects/" + p.id,
+                    before,
+                    project_json(new_project_view(child)),
+                ),
+            ) or raise;
+        }
+    }
     return id;
 }
 
 /// The project as it is in force when it is used: an inheriting child's
-/// accounts are its parent's as they are now. An inheriting tenant with no
-/// parent (made before the habitat had a project) is made the habitat's
-/// child here, once.
+/// accounts are its parent's as they are now. An inheriting tenant still
+/// with no parent (the habitat's project made before it, or outside a
+/// habitat) is made the habitat's child here, once.
 fn as_in_force(store: st::Store, p: st::ProjectRow) -> st::ProjectRow fallible(st::StoreError) {
     if !p.inherits { return p; }
     let mut out = p;
@@ -170,7 +190,7 @@ fn tenant_of(token: String) -> String {
         i = i + 1;
         if !std::str::starts_with(name, family) { continue; }
         let label = name[len(family)..len(name)];
-        if !is_slug(label) || len(member_project(label)) > 63 { continue; }
+        if !is_slug(label) || !is_project_id(member_project(label)) { continue; }
         if tenant_holds(label, token) { return label; }
     }
     return "";
@@ -204,9 +224,13 @@ fn tenant_label(k: st::KeyRow) -> String {
 /// key.
 @unbounded
 fn tenant_key(store: st::Store, label: String, digest: String) -> st::KeyRow fallible(ApiError) {
-    let pid = member_project(label);
-    // the habitat's own infrastructure calls as the habitat's project itself
     let habitat = ensure_habitat(store) or fail metering_failed(err);
+    // the habitat's own infrastructure calls as the habitat's project
+    // itself; a tenant made before the habitat named its callers keeps its
+    // project, `tenant-<label>`, through a rotation
+    let mut pid = member_project(label);
+    let legacy = store.project(tenant_project(label)) or fail metering_failed(err);
+    if legacy.present { pid = tenant_project(label); }
     let mut p = store.project(pid) or fail metering_failed(err);
     if !p.present {
         // a child of the habitat's project, inheriting its accounts (none of

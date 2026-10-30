@@ -174,8 +174,18 @@ locus Runner {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
         }
+        // what the placement reserved for it (its variant and its prompt
+        // cache), or, placed before voice sized that, its variant's need
+        let reserved = std::json::find_int_field(config, "reserved_bytes");
         let share = gpu_share(
-            std::json::find_int_field(std::json::find_field_raw(config, "variant"), "memory_bytes"),
+            if reserved > 0 {
+                reserved
+            } else {
+                std::json::find_int_field(
+                    std::json::find_field_raw(config, "variant"),
+                    "memory_bytes",
+                )
+            },
             self.gpu_memory,
         );
         let port = free_port(PORT_FROM + count(self.runs.items));
@@ -230,7 +240,7 @@ locus Runner {
                     8080,
                     "0.0.0.0",
                     std::json::find_string_field(config, "model"), share,
-                    std::json::find_int_field(config, "context_length"),
+                    served_tokens(config),
                 ),
             );
         } else {
@@ -262,7 +272,7 @@ locus Runner {
                     port,
                     "127.0.0.1",
                     std::json::find_string_field(config, "model"), share,
-                    std::json::find_int_field(config, "context_length"),
+                    served_tokens(config),
                 );
         }
         // started apart from the node, its output to a file of its own: sh
@@ -449,7 +459,7 @@ fn server_args(
     host: String,
     name: String,
     share: String,
-    native: Int
+    tokens: Int
 ) -> String {
     if server == "vllm" {
         // vLLM takes the share of the GPU's memory it is given, all of it
@@ -468,14 +478,23 @@ fn server_args(
                 }
             );
     }
-    // llama-server serves the context a shipped recipe's memory_bytes is
-    // fitted for (scripts/catalog-recipes.py, CONTEXT), so what the seat
-    // takes is what placement fitted; left to itself it sizes the cache
-    // for the model's whole context
+    // llama-server keeps one prompt cache of `tokens` (served_tokens), which
+    // its slots share: a conversation that comes back is restored from it
+    // rather than read again, while there is room for it. Left to itself it
+    // would size the cache for the model's whole context
     return "-m\n" + first + "\n--host\n" + host + "\n--port\n" + to_string(port) + "\n--alias\n"
-        + name + "\n-c\n" + to_string(
-            if native > 0 && native < SERVED_CONTEXT { native } else { SERVED_CONTEXT },
-        );
+        + name + "\n-c\n" + to_string(tokens);
+}
+
+/// The prompt cache, in tokens, a llama-server seat keeps, shared by the
+/// conversations it holds: what its placement sized (`cache_tokens`), or,
+/// placed before voice sized it, `SERVED_CONTEXT`, less for a model made for
+/// less. One conversation is never given more than the model is made for.
+fn served_tokens(config: String) -> Int {
+    let cache = std::json::find_int_field(config, "cache_tokens");
+    if cache > 0 { return cache; }
+    let native = std::json::find_int_field(config, "context_length");
+    return if native > 0 && native < SERVED_CONTEXT { native } else { SERVED_CONTEXT };
 }
 
 /// The context, in tokens, a server that answers took: llama-server's

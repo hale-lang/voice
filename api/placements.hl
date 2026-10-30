@@ -59,6 +59,13 @@ type Placement {
     leader: String = "";
     seat: String = "";
     fit: bounded[VariantFit; 8];
+    // the prompt cache its seat keeps, in tokens, and what the placement
+    // holds of its node's memory for models: its variant and that cache.
+    // Left out of a placement made before voice sized them.
+    has_cache_tokens: Bool = false;
+    cache_tokens: Int = 0;
+    has_reserved_bytes: Bool = false;
+    reserved_bytes: Int = 0;
     created_at: Time = `1970-01-01T00:00:00Z`;
 }
 
@@ -76,6 +83,21 @@ locus Placements {
         // the seats a placement creates and removes (nodes.hl): the api's
         // own, which tell the node its assignment, behind the same gate
         seats: Seats;
+    }
+
+    /// What placement `r` holds of its node's memory for models: what it
+    /// reserved, or, made before voice sized it, its variant's need.
+    fn held_by(r: st::PlacementRow) -> Int fallible(CtlError) {
+        let reserved = std::json::find_int_field(r.body, "reserved_bytes");
+        if reserved > 0 { return reserved; }
+        let recipe = self.recipes.get_in_gate(std::json::find_string_field(r.body, "recipe")) or {
+            return 0;
+        };
+        let v = variant_body_of(
+            recipe.variants.text,
+            std::json::find_string_field(r.body, "variant"),
+        );
+        return std::json::find_int_field(v, "memory_bytes");
     }
 
     /// `listPlacements`: those not withdrawn.
@@ -151,13 +173,17 @@ locus Placements {
             );
         }
         let existing = self.store.placements() or fail store_down(err);
+        // what the node's other placements hold of its memory for models
+        let mut held = 0;
         for r in existing.rows {
-            if !r.removed && r.model == c.model
-                && std::json::find_string_field(r.body, "leader") == leader
-            {
-                fail clash("model " + c.model + " is placed on node " + leader + " by " + r.id);
+            if !r.removed && std::json::find_string_field(r.body, "leader") == leader {
+                if r.model == c.model {
+                    fail clash("model " + c.model + " is placed on node " + leader + " by " + r.id);
+                }
+                held = held + (self.held_by(r) or raise);
             }
         }
+        let room = std::json::find_int_field(hw, "model_memory_bytes") - held;
 
         let mut out = Placement {
             id: c.id,
@@ -187,7 +213,7 @@ locus Placements {
         let mut it = std::json::array_first(recipe.variants.text);
         while !it.done {
             let v = it.element;
-            let judged = judge_variant(v, hw, usable);
+            let judged = judge_variant(v, hw, usable, room, held);
             push(out.fit, judged) or discard;
             let rank = format_rank(std::json::find_string_field(v, "format"), hw)
                 + (if judged.has_runtime && runs_on_cpu(usable, judged.runtime) { 10 } else { 0 });
@@ -231,6 +257,18 @@ locus Placements {
             if c.has_runtime { out.chosen_by = PlacementChooser::operator; }
         }
 
+        // its seat's prompt cache: room for CACHED conversations of the
+        // model's context (at most CONVERSATION_MAX), from at most half the
+        // room the variant leaves, never less than the context it was
+        // fitted with
+        let variant = variant_body_of(recipe.variants.text, out.variant);
+        let need = std::json::find_int_field(variant, "memory_bytes");
+        let pool = cache_pool(room - need, recipe.kv_bytes_per_token, recipe.context_length, need);
+        out.has_cache_tokens = true;
+        out.cache_tokens = pool;
+        out.has_reserved_bytes = true;
+        out.reserved_bytes = need + (pool - FITTED_CONTEXT) * recipe.kv_bytes_per_token;
+
         // the seat first: its own checks (the account, the node's room)
         // refuse before anything is kept
         out.seat = leader + "/" + c.id;
@@ -244,6 +282,8 @@ locus Placements {
                     c.id,
                     c.model,
                     recipe.context_length,
+                    out.cache_tokens,
+                    out.reserved_bytes,
                     variant_body_of(recipe.variants.text, out.variant),
                     runtime_body_of(all, out.runtime),
                 ),
@@ -326,6 +366,10 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
         },
         leader: std::json::find_string_field(b, "leader"),
         seat: std::json::find_string_field(b, "seat"),
+        has_cache_tokens: std::json::find_int_field(b, "cache_tokens") > 0,
+        cache_tokens: std::json::find_int_field(b, "cache_tokens"),
+        has_reserved_bytes: std::json::find_int_field(b, "reserved_bytes") > 0,
+        reserved_bytes: std::json::find_int_field(b, "reserved_bytes"),
         created_at: r.created_at
     };
     let mut nodes = std::json::array_first(std::json::find_field_raw(b, "nodes"));
@@ -377,7 +421,50 @@ fn placement_json(p: Placement) -> String {
         + jq(p.runtime) + ", \"chosen_by\": "
         + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"seat\": "
         + jq(p.seat) + ", \"fit\": ["
-        + fits.text() + "], \"created_at\": " + jtime(p.created_at) + "}";
+        + fits.text() + "]"
+        + (if p.has_cache_tokens { ", \"cache_tokens\": " + to_string(p.cache_tokens) } else { "" })
+        + (
+            if p.has_reserved_bytes {
+                ", \"reserved_bytes\": " + to_string(p.reserved_bytes)
+            } else {
+                ""
+            }
+        )
+        + ", \"created_at\": " + jtime(p.created_at) + "}";
+}
+
+// ---- the prompt cache --------------------------------------------------
+
+/// The context a recipe's `memory_bytes` provides for
+/// (scripts/catalog-recipes.py, CONTEXT).
+const FITTED_CONTEXT: Int = 32768;
+
+/// The conversations a seat's prompt cache holds at once, each returned to
+/// what it said when it comes back (llama-server's slots).
+const CACHED: Int = 4;
+
+/// The most context a cached conversation is given room for.
+const CONVERSATION_MAX: Int = 131072;
+
+/// A seat's prompt cache, in tokens: room for `CACHED` conversations of the
+/// model's context (`native`, at most `CONVERSATION_MAX`), from at most half
+/// of `spare`, the memory its variant leaves, and never more than `need`,
+/// the variant's own, past what that provides (a cache no larger than the
+/// model it serves); never less than
+/// `FITTED_CONTEXT`, which the variant's memory provides. With no per-token
+/// cost known, `FITTED_CONTEXT`.
+fn cache_pool(spare: Int, per_token: Int, native: Int, need: Int) -> Int {
+    if per_token <= 0 || spare <= 0 { return FITTED_CONTEXT; }
+    let conversation = if native > 0 && native < CONVERSATION_MAX {
+        native
+    } else {
+        CONVERSATION_MAX
+    };
+    let want = CACHED * conversation;
+    if want <= FITTED_CONTEXT { return FITTED_CONTEXT; }
+    let budget = if spare / 2 < need { spare / 2 } else { need };
+    let afford = FITTED_CONTEXT + budget / per_token;
+    return if afford < want { afford } else { want };
 }
 
 // ---- the seat ---------------------------------------------------------
@@ -423,6 +510,8 @@ fn managed_config(
     placement: String,
     model: String,
     context_length: Int,
+    cache_tokens: Int,
+    reserved_bytes: Int,
     variant: String,
     runtime: String
 ) -> String {
@@ -436,6 +525,10 @@ fn managed_config(
                 ""
             }
         )
+    // the prompt cache its server keeps, in tokens, and the memory it
+    // may take (node/run.hl)
+        + ", \"cache_tokens\": " + to_string(cache_tokens) + ", \"reserved_bytes\": "
+        + to_string(reserved_bytes)
         + ", \"variant\": "
         + variant
         + ", \"runtime\": " + runtime + "}";
@@ -516,7 +609,7 @@ fn accelerator_kinds(hw: String) -> String {
 /// may serve it: a runtime reads its format there, it fits what models may
 /// use of the memory, and its files fit the disk.
 @bounded_by(v)
-fn judge_variant(v: String, hw: String, rts: RuntimeList) -> VariantFit {
+fn judge_variant(v: String, hw: String, rts: RuntimeList, room: Int, held: Int) -> VariantFit {
     let id = std::json::find_string_field(v, "id");
     let format = std::json::find_string_field(v, "format");
     let rt = runtime_for(format, hw, rts);
@@ -531,8 +624,8 @@ fn judge_variant(v: String, hw: String, rts: RuntimeList) -> VariantFit {
     }
     let runs = rt + " runs " + format + " on " + runtime_on(rts, rt);
     let need = std::json::find_int_field(v, "memory_bytes");
-    let room = std::json::find_int_field(hw, "model_memory_bytes");
-    let memory = gb(need) + " of " + gb(room) + " for models";
+    let memory = gb(need) + " of " + gb(room) + " for models"
+        + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
     if need > room {
         return VariantFit {
             variant: id,

@@ -28,6 +28,10 @@ type RecipeCreate {
     // max_position_embeddings); left out when not known
     has_context_length: Bool = false;
     context_length: Int = 0;
+    // what one more token of context costs in KV cache, in bytes at 16
+    // bits, past any sliding window; left out when not known
+    has_kv_bytes_per_token: Bool = false;
+    kv_bytes_per_token: Int = 0;
     variants: std::json::Value = std::json::Value::null();
 }
 
@@ -47,6 +51,10 @@ type Recipe {
     license: License = License { };
     has_context_length: Bool = false;
     context_length: Int = 0;
+    // what one more token of context costs in KV cache, in bytes at 16
+    // bits, past any sliding window; left out when not known
+    has_kv_bytes_per_token: Bool = false;
+    kv_bytes_per_token: Int = 0;
     variants: std::json::Value = std::json::Value::null();
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
@@ -141,6 +149,7 @@ locus Recipes {
             c.id,
             c.license,
             if c.has_context_length { c.context_length } else { 0 },
+            if c.has_kv_bytes_per_token { c.kv_bytes_per_token } else { 0 },
             c.variants.text,
         );
         if std::str::starts_with(body, "!") {
@@ -256,6 +265,8 @@ fn recipe_view(
         },
         has_context_length: std::json::find_int_field(body, "context_length") > 0,
         context_length: std::json::find_int_field(body, "context_length"),
+        has_kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token") > 0,
+        kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token"),
         variants: stored_value(
             std::json::find_field_raw(body, "variants"),
             "a recipe's variants",
@@ -271,6 +282,7 @@ fn recipe_json(r: Recipe) -> String {
     return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
         + ", \"url\": "
         + jq(r.license.url) + "}" + context_field(r.has_context_length, r.context_length)
+        + kv_field(r.has_kv_bytes_per_token, r.kv_bytes_per_token)
         + ", \"variants\": " + r.variants.text + ", \"origin\": "
         + jq(origin_name(r.origin)) + ", \"created_at\": "
         + jtime_or_null(r.has_created_at, r.created_at) + "}";
@@ -282,11 +294,20 @@ fn recipe_json(r: Recipe) -> String {
 // checked, or `!<param>\t<problem>` (the param is the field at fault).
 
 @bounded_by(variants)
-fn recipe_body(id: String, license: License, context_length: Int, variants: String) -> String {
+fn recipe_body(
+    id: String,
+    license: License,
+    context_length: Int,
+    kv_bytes_per_token: Int,
+    variants: String
+) -> String {
     let head = id_and_license(id, license);
     if len(head) > 0 { return head; }
     if context_length < 0 || context_length > CONTEXT_MAX {
         return "!context_length\t`context_length` is 1 to 16777216 tokens";
+    }
+    if kv_bytes_per_token < 0 || kv_bytes_per_token > KV_PER_TOKEN_MAX {
+        return "!kv_bytes_per_token\t`kv_bytes_per_token` is 1 to 16777216 bytes";
     }
     if std::json::string_field("{\"v\": " + variants + "}", "v").kind != "array" {
         return "!variants\t`variants` is a list";
@@ -317,6 +338,7 @@ fn recipe_body(id: String, license: License, context_length: Int, variants: Stri
     let body = "{\"id\": " + jq(id) + ", \"license\": {\"name\": " + jq(license.name)
         + ", \"url\": "
         + jq(license.url) + "}" + context_field(context_length > 0, context_length)
+        + kv_field(kv_bytes_per_token > 0, kv_bytes_per_token)
         + ", \"variants\": [" + out.text() + "]}";
     if len(body) > RECIPE_MAX {
         return "!variants\ta recipe is at most 48 KiB (" + to_string(len(body)) + " bytes)";
@@ -326,6 +348,15 @@ fn recipe_body(id: String, license: License, context_length: Int, variants: Stri
 
 /// The most context a recipe may say a model has: 16M tokens.
 const CONTEXT_MAX: Int = 16777216;
+
+/// The most a token of context may cost in KV cache: 16 MiB.
+const KV_PER_TOKEN_MAX: Int = 16777216;
+
+/// `, "kv_bytes_per_token": n` when it is known, "" when not.
+fn kv_field(known: Bool, n: Int) -> String {
+    if !known { return ""; }
+    return ", \"kv_bytes_per_token\": " + to_string(n);
+}
 
 /// `, "context_length": n` when it is known, "" when not.
 fn context_field(known: Bool, n: Int) -> String {

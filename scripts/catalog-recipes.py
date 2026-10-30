@@ -342,6 +342,34 @@ def kv_bytes(cfg, ctx):
     return per_token * ctx * layers
 
 
+def kv_per_token(cfg):
+    """What one more token of context costs in KV cache at 16 bits, past any sliding window: the layers that keep
+    every token (full attention, or MLA's latent), none of the linear or recurrent ones. None when the config does
+    not say."""
+    c = {**cfg, **(cfg.get("text_config") or {})}
+    layers = c.get("num_hidden_layers")
+    if not layers:
+        return None
+    if c.get("kv_lora_rank"):
+        return layers * (c["kv_lora_rank"] + (c.get("qk_rope_head_dim") or 64)) * 2
+    heads = c.get("num_attention_heads")
+    kv_heads = c.get("num_key_value_heads") or heads
+    head_dim = c.get("head_dim") or (c.get("hidden_size") // heads if heads and c.get("hidden_size") else None)
+    if not (kv_heads and head_dim):
+        return None
+    per_token = 2 * kv_heads * head_dim * 2
+    types = c.get("layer_types")
+    if isinstance(types, list) and types:
+        full = sum(1 for t in types if not any(w in str(t).lower() for w in ("linear", "mamba", "conv", "ssm", "recurrent", "sliding")))
+        return per_token * full
+    if c.get("full_attention_interval"):
+        return per_token * (layers // c["full_attention_interval"])
+    for k in ("full_attn_idxs", "attn_layer_indices"):
+        if isinstance(c.get(k), list):
+            return per_token * len(c[k])
+    return per_token * layers
+
+
 def need_bytes(files, kv):
     """Weights, buffers and the KV cache; a fifth more than the weights when the cache is not known."""
     size = sum(f["bytes"] for f in files)
@@ -519,6 +547,9 @@ def resolve(model, quants, arches, tag, registry, types, limits):
         native = native_context(cfg)
         if native:
             recipe["context_length"] = native
+        per_token = kv_per_token(cfg)
+        if per_token:
+            recipe["kv_bytes_per_token"] = per_token
         recipe["variants"] = variants
         size = len(api_json(recipe).encode())
         if size > limits["recipe"]:

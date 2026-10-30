@@ -56,7 +56,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
 }
 
 /** A list that may be none, any, or some names: `[]`, `null`, or the names. */
-type Scope = 'none' | 'any' | 'these' | 'parent';
+type Scope = 'none' | 'any' | 'these' | 'parent' | 'kept';
 const scopeOf = (v: string[] | null | undefined, empty: Scope): Scope => (v == null ? 'any' : v.length ? 'these' : empty);
 
 /** Projects in order, each followed by its children: a habitat's callers under it. */
@@ -180,7 +180,9 @@ function ProjectInspector({ project: p }: { project: Project }) {
                 ...(parent !== (p.parent ?? '') ? { parent: parent || null } : {}),
                 // a child set to its parent's inherits them; any accounts of
                 // its own narrow it
-                ...(accountScope === 'parent'
+                ...(accountScope === 'kept'
+                  ? {}
+                  : accountScope === 'parent'
                   ? { inherits: true }
                   : { accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames }),
                 models: modelScope === 'any' ? null : modelScope === 'none' ? [] : modelNames,
@@ -200,13 +202,16 @@ function ProjectInspector({ project: p }: { project: Project }) {
               value={parent}
               onChange={(v) => {
                 setParent(v);
-                if (!v && accountScope === 'parent') setAccountScope(scopeOf(p.accounts, 'none'));
+                // made a project of its own, it keeps what it spends now
+                // (the server copies its parent's) unless set otherwise
+                if (!v && accountScope === 'parent') setAccountScope('kept');
+                if (v && accountScope === 'kept') setAccountScope('parent');
               }}
               options={isParent ? [{ value: '', label: 'none: a project of its own' }] : [{ value: '', label: 'none: a project of its own' }, ...parentsFor(projects.data?.data ?? [], p.id).map((q) => ({ value: q.id, label: q.id }))]}
             />
           </Field>
           <Field label="accounts it may spend" help={(known.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ') || 'no account yet: create one on Accounts'}>
-            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(child ? [{ value: 'parent', label: `${parent}'s (inherit)` }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(child ? [{ value: 'parent', label: `${parent}'s (inherit)` }] : []), ...(accountScope === 'kept' ? [{ value: 'kept', label: 'what it spends now (kept)' }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
           </Field>
           {accountScope === 'these' && (
             <Field label="accounts">

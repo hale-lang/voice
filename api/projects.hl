@@ -2,6 +2,10 @@
 // the admin plane, and the caller plane's bearer: the project key a
 // request presents. Every write records its change.
 
+/// What every change of a project's parent holds (store.hold), on every api
+/// instance, from its check to its write.
+const HIERARCHY: String = "projects/hierarchy";
+
 locus Projects {
     params {
         store: st::Store;
@@ -85,7 +89,12 @@ locus Projects {
             push(row.data_classes.items, "internal") or discard;
         }
         if c.has_parent {
-            self.check_parent(c.id, c.parent) or raise;
+            // the hierarchy is held from this check to the project's write
+            self.store.hold(HIERARCHY) or fail store_down(err);
+            self.check_parent(c.id, c.parent) or {
+                self.store.let_go();
+                fail err;
+            };
             row.parent = c.parent;
             // with no accounts of its own, it spends its parent's
             if !c.has_accounts {
@@ -93,7 +102,10 @@ locus Projects {
                 row.accounts = st::Restriction { any: false };
             }
         }
-        let v = self.view(row) or raise;
+        let v = self.view(row) or {
+            self.store.let_go();
+            fail err;
+        };
         let added = self.store.insert_project(
             row,
             checked_change("create", "projects/" + c.id, "", project_json(v)) or raise,
@@ -145,7 +157,12 @@ locus Projects {
                 "limits"
             );
         }
-        self.store.hold("projects/" + u.project) or fail store_down(err);
+        // a change of its parent holds the hierarchy too, so no two changes
+        // on any api instance make a cycle or a second level between them
+        self.store.hold(
+            "projects/" + u.project
+                + (if u.has_parent || u.clear_parent { "\n" + HIERARCHY } else { "" }),
+        ) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;

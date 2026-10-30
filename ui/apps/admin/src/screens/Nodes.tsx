@@ -356,6 +356,9 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
   const engineDef = engines.find((e) => e.id === engine);
   const schema = (engineDef?.config_schema ?? { type: 'object' }) as JsonSchema;
   const cancel = () => (onDone ? onDone() : go('nodes', node.id));
+  // a placement's seat runs its model's weights: its engine, what it serves
+  // and its config are the placement's, changed on Placements
+  const placed = typeof seat?.config?.placement === 'string' ? seat.config.placement : '';
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-3)' }}>{seat ? <><Mono>{seat.ref}</Mono></> : `New seat on ${node.id}`}</h2>
@@ -364,7 +367,7 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
         onSubmit={async () => {
           const body: Seat = { id, engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config };
           const r = seat
-            ? await w.write('patch', '/admin/v1/nodes/{node}/seats/{seat}', { params: { path: { node: node.id, seat: seat.id } }, body: { engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config } })
+            ? await w.write('patch', '/admin/v1/nodes/{node}/seats/{seat}', { params: { path: { node: node.id, seat: seat.id } }, body: placed ? { account, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled } : { engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config } })
             : await w.write('post', '/admin/v1/nodes/{node}/seats', { params: { path: { node: node.id } }, body });
           if (r) {
             if (onDone) onDone();
@@ -383,15 +386,20 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
             <TextInput mono value={id} onChange={setId} required pattern="^[a-z0-9][a-z0-9-]{0,62}$" placeholder="static" />
           </Field>
         )}
-        <Field label="engine" required help="one the node offers">
+        {placed && (
+          <p className="muted" style={{ margin: 0 }}>
+            Placement <a href={`#/placements/${placed}`}><Mono>{placed}</Mono></a>'s seat: it serves {serves.map((m) => m.model).join(', ')} alone, on the engine and config the placement chose. To serve another model, place it on Placements.
+          </p>
+        )}
+        {!placed && <Field label="engine" required help="one the node offers">
           <Select value={engine} onChange={(v) => { setEngine(v); setConfig({}); }} options={engines.map((e) => ({ value: e.id, label: `${e.id} (${e.kind})` }))} required empty="" />
-        </Field>
+        </Field>}
         <Field label="account" required help="what this seat spends">
           <Select value={account} onChange={setAccount} options={(accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => ({ value: a.id, label: `${a.id} · ${a.billing}` }))} required empty="" />
         </Field>
-        <Field label="serves" required help="catalog models this seat serves; `as` is the engine's own name when it differs">
+        {!placed && <Field label="serves" required help="catalog models this seat serves; `as` is the engine's own name when it differs">
           <ServesEditor value={serves} onChange={setServes} models={(catalog.data?.data ?? []).map((m) => m.id)} engineModels={engineDef?.models ?? null} />
-        </Field>
+        </Field>}
         <Field label="data classes" help="what this seat may carry">
           <ListInput value={dataClasses} onChange={setDataClasses} />
         </Field>
@@ -399,7 +407,7 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
           <NumberInput value={concurrency} onChange={setConcurrency} min={1} />
         </Field>
         <Checkbox checked={enabled} onChange={setEnabled} label="enabled" />
-        {schema.properties && (
+        {!placed && schema.properties && (
           <>
             <h3 style={{ margin: 'var(--space-2) 0 0' }}>{engine} config</h3>
             <SchemaForm schema={schema} value={config} onChange={setConfig} />

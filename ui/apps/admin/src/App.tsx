@@ -53,8 +53,8 @@ function OperatorToken() {
         onSubmit={() => keepOperatorToken(value.trim())}
         actions={<Button type="submit" tone="primary">continue</Button>}
       >
-        <Field label="operator token" required help="voice-api admin-token prints it: docker compose exec api voice-api admin-token">
-          <TextInput mono value={value} onChange={setValue} required pattern="\s*va-[0-9a-f]+\s*" placeholder="va-..." />
+        <Field label="operator token" required help="standalone: docker compose exec api voice-api admin-token; in a habitat: hale dna secret show operator-token">
+          <TextInput mono value={value} onChange={setValue} required pattern="\s*[0-9a-zA-Z_-]+\s*" placeholder="va-... or the habitat's" />
         </Field>
       </Form>
     </Shell>

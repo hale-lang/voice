@@ -47,6 +47,13 @@ It is never read from the environment and never logged.
 when no api has yet; under Compose, `docker compose exec api voice-api
 admin-token`.
 
+Grafted, the habitat draws the token (hale.toml `[dna.secrets.operator-token]`)
+and hands the api its vault and the entry's name (`HALE_VAULT_DIR`,
+`HALE_SECRET_OPERATOR_TOKEN`): the api mints none and checks each request
+against the entry on the sealed side (`std::secret::Credential.matches`),
+read fresh each time, so a rotation needs no restart. `admin-token` then
+refuses and names `hale dna secret show operator-token`.
+
 A control-plane failure is a classed variant of `CtlError`
 ([`api/ctl.hl`](../api/ctl.hl)): `Invalid` 422, `NotFound` 404, `Conflict`
 409, `Unavailable` 503, named in the `Hale-Error-Class` header, the body the

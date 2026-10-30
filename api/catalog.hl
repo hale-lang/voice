@@ -226,7 +226,10 @@ locus Models {
     /// `listModels`.
     fn list(ctx: std::api::Context) -> ModelList fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let rows = self.store.models() or fail metering_failed(err);
         let mut out = ModelList { };
         for r in rows.rows {
@@ -242,7 +245,10 @@ locus Models {
     /// does not exist.
     fn get(r: ModelRef, ctx: std::api::Context) -> Model fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let row = self.store.model(r.model) or fail metering_failed(err);
         if !row.present || row.removed || !visible(p, k, r.model) {
             fail ApiError {
@@ -262,7 +268,10 @@ locus Models {
     /// any scope, and the project's budget.
     fn capabilities(ctx: std::api::Context) -> Capabilities fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let rows = self.store.models() or fail metering_failed(err);
         let mut out = Capabilities {
             project_id: p.id,
@@ -272,7 +281,7 @@ locus Models {
             has_budget: p.budgeted,
             budget: budget_view(p.budget, now_seconds())
         };
-        let spends = if k.accounts.any { p.accounts } else { k.accounts };
+        let spends = spends_of(p, k);
         out.has_accounts = !spends.any;
         out.accounts = spends.names.items;
         out.data_classes = p.data_classes.items;
@@ -304,9 +313,17 @@ locus Models {
     }
 }
 
-/// The accounts a key may spend: its own restriction, else its project's.
+/// The accounts a key may spend: those both it and its project allow (as
+/// serving holds them, inference.hl), its project's as in force, the
+/// habitat's grant for an inheriting tenant.
 fn spends_of(p: st::ProjectRow, k: st::KeyRow) -> st::Restriction {
-    return if k.accounts.any { p.accounts } else { k.accounts };
+    if k.accounts.any { return p.accounts; }
+    if p.accounts.any { return k.accounts; }
+    let mut both = st::Restriction { any: false };
+    for n in k.accounts.names.items {
+        if allows(p.accounts, n) { push(both.names.items, n) or discard; }
+    }
+    return both;
 }
 
 /// True when the project and the key both let `model` through.

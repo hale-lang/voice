@@ -215,8 +215,8 @@ echo "each served request is told to the organization ($told usage events on zzo
 
 # an organism of voice's habitat calls with the key the habitat drew for it
 # (a member of the tenant-key family, in the vault the api reads): voice
-# makes it a project, from the tenant defaults, which allow no account
-# until the operator says so (api/tenants.hl)
+# makes it a project that inherits what the habitat may spend, which is no
+# account until the operator grants it some (api/tenants.hl)
 tenant_key=$(openssl rand -hex 16)
 printf '%s' "$tenant_key" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 chmod 600 "$work/vault/secret-dna_e2e-tenant-key--organism-a"
@@ -227,13 +227,19 @@ import json, sys
 m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
 assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
 PY
-curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant's project is not as the defaults say"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant's project does not inherit the habitat's grant"; exit 1; }
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
-# the operator grants it the account: it is served, as its project
-curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"accounts": null}' >/dev/null
-code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
-[ "$code" = 200 ] || { echo "a granted tenant was not served: $code $(cat "$work/tenant.out")"; exit 1; }
+# the operator grants the habitat the account, once: the tenant is served on
+# its next call, its project untouched
+ask_tenant() { tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}'; }
+curl -fsS -X PUT -H @"$work/admin.h" "$api/admin/v1/habitat" -H 'content-type: application/json' -d '{"accounts": ["static"]}' >/dev/null
+[ "$(ask_tenant)" = 200 ] || { echo "a tenant of a granted habitat was not served: $(cat "$work/tenant.out")"; exit 1; }
+# narrowed on its project to no account, it is not; set to inherit, it is again
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"accounts": []}' >/dev/null
+[ "$(ask_tenant)" != 200 ] || { echo "a tenant narrowed to no account was served"; exit 1; }
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
+[ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
 # renamed by the operator, it is still the tenant's: rotated, the old value
 # stops and the new one serves; removed, it stops
 tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
@@ -244,7 +250,7 @@ printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
-echo "a tenant's key: its project made with no account, served once granted, rotated and removed"
+echo "a tenant's key: its project inherits the habitat's grant, live; narrowed and inheriting again; renamed, rotated and removed"
 
 # grafted: the nodes' account on the broker, as registration hands it over.
 # laptop serves only because it connected with it (the broker takes no

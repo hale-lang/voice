@@ -621,3 +621,21 @@ create table tenant_defaults (
   body  jsonb not null
 );
 ```
+
+### Migration 13: the habitat's grant, inherited live
+
+The habitat is voice's customer: the operator says once what it may spend,
+its grant (`PUT /admin/v1/habitat`, the Habitat screen), and each tenant
+inherits it when it is used, until the operator narrows that tenant on its
+own project. The tenant defaults of migration 12, copied into a tenant at
+its first call, become the grant; a tenant voice made that holds no account
+of its own (a key it created, prefix `tenant`) now inherits; one that got
+accounts copied keeps them, narrowed, until set to inherit.
+
+```sql
+alter table tenant_defaults rename to habitat_grant;
+alter table project add column inherits boolean not null default false;
+update project p set inherits = true
+  where p.accounts = '{}'
+    and exists (select 1 from api_key k where k.project = p.id and k.prefix = 'tenant');
+```

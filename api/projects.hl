@@ -158,8 +158,21 @@ locus Projects {
         if u.has_models || u.clear_models { row.models = restriction_of(u.has_models, u.models); }
         if u.has_accounts || u.clear_accounts {
             row.accounts = accounts_restriction(u.has_accounts, u.accounts) or raise;
+            // a tenant given accounts of its own is narrowed: it no longer
+            // inherits the habitat's grant
+            row.inherits = false;
         }
-        self.keys_within(row) or raise;
+        if u.has_inherits {
+            if u.inherits && !is_tenant_project(self.store, row.id) {
+                fail bad("only a tenant's project inherits the habitat's grant", "inherits");
+            }
+            row.inherits = u.inherits;
+            if u.inherits { row.accounts = st::Restriction { any: false }; }
+        }
+        // a tenant's keys are held to the accounts it spends: the habitat's
+        // grant when it inherits
+        let spending = as_in_force(self.store, row) or fail store_down(err);
+        self.keys_within(spending) or raise;
         let after = self.view(row) or raise;
         self.store.update_project(
             row,
@@ -443,7 +456,8 @@ locus Projects {
             position: r.position,
             created_at: r.created_at,
             has_archived_at: r.archived,
-            archived_at: r.archived_at
+            archived_at: r.archived_at,
+            inherits: r.inherits
         };
         v.models = r.models.names.items;
         v.accounts = r.accounts.names.items;
@@ -509,7 +523,10 @@ locus Keys {
 
     /// `create`, holding the resource from its read to its write.
     fn create_held(c: KeyCreate) -> Key fallible(CtlError) {
-        let p = self.project_of(c.project) or raise;
+        let held = self.project_of(c.project) or raise;
+        // a key is held within what its project spends: the habitat's grant
+        // for an inheriting tenant
+        let p = as_in_force(self.store, held) or fail store_down(err);
         if p.archived {
             fail bad(
                 "project " + c.project + " is archived, and an archived project takes no key",
@@ -596,7 +613,10 @@ locus Keys {
     /// `update`, holding the resource from its read to its write.
     fn update_held(u: KeyUpdate) -> Key fallible(CtlError) {
         let mut k = self.known(u.project, u.key) or raise;
-        let p = self.project_of(u.project) or raise;
+        let held = self.project_of(u.project) or raise;
+        // a key is held within what its project spends: the habitat's grant
+        // for an inheriting tenant
+        let p = as_in_force(self.store, held) or fail store_down(err);
         let now = now_seconds();
         let before = key_view(k, now);
         if u.has_name {

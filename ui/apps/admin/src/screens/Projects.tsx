@@ -40,7 +40,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
             { key: 'name', header: 'Name', render: (p) => p.name },
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
-            { key: 'accounts', header: 'Accounts', render: (p) => (p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
+            { key: 'accounts', header: 'Accounts', render: (p) => (p.inherits ? <span className="muted">the habitat's</span> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
             { key: 'spent', header: 'Spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
             { key: 'budget', header: 'Allowance', num: true, render: (p) => (p.budget ? `${micros(p.budget.allowance_micros, p.budget.currency)} / ${p.budget.period}` : '') },
           ]}
@@ -51,72 +51,13 @@ export function Projects({ route, setInspector }: ScreenProps) {
         </p>
       </Panel>
       {project && <Keys project={project} />}
-      <TenantDefaults />
     </>
   );
 }
 
 /** A list that may be none, any, or some names: `[]`, `null`, or the names. */
-type Scope = 'none' | 'any' | 'these';
+type Scope = 'none' | 'any' | 'these' | 'habitat';
 const scopeOf = (v: string[] | null | undefined, empty: Scope): Scope => (v == null ? 'any' : v.length ? 'these' : empty);
-
-/**
- * What a tenant's project is created with: the organisms of voice's habitat
- * call with keys the habitat draws, and each becomes a project,
- * `tenant-<organism>`, on its first call. Until this says otherwise a tenant
- * spends no account.
- */
-function TenantDefaults() {
-  const q = useGet('/admin/v1/tenants/defaults');
-  const accounts = useGet('/admin/v1/accounts');
-  const w = useWrite();
-  const [accountScope, setAccountScope] = useState<Scope>('none');
-  const [accountNames, setAccountNames] = useState<string[]>([]);
-  const [modelScope, setModelScope] = useState<Scope>('any');
-  const [modelNames, setModelNames] = useState<string[]>([]);
-  useEffect(() => {
-    if (!q.data) return;
-    setAccountScope(q.data.accounts.length ? 'these' : 'none');
-    setAccountNames(q.data.accounts ?? []);
-    setModelScope(scopeOf(q.data.models, 'none'));
-    setModelNames(q.data.models ?? []);
-  }, [q.data]);
-  if (q.isPending) return null;
-  if (q.isError) return <Panel title="Tenant defaults"><span className="faint">{q.error.message}</span></Panel>;
-  const listOf = (s: Scope, names: string[]) => (s === 'any' ? null : s === 'none' ? [] : names);
-  const known = (accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ');
-  return (
-    <Panel title="Tenant defaults" readout={readout(q)}>
-      <p className="muted" style={{ marginTop: 0 }}>
-        Each organism of voice's habitat calls with a key the habitat draws for it, and becomes a project, <Mono>tenant-&lt;organism&gt;</Mono>, on its first call, with these. A tenant created before a change keeps its project as it was; change that on the project.
-      </p>
-      <Form
-        error={w.error}
-        onSubmit={async () => {
-          await w.write('put', '/admin/v1/tenants/defaults', { body: { accounts: accountScope === 'these' ? accountNames : [], models: listOf(modelScope, modelNames), data_classes: q.data.data_classes ?? ['internal'] } });
-        }}
-        actions={<Button type="submit" tone="primary" disabled={w.busy}>save</Button>}
-      >
-        <Field label="accounts it may spend" help={`${known ? `active accounts: ${known}` : 'no account yet'}. To open one tenant to every account, set its project's accounts.`}>
-          <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }]} />
-        </Field>
-        {accountScope === 'these' && (
-          <Field label="accounts">
-            <ListInput mono value={accountNames} onChange={setAccountNames} placeholder="local, work" />
-          </Field>
-        )}
-        <Field label="models it may name">
-          <Select value={modelScope} onChange={(v) => setModelScope(v as Scope)} options={[{ value: 'any', label: 'the whole catalog' }, { value: 'these', label: 'these' }]} />
-        </Field>
-        {modelScope === 'these' && (
-          <Field label="models">
-            <ListInput mono value={modelNames} onChange={setModelNames} placeholder="qwen3-0.6b" />
-          </Field>
-        )}
-      </Form>
-    </Panel>
-  );
-}
 
 function CreateProject() {
   const w = useWrite();
@@ -160,11 +101,13 @@ function CreateProject() {
 function ProjectInspector({ project: p }: { project: Project }) {
   const w = useWrite();
   const [mode, setMode] = useState<'view' | 'budget' | 'limits' | 'access'>('view');
-  const [accountScope, setAccountScope] = useState<Scope>(scopeOf(p.accounts, 'none'));
+  const [accountScope, setAccountScope] = useState<Scope>(p.inherits ? 'habitat' : scopeOf(p.accounts, 'none'));
   const [accountNames, setAccountNames] = useState<string[]>(p.accounts ?? []);
   const [modelScope, setModelScope] = useState<Scope>(scopeOf(p.models, 'none'));
   const [modelNames, setModelNames] = useState<string[]>(p.models ?? []);
   const known = useGet('/admin/v1/accounts');
+  // a tenant (an organism of voice's habitat) may inherit the habitat's grant
+  const tenant = p.inherits || p.id.startsWith('tenant-');
   const [allowance, setAllowance] = useState<number | null>(p.budget ? p.budget.allowance_micros / 1e6 : null);
   const [period, setPeriod] = useState<'day' | 'week' | 'month' | 'none'>(p.budget?.period ?? 'month');
   const [limits, setLimits] = useState<Limit[]>(p.limits ?? []);
@@ -173,7 +116,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
     setAllowance(p.budget ? p.budget.allowance_micros / 1e6 : null);
     setPeriod(p.budget?.period ?? 'month');
     setLimits(p.limits ?? []);
-    setAccountScope(scopeOf(p.accounts, 'none'));
+    setAccountScope(p.inherits ? 'habitat' : scopeOf(p.accounts, 'none'));
     setAccountNames(p.accounts ?? []);
     setModelScope(scopeOf(p.models, 'none'));
     setModelNames(p.models ?? []);
@@ -191,7 +134,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
           { k: 'models', v: p.models ? (p.models.length ? p.models.join(', ') : <span className="c-wait">none</span>) : 'the whole catalog' },
-          { k: 'accounts', v: p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
+          { k: 'accounts', v: p.inherits ? <>the habitat's <a href="#/habitat">(Habitat)</a></> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
           { k: 'position', v: p.position ?? '–' },
           { k: 'created', v: when(p.created_at) },
         ]}
@@ -203,7 +146,11 @@ function ProjectInspector({ project: p }: { project: Project }) {
             const r = await w.write('patch', '/admin/v1/projects/{project}', {
               params: { path: { project: p.id } },
               body: {
-                accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames,
+                // a tenant set to the habitat's inherits it; any accounts of
+                // its own narrow it
+                ...(accountScope === 'habitat'
+                  ? { inherits: true }
+                  : { accounts: accountScope === 'any' ? null : accountScope === 'none' ? [] : accountNames }),
                 models: modelScope === 'any' ? null : modelScope === 'none' ? [] : modelNames,
               },
             });
@@ -217,7 +164,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
           }
         >
           <Field label="accounts it may spend" help={(known.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ') || 'no account yet: create one on Accounts'}>
-            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+            <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[...(tenant ? [{ value: 'habitat', label: "the habitat's (inherit)" }] : []), { value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
           </Field>
           {accountScope === 'these' && (
             <Field label="accounts">

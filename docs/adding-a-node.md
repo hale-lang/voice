@@ -12,8 +12,8 @@ voice on one laptop is the coordinator in the habitat's compose and the node
 beside it, native, on the laptop's GPU. By hand it is the same command.
 
 A node runs natively, never in a container: on a Mac only a native process
-reaches Metal. Compose's demo node (`docker compose --profile node up`) is
-the exception, for a first look; it serves the static engine only.
+reaches Metal. Voice ships no node; each is added on purpose, the machine
+the coordinator runs on included.
 
 ## What it needs
 
@@ -56,7 +56,12 @@ It:
   (below);
 - writes `~/.voice/node-data/capabilities.json`: the managed engine, which
   runs the models placed on the node, and the claude CLI when the vault holds
-  a Claude account's token and `claude` is on PATH;
+  a Claude account's token and `claude` is on PATH; and, on a machine it
+  shares, the memory left for models (`hardware.model_memory_bytes`): in a
+  habitat, the machine's less what the habitat said its own services may
+  take there (`HALE_DNA_HOST_RESERVED_BYTES`), or less 8 GiB from a hale
+  that does not say; outside one, less 8 GiB for the coordinator when
+  `--api` is on this machine (localhost);
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a

@@ -86,12 +86,75 @@ fn reason_of(r: Reply) -> String {
 @unbounded
 fn quote(s: String) -> String { return "\"" + std::json::escape_string(s) + "\""; }
 
-/// The capabilities voice decides for a node: the managed engine, and the
-/// claude CLI when the machine holds its login.
+/// The capabilities voice decides for a node: the managed engine, the
+/// claude CLI when the machine holds its login, and, when some of the
+/// machine is another's, the memory left for models (`model_memory`, -1
+/// for all of it).
 @unbounded
-fn node_capabilities(claude: Bool) -> String {
+fn node_capabilities(claude: Bool, model_memory: Int) -> String {
     return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}"
-        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" }) + "]}";
+        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" }) + "]"
+        + (
+            if model_memory >= 0 {
+                ", \"hardware\": {\"model_memory_bytes\": " + to_string(model_memory) + "}"
+            } else {
+                ""
+            }
+        )
+        + "}";
+}
+
+/// What the coordinator takes of a machine it shares with a node, outside a
+/// habitat (Postgres, NATS, the api, the brain, with room): 8 GiB.
+const COORDINATOR_BYTES: Int = 8589934592;
+
+/// What of the machine's `memory` is not the node's to give models: in a
+/// habitat, what it said its own services may take on this host
+/// (`HALE_DNA_HOST_RESERVED_BYTES`); outside one, `COORDINATOR_BYTES` when
+/// the coordinator runs here (`api` on loopback), else none. The memory
+/// left for models, -1 when it is all of it.
+@unbounded
+fn model_memory_for(memory: Int, api: String) -> Int {
+    let said = std::env::var_exists("HALE_DNA_HOST_RESERVED_BYTES");
+    let mut habitat = 0;
+    if said {
+        habitat = std::str::parse_int(
+            std::str::trim(std::env::var("HALE_DNA_HOST_RESERVED_BYTES")),
+        ) or 0;
+    }
+    // grafted, the habitat hands over the operator token's entry
+    let grafted = std::env::var_exists("HALE_SECRET_OPERATOR_TOKEN");
+    return memory_left(memory, api, said, habitat, grafted);
+}
+
+/// `model_memory_for`, with what the habitat said (`said`, `habitat`) and
+/// whether the node is placed by one (`grafted`). A habitat that does not
+/// say what it takes (a hale before it did) is held to `COORDINATOR_BYTES`
+/// as the coordinator is: never the whole machine.
+fn memory_left(memory: Int, api: String, said: Bool, habitat: Int, grafted: Bool) -> Int {
+    let reserved = if said {
+        habitat
+    } else if grafted || on_loopback(api) {
+        COORDINATOR_BYTES
+    } else {
+        0
+    };
+    if reserved <= 0 || memory <= 0 { return -1; }
+    return if reserved < memory { memory - reserved } else { 0 };
+}
+
+/// True when `url` names this machine: localhost, 127.0.0.1 or ::1.
+fn on_loopback(url: String) -> Bool {
+    let mut rest = url;
+    let scheme = std::str::index_of(rest, "://");
+    if scheme >= 0 { rest = rest[(scheme + 3)..len(rest)]; }
+    if std::str::starts_with(rest, "[::1]") { return true; }
+    let mut end = 0;
+    while end < len(rest) && rest[end..(end + 1)] != ":" && rest[end..(end + 1)] != "/" {
+        end = end + 1;
+    }
+    let host = rest[0..end];
+    return host == "localhost" || host == "127.0.0.1";
 }
 
 /// The service's name, the same on both: the systemd unit
@@ -142,7 +205,12 @@ fn install() {
     keep_claude_tokens(vault);
     let claude = len(claude_labels(vault)) > 0
         && len(std::str::trim(run_out("sh\n-c\nPATH=\"$0\" command -v claude\n" + path))) > 0;
-    std::io::fs::write_file(data + "/capabilities.json", node_capabilities(claude)) or fail_install(
+    // the memory left for models, where some of the machine is another's
+    let model_memory = model_memory_for(machine_memory(os_of(run_out("uname\n-s"))), api);
+    std::io::fs::write_file(
+        data + "/capabilities.json",
+        node_capabilities(claude, model_memory),
+    ) or fail_install(
         "the capabilities file could not be written",
     );
 

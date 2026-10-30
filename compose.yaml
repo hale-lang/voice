@@ -1,22 +1,19 @@
 # voice's process model on one machine: Postgres, NATS, the api and the
-# brain, each its own process, as in docs/internals.md's MVP; and, opt-in,
-# a node in a container for the single-box demo (the `node` profile).
-#
-#   docker compose up --build                  # the coordinator
-#   docker compose --profile node up --build   # and the demo's node
-#
-# The api answers on 127.0.0.1:8080 (the admin UI at /, the planes under
-# it), the demo node's local API on 127.0.0.1:8081
-# and NATS on 127.0.0.1:4222 (for a process run outside Compose); nothing
-# else is published. A node that serves models runs on its host natively,
-# where its GPU is: in a habitat, `hale habitat organism place voice node
+# brain, each its own process, as in docs/internals.md's MVP. No node: each
+# is added on purpose, on its host, natively, where its GPU is (this
+# machine's too): in a habitat, `hale habitat organism place voice node
 # --host <h>` (`--host local` for the habitat's own machine); by hand,
 # docs/adding-a-node.md.
 #
-# The api hands each enrolling node a NATS address (--node-nats). Inside
-# Compose that is `nats`, which only this network resolves. A node on
-# another machine (or the workstation, outside Compose) needs the name it
-# reaches this host by and a published port it can dial:
+#   docker compose up --build
+#
+# The api answers on 127.0.0.1:8080 (the admin UI at /, the planes under
+# it) and NATS on 127.0.0.1:4222, for the nodes; nothing else is published.
+#
+# The api hands each enrolling node a NATS address (--node-nats): by
+# default 127.0.0.1, which a node on this machine dials. A node on another
+# machine needs the name it reaches this host by and a published port it
+# can dial:
 #
 #   VOICE_NODE_HOST=voice.example.net VOICE_NATS_BIND=0.0.0.0 docker compose up -d
 #
@@ -48,11 +45,7 @@
 # the api and the brain wait on it; the api keeps its configuration in
 # Postgres and reaches the node over NATS; the brain publishes the route
 # table. The node serves once it is created on the api and started with
-# its token:
-#
-#   docker compose exec api voice-api admin-token | sed 's/^/Authorization: Bearer /' > admin.h
-#   curl -X POST localhost:8080/admin/v1/nodes -H @admin.h -H 'content-type: application/json' -d '{"id": "local"}'
-#   VOICE_ENROLLMENT_TOKEN=vn-... docker compose --profile node up -d node
+# its token (docs/adding-a-node.md).
 
 name: voice
 
@@ -64,6 +57,9 @@ x-voice: &voice
 services:
   postgres:
     image: postgres:17
+    # a ceiling the habitat counts against its host's memory for models
+    # (HALE_DNA_HOST_RESERVED_BYTES): a node beside voice leaves it this
+    mem_limit: 512m
     environment:
       POSTGRES_USER: voice
       POSTGRES_PASSWORD: voice
@@ -78,6 +74,7 @@ services:
 
   nats:
     image: nats:2.11-alpine
+    mem_limit: 256m
     # a 12 MiB request fits a 16 MiB message (deploy/nats/nats.conf)
     command: ["-c", "/etc/nats/voice.conf"]
     volumes:
@@ -92,6 +89,7 @@ services:
 
   # the schema, brought up to date once, before the api and the brain start
   migrate:
+    mem_limit: 256m
     <<: *voice
     command: ["voice-api", "migrate", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable", "--migrations", "/usr/share/voice/migrations"]
     restart: "no"
@@ -100,6 +98,7 @@ services:
         condition: service_healthy
 
   api:
+    mem_limit: 1g
     <<: *voice
     # the database `voice-api admin-token` reads the operator token from,
     # when it runs in this container (docker compose exec api ...)
@@ -123,7 +122,7 @@ services:
     # empty directory nothing reads
     volumes:
       - "${HALE_VAULT_DIR:-./deploy/no-vault}:${HALE_VAULT_DIR:-/run/voice/no-vault}:ro"
-    command: ["voice-api", "--host", "0.0.0.0", "--port", "8080", "--nats", "nats://nats:4222", "--node-nats", "nats://${VOICE_NODE_HOST:-${HALE_DNA_HOST_NAME:-nats}}:${VOICE_NATS_PORT:-4222}", "--ui", "/usr/share/voice/ui", "--recipes", "/usr/share/voice/recipes", "--runtimes", "/usr/share/voice/runtimes", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable"]
+    command: ["voice-api", "--host", "0.0.0.0", "--port", "8080", "--nats", "nats://nats:4222", "--node-nats", "nats://${VOICE_NODE_HOST:-${HALE_DNA_HOST_NAME:-127.0.0.1}}:${VOICE_NATS_PORT:-4222}", "--ui", "/usr/share/voice/ui", "--recipes", "/usr/share/voice/recipes", "--runtimes", "/usr/share/voice/runtimes", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable"]
     ports:
       - "${VOICE_API_BIND:-${HALE_DNA_HOST_LISTEN:-127.0.0.1}}:8080:8080"
     depends_on:
@@ -138,6 +137,7 @@ services:
       retries: 30
 
   brain:
+    mem_limit: 256m
     <<: *voice
     command: ["voice-brain", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable", "--nats", "nats://nats:4222"]
     depends_on:
@@ -148,46 +148,6 @@ services:
       api:
         condition: service_started
 
-  node:
-    <<: *voice
-    # the node `local`, created on the api (POST /admin/v1/nodes, under the
-    # operator token), started
-    # with the enrollment token that answered: VOICE_ENROLLMENT_TOKEN=vn-...
-    # Opt-in (`--profile node`): it runs in a container, without the host's
-    # GPU (on a Mac, Docker's VM cannot reach Metal), so it serves only the
-    # static engine, for the single-box demo. A habitat places voice's node
-    # on each host instead, natively (hale.toml [dna.host.node]).
-    profiles: ["node"]
-    environment:
-      VOICE_ENROLLMENT_TOKEN: ${VOICE_ENROLLMENT_TOKEN:-}
-    command:
-      - voice-node
-      - --id
-      - local
-      - --api
-      - http://api:8080
-      - --data
-      - /var/lib/voice-node
-      - --capabilities
-      - /etc/voice/capabilities.json
-      - --host
-      - 0.0.0.0
-      - --port
-      - "8081"
-    volumes:
-      - node-data:/var/lib/voice-node
-      - ./deploy/node/capabilities.json:/etc/voice/capabilities.json:ro
-    ports:
-      - "127.0.0.1:8081:8081"
-    depends_on:
-      api:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/healthz"]
-      interval: 2s
-      timeout: 2s
-      retries: 30
 
 volumes:
   postgres:
-  node-data:

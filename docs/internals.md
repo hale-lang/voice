@@ -409,30 +409,24 @@ reaches the node over NATS. CI runs it (`end to end`).
 ## Running the process model
 
 [`compose.yaml`](../compose.yaml) runs voice as the MVP will: Postgres, NATS,
-the api and the brain, each its own process, and with `--profile node` a demo
-node, from one image built with hale's released toolchain
-([`Dockerfile`](../Dockerfile)). The demo node runs in a container, without
-the host's GPU, so it serves the static engine; a node that serves models
-runs natively on its host (docs/adding-a-node.md).
+the api and the brain, each its own process, from one image built with
+hale's released toolchain ([`Dockerfile`](../Dockerfile)). It runs no node:
+each is added on purpose and runs natively on its host, this machine
+included (docs/adding-a-node.md).
 
 ```sh
-docker compose --profile node up --build
+docker compose up --build
 curl localhost:8080/healthz        # the api; see "The api" for a key
-curl localhost:8081/node/v1/status # the demo node's local API
 ```
 
 The api hands a node the NATS address in `--node-nats` (`NatsLink.place`),
-not the one it dials itself. In Compose it is `nats`, which resolves only in
-the Compose network; for a node on another machine, set `VOICE_NODE_HOST` to
+not the one it dials itself. In Compose it is `127.0.0.1`, where NATS is
+published, for a node on the same machine; for a node on another machine, set `VOICE_NODE_HOST` to
 the name that machine reaches this host by and `VOICE_NATS_BIND=0.0.0.0` to
 publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises, a host port other than 4222).
 
-The node `local` serves once it exists on the api and is started with its
-token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`, under the
-operator token `docker compose exec api voice-api admin-token` prints), give it a
-seat, and start it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose --profile
-node up -d node` (the demo node is opt-in: it runs in a container, without
-the host's GPU). The `migrate` service brings the schema up to date before the
+A node serves once it exists on the api and is started with its token
+(docs/adding-a-node.md). The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
 so it survives a restart of the api. The brain writes the route table to
 Postgres every second and tells NATS its new version.
@@ -1011,6 +1005,6 @@ already there.
 
 | Deployment | Runs |
 |---|---|
-| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`; a demo `node` with `--profile node` |
+| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`; each node native on its host |
 | Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine with logins |
 | Scaled out | `api` behind a load balancer, `brain` with a standby, `postgres`, `nats`, and `node` anywhere |

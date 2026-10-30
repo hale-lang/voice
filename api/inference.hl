@@ -1019,6 +1019,76 @@ fn key_hash(s: String) -> Int {
     return h % 2147483648;
 }
 
+/// `body` with each `\u0000` and each lone surrogate escape (`\ud800`
+/// with no low half after it, or a low half alone) as `\ufffd`, the
+/// replacement character: valid JSON a model cannot take, which a tool's
+/// output carries when it read a binary file. The rest is as it was, and a
+/// body with neither is answered as it is.
+fn model_text(body: String) -> String {
+    if !std::str::contains(body, "\\u0000")
+        && !std::str::contains(body, "\\ud")
+        && !std::str::contains(body, "\\uD")
+    {
+        return body;
+    }
+    let v = std::str::bytes_view(body);
+    let src = std::bytes::from_string(body);
+    let out = std::bytes::BytesBuilder { initial_cap: len(body) };
+    let mut from = 0;
+    let mut i = 0;
+    while i < v.n {
+        if std::str::byte_at(v, i) != 92 {
+            i = i + 1;
+            continue;
+        }
+        // an escape: `\u` and four hex digits, or two bytes
+        if i + 5 < v.n && std::str::byte_at(v, i + 1) == 117 {
+            let unit = hex4(body, i + 2);
+            let mut bad = unit == 0;
+            let mut width = 6;
+            if unit >= 55296 && unit <= 56319 {
+                // a high half: whole with a low half after it
+                let low = if i + 11 < v.n && std::str::byte_at(v, i + 6) == 92
+                    && std::str::byte_at(v, i + 7) == 117
+                {
+                    hex4(body, i + 8)
+                } else {
+                        -1
+                };
+                if low >= 56320 && low <= 57343 { width = 12; } else { bad = true; }
+            } else if unit >= 56320 && unit <= 57343 {
+                bad = true;
+            }
+            if bad {
+                out.append_slice(src, from, i);
+                out.append_str("\\ufffd");
+                from = i + 6;
+            }
+            i = i + width;
+        } else {
+            i = i + 2;
+        }
+    }
+    out.append_slice(src, from, v.n);
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// The four hex digits at `at` in `s` as a number, -1 when they are not.
+fn hex4(s: String, at: Int) -> Int {
+    if at + 4 > len(s) { return -1; }
+    let mut n = 0;
+    let mut k = 0;
+    while k < 4 {
+        let c = s[(at + k)..(at + k + 1)];
+        let d = std::str::index_of("0123456789abcdef0123456789ABCDEF", c) % 16;
+        if std::str::index_of("0123456789abcdef0123456789ABCDEF", c) < 0 { return -1; }
+        n = n * 16 + d;
+        k = k + 1;
+    }
+    return n;
+}
+
 /// True when a seat refused a request for its length: llama-server's
 /// "exceeds the available context size" (`exceed_context_size_error`),
 /// vLLM's "maximum context length", or an OpenAI upstream's
@@ -1306,7 +1376,8 @@ fn chat_tool_choice(body: String) -> String fallible(ApiError) {
 
 /// What admission reads of a `CreateResponseRequest` or a
 /// `ChatCompletionRequest`, and the standard request a node is sent.
-fn read_inference(body: String, endpoint: String) -> InferenceRequest fallible(ApiError) {
+fn read_inference(raw: String, endpoint: String) -> InferenceRequest fallible(ApiError) {
+    let body = model_text(raw);
     object_body(body) or raise;
     let model = required_string(body, "model") or raise;
     if endpoint == "chat" {

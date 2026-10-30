@@ -76,7 +76,7 @@ function TenantDefaults() {
   const [modelNames, setModelNames] = useState<string[]>([]);
   useEffect(() => {
     if (!q.data) return;
-    setAccountScope(scopeOf(q.data.accounts, 'none'));
+    setAccountScope(q.data.accounts.length ? 'these' : 'none');
     setAccountNames(q.data.accounts ?? []);
     setModelScope(scopeOf(q.data.models, 'none'));
     setModelNames(q.data.models ?? []);
@@ -93,12 +93,12 @@ function TenantDefaults() {
       <Form
         error={w.error}
         onSubmit={async () => {
-          await w.write('put', '/admin/v1/tenants/defaults', { body: { accounts: listOf(accountScope, accountNames), models: listOf(modelScope, modelNames), data_classes: q.data.data_classes ?? ['internal'] } });
+          await w.write('put', '/admin/v1/tenants/defaults', { body: { accounts: accountScope === 'these' ? accountNames : [], models: listOf(modelScope, modelNames), data_classes: q.data.data_classes ?? ['internal'] } });
         }}
         actions={<Button type="submit" tone="primary" disabled={w.busy}>save</Button>}
       >
-        <Field label="accounts it may spend" help={known ? `active accounts: ${known}` : 'no account yet'}>
-          <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }, { value: 'any', label: 'any' }]} />
+        <Field label="accounts it may spend" help={`${known ? `active accounts: ${known}` : 'no account yet'}. To open one tenant to every account, set its project's accounts.`}>
+          <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }]} />
         </Field>
         {accountScope === 'these' && (
           <Field label="accounts">

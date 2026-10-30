@@ -12,8 +12,8 @@ voice on one laptop is the coordinator in the habitat's compose and the node
 beside it, native, on the laptop's GPU. By hand it is the same command.
 
 A node runs natively, never in a container: on a Mac only a native process
-reaches Metal. Compose's demo node (`docker compose --profile node up`) is
-the exception, for a first look; it serves the static engine only.
+reaches Metal. Voice ships no node; each is added on purpose, the machine
+the coordinator runs on included.
 
 ## What it needs
 

@@ -1,0 +1,276 @@
+// Tenants: the organisms of voice's habitat, each calling voice for models
+// with the key the habitat drew for it (hale.toml `[dna.provides.models]`,
+// `[dna.secrets.tenant-key]`). No person mints those keys: the habitat
+// draws a member of the `tenant-key` family per tenant, labelled with the
+// tenant's organism name, removes it when the tenant goes, and redraws it
+// on rotation, in the vault directory it hands the api
+// (`HALE_VAULT_DIR`), each member's entry named by the family's prefix
+// (`HALE_SECRET_TENANT_KEY_FAMILY`) and its label.
+//
+// A tenant is a project of voice's, `tenant-<label>`, created when the
+// tenant first calls, from the tenant defaults the operator set (none until
+// they do, so it spends no account until the operator says so), with one
+// key whose digest is that of the key it presented. Every later call finds
+// the key by its digest and holds it to the member again, so a removed
+// tenant stops at once and a rotated key's old value stops at the first use
+// of its new one. Its usage, limits and budget are its project's, as any
+// project's are.
+
+/// What a tenant's project is created with (`TenantDefaults` in
+/// spec/openapi.yaml): the accounts it may spend (none by default, `null`
+/// for any), the models it may name (`null`, the default, for the whole
+/// catalog) and its data classes (`[internal]` by default).
+type TenantDefaults {
+    has_accounts: Bool = true;
+    accounts: bounded[String; 32];
+    has_models: Bool = false;
+    models: bounded[String; 32];
+    data_classes: bounded[String; 32];
+}
+
+/// The name a tenant's key goes by: the one voice created for the
+/// habitat's member, never one an operator minted.
+const TENANT_KEY_NAME: String = "habitat tenant key";
+
+/// The project of the tenant labelled `label`.
+fn tenant_project(label: String) -> String { return "tenant-" + label; }
+
+/// True when `k` is a tenant's key, the one voice created for a member.
+fn is_tenant_key(k: st::KeyRow) -> Bool {
+    return std::str::starts_with(k.project, "tenant-") && k.name == TENANT_KEY_NAME;
+}
+
+/// The members' entry prefix, `secret-<org>-tenant-key--`; "" when voice
+/// has no habitat that makes it a provider.
+fn tenant_family() -> String {
+    if !std::env::var_exists("HALE_SECRET_TENANT_KEY_FAMILY") { return ""; }
+    return std::str::trim(std::env::var("HALE_SECRET_TENANT_KEY_FAMILY"));
+}
+
+fn vault_dir() -> String {
+    if !std::env::var_exists("HALE_VAULT_DIR") { return ""; }
+    return std::str::trim(std::env::var("HALE_VAULT_DIR"));
+}
+
+/// The defaults as stored, or none set: no account, the whole catalog,
+/// `[internal]`.
+fn tenant_defaults_of(body: String) -> TenantDefaults {
+    let mut d = TenantDefaults { };
+    if len(std::str::trim(body)) == 0 { return d; }
+    let accounts = std::str::trim(std::json::find_field_raw(body, "accounts"));
+    d.has_accounts = accounts != "null";
+    d.accounts = stored_names(accounts).items;
+    let models = std::str::trim(std::json::find_field_raw(body, "models"));
+    d.has_models = std::str::starts_with(models, "[");
+    d.models = stored_names(models).items;
+    d.data_classes = stored_names(std::json::find_field_raw(body, "data_classes")).items;
+    return d;
+}
+
+/// A JSON list of strings, as names; none for `null` or anything else.
+fn stored_names(raw: String) -> st::Names {
+    let mut out = st::Names { };
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if std::str::starts_with(e, "\"") {
+            push(out.items, std::json::unescape_string(e[1..(len(e) - 1)])) or discard;
+        }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+fn tenant_defaults_json(d: TenantDefaults) -> String {
+    return "{\"accounts\": " + jnames_or_null(d.has_accounts, d.accounts) + ", \"models\": "
+        + jnames_or_null(d.has_models, d.models) + ", \"data_classes\": "
+        + st::jnames(d.data_classes) + "}";
+}
+
+/// The tenant defaults on the admin plane (`getTenantDefaults`,
+/// `setTenantDefaults`).
+locus Tenants {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `getTenantDefaults`.
+    fn defaults() -> TenantDefaults fallible(CtlError) {
+        self.gate.enter();
+        let body = self.store.tenant_defaults() or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        return shown(tenant_defaults_of(body));
+    }
+
+    /// `setTenantDefaults`: what a tenant's project is created with from
+    /// now on; a tenant that has called already keeps its project as it is.
+    fn set_defaults(d: TenantDefaults) -> TenantDefaults fallible(CtlError) {
+        self.gate.enter();
+        let out = self.set_in_gate(d) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn set_in_gate(d: TenantDefaults) -> TenantDefaults fallible(CtlError) {
+        accounts_restriction(d.has_accounts, d.accounts) or raise;
+        let v = shown(d);
+        let before = self.store.tenant_defaults() or fail store_down(err);
+        let after = tenant_defaults_json(v);
+        self.store.put_tenant_defaults(
+            after,
+            checked_change(
+                if len(std::str::trim(before)) == 0 { "create" } else { "update" },
+                "tenants/defaults",
+                if len(std::str::trim(before)) == 0 {
+                    ""
+                } else {
+                    tenant_defaults_json(tenant_defaults_of(before))
+                },
+                after,
+            ) or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+}
+
+/// The defaults as they are answered: an empty list of data classes is the
+/// default, `[internal]`.
+fn shown(d: TenantDefaults) -> TenantDefaults {
+    let mut v = d;
+    if count(v.data_classes) == 0 { push(v.data_classes, "internal") or discard; }
+    return v;
+}
+
+/// The label of the tenant whose member `token` is, "" for none: each
+/// member in the vault directory, compared on the sealed side. Listed on
+/// each look, so a tenant drawn while the api runs is known at its first
+/// call.
+@unbounded
+fn tenant_of(token: String) -> String {
+    let family = tenant_family();
+    let dir = vault_dir();
+    if len(family) == 0 || len(dir) == 0 || len(token) == 0 { return ""; }
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if !std::str::starts_with(name, family) { continue; }
+        let label = name[len(family)..len(name)];
+        if !is_slug(label) || len(tenant_project(label)) > 63 { continue; }
+        if tenant_holds(label, token) { return label; }
+    }
+    return "";
+}
+
+/// True when the tenant labelled `label` holds `token` now: its member is
+/// in the vault and is `token`.
+fn tenant_holds(label: String, token: String) -> Bool {
+    let family = tenant_family();
+    if len(family) == 0 || len(vault_dir()) == 0 { return false; }
+    let member = std::secret::Credential { vault: family + label };
+    return member.matches(std::bytes::from_string(token));
+}
+
+/// The label of a tenant's key, from its project.
+fn tenant_label(k: st::KeyRow) -> String { return k.project[7..len(k.project)]; }
+
+/// The key of the tenant labelled `label`, which presented the key whose
+/// digest is `digest`: its project created from the tenant defaults the
+/// first time, and a key row of that digest, which every later call finds.
+/// A key row of the tenant's from an earlier value of its member (a
+/// rotation) is revoked. A tenant's project the operator archived takes no
+/// key.
+@unbounded
+fn tenant_key(store: st::Store, label: String, digest: String) -> st::KeyRow fallible(ApiError) {
+    let pid = tenant_project(label);
+    let mut p = store.project(pid) or fail metering_failed(err);
+    if !p.present {
+        let d = tenant_defaults_of(store.tenant_defaults() or fail metering_failed(err));
+        let mut row = st::ProjectRow {
+            id: pid,
+            name: "tenant " + label,
+            models: restriction_of(d.has_models, d.models),
+            accounts: restriction_of(d.has_accounts, d.accounts),
+            created_at: now_seconds()
+        };
+        row.data_classes.items = shown(d).data_classes;
+        row.position = "the habitat's organism " + label;
+        let made = project_json(new_project_view(row));
+        store.insert_project(
+            row,
+            change_of("create", "projects/" + pid, "", made),
+        ) or fail metering_failed(err);
+        p = store.project(pid) or fail metering_failed(err);
+    }
+    if !p.present || p.archived { fail invalid_key(); }
+    let now = now_seconds();
+    let keys = store.keys(pid) or fail metering_failed(err);
+    for k in keys.rows {
+        if k.name == TENANT_KEY_NAME && !k.revoked && k.digest != digest {
+            let mut gone = k;
+            gone.revoked = true;
+            gone.revoked_at = now;
+            store.update_key(
+                gone,
+                change_of(
+                    "revoke",
+                    key_target(gone),
+                    key_json(key_view(k, now)),
+                    key_json(key_view(gone, now)),
+                ),
+            ) or fail metering_failed(err);
+        }
+        if k.name == TENANT_KEY_NAME && !k.revoked && k.digest == digest { return k; }
+    }
+    let id_hex = random_hex(8) or fail entropy_failed(err.message);
+    let row = st::KeyRow {
+        id: "k_" + id_hex,
+        project: pid,
+        name: TENANT_KEY_NAME,
+        prefix: "tenant",
+        digest: digest,
+        created_at: now
+    };
+    store.insert_key(
+        row,
+        change_of("create", key_target(row), "", key_json(key_view(row, now))),
+    ) or fail metering_failed(err);
+    return row;
+}
+
+/// A change voice made itself, for a tenant, recorded as a write on the
+/// admin plane records one. A tenant's project and key are small, so their
+/// JSON is always readable back.
+fn change_of(action: String, target: String, before: String, after: String) -> st::ChangeRow {
+    return change(action, target, before, after);
+}
+
+/// A project just created, as `GET` answers it: no keys yet, no budget.
+fn new_project_view(r: st::ProjectRow) -> Project {
+    let mut v = Project {
+        id: r.id,
+        name: r.name,
+        status: Lifecycle::active,
+        has_models: !r.models.any,
+        has_accounts: !r.accounts.any,
+        budget: budget_view(r.budget, now_seconds()),
+        key_count: 0,
+        has_position: len(r.position) > 0,
+        position: r.position,
+        created_at: r.created_at
+    };
+    v.models = r.models.names.items;
+    v.accounts = r.accounts.names.items;
+    v.owners = r.owners.items;
+    v.data_classes = r.data_classes.items;
+    return v;
+}

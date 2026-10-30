@@ -606,3 +606,18 @@ alter table seat_state add constraint seat_state_status_check
   check (status in ('starting', 'fetching', 'up', 'down', 'disabled', 'paused', 'refused'));
 alter table seat_state add column done_bytes bigint, add column total_bytes bigint;
 ```
+
+### Migration 12: tenant defaults
+
+What voice creates a tenant's project with, when an organism of its habitat
+first calls it with the key the habitat drew for it (api/tenants.hl): the
+`TenantDefaults` the operator last set (`PUT /admin/v1/tenants/defaults`).
+No row means none was set: a tenant may spend no account until the
+operator sets the defaults or grants its project accounts.
+
+```sql
+create table tenant_defaults (
+  id    boolean primary key default true check (id),
+  body  jsonb not null
+);
+```

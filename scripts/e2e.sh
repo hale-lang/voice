@@ -93,7 +93,7 @@ fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
-HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
+HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- \
   api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
@@ -161,6 +161,36 @@ readings=$(curl -fsS "http://127.0.0.1:$READINGS_PORT/metrics")
 printf '%s\n' "$readings" | grep -qx 'voice_node_seat_up{seat="static",engine="static"} 1' || { echo "the node's readings do not say laptop/static is up:"; printf '%s\n' "$readings" | grep '^voice_node' ; exit 1; }
 printf '%s\n' "$readings" | grep -q '^hale_process_' || { echo "the node's readings carry none of the runtime's own"; exit 1; }
 echo "laptop's readings say static is up"
+
+# an organism of voice's habitat calls with the key the habitat drew for it
+# (a member of the tenant-key family, in the vault the api reads): voice
+# makes it a project, from the tenant defaults, which allow no account
+# until the operator says so (api/tenants.hl)
+tenant_key=$(openssl rand -hex 16)
+printf '%s' "$tenant_key" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
+chmod 600 "$work/vault/secret-dna_e2e-tenant-key--organism-a"
+tenant() { curl -s -o "$work/tenant.out" -w '%{http_code}' "$api$1" -H "Authorization: Bearer $2" "${@:3}"; }
+[ "$(tenant /v1/models "$tenant_key")" = 200 ] || { echo "a tenant's key was refused on /v1/models: $(cat "$work/tenant.out")"; exit 1; }
+python3 - "$work/tenant.out" <<'PY' || exit 1
+import json, sys
+m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
+assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
+PY
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant's project is not as the defaults say"; exit 1; }
+code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
+[ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
+# the operator grants it the account: it is served, as its project
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/tenant-organism-a" -H 'content-type: application/json' -d '{"accounts": null}' >/dev/null
+code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
+[ "$code" = 200 ] || { echo "a granted tenant was not served: $code $(cat "$work/tenant.out")"; exit 1; }
+# rotated, the old value stops and the new one serves; removed, it stops
+tenant_new=$(openssl rand -hex 16)
+printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
+[ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }
+[ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
+rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
+[ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
+echo "a tenant's key: its project made with no account, served once granted, rotated and removed"
 
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)

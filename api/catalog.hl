@@ -231,7 +231,7 @@ locus Models {
         let mut out = ModelList { };
         for r in rows.rows {
             if !r.removed && visible(p, k, r.id) {
-                let v = model_with_seats(self.store, r) or fail metering_failed(err);
+                let v = model_for(self.store, r, spends_of(p, k)) or fail metering_failed(err);
                 push(out.data, v) or discard;
             }
         }
@@ -254,7 +254,7 @@ locus Models {
                 param: "model",
             };
         }
-        return model_with_seats(self.store, row) or fail metering_failed(err);
+        return model_for(self.store, row, spends_of(p, k)) or fail metering_failed(err);
     }
 
     /// `getCapabilities`: the project and key, the models the key may
@@ -302,6 +302,11 @@ locus Models {
         if !k.present { fail invalid_key(); }
         return k;
     }
+}
+
+/// The accounts a key may spend: its own restriction, else its project's.
+fn spends_of(p: st::ProjectRow, k: st::KeyRow) -> st::Restriction {
+    return if k.accounts.any { p.accounts } else { k.accounts };
 }
 
 /// True when the project and the key both let `model` through.
@@ -508,19 +513,38 @@ fn capabilities_json(c: Capabilities) -> String {
 
 /// Whether a model can be served now, and the data classes the seats that
 /// could serve it carry.
-type Availability { available: Bool = false; data_classes: bounded[String; 32]; }
+type Availability {
+    available: Bool = false;
+    tools: Bool = false;
+    data_classes: bounded[String; 32];
+}
 
 /// A seat could serve `model` when it is enabled, spends an account that
 /// is not archived, and its node is up, not draining, has applied its
 /// assignment, reports it `up` and holds it by no local control.
 fn availability(store: st::Store, model: String) -> Availability fallible(st::StoreError) {
+    return availability_for(store, model, st::Restriction { }) or raise;
+}
+
+/// `availability`, counting only seats that spend an account in `spends`:
+/// what a caller whose key may spend those could be served by. With it,
+/// whether one of them carries a request's `tools` through to its model.
+@unbounded
+fn availability_for(
+    store: st::Store,
+    model: String,
+    spends: st::Restriction
+) -> Availability fallible(st::StoreError) {
     let seats = store.seats() or raise;
     let mut out = Availability { };
     for s in seats.rows {
-        if seat_serves(s, model) && s.enabled {
+        if seat_serves(s, model) && s.enabled && allows(spends, s.account) {
             let ready = seat_ready(store, s) or raise;
             if ready {
                 out.available = true;
+                if !out.tools {
+                    out.tools = seat_tools(store, s) or raise;
+                }
                 for dc in s.data_classes.items {
                     if !has_name(out.data_classes, dc) { push(out.data_classes, dc) or discard; }
                 }
@@ -531,9 +555,57 @@ fn availability(store: st::Store, model: String) -> Availability fallible(st::St
 }
 
 fn model_with_seats(store: st::Store, r: st::ModelRow) -> Model fallible(st::StoreError) {
+    return model_for(store, r, st::Restriction { }) or raise;
+}
+
+/// The model as a caller that may spend `spends` sees it: available when a
+/// seat it may spend serves it, with tools when one of those carries them.
+fn model_for(
+    store: st::Store,
+    r: st::ModelRow,
+    spends: st::Restriction
+) -> Model fallible(st::StoreError) {
     let mut v = model_view(r);
-    let a = availability(store, r.id) or raise;
+    let a = availability_for(store, r.id, spends) or raise;
     v.available = a.available;
+    v.tools = a.tools;
     v.data_classes = a.data_classes;
     return v;
+}
+
+/// True when seat `s` carries a request's `tools` through to its model and
+/// back as tool calls: an openai-compatible engine passes them to its
+/// upstream; a managed seat under llama-server applies the model's own chat
+/// template, which knows its tools (b11913 uses Jinja by default), and one
+/// under vLLM does not until voice starts it with a tool-call parser; the
+/// static engine when its drill makes a call; the claude CLI answers text.
+fn seat_tools(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError) {
+    let f = store.fleet(s.node) or raise;
+    let kind = engine_kind_of(f.capabilities, s.engine);
+    if kind == "openai-compatible" { return true; }
+    if kind == "managed" {
+        let rt = std::json::find_field_raw(s.config, "runtime");
+        return std::json::find_string_field(rt, "server") == "llama-server";
+    }
+    if kind == "static" {
+        return std::str::starts_with(
+            std::str::trim(std::json::find_field_raw(s.config, "tool_call")),
+            "{",
+        );
+    }
+    return false;
+}
+
+/// The kind of the engine `engine` in a node's declared capabilities, ""
+/// when it declares none by that id.
+@bounded_by(capabilities)
+fn engine_kind_of(capabilities: String, engine: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "engines"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "id") == engine {
+            return std::json::find_string_field(it.element, "kind");
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
 }

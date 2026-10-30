@@ -40,7 +40,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
             { key: 'name', header: 'Name', render: (p) => p.name },
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
-            { key: 'accounts', header: 'Accounts', render: (p) => (p.accounts ? p.accounts.join(', ') : <span className="muted">any</span>) },
+            { key: 'accounts', header: 'Accounts', render: (p) => (p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
             { key: 'spent', header: 'Spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
             { key: 'budget', header: 'Allowance', num: true, render: (p) => (p.budget ? `${micros(p.budget.allowance_micros, p.budget.currency)} / ${p.budget.period}` : '') },
           ]}
@@ -51,7 +51,70 @@ export function Projects({ route, setInspector }: ScreenProps) {
         </p>
       </Panel>
       {project && <Keys project={project} />}
+      <TenantDefaults />
     </>
+  );
+}
+
+/** A list that may be none, any, or some names: `[]`, `null`, or the names. */
+type Scope = 'none' | 'any' | 'these';
+const scopeOf = (v: string[] | null | undefined, empty: Scope): Scope => (v == null ? 'any' : v.length ? 'these' : empty);
+
+/**
+ * What a tenant's project is created with: the organisms of voice's habitat
+ * call with keys the habitat draws, and each becomes a project,
+ * `tenant-<organism>`, on its first call. Until this says otherwise a tenant
+ * spends no account.
+ */
+function TenantDefaults() {
+  const q = useGet('/admin/v1/tenants/defaults');
+  const accounts = useGet('/admin/v1/accounts');
+  const w = useWrite();
+  const [accountScope, setAccountScope] = useState<Scope>('none');
+  const [accountNames, setAccountNames] = useState<string[]>([]);
+  const [modelScope, setModelScope] = useState<Scope>('any');
+  const [modelNames, setModelNames] = useState<string[]>([]);
+  useEffect(() => {
+    if (!q.data) return;
+    setAccountScope(q.data.accounts.length ? 'these' : 'none');
+    setAccountNames(q.data.accounts ?? []);
+    setModelScope(scopeOf(q.data.models, 'none'));
+    setModelNames(q.data.models ?? []);
+  }, [q.data]);
+  if (q.isPending) return null;
+  if (q.isError) return <Panel title="Tenant defaults"><span className="faint">{q.error.message}</span></Panel>;
+  const listOf = (s: Scope, names: string[]) => (s === 'any' ? null : s === 'none' ? [] : names);
+  const known = (accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => a.id).join(', ');
+  return (
+    <Panel title="Tenant defaults" readout={readout(q)}>
+      <p className="muted" style={{ marginTop: 0 }}>
+        Each organism of voice's habitat calls with a key the habitat draws for it, and becomes a project, <Mono>tenant-&lt;organism&gt;</Mono>, on its first call, with these. A tenant created before a change keeps its project as it was; change that on the project.
+      </p>
+      <Form
+        error={w.error}
+        onSubmit={async () => {
+          await w.write('put', '/admin/v1/tenants/defaults', { body: { accounts: accountScope === 'these' ? accountNames : [], models: listOf(modelScope, modelNames), data_classes: q.data.data_classes ?? ['internal'] } });
+        }}
+        actions={<Button type="submit" tone="primary" disabled={w.busy}>save</Button>}
+      >
+        <Field label="accounts it may spend" help={`${known ? `active accounts: ${known}` : 'no account yet'}. To open one tenant to every account, set its project's accounts.`}>
+          <Select value={accountScope} onChange={(v) => setAccountScope(v as Scope)} options={[{ value: 'none', label: 'none' }, { value: 'these', label: 'these' }]} />
+        </Field>
+        {accountScope === 'these' && (
+          <Field label="accounts">
+            <ListInput mono value={accountNames} onChange={setAccountNames} placeholder="local, work" />
+          </Field>
+        )}
+        <Field label="models it may name">
+          <Select value={modelScope} onChange={(v) => setModelScope(v as Scope)} options={[{ value: 'any', label: 'the whole catalog' }, { value: 'these', label: 'these' }]} />
+        </Field>
+        {modelScope === 'these' && (
+          <Field label="models">
+            <ListInput mono value={modelNames} onChange={setModelNames} placeholder="qwen3-0.6b" />
+          </Field>
+        )}
+      </Form>
+    </Panel>
   );
 }
 

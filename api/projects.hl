@@ -685,7 +685,8 @@ locus Keys {
 }
 
 /// The caller plane's bearer: an `Authorization: Bearer vk-...` header
-/// names a key, which is the caller. A key that is revoked or expired, or
+/// names a key, which is the caller, as does a key the habitat drew for one
+/// of its organisms (tenants.hl). A key that is revoked or expired, or
 /// whose project is archived, names nobody.
 locus KeyBearer {
     params { store: st::Store; }
@@ -700,8 +701,18 @@ locus KeyBearer {
         }
         let token = std::str::trim(authorization[7..len(authorization)]);
         if len(token) == 0 { fail invalid_key(); }
-        let k = self.store.key_by_digest(secret_digest(token)) or fail metering_failed(err);
-        if !k.present { fail invalid_key(); }
+        let digest = secret_digest(token);
+        let mut k = self.store.key_by_digest(digest) or fail metering_failed(err);
+        if k.present && is_tenant_key(k) {
+            // a tenant's key holds while the habitat's member is still it
+            if !tenant_holds(tenant_label(k), token) { fail invalid_key(); }
+        } else if !k.present {
+            // a tenant calling for the first time, or with a rotated key
+            // (tenants.hl); anything else is no key
+            let label = tenant_of(token);
+            if len(label) == 0 { fail invalid_key(); }
+            k = tenant_key(self.store, label, digest) or raise;
+        }
         if key_status(k, now_seconds()) != KeyStatus::active { fail invalid_key(); }
         let p = self.store.project(k.project) or fail metering_failed(err);
         if !p.present || p.archived { fail invalid_key(); }

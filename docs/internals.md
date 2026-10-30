@@ -307,6 +307,33 @@ After a change, `npm run bundle -- --write` writes the gaps again; the diff
 is what to review. Friction met along the way is in
 [`FRICTION.md`](../FRICTION.md).
 
+### Tenants: the habitat's organisms
+
+Grafted into a habitat, voice is every organism's model backend
+(`[dna.provides.models]` in [`hale.toml`](../hale.toml)): an organism's legs
+call `/v1/chat/completions` and `/v1/models` with a key the habitat drew
+for it, a member of the `tenant-key` family in the vault it hands the api
+(`HALE_VAULT_DIR`, the members' prefix in `HALE_SECRET_TENANT_KEY_FAMILY`),
+labelled with the organism's name. No person mints those keys.
+
+A key the store does not know is compared, on the sealed side, with each
+member ([`api/tenants.hl`](../api/tenants.hl)). The first time a member
+calls, voice makes its organism a project, `tenant-<organism>`, from the
+tenant defaults (`/admin/v1/tenants/defaults`, the Projects screen), and a
+key for it holding the digest of the key it presented; from then on it is a
+project like any other, its usage, limits and budget its own. Each later
+call finds that key by its digest and holds it to the member again, so a
+removed member stops at once and a rotated one retires its old value at the
+first use of the new. Until the operator sets the defaults, a tenant spends
+**no account**: it sees the catalog, with `voice.available` false, and no
+seat serves it.
+
+`/v1/models` answers what the caller could be served: a model is
+`available` when a seat on an account the key may spend serves it, and
+`voice.capabilities.tools` says whether such a seat carries `tools` to the
+model (an openai-compatible seat, or a managed one under llama-server; not
+under vLLM, which voice does not yet start with a tool-call parser).
+
 ## The node
 
 [`node/`](../node/) is voice's own node. It reads and checks its

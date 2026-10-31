@@ -12,6 +12,8 @@ URL and sha256. A runtime names no command.
 |---|---|---|---|
 | `vllm-26.09` | safetensors | CUDA, linux arm64 and x86_64 | `nvcr.io/nvidia/vllm:26.09-py3` |
 | `llama-server-b11913-cuda` | gguf | CUDA, linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-cuda-b11913` |
+| `llama-server-b11913-rocm` | gguf | ROCm (AMD), linux x86_64 | `ghcr.io/ggml-org/llama.cpp:server-rocm-b11913` |
+| `llama-server-b11913-vulkan` | gguf | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-vulkan-b11913` |
 | `llama-server-b11913-metal` | gguf | Metal, macOS arm64 | llama.cpp's b11913 release for macOS arm64 |
 
 The operator is the authority on what may run: they allow more runtimes on

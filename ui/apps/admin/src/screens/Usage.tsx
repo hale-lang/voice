@@ -5,6 +5,7 @@ import { useGet, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
+import { PeekSection } from '../peek';
 
 /** Requests a page holds. */
 const PAGE = 50;
@@ -127,6 +128,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'metadata', v: <Mono>{JSON.stringify(r.metadata)}</Mono> },
         ]}
       />
+      <PeekSection id={r.id} />
     </>
   );
 }

@@ -273,7 +273,7 @@ request it sends is recorded whole, the standard request as it was served and
 the final response, reasoning included, when the request settles
 ([`api/peek.hl`](../api/peek.hl)). A request is recorded when its project or
 its key peeks; admission decides it once. The operator reads recordings with
-`listPeeks` and `getPeek` (the admin UI's Peek screen); each is kept seven
+`listPeeks` and `getPeek`; the admin UI shows a request's in its Usage inspector. Each is kept seven
 days, the older ones deleted as new ones are written. A recording's request
 and response are the JSON documents they were, as text, since they may be far
 larger than a JSON value on the typed surface holds. Off unless set: recording

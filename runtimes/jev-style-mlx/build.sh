@@ -8,7 +8,8 @@
 #
 #   runtimes/jev-style-mlx/build.sh OUT_DIR
 #
-# Writes OUT_DIR/jev-style-0.3.0-mlx-darwin-arm64.tar.gz and prints its
+# Runs on macOS 14 and later. Writes
+# OUT_DIR/jev-style-0.3.0-mlx-darwin-arm64.tar.gz and prints its
 # sha256 and size. Byte for byte the same each run: files in name order,
 # owned by 0:0, dated SOURCE_DATE_EPOCH, no bytecode. Runs on macOS arm64.
 set -euo pipefail
@@ -43,8 +44,14 @@ while read -r repo commit sha; do
   mkdir -p "$root/share/$repo"
   fetch "https://huggingface.co/$repo/resolve/$commit/jev_style_decision_mlx.py" "$root/share/$repo/jev_style_decision_mlx.py" "$sha"
 done <<<"$RUNTIME_FILES"
+# the wheels for macOS 14, whatever macOS builds it: a package with a wheel
+# per macOS version (MLX) would otherwise take the builder's, so the archive
+# would differ by where it was built and not run on an older node
 PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$root/python/bin/python3" -m pip install -q \
-  --no-deps --require-hashes --only-binary :all: --no-compile -r "$here/requirements.lock"
+  --no-deps --require-hashes --only-binary :all: --no-compile \
+  --platform macosx_14_0_arm64 --python-version 3.12 --implementation cp --abi cp312 \
+  --target "$root/python/lib/python3.12/site-packages" --upgrade \
+  -r "$here/requirements.lock"
 "$root/python/bin/python3" -c 'import jev_style, mlx.core, mlx_lm, fastapi, uvicorn'
 # at the top, where a node looks for a runtime's program
 install -m 0755 "$here/jev-style-serve" "$root/jev-style-serve"

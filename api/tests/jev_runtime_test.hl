@@ -1,0 +1,118 @@
+// A decision model's weights are served by a decision server (`jev-style`),
+// and only by one: a placement judges a decision recipe's variants against
+// jev-style runtimes alone, and a generative recipe's never against one. A
+// jev-style runtime is, for now, an archive that reads mlx on metal.
+import ".." as api;
+
+fn runtime(id: String, server: String, format: api::ModelFormat) -> api::Runtime {
+    let mut r = api::Runtime {
+        id: id,
+        server: server,
+        accelerator: api::RuntimeAccelerator::metal,
+    };
+    push(r.formats, format) or discard;
+    push(
+        r.platforms,
+        api::RuntimePlatform { os: api::HostOs::darwin, arch: api::HostArch::arm64 },
+    ) or discard;
+    return r;
+}
+
+const MAC: String = "{\"os\": \"darwin\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"metal\"}], \"disk_free_bytes\": 1000000000000}";
+
+const MLX: String = "[{\"id\": \"mlx-bf16\", \"format\": \"mlx\", \"memory_bytes\": 6000000000, \"files\": [{\"path\": \"bf16/model.safetensors\", \"bytes\": 4000000000}]}]";
+
+const GGUF: String = "[{\"id\": \"gguf-q8_0\", \"format\": \"gguf\", \"memory_bytes\": 3000000000, \"files\": [{\"path\": \"m.gguf\", \"bytes\": 2000000000}]}]";
+
+fn main() {
+    let mut both = api::RuntimeList { };
+    push(both.data, runtime("llama-metal", "llama-server", api::ModelFormat::gguf)) or discard;
+    push(both.data, runtime("mlx-lm-metal", "llama-server", api::ModelFormat::mlx)) or discard;
+    push(both.data, runtime("jev-style-mlx", "jev-style", api::ModelFormat::mlx)) or discard;
+    let room = 64000000000;
+
+    let decided = api::judge_recipe(MLX, MAC, both, room, 0, true);
+    let d0 = at(decided.fit, 0) or api::VariantFit { };
+    std::test::assert(
+        decided.best == 0 && d0.runtime == "jev-style-mlx",
+        "a decision recipe's mlx is served by the jev-style runtime: " + d0.reason,
+    );
+    let made = api::judge_recipe(MLX, MAC, both, room, 0, false);
+    let m0 = at(made.fit, 0) or api::VariantFit { };
+    std::test::assert(
+        made.best == 0 && m0.runtime == "mlx-lm-metal",
+        "a generative recipe's mlx is never the jev-style runtime's: " + m0.reason,
+    );
+    let gguf = api::judge_recipe(GGUF, MAC, both, room, 0, true);
+    let g0 = at(gguf.fit, 0) or api::VariantFit { };
+    std::test::assert(
+        gguf.best < 0
+            && std::str::starts_with(
+                g0.reason,
+                "no jev-style runtime (a decision model's server) reads gguf",
+            ),
+        "a decision recipe with no decision server for it does not fit, and says why: " + g0.reason,
+    );
+    let mut jev_only = api::RuntimeList { };
+    push(jev_only.data, runtime("jev-style-mlx", "jev-style", api::ModelFormat::mlx)) or discard;
+    let lone = api::judge_recipe(MLX, MAC, jev_only, room, 0, false);
+    std::test::assert(
+        lone.best < 0,
+        "a generative recipe does not take a jev-style runtime even when it is the only one",
+    );
+
+    // a jev-style runtime: an archive that reads mlx on metal, for now
+    let mut archive = api::RuntimeCreate {
+        id: "jev-style-mlx",
+        license: api::License {
+            name: "apache-2.0",
+            url: "https://www.apache.org/licenses/LICENSE-2.0",
+        },
+        server: "jev-style",
+        accelerator: api::RuntimeAccelerator::metal,
+        artifact: api::RuntimeArtifact {
+            kind: api::ArtifactKind::archive,
+            has_url: true,
+            url: "https://example.org/jev.tar.gz",
+            has_sha256: true,
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            has_bytes: true,
+            bytes: 100,
+        },
+    };
+    push(archive.formats, api::ModelFormat::mlx) or discard;
+    push(
+        archive.platforms,
+        api::RuntimePlatform { os: api::HostOs::darwin, arch: api::HostArch::arm64 },
+    ) or discard;
+    let kept = api::runtime_body(archive);
+    std::test::assert(
+        !std::str::starts_with(kept, "!"),
+        "an mlx archive on metal is a jev-style runtime: " + kept,
+    );
+    let mut boxed = archive;
+    boxed.artifact = api::RuntimeArtifact {
+        kind: api::ArtifactKind::container,
+        has_image: true,
+        image: "ghcr.io/x/jev",
+        has_digest: true,
+        digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    };
+    std::test::assert(
+        std::str::starts_with(api::runtime_body(boxed), "!artifact"),
+        "a container is not, for now",
+    );
+    let mut cuda = archive;
+    cuda.accelerator = api::RuntimeAccelerator::cuda;
+    std::test::assert(
+        std::str::starts_with(api::runtime_body(cuda), "!accelerator"),
+        "nor one on cuda",
+    );
+    let mut gg = archive;
+    gg.formats = archive.formats;
+    push(gg.formats, api::ModelFormat::gguf) or discard;
+    std::test::assert(
+        std::str::starts_with(api::runtime_body(gg), "!formats"),
+        "nor one that reads gguf",
+    );
+}

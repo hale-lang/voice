@@ -17,9 +17,10 @@ export const entityId = (kind: Kind, name: string) => `${kind}:${name}`;
 export const edgeId = (a: string, b: string) => [a, b].sort().join('|');
 const link = (...parts: string[]) => '#/' + parts.map(encodeURIComponent).join('/');
 
-/** Repository is an optional caller label. API identity must come from trusted observation, never caller metadata. */
+/** Repository is an optional caller label. API identity must come from trusted observation, never caller metadata: the record's `instance`, which the api itself writes. */
 export function requestContext(record: UsageRecord, contexts?: Fleet['contexts']): RequestContext {
-  return { repository: record.metadata.repository?.trim() || undefined, ...contexts?.[record.id] };
+  const instance = (record as { instance?: string | null }).instance ?? undefined;
+  return { repository: record.metadata.repository?.trim() || undefined, ...(instance ? { apiInstance: instance } : {}), ...contexts?.[record.id] };
 }
 
 /** Each request is a hyperedge: a correlated set of participants, rendered as links. */
@@ -75,7 +76,7 @@ export function buildGraph(fleet: Fleet): Graph {
       if (key === 'repository' || typeof value !== 'string' || !value.trim()) continue;
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));
     }
-    const api = context.apiInstance ? member('api', context.apiInstance, 'Request observation. Demo instances are synthetic; API identity is not currently exposed by UsageRecord.') : null;
+    const api = context.apiInstance ? member('api', context.apiInstance, 'The api instance that admitted the request, as its usage record says.') : null;
     if (api) join(project, api, true);
     if (r.served) {
       const seat = member('seat', r.served.seat);

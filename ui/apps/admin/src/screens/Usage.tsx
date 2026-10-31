@@ -7,13 +7,19 @@ import { go } from '../route';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
 import { Board } from './Board';
+import { ConversationView } from './Conversation';
+import { href } from '../route';
 
 /** Requests a page holds. */
 const PAGE = 50;
 
 /** The board of conversations, live; summaries; then the records behind them, a page at a time. */
 export function Usage({ route, setInspector }: ScreenProps) {
-  const selected = route.parts[1];
+  // `usage/<request>`, or a conversation: `usage/c/<prompt_cache_key>` or
+  // `usage/m/<name=value>`, the turns that set that metadata pair
+  const kind = route.parts[1] === 'c' || route.parts[1] === 'm' ? route.parts[1] : null;
+  const root = kind ? (route.parts[2] ?? '') : null;
+  const selected = kind ? undefined : route.parts[1];
   // the cursors of the pages before this one, newest first: older pushes
   // the page's `next_cursor`, newer pops it
   const [cursors, setCursors] = useState<string[]>([]);
@@ -27,8 +33,9 @@ export function Usage({ route, setInspector }: ScreenProps) {
   const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...query(filter), ...(cursor ? { cursor } : {}) } } });
   const onPage = records.data?.data.find((r) => r.id === selected);
   useEffect(() => {
-    setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
-  }, [selected, onPage, setInspector]);
+    if (kind && root) setInspector(<ConversationView key={kind + root} root={kind === 'c' ? { conversation: root } : { metadata: root }} />);
+    else setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
+  }, [kind, root, selected, onPage, setInspector]);
   const next = records.data?.next_cursor ?? null;
   const page = cursors.length + 1;
 
@@ -37,9 +44,9 @@ export function Usage({ route, setInspector }: ScreenProps) {
       <h1>Usage</h1>
       <Board
         onOpen={(f) => {
-          // a conversation narrows the requests to its turns
-          if (f.conversation) setFilter({ ...NO_FILTER, conversation: f.conversation });
-          go('usage', f.last_request);
+          // a conversation opens as one; a request of none, as itself
+          if (f.conversation) go('usage', 'c', f.conversation);
+          else go('usage', f.last_request);
         }}
       />
       <PanelGrid>
@@ -138,7 +145,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
-          { k: 'conversation', v: r.conversation ? <Mono>{r.conversation}</Mono> : <span className="faint">none</span> },
+          { k: 'conversation', v: r.conversation ? <><Mono>{r.conversation}</Mono> <a href={href('usage', 'c', r.conversation)}>read it</a></> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
           { k: 'tokens', v: `${count(r.input_tokens)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
@@ -161,6 +168,13 @@ function Metadata({ of }: { of: unknown }) {
       {pairs.map(([k, v]) => (
         <div key={k}>
           <Mono>{k}</Mono> <span className="faint">=</span> <Mono>{typeof v === 'string' ? v : JSON.stringify(v)}</Mono>
+          {/* the requests that set the same pair, read as one conversation */}
+          {typeof v === 'string' && v && !k.includes('=') && (
+            <>
+              {' '}
+              <a href={href('usage', 'm', `${k}=${v}`)}>as a conversation</a>
+            </>
+          )}
         </div>
       ))}
     </>

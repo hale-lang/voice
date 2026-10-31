@@ -741,3 +741,12 @@ routed, whatever serves it.
 ```sql
 alter table catalog_model add column contract text not null default 'generative' check (contract in ('generative', 'decision'));
 ```
+
+### Migration 21: which api instance a request is in flight on
+
+A request in flight names the api instance that admitted it, so a live view
+draws its path through that instance as it runs. A row from before has none.
+
+```sql
+alter table in_flight add column instance text not null default '';
+```

@@ -35,7 +35,7 @@ TRUSTED='^(Qwen|google|microsoft|meta-llama|deepseek-ai|mistralai|openai|nvidia|
 # Repackagings of a model we would take from its publisher instead.
 REPACK='(GPTQ|AWQ|FP8|Int4|Int8|bnb|MLX|-mlx|NVFP4|W4A16|w4a16|W8A8|-ct$)'
 # Specialists that land in a general bucket: not a default for the class.
-NICHE='(Math|Guard|[Mm]ed|[Ss]afe|Prover|Lean|-[Bb]ase$|Base-|Embed|Reward|Distill-Qwen-1|Diffusion|Encoder|OCR|ocr|Parse|RADIO|t5gemma|Emo_|World|Cosmos|Research|Labs|preview|FP4|Local|UI2Code)'
+NICHE='(Math|Guard|[Mm]ed|[Ss]afe|Prover|Lean|-[Bb]ase$|Base-|Embed|Reward|Distill-Qwen-1|Diffusion|Encoder|OCR|ocr|Parse|RADIO|t5gemma|Emo_|World|Cosmos|Research|Labs|preview|FP4|Local)'
 # Below this the quantization costs more than the larger model gains.
 LOWQUANT='^(Q2|Q3|IQ[123])'
 

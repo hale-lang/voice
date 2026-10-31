@@ -42,6 +42,14 @@ the context its server took.
 | `qwen3-coder-next` | apache-2.0 | `gguf-q8_0` (84.8 GB), `safetensors-bf16` (159.4 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 <!-- /recipes -->
 
+The rest are voice's default catalog, generated: `scripts/catalog-refresh.sh`
+simulates what fits each platform and memory tier per category
+([`docs/catalog-sim.md`](../docs/catalog-sim.md)), resolves the picks to
+pinned recipes here ([`docs/catalog-recipes.md`](../docs/catalog-recipes.md),
+which lists every one and its variants), and writes which recipe a node of
+each platform and memory is offered per category
+([`catalog/picks.json`](../catalog/picks.json)).
+
 The operator is the authority on which weights may run: they allow more
 recipes on the admin plane (`POST /admin/v1/recipes`). These are read by the
 api at start (`--recipes`), listed as `shipped`, and cannot be changed or

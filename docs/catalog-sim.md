@@ -15,7 +15,7 @@ How it was scored:
 
 Reading it: `<class>` is the System 2 pick, `<class>/sys1` its fast twin, `sys1` the Jev decision model.
 `(chat)`: the class had nothing of its own and takes the chat pick. `-`: nothing fits.
-Blocked: 945 picks that cannot ship (docs/catalog-blocked.tsv) were skipped, so the next candidate stands at that tier.
+Blocked: 952 picks that cannot ship (docs/catalog-blocked.tsv) were skipped, so the next candidate stands at that tier.
 `servable`: voice can serve the class today (text only, no /v1/embeddings, no /v1/systemone); `scripts/catalog-recipes.sh` takes only these rows.
 
 ## osx
@@ -139,7 +139,7 @@ Blocked: 945 picks that cannot ship (docs/catalog-blocked.tsv) were skipped, so 
 | 16 | sys1 | jev-style-2b-decision-v3 | 2B | dense | Q8_0 | 2.01 | - | 2026-09-27 | no |
 | 32 | chat | ibm-granite/granite-4.0-h-small | 32.2B | moe | Q6_K | 16.5 | 112 | 2025-09-16 | yes |
 | 32 | chat/sys1 | microsoft/Phi-mini-MoE-instruct | 7.6B | moe | Q8_0 | 3.9 | 279 | 2025-06-23 | yes |
-| 32 | coding | XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B | 9.4B | dense | Q8_0 | 11.4 | 97 | 2026-09-21 | yes |
+| 32 | coding | zai-org/UI2Code_N | 10.3B | dense | Q8_0 | 11.6 | 88 | 2025-11-11 | yes |
 | 32 | coding/sys1 | microsoft/Phi-mini-MoE-instruct (chat) | 7.6B | moe | Q8_0 | 3.9 | 279 | 2025-06-23 | yes |
 | 32 | reasoning | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B | 8.2B | dense | Q8_0 | 10.2 | 111 | 2025-05-29 | yes |
 | 32 | reasoning/sys1 | microsoft/Phi-4-mini-reasoning | 3.8B | dense | Q8_0 | 5.5 | 237 | 2025-05-01 | yes |

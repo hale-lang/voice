@@ -22,7 +22,6 @@ Each servable pick, resolved at each repo's current commit:
 | Qwen/Qwen3-235B-A22B | apache-2.0 | Qwen/Qwen3-235B-A22B-GGUF @211e807ecd6d | qwen3moe: yes | - | 6.3 GB | - | recipes/qwen3-235b-a22b.json: gguf-q8_0 |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct | apache-2.0 | ggml-org/Qwen3-Coder-30B-A3B-Instruct-GGUF @0ca51122012f (ggml-org) | qwen3moe: yes | Qwen3MoeForCausalLM: yes | 3.2 GB | - | recipes/qwen3-coder-30b-a3b-instruct.json: gguf-q8_0, safetensors-bf16 |
 | Qwen/Qwen3-Coder-Next | apache-2.0 | Qwen/Qwen3-Coder-Next-GGUF @b82fb7382639 | qwen3next: yes | Qwen3NextForCausalLM: yes | 0.8 GB | - | recipes/qwen3-coder-next.json: gguf-q8_0, safetensors-bf16 |
-| XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B | mit | ggml-org/MiMo-V2.6-Distill-Qwen-9B-GGUF @81baddc39bc4 (ggml-org) | qwen35: yes | Qwen3_5ForConditionalGeneration: yes | 1.1 GB | - | recipes/mimo-v2.6-distill-qwen-9b.json: gguf-q8_0, safetensors-bf16 |
 | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B | mit | none | - | Qwen3ForCausalLM: yes | 4.8 GB | - | recipes/deepseek-r1-0528-qwen3-8b.json: safetensors-bf16. GGUF: neither the publisher nor ggml-org ships one |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | mit | ggml-org/DeepSeek-V4-Flash-0731-GGUF @732711f990ea (ggml-org) | deepseek4: yes | DeepseekV4ForCausalLM: yes | 2.9 GB | - | recipes/deepseek-v4-flash-0731.json: safetensors-fp8. GGUF: no Q5_K_M (not published), Q8_0 (not published) in ggml-org/DeepSeek-V4-Flash-0731-GGUF (it has: BF16, MXFP4, Q2_K, Q2_K_S) |
 | ibm-granite/granite-4.0-350m | apache-2.0 | ibm-granite/granite-4.0-350m-GGUF @b8208a86a584 | granite: yes | GraniteMoeHybridForCausalLM: yes | 0.9 GB | - | recipes/granite-4.0-350m.json: gguf-q8_0, safetensors-bf16 |
@@ -35,6 +34,7 @@ Each servable pick, resolved at each repo's current commit:
 | openai/gpt-oss-120b | apache-2.0 | ggml-org/gpt-oss-120b-GGUF @7200b74bea78 (ggml-org) | gpt-oss: yes | GptOssForCausalLM: yes | 1.2 GB | - | recipes/gpt-oss-120b.json: gguf-mxfp4, safetensors-mxfp4 |
 | openai/gpt-oss-20b | apache-2.0 | ggml-org/gpt-oss-20b-GGUF @15dcfc7e7c60 (ggml-org) | gpt-oss: yes | GptOssForCausalLM: yes | 0.8 GB | - | recipes/gpt-oss-20b.json: gguf-mxfp4, safetensors-mxfp4 |
 | zai-org/GLM-4.7-Flash | mit | ggml-org/GLM-4.7-Flash-GGUF @7559e96b7e32 (ggml-org) | deepseek2: yes | Glm4MoeLiteForCausalLM: yes | 1.8 GB | - | recipes/glm-4.7-flash.json: gguf-q8_0, safetensors-bf16 |
+| zai-org/UI2Code_N | mit | none | - | Glm4vForConditionalGeneration: yes | 1.3 GB | - | recipes/ui2code-n.json: safetensors-bf16. GGUF: neither the publisher nor ggml-org ships one |
 
 Where each model is picked:
 
@@ -42,7 +42,6 @@ Where each model is picked:
 - `Qwen/Qwen3-235B-A22B`: osx:512 chat, osx:512 reasoning
 - `Qwen/Qwen3-Coder-30B-A3B-Instruct`: linux:64 coding, linux:256 coding/sys1, linux:512 coding/sys1, osx:64 coding, osx:128 coding, osx:128 coding/sys1, osx:256 coding/sys1, osx:512 coding/sys1
 - `Qwen/Qwen3-Coder-Next`: linux:128 coding, linux:256 coding, linux:512 coding, osx:256 coding, osx:512 coding
-- `XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B`: linux:32 coding
 - `deepseek-ai/DeepSeek-R1-0528-Qwen3-8B`: linux:32 reasoning, linux:256 reasoning/sys1, linux:512 reasoning/sys1
 - `deepseek-ai/DeepSeek-V4-Flash-0731`: linux:256 chat, linux:512 chat
 - `ibm-granite/granite-4.0-350m`: linux:8 chat/sys1, linux:8 coding/sys1, linux:8 reasoning/sys1, osx:4 chat, osx:4 coding, osx:4 reasoning, osx:8 chat/sys1, osx:8 coding/sys1, osx:8 reasoning/sys1, osx:16 chat, osx:16 chat/sys1, osx:16 coding, osx:16 coding/sys1, osx:16 reasoning, osx:16 reasoning/sys1
@@ -55,6 +54,7 @@ Where each model is picked:
 - `openai/gpt-oss-120b`: linux:128 chat, osx:128 chat, osx:128 reasoning, osx:256 chat, osx:256 reasoning
 - `openai/gpt-oss-20b`: linux:16 chat, linux:16 coding, linux:64 chat/sys1, linux:64 coding/sys1, linux:64 reasoning/sys1
 - `zai-org/GLM-4.7-Flash`: linux:128 chat/sys1, linux:128 coding/sys1, linux:128 reasoning/sys1, linux:256 chat/sys1, linux:512 chat/sys1, osx:128 chat/sys1, osx:128 reasoning/sys1, osx:256 chat/sys1, osx:256 reasoning/sys1, osx:512 chat/sys1, osx:512 reasoning/sys1
+- `zai-org/UI2Code_N`: linux:32 coding
 
 Recipes this script wrote (it removes these before writing, never another recipe):
 
@@ -66,7 +66,6 @@ Recipes this script wrote (it removes these before writing, never another recipe
 - `recipes/granite-4.0-350m.json`
 - `recipes/granite-4.0-h-small.json`
 - `recipes/granite-4.0-h-tiny.json`
-- `recipes/mimo-v2.6-distill-qwen-9b.json`
 - `recipes/openreasoning-nemotron-32b.json`
 - `recipes/phi-4-mini-reasoning.json`
 - `recipes/phi-mini-moe-instruct.json`
@@ -75,3 +74,4 @@ Recipes this script wrote (it removes these before writing, never another recipe
 - `recipes/qwen3-235b-a22b.json`
 - `recipes/qwen3-coder-30b-a3b-instruct.json`
 - `recipes/qwen3-coder-next.json`
+- `recipes/ui2code-n.json`

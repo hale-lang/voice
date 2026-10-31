@@ -356,7 +356,9 @@ type UsageQuery {
 type UsageRows { rows: bounded[UsageRow; 1000]; more: Bool = false; }
 
 /// What the rows matching `q` add up to, grouped by `by`: any of
-/// project, key, model, account, seat, node, conversation, day, hour (`valid_group`).
+/// project, key, model, account, seat, node, conversation, day, hour
+/// (`valid_group`). The groups come most recently active first, at most
+/// `SUMMARY_GROUPS` of them.
 type UsageSummaryQuery {
     by: Names = Names { };
     q: UsageQuery = UsageQuery { };
@@ -378,6 +380,9 @@ type UsageGroup {
 }
 
 type UsageGroups { rows: bounded[UsageGroup; 1000]; }
+
+/// The most groups a summary answers: the most recently active.
+const SUMMARY_GROUPS: Int = 1000;
 
 /// True for a field a summary groups by.
 fn valid_group(f: String) -> Bool {
@@ -1212,10 +1217,13 @@ locus MemoryStore {
         for f in s.by.items {
             if !valid_group(f) { fail StoreError { kind: "invalid", message: "no group " + f }; }
         }
-        let mut i = 0;
-        while i < self.usage_log.len() {
+        // newest first, so a group is first met at its latest request, the
+        // groups come most recently active first, and those past the cap
+        // are the least recent
+        let mut i = self.usage_log.len();
+        while i > 0 {
+            i = i - 1;
             let r = self.usage_log.get(i) or UsageRow { };
-            i = i + 1;
             if !usage_matches(r, s.q) { continue; }
             let mut g = "";
             for f in s.by.items {
@@ -1231,11 +1239,16 @@ locus MemoryStore {
                 n = n + 1;
             }
             if found < 0 {
+                if count(out.rows) >= SUMMARY_GROUPS { continue; }
                 push(
                     out.rows,
-                    UsageGroup { group: g, currency: r.currency, first_at: r.created_at },
-                )
-                or fail StoreError { kind: "full", message: "a summary has at most 1000 groups" };
+                    UsageGroup {
+                        group: g,
+                        currency: r.currency,
+                        last_at: r.created_at,
+                        last_request: r.id,
+                    },
+                ) or discard;
                 found = count(out.rows) - 1;
             }
             let mut u = at(out.rows, found) or UsageGroup { };
@@ -1243,9 +1256,8 @@ locus MemoryStore {
             u.input_tokens = u.input_tokens + r.input_tokens;
             u.output_tokens = u.output_tokens + r.output_tokens;
             u.price_micros = u.price_micros + r.price_micros;
-            // the log is in the order rows were written: this is the latest so far
-            u.last_at = r.created_at;
-            u.last_request = r.id;
+            // read newest first: this is the earliest so far
+            u.first_at = r.created_at;
             set(out.rows, found, u) or discard;
         }
         return out;

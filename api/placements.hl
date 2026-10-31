@@ -206,7 +206,14 @@ locus Placements {
                 }
                 continue;
             }
-            let judged = judge_recipe(recipe.variants.text, hw, usable, room, held);
+            let judged = judge_recipe(
+                recipe.variants.text,
+                hw,
+                usable,
+                room,
+                held,
+                recipe.contract == ModelContract::decision,
+            );
             if judged.best < 0 {
                 why = id + ": " + reasons(judged.fit);
                 continue;
@@ -347,7 +354,16 @@ locus Placements {
                 "runtime"
             );
         }
-        let judged = judge_recipe(recipe.variants.text, hw, usable, room, held);
+        let judged = judge_recipe(
+            recipe.variants.text,
+            hw,
+            usable,
+            room,
+            held,
+            // the model's own contract, which may differ from its recipe's
+            // default: it is what its requests are served as
+            m.contract == "decision",
+        );
         out.fit = judged.fit;
         let best = judged.best;
         let mut named = -1;
@@ -705,12 +721,14 @@ fn managed_config(
 /// hardware says: one for its platform, on one of its accelerators before
 /// one on its processors; "" when none does.
 @bounded_by(rts)
-fn runtime_for(format: String, hw: String, rts: RuntimeList) -> String {
+fn runtime_for(format: String, hw: String, rts: RuntimeList, decision: Bool) -> String {
     let os = std::json::find_string_field(hw, "os");
     let arch = std::json::find_string_field(hw, "arch");
     let accel = accelerator_kinds(hw);
     let mut cpu = "";
     for r in rts.data {
+        // a decision model's server serves decision models, and only it does
+        if (r.server == "jev-style") != decision { continue; }
         let mut reads = false;
         for f in r.formats {
             if model_format_name(f) == format { reads = true; }
@@ -777,7 +795,14 @@ fn accelerator_kinds(hw: String) -> String {
 type Judged { fit: bounded[VariantFit; 8]; best: Int = -1; }
 
 @bounded_by(variants)
-fn judge_recipe(variants: String, hw: String, rts: RuntimeList, room: Int, held: Int) -> Judged {
+fn judge_recipe(
+    variants: String,
+    hw: String,
+    rts: RuntimeList,
+    room: Int,
+    held: Int,
+    decision: Bool
+) -> Judged {
     let mut out = Judged { };
     let mut best_rank = 0;
     let mut best_memory = 0;
@@ -785,7 +810,7 @@ fn judge_recipe(variants: String, hw: String, rts: RuntimeList, room: Int, held:
     let mut it = std::json::array_first(variants);
     while !it.done {
         let v = it.element;
-        let judged = judge_variant(v, hw, rts, room, held);
+        let judged = judge_variant(v, hw, rts, room, held, decision);
         push(out.fit, judged) or discard;
         let rank = format_rank(std::json::find_string_field(v, "format"), hw)
             + (if judged.has_runtime && runs_on_cpu(rts, judged.runtime) { 10 } else { 0 });
@@ -805,17 +830,33 @@ fn judge_recipe(variants: String, hw: String, rts: RuntimeList, room: Int, held:
 
 /// One variant judged against a machine's hardware and the runtimes that
 /// may serve it: a runtime reads its format there, it fits what models may
-/// use of the memory, and its files fit the disk.
+/// use of the memory, and its files fit the disk. A decision recipe's
+/// (`decision`) is served only by a decision server (`jev-style`), and a
+/// generative one never.
 @bounded_by(v)
-fn judge_variant(v: String, hw: String, rts: RuntimeList, room: Int, held: Int) -> VariantFit {
+fn judge_variant(
+    v: String,
+    hw: String,
+    rts: RuntimeList,
+    room: Int,
+    held: Int,
+    decision: Bool
+) -> VariantFit {
     let id = std::json::find_string_field(v, "id");
     let format = std::json::find_string_field(v, "format");
-    let rt = runtime_for(format, hw, rts);
+    let rt = runtime_for(format, hw, rts, decision);
     if len(rt) == 0 {
         return VariantFit {
             variant: id,
             fits: false,
-            reason: "no runtime reads " + format + " on " + std::json::find_string_field(hw, "os")
+            reason: (
+                if decision {
+                    "no jev-style runtime (a decision model's server)"
+                } else {
+                    "no runtime"
+                }
+            )
+                + " reads " + format + " on " + std::json::find_string_field(hw, "os")
                 + "/"
                 + std::json::find_string_field(hw, "arch") + " with " + accelerators_said(hw),
         };

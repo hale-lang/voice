@@ -1,5 +1,7 @@
 import type { ReactNode } from 'react';
 import s from './Table.module.css';
+import { Fragment, useEffect, useId } from 'react';
+import { useDetail } from './Detail';
 
 export type Column<T> = {
   key: string;
@@ -23,6 +25,23 @@ export function Table<T>(props: {
   empty?: ReactNode;
 }) {
   const selectable = !!props.onSelect;
+  const detail = useDetail();
+  const table = useId();
+  // in place, the open item is a row under the row clicked, in this table
+  const here =
+    detail?.layout === 'inline' &&
+    detail.node != null &&
+    detail.clicked?.table === table &&
+    detail.clicked.key === props.selectedKey &&
+    props.rows.some((r) => props.rowKey(r) === props.selectedKey);
+  useEffect(() => {
+    detail?.claim(table, !!here);
+    return () => detail?.claim(table, false);
+  }, [here, table]);
+  const select = (row: T) => {
+    detail?.click(table, props.rowKey(row));
+    props.onSelect!(row);
+  };
   return (
     <div className={s.wrap}>
     <table className={`${s.table} ${selectable ? s.selectable : ''}`}>
@@ -49,17 +68,17 @@ export function Table<T>(props: {
             .filter(Boolean)
             .join(' ');
           return (
+            <Fragment key={k}>
             <tr
-              key={k}
               className={cls || undefined}
-              onClick={props.onSelect ? () => props.onSelect!(row) : undefined}
+              onClick={props.onSelect ? () => select(row) : undefined}
               tabIndex={selectable ? 0 : undefined}
               onKeyDown={
                 props.onSelect
                   ? (e) => {
                       if (e.key === 'Enter' || e.key === ' ') {
                         e.preventDefault();
-                        props.onSelect!(row);
+                        select(row);
                       }
                     }
                   : undefined
@@ -72,6 +91,12 @@ export function Table<T>(props: {
                 </td>
               ))}
             </tr>
+            {here && k === props.selectedKey && (
+              <tr className={s.expanded}>
+                <td colSpan={props.columns.length}>{detail!.node}</td>
+              </tr>
+            )}
+            </Fragment>
           );
         })}
       </tbody>

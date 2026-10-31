@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, useId } from 'react';
 import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/components';
 import { useGet, type UsageRecord } from '../api/client';
-import { subscribeAdminEvents } from '../api/events';
+import { subscribeAdminEvents, subscribeFlights, type Flight } from '../api/events';
 import type { ScreenProps } from '../App';
 import { buildGraph, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
 import { demoFleet, demoInFlight, demoCompletions, demoContext, DEMO_TICK_MS } from './network-demo';
@@ -93,14 +93,6 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
     const interval = setInterval(() => {
       const now = Date.now();
       setPulses((old) => old.filter((p) => now - p.at < 7000));
-      // one whose usage never came (its api stopped) goes after an hour
-      setFlying((old) => {
-        const stale = [...old.values()].filter((f) => now - f.at > 3_600_000);
-        if (!stale.length) return old;
-        const next = new Map(old);
-        for (const f of stale) next.delete(f.record.id);
-        return next;
-      });
       if (demo && !pausedRef.current) setClock((old) => ({ tick: old.tick + 1, now }));
     }, DEMO_TICK_MS);
     return () => clearInterval(interval);
@@ -115,26 +107,25 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
     }
   }, [demo, clock]);
 
+  // the requests in flight, as the stream last said: lit until it no
+  // longer tells them, however they ended
+  useEffect(() => {
+    if (demo) return;
+    return subscribeFlights((now) => {
+      setFlying((old) => {
+        const next = new Map<string, { record: UsageRecord; at: number }>();
+        for (const f of now) next.set(f.id, old.get(f.id) ?? { record: provisional(f), at: Date.now() });
+        return next;
+      });
+    });
+  }, [demo]);
+
   useEffect(() => {
     if (demo) return;
     return subscribeAdminEvents((event) => {
       if (event.type === 'reset') { setArrivals([]); setPulses([]); setFlying(new Map()); seen.current.clear(); return; }
-      if (event.type === 'request') {
-        const f = event.data;
-        if (seen.current.has(f.id)) return;
-        // a provisional record: what lights its path until its usage comes
-        const record = { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {} } as unknown as UsageRecord;
-        setFlying((old) => new Map(old).set(f.id, { record, at: Date.now() }));
-        return;
-      }
       if (event.type !== 'usage' || seen.current.has(event.data.id)) return;
       const record = event.data;
-      setFlying((old) => {
-        if (!old.has(record.id)) return old;
-        const next = new Map(old);
-        next.delete(record.id);
-        return next;
-      });
       seen.current.add(record.id);
       if (seen.current.size > 512) seen.current.delete(seen.current.values().next().value!);
       setArrivals((old) => [record, ...old].slice(0, 8));
@@ -221,6 +212,11 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
 
 function Marker({ kind }: { kind: Kind }) {
   return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
+}
+
+/** A request in flight as a record the graph can light: what it is, and the seat it is on. */
+function provisional(f: Flight): UsageRecord {
+  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {} } as unknown as UsageRecord;
 }
 
 function Constellation({ layout, graph, selected, focusedIds, focusedEdges, pulses, paused, onSelect, onHover }: { layout: Graph; graph: Graph; selected: string[]; focusedIds: Set<string>; focusedEdges: Set<string>; pulses: Pulse[]; paused: boolean; onSelect: (id: string) => void; onHover: (id: string | null) => void }) {

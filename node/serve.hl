@@ -1,0 +1,311 @@
+// A slot of the node's: one request served on its seat at a time, while the
+// node's other slots serve theirs (session.hl hands each accepted `serve`
+// to a free slot). The node runs `SLOTS` of them, each its own thread
+// (main.hl), so two seats, or two requests on one seat of concurrency 2,
+// are served at once. A slot publishes the request's events and result on
+// NATS with a client of its own; a `cancel` for it reaches it from the
+// session, on the bus.
+
+import "../lib/pond/realtime/nats" as nats;
+
+/// The slots a node serves on: the most requests it serves at once.
+const SLOTS: Int = 8;
+
+/// A request handed to a slot: the `serve` message, what the session knows
+/// of its seat, and the broker to answer on.
+type ServeWork {
+    slot: Int = 0;
+    request_id: String = "";
+    reply_to: String = "";
+    msg: String = "";
+    seat: String = "";
+    engine: String = "";
+    // the seat's engine kind, config and (managed) server's endpoint
+    kind: String = "";
+    config: String = "{}";
+    endpoint: String = "";
+    nats_url: String = "";
+    nats_user: String = "";
+    nats_pass: String = "";
+}
+
+topic ServeJob { payload: ServeWork; keyed_by slot; }
+
+/// A `cancel` the session read, for whichever slot serves it.
+type ServeStop { request_id: String = ""; }
+
+topic ServeCancel { payload: ServeStop; }
+
+/// A slot is free again: what it served, and how it went, for the
+/// session's readings and its load.
+type ServeReport {
+    slot: Int = 0;
+    request_id: String = "";
+    seat: String = "";
+    engine: String = "";
+    // served (or incomplete), not failed or cancelled
+    ok: Bool = false;
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    first_ms: Int = -1;
+    elapsed_ms: Int = 0;
+}
+
+topic ServeDone { payload: ServeReport; }
+
+locus Server {
+    params {
+        client: nats::NatsClient = nats::NatsClient { name: "voice-node-slot" };
+        // the request handed it, waiting or being served
+        work: ServeWork = ServeWork { };
+        waiting: Bool = false;
+        serving: String = "";
+        cancelled: Bool = false;
+        // monotonic ns of the last look at the bus while serving
+        looked: Int = 0;
+    }
+
+    bus {
+        subscribe ServeJob as on_job where key == replica;
+        subscribe ServeCancel as on_cancel;
+        publish ServeDone;
+    }
+
+    run() {
+        while true {
+            self.step();
+        }
+    }
+
+    /// One turn: a request handed it is served; else its connection
+    /// tended and a sleep, where the next arrives.
+    fn step() {
+        if self.waiting {
+            self.waiting = false;
+            self.serve(self.work);
+        } else {
+            self.tend();
+            std::time::sleep(5ms);
+        }
+    }
+
+    /// Read what the broker sent: its PINGs answered (the client answers
+    /// only while read), a connection it closed found closed.
+    fn tend() {
+        if !self.client.connected { return; }
+        let mut n = 0;
+        while n < 8 && self.client.read_msg(1ms) { n = n + 1; }
+    }
+
+    /// Publish on the request's broker, connected again and sent once more
+    /// when the connection is gone.
+    fn send(subject: String, reply: String, data: Bytes) {
+        self.client.pub_msg(subject, reply, data) or {
+            self.client.close();
+            if self.reach(self.work) {
+                self.client.pub_msg(subject, reply, data) or {
+                    log_error(
+                        "a slot could not publish its request's answer",
+                        fields2(
+                            std::log::kv("subject", subject),
+                            std::log::kv("why", err.kind + ": " + err.detail),
+                        ),
+                    );
+                };
+            }
+        };
+    }
+
+    fn on_job(w: ServeWork) {
+        self.work = w;
+        self.waiting = true;
+    }
+
+    fn on_cancel(c: ServeStop) {
+        if len(self.serving) > 0 && c.request_id == self.serving { self.cancelled = true; }
+    }
+
+    /// The broker `w` names, connected to (again, when it changed).
+    fn reach(w: ServeWork) -> Bool {
+        // a connection the broker closed while the slot was idle is found so
+        self.tend();
+        if self.client.connected
+            && self.client.url == w.nats_url
+            && self.client.user == w.nats_user
+            && self.client.pass == w.nats_pass
+        {
+            return true;
+        }
+        self.client.close();
+        self.client.url = w.nats_url;
+        self.client.user = w.nats_user;
+        self.client.pass = w.nats_pass;
+        return self.client.open();
+    }
+
+    /// A look at the bus, where a `cancel` for this request arrives.
+    fn look() {
+        self.looked = std::time::monotonic_ns();
+        self.tend();
+        std::time::sleep(1ms);
+    }
+
+    /// Wait `ms`, in short slices that look at the bus, until the request
+    /// is cancelled.
+    fn pause(ms: Int) {
+        let until = std::time::monotonic_ns() + ms * 1000000;
+        while !self.cancelled && std::time::monotonic_ns() < until {
+            let left = (until - std::time::monotonic_ns()) / 1000000;
+            std::time::sleep((if left > 50 { 50 } else if left > 0 { left } else { 0 }) * 1ms);
+        }
+    }
+
+    /// Serve `w` on its seat: its events and its result on the reply
+    /// subject, then the session told the slot is free.
+    @unbounded
+    fn serve(w: ServeWork) {
+        let id = w.request_id;
+        let reply_to = w.reply_to;
+        self.serving = id;
+        self.cancelled = false;
+        self.looked = std::time::monotonic_ns();
+        let mut done = ServeReport { slot: w.slot, request_id: id, seat: w.seat, engine: w.engine };
+        if !self.reach(w) {
+            log_error(
+                "a slot could not reach NATS to answer a request",
+                fields2(std::log::kv("request", id), std::log::kv("why", self.client.last_error)),
+            );
+            self.serving = "";
+            ServeDone <- done;
+            return;
+        }
+        let t0 = std::time::monotonic_ns();
+        let model = std::json::find_string_field(w.msg, "model");
+        let request = std::str::trim(std::json::find_field_raw(w.msg, "body"));
+        let mut first = -1;
+        let kind = w.kind;
+        let compat = kind == "openai-compatible" || kind == "managed";
+        // a managed seat is served by its own server, on loopback (run.hl)
+        let cc = if kind == "managed" {
+            compat_config(
+                "{\"base_url\": " + q(w.endpoint) + ", \"model\": "
+                    + q(std::json::find_string_field(w.config, "model")) + "}",
+            )
+        } else {
+            compat_config(w.config)
+        };
+        let cli = w.kind == "claude-cli";
+        let mut run = StaticRun { };
+        if cli {
+            // the CLI's output is relayed as it arrives, like an http upstream's
+            let cr = claude_run_for(id, model, request, claude_config(w.config));
+            cr.open();
+            while !cr.done && !self.cancelled {
+                let d = cr.next_data();
+                if len(d) > 0 {
+                    let lines = cr.feed(d);
+                    let lv = std::str::bytes_view(lines);
+                    let mut at = 0;
+                    while at < lv.n {
+                        let e = line_end(lv, at);
+                        let ev = std::str::slice(lv, at, e);
+                        at = e + 1;
+                        if first < 0 && is_output(ev) {
+                            first = (std::time::monotonic_ns() - t0) / 1000000;
+                        }
+                        self.send(
+                            reply_to + ".event",
+                            "",
+                            std::bytes::from_string(
+                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
+                                    + "}",
+                            ),
+                        );
+                    }
+                }
+                if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
+            }
+            run = cr.finish();
+        } else if compat {
+            // the upstream, http or https, is relayed as it arrives: each
+            // event leaves as soon as it is read
+            let up = upstream_over_wire(id, model, request, cc);
+            while !up.done && !self.cancelled {
+                let d = up.next_data();
+                if len(d) > 0 {
+                    let lines = up.feed(d);
+                    let lv = std::str::bytes_view(lines);
+                    let mut at = 0;
+                    while at < lv.n {
+                        let e = line_end(lv, at);
+                        let ev = std::str::slice(lv, at, e);
+                        at = e + 1;
+                        if first < 0 && is_output(ev) {
+                            first = (std::time::monotonic_ns() - t0) / 1000000;
+                        }
+                        self.send(
+                            reply_to + ".event",
+                            "",
+                            std::bytes::from_string(
+                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
+                                    + "}",
+                            ),
+                        );
+                    }
+                }
+                if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
+            }
+            run = up.finish();
+        } else {
+            let engine_model = std::json::string_field(w.msg, "engine_model");
+            run = run_static(
+                id,
+                model,
+                if engine_model.kind == "string" { engine_model.text } else { model },
+                request,
+                static_config(w.config),
+            );
+        }
+        let v = std::str::bytes_view(run.script);
+        let mut start = 0;
+        while start < v.n && !self.cancelled {
+            let at = line_end(v, start);
+            let line = std::str::slice(v, start, at);
+            start = at + 1;
+            if std::str::starts_with(line, "pause ") {
+                self.pause(std::str::parse_int(line[6..len(line)]) or 0);
+            } else {
+                if first < 0 && is_output(line) {
+                    first = (std::time::monotonic_ns() - t0) / 1000000;
+                }
+                self.send(
+                    reply_to + ".event",
+                    "",
+                    std::bytes::from_string(
+                        "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}",
+                    ),
+                );
+                // a look costs up to a millisecond when nothing waits, so
+                // a run of events looks every 50 ms, not after each
+                if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
+            }
+        }
+        let elapsed = (std::time::monotonic_ns() - t0) / 1000000;
+        let result = if self.cancelled {
+            cancelled_result(id)
+        } else if run.outcome == "failed" {
+            failed_result(id, "engine_failed", run.failure, true)
+        } else {
+            result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
+        };
+        self.send(reply_to + ".result", "", std::bytes::from_string(result));
+        done.ok = !self.cancelled && run.outcome != "failed";
+        done.input_tokens = run.input_tokens;
+        done.output_tokens = run.output_tokens;
+        done.first_ms = first;
+        done.elapsed_ms = elapsed;
+        self.serving = "";
+        self.cancelled = false;
+        ServeDone <- done;
+    }
+}

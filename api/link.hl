@@ -40,15 +40,21 @@ interface Link {
     /// Publish `body` on `<root>.node.<node>.assign`; false when it could
     /// not be sent.
     fn assign(node: String, body: String) -> Bool;
-    /// Offer `body` (a `serve` message naming `reply_to`) to the node: its
-    /// ack (`accepted`, `refused`, `unanswered` or `lost`, with `reason`).
-    /// An accepted offer stays open for `next` until `finish`.
-    fn offer(node: String, reply_to: String, body: String) -> ServeOutcome;
-    /// The open offer's next message, waiting at most `wait`: an `event`
-    /// (the standard event object), the `result`, `none` when the wait
-    /// ran out, or `lost`.
+    /// Offer `body` (a `serve` message naming `reply_to`) to the node: the
+    /// offer, its own, so requests served at once each wait on theirs.
+    fn offer(node: String, reply_to: String, body: String) -> Offer;
+}
+
+/// One request's offer to one seat, from its ack to its finish.
+interface Offer {
+    /// The node's ack: `accepted`, `refused`, `unanswered` or `lost`, with
+    /// `reason`. An accepted offer stays open for `next` until `finish`.
+    fn ack() -> ServeOutcome;
+    /// The offer's next message, waiting at most `wait`: an `event` (the
+    /// standard event object), the `result`, `none` when the wait ran out,
+    /// or `lost`.
     fn next(wait: Duration) -> LinkMsg;
-    /// End the open offer; one whose result has not come is sent `cancel`.
+    /// End the offer; one whose result has not come is sent `cancel`.
     fn finish();
 }
 
@@ -66,12 +72,13 @@ fn serve_over(
     first: Duration,
     idle: Duration
 ) -> ServeOutcome {
-    let mut out = link.offer(node, reply_to, body);
+    let offer = link.offer(node, reply_to, body);
+    let mut out = offer.ack();
     if out.ack != "accepted" { return out; }
     let mut deadline = std::time::monotonic() + first;
     let mut done = false;
     while !done && std::time::monotonic() < deadline {
-        let m = link.next(1s);
+        let m = offer.next(1s);
         if m.kind == "event" {
             out = take_event(out, m.json);
         } else if m.kind == "result" {
@@ -84,7 +91,7 @@ fn serve_over(
             deadline = std::time::monotonic() + (if out.output { idle } else { first });
         }
     }
-    link.finish();
+    offer.finish();
     return out;
 }
 
@@ -107,8 +114,6 @@ locus NatsLink {
         vault: String = "";
         subjects: String = "voice";
         inbox: String = "_INBOX";
-        // the offer open now
-        attempt: NatsAttempt = NatsAttempt { };
     }
 
     fn place() -> String { return if len(self.node_url) > 0 { self.node_url } else { self.url }; }
@@ -145,15 +150,18 @@ locus NatsLink {
 
     /// Subscribe to the attempt's replies first, then offer it, so no
     /// event can arrive before the api listens. Each offer is an attempt
-    /// of its own, with its own connection, gone when the next replaces it.
-    /// (The data plane is a per-message handler of the Rest listener, so the
-    /// analysis now sees this allocation as one per request, as it is.)
+    /// of its own, with its own connection, held by the request that made
+    /// it, so requests served at once never share one. (The data plane is a
+    /// per-message handler of the Rest listener, so the analysis sees this
+    /// allocation as one per request, as it is.)
     @unbounded
-    fn offer(node: String, reply_to: String, body: String) -> ServeOutcome {
+    fn offer(node: String, reply_to: String, body: String) -> Offer {
         if len(self.url) == 0 {
-            return ServeOutcome { ack: "lost", reason: "no NATS is configured" };
+            return NatsAttempt {
+                outcome: ServeOutcome { ack: "lost", reason: "no NATS is configured" },
+            };
         }
-        self.attempt = NatsAttempt {
+        let a = NatsAttempt {
             node: node,
             reply_to: reply_to,
             request_id: std::json::find_string_field(body, "request_id"),
@@ -165,12 +173,9 @@ locus NatsLink {
                 inbox_prefix: self.inbox,
             },
         };
-        return self.attempt.offer(self.url, body);
+        a.send(self.url, body);
+        return a;
     }
-
-    fn next(wait: Duration) -> LinkMsg { return self.attempt.next(wait); }
-
-    fn finish() { self.attempt.finish(); }
 }
 
 /// One offer over NATS, from its subscription to its finish. Only messages
@@ -186,9 +191,16 @@ locus NatsAttempt {
         c: nats::NatsClient = nats::NatsClient { name: "voice-api" };
         open: Bool = false;
         finished: Bool = false;
+        // the node's ack, once `send` has offered it
+        outcome: ServeOutcome = ServeOutcome { ack: "lost" };
     }
 
-    fn offer(url: String, body: String) -> ServeOutcome {
+    fn ack() -> ServeOutcome { return self.outcome; }
+
+    /// Offer `body` at `url`, its ack kept for `ack`.
+    fn send(url: String, body: String) { self.outcome = self.offered(url, body); }
+
+    fn offered(url: String, body: String) -> ServeOutcome {
         self.c.url = url;
         if !self.c.open() {
             return ServeOutcome {

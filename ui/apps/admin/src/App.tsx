@@ -1,6 +1,7 @@
 import { useIsFetching, useQueryClient } from '@tanstack/react-query';
-import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button } from '@hale/components';
-import { useRoute, href } from './route';
+import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button, Select, DETAIL_LAYOUTS, type DetailLayout } from '@hale/components';
+import { EventLog } from './EventLog';
+import { useRoute, href, go } from './route';
 import { useGet } from './api/client';
 import { Overview } from './screens/Overview';
 import { Network } from './screens/Network';
@@ -11,13 +12,14 @@ import { Changes } from './screens/Changes';
 import { Accounts } from './screens/Accounts';
 import { Catalog } from './screens/Catalog';
 import { Projects } from './screens/Projects';
+import { Api } from './screens/Api';
 import { Recipes } from './screens/Recipes';
 import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
 import { useAdminEvents } from './api/events';
 import { useHub } from './api/hub';
 import { useOperatorToken, keepOperatorToken } from './api/token';
-import { useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
 const NAV = [
   { href: href(), label: 'Overview', key: '' },
@@ -32,6 +34,7 @@ const NAV = [
   { href: href('runtimes'), label: 'Runtimes', key: 'runtimes' },
   { href: href('projects'), label: 'Projects', key: 'projects' },
   { href: href('changes'), label: 'Changes', key: 'changes' },
+  { href: href('api'), label: 'API', key: 'api' },
 ];
 
 export function App() {
@@ -52,8 +55,8 @@ function OperatorToken() {
         onSubmit={() => keepOperatorToken(value.trim())}
         actions={<Button type="submit" tone="primary">continue</Button>}
       >
-        <Field label="operator token" required help="voice-api admin-token prints it: docker compose exec api voice-api admin-token">
-          <TextInput mono value={value} onChange={setValue} required pattern="\s*va-[0-9a-f]+\s*" placeholder="va-..." />
+        <Field label="operator token" required help="standalone: docker compose exec api voice-api admin-token; in a habitat: hale dna secret show operator-token">
+          <TextInput mono value={value} onChange={setValue} required pattern="\s*[0-9a-zA-Z_-]+\s*" placeholder="va-... or the habitat's" />
         </Field>
       </Form>
     </Shell>
@@ -64,12 +67,14 @@ function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects }[section];
+  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects, api: Api }[section];
   const Screen = screen ?? Overview;
 
   // The inspector belongs to the screen; a new screen starts it empty. A
   // layout effect, so it runs before the screen's own effect fills it.
   useLayoutEffect(() => setInspector(null), [section]);
+  const [layout, setLayout] = useDetailLayout();
+  const close = useCallback(() => go(section), [section]);
 
   return (
     <Shell
@@ -78,15 +83,45 @@ function Admin() {
         <>
           <RailHeader app="voice" sub="admin" />
           <RailNav items={NAV.map((n) => ({ ...n, active: n.key === section }))} />
-          <RailPrincipal>operator · <a href="#" onClick={(e) => { e.preventDefault(); keepOperatorToken(null); }}>forget token</a></RailPrincipal>
+          <RailPrincipal>
+            <div style={{ marginBottom: 'var(--space-3)' }}>
+              <div className="faint" style={{ marginBottom: 2 }}>open items as</div>
+              <Select value={layout} onChange={(v) => setLayout(v as DetailLayout)} options={DETAIL_LAYOUTS} />
+            </div>
+            operator · <a href="#" onClick={(e) => { e.preventDefault(); keepOperatorToken(null); }}>forget token</a>
+          </RailPrincipal>
         </>
       }
-      inspector={inspector}
+      detail={inspector}
+      layout={layout}
+      onClose={close}
       evidence={<EvidenceStrip />}
+      dock={<EventLog />}
     >
       <Screen route={route} setInspector={setInspector} />
     </Shell>
   );
+}
+
+/** How the viewer likes items opened (the rail's picker), kept in this browser. */
+function useDetailLayout(): [DetailLayout, (l: DetailLayout) => void] {
+  const [layout, set] = useState<DetailLayout>(() => {
+    try {
+      const v = localStorage.getItem('voice.detail-layout');
+      return v === 'page' || v === 'drawer' || v === 'inline' ? v : 'page';
+    } catch {
+      return 'page';
+    }
+  });
+  const keep = useCallback((l: DetailLayout) => {
+    set(l);
+    try {
+      localStorage.setItem('voice.detail-layout', l);
+    } catch {
+      // kept for this visit only
+    }
+  }, []);
+  return [layout, keep];
 }
 
 export type ScreenProps = { route: ReturnType<typeof useRoute>; setInspector: (n: ReactNode) => void };

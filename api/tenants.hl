@@ -1,0 +1,355 @@
+// Tenants: the organisms of voice's habitat, each calling voice for models
+// with the key the habitat drew for it (hale.toml `[dna.provides.models]`,
+// `[dna.secrets.tenant-key]`). No person mints those keys: the habitat
+// draws a member of the `tenant-key` family per tenant, labelled with the
+// tenant's organism name, removes it when the tenant goes, and redraws it
+// on rotation, in the vault directory it hands the api
+// (`HALE_VAULT_DIR`), each member's entry named by the family's prefix
+// (`HALE_SECRET_TENANT_KEY_FAMILY`) and its label.
+//
+// A project is a caller. In a habitat (its name, `HALE_DNA_HABITAT_NAME`)
+// each is `<habitat>-<caller>`: the habitat's own infrastructure,
+// `<habitat>-habitat`, holding the accounts the habitat may spend, which the
+// operator sets as any project's; and each organism that uses models,
+// `<habitat>-<organism>`, created when it first calls, a child of the
+// habitat's project that inherits its accounts: they are its parent's
+// as they are when the tenant is used, so a change reaches every inheriting
+// tenant on its next call. An operator narrows one tenant by giving its
+// project accounts of its own (it no longer inherits), and sets it to inherit
+// again. Its key's digest is that of the key it presented; every later call
+// finds the key by its digest and holds it to the member again, so a removed
+// tenant stops at once and a rotated key's old value stops at the first use
+// of its new one. Its usage, limits and budget are its project's, as any
+// project's are. The habitat draws each caller a member of the tenant-key
+// family, labelled with the caller: the organism's name, and `habitat` for its
+// own. Outside a habitat a caller is `tenant-<label>`, a project of its own,
+// with no account until the operator gives it some.
+
+/// The grant voice 0.1 kept for the habitat (migration 13), which the
+/// habitat's project takes as its accounts when it is first made.
+type HabitatGrant {
+    accounts: bounded[String; 32];
+}
+
+/// The name a tenant's key is created with; an operator may rename it.
+const TENANT_KEY_NAME: String = "habitat tenant key";
+
+/// What marks a tenant's key, the one voice created for the habitat's
+/// member: its `prefix`, which only voice writes and nothing changes (a
+/// project key's is the first characters of its `vk-` secret), never its
+/// name, which the operator may edit.
+const TENANT_KEY_PREFIX: String = "tenant";
+
+/// The project of the tenant labelled `label`.
+fn tenant_project(label: String) -> String { return "tenant-" + label; }
+
+/// True when `k` is a tenant's key, the one voice created for a member.
+fn is_tenant_key(k: st::KeyRow) -> Bool { return k.prefix == TENANT_KEY_PREFIX; }
+
+/// The project of the caller labelled `label`: `<habitat>-<label>` in a
+/// habitat (`<habitat>-habitat`, for `habitat`, is the habitat's own),
+/// `tenant-<label>` outside one.
+fn member_project(label: String) -> String {
+    let h = habitat_name();
+    if len(h) == 0 { return tenant_project(label); }
+    return h + "-" + label;
+}
+
+/// The members' entry prefix, `secret-<org>-tenant-key--`; "" when voice
+/// has no habitat that makes it a provider.
+fn tenant_family() -> String {
+    if !std::env::var_exists("HALE_SECRET_TENANT_KEY_FAMILY") { return ""; }
+    return std::str::trim(std::env::var("HALE_SECRET_TENANT_KEY_FAMILY"));
+}
+
+fn vault_dir() -> String {
+    if !std::env::var_exists("HALE_VAULT_DIR") { return ""; }
+    return std::str::trim(std::env::var("HALE_VAULT_DIR"));
+}
+
+/// That grant as stored, or none set: no account.
+fn habitat_grant_of(body: String) -> HabitatGrant {
+    let mut g = HabitatGrant { };
+    if len(std::str::trim(body)) == 0 { return g; }
+    g.accounts = stored_names(std::json::find_field_raw(body, "accounts")).items;
+    return g;
+}
+
+/// A JSON list of strings, as names; none for `null` or anything else.
+fn stored_names(raw: String) -> st::Names {
+    let mut out = st::Names { };
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if std::str::starts_with(e, "\"") {
+            push(out.items, std::json::unescape_string(e[1..(len(e) - 1)])) or discard;
+        }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The habitat's name (`HALE_DNA_HABITAT_NAME`), "" outside a habitat.
+fn habitat_name() -> String {
+    if !std::env::var_exists("HALE_DNA_HABITAT_NAME") { return ""; }
+    return std::str::trim(std::env::var("HALE_DNA_HABITAT_NAME"));
+}
+
+/// The habitat's own project: `<habitat>-habitat`, "" outside a habitat or
+/// for a name no project id holds.
+fn habitat_project() -> String {
+    let name = habitat_name();
+    let id = name + "-habitat";
+    if len(name) == 0 || !is_project_id(id) { return ""; }
+    return id;
+}
+
+/// The habitat's project, made if it is not yet: holding no account (or
+/// what voice 0.1's habitat grant held, migration 13) until the operator
+/// gives it some. "" outside a habitat.
+fn ensure_habitat(store: st::Store) -> String fallible(st::StoreError) {
+    let id = habitat_project();
+    if len(id) == 0 { return ""; }
+    let had = store.project(id) or raise;
+    if had.present {
+        adopt_legacy(store, id) or raise;
+        return id;
+    }
+    let g = habitat_grant_of(store.habitat_grant() or raise);
+    let mut row = st::ProjectRow {
+        id: id,
+        name: habitat_name() + " habitat",
+        accounts: restriction_of(true, g.accounts),
+        created_at: now_seconds()
+    };
+    push(row.data_classes.items, "internal") or discard;
+    row.position = "the habitat " + habitat_name() + ", voice's customer";
+    store.insert_project(
+        row,
+        change_of("create", "projects/" + id, "", project_json(new_project_view(row))),
+    ) or raise;
+    adopt_legacy(store, id) or raise;
+    return id;
+}
+
+/// The tenants made before the habitat named its callers (`tenant-<x>`,
+/// migration 14) made children of the habitat's project `habitat`, keeping
+/// their ids and whether they inherit or were narrowed; the habitat's own
+/// project (`tenant-habitat`, for a habitat named `tenant`) stays a root.
+fn adopt_legacy(store: st::Store, habitat: String) fallible(st::StoreError) {
+    let all = store.projects() or raise;
+    for p in all.rows {
+        if is_legacy_tenant(p, habitat) {
+            let before = project_json(new_project_view(p));
+            let mut child = p;
+            child.parent = habitat;
+            store.update_project(
+                child,
+                change_of(
+                    "update",
+                    "projects/" + p.id,
+                    before,
+                    project_json(new_project_view(child)),
+                ),
+            ) or raise;
+        }
+    }
+}
+
+/// True when `p` is a tenant from before the habitat `habitat` named its
+/// callers, not yet its child.
+fn is_legacy_tenant(p: st::ProjectRow, habitat: String) -> Bool {
+    return std::str::starts_with(p.id, "tenant-") && len(p.parent) == 0 && p.id != habitat;
+}
+
+/// Whether a project peeks (peek.hl): its own setting (`set`, `own`), else
+/// its parent's (`parent`, "" for none), read now; a project of its own
+/// with none does not.
+fn peeks(
+    store: st::Store,
+    set: Bool,
+    own: Bool,
+    parent_id: String
+) -> Bool fallible(st::StoreError) {
+    if set { return own; }
+    if len(parent_id) == 0 { return false; }
+    let parent = store.project(parent_id) or raise;
+    return parent.present && parent.peek_set && parent.peek;
+}
+
+/// The project as it is in force when it is used: an inheriting child's
+/// accounts are its parent's as they are now. An inheriting tenant still
+/// with no parent (the habitat's project made before it, or outside a
+/// habitat) is made the habitat's child here, once.
+fn as_in_force(store: st::Store, p: st::ProjectRow) -> st::ProjectRow fallible(st::StoreError) {
+    if !p.inherits { return p; }
+    let mut out = p;
+    if len(out.parent) == 0 {
+        let h = ensure_habitat(store) or raise;
+        if len(h) == 0 { return p; }
+        let before = project_json(new_project_view(out));
+        out.parent = h;
+        store.update_project(
+            out,
+            change_of("update", "projects/" + out.id, before, project_json(new_project_view(out))),
+        ) or raise;
+    }
+    let parent = store.project(out.parent) or raise;
+    if !parent.present || parent.archived {
+        out.accounts = st::Restriction { any: false };
+        return out;
+    }
+    out.accounts = parent.accounts;
+    return out;
+}
+
+/// The label of the tenant whose member `token` is, "" for none: each
+/// member in the vault directory, compared on the sealed side. Listed on
+/// each look, so a tenant drawn while the api runs is known at its first
+/// call.
+@unbounded
+fn tenant_of(token: String) -> String {
+    let family = tenant_family();
+    let dir = vault_dir();
+    if len(family) == 0 || len(dir) == 0 || len(token) == 0 { return ""; }
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if !std::str::starts_with(name, family) { continue; }
+        let label = name[len(family)..len(name)];
+        if !is_slug(label) || !is_project_id(member_project(label)) { continue; }
+        if tenant_holds(label, token) { return label; }
+    }
+    return "";
+}
+
+/// True when the tenant labelled `label` holds `token` now: its member is
+/// in the vault and is `token`.
+fn tenant_holds(label: String, token: String) -> Bool {
+    let family = tenant_family();
+    if len(family) == 0 || len(vault_dir()) == 0 { return false; }
+    let member = std::secret::Credential { vault: family + label };
+    return member.matches(std::bytes::from_string(token));
+}
+
+/// The label of a tenant's key, from its project.
+fn tenant_label(k: st::KeyRow) -> String {
+    let h = habitat_name();
+    if len(h) > 0 && std::str::starts_with(k.project, h + "-") {
+        return k.project[(len(h) + 1)..len(k.project)];
+    }
+    // a tenant made before the habitat named its callers so
+    if std::str::starts_with(k.project, "tenant-") { return k.project[7..len(k.project)]; }
+    return "";
+}
+
+/// The key of the tenant labelled `label`, which presented the key whose
+/// digest is `digest`: its project created from the tenant defaults the
+/// first time, and a key row of that digest, which every later call finds.
+/// A key row of the tenant's from an earlier value of its member (a
+/// rotation) is revoked. A tenant's project the operator archived takes no
+/// key.
+@unbounded
+fn tenant_key(store: st::Store, label: String, digest: String) -> st::KeyRow fallible(ApiError) {
+    let habitat = ensure_habitat(store) or fail metering_failed(err);
+    // the habitat's own infrastructure calls as the habitat's project
+    // itself; a tenant made before the habitat named its callers keeps its
+    // project, `tenant-<label>`, through a rotation
+    let mut pid = member_project(label);
+    let legacy = store.project(tenant_project(label)) or fail metering_failed(err);
+    if legacy.present { pid = tenant_project(label); }
+    let mut p = store.project(pid) or fail metering_failed(err);
+    if !p.present {
+        // a child of the habitat's project, inheriting its accounts (none of
+        // its own); outside a habitat a project of its own, with no account
+        // until the operator gives it some
+        let parent = habitat;
+        let mut row = st::ProjectRow {
+            id: pid,
+            name: (if len(habitat_name()) > 0 { habitat_name() + " " } else { "tenant " }) + label,
+            accounts: st::Restriction { any: false },
+            created_at: now_seconds(),
+            parent: parent,
+            inherits: len(parent) > 0
+        };
+        push(row.data_classes.items, "internal") or discard;
+        row.position = "the habitat's organism " + label + ", calling voice";
+        let made = project_json(new_project_view(row));
+        // a child, made as any change of a parent is, the hierarchy held
+        if len(parent) > 0 { store.hold(HIERARCHY) or fail metering_failed(err); }
+        store.insert_project(
+            row,
+            change_of("create", "projects/" + pid, "", made),
+        ) or fail metering_failed(err);
+        p = store.project(pid) or fail metering_failed(err);
+    }
+    if !p.present || p.archived { fail invalid_key(); }
+    let now = now_seconds();
+    let keys = store.keys(pid) or fail metering_failed(err);
+    for k in keys.rows {
+        if is_tenant_key(k) && !k.revoked && k.digest != digest {
+            let mut gone = k;
+            gone.revoked = true;
+            gone.revoked_at = now;
+            store.update_key(
+                gone,
+                change_of(
+                    "revoke",
+                    key_target(gone),
+                    key_json(key_view(k, now)),
+                    key_json(key_view(gone, now)),
+                ),
+            ) or fail metering_failed(err);
+        }
+        if is_tenant_key(k) && !k.revoked && k.digest == digest { return k; }
+    }
+    let id_hex = random_hex(8) or fail entropy_failed(err.message);
+    let row = st::KeyRow {
+        id: "k_" + id_hex,
+        project: pid,
+        name: TENANT_KEY_NAME,
+        prefix: TENANT_KEY_PREFIX,
+        digest: digest,
+        created_at: now
+    };
+    store.insert_key(
+        row,
+        change_of("create", key_target(row), "", key_json(key_view(row, now))),
+    ) or fail metering_failed(err);
+    return row;
+}
+
+/// A change voice made itself, for a tenant, recorded as a write on the
+/// admin plane records one. A tenant's project and key are small, so their
+/// JSON is always readable back.
+fn change_of(action: String, target: String, before: String, after: String) -> st::ChangeRow {
+    return change(action, target, before, after);
+}
+
+/// A project just created, as `GET` answers it: no keys yet, no budget.
+fn new_project_view(r: st::ProjectRow) -> Project {
+    let mut v = Project {
+        id: r.id,
+        name: r.name,
+        status: Lifecycle::active,
+        has_models: !r.models.any,
+        has_accounts: !r.accounts.any,
+        budget: budget_view(r.budget, now_seconds()),
+        key_count: 0,
+        has_position: len(r.position) > 0,
+        position: r.position,
+        created_at: r.created_at,
+        has_parent: len(r.parent) > 0,
+        parent: r.parent,
+        inherits: r.inherits,
+        has_peek: r.peek_set,
+        peek: r.peek
+    };
+    v.models = r.models.names.items;
+    v.accounts = r.accounts.names.items;
+    v.owners = r.owners.items;
+    v.data_classes = r.data_classes.items;
+    return v;
+}

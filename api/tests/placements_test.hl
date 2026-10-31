@@ -33,6 +33,102 @@ fn hardware(accel: String, model_memory: Int, disk: Int) -> String {
         + to_string(disk) + "}";
 }
 
+/// A seat's prompt cache: four conversations of the model's context (at
+/// most 128k), from at most half the spare memory and no more than the
+/// model's own, never less than the fitted 32k.
+fn cache_pool() {
+    let big = 100000000000;
+    std::test::assert_eq_int(
+        api::cache_pool(big, 0, 262144, big),
+        32768,
+        "no per-token cost, the fitted context",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(big, 24576, 262144, big),
+        524288,
+        "room to spare: four of 128k",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(big, 24576, 40960, big),
+        163840,
+        "four of a smaller model's own",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(2000000000, 24576, 262144, big),
+        ((32768 + 1000000000 / 24576) / 256) * 256,
+        "half the spare, when that is less, in llama.cpp's steps of 256",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(0, 24576, 262144, big),
+        32768,
+        "none to spare, the fitted context",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(big, 0, 4096, big),
+        4096,
+        "a model made for less was fitted for its own",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(0, 65536, 4096, big),
+        4096,
+        "and keeps it with none to spare",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(big, 65536, 4096, big),
+        16384,
+        "or four of its own, from the spare",
+    );
+    std::test::assert_eq_int(api::fitted_context(4096), 4096, "its fitted context, its own");
+    std::test::assert_eq_int(api::fitted_context(262144), 32768, "a long model's, the 32k fitted");
+    std::test::assert_eq_int(
+        api::cache_pool(big, 114688, 40960, 1500000000),
+        ((32768 + 1500000000 / 114688) / 256) * 256,
+        "a cache no larger than the model it serves",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(2 * 1048576, 524288, 4096, 10000000000),
+        4096,
+        "an enlargement short of one step is none",
+    );
+    std::test::assert_eq_int(
+        api::cache_pool(2 * 257 * 524288, 524288, 4096, 10000000000),
+        4352,
+        "one step past the fitted context, not a token more",
+    );
+}
+
+/// A node's room for a placement is what its others leave.
+fn held_room(store: st::Store, catalog: api::Catalog, placements: api::Placements, gb10: String) {
+    node(store, "tight", hardware(gb10, 10000000000, 3500000000000));
+    catalog.create(
+        api::CatalogModelCreate { id: "fixture-a", has_recipe: true, recipe: "fixture-1" },
+    ) or discard;
+    catalog.create(
+        api::CatalogModelCreate { id: "fixture-b", has_recipe: true, recipe: "fixture-1" },
+    ) or discard;
+    let mut first = api::PlacementCreate { id: "tight-a", model: "fixture-a", account: "local" };
+    push(first.nodes, "tight") or discard;
+    let mut first_why = "";
+    let a = placements.create(first) or {
+        first_why = api::ctl_message(err);
+        blank()
+    };
+    std::test::assert_eq_str(a.id, "tight-a", "the first fits: " + first_why);
+    let mut second = api::PlacementCreate { id: "tight-b", model: "fixture-b", account: "local" };
+    push(second.nodes, "tight") or discard;
+    let mut why = "";
+    placements.create(second) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(
+            why,
+            "needs 5.6 GB of 4.4 GB for models (5.6 GB held by its other placements)",
+        ),
+        "the second does not, beside it: " + why,
+    );
+}
+
 fn main() {
     let store = st::MemoryStore { };
     let recipes = api::Recipes {
@@ -107,6 +203,16 @@ fn main() {
     );
     let read = placements.get(api::PlacementRef { placement: "on-spark" }) or blank();
     std::test::assert(read.variant == p.variant && count(read.fit) == 1, "it reads back");
+    // the fixture recipe does not say what a token costs: the context its
+    // memory was fitted for, and the variant's need, held
+    std::test::assert_eq_int(p.cache_tokens, 32768, "a cache of the fitted context");
+    std::test::assert_eq_int(p.reserved_bytes, 5600000000, "it holds its variant's need");
+    std::test::assert_eq_int(read.reserved_bytes, p.reserved_bytes, "and reads back what it holds");
+    std::test::assert(
+        std::str::contains(seat.config, "\"cache_tokens\": 32768"),
+        "its seat is told its cache",
+    );
+    cache_pool();
 
     let mut failed = "";
     let mut again = api::PlacementCreate { id: "twice", model: "fixture", account: "local" };
@@ -250,4 +356,5 @@ fn main() {
         kind: api::ModelKind::local,
     };
     std::test::assert_eq_str(removed.id, "fixture", "then the model can go");
+    held_room(store, catalog, placements, gb10);
 }

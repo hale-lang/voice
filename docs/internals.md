@@ -47,6 +47,13 @@ It is never read from the environment and never logged.
 when no api has yet; under Compose, `docker compose exec api voice-api
 admin-token`.
 
+Grafted, the habitat draws the token (hale.toml `[dna.secrets.operator-token]`)
+and hands the api its vault and the entry's name (`HALE_VAULT_DIR`,
+`HALE_SECRET_OPERATOR_TOKEN`): the api mints none and checks each request
+against the entry on the sealed side (`std::secret::Credential.matches`),
+read fresh each time, so a rotation needs no restart. `admin-token` then
+refuses and names `hale dna secret show operator-token`.
+
 A control-plane failure is a classed variant of `CtlError`
 ([`api/ctl.hl`](../api/ctl.hl)): `Invalid` 422, `NotFound` 404, `Conflict`
 409, `Unavailable` 503, named in the `Hale-Error-Class` header, the body the
@@ -258,6 +265,20 @@ hale test api
 A live call to every endpoint validates against the spec
 (`spec/validate`).
 
+
+### Peek
+
+A project or a key may **peek** (`peek` on either, set in its inspector): each
+request it sends is recorded whole, the standard request as it was served and
+the final response, reasoning included, when the request settles
+([`api/peek.hl`](../api/peek.hl)). A request is recorded when its project or
+its key peeks; admission decides it once. The operator reads recordings with
+`listPeeks` and `getPeek`; the admin UI shows a request's in its Usage inspector. Each is kept seven
+days, the older ones deleted as new ones are written. A recording's request
+and response are the JSON documents they were, as text, since they may be far
+larger than a JSON value on the typed surface holds. Off unless set: recording
+is the operator's choice per project or key, whatever its data class.
+
 ### The surface's bundle
 
 [`api/bundle/`](../api/bundle/) is `hale api export --surface Voice` of the
@@ -300,6 +321,42 @@ After a change, `npm run bundle -- --write` writes the gaps again; the diff
 is what to review. Friction met along the way is in
 [`FRICTION.md`](../FRICTION.md).
 
+### Tenants: the habitat's organisms
+
+Grafted into a habitat, voice is every organism's model backend
+(`[dna.provides.models]` in [`hale.toml`](../hale.toml)): an organism's legs
+call `/v1/chat/completions` and `/v1/models` with a key the habitat drew
+for it, a member of the `tenant-key` family in the vault it hands the api
+(`HALE_VAULT_DIR`, the members' prefix in `HALE_SECRET_TENANT_KEY_FAMILY`),
+labelled with the organism's name. No person mints those keys.
+
+A project is a caller. In a habitat (named by `HALE_DNA_HABITAT_NAME`), each
+is `<habitat>-<caller>`: the habitat's own infrastructure,
+`<habitat>-habitat`, whose accounts are what the habitat may spend (set as any
+project's, `PATCH /admin/v1/projects/<habitat>-habitat`; none until the
+operator gives it some), and each organism that uses models,
+`<habitat>-<organism>`, a child of it.
+
+A key the store does not know is compared, on the sealed side, with each
+member ([`api/tenants.hl`](../api/tenants.hl)), whose label is the caller:
+the organism's name, or `habitat` for the habitat's own. The first time a
+member calls, voice makes its project (the habitat's own, or the organism's,
+a child of it that **inherits** its accounts) and a key for it holding the
+digest of the key it presented. An inheriting child's accounts are read from
+its parent each time it is used, so a change reaches every one on its next
+call; an operator narrows one by giving its project accounts of its own, and
+sets it to inherit again. Its usage, limits and budget are its own. Each
+later call finds the key by its digest and holds it to the member again, so
+a removed member stops at once and a rotated one retires its old value at the
+first use of the new. Outside a habitat a caller is `tenant-<label>`, with no
+parent and no account until the operator gives it some.
+
+`/v1/models` answers what the caller could be served: a model is
+`available` when a seat on an account the key may spend serves it, and
+`voice.capabilities.tools` says whether such a seat carries `tools` to the
+model (an openai-compatible seat, or a managed one under llama-server; not
+under vLLM, which voice does not yet start with a tool-call parser).
+
 ## The node
 
 [`node/`](../node/) is voice's own node. It reads and checks its
@@ -329,8 +386,10 @@ heartbeats with the assignment version it applied. On NATS it takes
 `assign`, and answers `serve` at once with `accepted` or `refused`, then
 serves the request on its seat with the static engine, streaming the
 standard's events and the result to the reply subject the request named
-(`protocol.yaml`); a `cancel` stops it. It serves one request at a time,
-and refuses a `serve` that arrives meanwhile, so the request goes to
+(`protocol.yaml`); a `cancel` stops it. It serves several at once: each
+accepted `serve` goes to a slot of its own ([`node/serve.hl`](../node/serve.hl),
+eight, each its own thread), up to the node's cap and up to each seat's
+`concurrency`, and a `serve` past either is refused, so the request goes to
 another seat. Core NATS delivers an `assign` at most once, so a node reads
 its assignment each time it is on NATS again, and the api sends the
 assignment again to a node whose heartbeat says it is behind.
@@ -366,26 +425,24 @@ reaches the node over NATS. CI runs it (`end to end`).
 ## Running the process model
 
 [`compose.yaml`](../compose.yaml) runs voice as the MVP will: Postgres, NATS,
-the api, the brain and a node, each its own process, from one image built
-with hale's released toolchain ([`Dockerfile`](../Dockerfile)).
+the api and the brain, each its own process, from one image built with
+hale's released toolchain ([`Dockerfile`](../Dockerfile)). It runs no node:
+each is added on purpose and runs natively on its host, this machine
+included (docs/adding-a-node.md).
 
 ```sh
 docker compose up --build
 curl localhost:8080/healthz        # the api; see "The api" for a key
-curl localhost:8081/node/v1/status # the node's local API
 ```
 
 The api hands a node the NATS address in `--node-nats` (`NatsLink.place`),
-not the one it dials itself. In Compose it is `nats`, which resolves only in
-the Compose network; for a node on another machine, set `VOICE_NODE_HOST` to
+not the one it dials itself. In Compose it is `127.0.0.1`, where NATS is
+published, for a node on the same machine; for a node on another machine, set `VOICE_NODE_HOST` to
 the name that machine reaches this host by and `VOICE_NATS_BIND=0.0.0.0` to
 publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises, a host port other than 4222).
 
-The node `local` serves once it exists on the api and is started with its
-token: create it (`POST /admin/v1/nodes` with `{"id": "local"}`, under the
-operator token `docker compose exec api voice-api admin-token` prints), give it a
-seat, and restart it with `VOICE_ENROLLMENT_TOKEN=vn-... docker compose up
--d node`. The `migrate` service brings the schema up to date before the
+A node serves once it exists on the api and is started with its token
+(docs/adding-a-node.md). The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
 so it survives a restart of the api. The brain writes the route table to
 Postgres every second and tells NATS its new version.
@@ -964,6 +1021,6 @@ already there.
 
 | Deployment | Runs |
 |---|---|
-| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`, `node` |
+| MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`; each node native on its host |
 | Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine with logins |
 | Scaled out | `api` behind a load balancer, `brain` with a standby, `postgres`, `nats`, and `node` anywhere |

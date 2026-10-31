@@ -1,6 +1,6 @@
 import createClient, { type MaybeOptionalInit } from 'openapi-fetch';
 import type { PathsWithMethod, RequiredKeysOf } from 'openapi-typescript-helpers';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueries } from '@tanstack/react-query';
 import type { paths, components } from './schema';
 import { operatorToken, forgetOperatorToken } from './token';
 
@@ -59,6 +59,26 @@ export function useGet<P extends GetPaths>(path: P, ...init: InitParam<MaybeOpti
 }
 
 /**
+ * A typed GET of what never changes once written (a request's recording):
+ * read once, kept, never refetched, and a miss is not retried.
+ */
+export function useGetOnce<P extends GetPaths>(path: P, ...init: InitParam<MaybeOptionalInit<paths[P], 'get'>>) {
+  return useQuery({
+    queryKey: [path, init[0] ?? null],
+    queryFn: async () => {
+      const r = await api.GET(path, ...init);
+      if (r.error !== undefined || r.data === undefined) {
+        throw new Error(describe(r.error, r.response.status));
+      }
+      return r.data;
+    },
+    staleTime: Infinity,
+    refetchInterval: false,
+    retry: false,
+  });
+}
+
+/**
  * What a failure says. The control plane answers a class's variant,
  * `{"NotFound": {"code", "message"}}` (a transport refusal is
  * `{"refusal": {"kind", "reason"}}`); the data plane keeps the OpenAI-shaped
@@ -71,4 +91,57 @@ export function describe(error: unknown, status: number): string {
   if (problem?.message !== undefined) return problem.code ? `${problem.code}: ${problem.message}` : problem.message;
   if (refusal) return `${refusal.kind ?? 'refused'}: ${refusal.reason ?? ''}`;
   return `${status}`;
+}
+
+/** A request's recording, as `getPeek` answers it. */
+export type Peek = Schemas['Peek'];
+
+/**
+ * The recordings of `ids`, each read once and kept, as `useGetOnce` reads
+ * one (the same cache): a request not recorded is an error, not retried.
+ */
+export function usePeeks(ids: string[]) {
+  return useQueries({
+    queries: ids.map((id) => {
+      const init = { params: { path: { request_id: id } } };
+      return {
+        queryKey: ['/admin/v1/peeks/{request_id}', init] as const,
+        queryFn: async () => {
+          const r = await api.GET('/admin/v1/peeks/{request_id}', init);
+          if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+          return r.data;
+        },
+        staleTime: Infinity,
+        refetchInterval: false as const,
+        retry: false,
+      };
+    }),
+  });
+}
+
+/** Turns of one conversation read at most, newest first. */
+const TURNS_MAX = 2000;
+
+/**
+ * Every usage record `query` matches, oldest first, following the ledger's
+ * pages to at most `TURNS_MAX`. Its key is under `/admin/v1/usage`, so the
+ * event stream refreshes it as turns land.
+ */
+export function useAllUsage(query: { conversation?: string; metadata?: string[] }) {
+  return useQuery({
+    queryKey: ['/admin/v1/usage', { all: query }],
+    queryFn: async () => {
+      const out: UsageRecord[] = [];
+      let cursor: string | undefined;
+      let more = false;
+      do {
+        const r = await api.GET('/admin/v1/usage', { params: { query: { ...query, limit: 1000, ...(cursor ? { cursor } : {}) } } });
+        if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+        out.push(...r.data.data);
+        cursor = r.data.next_cursor ?? undefined;
+        more = !!cursor && out.length < TURNS_MAX;
+      } while (more);
+      return { turns: out.reverse(), truncated: !!cursor };
+    },
+  });
 }

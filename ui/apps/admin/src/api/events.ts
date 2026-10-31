@@ -12,6 +12,27 @@ export function subscribeAdminEvents(listener: (event: AdminEvent) => void): () 
   return () => { listeners.delete(listener); };
 }
 
+/** A request a seat is serving now, as the stream's `request` event says it. */
+export type Flight = Extract<AdminEvent, { type: 'request' }>['data'];
+
+// Every answer of the stream tells every request in flight then, so the
+// last answer's are the requests in flight: a request leaves when an answer
+// no longer tells it, however it ended (a usage row or none).
+let flights: Flight[] = [];
+const flightListeners = new Set<(f: Flight[]) => void>();
+
+/** The requests in flight, now and as each answer of the stream says. */
+export function subscribeFlights(listener: (f: Flight[]) => void): () => void {
+  flightListeners.add(listener);
+  listener(flights);
+  return () => { flightListeners.delete(listener); };
+}
+
+function setFlights(next: Flight[]) {
+  flights = next;
+  for (const l of flightListeners) l(flights);
+}
+
 /**
  * The admin event stream: each event names a resource that changed, and
  * the queries that show it are refetched. A `reset` refetches everything.
@@ -26,6 +47,9 @@ const AFFECTS: Record<string, string[]> = {
   account: ['/admin/v1/accounts', '/admin/v1/routes'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
   change: ['/admin/v1/changes'],
+  // a request a seat is serving: told to listeners (the Network view), no
+  // query changes until its usage is recorded
+  request: [],
 };
 
 /** One server-sent event: its `event`, `data` and `id`, and a `retry`. */
@@ -71,7 +95,17 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
         for (const listener of listeners) listener(event);
       } catch { /* A malformed event does not stop subsequent valid events. */ }
     };
+    // the requests this answer tells in flight
+    let answering: Flight[] = [];
     const dispatch = (e: Sse) => {
+      if (e.event === 'request') {
+        // told again by every answer while it runs: a set, never deduplicated
+        try {
+          const f = (JSON.parse(e.data) as AdminEvent).data as Flight;
+          if (typeof f?.id === 'string' && typeof f.seat === 'string' && typeof f.project === 'string') answering.push(f);
+        } catch { /* a malformed event does not stop the rest */ }
+        return;
+      }
       if (e.event === 'reset') { seen.clear(); receive(e.data); void qc.invalidateQueries(); return; }
       const keys = AFFECTS[e.event];
       if (!keys) return;
@@ -89,6 +123,10 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
           if (r.status === 401) { setState('closed'); forgetOperatorToken(); return; }
           if (!r.ok || !r.body) throw new Error(String(r.status));
           setState('open');
+          // an answer that resumes a place tells what is in flight; the first
+          // (no place yet) tells nothing of it, and is not taken as the set
+          const resumed = last !== null;
+          answering = [];
           const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
           let buffer = '';
           for (;;) {
@@ -104,6 +142,7 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
               if (e.data) dispatch(e);
             }
           }
+          if (resumed) setFlights(answering);
         } catch {
           if (stop.signal.aborted) return;
           setState('connecting');

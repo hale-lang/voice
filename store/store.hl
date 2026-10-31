@@ -87,6 +87,15 @@ type ProjectRow {
     created_at: Time = `1970-01-01T00:00:00Z`;
     archived: Bool = false;
     archived_at: Time = `1970-01-01T00:00:00Z`;
+    // the project this one is a child of ("" for none): a tenant's is its
+    // habitat's project (api/tenants.hl)
+    parent: String = "";
+    // its accounts are its parent's, read when it is used, not its own
+    inherits: Bool = false;
+    // each request it sends is recorded whole, prompt and output (peek.hl):
+    // its own setting when `peek_set`, else its parent's
+    peek_set: Bool = false;
+    peek: Bool = false;
     present: Bool = false;
 }
 
@@ -107,8 +116,46 @@ type KeyRow {
     last_used_at: Time = `1970-01-01T00:00:00Z`;
     revoked: Bool = false;
     revoked_at: Time = `1970-01-01T00:00:00Z`;
+    // each request it sends is recorded whole, prompt and output (peek.hl)
+    peek: Bool = false;
     present: Bool = false;
 }
+
+/// A request recorded whole, for a project or key that peeks: its standard
+/// request as served and its final response, each the JSON it was.
+type PeekRow {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    input: String = "";
+    output: String = "";
+    present: Bool = false;
+}
+
+/// Recorded requests, newest first: their bodies left out ("") when listed.
+type PeekRows { rows: bounded[PeekRow; 200]; }
+
+/// A request being served now: on which seat, since when (inference.hl). A
+/// row is written as each attempt is offered and gone once it ends; the
+/// admin event stream tells each new one (`request`), so a live view lights
+/// a request for as long as it runs. `seq` numbers them as written.
+type FlightRow {
+    seq: Int = 0;
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    seat: String = "";
+    account: String = "";
+    started_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type FlightRows { rows: bounded[FlightRow; 100]; }
+
+/// The days a recorded request is kept.
+const PEEK_DAYS: Int = 7;
 
 /// An `account` row, with its account-scope limits. `provider` "" is `null`.
 type AccountRow {
@@ -201,6 +248,8 @@ type SeatStateRow {
     has_progress: Bool = false;
     done_bytes: Int = 0;
     total_bytes: Int = 0;
+    // a managed seat's server's context, in tokens; 0 until it says
+    context: Int = 0;
     present: Bool = false;
 }
 
@@ -284,8 +333,8 @@ type UsageRow {
     present: Bool = false;
 }
 
-/// Which usage, newest first: of `project`, `key`, `account` and `model`
-/// (requested or served) where not "", with every `metadata` pair
+/// Which usage, newest first: of `project`, `key`, `account`, `model`
+/// (requested or served) and `conversation` where not "", with every `metadata` pair
 /// (`name=value`), in [from, to] where set, older than `cursor` (a row's
 /// `seq`) when above 0, at most `limit`.
 type UsageQuery {
@@ -293,6 +342,8 @@ type UsageQuery {
     key: String = "";
     model: String = "";
     account: String = "";
+    // the record's `conversation`
+    conversation: String = "";
     metadata: Names = Names { };
     has_from: Bool = false;
     from: Time = `1970-01-01T00:00:00Z`;
@@ -305,7 +356,9 @@ type UsageQuery {
 type UsageRows { rows: bounded[UsageRow; 1000]; more: Bool = false; }
 
 /// What the rows matching `q` add up to, grouped by `by`: any of
-/// project, key, model, account, seat, node, day, hour (`valid_group`).
+/// project, key, model, account, seat, node, conversation, day, hour
+/// (`valid_group`). The groups come most recently active first, at most
+/// `SUMMARY_GROUPS` of them.
 type UsageSummaryQuery {
     by: Names = Names { };
     q: UsageQuery = UsageQuery { };
@@ -320,14 +373,21 @@ type UsageGroup {
     output_tokens: Int = 0;
     price_micros: Int = 0;
     currency: String = "USD";
+    // the group's earliest and latest request, and the latest's id
+    first_at: Time = `1970-01-01T00:00:00Z`;
+    last_at: Time = `1970-01-01T00:00:00Z`;
+    last_request: String = "";
 }
 
 type UsageGroups { rows: bounded[UsageGroup; 1000]; }
 
+/// The most groups a summary answers: the most recently active.
+const SUMMARY_GROUPS: Int = 1000;
+
 /// True for a field a summary groups by.
 fn valid_group(f: String) -> Bool {
     return f == "project" || f == "key" || f == "model" || f == "account" || f == "seat"
-        || f == "node" || f == "day" || f == "hour";
+        || f == "node" || f == "conversation" || f == "day" || f == "hour";
 }
 
 /// The value of group field `f` in `r`.
@@ -340,9 +400,20 @@ fn group_value(r: UsageRow, f: String) -> String {
     if f == "account" { return r.account; }
     if f == "seat" { return r.seat; }
     if f == "node" { return r.node; }
+    if f == "conversation" { return conversation_of(r); }
     let t = std::time::iso8601(r.created_at);
     if f == "day" { return t[0..10] + "T00:00:00Z"; }
     return t[0..13] + ":00:00Z";
+}
+
+/// The conversation `r` was a turn of, "" when it names none (`null`).
+fn conversation_of(r: UsageRow) -> String {
+    let raw = std::str::trim(std::json::find_field_raw(r.record, "conversation"));
+    return if std::str::starts_with(raw, "\"") {
+        std::json::find_string_field(r.record, "conversation")
+    } else {
+        ""
+    };
 }
 
 /// True when `r` is one `q` asks for (all but the cursor and the limit).
@@ -351,6 +422,9 @@ fn usage_matches(r: UsageRow, q: UsageQuery) -> Bool {
     if len(q.key) > 0 && r.key != q.key { return false; }
     if len(q.account) > 0 && r.account != q.account { return false; }
     if len(q.model) > 0 && r.requested_model != q.model && r.served_model != q.model {
+        return false;
+    }
+    if len(q.conversation) > 0 && conversation_of(r) != q.conversation {
         return false;
     }
     let at = std::time::unix(r.created_at);
@@ -373,6 +447,8 @@ interface Store {
     /// to the write that follows it: on any api instance, a writer of the
     /// same resource waits, so the read is current and no update is lost.
     /// The write ends the hold; `let_go` ends one that wrote nothing.
+    /// `target` may name several, one a line, each held, in the order of
+    /// their names so two holders never wait on each other.
     fn hold(target: String) fallible(StoreError);
     fn let_go();
     /// True when the store answers.
@@ -467,6 +543,13 @@ interface Store {
     fn usage_rows(q: UsageQuery) -> UsageRows fallible(StoreError);
     /// Up to `limit` rows written after `seq`, oldest first.
     fn usage_after(seq: Int, limit: Int) -> UsageRows fallible(StoreError);
+    /// A request offered to a seat: its row written anew (a new `seq`).
+    fn put_flight(row: FlightRow) fallible(StoreError);
+    /// The request's attempt ended: its row gone.
+    fn drop_flight(request_id: String) fallible(StoreError);
+    /// Rows written after `seq`, oldest first, at most `limit`, started in
+    /// the last hour: a row an api left behind when it stopped is not one.
+    fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError);
     /// Totals over the matching rows, grouped.
     fn usage_summary(q: UsageSummaryQuery) -> UsageGroups fallible(StoreError);
 
@@ -479,6 +562,11 @@ interface Store {
     /// store answers to the same token. "" when none is kept and `fresh` is
     /// "".
     fn operator_token(fresh: String) -> String fallible(StoreError);
+
+    /// The habitat grant voice 0.1 kept (migration 13), as its JSON; "" when
+    /// none was set. Read once, to give the habitat's project its accounts
+    /// when that project is first made (api/tenants.hl).
+    fn habitat_grant() -> String fallible(StoreError);
 
     // ---- the fleet as reported (the node plane's writes; no change log)
 
@@ -496,6 +584,14 @@ interface Store {
     fn put_seat_state(row: SeatStateRow) fallible(StoreError);
     /// An account's provider windows, the JSON array an engine last
     /// reported, "" for none.
+    /// Record a request whole; those past `PEEK_DAYS` go.
+    fn put_peek(row: PeekRow) fallible(StoreError);
+    /// Recorded requests, newest first, at most `limit`: a project's (and a
+    /// key's, when `key` is not ""), all of them when `project` is "". Their
+    /// bodies are left out.
+    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError);
+    /// One recorded request whole; `present` false when there is none.
+    fn peek(request_id: String) -> PeekRow fallible(StoreError);
     fn windows(account: String) -> String fallible(StoreError);
     fn put_windows(account: String, json: String) fallible(StoreError);
 }
@@ -599,9 +695,15 @@ locus MemoryStore {
         beat_load: bounded[Int; 64];
         seat_state_rows: SeatStateTable = SeatStateTable { };
         window_rows: WindowTable = WindowTable { };
+        // recorded requests, newest first, the last 200 (peek.hl)
+        peek_rows: PeekRows = PeekRows { };
+        // requests being served now, and the last `seq` given one
+        flight_rows: FlightRows = FlightRows { };
+        flight_seq: Int = 0;
         // the operator token: a standalone api's is kept in its state
         // directory and handed in here (api/operator.hl)
         operator: String = "";
+        habitat_grant: String = "";
     }
 
     fn kind() -> String { return "memory"; }
@@ -1115,10 +1217,13 @@ locus MemoryStore {
         for f in s.by.items {
             if !valid_group(f) { fail StoreError { kind: "invalid", message: "no group " + f }; }
         }
-        let mut i = 0;
-        while i < self.usage_log.len() {
+        // newest first, so a group is first met at its latest request, the
+        // groups come most recently active first, and those past the cap
+        // are the least recent
+        let mut i = self.usage_log.len();
+        while i > 0 {
+            i = i - 1;
             let r = self.usage_log.get(i) or UsageRow { };
-            i = i + 1;
             if !usage_matches(r, s.q) { continue; }
             let mut g = "";
             for f in s.by.items {
@@ -1134,8 +1239,16 @@ locus MemoryStore {
                 n = n + 1;
             }
             if found < 0 {
-                push(out.rows, UsageGroup { group: g, currency: r.currency })
-                or fail StoreError { kind: "full", message: "a summary has at most 1000 groups" };
+                if count(out.rows) >= SUMMARY_GROUPS { continue; }
+                push(
+                    out.rows,
+                    UsageGroup {
+                        group: g,
+                        currency: r.currency,
+                        last_at: r.created_at,
+                        last_request: r.id,
+                    },
+                ) or discard;
                 found = count(out.rows) - 1;
             }
             let mut u = at(out.rows, found) or UsageGroup { };
@@ -1143,6 +1256,8 @@ locus MemoryStore {
             u.input_tokens = u.input_tokens + r.input_tokens;
             u.output_tokens = u.output_tokens + r.output_tokens;
             u.price_micros = u.price_micros + r.price_micros;
+            // read newest first: this is the earliest so far
+            u.first_at = r.created_at;
             set(out.rows, found, u) or discard;
         }
         return out;
@@ -1155,6 +1270,8 @@ locus MemoryStore {
         if len(self.operator) == 0 { self.operator = fresh; }
         return self.operator;
     }
+
+    fn habitat_grant() -> String fallible(StoreError) { return self.habitat_grant; }
 
     fn changes(q: ChangeQuery) -> ChangeRows fallible(StoreError) {
         let mut out = ChangeRows { };
@@ -1243,12 +1360,83 @@ locus MemoryStore {
             && cur.status == row.status
             && cur.reason == row.reason
             && cur.in_flight == row.in_flight
+            && cur.has_progress == row.has_progress
+            && cur.done_bytes == row.done_bytes
+            && cur.total_bytes == row.total_bytes
+            && cur.context == row.context
         {
             return;
         }
         let mut r = row;
         r.present = true;
         self.seat_state_rows.set(r);
+    }
+
+    fn put_flight(row: FlightRow) fallible(StoreError) {
+        self.flight_seq = self.flight_seq + 1;
+        let mut next = FlightRows { };
+        for held in self.flight_rows.rows {
+            if held.request_id != row.request_id && count(next.rows) < 99 {
+                push(next.rows, held) or discard;
+            }
+        }
+        let mut r = row;
+        r.seq = self.flight_seq;
+        push(next.rows, r) or discard;
+        self.flight_rows = next;
+    }
+
+    fn drop_flight(request_id: String) fallible(StoreError) {
+        let mut next = FlightRows { };
+        for held in self.flight_rows.rows {
+            if held.request_id != request_id { push(next.rows, held) or discard; }
+        }
+        self.flight_rows = next;
+    }
+
+    fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError) {
+        let mut out = FlightRows { };
+        for r in self.flight_rows.rows {
+            // one an api left behind when it stopped is not in flight
+            let fresh = std::time::unix(r.started_at) > std::time::unix(std::time::current())
+                - 3600;
+            if r.seq > seq && fresh && count(out.rows) < limit { push(out.rows, r) or discard; }
+        }
+        return out;
+    }
+
+    fn put_peek(row: PeekRow) fallible(StoreError) {
+        let mut next = PeekRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.peek_rows.rows {
+            if count(next.rows) < 200 && held.request_id != row.request_id {
+                push(next.rows, held) or discard;
+            }
+        }
+        self.peek_rows = next;
+    }
+
+    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+        let mut out = PeekRows { };
+        for r in self.peek_rows.rows {
+            if count(out.rows) >= limit { break; }
+            if (len(project) == 0 || r.project == project) && (len(key) == 0 || r.key == key) {
+                let mut listed = r;
+                listed.input = "";
+                listed.output = "";
+                push(out.rows, listed) or discard;
+            }
+        }
+        return out;
+    }
+
+    fn peek(request_id: String) -> PeekRow fallible(StoreError) {
+        for r in self.peek_rows.rows {
+            if r.request_id == request_id { return r; }
+        }
+        return PeekRow { };
     }
 
     fn windows(account: String) -> String fallible(StoreError) {

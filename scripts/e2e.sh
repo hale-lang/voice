@@ -93,7 +93,7 @@ fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
 # seconds
-HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" \
+HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
   api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
@@ -162,8 +162,24 @@ printf '%s\n' "$readings" | grep -qx 'voice_node_seat_up{seat="static",engine="s
 printf '%s\n' "$readings" | grep -q '^hale_process_' || { echo "the node's readings carry none of the runtime's own"; exit 1; }
 echo "laptop's readings say static is up"
 
+
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)
+
+# a served request's record carries the seat's own timing, to its first
+# output and to its end, which is what its throughput is read from; and the
+# node's readings count its tokens and time its generation
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage?limit=20" | python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin)["data"] if r["status"] == "served" and r["output_tokens"] > 0]
+assert rows, "no served request with output in the ledger"
+t = rows[0]["timing"]
+assert "first_output_ms" in t and "engine_ms" in t and t["engine_ms"] >= t["first_output_ms"] >= 0, t
+' || exit 1
+readings=$(curl -fsS "http://127.0.0.1:$READINGS_PORT/metrics")
+printf '%s\n' "$readings" | grep -qE '^voice_node_tokens_total\{seat="static",engine="static",kind="output"\} [1-9]' || { echo "the node's readings count no output tokens:"; printf '%s\n' "$readings" | grep '^voice_node'; exit 1; }
+printf '%s\n' "$readings" | grep -qE '^voice_node_generation_seconds_count\{seat="static",engine="static"\} [1-9]' || { echo "the node's readings time no generation:"; printf '%s\n' "$readings" | grep '^voice_node'; exit 1; }
+echo "a served request's record says its seat's timing, and the node's readings count its tokens"
 
 # the newest usage event on the organization's stream, as JSON
 last_event() {
@@ -196,6 +212,47 @@ assert e["requested_model"] == "echo-1" and e["seat"] == "laptop/static" and e["
 assert e["input_tokens"] > 0 and e["currency"] == "USD", e
 ' || { echo "the usage event is not as served"; nats_box stream get ZZORG 1 -j; exit 1; }
 echo "each served request is told to the organization ($told usage events on zzorg.app.voice.usage.recorded)"
+
+# an organism of voice's habitat (`e2e`) calls with the key the habitat drew
+# for it (a member of the tenant-key family, in the vault the api reads):
+# voice makes it a project, e2e-organism-a, a child of the habitat's own,
+# e2e-habitat, inheriting its accounts, none until the operator gives the
+# habitat some (api/tenants.hl)
+tenant_key=$(openssl rand -hex 16)
+printf '%s' "$tenant_key" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
+chmod 600 "$work/vault/secret-dna_e2e-tenant-key--organism-a"
+tenant() { curl -s -o "$work/tenant.out" -w '%{http_code}' "$api$1" -H "Authorization: Bearer $2" "${@:3}"; }
+[ "$(tenant /v1/models "$tenant_key")" = 200 ] || { echo "a tenant's key was refused on /v1/models: $(cat "$work/tenant.out")"; exit 1; }
+python3 - "$work/tenant.out" <<'PY' || exit 1
+import json, sys
+m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
+assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
+PY
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and not p.get("parent"), p' || { echo "the habitat's project is not as it should be"; exit 1; }
+code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
+[ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
+# the operator gives the habitat's project the account, once: the tenant is
+# served on its next call, its own project untouched
+ask_tenant() { tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}'; }
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" -H 'content-type: application/json' -d '{"accounts": ["static"]}' >/dev/null
+[ "$(ask_tenant)" = 200 ] || { echo "a tenant of a granted habitat was not served: $(cat "$work/tenant.out")"; exit 1; }
+# narrowed on its project to no account, it is not; set to inherit, it is again
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"accounts": []}' >/dev/null
+[ "$(ask_tenant)" != 200 ] || { echo "a tenant narrowed to no account was served"; exit 1; }
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
+[ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
+# renamed by the operator, it is still the tenant's: rotated, the old value
+# stops and the new one serves; removed, it stops
+tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
+curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys/$tkey" -H 'content-type: application/json' -d '{"name": "organism a"}' >/dev/null
+tenant_new=$(openssl rand -hex 16)
+printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
+[ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }
+[ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
+rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
+[ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
+echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
 
 # grafted: the nodes' account on the broker, as registration hands it over.
 # laptop serves only because it connected with it (the broker takes no
@@ -546,6 +603,33 @@ grep -q 'the enrollment token is in the open' "$work/node.log" || { echo "a node
 ! grep -q 'in the open' "$work/node2.log" || { echo "a node with its token in the vault warned"; exit 1; }
 echo "a node enrolled with its token from the vault; one given it in the open warned"
 echo "failed over from laptop/static to mini/steady in $ms ms"
+
+# the api serves its callers at once: two requests, each on a seat that
+# takes 3 s to its first output, are both served in about 3 s, one on each
+# node; served in turn they would take 6
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "from the laptop", "first_output_ms": 3000}}' >/dev/null
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "from the mini", "first_output_ms": 3000}}' >/dev/null
+for i in $(seq 1 100); do
+  [ "$(seat_status)" = "up" ] && [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/mini/seats/steady" | field status)" = "up" ] && break
+  sleep 0.2
+done
+t0=$(date +%s%N)
+responds >"$work/at-once-1.json" &
+first_pid=$!
+responds >"$work/at-once-2.json" &
+second_pid=$!
+wait $first_pid $second_pid
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+python3 - "$work/at-once-1.json" "$work/at-once-2.json" <<'PY' || { echo "two requests at once were not both served, one on each node"; cat "$work/at-once-1.json" "$work/at-once-2.json"; exit 1; }
+import json, sys
+seats = sorted(json.load(open(f))["voice"]["served"]["seat"] for f in sys.argv[1:])
+assert seats == ["laptop/static", "mini/steady"], seats
+PY
+[ "$ms" -lt 5500 ] || { echo "two requests at once took $ms ms: served in turn, not at once"; exit 1; }
+echo "two requests served at once, one on each node, in $ms ms"
+# laptop's seat fails again, as the failover left it, for what follows
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 8000}}' >/dev/null
+wait_for up
 
 # every seat fails: a 502 that names the request and every attempt
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/mini/seats/steady" -H 'content-type: application/json' -d '{"config": {"text": "never", "fail_after_ms": 100}}' >/dev/null

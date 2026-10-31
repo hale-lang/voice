@@ -66,11 +66,18 @@ locus Catalog {
                 );
             }
         }
+        // a model made from a recipe is as long as its weights are made for,
+        // unless the operator says otherwise
+        let mut context = m.context_length;
+        if m.has_recipe && context == 0 {
+            let r = self.recipes.get_in_gate(m.recipe) or raise;
+            context = r.context_length;
+        }
         let row = st::ModelRow {
             id: m.id,
             owned_by: if len(m.owned_by) > 0 { m.owned_by } else { "local" },
             kind: if m.has_kind { model_kind_name(m.kind) } else { "local" },
-            context_length: m.context_length,
+            context_length: context,
             max_output_tokens: m.max_output_tokens,
             priced: m.has_price,
             price: m.price,
@@ -211,6 +218,8 @@ locus Catalog {
         let mut v = catalog_view(r);
         let a = availability(self.store, r.id) or fail store_down(err);
         v.available = a.available;
+        v.has_served_context_length = a.context > 0;
+        v.served_context_length = a.context;
         for s in seats.rows {
             if seat_serves(s, r.id) { push(v.seats, s.ref) or discard; }
         }
@@ -226,12 +235,15 @@ locus Models {
     /// `listModels`.
     fn list(ctx: std::api::Context) -> ModelList fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let rows = self.store.models() or fail metering_failed(err);
         let mut out = ModelList { };
         for r in rows.rows {
             if !r.removed && visible(p, k, r.id) {
-                let v = model_with_seats(self.store, r) or fail metering_failed(err);
+                let v = model_for(self.store, r, spends_of(p, k)) or fail metering_failed(err);
                 push(out.data, v) or discard;
             }
         }
@@ -242,7 +254,10 @@ locus Models {
     /// does not exist.
     fn get(r: ModelRef, ctx: std::api::Context) -> Model fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let row = self.store.model(r.model) or fail metering_failed(err);
         if !row.present || row.removed || !visible(p, k, r.model) {
             fail ApiError {
@@ -254,7 +269,7 @@ locus Models {
                 param: "model",
             };
         }
-        return model_with_seats(self.store, row) or fail metering_failed(err);
+        return model_for(self.store, row, spends_of(p, k)) or fail metering_failed(err);
     }
 
     /// `getCapabilities`: the project and key, the models the key may
@@ -262,7 +277,10 @@ locus Models {
     /// any scope, and the project's budget.
     fn capabilities(ctx: std::api::Context) -> Capabilities fallible(ApiError) {
         let k = self.caller_key(ctx) or raise;
-        let p = self.store.project(k.project) or fail metering_failed(err);
+        let p = as_in_force(
+            self.store,
+            self.store.project(k.project) or fail metering_failed(err),
+        ) or fail metering_failed(err);
         let rows = self.store.models() or fail metering_failed(err);
         let mut out = Capabilities {
             project_id: p.id,
@@ -272,7 +290,7 @@ locus Models {
             has_budget: p.budgeted,
             budget: budget_view(p.budget, now_seconds())
         };
-        let spends = if k.accounts.any { p.accounts } else { k.accounts };
+        let spends = spends_of(p, k);
         out.has_accounts = !spends.any;
         out.accounts = spends.names.items;
         out.data_classes = p.data_classes.items;
@@ -302,6 +320,19 @@ locus Models {
         if !k.present { fail invalid_key(); }
         return k;
     }
+}
+
+/// The accounts a key may spend: those both it and its project allow (as
+/// serving holds them, inference.hl), its project's as in force, the
+/// habitat's grant for an inheriting tenant.
+fn spends_of(p: st::ProjectRow, k: st::KeyRow) -> st::Restriction {
+    if k.accounts.any { return p.accounts; }
+    if p.accounts.any { return k.accounts; }
+    let mut both = st::Restriction { any: false };
+    for n in k.accounts.names.items {
+        if allows(p.accounts, n) { push(both.names.items, n) or discard; }
+    }
+    return both;
 }
 
 /// True when the project and the key both let `model` through.
@@ -508,19 +539,43 @@ fn capabilities_json(c: Capabilities) -> String {
 
 /// Whether a model can be served now, and the data classes the seats that
 /// could serve it carry.
-type Availability { available: Bool = false; data_classes: bounded[String; 32]; }
+type Availability {
+    available: Bool = false;
+    tools: Bool = false;
+    // the least context, in tokens, a seat that could serve it took; 0 when
+    // none has said
+    context: Int = 0;
+    data_classes: bounded[String; 32];
+}
 
 /// A seat could serve `model` when it is enabled, spends an account that
 /// is not archived, and its node is up, not draining, has applied its
 /// assignment, reports it `up` and holds it by no local control.
 fn availability(store: st::Store, model: String) -> Availability fallible(st::StoreError) {
+    return availability_for(store, model, st::Restriction { }) or raise;
+}
+
+/// `availability`, counting only seats that spend an account in `spends`:
+/// what a caller whose key may spend those could be served by. With it,
+/// whether one of them carries a request's `tools` through to its model.
+@unbounded
+fn availability_for(
+    store: st::Store,
+    model: String,
+    spends: st::Restriction
+) -> Availability fallible(st::StoreError) {
     let seats = store.seats() or raise;
     let mut out = Availability { };
     for s in seats.rows {
-        if seat_serves(s, model) && s.enabled {
+        if seat_serves(s, model) && s.enabled && allows(spends, s.account) {
             let ready = seat_ready(store, s) or raise;
             if ready {
                 out.available = true;
+                let c = seat_context(store, s) or raise;
+                if c > 0 && (out.context == 0 || c < out.context) { out.context = c; }
+                if !out.tools {
+                    out.tools = seat_tools(store, s) or raise;
+                }
                 for dc in s.data_classes.items {
                     if !has_name(out.data_classes, dc) { push(out.data_classes, dc) or discard; }
                 }
@@ -530,10 +585,73 @@ fn availability(store: st::Store, model: String) -> Availability fallible(st::St
     return out;
 }
 
+/// The context, in tokens, seat `s`'s server took, as its node last
+/// reported; 0 when it has not said.
+fn seat_context(store: st::Store, s: st::SeatRow) -> Int fallible(st::StoreError) {
+    let states = store.seat_states(s.node) or raise;
+    for st in states.rows {
+        if st.seat == s.id { return st.context; }
+    }
+    return 0;
+}
+
 fn model_with_seats(store: st::Store, r: st::ModelRow) -> Model fallible(st::StoreError) {
+    return model_for(store, r, st::Restriction { }) or raise;
+}
+
+/// The model as a caller that may spend `spends` sees it: available when a
+/// seat it may spend serves it, with tools when one of those carries them.
+fn model_for(
+    store: st::Store,
+    r: st::ModelRow,
+    spends: st::Restriction
+) -> Model fallible(st::StoreError) {
     let mut v = model_view(r);
-    let a = availability(store, r.id) or raise;
+    let a = availability_for(store, r.id, spends) or raise;
     v.available = a.available;
+    v.tools = a.tools;
+    // what a caller can count on: the least any seat that could serve it
+    // took, never more than the model is made for
+    if a.context > 0 && (v.context_length == 0 || a.context < v.context_length) {
+        v.context_length = a.context;
+    }
     v.data_classes = a.data_classes;
     return v;
+}
+
+/// True when seat `s` carries a request's `tools` through to its model and
+/// back as tool calls: an openai-compatible engine passes them to its
+/// upstream; a managed seat under llama-server applies the model's own chat
+/// template, which knows its tools (b11913 uses Jinja by default), and one
+/// under vLLM does not until voice starts it with a tool-call parser; the
+/// static engine when its drill makes a call; the claude CLI answers text.
+fn seat_tools(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError) {
+    let f = store.fleet(s.node) or raise;
+    let kind = engine_kind_of(f.capabilities, s.engine);
+    if kind == "openai-compatible" { return true; }
+    if kind == "managed" {
+        let rt = std::json::find_field_raw(s.config, "runtime");
+        return std::json::find_string_field(rt, "server") == "llama-server";
+    }
+    if kind == "static" {
+        return std::str::starts_with(
+            std::str::trim(std::json::find_field_raw(s.config, "tool_call")),
+            "{",
+        );
+    }
+    return false;
+}
+
+/// The kind of the engine `engine` in a node's declared capabilities, ""
+/// when it declares none by that id.
+@bounded_by(capabilities)
+fn engine_kind_of(capabilities: String, engine: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "engines"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "id") == engine {
+            return std::json::find_string_field(it.element, "kind");
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
 }

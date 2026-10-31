@@ -11,9 +11,10 @@
 ///
 /// It makes no call to the api: those wait on the api, which serves its
 /// callers one at a time, and a session waiting there could not answer a
-/// `serve`. It serves one request at a time; a `serve` that arrives while
-/// it serves is refused at once, so the coordinator offers the request
-/// elsewhere.
+/// `serve`. It hands each `serve` it accepts to a slot of its own
+/// (serve.hl), so the node serves several at once: up to its cap, and up to
+/// each seat's concurrency. A `serve` past either is refused at once, so the
+/// coordinator offers the request elsewhere.
 ///
 /// What the admin API shows of it is in `<data>/session.json`.
 
@@ -42,13 +43,9 @@ locus Session {
         // each managed seat's fetch as the fetcher last told it (fetch.hl)
         fetches: FetchStates = FetchStates { };
         subscribed: Bool = false;
-        // the request being served, and whether it was cancelled
-        serving: String = "";
-        // the seat it is served on
+        // the requests being served, one a line: the slot, its seat and its
+        // request id, tab-separated (serve.hl)
         busy: String = "";
-        cancelled: Bool = false;
-        // monotonic ns of the last look at NATS while serving
-        looked: Int = 0;
         client: nats::NatsClient = nats::NatsClient { name: "voice-node" };
         // the seats' readings, scraped with the runtime's (readings.hl)
         readings: std::metrics::Registry = std::metrics::Registry { namespace: "voice_node" };
@@ -62,11 +59,14 @@ locus Session {
         subscribe LocalApplied as on_local;
         subscribe PlaneReport as on_plane;
         subscribe FetchUpdated as on_fetch;
+        subscribe ServeDone as on_done;
         publish SeatsApplied;
         publish FetchWanted;
         publish ManagedAssigned;
         publish NatsConnected;
         publish LoadChanged;
+        publish ServeJob;
+        publish ServeCancel;
     }
 
     run() {
@@ -84,7 +84,8 @@ locus Session {
         }
         if !self.client.connected || !self.subscribed { self.connect(); }
         if self.client.connected {
-            if self.client.read_msg(200ms) { self.on_message(); }
+            // short, so a slot freed (on the bus) is told soon
+            if self.client.read_msg(20ms) { self.on_message(); }
             std::time::sleep(1ms);
         } else {
             std::time::sleep(500ms);
@@ -251,6 +252,7 @@ locus Session {
                             s.total_bytes = f.total;
                         }
                         s.endpoint = f.endpoint;
+                        s.context = f.context;
                     }
                 }
                 set(next.items, i, s) or discard;
@@ -277,54 +279,23 @@ locus Session {
             if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
         } else if subject == self.subject + ".serve" {
             self.serve(body, self.client.last.reply);
+        } else if subject == self.subject + ".cancel" {
+            // to whichever slot serves it
+            ServeCancel <- ServeStop {
+                request_id: std::json::find_string_field(body, "request_id"),
+            };
         }
     }
 
-    /// While a request is served: the messages that arrived. A `cancel`
-    /// for it stops it, a `serve` is refused at once, an `assign` is
-    /// adopted.
-    fn interject() {
-        self.looked = std::time::monotonic_ns();
-        let mut n = 0;
-        while n < 16 && self.client.read_msg(1ms) {
-            n = n + 1;
-            let subject = self.client.last.subject;
-            let body = std::str::from_bytes(self.client.last.data);
-            if subject == self.subject + ".cancel" {
-                if std::json::find_string_field(body, "request_id") == self.serving {
-                    self.cancelled = true;
-                }
-            } else if subject == self.subject + ".serve" {
-                let ack = "{\"request_id\": " + q(std::json::find_string_field(body, "request_id"))
-                    + ", \"outcome\": \"refused\", \"reason\": \"the node is serving another request\"}";
-                self.client.pub_msg(
-                    self.client.last.reply,
-                    "",
-                    std::bytes::from_string(ack),
-                ) or discard;
-            } else if subject == self.subject + ".assign" {
-                let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
-                if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
-            }
-        }
-    }
-
-    /// Wait `ms`, in short slices that read what arrives meanwhile, until
-    /// the request is cancelled.
-    fn pause(ms: Int) {
-        let until = std::time::monotonic_ns() + ms * 1000000;
-        while !self.cancelled && std::time::monotonic_ns() < until {
-            let left = (until - std::time::monotonic_ns()) / 1000000;
-            std::time::sleep((if left > 50 { 50 } else if left > 0 { left } else { 0 }) * 1ms);
-            self.interject();
-        }
-    }
-
-    /// Answer a `serve` at once, then serve it on its seat.
+    /// Answer a `serve` at once: accepted, and handed to a free slot, or
+    /// refused.
+    @unbounded
     fn serve(msg: String, inbox: String) {
         let id = std::json::find_string_field(msg, "request_id");
         let reply_to = std::json::find_string_field(msg, "reply_to");
         let seat = seat_of(self.seats, std::json::find_string_field(msg, "seat"));
+        let cap = node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data));
+        let slots = if cap < SLOTS { cap } else { SLOTS };
         let mut refusal = "";
         if len(seat.id) == 0 {
             refusal = "no seat " + std::json::find_string_field(msg, "seat")
@@ -336,9 +307,17 @@ locus Session {
             && !seat_carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
         {
             refusal = "seat " + seat.id + " does not carry tools: its engine answers text only";
-        } else if node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data)) < 1 {
+        } else if cap < 1 {
             refusal = "the node takes no requests: its cap is 0";
+        } else if busy_count(self.busy) >= slots {
+            refusal = "the node is serving " + to_string(busy_count(self.busy))
+                + " requests, its most at once";
+        } else if seat_busy(self.busy, seat.id) >= seat.concurrency {
+            refusal = "seat " + seat.id + " is serving " + to_string(seat_busy(self.busy, seat.id))
+                + ", its most at once";
         }
+        let slot = if len(refusal) == 0 { free_slot(self.busy, slots) } else { -1 };
+        if len(refusal) == 0 && slot < 0 { refusal = "the node has no free slot"; }
         let ack = "{\"request_id\": " + q(id) + ", \"outcome\": "
             + (
                 if len(refusal) > 0 {
@@ -350,135 +329,38 @@ locus Session {
             + "}";
         self.client.pub_msg(inbox, "", std::bytes::from_string(ack)) or discard;
         if len(refusal) > 0 { return; }
-
-        self.serving = id;
-        self.busy = seat.id;
-        self.cancelled = false;
-        self.loaded();
-        self.looked = std::time::monotonic_ns();
-        let t0 = std::time::monotonic_ns();
-        let model = std::json::find_string_field(msg, "model");
-        let request = std::str::trim(std::json::find_field_raw(msg, "body"));
-        let mut first = -1;
-        let kind = engine_kind(self.capabilities, seat.engine);
-        let compat = kind == "openai-compatible" || kind == "managed";
-        // a managed seat is served by its own server, on loopback (run.hl)
-        let cc = if kind == "managed" {
-            compat_config(
-                "{\"base_url\": " + q(seat.endpoint) + ", \"model\": "
-                    + q(std::json::find_string_field(seat.config, "model")) + "}",
-            )
-        } else {
-            compat_config(seat.config)
+        self.busy = self.busy + to_string(slot) + "\t" + seat.id + "\t" + id + "\n";
+        ServeJob <- ServeWork {
+            slot: slot,
+            request_id: id,
+            reply_to: reply_to,
+            msg: msg,
+            seat: seat.id,
+            engine: seat.engine,
+            kind: engine_kind(self.capabilities, seat.engine),
+            config: seat.config,
+            endpoint: seat.endpoint,
+            nats_url: self.client.url,
+            nats_user: self.client.user,
+            nats_pass: self.client.pass,
         };
-        let cli = engine_kind(self.capabilities, seat.engine) == "claude-cli";
-        let mut run = StaticRun { };
-        if cli {
-            // the CLI's output is relayed as it arrives, like an http upstream's
-            let cr = claude_run_for(id, model, request, claude_config(seat.config));
-            cr.open();
-            while !cr.done && !self.cancelled {
-                let d = cr.next_data();
-                if len(d) > 0 {
-                    let lines = cr.feed(d);
-                    let lv = std::str::bytes_view(lines);
-                    let mut at = 0;
-                    while at < lv.n {
-                        let e = line_end(lv, at);
-                        let ev = std::str::slice(lv, at, e);
-                        at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
-                            first = (std::time::monotonic_ns() - t0) / 1000000;
-                        }
-                        self.client.pub_msg(
-                            reply_to + ".event",
-                            "",
-                            std::bytes::from_string(
-                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
-                                    + "}",
-                            ),
-                        ) or discard;
-                    }
-                }
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
-            }
-            run = cr.finish();
-        } else if compat {
-            // the upstream, http or https, is relayed as it arrives: each
-            // event leaves as soon as it is read
-            let up = upstream_over_wire(id, model, request, cc);
-            while !up.done && !self.cancelled {
-                let d = up.next_data();
-                if len(d) > 0 {
-                    let lines = up.feed(d);
-                    let lv = std::str::bytes_view(lines);
-                    let mut at = 0;
-                    while at < lv.n {
-                        let e = line_end(lv, at);
-                        let ev = std::str::slice(lv, at, e);
-                        at = e + 1;
-                        if first < 0 && std::str::contains(ev, "response.output_text.delta") {
-                            first = (std::time::monotonic_ns() - t0) / 1000000;
-                        }
-                        self.client.pub_msg(
-                            reply_to + ".event",
-                            "",
-                            std::bytes::from_string(
-                                "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
-                                    + "}",
-                            ),
-                        ) or discard;
-                    }
-                }
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
-            }
-            run = up.finish();
-        } else {
-            let engine_model = std::json::string_field(msg, "engine_model");
-            run = run_static(
-                id,
-                model,
-                if engine_model.kind == "string" { engine_model.text } else { model },
-                request,
-                static_config(seat.config),
+        self.loaded();
+    }
+
+    /// A slot is free again: its request is read out, and the load told.
+    @unbounded
+    fn on_done(d: ServeReport) {
+        self.busy = busy_without(self.busy, d.slot);
+        if d.ok {
+            self.read_run(
+                d.seat,
+                d.engine,
+                d.input_tokens,
+                d.output_tokens,
+                d.first_ms,
+                d.elapsed_ms,
             );
         }
-        let v = std::str::bytes_view(run.script);
-        let mut start = 0;
-        while start < v.n && !self.cancelled {
-            let at = line_end(v, start);
-            let line = std::str::slice(v, start, at);
-            start = at + 1;
-            if std::str::starts_with(line, "pause ") {
-                self.pause(std::str::parse_int(line[6..len(line)]) or 0);
-            } else {
-                if first < 0 && std::str::contains(line, "response.output_text.delta") {
-                    first = (std::time::monotonic_ns() - t0) / 1000000;
-                }
-                self.client.pub_msg(
-                    reply_to + ".event",
-                    "",
-                    std::bytes::from_string(
-                        "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}",
-                    ),
-                ) or discard;
-                // a look costs up to a millisecond when nothing waits, so
-                // a run of events looks every 50 ms, not after each
-                if std::time::monotonic_ns() - self.looked > 50000000 { self.interject(); }
-            }
-        }
-        let elapsed = (std::time::monotonic_ns() - t0) / 1000000;
-        let result = if self.cancelled {
-            cancelled_result(id)
-        } else if run.outcome == "failed" {
-            failed_result(id, "engine_failed", run.failure, true)
-        } else {
-            result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
-        };
-        self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
-        self.serving = "";
-        self.busy = "";
-        self.cancelled = false;
         self.loaded();
     }
 
@@ -486,7 +368,7 @@ locus Session {
     /// status, say so.
     fn loaded() {
         LoadChanged <- Load {
-            in_flight: if len(self.busy) > 0 { 1 } else { 0 },
+            in_flight: busy_count(self.busy),
             states: states_json(self.seats, self.busy),
         };
         self.report();
@@ -512,10 +394,46 @@ locus Session {
             + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
             + ", \"max_in_flight\": "
             + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local))
-            + ", \"in_flight\": " + (if len(self.busy) > 0 { "1" } else { "0" }) + ", \"seats\": "
+            + ", \"in_flight\": " + to_string(busy_count(self.busy)) + ", \"seats\": "
             + status_seats(self.assignment, self.seats, self.busy) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
         self.read_out();
+    }
+
+    /// A run a seat finished, in its readings: the tokens it read and
+    /// wrote, and how long it generated, from its first output to its end
+    /// (readings.hl), so a seat's throughput is the one over the other.
+    fn read_run(
+        seat: String,
+        engine: String,
+        input: Int,
+        output: Int,
+        first_ms: Int,
+        elapsed_ms: Int
+    ) {
+        let l = std::metrics::labels_two("seat", seat, "engine", engine);
+        seat_tokens(self.readings, l, "input", input);
+        // output is counted with the time it took, so the two cover the same
+        // runs and their ratio is the seat's throughput
+        if output > 0 && first_ms >= 0 && elapsed_ms >= first_ms {
+            seat_tokens(self.readings, l, "output", output);
+            std::metrics::histogram(
+                self.readings,
+                "generation_seconds",
+                GENERATION_BOUNDS,
+                l,
+            ).observe(
+                std::math::int_to_float(elapsed_ms - first_ms) / 1000.0,
+            );
+            std::metrics::histogram(
+                self.readings,
+                "first_output_seconds",
+                GENERATION_BOUNDS,
+                l,
+            ).observe(
+                std::math::int_to_float(first_ms) / 1000.0,
+            );
+        }
     }
 
     /// The seats' readings, as `report` says them: each seat up or not,
@@ -529,7 +447,7 @@ locus Session {
             push(now.items, ReadSeat { id: s.id, engine: s.engine }) or discard;
             let l = std::metrics::labels_two("seat", s.id, "engine", s.engine);
             seat_reading(self.readings, "seat_up", l, if s.status == "up" { 1 } else { 0 });
-            seat_reading(self.readings, "seat_in_flight", l, if s.id == self.busy { 1 } else { 0 });
+            seat_reading(self.readings, "seat_in_flight", l, seat_busy(self.busy, s.id));
             if s.managed {
                 seat_reading(self.readings, "seat_fetch_done_bytes", l, s.done_bytes);
                 seat_reading(self.readings, "seat_fetch_total_bytes", l, s.total_bytes);
@@ -560,10 +478,20 @@ fn status_seats(assignment: String, seats: NodeSeats, busy: String) -> String {
         out.append_str(
             s[0..(len(s) - 1)] + ", \"status\": " + q(st.status) + ", \"reason\": "
                 + (if len(st.reason) > 0 { q(st.reason) } else { "null" }) + ", \"in_flight\": "
-                + (if st.id == busy { "1" } else { "0" }) + "}",
+                + to_string(seat_busy(busy, st.id)) + "}",
         );
         it = std::json::array_next(it);
     }
     let b = out.snapshot() or b"";
     return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// True when `event` is output: by its own `type`, text, a tool call's
+/// arguments or a refusal, as the api reads it too (api/stream.hl,
+/// `output_event`), never by what its payload or the caller's metadata
+/// says. The first is when the seat began to generate.
+fn is_output(event: String) -> Bool {
+    let kind = std::json::find_string_field(event, "type");
+    return kind == "response.output_text.delta" || kind == "response.function_call_arguments.delta"
+        || kind == "response.refusal.delta" || kind == "response.reasoning.delta";
 }

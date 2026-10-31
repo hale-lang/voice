@@ -26,8 +26,12 @@ export function useWrite() {
     setError(null);
     setPending(null);
     try {
-      const fn = { post: api.POST, put: api.PUT, patch: api.PATCH, delete: api.DELETE }[method] as (p: P, ...i: typeof init) => Promise<{ data?: unknown; error?: unknown; response: Response }>;
-      const r = await fn(path, ...init);
+      const fn = { post: api.POST, put: api.PUT, patch: api.PATCH, delete: api.DELETE }[method] as (p: P, ...i: unknown[]) => Promise<{ data?: unknown; error?: unknown; response: Response }>;
+      // a write with no body goes with `{}` as JSON: hale's REST guard
+      // refuses a bodiless write from an origin it does not answer CORS
+      // for, which the admin UI is when the habitat serves it at another
+      const given = (init[0] ?? {}) as Record<string, unknown>;
+      const r = await fn(path, 'body' in given ? given : { ...given, body: {} });
       if (r.error !== undefined) {
         setError(describe(r.error, r.response.status));
         return null;

@@ -97,6 +97,9 @@ type SeatRead {
     // a managed seat's fetch, as its node last reported it
     has_progress: Bool = false;
     progress: FetchProgress = FetchProgress { };
+    // a managed seat's server's context, in tokens, as its node last said
+    has_context: Bool = false;
+    context: Int = 0;
     problems: bounded[String; 8];
 }
 
@@ -123,6 +126,9 @@ type SeatView {
     in_flight: Int = 0;
     has_progress: Bool = false;
     progress: FetchProgress = FetchProgress { };
+    // a managed seat's server's context, in tokens, as its node last said
+    has_context: Bool = false;
+    context: Int = 0;
     problems: bounded[String; 8];
 }
 
@@ -677,6 +683,7 @@ locus Seats {
             push(row.data_classes.items, "internal") or discard;
         }
         self.check(row) or raise;
+        check_placed(row) or raise;
         let held = self.store.seats() or fail store_down(err);
         let mut on_node = 0;
         for s in held.rows {
@@ -725,6 +732,7 @@ locus Seats {
         if u.has_enabled { row.enabled = u.enabled; }
         if u.has_config { row.config = config_text(u.config, false) or raise; }
         self.check(row) or raise;
+        if u.has_serves || u.has_config { check_placed(row) or raise; }
         let after = seat_view(self.store, row, n) or raise;
         self.store.update_seat(
             row,
@@ -791,6 +799,27 @@ locus Seats {
     }
 }
 
+/// A seat a placement made runs that model's weights and serves that model
+/// alone (placements.hl); another model is served by a placement of its
+/// own. Held when a seat is made and when its models or config change, so a
+/// seat kept from before can still be disabled or repaired.
+fn check_placed(s: st::SeatRow) -> Bool fallible(CtlError) {
+    let placed = std::json::find_string_field(s.config, "placement");
+    if len(placed) > 0 {
+        let model = std::json::find_string_field(s.config, "model");
+        let one = at(s.serves.items, 0) or st::SeatModel { };
+        if count(s.serves.items) != 1 || one.model != model {
+            fail bad(
+                "seat " + s.id + " is placement " + placed + "'s, and serves its model, "
+                    + model
+                    + ", alone: place another model to serve it",
+                "serves",
+            );
+        }
+    }
+    return true;
+}
+
 /// Stored JSON as a `std::json::Value`, for an answer that must carry one
 /// (the surface's typed rows). A value holds at most 64 KiB and 64 levels;
 /// stored JSON past that is never replaced by `null`: it is an error naming
@@ -823,6 +852,8 @@ fn seat_view_of(r: SeatRead) -> SeatView fallible(CtlError) {
         in_flight: r.in_flight,
         has_progress: r.has_progress,
         progress: r.progress,
+        has_context: r.has_context,
+        context: r.context,
     };
     v.serves = r.serves;
     v.data_classes = r.data_classes;
@@ -912,6 +943,8 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatRead falli
                         done_bytes: st.done_bytes,
                         total_bytes: st.total_bytes,
                     };
+                    v.has_context = st.context > 0;
+                    v.context = st.context;
                 }
             }
         }
@@ -1051,7 +1084,8 @@ fn seat_json(s: SeatRead) -> String {
                 + to_string(s.progress.total_bytes) + "}"
         } else {
             ""
-        }) + ", \"in_flight\": "
+        }) + (if s.has_context { ", \"context\": " + to_string(s.context) } else { "" })
+        + ", \"in_flight\": "
         + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
 }
 

@@ -606,3 +606,115 @@ alter table seat_state add constraint seat_state_status_check
   check (status in ('starting', 'fetching', 'up', 'down', 'disabled', 'paused', 'refused'));
 alter table seat_state add column done_bytes bigint, add column total_bytes bigint;
 ```
+
+### Migration 12: tenant defaults
+
+What voice creates a tenant's project with, when an organism of its habitat
+first calls it with the key the habitat drew for it (api/tenants.hl): the
+`TenantDefaults` the operator last set (`PUT /admin/v1/tenants/defaults`).
+No row means none was set: a tenant may spend no account until the
+operator sets the defaults or grants its project accounts.
+
+```sql
+create table tenant_defaults (
+  id    boolean primary key default true check (id),
+  body  jsonb not null
+);
+```
+
+### Migration 13: the habitat's grant, inherited live
+
+The habitat is voice's customer: the operator says once what it may spend,
+its grant (`PUT /admin/v1/habitat`, the Habitat screen), and each tenant
+inherits it when it is used, until the operator narrows that tenant on its
+own project. The tenant defaults of migration 12, copied into a tenant at
+its first call, become the grant; a tenant voice made that holds no account
+of its own (a key it created, prefix `tenant`) now inherits; one that got
+accounts copied keeps them, narrowed, until set to inherit.
+
+```sql
+alter table tenant_defaults rename to habitat_grant;
+alter table project add column inherits boolean not null default false;
+update project p set inherits = true
+  where p.accounts = '{}'
+    and exists (select 1 from api_key k where k.project = p.id and k.prefix = 'tenant');
+```
+
+### Migration 14: a project's parent
+
+The habitat is a project like any customer, `habitat-<name>`, and each of
+its organisms' tenants a child of it, inheriting its accounts live until an
+operator narrows it. The api makes the habitat's project the first time it
+knows the habitat's name (`HALE_DNA_HABITAT_NAME`), with migration 13's grant
+as its accounts, and makes it the parent of every inheriting tenant that has
+none; migration 13's table is read for that alone.
+
+```sql
+alter table project add column parent text references project;
+```
+
+### Migration 15: the context a seat serves
+
+A managed seat's server reports the context, in tokens, it took once it
+answers (`SeatState.context` in the protocol); the seat's state keeps it,
+null until it says.
+
+```sql
+alter table seat_state add column context integer;
+```
+
+### Migration 16: peek
+
+A project or a key may peek: each request it sends is recorded whole, its
+standard request as served and its final response, for the operator to read
+(`/admin/v1/peeks`). A recording is kept seven days.
+
+```sql
+alter table project add column peek boolean not null default false;
+alter table api_key add column peek boolean not null default false;
+create table peek (
+  request_id text primary key,
+  project text not null references project,
+  key text not null,
+  model text not null,
+  created_at timestamptz not null,
+  input text not null,
+  output text not null
+);
+create index peek_by_project on peek (project, created_at desc);
+```
+
+### Migration 17: peek follows the parent
+
+A project's `peek` is its own setting or, null, its parent's, read when a
+request is admitted: one setting on a habitat's project covers every caller
+under it, made since or yet to be, unless one sets its own. What was stored
+`false` becomes null, still off for a project of its own.
+
+```sql
+alter table project alter column peek drop not null;
+alter table project alter column peek drop default;
+update project set peek = null where peek = false;
+```
+
+### Migration 18: requests in flight
+
+A request offered to a seat has a row for as long as that attempt runs,
+written anew for each attempt; the admin event stream tells each new row as
+a `request` event, so a live view keeps a request lit until its usage is
+recorded. A row an api left behind (it stopped mid-request) is only ever
+read for its `seq`, and is gone when the same request id is written again.
+
+```sql
+create table in_flight (
+  seq bigserial not null,
+  request_id text primary key,
+  project text not null,
+  key text not null,
+  model text not null,
+  seat text not null,
+  account text not null,
+  started_at timestamptz not null
+);
+create index in_flight_by_seq on in_flight (seq);
+```

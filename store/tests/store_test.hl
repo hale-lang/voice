@@ -577,8 +577,9 @@ fn spent(
         served: "{\"model\": \"" + model + "\", \"node\": \"" + node + "\", \"seat\": \"" + seat
             + "\", \"account\": \"" + account + "\"}",
         record: "{\"id\": \"" + id + "\", \"project\": \"" + project
-            + "\", \"metadata\": {\"batch\": \"" + (if project == "work" { "a" } else { "b" })
-            + "\"}}"
+            + "\", \"conversation\": " + (if project == "work" { "\"c1\"" } else { "null" })
+            + ", \"metadata\": {\"batch\": \"" + (if project == "work" { "a" } else { "b" })
+            + "\", \"conversation\": \"c9\"}}"
     };
 }
 
@@ -660,6 +661,16 @@ fn ledger(s: st::Store, label: String) {
         label + ": by metadata",
     );
     std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { conversation: "c1" }) or st::UsageRows { }),
+        "u2 u1",
+        label + ": by conversation",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { conversation: "c9" }) or st::UsageRows { }),
+        "",
+        label + ": the record's own, not one its metadata names",
+    );
+    std::test::assert_eq_str(
         ids(
             s.usage_rows(
                 st::UsageQuery {
@@ -692,25 +703,25 @@ fn ledger(s: st::Store, label: String) {
     let by_project = s.usage_summary(st::UsageSummaryQuery { by: names("project", "") })
     or st::UsageGroups { };
     std::test::assert_eq_int(count(by_project.rows), 2, label + ": two projects");
-    let work = at(by_project.rows, 0) or st::UsageGroup { };
+    let work = at(by_project.rows, 1) or st::UsageGroup { };
     std::test::assert_eq_str(
         work.group,
         "{\"project\": \"work\"}",
-        label + ": a group is its fields",
+        label + ": a group is its fields, the most recently active first",
     );
     std::test::assert(
         work.requests == 2 && work.input_tokens == 30 && work.output_tokens == 11
             && work.price_micros == 300 && work.currency == "USD",
         label + ": totals of a group",
     );
-    let play = at(by_project.rows, 1) or st::UsageGroup { };
+    let play = at(by_project.rows, 0) or st::UsageGroup { };
     std::test::assert(play.requests == 1 && play.price_micros == 5, label + ": and of the next");
     let by_day = s.usage_summary(
         st::UsageSummaryQuery { by: names("day", "") },
     ) or st::UsageGroups { };
     std::test::assert_eq_int(count(by_day.rows), 2, label + ": two days");
     std::test::assert_eq_str(
-        (at(by_day.rows, 0) or st::UsageGroup { }).group,
+        (at(by_day.rows, 1) or st::UsageGroup { }).group,
         "{\"day\": \"2026-10-17T00:00:00Z\"}",
         label + ": a day is its start",
     );
@@ -718,7 +729,7 @@ fn ledger(s: st::Store, label: String) {
         st::UsageSummaryQuery { by: names("hour", "") },
     ) or st::UsageGroups { };
     std::test::assert_eq_str(
-        (at(by_hour.rows, 0) or st::UsageGroup { }).group,
+        (at(by_hour.rows, 1) or st::UsageGroup { }).group,
         "{\"hour\": \"2026-10-17T10:00:00Z\"}",
         label + ": and an hour",
     );
@@ -733,6 +744,30 @@ fn ledger(s: st::Store, label: String) {
         (at(two.rows, 0) or st::UsageGroup { }).group,
         "{\"node\": \"laptop\", \"seat\": \"laptop/static\"}",
         label + ": by two fields",
+    );
+    let turns = s.usage_summary(st::UsageSummaryQuery { by: names("conversation", "") })
+    or st::UsageGroups { };
+    std::test::assert_eq_int(
+        count(turns.rows),
+        2,
+        label + ": a conversation, and requests of none",
+    );
+    let c1 = at(turns.rows, 1) or st::UsageGroup { };
+    std::test::assert(
+        c1.group == "{\"conversation\": \"c1\"}" && c1.requests == 2 && c1.input_tokens == 30,
+        label + ": a conversation's turns, summed",
+    );
+    std::test::assert(
+        std::time::iso8601(c1.first_at) == "2026-10-17T10:15:00Z"
+            && std::time::iso8601(c1.last_at) == "2026-10-17T10:45:00Z" && c1.last_request == "u2",
+        label + ": from its first turn to its last, the last named: "
+            + std::time::iso8601(c1.first_at) + " " + std::time::iso8601(c1.last_at) + " "
+            + c1.last_request,
+    );
+    std::test::assert_eq_str(
+        (at(turns.rows, 0) or st::UsageGroup { }).group,
+        "{\"conversation\": \"\"}",
+        label + ": requests of no conversation, together",
     );
     let bad = s.usage_summary(st::UsageSummaryQuery { by: names("colour", "") })
     or st::UsageGroups { };
@@ -757,6 +792,43 @@ fn operator(s: st::Store, label: String) {
         s.operator_token("") or "",
         "va-one",
         label + ": and so does a reader",
+    );
+}
+
+/// More groups than a summary answers: the most recently active are kept.
+fn crowded(s: st::Store, label: String) {
+    let mut i = 0;
+    while i < 1002 {
+        s.insert_usage(
+            spent(
+                "c" + to_string(i),
+                "2026-10-20T10:00:00Z",
+                "crowd",
+                "k" + to_string(i),
+                "echo-1",
+                "laptop",
+                "static",
+                1,
+                1,
+                0,
+            ),
+        )
+        or discard;
+        i = i + 1;
+    }
+    let g = s.usage_summary(
+        st::UsageSummaryQuery { by: names("key", ""), q: st::UsageQuery { project: "crowd" } },
+    ) or st::UsageGroups { };
+    std::test::assert_eq_int(count(g.rows), 1000, label + ": at most 1000 groups");
+    std::test::assert_eq_str(
+        (at(g.rows, 0) or st::UsageGroup { }).group,
+        "{\"key\": \"k1001\"}",
+        label + ": the newest first",
+    );
+    std::test::assert_eq_str(
+        (at(g.rows, 999) or st::UsageGroup { }).group,
+        "{\"key\": \"k2\"}",
+        label + ": the least recent left out",
     );
 }
 
@@ -819,6 +891,7 @@ fn main() {
     );
     exercise(st::MemoryStore { }, "memory");
     ledger(st::MemoryStore { }, "memory");
+    crowded(st::MemoryStore { }, "memory");
     bounded(st::MemoryStore { }, "memory");
     operator(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
@@ -830,6 +903,8 @@ fn main() {
     exercise(pg, "postgres");
     pg.conn.exec("TRUNCATE usage RESTART IDENTITY");
     ledger(pg, "postgres");
+    pg.conn.exec("TRUNCATE usage RESTART IDENTITY");
+    crowded(pg, "postgres");
     pg.conn.exec(
         "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
     );

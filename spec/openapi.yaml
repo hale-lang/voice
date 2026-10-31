@@ -958,6 +958,7 @@ paths:
         - $ref: '#/components/parameters/KeyFilter'
         - $ref: '#/components/parameters/ModelFilter'
         - $ref: '#/components/parameters/AccountFilter'
+        - $ref: '#/components/parameters/ConversationFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -992,9 +993,10 @@ paths:
       summary: Summarise usage, grouped
       description: |
         Totals of requests, tokens and spend, grouped by any of project, key,
-        model, account, seat, node and time bucket. The tracking view: what
-        each project and each of its keys spent over a period, and which
-        account paid for it.
+        model, account, seat, node, conversation and time bucket. The
+        tracking view: what each project and each of its keys spent over a
+        period, and which account paid for it. Groups come most recently
+        active first: at most 1000, the least recent left out.
       security:
         - operatorToken: []
       parameters:
@@ -1008,12 +1010,13 @@ paths:
             minItems: 1
             items:
               type: string
-              enum: [project, key, model, account, seat, node, day, hour]
+              enum: [project, key, model, account, seat, node, conversation, day, hour]
           example: [project, account]
         - $ref: '#/components/parameters/ProjectFilter'
         - $ref: '#/components/parameters/KeyFilter'
         - $ref: '#/components/parameters/ModelFilter'
         - $ref: '#/components/parameters/AccountFilter'
+        - $ref: '#/components/parameters/ConversationFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -1054,6 +1057,73 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UsageRecord'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/peeks:
+    get:
+      tags: [usage]
+      operationId: listPeeks
+      summary: List recorded requests
+      description: |
+        The requests recorded whole for a project or key that peeks, newest
+        first, without their bodies (`getPeek`). Kept seven days.
+      security:
+        - operatorToken: []
+      parameters:
+        - name: project
+          in: query
+          schema: { type: string }
+        - name: key
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+      responses:
+        '200':
+          description: Recorded requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PeekSummary' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/peeks/{request_id}:
+    get:
+      tags: [usage]
+      operationId: getPeek
+      summary: Get a recorded request whole
+      security:
+        - operatorToken: []
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The request as it was served and its final response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Peek'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -2148,7 +2218,7 @@ paths:
             type: array
             items:
               type: string
-              enum: [node, seat, account, usage, change]
+              enum: [node, seat, account, usage, change, request]
         - name: Last-Event-ID
           in: header
           required: false
@@ -2503,7 +2573,7 @@ components:
     projectKey:
       type: http
       scheme: bearer
-      description: "A project key, presented as `Authorization: Bearer vk-...`."
+      description: "A project key, presented as `Authorization: Bearer vk-...`; or, from an organism of voice's habitat, the key the habitat drew for it, which voice makes a project of its own, `tenant-<organism>`, a child of the habitat's project, `habitat-<name>`, that inherits its accounts."
     enrollmentToken:
       type: http
       scheme: bearer
@@ -2595,6 +2665,11 @@ components:
       schema:
         type: array
         items: { type: string }
+    ConversationFilter:
+      name: conversation
+      in: query
+      description: Only the turns of this conversation (`UsageRecord.conversation`).
+      schema: { type: string }
     MetadataFilter:
       name: metadata
       in: query
@@ -2786,8 +2861,10 @@ components:
 
     ProjectIdValue:
       type: string
-      pattern: '^[a-z0-9][a-z0-9-]{0,62}$'
-      description: Chosen at creation, stable forever, never reused.
+      pattern: '^[a-z0-9][a-z0-9-]{0,126}$'
+      description: |
+        Chosen at creation, stable forever, never reused. Up to 127, room for
+        a habitat's caller, `<habitat>-<caller>`.
       examples: [personal, work]
 
     AccountIdValue:
@@ -2881,6 +2958,22 @@ components:
         load_ms:
           type: integer
           description: Time spent fetching or loading weights before serving; 0 when warm.
+        first_output_ms:
+          type: integer
+          minimum: 0
+          description: |
+            From the seat receiving the request to its first output, as its
+            node measured it: what the seat spent before it began to
+            generate (reading the prompt, a cold start). Present when the
+            seat produced output.
+        engine_ms:
+          type: integer
+          minimum: 0
+          description: |
+            From the seat receiving the request to its result, as its node
+            measured it. Generation is `engine_ms - first_output_ms`, and the
+            seat's throughput `output_tokens` over that. Present with
+            `first_output_ms`.
 
     Attempt:
       type: object
@@ -2992,6 +3085,14 @@ components:
                 properties:
                   type: { type: string, examples: [text, image_url] }
         name: { type: string }
+        reasoning_content:
+          type: string
+          description: |
+            An answer's: the model's thinking before it, when it thought
+            (llama-server's and vLLM's `reasoning_content`; on `/v1/responses`
+            a `reasoning` output item). A stream carries it as
+            `delta.reasoning_content`. An answer whose output cap ran out while
+            it thought has its thinking and finish reason `length`.
         tool_calls:
           type: array
           items: { type: object }
@@ -3027,6 +3128,14 @@ components:
               maxItems: 4
         seed: { type: integer }
         n: { type: integer, const: 1 }
+        prompt_cache_key:
+          type: string
+          description: |
+            One value per conversation, the same on each of its turns (as on
+            `/v1/responses`). Voice sends a conversation to the same seat each
+            turn when several serve its model, so the seat's prompt cache holds
+            what it said and a turn reads only what it added. A routing key,
+            never a secret or user data; leave it out for one-shot calls.
         stream: { type: boolean, default: false }
         stream_options:
           type: object
@@ -3148,7 +3257,12 @@ components:
             kind:
               type: string
               enum: [local, hosted]
-            context_length: { type: integer }
+            context_length:
+              type: integer
+              description: |
+                The context, in tokens, a request can count on: the least any
+                seat that could serve it took, never more than the model is
+                made for; the catalog's when no seat has said.
             max_output_tokens:
               type: integer
               description: Default and maximum output; used for reservation when a request sets none.
@@ -3167,7 +3281,20 @@ components:
                 - type: 'null'
             available:
               type: boolean
-              description: True when at least one enabled seat on a connected node serves it and its account has headroom.
+              description: True when at least one enabled seat on a connected node serves it, spending an account this key may spend, and its account has headroom.
+            capabilities:
+              type: object
+              description: What a seat that could serve this key carries through to the model.
+              required: [tools]
+              properties:
+                tools:
+                  type: boolean
+                  description: |
+                    A request's `tools` reach the model and come back as tool
+                    calls: an openai-compatible seat, a managed seat under
+                    llama-server, or the static engine's tool-call drill.
+                    False under vLLM until voice starts it with a tool-call
+                    parser, and for the claude CLI.
 
     ModelList:
       type: object
@@ -3329,6 +3456,15 @@ components:
         id:
           $ref: '#/components/schemas/ProjectIdValue'
         name: { type: string, maxLength: 128 }
+        peek:
+          type: boolean
+          description: |
+            Each request it sends is recorded whole, its request as served and
+            its final response, reasoning included, for the operator to read
+            (`listPeeks`); kept seven days. Left out, a child follows its
+            parent's, read when a request is admitted, and a project of its
+            own does not peek. A request is recorded when its project peeks or
+            its key does.
         owners:
           type: array
           description: Principals who may administer the project. The creator is always added.
@@ -3342,6 +3478,12 @@ components:
           type: [array, 'null']
           description: Catalog visibility. Null means the whole catalog.
           items: { type: string }
+        parent:
+          $ref: '#/components/schemas/ProjectIdValue'
+          description: |
+            The project it is a child of: one of no parent of its own, not
+            archived. With no `accounts` of its own, a child inherits its
+            parent's, read when it is used; giving it `accounts` narrows it.
         accounts:
           type: [array, 'null']
           description: Accounts the project may spend. Null means any.
@@ -3359,6 +3501,12 @@ components:
       description: Only the fields present change. Budget and limits have their own endpoints.
       properties:
         name: { type: string, maxLength: 128 }
+        peek:
+          type: [boolean, 'null']
+          description: |
+            `true` or `false` sets its own; `null` follows its parent's again
+            (off for a project of its own). Each request it sends is recorded
+            whole (`listPeeks`), kept seven days.
         owners:
           type: array
           items: { type: string }
@@ -3373,12 +3521,33 @@ components:
           type: [array, 'null']
           items:
             $ref: '#/components/schemas/AccountIdValue'
+        parent:
+          type: [string, 'null']
+          description: |
+            Moves it under a project of no parent of its own, or, `null`, makes
+            it a project of its own, keeping the accounts it spent. A project
+            that is a parent cannot become a child.
+        inherits:
+          type: boolean
+          description: |
+            A child's (a tenant, `tenant-<organism>`, is its habitat's project's):
+            `true` to inherit its parent's accounts again, its own cleared.
+            Setting `accounts` narrows it instead, and it no longer inherits.
+            Only a project with a parent inherits.
 
     Project:
       type: object
       required: [id, name, status, owners, data_classes, created_at]
       properties:
         id: { type: string }
+        peek:
+          type: [boolean, 'null']
+          description: Its own setting; `null` when it follows its parent's.
+        peeks:
+          type: boolean
+          description: |
+            Whether its requests are recorded whole now (`listPeeks`): its own
+            `peek`, else its parent's.
         name: { type: string }
         status:
           type: string
@@ -3405,6 +3574,19 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Limit'
+        parent:
+          type: [string, 'null']
+          description: |
+            The project this one is a child of. Voice makes each organism of its
+            habitat a project, `tenant-<organism>`, on its first call, a child of
+            the habitat's project, `habitat-<name>`, the habitat itself, voice's
+            customer: what the habitat may spend is that project's accounts.
+        inherits:
+          type: boolean
+          description: |
+            A child's that spends its parent's accounts, read when it is used,
+            not its own `accounts`: a change to the parent's reaches it on its
+            next call.
         key_count: { type: integer }
         position:
           type: [string, 'null']
@@ -3442,6 +3624,13 @@ components:
           type: string
           maxLength: 128
           description: Name the client this key is for; usage is broken down by key.
+        peek:
+          type: boolean
+          description: |
+            Each request it sends is recorded whole, its request as served and
+            its final response, reasoning included, for the operator to read
+            (`listPeeks`); kept seven days. A request is recorded when its
+            project or its key peeks.
         models:
           type: [array, 'null']
           description: Restrict the key to these models. Null means the project's catalog.
@@ -3468,6 +3657,13 @@ components:
       description: Only the fields present change.
       properties:
         name: { type: string, maxLength: 128 }
+        peek:
+          type: boolean
+          description: |
+            Each request it sends is recorded whole, its request as served and
+            its final response, reasoning included, for the operator to read
+            (`listPeeks`); kept seven days. A request is recorded when its
+            project or its key peeks.
         models:
           type: [array, 'null']
           items: { type: string }
@@ -3488,6 +3684,9 @@ components:
       required: [id, project, name, created_at, status]
       properties:
         id: { type: string }
+        peek:
+          type: boolean
+          description: Each request it sends is recorded whole (`listPeeks`).
         project: { type: string }
         name: { type: string }
         prefix:
@@ -3590,6 +3789,12 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Attempt'
+        conversation:
+          type: [string, 'null']
+          description: |
+            The conversation the request was a turn of: its
+            `prompt_cache_key`, the same on each turn. `null` when the caller
+            sent none. The ledger's turns of one conversation share it.
         metadata:
           $ref: '#/components/schemas/Metadata'
 
@@ -3606,7 +3811,7 @@ components:
           type: array
           items:
             type: object
-            required: [group, requests, input_tokens, output_tokens, price_micros, currency]
+            required: [group, requests, input_tokens, output_tokens, price_micros, currency, first_at, last_at, last_request]
             properties:
               group:
                 type: object
@@ -3620,6 +3825,17 @@ components:
               output_tokens: { type: integer }
               price_micros: { type: integer }
               currency: { type: string }
+              first_at:
+                type: string
+                format: date-time
+                description: When the group's earliest request was made.
+              last_at:
+                type: string
+                format: date-time
+                description: When its latest was.
+              last_request:
+                type: string
+                description: The latest request's id, as `getUsage` reads it.
 
     # ---- admin plane: catalog --------------------------------------------
 
@@ -3639,7 +3855,12 @@ components:
           type: string
           enum: [local, hosted]
           default: local
-        context_length: { type: integer, minimum: 1 }
+        context_length:
+          type: integer
+          minimum: 1
+          description: |
+            The longest context, in tokens, the model is made for. A model made
+            from a recipe takes the recipe's when this is left out.
         max_output_tokens:
           type: integer
           minimum: 1
@@ -3684,6 +3905,14 @@ components:
             available:
               type: boolean
               description: As on `/v1/models`.
+            served_context_length:
+              type: integer
+              minimum: 1
+              description: |
+                The least context, in tokens, a seat that could serve it now
+                took (`SeatView.context`); left out when none has said. Less
+                than `context_length` when its seats serve less than the model
+                is made for.
             created_at: { type: string, format: date-time }
 
     # ---- recipes ---------------------------------------------------------
@@ -3709,6 +3938,25 @@ components:
           properties:
             name: { type: string, minLength: 1, maxLength: 64, examples: [apache-2.0] }
             url: { type: string, format: uri, maxLength: 512 }
+        context_length:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          description: |
+            The longest context, in tokens, the model is made for (its
+            config's `max_position_embeddings`). A catalog model made from the
+            recipe takes it as its `context_length` unless one is given, and a
+            seat is never started with more. What a seat actually serves can
+            be less; each seat reports its own (`SeatState.context`).
+        kv_bytes_per_token:
+          type: integer
+          minimum: 1
+          maximum: 16777216
+          description: |
+            What one more token of context costs in KV cache, in bytes at 16
+            bits: the layers that keep every token (full attention, or MLA's
+            latent), not the linear, recurrent or sliding-window ones. A
+            placement sizes its seat's prompt cache by it.
         variants:
           type: array
           minItems: 1
@@ -3773,8 +4021,12 @@ components:
         files:
           type: array
           minItems: 1
-          maxItems: 128
+          maxItems: 300
           description: |
+            At most 300, and the variant at most 45 KiB as JSON, which a
+            frontier model's 160–250 shards fit: a placed seat's config
+            carries the variant whole, and a seat's config is at most 48 KiB.
+
             Every file the variant needs, and nothing else: a file is
             fetched only when it is listed here, and used only when its
             digest matches. Each holds tensors, a tokenizer or settings
@@ -3957,7 +4209,49 @@ components:
               type: array
               description: Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made.
               items: { $ref: '#/components/schemas/VariantFit' }
+            cache_tokens:
+              type: integer
+              minimum: 1
+              description: |
+                The prompt cache its seat keeps, in tokens, shared by the
+                conversations it holds: room for four of the model's context
+                (at most 128k each) from at most half the memory its variant
+                leaves on the node, and no larger than the variant itself;
+                never less than the 32k its variant's memory provides. Left out
+                of a placement made before voice sized it.
+            reserved_bytes:
+              type: integer
+              minimum: 1
+              description: |
+                What it holds of its node's memory for models: its variant's
+                need and its cache. A later placement on the node fits in what
+                the others leave.
             created_at: { type: string, format: date-time }
+
+    PeekSummary:
+      type: object
+      description: A recorded request, listed.
+      required: [request_id, project, key, model, created_at]
+      properties:
+        request_id: { type: string }
+        project: { type: string }
+        key: { type: string }
+        model: { type: string }
+        created_at: { type: string, format: date-time }
+
+    Peek:
+      description: A recorded request whole.
+      allOf:
+        - $ref: '#/components/schemas/PeekSummary'
+        - type: object
+          required: [input, output]
+          properties:
+            input:
+              type: string
+              description: The standard request as it was served, a JSON document as text.
+            output:
+              type: string
+              description: The final response, reasoning included, a JSON document as text.
 
     VariantFit:
       type: object
@@ -4173,6 +4467,14 @@ components:
               description: The node's reason, for `down`, `paused` and `refused`.
             progress:
               $ref: './protocol.yaml#/components/schemas/FetchProgress'
+            context:
+              type: integer
+              minimum: 1
+              description: |
+                A managed seat's: the context, in tokens, its server took, as
+                its node last reported (`SeatState.context`). Left out until
+                it says. It is never more than the recipe's `context_length`,
+                and a llama.cpp seat's is at most 32768.
             in_flight: { type: integer }
             problems:
               type: array
@@ -4232,6 +4534,27 @@ components:
             at: { type: string, format: date-time }
             type: { type: string, const: change }
             data: { $ref: '#/components/schemas/Change' }
+        - type: object
+          required: [id, at, type, data]
+          description: |
+            A request offered to a seat, told once for each attempt; it runs
+            until its `usage` event (same `data.id`) is told. A live view lights
+            it meanwhile.
+          properties:
+            id: { type: string }
+            at: { type: string, format: date-time }
+            type: { type: string, const: request }
+            data:
+              type: object
+              required: [id, project, key, requested_model, seat, account, started_at]
+              properties:
+                id: { type: string, description: "The request's id, its usage record's." }
+                project: { type: string }
+                key: { type: string }
+                requested_model: { type: string }
+                seat: { type: string, description: 'The seat it is offered to, `<node>/<seat>`.' }
+                account: { type: string }
+                started_at: { type: string, format: date-time }
         - type: object
           required: [id, at, type, data]
           properties:
@@ -4317,6 +4640,7 @@ components:
             - invalid_request
             - unsupported
             - request_too_large
+            - context_length_exceeded
             - invalid_key
             - model_not_found
             - model_not_permitted
@@ -4404,6 +4728,7 @@ components:
                 - invalid_request
                 - unsupported
                 - request_too_large
+                - context_length_exceeded
                 - invalid_key
                 - model_not_found
                 - model_not_permitted

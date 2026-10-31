@@ -1,29 +1,99 @@
-import type { ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import s from './Shell.module.css';
+import { DetailContext, type DetailLayout, type DetailState } from './Detail';
 
-/** The instrument's frame: context rail, canvas, inspector, evidence strip. */
+/**
+ * The instrument's frame: context rail, canvas, evidence strip, and the item
+ * opened from a list (`detail`), shown as `layout` says: a page of its own
+ * over the list (kept, hidden, so its filters and page survive), a drawer
+ * over it, or in place under the row clicked (at the top of the canvas when
+ * no table shows it there). `onClose` closes it: the back link, Esc, or the
+ * drawer's backdrop. `dock`, when given, sits between the canvas and the
+ * evidence strip, across the canvas's width (a live log).
+ */
 export function Shell(props: {
   rail: ReactNode;
   wide?: boolean;
-  inspector?: ReactNode;
+  detail?: ReactNode;
+  layout?: DetailLayout;
+  onClose?: () => void;
   evidence: ReactNode;
+  dock?: ReactNode;
   children: ReactNode;
 }) {
+  const layout = props.layout ?? 'page';
+  const open = props.detail != null;
+  const [clicked, setClicked] = useState<{ table: string; key: string } | null>(null);
+  const [claims, setClaims] = useState<Record<string, boolean>>({});
+  const click = useCallback((table: string, key: string) => setClicked({ table, key }), []);
+  const claim = useCallback(
+    (table: string, on: boolean) =>
+      setClaims((c) => (!!c[table] === on ? c : { ...c, [table]: on })),
+    [],
+  );
+  const shownInPlace = Object.values(claims).some(Boolean);
+  const detail = useMemo<DetailState>(
+    () => ({ layout, node: props.detail, clicked, click, claim }),
+    [layout, props.detail, clicked, click, claim],
+  );
+  const close = props.onClose;
+  useEffect(() => {
+    if (!open || !close) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLSelectElement)) close();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, close]);
+
+  const back = close && (
+    <p className={s.back}>
+      <a href="#" onClick={(e) => { e.preventDefault(); close(); }}>← back</a>
+    </p>
+  );
   return (
-    <div className={`${s.shell} ${props.wide ? s.wide : ''}`}>
-      <nav className={s.rail} aria-label="Context">
-        {props.rail}
-      </nav>
-      <main className={s.canvas}>
-        <div className={s.canvasInner}>{props.children}</div>
-      </main>
-      {!props.wide && <aside className={s.inspector} aria-label="Inspector">
-        {props.inspector ?? <span className="faint">Select something to inspect it.</span>}
-      </aside>}
-      <footer className={s.evidence} aria-label="Evidence">
-        {props.evidence}
-      </footer>
-    </div>
+    <DetailContext.Provider value={detail}>
+      <div className={`${s.shell} ${props.wide ? s.wide : ''}`}>
+        <nav className={s.rail} aria-label="Context">
+          {props.rail}
+        </nav>
+        <main className={s.canvas}>
+          {open && layout === 'page' && (
+            <div className={s.canvasInner}>
+              {back}
+              <section className={s.page} aria-label="Detail">{props.detail}</section>
+            </div>
+          )}
+          {/* kept, so its filters and page survive; `hidden` alone loses to its display: flex */}
+          <div className={s.canvasInner} style={open && layout === 'page' ? { display: 'none' } : undefined}>
+            {open && layout === 'inline' && !shownInPlace && (
+              <section className={s.inplace} aria-label="Detail">
+                {back}
+                {props.detail}
+              </section>
+            )}
+            {props.children}
+          </div>
+        </main>
+        {props.dock && <div className={s.dock}>{props.dock}</div>}
+        <footer className={s.evidence} aria-label="Evidence">
+          {props.evidence}
+        </footer>
+        {open && layout === 'drawer' && (
+          <>
+            <div className={s.backdrop} onClick={close} aria-hidden="true" />
+            <aside className={s.drawer} aria-label="Detail">
+              {close && (
+                <button type="button" className={s.drawerClose} onClick={close} aria-label="Close">
+                  ✕
+                </button>
+              )}
+              {props.detail}
+            </aside>
+          </>
+        )}
+      </div>
+    </DetailContext.Provider>
   );
 }
 

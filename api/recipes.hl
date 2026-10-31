@@ -24,6 +24,14 @@ type License { name: String = ""; url: String = ""; }
 type RecipeCreate {
     id: String;
     license: License;
+    // the longest context, in tokens, the model is made for (its config's
+    // max_position_embeddings); left out when not known
+    has_context_length: Bool = false;
+    context_length: Int = 0;
+    // what one more token of context costs in KV cache, in bytes at 16
+    // bits, past any sliding window; left out when not known
+    has_kv_bytes_per_token: Bool = false;
+    kv_bytes_per_token: Int = 0;
     variants: std::json::Value = std::json::Value::null();
 }
 
@@ -41,6 +49,12 @@ fn origin_name(v: Origin) -> String {
 type Recipe {
     id: String = "";
     license: License = License { };
+    has_context_length: Bool = false;
+    context_length: Int = 0;
+    // what one more token of context costs in KV cache, in bytes at 16
+    // bits, past any sliding window; left out when not known
+    has_kv_bytes_per_token: Bool = false;
+    kv_bytes_per_token: Int = 0;
     variants: std::json::Value = std::json::Value::null();
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
@@ -56,6 +70,15 @@ const SHIPPED_MAX: Int = 64;
 /// The most a recipe's body may be: a change holds it whole, and the change
 /// log reads a change back as a JSON value of at most 64 KiB.
 const RECIPE_MAX: Int = 49152;
+
+/// The most files a variant lists: a frontier model ships 160–250 shards.
+const VARIANT_FILES_MAX: Int = 300;
+
+/// The most a variant may be, as JSON: a placed seat's config carries the
+/// variant whole beside its runtime (placements.hl, `managed_config`; a
+/// runtime is under 2 KiB at its bounds), and a seat's config is at most
+/// 48 KiB (nodes.hl, `SEAT_CONFIG_MAX`), so every variant can be placed.
+const VARIANT_MAX: Int = 46080;
 
 locus Recipes {
     params {
@@ -122,7 +145,13 @@ locus Recipes {
     }
 
     fn create_in_gate(c: RecipeCreate) -> Recipe fallible(CtlError) {
-        let body = recipe_body(c.id, c.license, c.variants.text);
+        let body = recipe_body(
+            c.id,
+            c.license,
+            if c.has_context_length { c.context_length } else { 0 },
+            if c.has_kv_bytes_per_token { c.kv_bytes_per_token } else { 0 },
+            c.variants.text,
+        );
         if std::str::starts_with(body, "!") {
             fail bad(refusal_message(body), recipe_param(body));
         }
@@ -234,6 +263,10 @@ fn recipe_view(
             name: std::json::find_string_field(lic, "name"),
             url: std::json::find_string_field(lic, "url"),
         },
+        has_context_length: std::json::find_int_field(body, "context_length") > 0,
+        context_length: std::json::find_int_field(body, "context_length"),
+        has_kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token") > 0,
+        kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token"),
         variants: stored_value(
             std::json::find_field_raw(body, "variants"),
             "a recipe's variants",
@@ -248,7 +281,9 @@ fn recipe_view(
 fn recipe_json(r: Recipe) -> String {
     return "{\"id\": " + jq(r.id) + ", \"license\": {\"name\": " + jq(r.license.name)
         + ", \"url\": "
-        + jq(r.license.url) + "}, \"variants\": " + r.variants.text + ", \"origin\": "
+        + jq(r.license.url) + "}" + context_field(r.has_context_length, r.context_length)
+        + kv_field(r.has_kv_bytes_per_token, r.kv_bytes_per_token)
+        + ", \"variants\": " + r.variants.text + ", \"origin\": "
         + jq(origin_name(r.origin)) + ", \"created_at\": "
         + jtime_or_null(r.has_created_at, r.created_at) + "}";
 }
@@ -259,9 +294,21 @@ fn recipe_json(r: Recipe) -> String {
 // checked, or `!<param>\t<problem>` (the param is the field at fault).
 
 @bounded_by(variants)
-fn recipe_body(id: String, license: License, variants: String) -> String {
+fn recipe_body(
+    id: String,
+    license: License,
+    context_length: Int,
+    kv_bytes_per_token: Int,
+    variants: String
+) -> String {
     let head = id_and_license(id, license);
     if len(head) > 0 { return head; }
+    if context_length < 0 || context_length > CONTEXT_MAX {
+        return "!context_length\t`context_length` is 1 to 16777216 tokens";
+    }
+    if kv_bytes_per_token < 0 || kv_bytes_per_token > KV_PER_TOKEN_MAX {
+        return "!kv_bytes_per_token\t`kv_bytes_per_token` is 1 to 16777216 bytes";
+    }
     if std::json::string_field("{\"v\": " + variants + "}", "v").kind != "array" {
         return "!variants\t`variants` is a list";
     }
@@ -274,6 +321,11 @@ fn recipe_body(id: String, license: License, variants: String) -> String {
         if n > 8 { return "!variants\ta recipe has at most 8 variants"; }
         let v = variant_body(it.element, n);
         if std::str::starts_with(v, "!") { return v; }
+        if len(v) > VARIANT_MAX {
+            return "!variants\tvariants[" + to_string(n - 1) + "] is at most 45 KiB ("
+                + to_string(len(v))
+                + " bytes), which a placed seat's config carries whole";
+        }
         let vid = std::json::find_string_field(v, "id");
         if std::str::contains(seen, "\n" + vid + "\n") {
             return "!variants\ttwo variants are named " + vid;
@@ -285,11 +337,31 @@ fn recipe_body(id: String, license: License, variants: String) -> String {
     if n == 0 { return "!variants\ta recipe has at least one variant"; }
     let body = "{\"id\": " + jq(id) + ", \"license\": {\"name\": " + jq(license.name)
         + ", \"url\": "
-        + jq(license.url) + "}, \"variants\": [" + out.text() + "]}";
+        + jq(license.url) + "}" + context_field(context_length > 0, context_length)
+        + kv_field(kv_bytes_per_token > 0, kv_bytes_per_token)
+        + ", \"variants\": [" + out.text() + "]}";
     if len(body) > RECIPE_MAX {
         return "!variants\ta recipe is at most 48 KiB (" + to_string(len(body)) + " bytes)";
     }
     return body;
+}
+
+/// The most context a recipe may say a model has: 16M tokens.
+const CONTEXT_MAX: Int = 16777216;
+
+/// The most a token of context may cost in KV cache: 16 MiB.
+const KV_PER_TOKEN_MAX: Int = 16777216;
+
+/// `, "kv_bytes_per_token": n` when it is known, "" when not.
+fn kv_field(known: Bool, n: Int) -> String {
+    if !known { return ""; }
+    return ", \"kv_bytes_per_token\": " + to_string(n);
+}
+
+/// `, "context_length": n` when it is known, "" when not.
+fn context_field(known: Bool, n: Int) -> String {
+    if !known { return ""; }
+    return ", \"context_length\": " + to_string(n);
 }
 
 /// A curated id and license refused, as `!<param>\t<problem>`; "" when both
@@ -370,7 +442,9 @@ fn variant_body(v: String, n: Int) -> String {
     let mut it = std::json::array_first(files);
     while !it.done {
         k = k + 1;
-        if k > 128 { return "!variants\t" + at + " lists at most 128 files"; }
+        if k > VARIANT_FILES_MAX {
+            return "!variants\t" + at + " lists at most " + to_string(VARIANT_FILES_MAX) + " files";
+        }
         let f = it.element;
         let fat = at + ".files[" + to_string(k - 1) + "]";
         let fkeys = only_keys(f, ",path,bytes,sha256,");

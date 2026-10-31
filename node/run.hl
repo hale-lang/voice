@@ -45,6 +45,12 @@ type Run {
     // the process, and the file it writes to
     pid: Int = 0;
     log: String = "";
+    // the server (vllm or llama-server), and the context it took, read once
+    // it answers
+    server: String = "";
+    context: Int = 0;
+    // times it was asked for its context since it answered
+    asked: Int = 0;
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -109,7 +115,13 @@ locus Runner {
         if !self.holds(j.seat) { return; }
         if std::str::contains("\n" + self.queue, "\n" + j.seat + "\t") { return; }
         for r in self.runs.items {
-            if r.seat == j.seat { return; }
+            // a seat already served, asked for again when an assignment
+            // changes: the fetcher just said `starting` of it, so it is told
+            // up again (one still starting says so when it answers)
+            if r.seat == j.seat {
+                if r.phase == "up" { self.tell_up(r); }
+                return;
+            }
         }
         self.queue = self.queue + j.seat + "\t" + std::json::escape_string(j.config) + "\n";
     }
@@ -162,8 +174,18 @@ locus Runner {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
         }
+        // what the placement reserved for it (its variant and its prompt
+        // cache), or, placed before voice sized that, its variant's need
+        let reserved = std::json::find_int_field(config, "reserved_bytes");
         let share = gpu_share(
-            std::json::find_int_field(std::json::find_field_raw(config, "variant"), "memory_bytes"),
+            if reserved > 0 {
+                reserved
+            } else {
+                std::json::find_int_field(
+                    std::json::find_field_raw(config, "variant"),
+                    "memory_bytes",
+                )
+            },
             self.gpu_memory,
         );
         let port = free_port(PORT_FROM + count(self.runs.items));
@@ -173,6 +195,7 @@ locus Runner {
         }
         let mut r = Run {
             seat: seat,
+            server: server,
             port: port,
             health: "http://127.0.0.1:" + to_string(port) + "/health",
             endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
@@ -217,6 +240,7 @@ locus Runner {
                     8080,
                     "0.0.0.0",
                     std::json::find_string_field(config, "model"), share,
+                    served_tokens(config),
                 ),
             );
         } else {
@@ -248,6 +272,7 @@ locus Runner {
                     port,
                     "127.0.0.1",
                     std::json::find_string_field(config, "model"), share,
+                    served_tokens(config),
                 );
         }
         // started apart from the node, its output to a file of its own: sh
@@ -289,7 +314,15 @@ locus Runner {
             } else {
                 if r.phase == "starting" && healthy(r.health) {
                     r.phase = "up";
-                    self.tell(r.seat, "up", "", r.endpoint);
+                    r.context = served_context(r.server, r.port);
+                    r.asked = 1;
+                    self.tell_up(r);
+                } else if r.phase == "up" && r.context == 0 && r.asked < CONTEXT_ASKS {
+                    // one that answered before it could say its context is
+                    // asked again, for a while
+                    r.context = served_context(r.server, r.port);
+                    r.asked = r.asked + 1;
+                    if r.context > 0 { self.tell_up(r); }
                 }
                 push(next.items, r) or discard;
             }
@@ -378,6 +411,17 @@ locus Runner {
         return dir;
     }
 
+    /// A seat's server answers: where, and the context it took.
+    fn tell_up(r: Run) {
+        FetchUpdated <- FetchState {
+            seat: r.seat,
+            status: "up",
+            reason: "",
+            endpoint: r.endpoint,
+            context: r.context,
+        };
+    }
+
     fn tell(seat: String, status: String, reason: String, endpoint: String) {
         FetchUpdated <- FetchState {
             seat: seat,
@@ -414,7 +458,8 @@ fn server_args(
     port: Int,
     host: String,
     name: String,
-    share: String
+    share: String,
+    tokens: Int
 ) -> String {
     if server == "vllm" {
         // vLLM takes the share of the GPU's memory it is given, all of it
@@ -433,9 +478,55 @@ fn server_args(
                 }
             );
     }
+    // llama-server keeps one prompt cache of `tokens` (served_tokens), which
+    // its slots share: a conversation that comes back is restored from it
+    // rather than read again, while there is room for it. Left to itself it
+    // would size the cache for the model's whole context
     return "-m\n" + first + "\n--host\n" + host + "\n--port\n" + to_string(port) + "\n--alias\n"
-        + name;
+        + name + "\n-c\n" + to_string(tokens);
 }
+
+/// The prompt cache, in tokens, a llama-server seat keeps, shared by the
+/// conversations it holds: what its placement sized (`cache_tokens`), or,
+/// placed before voice sized it, `SERVED_CONTEXT`, less for a model made for
+/// less. One conversation is never given more than the model is made for.
+fn served_tokens(config: String) -> Int {
+    let cache = std::json::find_int_field(config, "cache_tokens");
+    if cache > 0 { return cache; }
+    let native = std::json::find_int_field(config, "context_length");
+    return if native > 0 && native < SERVED_CONTEXT { native } else { SERVED_CONTEXT };
+}
+
+/// The context, in tokens, a server that answers took: llama-server's
+/// `n_ctx` (`/props`), vLLM's `max_model_len` (`/v1/models`); 0 when it
+/// does not say.
+fn served_context(server: String, port: Int) -> Int {
+    let base = "http://127.0.0.1:" + to_string(port);
+    if server == "vllm" {
+        let r = std::http::get(base + "/v1/models") or { return 0; };
+        if r.status != 200 { return 0; }
+        let first = std::json::array_first(
+            std::json::find_field_raw(std::str::from_bytes(r.body), "data"),
+        );
+        if first.done { return 0; }
+        return std::json::find_int_field(first.element, "max_model_len");
+    }
+    let r = std::http::get(base + "/props") or { return 0; };
+    if r.status != 200 { return 0; }
+    let body = std::str::from_bytes(r.body);
+    let settings = std::json::find_field_raw(body, "default_generation_settings");
+    let n = std::json::find_int_field(settings, "n_ctx");
+    return if n > 0 { n } else { std::json::find_int_field(body, "n_ctx") };
+}
+
+/// The most context, in tokens, a llama-server seat serves: what a recipe's
+/// memory_bytes provides KV cache for (scripts/catalog-recipes.py, CONTEXT);
+/// less for a model made for less (the recipe's `context_length`).
+const SERVED_CONTEXT: Int = 32768;
+
+/// How many turns (half a second each) a server that answered is asked for
+/// its context before the seat goes without one.
+const CONTEXT_ASKS: Int = 20;
 
 /// `docker run` for a container runtime: its port on loopback only, the
 /// weights and the store they link into mounted read-only at the paths the

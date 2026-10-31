@@ -102,7 +102,7 @@ function Fold(props: { title: string; kind?: string; preview?: string; body?: Re
   const [open, setOpen] = useState(!!props.open);
   const preview = (props.preview ?? '').replace(/\s+/g, ' ').trim();
   return (
-    <div className={`${s.fold} ${props.kind ? s[props.kind] ?? '' : ''}`}>
+    <div className={`${s.fold} ${props.kind ? s[props.kind] ?? '' : ''} ${open ? s.open : ''}`}>
       <button type="button" className={s.foldHead} onClick={() => setOpen(!open)} aria-expanded={open}>
         <span className={s.chevron}>{open ? '▾' : '▸'}</span>
         <span className={s.title}>{props.title}</span>

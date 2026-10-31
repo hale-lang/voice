@@ -1,7 +1,7 @@
-// A decision model's weights are served by a decision server (`jev-style`),
+// A decision model's weights are served by a decision server (`decision`),
 // and only by one: a placement judges a decision recipe's variants against
-// jev-style runtimes alone, and a generative recipe's never against one. A
-// jev-style runtime is, for now, an archive that reads mlx on metal.
+// decision runtimes alone, and a generative recipe's never against one. A
+// decision runtime reads mlx as an archive on metal, or gguf anywhere.
 import ".." as api;
 
 fn runtime(id: String, server: String, format: api::ModelFormat) -> api::Runtime {
@@ -28,20 +28,20 @@ fn main() {
     let mut both = api::RuntimeList { };
     push(both.data, runtime("llama-metal", "llama-server", api::ModelFormat::gguf)) or discard;
     push(both.data, runtime("mlx-lm-metal", "llama-server", api::ModelFormat::mlx)) or discard;
-    push(both.data, runtime("jev-style-mlx", "jev-style", api::ModelFormat::mlx)) or discard;
+    push(both.data, runtime("decision-mlx", "decision", api::ModelFormat::mlx)) or discard;
     let room = 64000000000;
 
     let decided = api::judge_recipe(MLX, MAC, both, room, 0, true);
     let d0 = at(decided.fit, 0) or api::VariantFit { };
     std::test::assert(
-        decided.best == 0 && d0.runtime == "jev-style-mlx",
-        "a decision recipe's mlx is served by the jev-style runtime: " + d0.reason,
+        decided.best == 0 && d0.runtime == "decision-mlx",
+        "a decision recipe's mlx is served by the decision runtime: " + d0.reason,
     );
     let made = api::judge_recipe(MLX, MAC, both, room, 0, false);
     let m0 = at(made.fit, 0) or api::VariantFit { };
     std::test::assert(
         made.best == 0 && m0.runtime == "mlx-lm-metal",
-        "a generative recipe's mlx is never the jev-style runtime's: " + m0.reason,
+        "a generative recipe's mlx is never the decision runtime's: " + m0.reason,
     );
     let gguf = api::judge_recipe(GGUF, MAC, both, room, 0, true);
     let g0 = at(gguf.fit, 0) or api::VariantFit { };
@@ -49,31 +49,31 @@ fn main() {
         gguf.best < 0
             && std::str::starts_with(
                 g0.reason,
-                "no jev-style runtime (a decision model's server) reads gguf",
+                "no decision runtime (a decision model's server) reads gguf",
             ),
         "a decision recipe with no decision server for it does not fit, and says why: " + g0.reason,
     );
-    let mut jev_only = api::RuntimeList { };
-    push(jev_only.data, runtime("jev-style-mlx", "jev-style", api::ModelFormat::mlx)) or discard;
-    let lone = api::judge_recipe(MLX, MAC, jev_only, room, 0, false);
+    let mut decision_only = api::RuntimeList { };
+    push(decision_only.data, runtime("decision-mlx", "decision", api::ModelFormat::mlx)) or discard;
+    let lone = api::judge_recipe(MLX, MAC, decision_only, room, 0, false);
     std::test::assert(
         lone.best < 0,
-        "a generative recipe does not take a jev-style runtime even when it is the only one",
+        "a generative recipe does not take a decision runtime even when it is the only one",
     );
 
-    // a jev-style runtime: an archive that reads mlx on metal, for now
+    // a decision runtime that reads mlx: an archive on metal
     let mut archive = api::RuntimeCreate {
-        id: "jev-style-mlx",
+        id: "decision-mlx",
         license: api::License {
             name: "apache-2.0",
             url: "https://www.apache.org/licenses/LICENSE-2.0",
         },
-        server: "jev-style",
+        server: "decision",
         accelerator: api::RuntimeAccelerator::metal,
         artifact: api::RuntimeArtifact {
             kind: api::ArtifactKind::archive,
             has_url: true,
-            url: "https://example.org/jev.tar.gz",
+            url: "https://example.org/decision.tar.gz",
             has_sha256: true,
             sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             has_bytes: true,
@@ -88,31 +88,64 @@ fn main() {
     let kept = api::runtime_body(archive);
     std::test::assert(
         !std::str::starts_with(kept, "!"),
-        "an mlx archive on metal is a jev-style runtime: " + kept,
+        "an mlx archive on metal is a decision runtime: " + kept,
     );
     let mut boxed = archive;
     boxed.artifact = api::RuntimeArtifact {
         kind: api::ArtifactKind::container,
         has_image: true,
-        image: "ghcr.io/x/jev",
+        image: "ghcr.io/x/decision",
         has_digest: true,
         digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     };
     std::test::assert(
-        std::str::starts_with(api::runtime_body(boxed), "!artifact"),
-        "a container is not, for now",
+        std::str::starts_with(api::runtime_body(boxed), "!formats"),
+        "mlx is not read in a container",
     );
     let mut cuda = archive;
     cuda.accelerator = api::RuntimeAccelerator::cuda;
     std::test::assert(
-        std::str::starts_with(api::runtime_body(cuda), "!accelerator"),
-        "nor one on cuda",
+        std::str::starts_with(api::runtime_body(cuda), "!formats"),
+        "nor on cuda",
     );
-    let mut gg = archive;
-    gg.formats = archive.formats;
-    push(gg.formats, api::ModelFormat::gguf) or discard;
+    // voice-decide reads gguf, in a container on any accelerator
+    let native = decision_container(api::ModelFormat::gguf);
+    let n = api::runtime_body(native);
     std::test::assert(
-        std::str::starts_with(api::runtime_body(gg), "!formats"),
-        "nor one that reads gguf",
+        !std::str::starts_with(n, "!"),
+        "a gguf container on rocm is a decision runtime: " + n,
     );
+    std::test::assert(
+        std::str::starts_with(
+            api::runtime_body(decision_container(api::ModelFormat::safetensors)),
+            "!formats",
+        ),
+        "nor one that reads safetensors",
+    );
+}
+
+/// A decision container on rocm that reads `format`.
+fn decision_container(format: api::ModelFormat) -> api::RuntimeCreate {
+    let mut c = api::RuntimeCreate {
+        id: "decision-0.1.0-rocm",
+        license: api::License {
+            name: "apache-2.0",
+            url: "https://www.apache.org/licenses/LICENSE-2.0",
+        },
+        server: "decision",
+        accelerator: api::RuntimeAccelerator::rocm,
+        artifact: api::RuntimeArtifact {
+            kind: api::ArtifactKind::container,
+            has_image: true,
+            image: "ghcr.io/x/decision",
+            has_digest: true,
+            digest: "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        },
+    };
+    push(c.formats, format) or discard;
+    push(
+        c.platforms,
+        api::RuntimePlatform { os: api::HostOs::linux, arch: api::HostArch::x86_64 },
+    ) or discard;
+    return c;
 }

@@ -1,0 +1,287 @@
+// The renderer (the Jev release's `Renderer`, macjev-render-v2-long-options):
+// a request's tokens, the slots its verdicts are read at, and the attention
+// blocks the scorer decodes them in.
+//
+//     State:\n<state>\n\n                        state blocks of BLOCK tokens
+//     Question [t]: <instructions>\nOptions:\n   one question block, when its
+//     - <option> ->\n  (each option; the slot is " ->")   tokens fit in BLOCK
+//
+// A question longer than BLOCK is written as a catalogue and a rubric
+// instead, each cut into blocks of its own:
+//
+//     Question [t]: <instructions>\nOptions:\n
+//     Option 1: <option>\n ...
+//     Judge each numbered option in the complete catalogue above:\n
+//     Option 1 ->\n ...
+//
+// Each piece is tokenized on its own and the pieces' tokens joined, as the
+// release does. The whole input, state and question, is at most
+// CONTEXT_LIMIT tokens; one longer is refused, never truncated.
+//
+// Tokens are kept as a JSON array's members ("1,2,3"): they go on to the
+// scorer as they came from it, and only their counts are read here.
+
+const BLOCK: Int = 2048;
+const CONTEXT_LIMIT: Int = 25600;
+
+/// Token ids, a JSON array's members, and how many.
+type Run { ids: String = ""; n: Int = 0; }
+
+/// The fixed pieces of every input, tokenized once.
+type Glue {
+    state_open: Run = Run { };
+    state_close: Run = Run { };
+    newline: Run = Run { };
+    dash: Run = Run { };
+    arrow: Run = Run { };
+    rubric_head: Run = Run { };
+    // "Option i: ", a catalogue's label, and "Option i", a rubric's
+    numbered: bounded[Run; 255];
+    named: bounded[Run; 255];
+    // the token ids a verdict reads: logit(yes) - logit(no) at each slot
+    yes: Int = -1;
+    no: Int = -1;
+}
+
+/// The fixed pieces' texts, in the order `glue_of` reads their tokens.
+fn glue_texts() -> String {
+    let b = std::bytes::BytesBuilder { };
+    b.append_str(
+        "\"State:\\n\",\"\\n\\n\",\"\\n\",\"- \",\" ->\",\"Judge each numbered option in the complete catalogue above:\\n\",\" yes\",\" no\"",
+    );
+    let mut i = 1;
+    while i <= CHOICE_OPTIONS_MAX {
+        b.append_str(",\"Option " + to_string(i) + ": \",\"Option " + to_string(i) + "\"");
+        i = i + 1;
+    }
+    return std::str::clone(b.text_view());
+}
+
+/// The glue from the scorer's tokenization of `glue_texts()`, its readout
+/// tokens checked against readout_config.json's: the GGUF must spell
+/// " yes", " no" and " ->" as the release's tokenizer does, one token each.
+fn glue_of(tokens: String, cfg: String) -> Glue fallible(Refusal) {
+    let slots = std::json::find_field_raw(cfg, "slot_tokens");
+    let yes = std::json::find_int_field(std::json::find_field_raw(slots, "yes"), "id");
+    let no = std::json::find_int_field(std::json::find_field_raw(slots, "no"), "id");
+    let arrow = std::json::find_int_field(std::json::find_field_raw(slots, "verdict_slot"), "id");
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(tokens, "ids")));
+    let mut g = Glue { yes: yes, no: no };
+    g.state_open = run_of(it.element);
+    it = std::json::array_next(it);
+    g.state_close = run_of(it.element);
+    it = std::json::array_next(it);
+    g.newline = run_of(it.element);
+    it = std::json::array_next(it);
+    g.dash = run_of(it.element);
+    it = std::json::array_next(it);
+    g.arrow = run_of(it.element);
+    it = std::json::array_next(it);
+    g.rubric_head = run_of(it.element);
+    it = std::json::array_next(it);
+    let y = run_of(it.element);
+    it = std::json::array_next(it);
+    let n = run_of(it.element);
+    it = std::json::array_next(it);
+    if y.ids != to_string(yes) || n.ids != to_string(no) || g.arrow.ids != to_string(arrow) {
+        fail Refusal {
+            status: 500,
+            code: "internal_error",
+            message: "the GGUF does not spell \" yes\", \" no\" and \" ->\" as readout_config.json's tokens "
+                + to_string(yes) + ", " + to_string(no) + " and " + to_string(arrow) + " (it reads "
+                + y.ids + ", " + n.ids + " and " + g.arrow.ids + ")",
+        };
+    }
+    while !it.done {
+        push(g.numbered, run_of(it.element)) or discard;
+        it = std::json::array_next(it);
+        push(g.named, run_of(it.element)) or discard;
+        it = std::json::array_next(it);
+    }
+    return g;
+}
+
+/// A request rendered: the scorer's request, and the tokens it reads.
+type Rendered {
+    request: String = "";
+    state_tokens: Int = 0;
+    // every question's own tokens, together
+    head_tokens: Int = 0;
+}
+
+/// The texts a request's tokens come from, in the order `render` reads
+/// them back: its state, then each question's head and options.
+fn texts(d: Decision) -> String {
+    let b = std::bytes::BytesBuilder { };
+    b.append_str(jq(d.state));
+    for q in d.questions {
+        b.append_str(",");
+        b.append_str(jq(q.head));
+        b.append_str(",");
+        b.append_str(q.options);
+    }
+    return std::str::clone(b.text_view());
+}
+
+/// Token ids as a scorer wrote them, `[1,2,3]`, as a run.
+fn run_of(array: String) -> Run {
+    let a = std::str::trim(array);
+    let inner = std::str::trim(a[1..(len(a) - 1)]);
+    if len(inner) == 0 { return Run { }; }
+    let mut n = 1;
+    let mut i = 0;
+    while i < len(inner) {
+        if std::str::byte_at_unchecked(inner, i) == 44 { n = n + 1; }
+        i = i + 1;
+    }
+    return Run { ids: inner, n: n };
+}
+
+/// Runs joined in order: the ids and how many.
+locus Ids {
+    params {
+        out: std::bytes::BytesBuilder = std::bytes::BytesBuilder { };
+        n: Int = 0;
+    }
+
+    fn add(r: Run) {
+        if r.n == 0 { return; }
+        if self.n > 0 { self.out.append_str(","); }
+        self.out.append_str(r.ids);
+        self.n = self.n + r.n;
+    }
+
+    fn text() -> String {
+        return std::str::clone(self.out.text_view());
+    }
+}
+
+/// `[start, stop)` cut into blocks of BLOCK tokens, each `[a,b]`, written
+/// after `sep` when any is.
+fn blocks_into(b: std::bytes::BytesBuilder, start: Int, stop: Int, sep: Bool) -> Bool {
+    let mut s = start;
+    let mut wrote = sep;
+    while s < stop {
+        if wrote { b.append_str(","); }
+        let e = if s + BLOCK < stop { s + BLOCK } else { stop };
+        b.append_str("[" + to_string(s) + "," + to_string(e) + "]");
+        wrote = true;
+        s = e;
+    }
+    return wrote;
+}
+
+/// The scorer's request for `d`, from `tokens`, the scorer's tokenization
+/// of `texts(d)` (`{"ids": [[...], ...]}`); refused when one question's
+/// input is longer than `limit`.
+fn render(d: Decision, g: Glue, tokens: String, limit: Int) -> Rendered fallible(Refusal) {
+    let all = std::str::trim(std::json::find_field_raw(tokens, "ids"));
+    let mut it = std::json::array_first(all);
+    let prefix = Ids { };
+    prefix.add(g.state_open);
+    prefix.add(run_of(it.element));
+    it = std::json::array_next(it);
+    prefix.add(g.state_close);
+    let p = prefix.n;
+    let req = std::bytes::BytesBuilder { initial_cap: 8 * p + 1024 };
+    req.append_str("{\"prefix\":[" + prefix.text() + "],\"prefix_blocks\":[");
+    blocks_into(req, 0, p, false);
+    req.append_str("],\"keep_prefix\":true,\"questions\":[");
+    let mut heads = 0;
+    let mut first = true;
+    for q in d.questions {
+        let head = run_of(it.element);
+        it = std::json::array_next(it);
+        let mut opts = Opts { };
+        let mut k = 0;
+        while k < q.count {
+            push(opts.runs, run_of(it.element)) or discard;
+            it = std::json::array_next(it);
+            k = k + 1;
+        }
+        let one = question_tokens(head, opts, g, p) or raise;
+        if p + one.n > limit {
+            fail Refusal {
+                code: "input_budget_exceeded",
+                message: "the complete input needs " + to_string(p + one.n) + " tokens (state "
+                    + to_string(p) + " + question/options/readout " + to_string(one.n)
+                    + "); the limit is " + to_string(limit) + " tokens (model maximum "
+                    + to_string(CONTEXT_LIMIT)
+                    + "). Nothing was truncated: shorten the state, the question or the options. (nothing truncated)",
+            };
+        }
+        if !first { req.append_str(","); }
+        first = false;
+        req.append_str(
+            "{\"ids\":[" + one.ids + "],\"blocks\":[" + one.blocks + "],\"slots\":[" + one.slots
+                + "],\"rows\":[" + to_string(g.yes) + "," + to_string(g.no) + "]}",
+        );
+        heads = heads + one.n;
+    }
+    req.append_str("]}");
+    return Rendered {
+        request: std::str::clone(req.text_view()),
+        state_tokens: p,
+        head_tokens: heads,
+    };
+}
+
+/// One question's options' runs, in order.
+type Opts { runs: bounded[Run; 255]; }
+
+/// One question's tokens after the state: their ids, how many, the
+/// absolute blocks they are decoded in and their slots.
+type Tokens { ids: String = ""; n: Int = 0; blocks: String = ""; slots: String = ""; }
+
+/// One question rendered after a state of `p` tokens: the short form when
+/// it fits one block, else the catalogue and its rubric.
+fn question_tokens(head: Run, opts: Opts, g: Glue, p: Int) -> Tokens fallible(Refusal) {
+    let short = Ids { };
+    let slots = std::bytes::BytesBuilder { };
+    short.add(head);
+    for o in opts.runs {
+        short.add(g.dash);
+        short.add(o);
+        short.add(g.arrow);
+        if slots.len() > 0 { slots.append_str(","); }
+        slots.append_str(to_string(p + short.n - 1));
+        short.add(g.newline);
+    }
+    if short.n <= BLOCK {
+        return Tokens {
+            ids: short.text(),
+            n: short.n,
+            blocks: "[" + to_string(p) + "," + to_string(p + short.n) + "]",
+            slots: std::str::clone(slots.text_view()),
+        };
+    }
+    let ids = Ids { };
+    ids.add(head);
+    let mut i = 0;
+    for o in opts.runs {
+        ids.add(at(g.numbered, i) or Run { });
+        ids.add(o);
+        ids.add(g.newline);
+        i = i + 1;
+    }
+    let doc_end = p + ids.n;
+    ids.add(g.rubric_head);
+    slots.clear();
+    i = 0;
+    for o in opts.runs {
+        ids.add(at(g.named, i) or Run { });
+        ids.add(g.arrow);
+        if i > 0 { slots.append_str(","); }
+        slots.append_str(to_string(p + ids.n - 1));
+        ids.add(g.newline);
+        i = i + 1;
+    }
+    let blocks = std::bytes::BytesBuilder { };
+    blocks_into(blocks, doc_end, p + ids.n, blocks_into(blocks, p, doc_end, false));
+    return Tokens {
+        ids: ids.text(),
+        n: ids.n,
+        blocks: std::str::clone(blocks.text_view()),
+        slots: std::str::clone(slots.text_view()),
+    };
+}

@@ -1,0 +1,381 @@
+// A systemone request read as the renderer reads it (jev_style's
+// schema.py, the contract voice's api writes and its node forwards):
+//
+//     {"model"?: str, "state": str | object | array,
+//      "questions": {id: {"type": "noul" | "choice" | "score",
+//                         "instructions": str | object | array,
+//                         "criteria"?: ...}}}
+//
+// Every refusal is the contract's 422 with the message schema.py gives.
+// Keys it does not know are ignored, as there. The body is first written
+// back as Python writes it (pyjson.hl), so every value read from it below
+// is already the text the renderer would write: a structure as
+// `json.dumps` spells it, a string as JSON string content Python's way.
+//
+// Text kept for the tokenizer is JSON string content (escaped), so a
+// string from the request goes on to the scorer as it came, never decoded.
+
+/// The most questions one request asks: the api asks at most 32
+/// (api/decision.hl).
+const QUESTIONS_MAX: Int = 64;
+const CHOICE_OPTIONS_MAX: Int = 255;
+const SCORE_LEVELS_MIN: Int = 2;
+const SCORE_LEVELS_MAX: Int = 10;
+
+/// A request refused: the contract's error body
+/// (`{"error": {"code", "message", "question"?}}`) and its HTTP status.
+type Refusal {
+    status: Int = 422;
+    // invalid_json | invalid_request | invalid_question | input_budget_exceeded | internal_error
+    code: String = "invalid_request";
+    message: String = "";
+    // the question at fault, JSON string content; "" for the request
+    question: String = "";
+}
+
+/// One question as the renderer reads it. Its texts are JSON string
+/// content; its lists are JSON array members, comma-joined.
+type Question {
+    // the id the answer goes by
+    id: String = "";
+    // noul | choice | score
+    kind: String = "";
+    // "Question [kind]: instructions\nOptions:\n"
+    head: String = "";
+    // each option's text, a JSON string each
+    options: String = "";
+    count: Int = 0;
+    // each option's name in the answer, a JSON string each: a choice's
+    // keys, a score's levels "0".., a noul's "false", "true"
+    names: String = "";
+    // a score's legend: its object's members, "0": label, ...
+    legend: String = "";
+}
+
+/// A request: the state the questions are about, and the questions.
+type Decision {
+    // the state as the renderer writes it, JSON string content
+    state: String = "";
+    questions: bounded[Question; 64];
+}
+
+fn refused(message: String) -> Refusal {
+    return Refusal { message: message };
+}
+
+fn refused_question(id: String, message: String) -> Refusal {
+    return Refusal { code: "invalid_question", message: message, question: id };
+}
+
+/// A request's body read, or refused as schema.py refuses it.
+fn parse(body: String) -> Decision fallible(Refusal) {
+    let raw = std::str::trim(body);
+    if !std::json::valid(raw) {
+        fail Refusal { code: "invalid_json", message: "request body is not valid JSON" };
+    }
+    let b = dumps(raw, true) or raise;
+    if !std::str::starts_with(b, "{") { fail refused("request body must be a JSON object"); }
+    let model = std::json::string_field(b, "model").kind;
+    if model != "missing" && model != "null" && model != "string" {
+        fail refused("model must be a string");
+    }
+    let mut d = Decision { };
+    let state = std::json::string_field(b, "state").kind;
+    if state == "missing" { fail refused("state is required"); }
+    if state != "string" && state != "object" && state != "array" {
+        fail refused("state must be a string, object or array");
+    }
+    d.state = text_of(std::json::find_field_raw(b, "state"));
+    let qs = std::str::trim(std::json::find_field_raw(b, "questions"));
+    if std::json::string_field(b, "questions").kind != "object" {
+        fail refused("questions must be an object mapping id -> question");
+    }
+    if qs == "{}" { fail refused("questions must not be empty"); }
+    let mut it = std::json::object_first(qs);
+    while !it.done {
+        let id = qs[it.key_start..it.key_end];
+        if len(id) == 0 { fail refused("question ids must be non-empty strings"); }
+        if count(d.questions) == QUESTIONS_MAX {
+            fail refused("a request asks at most " + to_string(QUESTIONS_MAX) + " questions");
+        }
+        let q = question(id, std::str::trim(std::json::obj_value_raw(it, qs))) or raise;
+        push(d.questions, q) or discard;
+        it = std::json::object_next(it, qs);
+    }
+    return d;
+}
+
+/// One question read, or refused naming it.
+fn question(id: String, q: String) -> Question fallible(Refusal) {
+    if !std::str::starts_with(q, "{") { fail refused_question(id, "question must be an object"); }
+    let t = std::json::string_field(q, "type");
+    if t.kind != "string" || !(t.text == "noul" || t.text == "choice" || t.text == "score") {
+        fail refused_question(
+            id,
+            "type must be one of noul, choice, score (got "
+                + (
+                    if t.kind == "missing" || t.kind == "null" {
+                        "None"
+                    } else {
+                        std::str::trim(std::json::find_field_raw(q, "type"))
+                    }
+                )
+                + ")",
+        );
+    }
+    let ins = instructions(id, q) or raise;
+    let mut out = Question {
+        id: id,
+        kind: t.text,
+        head: "Question [" + t.text + "]: " + ins + "\\nOptions:\\n",
+    };
+    let crit = std::json::string_field(q, "criteria").kind;
+    let raw = std::str::trim(std::json::find_field_raw(q, "criteria"));
+    if t.text == "noul" {
+        noul(out, id, crit, raw) or raise;
+    } else if t.text == "choice" {
+        choice(out, id, crit, raw) or raise;
+    } else {
+        score(out, id, crit, raw) or raise;
+    }
+    return out;
+}
+
+/// A question's instructions as the renderer writes them: a string as it
+/// is, a structure as compact JSON.
+fn instructions(id: String, q: String) -> String fallible(Refusal) {
+    let kind = std::json::string_field(q, "instructions").kind;
+    if kind == "missing" { fail refused_question(id, "instructions is required"); }
+    let raw = std::str::trim(std::json::find_field_raw(q, "instructions"));
+    if kind == "string" {
+        if blank(raw) { fail refused_question(id, "instructions must not be empty"); }
+        return content(raw);
+    }
+    if kind == "object" || kind == "array" {
+        if raw == "{}" || raw == "[]" {
+            fail refused_question(id, "instructions object/array must not be empty");
+        }
+        return std::json::escape_string(dumps(raw, false) or raise);
+    }
+    fail refused_question(id, "instructions must be a string, object or array");
+}
+
+/// A noul's two outcomes, `false` then `true`, each described or the
+/// renderer's own words.
+fn noul(out: Question, id: String, kind: String, crit: String) fallible(Refusal) {
+    let mut f = "";
+    let mut t = "";
+    if kind != "missing" && kind != "null" {
+        if kind != "object" {
+            fail refused_question(
+                id,
+                "noul criteria must be an object with optional 'true' / 'false'"
+            );
+        }
+        let stray = std::bytes::BytesBuilder { };
+        let mut it = std::json::object_first(crit);
+        while !it.done {
+            let k = crit[it.key_start..it.key_end];
+            if k != "true" && k != "false" {
+                if stray.len() > 0 { stray.append_str(", "); }
+                stray.append_str("'" + k + "'");
+            }
+            it = std::json::object_next(it, crit);
+        }
+        if stray.len() > 0 {
+            fail refused_question(
+                id,
+                "noul criteria accepts only 'true' and 'false' (got ["
+                    + std::str::clone(stray.text_view()) + "])",
+            );
+        }
+        f = description(id, crit, "false", "criteria.false") or raise;
+        t = description(id, crit, "true", "criteria.true") or raise;
+    }
+    out.options = jq("false: " + (if len(f) > 0 { f } else { "no, the statement does not hold" }))
+        + ","
+        + jq("true: " + (if len(t) > 0 { t } else { "yes, the statement holds" }));
+    out.count = 2;
+    out.names = "\"false\",\"true\"";
+}
+
+/// A choice's options in the order given: a name, and its description
+/// after a colon when it has one.
+fn choice(out: Question, id: String, kind: String, crit: String) fallible(Refusal) {
+    if kind != "object" {
+        fail refused_question(
+            id,
+            "choice criteria must be an object mapping option -> description or null"
+        );
+    }
+    let options = std::bytes::BytesBuilder { };
+    let names = std::bytes::BytesBuilder { };
+    let mut n = 0;
+    let mut it = std::json::object_first(crit);
+    while !it.done {
+        n = n + 1;
+        it = std::json::object_next(it, crit);
+    }
+    if n < 1 || n > CHOICE_OPTIONS_MAX {
+        fail refused_question(
+            id,
+            "choice needs 1.." + to_string(CHOICE_OPTIONS_MAX) + " options (got " + to_string(n)
+                + ")",
+        );
+    }
+    it = std::json::object_first(crit);
+    while !it.done {
+        let name = crit[it.key_start..it.key_end];
+        if blank(jq(name)) { fail refused_question(id, "choice option names must not be empty"); }
+        let desc = description(
+            id,
+            std::json::obj_value_raw(it, crit),
+            "",
+            "criteria['" + name + "']",
+        ) or raise;
+        if options.len() > 0 {
+            options.append_str(",");
+            names.append_str(",");
+        }
+        options.append_str(jq(if len(desc) > 0 { name + ": " + desc } else { name }));
+        names.append_str(jq(name));
+        it = std::json::object_next(it, crit);
+    }
+    out.options = std::str::clone(options.text_view());
+    out.names = std::str::clone(names.text_view());
+    out.count = n;
+}
+
+/// A score's levels, lowest first: each "level i: <its text>", and its
+/// label for the legend.
+fn score(out: Question, id: String, kind: String, crit: String) fallible(Refusal) {
+    if kind != "array" {
+        fail refused_question(id, "score criteria must be an ordered array of levels");
+    }
+    let mut n = 0;
+    let mut it = std::json::array_first(crit);
+    while !it.done {
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    if n < SCORE_LEVELS_MIN || n > SCORE_LEVELS_MAX {
+        fail refused_question(
+            id,
+            "score needs " + to_string(SCORE_LEVELS_MIN) + ".." + to_string(SCORE_LEVELS_MAX)
+                + " levels (got " + to_string(n) + ")",
+        );
+    }
+    let options = std::bytes::BytesBuilder { };
+    let names = std::bytes::BytesBuilder { };
+    let legend = std::bytes::BytesBuilder { };
+    let mut i = 0;
+    it = std::json::array_first(crit);
+    while !it.done {
+        let lv = level(id, i, std::str::trim(it.element)) or raise;
+        if i > 0 {
+            options.append_str(",");
+            names.append_str(",");
+            legend.append_str(", ");
+        }
+        options.append_str(jq("level " + to_string(i) + ": " + lv.text));
+        names.append_str(jq(to_string(i)));
+        legend.append_str(jq(to_string(i)) + ": " + jq(lv.label));
+        i = i + 1;
+        it = std::json::array_next(it);
+    }
+    out.options = std::str::clone(options.text_view());
+    out.names = std::str::clone(names.text_view());
+    out.legend = std::str::clone(legend.text_view());
+    out.count = n;
+}
+
+/// One score level: the text the renderer writes for it, and the label its
+/// legend gives it.
+type Level { text: String = ""; label: String = ""; }
+
+fn level(id: String, i: Int, raw: String) -> Level fallible(Refusal) {
+    let at = "score level " + to_string(i);
+    if std::str::starts_with(raw, "\"") {
+        if blank(raw) { fail refused_question(id, at + " must not be empty"); }
+        return Level { text: content(raw), label: content(raw) };
+    }
+    if std::str::starts_with(raw, "{") && std::json::string_field(raw, "label").kind != "missing" {
+        let label = std::json::string_field(raw, "label");
+        let lr = std::str::trim(std::json::find_field_raw(raw, "label"));
+        if label.kind != "string" || blank(lr) {
+            fail refused_question(id, at + ": label must be a non-empty string");
+        }
+        let d = std::json::string_field(raw, "description").kind;
+        if d != "missing" && d != "null" && d != "string" {
+            fail refused_question(id, at + ": description must be a string");
+        }
+        let dr = std::str::trim(std::json::find_field_raw(raw, "description"));
+        let text = if len(stray_key(raw, " label description ")) > 0 {
+            std::json::escape_string(raw)
+        } else if d != "string" || dr == "\"\"" {
+            content(lr)
+        } else {
+            content(lr) + ": " + content(dr)
+        };
+        return Level { text: text, label: content(lr) };
+    }
+    if (std::str::starts_with(raw, "{") && raw != "{}")
+        || (std::str::starts_with(raw, "[") && raw != "[]")
+    {
+        return Level {
+            text: std::json::escape_string(raw),
+            label: std::json::escape_string(dumps(raw, false) or raise),
+        };
+    }
+    fail refused_question(
+        id,
+        at + " must be a non-empty string, {label, description} object or array"
+    );
+}
+
+/// A criterion's description for the renderer: "" for none (missing,
+/// null or ""), a string as it is, a structure as `json.dumps` writes it.
+/// `key` "" reads `raw` itself, else its member `key`.
+fn description(id: String, raw: String, key: String, at: String) -> String fallible(Refusal) {
+    let v = std::str::trim(if len(key) > 0 { std::json::find_field_raw(raw, key) } else { raw });
+    if len(v) == 0 || v == "null" || v == "\"\"" { return ""; }
+    if std::str::starts_with(v, "\"") { return content(v); }
+    if std::str::starts_with(v, "{") || std::str::starts_with(v, "[") {
+        return std::json::escape_string(v);
+    }
+    fail refused_question(id, at + " must be a string, object, array or null");
+}
+
+/// A value the renderer writes as text: a string's content, anything else
+/// as the JSON it is (already Python's spelling), escaped.
+fn text_of(raw: String) -> String {
+    let v = std::str::trim(raw);
+    return if std::str::starts_with(v, "\"") { content(v) } else { std::json::escape_string(v) };
+}
+
+/// A JSON string's content, still escaped.
+fn content(raw: String) -> String {
+    return raw[1..(len(raw) - 1)];
+}
+
+/// JSON string content quoted: a JSON string.
+fn jq(escaped: String) -> String {
+    return "\"" + escaped + "\"";
+}
+
+/// A JSON string that is empty or only whitespace (Python's `not s.strip()`).
+fn blank(raw: String) -> Bool {
+    return len(std::str::trim(std::json::unescape_string(content(raw)))) == 0;
+}
+
+/// The first member of `obj` whose name is not in `allowed` (names with a
+/// space either side), "" when every one is.
+fn stray_key(obj: String, allowed: String) -> String {
+    let mut it = std::json::object_first(obj);
+    while !it.done {
+        let k = obj[it.key_start..it.key_end];
+        if !std::str::contains(allowed, " " + k + " ") { return k; }
+        it = std::json::object_next(it, obj);
+    }
+    return "";
+}

@@ -1,0 +1,297 @@
+// JSON written back as Python's `json.dumps(json.loads(text),
+// ensure_ascii=False)` writes it. The Jev renderer writes a structured
+// state, criterion or instruction that way, and the model was trained on
+// that text, so the tokens voice-decide reads it as must be the same: the
+// separators (", " and ": ", or "," and ":" compact), a string's escapes
+// (only `"`, `\` and the control characters, `\n`-style where Python has
+// one, `\u001f`-style where not; every other character as itself), and a
+// number as Python reads and writes it (`-0` is `0`, `1E2` is `100.0`, `1e400`
+// is `Infinity`).
+//
+// Three inputs Python would take are refused instead: an object naming one
+// key twice (Python keeps the last value, at the first one's place: a
+// reading no caller means), a lone surrogate escape (Python keeps it, and
+// its tokenizer then fails on it), and `\u0000` (a Hale String ends at a
+// NUL, so the text would be cut there).
+
+/// Python's writer, over a JSON text `std::json::valid` accepted.
+locus Dumper {
+    params {
+        out: std::bytes::BytesBuilder = std::bytes::BytesBuilder { };
+        // one key, written apart to check it against its object's others
+        key: std::bytes::BytesBuilder = std::bytes::BytesBuilder { };
+        spaced: Bool = true;
+    }
+
+    /// The value at `at` (whitespace before it skipped) written; where it
+    /// ends.
+    fn value(t: String, at: Int) -> Int fallible(Refusal) {
+        let n = len(t);
+        let i = std::json::next_non_ws(t, at, n);
+        let c = std::str::byte_at_unchecked(t, i);
+        if c == 123 { return self.object(t, i) or raise; }
+        if c == 91 { return self.array(t, i) or raise; }
+        if c == 34 { return string_into(self.out, t, i) or raise; }
+        if c == 116 {
+            self.out.append_str("true");
+            return i + 4;
+        }
+        if c == 102 {
+            self.out.append_str("false");
+            return i + 5;
+        }
+        if c == 110 {
+            self.out.append_str("null");
+            return i + 4;
+        }
+        return self.number(t, i);
+    }
+
+    fn object(t: String, at: Int) -> Int fallible(Refusal) {
+        let n = len(t);
+        // each key written so far, a line each: a written key holds no
+        // newline (Python writes it `\n`)
+        let seen = std::bytes::BytesBuilder { };
+        seen.append_str("\n");
+        self.out.append_str("{");
+        let mut p = std::json::next_non_ws(t, at + 1, n);
+        let mut first = true;
+        while std::str::byte_at_unchecked(t, p) != 125 {
+            if !first { self.out.append_str(if self.spaced { ", " } else { "," }); }
+            first = false;
+            self.key.clear();
+            p = string_into(self.key, t, p) or raise;
+            let k = std::str::clone(self.key.text_view());
+            if std::str::contains(std::str::clone(seen.text_view()), "\n" + k + "\n") {
+                fail Refusal {
+                    code: "invalid_json",
+                    message: "request body names the key " + k + " twice in one object",
+                };
+            }
+            seen.append_str(k);
+            seen.append_str("\n");
+            self.out.append_str(k);
+            self.out.append_str(if self.spaced { ": " } else { ":" });
+            // past the colon
+            p = std::json::next_non_ws(t, p, n) + 1;
+            p = std::json::next_non_ws(t, self.value(t, p) or raise, n);
+            if std::str::byte_at_unchecked(t, p) == 44 { p = std::json::next_non_ws(t, p + 1, n); }
+        }
+        self.out.append_str("}");
+        return p + 1;
+    }
+
+    fn array(t: String, at: Int) -> Int fallible(Refusal) {
+        let n = len(t);
+        self.out.append_str("[");
+        let mut p = std::json::next_non_ws(t, at + 1, n);
+        let mut first = true;
+        while std::str::byte_at_unchecked(t, p) != 93 {
+            if !first { self.out.append_str(if self.spaced { ", " } else { "," }); }
+            first = false;
+            p = std::json::next_non_ws(t, self.value(t, p) or raise, n);
+            if std::str::byte_at_unchecked(t, p) == 44 { p = std::json::next_non_ws(t, p + 1, n); }
+        }
+        self.out.append_str("]");
+        return p + 1;
+    }
+
+    /// A number as Python reads it and writes it back: an integer as
+    /// itself (`-0` is `0`), anything with a fraction or an exponent as the
+    /// float it is.
+    fn number(t: String, at: Int) -> Int {
+        let n = len(t);
+        let mut e = at;
+        let mut float = false;
+        while e < n {
+            let c = std::str::byte_at_unchecked(t, e);
+            if c == 46 || c == 101 || c == 69 {
+                float = true;
+            } else if !(c == 45 || c == 43 || (c >= 48 && c <= 57)) {
+                break;
+            }
+            e = e + 1;
+        }
+        let s = t[at..e];
+        if !float {
+            self.out.append_str(if s == "-0" { "0" } else { s });
+        } else {
+            self.out.append_str(float_text(s));
+        }
+        return e;
+    }
+}
+
+/// `text` as Python writes it back: members apart with ", " and ": "
+/// (`spaced`, `json.dumps`'s default) or "," and ":" (jev_style's
+/// `compact_json`).
+fn dumps(text: String, spaced: Bool) -> String fallible(Refusal) {
+    let d = Dumper {
+        spaced: spaced,
+        out: std::bytes::BytesBuilder { initial_cap: len(text) + 16 },
+    };
+    d.value(text, 0) or raise;
+    return std::str::clone(d.out.text_view());
+}
+
+/// The JSON string at `at` written into `to` with Python's escapes; where
+/// it ends.
+fn string_into(to: std::bytes::BytesBuilder, t: String, at: Int) -> Int fallible(Refusal) {
+    to.append_str("\"");
+    let mut i = at + 1;
+    while true {
+        let c = std::str::byte_at_unchecked(t, i);
+        if c == 34 { break; }
+        if c != 92 {
+            to.append_u8(c);
+            i = i + 1;
+            continue;
+        }
+        let e = std::str::byte_at_unchecked(t, i + 1);
+        if e != 117 {
+            // \" \\ \/ \b \f \n \r \t: Python writes each as itself but `/`
+            if e == 47 { to.append_str("/"); } else { to.append_u8(92); to.append_u8(e); }
+            i = i + 2;
+            continue;
+        }
+        let mut cp = hex4(t, i + 2);
+        i = i + 6;
+        if cp >= 0xD800 && cp <= 0xDBFF {
+            let low = if std::str::byte_at_unchecked(t, i) == 92
+                && std::str::byte_at_unchecked(t, i + 1) == 117
+            {
+                hex4(t, i + 2)
+            } else {
+                    -1
+            };
+            if low < 0xDC00 || low > 0xDFFF {
+                fail Refusal {
+                    code: "invalid_json",
+                    message: "request body holds a lone surrogate escape",
+                };
+            }
+            cp = 0x10000 + (cp - 0xD800) * 1024 + (low - 0xDC00);
+            i = i + 6;
+        } else if cp >= 0xDC00 && cp <= 0xDFFF {
+            fail Refusal {
+                code: "invalid_json",
+                message: "request body holds a lone surrogate escape",
+            };
+        } else if cp == 0 {
+            fail Refusal {
+                code: "invalid_json",
+                message: "request body holds \\u0000, which is not taken",
+            };
+        }
+        char_into(to, cp);
+    }
+    to.append_str("\"");
+    return i + 1;
+}
+
+/// One character Python's way: `"` and `\` escaped, a control character
+/// as its short escape or `\u00XX`, anything else as its UTF-8.
+fn char_into(to: std::bytes::BytesBuilder, cp: Int) {
+    if cp == 34 || cp == 92 {
+        to.append_u8(92);
+        to.append_u8(cp);
+    } else if cp == 8 {
+        to.append_str("\\b");
+    } else if cp == 9 {
+        to.append_str("\\t");
+    } else if cp == 10 {
+        to.append_str("\\n");
+    } else if cp == 12 {
+        to.append_str("\\f");
+    } else if cp == 13 {
+        to.append_str("\\r");
+    } else if cp < 0x20 {
+        to.append_str("\\u00");
+        to.append_u8(hex_digit(cp / 16));
+        to.append_u8(hex_digit(cp % 16));
+    } else if cp < 0x80 {
+        to.append_u8(cp);
+    } else if cp < 0x800 {
+        to.append_u8(0xC0 + cp / 64);
+        to.append_u8(0x80 + cp % 64);
+    } else if cp < 0x10000 {
+        to.append_u8(0xE0 + cp / 4096);
+        to.append_u8(0x80 + (cp / 64) % 64);
+        to.append_u8(0x80 + cp % 64);
+    } else {
+        to.append_u8(0xF0 + cp / 262144);
+        to.append_u8(0x80 + (cp / 4096) % 64);
+        to.append_u8(0x80 + (cp / 64) % 64);
+        to.append_u8(0x80 + cp % 64);
+    }
+}
+
+fn hex_digit(v: Int) -> Int {
+    return if v < 10 { 48 + v } else { 87 + v };
+}
+
+/// The four hex digits at `at`, as a number.
+fn hex4(t: String, at: Int) -> Int {
+    let mut v = 0;
+    let mut i = at;
+    while i < at + 4 {
+        let c = std::str::byte_at_unchecked(t, i);
+        let d = if c >= 97 { c - 87 } else if c >= 65 { c - 55 } else { c - 48 };
+        v = v * 16 + d;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// A JSON number with a fraction or an exponent as Python writes the float
+/// it reads as: its `repr`, `Infinity` for one too large for a float and
+/// `0.0` for one too small (the two a parse refuses, told apart by the
+/// exponent's sign).
+fn float_text(s: String) -> String {
+    let neg = std::str::starts_with(s, "-");
+    let f = std::str::parse_float(s) or {
+        let tiny = std::str::contains(s, "e-") || std::str::contains(s, "E-");
+        return (if neg { "-" } else { "" }) + (if tiny { "0.0" } else { "Infinity" });
+    };
+    return float_repr(f);
+}
+
+/// Python's `repr` of a float: the shortest digits that read back as it
+/// (Hale's `to_string` gives the same digits), fixed while its exponent is
+/// -4 to 15, with `.0` on a whole number, else `1.5e+300`, `1e-05`.
+fn float_repr(f: Float) -> String {
+    let s = to_string(f);
+    let neg = std::str::starts_with(s, "-");
+    let sign = if neg { "-" } else { "" };
+    let body = if neg { s[1..len(s)] } else { s };
+    let mut mant = body;
+    let mut exp = 0;
+    let at = std::str::index_of(body, "e");
+    if at >= 0 {
+        mant = body[0..at];
+        let e = body[(at + 1)..len(body)];
+        exp = std::str::parse_int(
+            if std::str::starts_with(e, "+") { e[1..len(e)] } else { e },
+        ) or 0;
+    }
+    let dot = std::str::index_of(mant, ".");
+    let whole = if dot >= 0 { mant[0..dot] } else { mant };
+    let all = if dot >= 0 { whole + mant[(dot + 1)..len(mant)] } else { whole };
+    let mut k = 0;
+    while k < len(all) && std::str::byte_at_unchecked(all, k) == 48 { k = k + 1; }
+    if k == len(all) { return sign + "0.0"; }
+    let mut end = len(all);
+    while std::str::byte_at_unchecked(all, end - 1) == 48 { end = end - 1; }
+    let digits = all[k..end];
+    let nd = len(digits);
+    // the decimal exponent of the first digit
+    let x = exp + len(whole) - 1 - k;
+    if x >= -4 && x < 16 {
+        if x < 0 { return sign + "0." + std::str::repeat("0", -x - 1) + digits; }
+        if nd <= x + 1 { return sign + digits + std::str::repeat("0", x + 1 - nd) + ".0"; }
+        return sign + digits[0..(x + 1)] + "." + digits[(x + 1)..nd];
+    }
+    let ax = if x < 0 { -x } else { x };
+    return sign + digits[0..1] + (if nd > 1 { "." + digits[1..nd] } else { "" }) + "e"
+        + (if x < 0 { "-" } else { "+" }) + (if ax < 10 { "0" } else { "" }) + to_string(ax);
+}

@@ -750,3 +750,18 @@ draws its path through that instance as it runs. A row from before has none.
 ```sql
 alter table in_flight add column instance text not null default '';
 ```
+
+### Migration 22: the decision server
+
+The server a decision model runs on is voice's decision server, `decision`
+(its program `voice-decide`), named for what it serves rather than the
+model family it first served (`jev-style`). An operator's runtime with
+that server says so, and a placement on voice's MLX build names that
+build's new id: the archive was rebuilt with its launcher renamed, so the
+nodes fetch it again.
+
+```sql
+update runtime set body = jsonb_set(body, '{server}', '"decision"') where body->>'server' = 'jev-style';
+update placement set body = jsonb_set(body, '{runtime}', '"decision-0.3.0-mlx"') where body->>'runtime' = 'jev-style-0.3.0-mlx';
+update placement set body = jsonb_set(body, '{fit}', (select jsonb_agg(case when f->>'runtime' = 'jev-style-0.3.0-mlx' then jsonb_set(f, '{runtime}', '"decision-0.3.0-mlx"') else f end order by n) from jsonb_array_elements(body->'fit') with ordinality as e(f, n))) where body->'fit' @> '[{"runtime": "jev-style-0.3.0-mlx"}]';
+```

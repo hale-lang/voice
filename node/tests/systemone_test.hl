@@ -1,0 +1,192 @@
+// A decision model's request on an openai-compatible seat (`endpoint:
+// systemone`): the body posted whole to `<base_url>/systemone`, naming the
+// seat's model, keyed when the seat has a key; the upstream's answer played
+// as one `systemone.answer` event; an upstream that refuses or errs fails the
+// run with its own error, so the coordinator moves on.
+import ".." as node;
+
+const ANSWER: String = "{\"model\":\"jev-2b\",\"answers\":{\"route\":{\"type\":\"choice\",\"choice\":\"billing\",\"confidence\":0.9,\"probabilities\":{\"billing\":0.95,\"security\":0.05}}},\"usage\":{\"input_tokens\":42,\"state_tokens\":30,\"output_tokens\":0}}";
+
+const ASK: String = "{\"state\":\"I was charged twice.\",\"questions\":{\"route\":{\"type\":\"choice\",\"instructions\":\"Which team?\",\"criteria\":{\"billing\":\"charges\",\"security\":\"access\"}}}}";
+
+fn answer(s: std::io::tcp::Stream, status: String, body: String) {
+    s.send(
+        "HTTP/1.1 " + status + "\r\nContent-Type: application/json\r\nContent-Length: "
+            + to_string(len(body)) + "\r\nConnection: close\r\n\r\n" + body,
+    ) or discard;
+}
+
+/// The request off the connection, whole: the client may send its head and
+/// its body in separate writes.
+fn read_request(s: std::io::tcp::Stream) -> String {
+    let mut req = s.recv(65536) or "";
+    let he = std::str::index_of(req, "\r\n\r\n");
+    if he < 0 { return req; }
+    let lowered = std::str::lower(req[0..he]);
+    let at = std::str::index_of(lowered, "content-length:");
+    if at < 0 { return req; }
+    let rest = lowered[(at + 15)..len(lowered)];
+    let end = std::str::index_of(rest, "\r\n");
+    let want = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or 0;
+    while len(req) < he + 4 + want {
+        let more = s.recv(65536) or "";
+        if len(more) == 0 { break; }
+        req = req + more;
+    }
+    return req;
+}
+
+/// The stub upstream: `/v1` answers a keyed request that names the seat's
+/// model and carries the questions; `/v2` errs as a server; `/v3` refuses
+/// the request as Jev does a malformed question.
+fn stub_conn(s: std::io::tcp::Stream) {
+    let req = read_request(s);
+    if std::str::starts_with(req, "POST /v1/systemone ") {
+        if std::str::contains(req, "Authorization: Bearer stub-key")
+            && std::str::contains(req, "\"model\":\"jev-2b\"")
+            && std::str::contains(req, "\"questions\":")
+            && !std::str::contains(req, "\"model\":\"decide\"")
+        {
+            answer(s, "200 OK", ANSWER);
+            return;
+        }
+        answer(s, "401 Unauthorized", "{\"error\":{\"message\":\"bad key\"}}");
+        return;
+    }
+    if std::str::starts_with(req, "POST /v2/systemone ") {
+        answer(s, "500 Internal Server Error", "{\"error\":{\"message\":\"engine crashed\"}}");
+        return;
+    }
+    if std::str::starts_with(req, "POST /v3/systemone ") {
+        answer(
+            s,
+            "422 Unprocessable Entity",
+            "{\"error\":{\"code\":\"invalid_question\",\"message\":\"choice needs criteria\",\"question\":\"route\"}}",
+        );
+        return;
+    }
+    answer(s, "404 Not Found", "{}");
+}
+
+/// Takes the stub's connections, one at a time, on a listener the test
+/// bound.
+locus Stub {
+    params { fd: Int = -1; }
+    run() {
+        while true {
+            let conn = std::io::tcp::accept_one(self.fd) or - 1;
+            if conn < 0 { return; }
+            stub_conn(std::io::tcp::Stream { conn_fd: conn, owns_fd: false });
+            std::io::tcp::close_fd(conn);
+        }
+    }
+}
+
+fn free_port() -> Int {
+    let mut port = 21000 + std::process::pid() % 9000;
+    while port < 30000 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+main locus App {
+    params {
+        srv: Stub = Stub { };
+        base: String = "";
+    }
+    placement { srv: cooperative(pool = io); }
+    run() {
+        std::time::sleep(200ms);
+        let keyed = node::compat_config(
+            "{\"base_url\": \"" + self.base
+                + "/v1\", \"model\": \"jev-2b\", \"api_key_vault\": \"voice-s1-key\"}",
+        );
+        std::test::assert_eq_str(keyed.problem, "", "a valid config");
+        // the caller named an alias; the upstream is asked for the seat's model
+        let asked = "{\"model\":\"decide\"," + ASK[1..len(ASK)];
+        let run = node::run_systemone("decide", "", asked, keyed);
+        std::test::assert_eq_str(run.outcome, "served", "served: " + run.failure);
+        std::test::assert_eq_str(run.model, "jev-2b", "the model the upstream reported");
+        std::test::assert_eq_int(run.input_tokens, 42, "its input tokens");
+        std::test::assert_eq_int(run.output_tokens, 0, "and no output tokens");
+        std::test::assert(
+            std::str::starts_with(
+                run.script,
+                "{\"type\":\"systemone.answer\",\"answer\":{\"model\":\"jev-2b\"",
+            ),
+            "one event, the answer whole: " + run.script,
+        );
+        std::test::assert(!std::str::contains(run.script, "stub-key"), "the key is not played");
+        std::test::assert(
+            node::is_output(std::str::trim(run.script)),
+            "the answer is the run's first output",
+        );
+        std::test::assert(
+            std::str::contains(
+                node::result_message("resp_s1", run, 1, 2),
+                "\"outcome\":\"served\"",
+            ),
+            "and its result says served",
+        );
+
+        // the seat's own name for the model, when the serve gives one
+        let named = node::run_systemone("decide", "jev-2b", asked, keyed);
+        std::test::assert_eq_str(
+            named.outcome,
+            "served",
+            "named by engine_model: " + named.failure,
+        );
+
+        let crashed = node::run_systemone(
+            "decide",
+            "",
+            ASK,
+            node::compat_config("{\"base_url\": \"" + self.base + "/v2\", \"model\": \"jev-2b\"}"),
+        );
+        std::test::assert_eq_str(crashed.outcome, "failed", "an upstream error fails the run");
+        std::test::assert_eq_str(
+            crashed.failure,
+            "the upstream answered 500: engine crashed",
+            "with the upstream's error",
+        );
+        let refused = node::run_systemone(
+            "decide",
+            "",
+            ASK,
+            node::compat_config("{\"base_url\": \"" + self.base + "/v3\", \"model\": \"jev-2b\"}"),
+        );
+        std::test::assert_eq_str(
+            refused.failure,
+            "the upstream answered 422 (invalid_question): choice needs criteria",
+            "a refused question keeps the upstream's code",
+        );
+        let away = node::run_systemone(
+            "decide",
+            "",
+            ASK,
+            node::compat_config("{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"jev-2b\"}"),
+        );
+        std::test::assert(
+            std::str::contains(away.failure, "could not be reached"),
+            "an upstream nobody serves: " + away.failure,
+        );
+    }
+}
+
+fn main() {
+    std::io::fs::write_file(
+        std::secret::vault_local_dir() + "/voice-s1-key",
+        "stub-key",
+    ) or discard;
+    let port = free_port();
+    std::test::assert(port > 0, "a free loopback port");
+    let fd = std::io::tcp::listen_socket("127.0.0.1", port) or - 1;
+    std::test::assert(fd >= 0, "the stub listens");
+    App { srv: Stub { fd: fd }, base: "http://127.0.0.1:" + to_string(port) };
+}

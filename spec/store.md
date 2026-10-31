@@ -696,3 +696,25 @@ alter table project alter column peek drop not null;
 alter table project alter column peek drop default;
 update project set peek = null where peek = false;
 ```
+
+### Migration 18: requests in flight
+
+A request offered to a seat has a row for as long as that attempt runs,
+written anew for each attempt; the admin event stream tells each new row as
+a `request` event, so a live view keeps a request lit until its usage is
+recorded. A row an api left behind (it stopped mid-request) is only ever
+read for its `seq`, and is gone when the same request id is written again.
+
+```sql
+create table in_flight (
+  seq bigserial not null,
+  request_id text primary key,
+  project text not null,
+  key text not null,
+  model text not null,
+  seat text not null,
+  account text not null,
+  started_at timestamptz not null
+);
+create index in_flight_by_seq on in_flight (seq);
+```

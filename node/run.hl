@@ -239,7 +239,7 @@ locus Runner {
                 port,
                 models,
                 self.data + "/blobs",
-                std::json::find_string_field(runtime, "accelerator") == "cuda",
+                gpu_args(std::json::find_string_field(runtime, "accelerator")),
                 std::json::find_string_field(artifact, "image") + "@"
                     + std::json::find_string_field(artifact, "digest"),
                 server_args(
@@ -552,14 +552,14 @@ const CONTEXT_ASKS: Int = 20;
 
 /// `docker run` for a container runtime: its port on loopback only, the
 /// weights and the store they link into mounted read-only at the paths the
-/// links name, the GPUs when it runs on CUDA.
+/// links name, and its accelerator's devices (`gpu_args`).
 fn container_argv(
     name: String,
     owner: String,
     port: Int,
     models: String,
     blobs: String,
-    cuda: Bool,
+    gpu: String,
     image: String,
     args: String
 ) -> String {
@@ -570,8 +570,28 @@ fn container_argv(
     // offline: a server reads the weights it was given and nothing from
     // the hub; and room in shared memory, which vLLM's workers need
         + "-e\nHF_HUB_OFFLINE=1\n-e\nTRANSFORMERS_OFFLINE=1\n--shm-size\n8g\n"
-        + (if cuda { "--gpus\nall\n" } else { "" })
+        + gpu
         + image + "\n" + args;
+}
+
+/// What `docker run` needs to hand a container its runtime's accelerator,
+/// one argument a line: every NVIDIA GPU for CUDA; ROCm's compute device and
+/// the render devices for ROCm, the render devices for Vulkan, each with the
+/// groups that own them on this machine (their ids differ between machines).
+fn gpu_args(accelerator: String) -> String {
+    if accelerator == "cuda" { return "--gpus\nall\n"; }
+    if accelerator != "rocm" && accelerator != "vulkan" { return ""; }
+    let render = std::str::trim(
+        run_out("sh\n-c\nstat -c %g /dev/dri/renderD* 2>/dev/null | head -n 1"),
+    );
+    let mut out = "--device\n/dev/dri\n";
+    if accelerator == "rocm" {
+        out = out + "--device\n/dev/kfd\n";
+        let kfd = std::str::trim(run_out("stat\n-c\n%g\n/dev/kfd"));
+        if len(kfd) > 0 && kfd != render { out = out + "--group-add\n" + kfd + "\n"; }
+    }
+    if len(render) > 0 { out = out + "--group-add\n" + render + "\n"; }
+    return out;
 }
 
 /// macOS's sandbox for an archive runtime: it writes only `dir` and the

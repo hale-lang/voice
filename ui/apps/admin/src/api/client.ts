@@ -59,6 +59,26 @@ export function useGet<P extends GetPaths>(path: P, ...init: InitParam<MaybeOpti
 }
 
 /**
+ * A typed GET of what never changes once written (a request's recording):
+ * read once, kept, never refetched, and a miss is not retried.
+ */
+export function useGetOnce<P extends GetPaths>(path: P, ...init: InitParam<MaybeOptionalInit<paths[P], 'get'>>) {
+  return useQuery({
+    queryKey: [path, init[0] ?? null],
+    queryFn: async () => {
+      const r = await api.GET(path, ...init);
+      if (r.error !== undefined || r.data === undefined) {
+        throw new Error(describe(r.error, r.response.status));
+      }
+      return r.data;
+    },
+    staleTime: Infinity,
+    refetchInterval: false,
+    retry: false,
+  });
+}
+
+/**
  * What a failure says. The control plane answers a class's variant,
  * `{"NotFound": {"code", "message"}}` (a transport refusal is
  * `{"refusal": {"kind", "reason"}}`); the data plane keeps the OpenAI-shaped

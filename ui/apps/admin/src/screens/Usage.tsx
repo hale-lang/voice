@@ -6,11 +6,12 @@ import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
+import { Board } from './Board';
 
 /** Requests a page holds. */
 const PAGE = 50;
 
-/** Summaries first, then the records behind them, a page at a time. */
+/** The board of conversations, live; summaries; then the records behind them, a page at a time. */
 export function Usage({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
   // the cursors of the pages before this one, newest first: older pushes
@@ -34,6 +35,13 @@ export function Usage({ route, setInspector }: ScreenProps) {
   return (
     <>
       <h1>Usage</h1>
+      <Board
+        onOpen={(f) => {
+          // a conversation narrows the requests to its turns
+          if (f.conversation) setFilter({ ...NO_FILTER, conversation: f.conversation });
+          go('usage', f.last_request);
+        }}
+      />
       <PanelGrid>
         <Summary group="project" />
         <Summary group="account" />
@@ -130,6 +138,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
+          { k: 'conversation', v: r.conversation ? <Mono>{r.conversation}</Mono> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
           { k: 'tokens', v: `${count(r.input_tokens)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
@@ -163,9 +172,9 @@ function Metadata({ of }: { of: unknown }) {
  * cutoff `since` chose, fixed when it was chosen, so the query (and its
  * cache) stays the same across renders and pages.
  */
-type Filter = { project: string; key: string; model: string; account: string; metadata: string; since: string; from: string };
+type Filter = { project: string; key: string; model: string; account: string; conversation: string; metadata: string; since: string; from: string };
 
-const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', metadata: '', since: '', from: '' };
+const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', conversation: '', metadata: '', since: '', from: '' };
 
 /** The time ranges offered, as how far back, in seconds. */
 const SINCE: { value: string; label: string }[] = [
@@ -189,6 +198,7 @@ function query(f: Filter) {
     ...(f.key ? { key: [f.key.trim()] } : {}),
     ...(f.model ? { model: [f.model] } : {}),
     ...(f.account ? { account: [f.account] } : {}),
+    ...(f.conversation.trim() ? { conversation: f.conversation.trim() } : {}),
     ...(pair ? { metadata: [pair] } : {}),
     ...(f.from ? { from: f.from } : {}),
   };
@@ -221,6 +231,10 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
       <label>
         <div className="faint">key</div>
         <TextInput mono value={f.key} onChange={set('key')} placeholder="k_…" />
+      </label>
+      <label>
+        <div className="faint">conversation</div>
+        <TextInput mono value={f.conversation} onChange={set('conversation')} placeholder="its prompt_cache_key" />
       </label>
       <label>
         <div className={badPair ? 'c-wait' : 'faint'}>{badPair ? 'metadata: one name=value' : 'metadata'}</div>

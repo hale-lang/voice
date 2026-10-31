@@ -209,7 +209,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
           {!demo && <a href={`#/usage/${encodeURIComponent(trace.id)}`}>Open usage record →</a>}
         </> : <>
           <h3>One connected system</h3><h2>Follow the work.</h2>
-          {!demo && <p className={s.small}>Only reported participants appear. API-instance identity is not exposed by UsageRecord yet; repository and other metadata are caller-supplied labels.</p>}
+          {!demo && <p className={s.small}>Only reported participants appear. A request's api instance is the one its usage record names; repository and other metadata are caller-supplied labels.</p>}
           <p className="muted">The whole fleet shares one field. Directional forces spread execution toward the models, while related entities settle around each other. Models are execution targets; projects, repositories, accounts and other context stay attached to the same request.</p>
           <div className={s.key}><span className="c-active">●</span><span>Reported in-flight work or a newly completed request</span><span className="c-wait">◐</span><span>Paused, pending or waiting</span><span className="c-fail">✕</span><span>Failed, down or exhausted</span></div>
           <p className="muted">Click any combination of entities to find their shared requests. Search includes every reported dimension. Optional context appears when supplied; selecting it never rearranges the network.</p>
@@ -232,7 +232,7 @@ function Marker({ kind }: { kind: Kind }) {
 
 /** A request in flight as a record the graph can light: what it is, and the seat it is on. */
 function provisional(f: Flight): UsageRecord {
-  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {} } as unknown as UsageRecord;
+  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {}, instance: (f as { instance?: string | null }).instance ?? null } as unknown as UsageRecord;
 }
 
 function Constellation({ layout, graph, selected, focusedIds, focusedEdges, pulses, paused, onSelect, onHover }: { layout: Graph; graph: Graph; selected: string[]; focusedIds: Set<string>; focusedEdges: Set<string>; pulses: Pulse[]; paused: boolean; onSelect: (id: string) => void; onHover: (id: string | null) => void }) {

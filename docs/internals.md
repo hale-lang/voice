@@ -386,8 +386,10 @@ heartbeats with the assignment version it applied. On NATS it takes
 `assign`, and answers `serve` at once with `accepted` or `refused`, then
 serves the request on its seat with the static engine, streaming the
 standard's events and the result to the reply subject the request named
-(`protocol.yaml`); a `cancel` stops it. It serves one request at a time,
-and refuses a `serve` that arrives meanwhile, so the request goes to
+(`protocol.yaml`); a `cancel` stops it. It serves several at once: each
+accepted `serve` goes to a slot of its own ([`node/serve.hl`](../node/serve.hl),
+eight, each its own thread), up to the node's cap and up to each seat's
+`concurrency`, and a `serve` past either is refused, so the request goes to
 another seat. Core NATS delivers an `assign` at most once, so a node reads
 its assignment each time it is on NATS again, and the api sends the
 assignment again to a node whose heartbeat says it is behind.

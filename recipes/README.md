@@ -12,7 +12,10 @@ simulates which current models fit each memory tier and platform
 its publisher's weights at a pinned commit, or llama.cpp's own GGUF build
 (`ggml-org`, the one fallback), keeping only what the pinned runtimes can
 load and the license allows ([`docs/catalog-recipes.md`](../docs/catalog-recipes.md)
-says why each is in or out). `qwen3-0.6b` is hand-made, the smallest
+says why each is in or out), and writes which recipe a node of each
+platform and memory tier is offered per category
+([`catalog/picks.json`](../catalog/picks.json), by
+[`scripts/catalog-picks.py`](../scripts/catalog-picks.py)). `qwen3-0.6b` is hand-made, the smallest
 end-to-end check. A recipe's `context_length` is the longest context the
 model is made for, from its config (`max_position_embeddings`). Its
 `memory_bytes` provides for 32768 tokens of context, which is the most a

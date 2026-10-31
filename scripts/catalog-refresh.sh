@@ -34,6 +34,8 @@ for round in $(seq 1 "$MAX_ROUNDS"); do
   if [ "$after" = "$before" ]; then
     echo "settled after $round round(s): $after blocked" >&2
     python3 scripts/recipes-table.py >&2
+    # what a node of each platform and memory is offered, per category
+    python3 scripts/catalog-picks.py
     exit 0
   fi
 done

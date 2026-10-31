@@ -1,0 +1,118 @@
+// The texts jev-serve tokenizes for a request are the Jev release's own,
+// byte for byte, and it refuses what the release refuses, with the same
+// code and question; given the release's tokens for those texts, the
+// request it sends the scorer is the release's (the same tokens, blocks
+// and slots), and one over its budget is refused. Each case in fixtures/
+// (scripts/jev-parity.py) is a request the release's Python read; given
+// scores for it, its answers are the release's and jev_style's, each
+// number to 1e-12.
+import ".." as jev;
+import "fixtures" as fx;
+
+/// A JSON string in one spelling, Python's, so two that hold the same
+/// text compare equal however each was escaped.
+fn same(raw: String) -> String {
+    return jev::dumps(raw, true) or "<unwritable>";
+}
+
+/// Two JSON values alike: the same text, and the same numbers to 1e-12.
+fn alike(got: String, want: String) -> Bool {
+    let g = std::str::trim(got);
+    let w = std::str::trim(want);
+    if std::str::starts_with(w, "{") {
+        let mut it = std::json::object_first(w);
+        while !it.done {
+            let k = std::json::obj_key_string(it, w);
+            if !alike(std::json::find_field_raw(g, k), std::json::obj_value_raw(it, w)) {
+                return false;
+            }
+            it = std::json::object_next(it, w);
+        }
+        return true;
+    }
+    let x = std::str::parse_float(w) or {
+        return same(g) == same(w);
+    };
+    let y = std::str::parse_float(g) or - 1000.0;
+    let d = x - y;
+    return d < 0.000000000001 && d > -0.000000000001;
+}
+
+fn main() {
+    let glue = jev::glue_of(fx::GLUE_TOKENS, fx::READOUT_CONFIG) or {
+        std::test::assert(false, "the glue: " + err.message);
+        jev::Glue { }
+    };
+    std::test::assert(count(glue.named) == 255, "every option's label");
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    let mut cases = 0;
+    while from >= 0 {
+        let c = it.line_at(fx::RENDER_CASES, from);
+        from = it.next_idx(fx::RENDER_CASES, from);
+        if len(std::str::trim(c)) == 0 { continue; }
+        cases = cases + 1;
+        let body = std::json::find_string_field(c, "body");
+        let want = std::json::string_field(c, "error");
+        let mut code = "";
+        let mut question = "";
+        let d = jev::parse(body) or {
+            code = err.code;
+            question = err.question;
+            jev::Decision { }
+        };
+        if want.kind == "string" {
+            std::test::assert(
+                code == want.text,
+                "refused as " + want.text + ", not " + code + ": " + body,
+            );
+            std::test::assert(
+                same(jev::jq(question)) == same(std::json::find_field_raw(c, "question")),
+                "refused naming " + std::json::find_field_raw(c, "question") + ": " + body,
+            );
+            continue;
+        }
+        std::test::assert(len(code) == 0, "read, not refused (" + code + "): " + body);
+        let got = "[" + jev::texts(d) + "]";
+        let expect = std::str::trim(std::json::find_field_raw(c, "texts"));
+        let mut g = std::json::array_first(got);
+        let mut e = std::json::array_first(expect);
+        let mut i = 0;
+        while !e.done {
+            std::test::assert(!g.done, "text " + to_string(i) + " missing: " + body);
+            std::test::assert(
+                same(std::str::trim(g.element)) == same(std::str::trim(e.element)),
+                "text " + to_string(i) + " is " + std::str::trim(e.element) + ", not "
+                    + std::str::trim(g.element),
+            );
+            g = std::json::array_next(g);
+            e = std::json::array_next(e);
+            i = i + 1;
+        }
+        std::test::assert(g.done, "no texts beyond the release's: " + body);
+
+        let tokens = std::str::trim(std::json::find_field_raw(c, "tokens"));
+        let mut over = false;
+        let r = jev::render(d, glue, tokens, std::json::find_int_field(c, "limit")) or {
+            over = err.code == "input_budget_exceeded";
+            jev::Rendered { }
+        };
+        if std::json::find_bool_field(c, "budget") {
+            std::test::assert(over, "over the budget, refused: " + body);
+            continue;
+        }
+        std::test::assert(
+            same(r.request) == same(std::str::trim(std::json::find_field_raw(c, "request"))),
+            "the scorer's request is the release's: " + body,
+        );
+        let scored = std::str::trim(std::json::find_field_raw(c, "scored"));
+        let a = jev::answers(d, scored, jev::temperature_of(fx::READOUT_CONFIG), r) or "<refused: "
+            + err.message + ">";
+        let want = std::str::trim(std::json::find_field_raw(c, "answers"));
+        std::test::assert(
+            alike("{" + a + "}", want),
+            "the answers are the release's: " + want + ", not {" + a + "}",
+        );
+    }
+    std::test::assert(cases > 40, "the cases were read");
+}

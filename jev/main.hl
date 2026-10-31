@@ -1,0 +1,310 @@
+/// jev-serve: Jev-Style 2B Decision v3 on llama.cpp, serving systemone.
+///
+///     jev-serve --weights DIR [--host 127.0.0.1] [--port 8080] [--scorer PATH]
+///               [--ngl 999] [--threads N]
+///
+/// DIR holds the release's GGUF (one `*.gguf`) and its readout_config.json;
+/// the scorer, jev-score-v2, is next to this program unless `--scorer`
+/// says. The arguments are the jev-style server's, which a node starts
+/// (node/run.hl), so a node runs either the same way.
+///
+///     POST /v1/systemone   decisions (request.hl, readout.hl)
+///     GET  /v1/models      the one model
+///     GET  /healthz        200 once the model is loaded
+///
+/// One model, one scorer: requests are served one at a time, in the order
+/// they come, which is what the scorer can do. The health check is read
+/// only while a seat starts, before any request comes.
+
+import "../lib/logfmt" as logfmt;
+
+const MODEL_ID: String = "jev-style-2b-decision-v3";
+/// What readout_config.json must say: the protocol this renderer writes.
+const READOUT_FORMAT: String = "macjev-readout-v2";
+const TEMPLATE: String = "macjev-render-v2-long-options";
+/// What the GGUF must be: another model's gives plausible, wrong answers.
+const GGUF_KEYS: String = "[\"general.architecture\",\"qwen35.block_count\",\"qwen35.embedding_length\"]";
+/// A request's largest body: a full context of state, escaped.
+const BODY_MAX: Int = 4194304;
+
+main locus Serve {
+    params {
+        weights: String = "";
+        host: String = "127.0.0.1";
+        port: Int = 8080;
+        scorer: String = "";
+        ngl: Int = 999;
+        threads: Int = 0;
+        decider: Decider = Decider { };
+    }
+
+    run() {
+        let problem = self.decider.load(self.weights, self.scorer, self.ngl, self.threads);
+        if len(problem) > 0 {
+            log_error(problem, "");
+            std::process::exit(1);
+        }
+        log_info(
+            "serving",
+            std::log::kv("model", MODEL_ID) + " "
+                + std::log::kv("at", self.host + ":" + to_string(self.port)),
+        );
+        std::http::Server {
+            host: self.host,
+            port: self.port,
+            handler: self.decider,
+            max_request_bytes: BODY_MAX,
+            too_large: std::http::Response {
+                status: 413,
+                content_type: "application/json",
+                body: "{\"error\": {\"code\": \"invalid_request\", \"message\": \"request body is too large\"}}",
+            },
+        };
+    }
+}
+
+/// The model behind the endpoints: its scorer, the glue tokens and the
+/// calibrated temperature.
+locus Decider {
+    params {
+        scorer: Scorer = Scorer { };
+        glue: Glue = Glue { };
+        temperature: Float = 1.0;
+        backend: String = "llama.cpp";
+    }
+
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let c = std::http::build_context(req);
+        if std::http::is_route(c, "POST", "/v1/systemone") {
+            let t0 = std::time::monotonic_ns();
+            let body = self.systemone(req.body) or { return error_response(err); };
+            return json_response(200, body + ", " + timing(t0) + "}");
+        }
+        if std::http::is_route(c, "GET", "/v1/models") {
+            return json_response(
+                200,
+                "{\"object\": \"list\", \"data\": [{\"id\": \"" + MODEL_ID
+                    + "\", \"context_tokens\": "
+                    + to_string(CONTEXT_LIMIT) + ", \"head_max_tokens\": "
+                    + to_string(CONTEXT_LIMIT)
+                    + ", \"backend\": \"" + self.backend + "\"}], \"models\": [{\"name\": \""
+                    + MODEL_ID
+                    + "\", \"release_date\": null, \"description\": \"Jev-Style 2B Decision v3: local typed decisions (noul / choice / score)\"}]}",
+            );
+        }
+        if std::http::is_route(c, "GET", "/healthz") {
+            return json_response(
+                200,
+                "{\"status\": \"ok\", \"model\": \"" + MODEL_ID + "\", \"backend\": \""
+                    + self.backend
+                    + "\", \"auth\": false, \"untrained\": false, \"release_kind\": \"release\"}",
+            );
+        }
+        return error_response(
+            Refusal {
+                status: 404,
+                code: "not_found",
+                message: "no such endpoint: " + req.method + " " + req.path,
+            },
+        );
+    }
+
+    /// One request answered: the response's members up to its timing.
+    fn systemone(body: String) -> String fallible(Refusal) {
+        let d = parse(body) or raise;
+        let tokens = self.ask("{\"cmd\":\"tokenize_many\",\"texts\":[" + texts(d) + "]}") or raise;
+        let r = render(d, self.glue, tokens, CONTEXT_LIMIT) or raise;
+        let scored = self.ask(r.request) or raise;
+        let a = answers(d, scored, self.temperature, r) or raise;
+        return "{\"model\": \"" + MODEL_ID + "\", \"answers\": {" + a
+            + "}, \"usage\": {\"input_tokens\": "
+            + to_string(r.state_tokens + r.head_tokens) + ", \"state_tokens\": "
+            + to_string(r.state_tokens)
+            + ", \"output_tokens\": 0}, \"backend\": \"" + self.backend + "\"";
+    }
+
+    fn ask(request: String) -> String fallible(Refusal) {
+        let got = self.scorer.ask(request);
+        if len(got) == 0 {
+            fail Refusal { status: 500, code: "internal_error", message: self.scorer.failure };
+        }
+        return got;
+    }
+
+    /// The model loaded: its readout checked, its scorer started on its
+    /// GGUF and the GGUF checked, the glue tokenized. "" when ready, else
+    /// why not.
+    fn load(weights: String, scorer: String, ngl: Int, threads: Int) -> String {
+        if len(weights) == 0 {
+            return "usage: jev-serve --weights DIR [--host H] [--port P] [--scorer PATH]";
+        }
+        let cfg = std::io::fs::read_file(weights + "/readout_config.json") or "";
+        if !std::json::valid_object(cfg) {
+            return weights + "/readout_config.json is missing or not JSON";
+        }
+        let wrong = readout_mismatch(cfg);
+        if len(wrong) > 0 {
+            return "readout_config.json does not describe this runtime's protocol: " + wrong;
+        }
+        let temps = std::json::find_field_raw(cfg, "temperatures");
+        self.temperature = std::str::parse_float(
+            std::str::trim(std::json::find_field_raw(temps, "global")),
+        ) or 0.0;
+        if !(self.temperature > 0.0) || self.temperature == std::math::inf() {
+            return "readout_config.json's temperatures.global must be finite and above 0";
+        }
+        let gguf = one_gguf(weights);
+        if len(gguf) == 0 { return weights + " holds no single .gguf file"; }
+        let program = if len(scorer) > 0 { scorer } else { beside_self("jev-score-v2") };
+        self.scorer.start(
+            program + "\n--model\n" + gguf + "\n--n-ctx\n32768\n--n-ubatch\n2048\n--ngl\n"
+                + to_string(ngl)
+                + "\n--flash-attn\ndefault\n--n-outputs-max\n512\n--cache-type\nf16"
+                + (if threads > 0 { "\n--threads\n" + to_string(threads) } else { "" }),
+        );
+        if len(self.scorer.failure) > 0 { return self.scorer.failure; }
+        let ready = self.scorer.ready;
+        if std::json::find_string_field(ready, "protocol") != "jev-score-v2"
+            || std::json::find_string_field(ready, "attention_type") != "non_causal"
+            || std::json::find_int_field(ready, "n_ubatch") != BLOCK
+            || std::json::find_int_field(ready, "n_batch") != BLOCK {
+                return "the scorer does not speak the v2 block protocol: " + ready;
+            }
+        let meta = std::json::find_field_raw(
+            self.scorer.ask("{\"cmd\":\"meta\",\"keys\":" + GGUF_KEYS + "}"),
+            "meta",
+        );
+        if std::json::find_string_field(meta, "general.architecture") != "qwen35"
+            || std::json::find_string_field(meta, "qwen35.block_count") != "24"
+            || std::json::find_string_field(meta, "qwen35.embedding_length") != "2048" {
+                return gguf + " is not a Jev-Style-2B-Decision-v3 GGUF: " + meta;
+            }
+        return self.tokenize_glue(cfg);
+    }
+
+    /// The fixed pieces tokenized, and the readout's tokens checked.
+    fn tokenize_glue(cfg: String) -> String {
+        let got = self.scorer.ask("{\"cmd\":\"tokenize_many\",\"texts\":[" + glue_texts() + "]}");
+        if len(got) == 0 { return self.scorer.failure; }
+        let mut problem = "";
+        self.glue = glue_of(got, cfg) or {
+            problem = err.message;
+            Glue { }
+        };
+        return problem;
+    }
+}
+
+/// The first member of readout_config.json that is not what this renderer
+/// writes, "" when none is.
+fn readout_mismatch(cfg: String) -> String {
+    if std::json::find_string_field(cfg, "format") != READOUT_FORMAT { return "format"; }
+    if std::json::find_string_field(cfg, "template") != TEMPLATE { return "template"; }
+    if std::json::find_string_field(cfg, "layout") != "sb" { return "layout"; }
+    if std::json::find_string_field(cfg, "readout") != "verdict" { return "readout"; }
+    if std::json::find_int_field(cfg, "block_size") != BLOCK { return "block_size"; }
+    if std::json::find_int_field(cfg, "total_context_limit") != CONTEXT_LIMIT {
+        return "total_context_limit";
+    }
+    return "";
+}
+
+/// The release's calibrated temperature, readout_config.json's
+/// `temperatures.global`; 0 when it gives none.
+fn temperature_of(cfg: String) -> Float {
+    let temps = std::json::find_field_raw(cfg, "temperatures");
+    return std::str::parse_float(std::str::trim(std::json::find_field_raw(temps, "global"))) or 0.0;
+}
+
+/// The one `*.gguf` in `dir`, as a path; "" for none or several.
+fn one_gguf(dir: String) -> String {
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let mut found = "";
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if std::str::ends_with(name, ".gguf") {
+            if len(found) > 0 { return ""; }
+            found = dir + "/" + name;
+        }
+    }
+    return found;
+}
+
+/// A program shipped beside this one.
+fn beside_self(name: String) -> String {
+    let me = std::env::arg(0);
+    let mut at = -1;
+    let mut i = std::str::index_of(me, "/");
+    while i >= 0 {
+        at = i;
+        i = std::str::index_of_from(me, "/", i + 1);
+    }
+    return if at >= 0 { me[0..(at + 1)] + name } else { name };
+}
+
+/// The request's time, rounded to a tenth of a millisecond, as systemone
+/// gives it.
+fn timing(t0: Int) -> String {
+    let ms = std::math::int_to_float(
+        std::math::round(std::math::int_to_float(std::time::monotonic_ns() - t0) / 100000.0),
+    ) / 10.0;
+    return "\"latency_ms\": " + to_string(ms) + ", \"timing\": {\"total_ms\": " + to_string(ms)
+        + "}";
+}
+
+fn json_response(status: Int, body: String) -> std::http::Response {
+    return std::http::Response { status: status, content_type: "application/json", body: body };
+}
+
+/// A refusal as the contract's error body.
+fn error_response(r: Refusal) -> std::http::Response {
+    return json_response(
+        r.status,
+        "{\"error\": {\"code\": \"" + r.code + "\", \"message\": \""
+            + std::json::escape_string(r.message) + "\""
+            + (if len(r.question) > 0 { ", \"question\": \"" + r.question + "\"" } else { "" })
+            + "}}",
+    );
+}
+
+fn log_info(msg: String, fields: String) {
+    let log = std::log::Logger { name: "voice.jev" };
+    log.info_kv(msg, fields);
+}
+
+fn log_error(msg: String, fields: String) {
+    let log = std::log::Logger { name: "voice.jev" };
+    log.error_kv(msg, fields);
+}
+
+fn main() {
+    let sink = logfmt::RecordSink { };
+    let mut weights = "";
+    let mut host = "127.0.0.1";
+    let mut port = 8080;
+    let mut scorer = "";
+    let mut ngl = 999;
+    let mut threads = 0;
+    let mut i = 1;
+    while i + 1 < std::env::args_count() {
+        let flag = std::env::arg(i);
+        let value = std::env::arg(i + 1);
+        if flag == "--weights" {
+            weights = value;
+        } else if flag == "--host" {
+            host = value;
+        } else if flag == "--port" {
+            port = std::str::parse_int(value) or 0;
+        } else if flag == "--scorer" {
+            scorer = value;
+        } else if flag == "--ngl" {
+            ngl = std::str::parse_int(value) or 999;
+        } else if flag == "--threads" {
+            threads = std::str::parse_int(value) or 0;
+        }
+        i = i + 2;
+    }
+    Serve { weights: weights, host: host, port: port, scorer: scorer, ngl: ngl, threads: threads };
+}

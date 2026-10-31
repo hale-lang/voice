@@ -1,0 +1,132 @@
+// The readout (macjev-readout-v2) and the answers systemone gives.
+//
+// Each option's score is logit(" yes") - logit(" no") at its slot; its
+// probability is softmax(scores / T), T the release's one calibrated
+// temperature (readout_config.json `temperatures.global`). The answers are
+// jev_style's (adapter.py):
+//
+//     noul    {"noul": P(true)}
+//     choice  {"choice": the likeliest option, "confidence", "probabilities"}
+//     score   {"score": sum of i * p_i over levels 0..K-1, "confidence",
+//              "legend", "probabilities"}
+//
+// with confidence (k * p_max - 1) / (k - 1) over k options, clipped to 0..1.
+// A score that is not finite (NaN, an infinity, or the scorer's null) is
+// never turned into a probability: the request fails, as the release's own
+// runtime refuses it.
+
+/// One question's probabilities, its options' order.
+type Probs { p: bounded[Float; 255]; }
+
+/// softmax(scores / t) over a result's `scores`; refused when one is not
+/// finite.
+fn probabilities(scores: String, t: Float, tokens: Int) -> Probs fallible(Refusal) {
+    let mut z = Probs { };
+    let bad = std::bytes::BytesBuilder { };
+    let mut it = std::json::array_first(scores);
+    let mut top = -std::math::inf();
+    while !it.done {
+        let raw = std::str::trim(it.element);
+        let s = std::str::parse_float(raw) or std::math::nan();
+        if std::math::is_nan(s) || s == std::math::inf() || s == -std::math::inf() {
+            if bad.len() > 0 { bad.append_str(", "); }
+            bad.append_str(to_string(count(z.p)));
+        }
+        push(z.p, s / t) or discard;
+        if s / t > top { top = s / t; }
+        it = std::json::array_next(it);
+    }
+    if bad.len() > 0 {
+        fail Refusal {
+            status: 500,
+            code: "internal_error",
+            message: "NonFiniteScoreError: non-finite decision scores for option(s) ["
+                + std::str::clone(bad.text_view()) + "] (" + to_string(tokens)
+                + " input tokens); refusing to return probabilities. Check the weights file / engine build.",
+        };
+    }
+    let mut e = Probs { };
+    let mut sum = 0.0;
+    for v in z.p {
+        let x = std::math::exp(v - top);
+        push(e.p, x) or discard;
+        sum = sum + x;
+    }
+    let mut out = Probs { };
+    for x in e.p { push(out.p, x / sum) or discard; }
+    return out;
+}
+
+/// (k * p_max - 1) / (k - 1), clipped to 0..1: 0 for an even spread, 1
+/// for every bit on one option.
+fn confidence(p: Probs) -> Float {
+    let k = count(p.p);
+    if k <= 1 { return 1.0; }
+    let mut top = 0.0;
+    for x in p.p { if x > top { top = x; } }
+    let c = (std::math::int_to_float(k) * top - 1.0) / std::math::int_to_float(k - 1);
+    return if c < 0.0 { 0.0 } else if c > 1.0 { 1.0 } else { c };
+}
+
+/// One question's answer, from its probabilities.
+fn answer(q: Question, p: Probs) -> String {
+    let names = "[" + q.names + "]";
+    if q.kind == "noul" {
+        return "{\"type\": \"noul\", \"noul\": " + to_string(at(p.p, 1) or 0.0) + "}";
+    }
+    let probs = std::bytes::BytesBuilder { };
+    let mut best = "";
+    let mut top = -1.0;
+    let mut expected = 0.0;
+    let mut i = 0;
+    let mut it = std::json::array_first(names);
+    while !it.done {
+        let name = std::str::trim(it.element);
+        let x = at(p.p, i) or 0.0;
+        if i > 0 { probs.append_str(", "); }
+        probs.append_str(name + ": " + to_string(x));
+        // the first of equal maxima, as Python's max() gives
+        if x > top {
+            top = x;
+            best = name;
+        }
+        expected = expected + std::math::int_to_float(i) * x;
+        i = i + 1;
+        it = std::json::array_next(it);
+    }
+    let rest = "\"confidence\": " + to_string(confidence(p)) + ", "
+        + (if q.kind == "score" { "\"legend\": {" + q.legend + "}, " } else { "" })
+        + "\"probabilities\": {" + std::str::clone(probs.text_view()) + "}}";
+    if q.kind == "choice" { return "{\"type\": \"choice\", \"choice\": " + best + ", " + rest; }
+    return "{\"type\": \"score\", \"score\": " + to_string(expected) + ", " + rest;
+}
+
+/// Every question's answer, an object's members in the questions' order,
+/// from the scorer's response.
+fn answers(d: Decision, scored: String, t: Float, r: Rendered) -> String fallible(Refusal) {
+    let results = std::str::trim(std::json::find_field_raw(scored, "results"));
+    let out = std::bytes::BytesBuilder { };
+    let mut it = std::json::array_first(results);
+    for q in d.questions {
+        if it.done {
+            fail Refusal {
+                status: 500,
+                code: "internal_error",
+                message: "the scorer answered too few questions",
+            };
+        }
+        let scores = std::str::trim(std::json::find_field_raw(it.element, "scores"));
+        let p = probabilities(scores, t, r.state_tokens + r.head_tokens) or raise;
+        if count(p.p) != q.count {
+            fail Refusal {
+                status: 500,
+                code: "internal_error",
+                message: "the scorer returned a wrong number of scores",
+            };
+        }
+        if out.len() > 0 { out.append_str(", "); }
+        out.append_str(jq(q.id) + ": " + answer(q, p));
+        it = std::json::array_next(it);
+    }
+    return std::str::clone(out.text_view());
+}

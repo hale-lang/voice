@@ -1,0 +1,107 @@
+// jev-score-v2, the llama.cpp program that runs the GGUF (runtimes/jev/):
+// started once, then asked one JSON line at a time, each answered with one
+// line. It keeps the last state it decoded, so a request about the same
+// state skips it. Its stderr, llama.cpp's log, is drained as it comes, so
+// it never fills and stops the child, and its tail kept for a failure.
+
+/// How long the scorer may take to load its model and say it is ready.
+const SCORER_START_MS: Int = 600000;
+/// How long one request may take: the largest input, on the CPU.
+const SCORER_ASK_MS: Int = 600000;
+/// How much of the scorer's log a failure quotes.
+const SCORER_TAIL: Int = 2000;
+
+locus Scorer {
+    params {
+        child: std::process::Child = std::process::Child { };
+        // read, not yet a whole line
+        pending: std::bytes::BytesBuilder = std::bytes::BytesBuilder { };
+        // the end of what it logged
+        tail: String = "";
+        // its ready line
+        ready: String = "";
+        failure: String = "";
+    }
+
+    /// Started as `argv` (a line each), up to its ready line, which
+    /// `ready` keeps; `failure` says why not.
+    fn start(argv: String) {
+        let s = std::process::spawn(argv) or std::process::Child { };
+        if s.pid <= 0 {
+            self.failure = "jev-score-v2 could not be started";
+            return;
+        }
+        std::process::adopt(self.child, s);
+        self.ready = self.line(SCORER_START_MS);
+        if len(self.ready) == 0 {
+            self.failure = "jev-score-v2 did not start: " + self.tail;
+        } else if !std::json::find_bool_field(self.ready, "ready") {
+            self.failure = "jev-score-v2 did not start: " + self.ready;
+            self.ready = "";
+        }
+    }
+
+    /// `request` asked, its answer's line; "" with `failure` set when the
+    /// scorer has gone, or answered with an error.
+    @unbounded
+    fn ask(request: String) -> String {
+        self.failure = "";
+        let wrote = std::process::write_stdin(self.child, request + "\n") or - 1;
+        if wrote != len(request) + 1 {
+            self.failure = "jev-score-v2 is not running: " + self.tail;
+            return "";
+        }
+        let got = self.line(SCORER_ASK_MS);
+        if len(got) == 0 { return ""; }
+        let e = std::json::string_field(got, "error");
+        if e.kind == "string" {
+            self.failure = "jev-score-v2: " + e.text;
+            return "";
+        }
+        return got;
+    }
+
+    /// The scorer's next line within `ms`; "" with `failure` set when it
+    /// exits or stays silent.
+    @unbounded
+    fn line(ms: Int) -> String {
+        let deadline = std::time::monotonic_ns() + ms * 1000000;
+        while true {
+            let chunk = std::process::read_stdout(self.child) or "";
+            self.read_log();
+            if len(chunk) > 0 {
+                self.pending.append_str(chunk);
+                if std::str::contains(chunk, "\n") {
+                    let all = std::str::clone(self.pending.text_view());
+                    let at = std::str::index_of(all, "\n");
+                    self.pending.clear();
+                    self.pending.append_str(all[(at + 1)..len(all)]);
+                    return std::str::trim(all[0..at]);
+                }
+                continue;
+            }
+            if (std::process::try_wait(self.child) or - 2) != -2 {
+                self.read_log();
+                self.failure = "jev-score-v2 exited: " + self.tail;
+                return "";
+            }
+            if std::time::monotonic_ns() > deadline {
+                self.failure = "jev-score-v2 did not answer in " + to_string(ms / 1000) + "s";
+                return "";
+            }
+            std::time::sleep(1ms);
+        }
+        return "";
+    }
+
+    /// What the scorer logged since, written on to this program's stderr
+    /// and its end kept.
+    @unbounded
+    fn read_log() {
+        let got = std::process::read_stderr(self.child) or "";
+        if len(got) == 0 { return; }
+        eprint(got);
+        let t = self.tail + got;
+        self.tail = if len(t) > SCORER_TAIL { t[(len(t) - SCORER_TAIL)..len(t)] } else { t };
+    }
+}

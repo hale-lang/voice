@@ -9,7 +9,16 @@ export type Route = { parts: string[]; query: URLSearchParams };
 function parse(): Route {
   const raw = location.hash.replace(/^#\/?/, '');
   const [path = '', q = ''] = raw.split('?');
-  return { parts: path.split('/').filter(Boolean), query: new URLSearchParams(q) };
+  // a part is decoded as `href` encoded it: an id may hold a slash
+  return { parts: path.split('/').filter(Boolean).map(decode), query: new URLSearchParams(q) };
+}
+
+function decode(part: string): string {
+  try {
+    return decodeURIComponent(part);
+  } catch {
+    return part;
+  }
 }
 
 export function useRoute(): Route {

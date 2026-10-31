@@ -3,7 +3,7 @@ import { Button } from '@hale/components';
 import { useGet } from './api/client';
 import s from './peek.module.css';
 
-type Item = {
+export type Item = {
   type?: string;
   role?: string;
   content?: unknown;
@@ -76,7 +76,7 @@ export function PeekSection({ id }: { id: string }) {
 }
 
 /** One part of the conversation, folded or open. */
-function ItemView({ item, open }: { item: Item; open: boolean }) {
+export function ItemView({ item, open }: { item: Item; open: boolean }) {
   if (item.type === 'reasoning') {
     const t = texts(item.content) || texts(item.summary);
     return <Fold title="reasoning" kind="reasoning" preview={t} body={t} open={open} />;
@@ -98,7 +98,7 @@ function ItemView({ item, open }: { item: Item; open: boolean }) {
  * folded, and its body only once opened: a long prompt is not laid out
  * until it is read.
  */
-function Fold(props: { title: string; kind?: string; preview?: string; body?: ReactNode; open?: boolean; children?: ReactNode }) {
+export function Fold(props: { title: string; kind?: string; preview?: string; body?: ReactNode; open?: boolean; children?: ReactNode }) {
   const [open, setOpen] = useState(!!props.open);
   const preview = (props.preview ?? '').replace(/\s+/g, ' ').trim();
   return (
@@ -121,13 +121,13 @@ function size(t: string): string {
 }
 
 /** The text of a content value: a string, or the `text` of each part. */
-function texts(c: unknown): string {
+export function texts(c: unknown): string {
   if (typeof c === 'string') return c;
   if (Array.isArray(c)) return c.map((p) => (typeof p === 'string' ? p : p && typeof p === 'object' && 'text' in p ? String((p as { text: unknown }).text) : '')).filter(Boolean).join('\n');
   return '';
 }
 
-function parse(t: string): Record<string, unknown> | null {
+export function parse(t: string): Record<string, unknown> | null {
   try {
     return JSON.parse(t) as Record<string, unknown>;
   } catch {

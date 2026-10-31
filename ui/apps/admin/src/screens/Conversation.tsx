@@ -52,22 +52,23 @@ export function ConversationView({ root }: { root: Root }) {
         <div className={s.split}>
           <aside className={s.context}>
             <h3>Context</h3>
-            {read.context.length || read.tools.length ? (
-              <>
-                {read.opening && (
+            {read.threads.map((th, k) => (
+              <div key={k} className={s.thread} style={{ ['--hue' as string]: threadHue(k) }}>
+                {read.threads.length > 1 && <div className={s.threadName}>thread {k + 1}</div>}
+                {th.opening && (
                   <div className={s.opening}>
                     <div className={s.label}>opening prompt</div>
-                    <div className={s.text}>{read.opening}</div>
+                    <div className={s.text}>{th.opening}</div>
                   </div>
                 )}
-                {read.context.map((c, i) => (
+                {th.context.map((c, i) => (
                   <div key={i}>{c}</div>
                 ))}
-                {read.tools.length > 0 && <Tools tools={read.tools} />}
-              </>
-            ) : (
-              <p className="faint">Nothing recorded set it up.</p>
-            )}
+                {th.tools.length > 0 && <Tools tools={th.tools} />}
+                {!th.context.length && !th.tools.length && !th.opening && <p className="faint">Nothing recorded set it up.</p>}
+              </div>
+            ))}
+            {!read.threads.length && <p className="faint">Nothing recorded set it up.</p>}
           </aside>
           <section className={s.chat}>
             {hidden > 0 && (
@@ -76,7 +77,7 @@ export function ConversationView({ root }: { root: Root }) {
               </p>
             )}
             {read.turns.map((t) => (
-              <TurnView key={t.record.id} turn={t} />
+              <TurnView key={t.record.id} turn={t} threads={read.threads.length} />
             ))}
           </section>
         </div>
@@ -99,13 +100,19 @@ function Tools({ tools }: { tools: Tool[] }) {
   );
 }
 
-type Turn = { record: UsageRecord; recorded: boolean; said: Item[]; earlier: Item[]; answered: Item[]; failure: string | null };
+type Turn = { record: UsageRecord; recorded: boolean; thread: number; said: Item[]; earlier: Item[]; answered: Item[]; failure: string | null };
 
-function TurnView({ turn: t }: { turn: Turn }) {
+/** A thread's own hue, the same in the context and on each of its turns. */
+function threadHue(k: number): number {
+  return (190 + k * 137) % 360;
+}
+
+function TurnView({ turn: t, threads }: { turn: Turn; threads: number }) {
   const r = t.record;
   return (
-    <div className={s.turn}>
+    <div className={`${s.turn} ${threads > 1 && t.thread >= 0 ? s.threaded : ''}`} style={{ ['--hue' as string]: threadHue(Math.max(0, t.thread)) }}>
       <a className={s.divider} href={href('usage', r.id)} title="the request">
+        {threads > 1 && t.thread >= 0 && <span className={s.threadTag}>thread {t.thread + 1}</span>}
         <span>{when(r.created_at)}</span>
         <span>{r.served?.seat ?? r.requested_model}</span>
         <span>{count(r.input_tokens)} in · {count(r.output_tokens)} out</span>
@@ -172,6 +179,38 @@ function isContext(it: Item): boolean {
   return false;
 }
 
+/**
+ * How many of a turn's leading parts replay what was said before: the
+ * longest run of them found in `history` in order (a client may drop or
+ * reshape a part it resends, reasoning most of all), counted only when it
+ * reaches the last part said before that is not reasoning. Otherwise the
+ * client sent only what is new, and none of it is a replay: a message is
+ * new whenever it is said again, whatever it says.
+ */
+function replays(history: string[], asked: string[]): number {
+  if (!history.length) return 0;
+  let j = 0;
+  let last = -1;
+  let n = 0;
+  while (n < asked.length) {
+    const at = history.indexOf(asked[n]!, j);
+    if (at < 0) {
+      // reasoning resent reshaped is still the replay
+      if (asked[n]!.startsWith('reasoning:')) {
+        n++;
+        continue;
+      }
+      break;
+    }
+    last = at;
+    j = at + 1;
+    n++;
+  }
+  let anchor = history.length - 1;
+  while (anchor >= 0 && history[anchor]!.startsWith('reasoning:')) anchor--;
+  return anchor < 0 || last >= anchor ? n : 0;
+}
+
 /** What makes two parts the same part, however a client resends it. */
 function identity(it: Item & { id?: string }): string {
   if (it.type === 'function_call' || it.type === 'function_call_output') return `${it.type}:${it.call_id ?? it.id ?? ''}`;
@@ -179,41 +218,68 @@ function identity(it: Item & { id?: string }): string {
   return `${it.role ?? it.type}:${texts(it.content) || it.text || ''}`;
 }
 
-type Thread = { context: ReactNode[]; tools: Tool[]; opening: string | null; turns: Turn[] };
+/** One thread of a conversation: what set it up, its tools, and what its user first asked. */
+type ThreadContext = { context: ReactNode[]; tools: Tool[]; opening: string | null };
+
+type Thread = { threads: ThreadContext[]; turns: Turn[] };
+
+/** A thread as it is read: its history so far, in order, as the client last told it, and its latest request. */
+type Open = { history: string[]; latest: Record<string, unknown> | null; opening: string | null; shown: boolean };
 
 /**
- * The turns as a thread: each one's parts not said before, then its answer.
- * The context is the latest recorded turn's (instructions, developer
- * messages, wrapped context, tools); the opening prompt the first thing the
- * user asked that the recordings hold. When earlier turns are not shown,
- * the first shown turn's history folds as what came before.
+ * The turns as threads, each turn's parts not said before (`replays`), then
+ * its answer. One root can hold several threads at once (a Codex session's
+ * agent and the reviewer judging its steps share its id): a turn continues
+ * the thread whose history it replays; one that opens with its own setup
+ * starts a thread; one that only adds what is new (a client that sends no
+ * history) goes on the latest. Each thread's context is its latest
+ * recorded turn's: instructions, setup messages, tools. When earlier turns
+ * are not shown, a thread's first shown turn folds its history away.
  */
 function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } | null)[], earlierHidden: boolean): Thread {
-  const seen = new Set<string>();
+  const open: Open[] = [];
+  let current = -1;
   const out: Turn[] = [];
-  let opening: string | null = null;
-  let latest: Record<string, unknown> | null = null;
   turns.forEach((record, i) => {
     const p = peeks[i];
     if (!p) {
-      out.push({ record, recorded: false, said: [], earlier: [], answered: [], failure: null });
+      out.push({ record, recorded: false, thread: -1, said: [], earlier: [], answered: [], failure: null });
       return;
     }
     const input = parse(p.input);
     const output = parse(p.output);
-    latest = input ?? latest;
     const asked = (Array.isArray(input?.input) ? input.input : typeof input?.input === 'string' ? [{ type: 'message', role: 'user', content: input.input }] : []) as Item[];
-    const fresh = asked.filter((it) => !isContext(it) && !seen.has(identity(it)));
-    for (const it of asked) seen.add(identity(it));
-    if (opening === null) {
-      const u = asked.find((it) => it.role === 'user' && !isContext(it) && texts(it.content).trim());
-      if (u) opening = texts(u.content).trim();
+    const ids = asked.map(identity);
+    // the thread this turn replays the most of
+    let best = -1;
+    let replayed = 0;
+    open.forEach((th, k) => {
+      const n = replays(th.history, ids);
+      if (n > replayed) {
+        replayed = n;
+        best = k;
+      }
+    });
+    if (best < 0) {
+      if (current < 0 || (asked[0] && isContext(asked[0]))) {
+        open.push({ history: [], latest: null, opening: null, shown: false });
+        best = open.length - 1;
+      } else {
+        best = current;
+      }
     }
-    // the first turn shown after hidden ones: its history before what the
-    // user last said folds away
+    current = best;
+    const th = open[best]!;
+    const fresh = asked.slice(replayed).filter((it) => !isContext(it));
+    if (th.opening === null) {
+      const u = asked.find((it) => it.role === 'user' && !isContext(it) && texts(it.content).trim());
+      if (u) th.opening = texts(u.content).trim();
+    }
+    // a thread's first turn shown after hidden ones: its history before
+    // what the user last said folds away
     let earlier: Item[] = [];
     let said = fresh;
-    if (earlierHidden && out.length === 0) {
+    if (earlierHidden && !th.shown) {
       let lastUser = -1;
       fresh.forEach((it, j) => {
         if (it.role === 'user') lastUser = j;
@@ -223,13 +289,21 @@ function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } 
         said = fresh.slice(lastUser);
       }
     }
+    th.shown = true;
+    th.latest = input ?? th.latest;
     const answered = (Array.isArray(output?.output) ? output.output : []) as Item[];
-    for (const it of answered) seen.add(identity(it));
-    out.push({ record, recorded: true, said, earlier, answered, failure: typeof output?.error === 'string' ? output.error : null });
+    // a client that resent the history told it whole; one that sent only
+    // what is new adds to it
+    th.history = [...(replayed > 0 ? [] : th.history), ...ids, ...answered.map(identity)];
+    out.push({ record, recorded: true, thread: best, said, earlier, answered, failure: typeof output?.error === 'string' ? output.error : null });
   });
+  return { threads: open.map((th) => contextOf(th.latest, th.opening)), turns: out };
+}
+
+/** What set a thread up, from its latest request. */
+function contextOf(top: Record<string, unknown> | null, opening: string | null): ThreadContext {
   const context: ReactNode[] = [];
   const tools: Tool[] = [];
-  const top = latest as Record<string, unknown> | null;
   if (top) {
     if (typeof top.instructions === 'string' && top.instructions.trim()) context.push(<Fold title="instructions" kind="system" preview={top.instructions} body={top.instructions} />);
     const asked = (Array.isArray(top.input) ? top.input : []) as Item[];
@@ -241,5 +315,5 @@ function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } 
       }
     }
   }
-  return { context, tools, opening, turns: out };
+  return { context, tools, opening };
 }

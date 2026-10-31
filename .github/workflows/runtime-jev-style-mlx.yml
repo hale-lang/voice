@@ -1,0 +1,85 @@
+# Voice's Jev-Style MLX runtime archive (runtimes/jev-style-0.3.0-mlx.json):
+# built here, from runtimes/jev-style-mlx/build.sh, never on someone's
+# machine. A pull request that touches the build or the runtime builds it
+# and holds the runtime's pinned sha256 and size to what was built. Run by
+# hand (Actions, "runtime: jev-style-mlx", Run workflow), it builds the same,
+# checks the same pin, and publishes the archive as the release asset the
+# runtime's URL names: the pin is what nodes check, so only a build that
+# matches it is ever published.
+
+name: "runtime: jev-style-mlx"
+
+on:
+  pull_request:
+    paths:
+      - runtimes/jev-style-mlx/**
+      - runtimes/jev-style-0.3.0-mlx.json
+      - .github/workflows/runtime-jev-style-mlx.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and check the pin
+    runs-on: macos-15
+    outputs:
+      tag: ${{ steps.pin.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the archive
+        run: runtimes/jev-style-mlx/build.sh "$RUNNER_TEMP/out"
+      - name: The archive is the one the runtime pins
+        id: pin
+        run: |
+          python3 - "$RUNNER_TEMP/out" <<'PY'
+          import hashlib, json, os, sys, urllib.parse
+          out = sys.argv[1]
+          rt = json.load(open("runtimes/jev-style-0.3.0-mlx.json"))
+          art = rt["artifact"]
+          name = os.path.basename(urllib.parse.urlparse(art["url"]).path)
+          path = os.path.join(out, name)
+          data = open(path, "rb").read()
+          sha, size = hashlib.sha256(data).hexdigest(), len(data)
+          print(f"built {name}: sha256 {sha}, {size} bytes")
+          if (sha, size) != (art["sha256"], art["bytes"]):
+              print(f"::error::the runtime pins sha256 {art['sha256']}, {art['bytes']} bytes; "
+                    f"this build is sha256 {sha}, {size} bytes. Pin what CI builds.")
+              sys.exit(1)
+          tag = urllib.parse.urlparse(art["url"]).path.split("/")[-2]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"tag={tag}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jev-style-mlx
+          path: ${{ runner.temp }}/out/*.tar.gz
+          retention-days: 7
+
+  publish:
+    name: publish the release asset
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: jev-style-mlx
+          path: out
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # a published asset never changes: the release is made once
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG exists; a runtime's asset is published once (another build is another runtime id)"
+            exit 1
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+            --title "Runtime: jev-style-0.3.0-mlx (macOS arm64)" \
+            --notes "Voice's Jev-Style decision runtime for macOS arm64 (Metal, MLX), built by runtimes/jev-style-mlx/build.sh in this workflow and pinned by runtimes/jev-style-0.3.0-mlx.json." \
+            out/*.tar.gz

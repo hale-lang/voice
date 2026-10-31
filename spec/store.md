@@ -718,3 +718,14 @@ create table in_flight (
 );
 create index in_flight_by_seq on in_flight (seq);
 ```
+
+### Migration 19: model aliases
+
+A project names its own models: each alias a name a caller asks for
+(`coding`) and the catalog model it stands for, set out of band and read
+when a request is admitted. A child's are its own over its parent's, name by
+name. Kept whole, as the list the api writes.
+
+```sql
+alter table project add column aliases jsonb not null default '[]';
+```

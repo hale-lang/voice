@@ -1,0 +1,117 @@
+// Model aliases: the names a project gives models, so a caller asks for
+// `coding` and the operator decides, out of band, which catalog model that
+// is. A project keeps its own (`ProjectRow.aliases`, a JSON list); a child's
+// are its own over its parent's, name by name, read when a request is
+// admitted (inference.hl `resolved`), so one setting on a habitat's project
+// covers every caller under it. Voice ships the names of its categories
+// (`CATEGORIES`, catalog/picks.json's): the admin UI offers them first.
+
+/// The categories voice ships, the names its catalog suggests models for.
+const CATEGORIES: String = "general coding reasoning decide";
+
+/// One alias: the name a caller asks for, and the catalog model it is.
+type ModelAlias { name: String = ""; model: String = ""; }
+
+/// An alias in force for a project: its own, or its parent's (`from`).
+type ResolvedAlias { name: String = ""; model: String = ""; from: String = ""; }
+
+type ModelAliases { items: bounded[ModelAlias; 32]; }
+
+type ResolvedAliases { items: bounded[ResolvedAlias; 64]; }
+
+/// `aliases` as a project keeps them, each checked: a slug of a name, given
+/// once, that names no catalog model itself (a model's own name is never
+/// another's), and a model the catalog has.
+fn aliases_json(
+    store: st::Store,
+    aliases: bounded[ModelAlias; 32],
+    param: String
+) -> String fallible(CtlError) {
+    let out = st::JsonList { };
+    let mut seen = st::Names { };
+    for a in aliases {
+        if !is_slug(a.name) {
+            fail bad(
+                "an alias's `name` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                param
+            );
+        }
+        if has_name(seen.items, a.name) { fail bad("alias " + a.name + " is given twice", param); }
+        push(seen.items, a.name) or discard;
+        let named = store.model(a.name) or fail store_down(err);
+        if named.present && !named.removed {
+            fail bad(
+                "alias " + a.name
+                    + " is the name of a catalog model; a model is asked for by its own name",
+                param
+            );
+        }
+        let m = store.model(a.model) or fail store_down(err);
+        if !m.present || m.removed {
+            fail bad("alias " + a.name + ": no model " + a.model + " in the catalog", param);
+        }
+        out.add("{\"name\": " + jq(a.name) + ", \"model\": " + jq(a.model) + "}");
+    }
+    return "[" + out.text() + "]";
+}
+
+/// A project's own aliases, from the JSON it keeps.
+@bounded_by(json)
+fn aliases_of(json: String) -> ModelAliases {
+    let mut out = ModelAliases { };
+    let mut it = std::json::array_first(json);
+    while !it.done {
+        push(
+            out.items,
+            ModelAlias {
+                name: std::json::find_string_field(it.element, "name"),
+                model: std::json::find_string_field(it.element, "model"),
+            },
+        ) or discard;
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The aliases in force for `p`: its own, then each of its parent's it does
+/// not give itself, read now.
+fn resolved_aliases(
+    store: st::Store,
+    p: st::ProjectRow
+) -> ResolvedAliases fallible(st::StoreError) {
+    let mut out = ResolvedAliases { };
+    let own = aliases_of(p.aliases);
+    for a in own.items {
+        push(out.items, ResolvedAlias { name: a.name, model: a.model, from: p.id }) or discard;
+    }
+    if len(p.parent) == 0 { return out; }
+    let parent = store.project(p.parent) or raise;
+    if !parent.present { return out; }
+    let theirs = aliases_of(parent.aliases);
+    for a in theirs.items {
+        let mut given = false;
+        for o in own.items {
+            if o.name == a.name { given = true; }
+        }
+        if !given {
+            push(
+                out.items,
+                ResolvedAlias { name: a.name, model: a.model, from: parent.id },
+            ) or discard;
+        }
+    }
+    return out;
+}
+
+/// The catalog model `name` is an alias of for `p`, "" when it is none.
+fn alias_target(
+    store: st::Store,
+    p: st::ProjectRow,
+    name: String
+) -> String fallible(st::StoreError) {
+    let all = resolved_aliases(store, p) or raise;
+    for a in all.items {
+        if a.name == name { return a.model; }
+    }
+    return "";
+}

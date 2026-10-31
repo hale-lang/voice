@@ -158,10 +158,14 @@ function Metadata({ of }: { of: unknown }) {
   );
 }
 
-/** What the requests are narrowed to: each "" for any. */
-type Filter = { project: string; key: string; model: string; account: string; metadata: string; since: string };
+/**
+ * What the requests are narrowed to: each "" for any. `from` is the
+ * cutoff `since` chose, fixed when it was chosen, so the query (and its
+ * cache) stays the same across renders and pages.
+ */
+type Filter = { project: string; key: string; model: string; account: string; metadata: string; since: string; from: string };
 
-const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', metadata: '', since: '' };
+const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', metadata: '', since: '', from: '' };
 
 /** The time ranges offered, as how far back, in seconds. */
 const SINCE: { value: string; label: string }[] = [
@@ -171,19 +175,22 @@ const SINCE: { value: string; label: string }[] = [
   { value: '604800', label: 'the last week' },
 ];
 
-/** The filter as listUsage's query: metadata a pair a line or comma, `name=value`. */
+/** The metadata pair asked for, `name=value`; the api takes one. */
+function metadataPair(m: string): string | null {
+  const t = m.trim();
+  return /^[^=,\s]+=[^,]*$/.test(t) ? t : null;
+}
+
+/** The filter as listUsage's query. */
 function query(f: Filter) {
-  const pairs = f.metadata
-    .split(/[\n,]/)
-    .map((p) => p.trim())
-    .filter((p) => p.includes('='));
+  const pair = metadataPair(f.metadata);
   return {
     ...(f.project ? { project: [f.project] } : {}),
     ...(f.key ? { key: [f.key.trim()] } : {}),
     ...(f.model ? { model: [f.model] } : {}),
     ...(f.account ? { account: [f.account] } : {}),
-    ...(pairs.length ? { metadata: pairs } : {}),
-    ...(f.since ? { from: new Date(Date.now() - Number(f.since) * 1000).toISOString() } : {}),
+    ...(pair ? { metadata: [pair] } : {}),
+    ...(f.from ? { from: f.from } : {}),
   };
 }
 
@@ -193,6 +200,9 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
   const models = useGet('/admin/v1/models');
   const accounts = useGet('/admin/v1/accounts');
   const set = (k: keyof Filter) => (v: string) => onChange({ ...f, [k]: v });
+  // the cutoff is fixed now, when the range is chosen
+  const since = (v: string) => onChange({ ...f, since: v, from: v ? new Date(Date.now() - Number(v) * 1000).toISOString() : '' });
+  const badPair = f.metadata.trim() !== '' && !metadataPair(f.metadata);
   const any = Object.values(f).some(Boolean);
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)', alignItems: 'end', marginBottom: 'var(--space-3)' }}>
@@ -213,12 +223,12 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
         <TextInput mono value={f.key} onChange={set('key')} placeholder="k_…" />
       </label>
       <label>
-        <div className="faint">metadata</div>
+        <div className={badPair ? 'c-wait' : 'faint'}>{badPair ? 'metadata: one name=value' : 'metadata'}</div>
         <TextInput mono value={f.metadata} onChange={set('metadata')} placeholder="session=abc" />
       </label>
       <label>
         <div className="faint">when</div>
-        <Select value={f.since} onChange={set('since')} options={SINCE} />
+        <Select value={f.since} onChange={since} options={SINCE} />
       </label>
       {any && <Button onClick={() => onChange(NO_FILTER)}>clear</Button>}
     </div>

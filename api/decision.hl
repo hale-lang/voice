@@ -1,0 +1,306 @@
+// A decision model's contract (`CatalogModel.contract: decision`): it
+// answers only structured requests, a JSON schema whose every property is a
+// question, and gives the probability of each answer. Whatever serves it (a
+// Jev-style decision model on a node, or one behind a service) is offered
+// the request as `POST /v1/systemone` speaks it (protocol.yaml `Serve`,
+// `endpoint: systemone`), and its answer comes back as the standard
+// response: the text is JSON that matches the schema, the most likely
+// answer to each question, and `voice.decision` carries the probabilities.
+//
+// A schema's property is a question by its JSON Schema type:
+//   a string `enum`, or `oneOf` of `{const, description}` strings: a `choice`;
+//   `boolean`: a `noul`, a calibrated yes or no;
+//   an integer or number `enum`, or `oneOf` of `{const, description}`, its
+//   levels in order: a `score`.
+// The property's `description` is the question's instructions. The request's
+// messages are the state the questions are asked of.
+
+/// The most questions one request asks, and a choice's options.
+const DECISION_QUESTIONS_MAX: Int = 32;
+const DECISION_OPTIONS_MAX: Int = 255;
+
+/// The fields a decision model has no use for: it generates nothing, so a
+/// request that sets one meant something else, and is told so.
+const DECISION_REFUSED: String = "tools tool_choice parallel_tool_calls temperature top_p top_logprobs max_output_tokens reasoning truncation";
+
+fn decision_refusal(message: String, param: String) -> ApiError {
+    return ApiError {
+        status: 400,
+        kind: "invalid_request",
+        code: ErrorCode::invalid_request,
+        message: message,
+        has_param: true,
+        param: param,
+    };
+}
+
+/// The standard request `body` as the systemone request a decision model
+/// answers, or the refusal naming what the contract does not allow.
+fn decision_body(body: String) -> String fallible(ApiError) {
+    let mut rest = DECISION_REFUSED;
+    while len(rest) > 0 {
+        let sp = std::str::index_of(rest, " ");
+        let f = if sp < 0 { rest } else { rest[0..sp] };
+        rest = if sp < 0 { "" } else { rest[(sp + 1)..len(rest)] };
+        if sets(body, f) {
+            fail decision_refusal(
+                "a decision model generates nothing, so `" + f
+                    + "` means nothing to it; leave it out",
+                f
+            );
+        }
+    }
+    let format = std::json::find_field_raw(std::json::find_field_raw(body, "text"), "format");
+    if std::json::find_string_field(format, "type") != "json_schema" {
+        fail decision_refusal(
+            "a decision model answers only a structured request: give `response_format` (or `text.format`) a `json_schema` whose properties are the questions",
+            "response_format"
+        );
+    }
+    let schema = std::str::trim(std::json::find_field_raw(format, "schema"));
+    let props = std::str::trim(std::json::find_field_raw(schema, "properties"));
+    if !std::json::valid_object(props) || props == "{}" {
+        fail decision_refusal(
+            "the schema is an object whose `properties` are the questions; it has none",
+            "response_format"
+        );
+    }
+    let questions = st::JsonList { };
+    let mut n = 0;
+    let mut it = std::json::object_first(props);
+    while !it.done {
+        let name = std::json::obj_key_string(it, props);
+        let q = std::str::trim(std::json::obj_value_raw(it, props));
+        it = std::json::object_next(it, props);
+        n = n + 1;
+        if n > DECISION_QUESTIONS_MAX {
+            fail decision_refusal(
+                "a decision model answers at most " + to_string(DECISION_QUESTIONS_MAX)
+                    + " questions at once",
+                "response_format"
+            );
+        }
+        questions.add(jq(name) + ": " + (question_of(name, q) or raise));
+    }
+    let state = decision_state(body) or raise;
+    return "{\"state\": " + state + ", \"questions\": {" + questions.text() + "}}";
+}
+
+/// One property as the question it asks.
+fn question_of(name: String, q: String) -> String fallible(ApiError) {
+    let d = std::json::find_string_field(q, "description");
+    let said = if std::json::string_field(q, "description").kind == "string" && len(d) > 0 {
+        d
+    } else {
+        name
+    };
+    let instructions = jq(said);
+    let t = std::json::find_string_field(q, "type");
+    if t == "boolean" {
+        return "{\"type\": \"noul\", \"instructions\": " + instructions + "}";
+    }
+    let levels = level_list(q);
+    let numeric = t == "integer" || t == "number";
+    if !numeric && (t == "string" || std::json::string_field(q, "type").kind == "missing") {
+        // a choice: each option a string, described or not
+        let crit = st::JsonList { };
+        let mut options = 0;
+        let mut l = std::json::array_first(levels);
+        while !l.done {
+            let raw = std::str::trim(l.element);
+            let value = if std::str::starts_with(raw, "{") {
+                std::str::trim(std::json::find_field_raw(raw, "const"))
+            } else {
+                raw
+            };
+            if !std::str::starts_with(value, "\"") {
+                fail decision_refusal(
+                    "property `" + name + "`: a choice's options are strings",
+                    "response_format"
+                );
+            }
+            let about = std::str::trim(std::json::find_field_raw(raw, "description"));
+            crit.add(
+                value + ": " + (if std::str::starts_with(about, "\"") { about } else { "null" }),
+            );
+            options = options + 1;
+            l = std::json::array_next(l);
+        }
+        if options >= 1 && options <= DECISION_OPTIONS_MAX {
+            return "{\"type\": \"choice\", \"instructions\": " + instructions + ", \"criteria\": {"
+                + crit.text() + "}}";
+        }
+    } else if numeric {
+        // a score: its levels in order, each by its value, described or not
+        let crit = st::JsonList { };
+        let mut count_levels = 0;
+        let mut l = std::json::array_first(levels);
+        while !l.done {
+            let raw = std::str::trim(l.element);
+            let value = if std::str::starts_with(raw, "{") {
+                std::str::trim(std::json::find_field_raw(raw, "const"))
+            } else {
+                raw
+            };
+            let about = std::str::trim(std::json::find_field_raw(raw, "description"));
+            crit.add(
+                "{\"label\": " + jq(value)
+                    + (
+                        if std::str::starts_with(about, "\"") {
+                            ", \"description\": " + about
+                        } else {
+                            ""
+                        }
+                    )
+                    + "}",
+            );
+            count_levels = count_levels + 1;
+            l = std::json::array_next(l);
+        }
+        if count_levels >= 2 && count_levels <= 10 {
+            return "{\"type\": \"score\", \"instructions\": " + instructions + ", \"criteria\": ["
+                + crit.text() + "]}";
+        }
+    }
+    fail decision_refusal(
+        "property `" + name
+            + "`: a decision model answers choices (a string `enum`, or `oneOf` of `{const, description}`, 1 to 255), yes or no (`boolean`) and scores (an integer `enum` or `oneOf`, 2 to 10 levels in order)",
+        "response_format"
+    );
+}
+
+/// A property's options or levels: its `enum`, else its `oneOf`.
+fn level_list(q: String) -> String {
+    let e = std::str::trim(std::json::find_field_raw(q, "enum"));
+    if std::str::starts_with(e, "[") { return e; }
+    let o = std::str::trim(std::json::find_field_raw(q, "oneOf"));
+    if std::str::starts_with(o, "[") { return o; }
+    return "[]";
+}
+
+/// The state the questions are asked of: the request's input as text, or
+/// its messages, each `{role, content}` with its text; instructions first.
+fn decision_state(body: String) -> String fallible(ApiError) {
+    let instructions = std::json::find_string_field(body, "instructions");
+    let has_instructions = std::json::string_field(body, "instructions").kind == "string"
+        && len(instructions) > 0;
+    let input = std::str::trim(std::json::find_field_raw(body, "input"));
+    if std::str::starts_with(input, "\"") {
+        if !has_instructions { return input; }
+        return jq(instructions + "\n\n" + std::json::find_string_field(body, "input"));
+    }
+    let out = st::JsonList { };
+    if has_instructions {
+        out.add("{\"role\": \"system\", \"content\": " + jq(instructions) + "}");
+    }
+    let mut it = std::json::array_first(input);
+    while !it.done {
+        let m = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        let kind = std::json::find_string_field(m, "type");
+        if std::json::string_field(m, "type").kind == "string" && kind != "message" {
+            fail decision_refusal(
+                "a decision model reads text messages only, not `" + kind + "`",
+                "input"
+            );
+        }
+        let role = std::json::find_string_field(m, "role");
+        let content = std::str::trim(std::json::find_field_raw(m, "content"));
+        let text = message_text(content) or raise;
+        out.add("{\"role\": " + jq(role) + ", \"content\": " + jq(text) + "}");
+    }
+    return "[" + out.text() + "]";
+}
+
+/// A message's content as its text: a string, or its text parts joined.
+fn message_text(content: String) -> String fallible(ApiError) {
+    if std::str::starts_with(content, "\"") {
+        return std::json::unescape_string(content[1..(len(content) - 1)]);
+    }
+    let mut out = "";
+    let mut it = std::json::array_first(content);
+    while !it.done {
+        let part = it.element;
+        it = std::json::array_next(it);
+        let t = std::json::find_string_field(part, "type");
+        if t != "input_text" && t != "output_text" && t != "text" {
+            fail decision_refusal(
+                "a decision model reads text only, not `" + t + "`",
+                "input"
+            );
+        }
+        out = out + (if len(out) > 0 { "\n" } else { "" })
+            + std::json::find_string_field(part, "text");
+    }
+    return out;
+}
+
+// ---- the answer ---------------------------------------------------------
+
+/// A systemone answer's `answers` as the JSON the schema asked for: each
+/// question's most likely answer, a choice as its option, a noul as true or
+/// false, a score as its level's value.
+fn decision_content(answers: String) -> String {
+    let out = st::JsonList { };
+    let mut it = std::json::object_first(answers);
+    while !it.done {
+        let name = std::json::obj_key_string(it, answers);
+        let a = std::str::trim(std::json::obj_value_raw(it, answers));
+        it = std::json::object_next(it, answers);
+        let t = std::json::find_string_field(a, "type");
+        let value = if t == "choice" {
+            jq(std::json::find_string_field(a, "choice"))
+        } else if t == "noul" {
+            if noul_of(a) >= 0.5 { "true" } else { "false" }
+        } else {
+            score_value(a)
+        };
+        out.add(jq(name) + ": " + value);
+    }
+    return "{" + out.text() + "}";
+}
+
+/// A noul answer's probability of yes.
+fn noul_of(a: String) -> Float {
+    let raw = std::str::trim(std::json::find_field_raw(a, "noul"));
+    return std::str::parse_float(raw) or 0.0;
+}
+
+/// A score answer's most likely level, as the value the schema gave it (its
+/// label in the answer's `legend`).
+fn score_value(a: String) -> String {
+    let probs = std::json::find_field_raw(a, "probabilities");
+    let mut best = "";
+    let mut best_p = -1.0;
+    let mut it = std::json::object_first(probs);
+    while !it.done {
+        let k = std::json::obj_key_string(it, probs);
+        let p = std::str::parse_float(std::str::trim(std::json::obj_value_raw(it, probs))) or 0.0;
+        it = std::json::object_next(it, probs);
+        if p > best_p {
+            best_p = p;
+            best = k;
+        }
+    }
+    let label = std::json::find_string_field(std::json::find_field_raw(a, "legend"), best);
+    // the label is the value's JSON text (`question_of`)
+    let raw = std::str::trim(label);
+    return if len(raw) > 0 && std::json::valid("{\"v\": " + raw + "}") { raw } else { jq(raw) };
+}
+
+/// A systemone `answer` as the standard response object: one message whose
+/// text is the schema's JSON, its usage the state's tokens.
+fn decision_response(answer: String, model: String) -> String {
+    let answers = std::str::trim(std::json::find_field_raw(answer, "answers"));
+    let input = std::json::find_int_field(
+        std::json::find_field_raw(answer, "usage"),
+        "input_tokens",
+    );
+    let named = std::json::find_string_field(answer, "model");
+    return "{\"id\": \"\", \"object\": \"response\", \"status\": \"completed\", \"model\": "
+        + jq(if len(named) > 0 && named != "null" { named } else { model })
+        + ", \"output\": [{\"type\": \"message\", \"id\": \"msg_decision\", \"status\": \"completed\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": "
+        + jq(decision_content(answers))
+        + ", \"annotations\": []}]}], \"usage\": {\"input_tokens\": "
+        + to_string(input) + ", \"output_tokens\": 0, \"total_tokens\": " + to_string(input) + "}}";
+}

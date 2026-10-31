@@ -729,3 +729,15 @@ name. Kept whole, as the list the api writes.
 ```sql
 alter table project add column aliases jsonb not null default '[]';
 ```
+
+### Migration 20: a model's contract
+
+What a catalog model answers: `generative`, the default, or `decision`, a
+model that answers only structured requests (a JSON schema of choices,
+yes/no questions and scores), with the probability of each answer. A
+request to a decision model is checked against that contract before it is
+routed, whatever serves it.
+
+```sql
+alter table catalog_model add column contract text not null default 'generative' check (contract in ('generative', 'decision'));
+```

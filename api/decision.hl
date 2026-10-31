@@ -58,6 +58,25 @@ fn decision_body(body: String) -> String fallible(ApiError) {
         );
     }
     let schema = std::str::trim(std::json::find_field_raw(format, "schema"));
+    // every constraint is one the answer keeps, or the request is refused:
+    // an accepted schema is one the answer matches
+    let stray = stray_key(
+        schema,
+        " type properties required additionalProperties title description $schema ",
+    );
+    if len(stray) > 0 {
+        fail decision_refusal(
+            "the schema's `" + stray + "` is not one a decision answer can keep",
+            "response_format"
+        );
+    }
+    let kind = std::json::string_field(schema, "type");
+    if kind.kind != "missing" && !(kind.kind == "string" && kind.text == "object") {
+        fail decision_refusal(
+            "the schema is an object whose properties are the questions",
+            "response_format"
+        );
+    }
     let props = std::str::trim(std::json::find_field_raw(schema, "properties"));
     if !std::json::valid_object(props) || props == "{}" {
         fail decision_refusal(
@@ -86,8 +105,34 @@ fn decision_body(body: String) -> String fallible(ApiError) {
     return "{\"state\": " + state + ", \"questions\": {" + questions.text() + "}}";
 }
 
+/// The first member of `obj` whose name is not in `allowed` (names with a
+/// space either side), "" when every one is.
+fn stray_key(obj: String, allowed: String) -> String {
+    let mut it = std::json::object_first(obj);
+    while !it.done {
+        let k = std::json::obj_key_string(it, obj);
+        if !std::str::contains(allowed, " " + k + " ") { return k; }
+        it = std::json::object_next(it, obj);
+    }
+    return "";
+}
+
 /// One property as the question it asks.
 fn question_of(name: String, q: String) -> String fallible(ApiError) {
+    let stray = stray_key(q, " type description title enum oneOf ");
+    if len(stray) > 0 {
+        fail decision_refusal(
+            "property `" + name + "`: `" + stray
+                + "` is not a constraint a decision answer keeps; a question is a `type`, its `description`, and its `enum` or `oneOf`",
+            "response_format"
+        );
+    }
+    if sets(q, "enum") && sets(q, "oneOf") {
+        fail decision_refusal(
+            "property `" + name + "`: give its options as `enum` or `oneOf`, not both",
+            "response_format"
+        );
+    }
     let d = std::json::find_string_field(q, "description");
     let said = if std::json::string_field(q, "description").kind == "string" && len(d) > 0 {
         d
@@ -97,6 +142,13 @@ fn question_of(name: String, q: String) -> String fallible(ApiError) {
     let instructions = jq(said);
     let t = std::json::find_string_field(q, "type");
     if t == "boolean" {
+        if sets(q, "enum") || sets(q, "oneOf") {
+            fail decision_refusal(
+                "property `" + name
+                    + "`: a yes or no answers either; it takes no `enum` or `oneOf`",
+                "response_format"
+            );
+        }
         return "{\"type\": \"noul\", \"instructions\": " + instructions + "}";
     }
     let levels = level_list(q);
@@ -108,6 +160,15 @@ fn question_of(name: String, q: String) -> String fallible(ApiError) {
         let mut l = std::json::array_first(levels);
         while !l.done {
             let raw = std::str::trim(l.element);
+            if std::str::starts_with(raw, "{") {
+                let stray = stray_key(raw, " const description title ");
+                if len(stray) > 0 || !sets(raw, "const") {
+                    fail decision_refusal(
+                        "property `" + name + "`: each of its `oneOf` is `{const, description}`",
+                        "response_format"
+                    );
+                }
+            }
             let value = if std::str::starts_with(raw, "{") {
                 std::str::trim(std::json::find_field_raw(raw, "const"))
             } else {
@@ -137,11 +198,26 @@ fn question_of(name: String, q: String) -> String fallible(ApiError) {
         let mut l = std::json::array_first(levels);
         while !l.done {
             let raw = std::str::trim(l.element);
+            if std::str::starts_with(raw, "{") {
+                let stray = stray_key(raw, " const description title ");
+                if len(stray) > 0 || !sets(raw, "const") {
+                    fail decision_refusal(
+                        "property `" + name + "`: each of its `oneOf` is `{const, description}`",
+                        "response_format"
+                    );
+                }
+            }
             let value = if std::str::starts_with(raw, "{") {
                 std::str::trim(std::json::find_field_raw(raw, "const"))
             } else {
                 raw
             };
+            if !is_number(value) || (t == "integer" && !is_integer(value)) {
+                fail decision_refusal(
+                    "property `" + name + "`: a score's levels are " + t + "s",
+                    "response_format"
+                );
+            }
             let about = std::str::trim(std::json::find_field_raw(raw, "description"));
             crit.add(
                 "{\"label\": " + jq(value)
@@ -167,6 +243,12 @@ fn question_of(name: String, q: String) -> String fallible(ApiError) {
             + "`: a decision model answers choices (a string `enum`, or `oneOf` of `{const, description}`, 1 to 255), yes or no (`boolean`) and scores (an integer `enum` or `oneOf`, 2 to 10 levels in order)",
         "response_format"
     );
+}
+
+/// True when `s` is a JSON number.
+fn is_number(s: String) -> Bool {
+    if len(s) == 0 { return false; }
+    return std::json::string_field("{\"v\": " + s + "}", "v").kind == "number";
 }
 
 /// A property's options or levels: its `enum`, else its `oneOf`.
@@ -286,6 +368,41 @@ fn score_value(a: String) -> String {
     // the label is the value's JSON text (`question_of`)
     let raw = std::str::trim(label);
     return if len(raw) > 0 && std::json::valid("{\"v\": " + raw + "}") { raw } else { jq(raw) };
+}
+
+/// A decision answer as the whole standard response resource `r` was asked
+/// for: `request_id` its id, now its times, `r`'s own instructions, text
+/// format, metadata and conversation, and the output and usage `answer`
+/// (`decision_response`'s) carries. The rest are the standard's defaults, as
+/// a stream's pending response has them (stream.hl).
+fn decision_resource(answer: String, request_id: String, r: InferenceRequest) -> String {
+    let at = to_string(std::time::unix(now_seconds()));
+    let output = std::str::trim(std::json::find_field_raw(answer, "output"));
+    let input = std::json::find_int_field(
+        std::json::find_field_raw(answer, "usage"),
+        "input_tokens",
+    );
+    let text = std::str::trim(std::json::find_field_raw(r.body, "text"));
+    let instructions = std::str::trim(std::json::find_field_raw(r.body, "instructions"));
+    let metadata = std::str::trim(std::json::find_field_raw(r.body, "metadata"));
+    let key = std::str::trim(std::json::find_field_raw(r.body, "prompt_cache_key"));
+    return "{\"id\": " + jq(request_id) + ", \"object\": \"response\", \"created_at\": " + at
+        + ", \"completed_at\": " + at + ", \"status\": \"completed\", \"incomplete_details\": null"
+        + ", \"model\": " + jq(std::json::find_string_field(answer, "model"))
+        + ", \"previous_response_id\": null, \"instructions\": "
+        + (if std::str::starts_with(instructions, "\"") { instructions } else { "null" })
+        + ", \"output\": " + output + ", \"error\": null"
+        + ", \"tools\": [], \"tool_choice\": \"none\", \"truncation\": \"disabled\", \"parallel_tool_calls\": false"
+        + ", \"text\": "
+        + (if std::json::valid_object(text) { text } else { "{\"format\": {\"type\": \"text\"}}" })
+        + ", \"top_p\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0, \"top_logprobs\": 0, \"temperature\": 1, \"reasoning\": null"
+        + ", \"usage\": {\"input_tokens\": " + to_string(input)
+        + ", \"input_tokens_details\": {\"cached_tokens\": 0}, \"output_tokens\": 0, \"output_tokens_details\": {\"reasoning_tokens\": 0}, \"total_tokens\": "
+        + to_string(input) + "}"
+        + ", \"max_output_tokens\": null, \"max_tool_calls\": null, \"store\": false, \"background\": false, \"service_tier\": \"default\""
+        + ", \"metadata\": " + (if std::json::valid_object(metadata) { metadata } else { "{}" })
+        + ", \"safety_identifier\": null, \"prompt_cache_key\": "
+        + (if std::str::starts_with(key, "\"") { key } else { "null" }) + "}";
 }
 
 /// A systemone `answer` as the standard response object: one message whose

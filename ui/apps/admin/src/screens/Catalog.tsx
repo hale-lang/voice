@@ -6,11 +6,13 @@ import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
 import { ContextWindow } from '../context';
+import { NamedByList, useAliasesByModel } from '../aliases';
 
 /** The catalog: what callers may name, with its price. */
 export function Catalog({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
   const q = useGet('/admin/v1/models');
+  const named = useAliasesByModel();
   const model = q.data?.data.find((m) => m.id === selected);
   const creating = selected === 'new';
 
@@ -37,6 +39,7 @@ export function Catalog({ route, setInspector }: ScreenProps) {
             { key: 'ctx', header: 'Context', num: true, render: (m) => <ContextWindow served={m.served_context_length} native={m.context_length} /> },
             { key: 'out', header: 'Max out', num: true, render: (m) => m.max_output_tokens?.toLocaleString() ?? '–' },
             { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => (m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} · ${micros(m.price.output_per_mtok_micros, m.price.currency)}` : <span className="faint">free</span>) },
+            { key: 'aliases', header: 'Named by', render: (m) => <NamedByList names={named.get(m.id)} /> },
             { key: 'seats', header: 'Seats', num: true, render: (m) => m.seats.length },
             { key: 'avail', header: 'Available', render: (m) => (m.available ? <Status tone="quiet" label="yes" /> : <Status tone="wait" label="no seat" />) },
           ]}
@@ -125,6 +128,7 @@ function ModelForm({ model }: { model?: CatalogModel }) {
 
 function ModelInspector({ model: m }: { model: CatalogModel }) {
   const w = useWrite();
+  const named = useAliasesByModel();
   const [editing, setEditing] = useState(false);
   useEffect(() => setEditing(false), [m]);
   if (editing) return <ModelForm model={m} />;
@@ -144,6 +148,7 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
           { k: 'price', v: m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },
           { k: 'available', v: m.available ? 'yes' : <span className="c-wait">no seat serves it</span> },
           { k: 'seats', v: m.seats.length ? m.seats.map((s) => <div key={s}><Mono>{s}</Mono></div>) : 'none' },
+          { k: 'named by', v: <NamedByList names={named.get(m.id)} /> },
           { k: 'created', v: when(m.created_at) },
         ]}
       />

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGraph, entityId, edgeId, requestEdges, requestVertices, requestContext, relatedRequests, matchingRequests, graphKinds, requestFlowEdges, layoutGraph, resizeLayout } from './network-model.ts';
+import { buildGraph, aliasId, entityId, edgeId, requestEdges, requestVertices, requestContext, relatedRequests, matchingRequests, graphKinds, requestFlowEdges, layoutGraph, resizeLayout } from './network-model.ts';
 import { demoFleet, demoRequest, demoInFlight, demoCompletions } from './network-demo.ts';
 
 test('graph relationships come from configuration or usage, never all-to-all guesses', () => {
@@ -188,7 +188,7 @@ test('directed force layout spreads execution toward models across the available
     const labels = graph.vertices.filter(v => v.kind !== 'seat');
     for (let i=0; i<labels.length; i++) for (let j=i+1; j<labels.length; j++) {
       const a = points.get(labels[i].id), b = points.get(labels[j].id);
-      assert(Math.abs(a.x-b.x)>145 || Math.abs(a.y-b.y)>(labels[i].kind === 'model' && labels[j].kind === 'model' ? 29 : 60), `Overlapping labels: ${labels[i].id}, ${labels[j].id}`);
+      assert(Math.abs(a.x-b.x)>145 || Math.abs(a.y-b.y)>(['model', 'alias'].includes(labels[i].kind) && ['model', 'alias'].includes(labels[j].kind) ? 29 : 60), `Overlapping labels: ${labels[i].id}, ${labels[j].id}`);
     }
   }
 });
@@ -251,4 +251,31 @@ test('homelab demo places CLI accounts on h1/h2 and MLX capacity on Macs', () =>
     if (['h1','h2'].includes(node.id) && seat.account === 'local') assert(seat.serves.every(s => ['llama-3b','llama-8b','qwen-7b'].includes(s.model)));
     if (!['h1','h2'].includes(node.id)) assert.equal(seat.engine,'mlx');
   }
+});
+
+test('an alias is its own vertex: its project names the model by it, and a request by it draws through it to that model', () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const base = demoRequest(fleet, 1, 1_800_000_000_000);
+  const target = base.served.model;
+  const projects = fleet.projects.map((p, i) => (i === 0 ? { ...p, aliases: [{ name: 'coding', model: target }], resolved_aliases: [{ name: 'coding', model: target, from: p.id }] } : p));
+  const project = projects[0].id;
+  const configured = buildGraph({ ...fleet, projects, usage: [] });
+  const named = aliasId('coding', target);
+  assert.equal(configured.vertices.find((v) => v.id === named)?.kind, 'alias');
+  assert(configured.edges.some((e) => e.id === edgeId(entityId('project', project), named) && e.kind === 'names'));
+  assert(configured.edges.some((e) => e.id === edgeId(named, entityId('model', target)) && e.kind === 'resolves'));
+  assert(!configured.vertices.some((v) => v.kind === 'model' && v.name === 'coding'), 'an alias is never a model');
+
+  const record = { ...base, project, requested_model: 'coding', resolved_model: target };
+  const graph = buildGraph({ ...fleet, projects, usage: [record] });
+  assert(requestVertices(record, graph).has(named));
+  assert(requestEdges(record, graph).has(edgeId(named, entityId('model', target))));
+  assert(!graph.vertices.some((v) => v.id === entityId('model', 'coding')));
+
+  // a record from before voice kept what an alias named reads the project's aliases now
+  const { resolved_model: _, ...legacy } = record;
+  assert(requestVertices(legacy, buildGraph({ ...fleet, projects, usage: [legacy] })).has(named));
+  // a model named itself is no alias
+  const direct = { ...base, project, requested_model: target, resolved_model: target };
+  assert(!requestVertices(direct, buildGraph({ ...fleet, projects, usage: [direct] })).has(named));
 });

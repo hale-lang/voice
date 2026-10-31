@@ -7,7 +7,7 @@ export const kindName = (kind: Kind): string => kind.startsWith('context:') ? ki
 export const graphKinds = (graph: Graph): Kind[] => [...new Set(graph.vertices.map(v => v.kind))].sort((a, b) => kindName(a).localeCompare(kindName(b)));
 
 export type RequestContext = { repository?: string; apiInstance?: string };
-export type Fleet = { nodes: Node[]; accounts: Account[]; projects: Schemas['Project'][]; usage: UsageRecord[]; contexts?: Record<string, RequestContext> };
+export type Fleet = { nodes: Node[]; accounts: Account[]; projects: Schemas['Project'][]; usage: UsageRecord[]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[] };
 export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string };
 export type Edge = { id: string; source: string; target: string; kind: 'offers' | 'hosts' | 'pays' | 'observed'; flow?: boolean };
 export type RequestPath = { vertices: string[]; edges: string[]; flowEdges: string[]; context: RequestContext };
@@ -38,6 +38,8 @@ export function buildGraph(fleet: Fleet): Graph {
     }
     return undefined;
   };
+  // the api instances the hub announced: alive while they beat
+  for (const i of fleet.instances ?? []) add({ id: entityId('api', i.id), name: i.id, kind: 'api', state: i.up ? 'up' : 'down', active: 0, details: [['API instance', i.id], ['Last heartbeat', i.at], ['Evidence', 'Announced by the hub as it beats; which instance served a request is not yet recorded.']] });
   for (const p of fleet.projects) add({ id: entityId('project', p.id), name: p.id, kind: 'project', state: p.status, active: 0, href: link('projects', p.id), details: [['Name', p.name], ['State', p.status]] });
   for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: link('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });
   for (const n of fleet.nodes) {

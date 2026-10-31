@@ -57,6 +57,24 @@ locus DataPlane {
         // the admin plane's bearer (ctl.hl): the event stream and the route
         // table take the operator token, as the rows do
         operator: AdminBearer = AdminBearer { store: self.store };
+        // the port of the api's hub (hub.hl), which `GET /admin/v1/hub` tells
+        hub_port: Int = 8085;
+    }
+
+    bus { publish NodeObserved; }
+
+    /// A node's report, recorded, told to the hub (hub.hl) as the node now
+    /// is. A node that cannot be read is told nothing: its report stands.
+    fn observed(ctx: std::api::Context, report: String) {
+        let n = self.nodes.get_read(NodeRef { node: ctx.caller.name }) or {
+            return;
+        };
+        NodeObserved <- NodeObservation {
+            node: n.id,
+            report: report,
+            at: now_seconds(),
+            body: node_json(n),
+        };
     }
 
     /// The registration's answer with the nodes' account in it, written
@@ -117,6 +135,18 @@ locus DataPlane {
             return caller_json(capabilities_json(caps));
         }
 
+        // the hub: where the fleet's heartbeats stream (hub.hl)
+        if std::http::is_route(c, "GET", "/admin/v1/hub") {
+            if !self.operator.admits(std::http::header(req, "Authorization")) {
+                return operator_refusal();
+            }
+            return json_answer(
+                200,
+                "{\"port\": " + to_string(self.hub_port)
+                    + ", \"topics\": [\"NodeObserved\", \"InstanceBeat\"]}",
+            );
+        }
+
         // routes
         if std::http::is_route(c, "GET", "/admin/v1/routes") {
             if !self.operator.admits(std::http::header(req, "Authorization")) {
@@ -140,6 +170,7 @@ locus DataPlane {
             let ctx = self.node_ctx(req) or raise;
             let r = read_registration(req.body) or raise;
             let answer = self.node_plane.register_read(r, ctx) or raise;
+            self.observed(ctx, "register");
             if len(self.node_user) > 0 { return self.registered_with_account(req, answer); }
             return json_answer(200, registered_json(answer));
         }
@@ -152,18 +183,21 @@ locus DataPlane {
             let ctx = self.node_ctx(req) or raise;
             let h = read_heartbeat(req.body) or raise;
             self.node_plane.heartbeat(h, ctx) or raise;
+            self.observed(ctx, "heartbeat");
             return no_content();
         }
         if std::http::is_route(c, "POST", "/node/v1/seats") {
             let ctx = self.node_ctx(req) or raise;
             let st = read_seat_states(req.body) or raise;
             self.node_plane.seat_states(st, ctx) or raise;
+            self.observed(ctx, "seats");
             return no_content();
         }
         if std::http::is_route(c, "PUT", "/node/v1/capabilities") {
             let ctx = self.node_ctx(req) or raise;
             let r = read_node_capabilities(req.body) or raise;
             self.node_plane.capabilities(r, ctx) or raise;
+            self.observed(ctx, "capabilities");
             return no_content();
         }
         if std::http::is_route(c, "PUT", "/node/v1/local") {
@@ -171,6 +205,7 @@ locus DataPlane {
             object_body(req.body) or raise;
             let r = read_local(std::str::trim(req.body)) or raise;
             self.node_plane.local(r, ctx) or raise;
+            self.observed(ctx, "local");
             return no_content();
         }
         if std::http::is_route(c, "POST", "/node/v1/quota") {

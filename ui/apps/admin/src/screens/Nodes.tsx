@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
 import { useGet, type Node, type SeatView, type Schemas } from '../api/client';
+import { useHubState } from '../api/hub';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { href, go } from '../route';
@@ -22,13 +23,15 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   const seat = node?.seats.find((s) => s.id === seatId);
   const newSeat = seatId === 'new';
   const qc = useQueryClient();
-  // a seat on its way up moves by itself: read again while one is
+  // a seat on its way up moves by itself: the hub says so as it does, and
+  // with no hub, read again while one is
+  const live = useHubState() === 'open';
   const moving = q.data?.data.some((n) => n.seats.some((s) => s.status === 'fetching' || s.status === 'starting')) ?? false;
   useEffect(() => {
-    if (!moving) return;
+    if (!moving || live) return;
     const t = setInterval(() => void qc.invalidateQueries({ queryKey: ['/admin/v1/nodes'] }), 3000);
     return () => clearInterval(t);
-  }, [moving, qc]);
+  }, [moving, live, qc]);
 
   useEffect(() => {
     if (creating) setInspector(<CreateNode />);

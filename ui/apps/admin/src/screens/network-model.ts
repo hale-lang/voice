@@ -25,13 +25,14 @@ const link = (...parts: string[]) => '#/' + parts.map(encodeURIComponent).join('
 export const aliasId = (name: string, model: string) => entityId('alias', `${name}→${model}`);
 
 /**
- * The catalog model a request's alias named. The record says, when it was
- * written after voice kept it (`resolved_model`, `null` for a model named
- * itself); an older record is read against its project's aliases in force now.
+ * The catalog model a request's alias named; none when it named a model. The
+ * record says, when it was written after voice kept it (`resolved_model`, the
+ * model it was routed as: the alias's model, or the one asked for itself); an
+ * older record is read against its project's aliases in force now.
  */
 export function resolvedModel(record: UsageRecord, projects: Schemas['Project'][]): { model: string; recorded: boolean } | undefined {
-  const kept = (record as { resolved_model?: string | null }).resolved_model;
-  if (kept !== undefined) return kept ? { model: kept, recorded: true } : undefined;
+  const kept = record.resolved_model;
+  if (kept) return kept !== record.requested_model ? { model: kept, recorded: true } : undefined;
   const now = projects.find(p => p.id === record.project)?.resolved_aliases?.find(a => a.name === record.requested_model);
   return now ? { model: now.model, recorded: false } : undefined;
 }

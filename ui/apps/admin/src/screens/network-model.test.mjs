@@ -276,6 +276,6 @@ test('an alias is its own vertex: its project names the model by it, and a reque
   const { resolved_model: _, ...legacy } = record;
   assert(requestVertices(legacy, buildGraph({ ...fleet, projects, usage: [legacy] })).has(named));
   // a model named itself is no alias
-  const direct = { ...base, project, resolved_model: null };
+  const direct = { ...base, project, requested_model: target, resolved_model: target };
   assert(!requestVertices(direct, buildGraph({ ...fleet, projects, usage: [direct] })).has(named));
 });

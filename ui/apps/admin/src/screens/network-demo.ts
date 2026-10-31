@@ -53,7 +53,7 @@ export function demoRequest(fleet: Fleet, sequence: number, now: number): UsageR
   const failed = sequence > 0 && sequence % 13 === 0;
   const alias = ALIASES[project]?.find(a => a.model === model);
   const unserved = sequence > 0 && sequence % 17 === 0;
-  return { id: `demo-${sequence}`, created_at: new Date(now).toISOString(), project, key: 'demo-key', requested_model: alias?.name ?? model, resolved_model: alias ? model : null, endpoint: 'responses', status: unserved ? 'no_capacity' : failed ? 'failed' : 'served', served: unserved ? null : { model, node: seat.node, seat: seat.ref, account: seat.account, engine: seat.engine }, input_tokens: unserved ? 0 : 420 + sequence % 17 * 100, output_tokens: unserved || failed ? 0 : 60 + sequence % 11 * 24, price_micros: unserved || seat.account === 'local' ? 0 : 3400, currency: 'USD', timing: { wall_ms: 920 + sequence % 9 * 140, queue_ms: sequence % 3 * 80, load_ms: 0 }, metadata: repository ? { repository } : {} };
+  return { id: `demo-${sequence}`, created_at: new Date(now).toISOString(), project, key: 'demo-key', requested_model: alias?.name ?? model, resolved_model: model, endpoint: 'responses', status: unserved ? 'no_capacity' : failed ? 'failed' : 'served', served: unserved ? null : { model, node: seat.node, seat: seat.ref, account: seat.account, engine: seat.engine }, input_tokens: unserved ? 0 : 420 + sequence % 17 * 100, output_tokens: unserved || failed ? 0 : 60 + sequence % 11 * 24, price_micros: unserved || seat.account === 'local' ? 0 : 3400, currency: 'USD', timing: { wall_ms: 920 + sequence % 9 * 140, queue_ms: sequence % 3 * 80, load_ms: 0 }, metadata: repository ? { repository } : {} };
 }
 
 // Three staggered workers, each with a gap between requests. No project occupies two workers.

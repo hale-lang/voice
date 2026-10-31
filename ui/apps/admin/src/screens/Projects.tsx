@@ -168,7 +168,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
                     {p.peek ? 'stop' : 'peek'}
                   </Button>
                 )}
-                {p.peek && <> <a href="#/peek">recordings</a></>}
+                {p.peek && <span className="muted"> · shown on each request in Usage</span>}
               </>
             ),
           },

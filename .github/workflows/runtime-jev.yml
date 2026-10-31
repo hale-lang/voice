@@ -1,0 +1,91 @@
+# Jev-Style's scorer, jev-score-v2 (runtimes/jev): built for every backend a
+# node runs, here, never on someone's machine. metal builds on macOS; cpu,
+# vulkan, rocm and cuda in their builders (runtimes/jev/Dockerfile), for each
+# architecture they serve. Where a runner can run a build (metal, and cpu on
+# both architectures), runtimes/jev/check/check.py holds it to the release:
+# its tokenizer, its GGUF check, and the MLX bf16 release's answers. GPU
+# builds are built here, and checked on the GPUs they serve.
+
+name: "runtime: jev"
+
+on:
+  pull_request:
+    paths:
+      - runtimes/jev/**
+      - .github/workflows/runtime-jev.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # the release the scorer is vendored from, and its Q8_0 weights
+  JEV_REPO: chaoliangUNSW/Jev-Style-2B-Decision-v3-GGUF
+  JEV_REVISION: 154f7ac19614e30f0af52cc5b685baa95114c5a7
+  JEV_GGUF_SHA256: f4826516125022362f4617e16d28b0e5f95b10d053bac18b59f49f27c89c83bb
+
+jobs:
+  build:
+    name: ${{ matrix.backend }} ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { backend: metal, arch: arm64, runner: macos-15, check: true }
+          - { backend: cpu, arch: x86_64, runner: ubuntu-24.04, check: true }
+          - { backend: cpu, arch: arm64, runner: ubuntu-24.04-arm, check: true }
+          - { backend: vulkan, arch: x86_64, runner: ubuntu-24.04 }
+          - { backend: vulkan, arch: arm64, runner: ubuntu-24.04-arm }
+          - { backend: rocm, arch: x86_64, runner: ubuntu-24.04 }
+          - { backend: cuda, arch: x86_64, runner: ubuntu-24.04 }
+          - { backend: cuda, arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # the ROCm and CUDA toolchains are tens of gigabytes unpacked
+      - name: Room for the builder
+        if: matrix.backend == 'rocm' || matrix.backend == 'cuda'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Build (macOS)
+        if: matrix.backend == 'metal'
+        run: runtimes/jev/build.sh metal "$RUNNER_TEMP/out"
+      - name: Build (Linux)
+        if: matrix.backend != 'metal'
+        run: |
+          docker build -f runtimes/jev/Dockerfile --build-arg BACKEND=${{ matrix.backend }} \
+            --target scorer --output type=local,dest="$RUNNER_TEMP/out" .
+
+      - name: The release's files
+        if: matrix.check
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/model
+          key: jev-style-2b-v3-gguf-${{ env.JEV_REVISION }}
+      - name: Fetch the release's files
+        if: matrix.check
+        run: |
+          set -eu
+          m="$RUNNER_TEMP/model"
+          mkdir -p "$m/tokenizer"
+          for f in Jev-Style-2B-Decision-v3-Q8_0.gguf jev_style_decision_gguf.py readout_config.json \
+                   tokenizer/tokenizer.json; do
+            [ -s "$m/$f" ] || curl -fsSL -o "$m/$f" "https://huggingface.co/$JEV_REPO/resolve/$JEV_REVISION/$f"
+          done
+          echo "$JEV_GGUF_SHA256  $m/Jev-Style-2B-Decision-v3-Q8_0.gguf" | shasum -a 256 -c -
+      - name: Check
+        if: matrix.check
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q numpy tokenizers
+          "$RUNNER_TEMP/venv/bin/python" runtimes/jev/check/check.py "$RUNNER_TEMP/out/jev-runtime" "$RUNNER_TEMP/model"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jev-runtime-${{ matrix.backend }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/out/jev-runtime
+          retention-days: 7

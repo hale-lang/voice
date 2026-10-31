@@ -37,7 +37,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
           selectedKey={selected}
           onSelect={(p) => go('projects', p.id)}
           columns={[
-            { key: 'id', header: 'Project', render: (p) => (p.parent ? <><span className="faint">↳ </span><Mono>{p.id}</Mono></> : <Mono>{p.id}</Mono>) },
+            { key: 'id', header: 'Project', render: (p) => (p.parent ? <><span className="faint">↳ </span><Mono>{p.id}</Mono></> : <>{<Mono>{p.id}</Mono>}{p.internal && <span className="faint"> · voice's own</span>}</>) },
             { key: 'name', header: 'Name', render: (p) => p.name },
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
@@ -176,6 +176,28 @@ function ProjectInspector({ project: p }: { project: Project }) {
               </>
             ),
           },
+          p.internal
+            ? {
+                k: 'annotate',
+                v: <span className="muted">voice's own project: the requests voice makes for itself (annotations) are its, spending its accounts and limits; its <Mono>decide</Mono> alias names the decision model asked</span>,
+              }
+            : {
+                k: 'annotate',
+                v: (
+                  <>
+                    {p.annotates ? <span className="c-wait">each request read by voice-system's decision model</span> : <span className="muted">off</span>}
+                    {p.annotate == null && p.parent ? <span className="muted"> · {p.parent}'s</span> : null}{' '}
+                    {p.status !== 'archived' && (
+                      <Select
+                        value={p.annotate == null ? (p.parent ? 'parent' : 'off') : p.annotate ? 'on' : 'off'}
+                        onChange={async (v) => { await w.write('patch', '/admin/v1/projects/{project}', { params: { path: { project: p.id } }, body: { annotate: v === 'parent' ? null : v === 'on' } }); }}
+                        options={[...(p.parent ? [{ value: 'parent', label: `${p.parent}'s` }] : []), { value: 'on', label: 'on' }, { value: 'off', label: 'off' }]}
+                      />
+                    )}
+                    {p.annotates && <span className="muted"> · spending voice-system's usage, not this project's</span>}
+                  </>
+                ),
+              },
           { k: 'name', v: p.name },
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
@@ -313,7 +335,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
         </>
       )}
       {w.pending && <p className="c-wait">Proposed, pending review: {w.pending}</p>}
-      {p.status === 'active' && (
+      {p.status === 'active' && !p.internal && (
         <p style={{ marginTop: 'var(--space-4)' }}>
           <Confirm label="archive project" confirm="archive: its keys are revoked" onConfirm={async () => { await w.write('delete', '/admin/v1/projects/{project}', { params: { path: { project: p.id } } }); }} />
         </p>
@@ -355,6 +377,18 @@ function Keys({ project }: { project: Project }) {
                 k.status === 'active' ? (
                   <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { peek: !k.peek } }); }} disabled={w.busy}>
                     {k.peek ? 'recording · stop' : project.peeks ? 'by the project' : 'peek'}
+                  </Button>
+                ) : (
+                  <span className="faint">–</span>
+                ),
+            },
+            {
+              key: 'annotate',
+              header: 'Annotate',
+              render: (k) =>
+                k.status === 'active' && !project.internal ? (
+                  <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { annotate: !k.annotate } }); }} disabled={w.busy}>
+                    {k.annotate ? 'annotating · stop' : project.annotates ? 'by the project' : 'annotate'}
                   </Button>
                 ) : (
                   <span className="faint">–</span>

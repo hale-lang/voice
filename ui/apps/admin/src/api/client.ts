@@ -95,6 +95,7 @@ export function describe(error: unknown, status: number): string {
 
 /** A request's recording, as `getPeek` answers it. */
 export type Peek = Schemas['Peek'];
+export type Annotation = Schemas['Annotation'];
 
 /**
  * The recordings of `ids`, each read once and kept, as `useGetOnce` reads
@@ -119,6 +120,30 @@ export function usePeeks(ids: string[]) {
   });
 }
 
+/**
+ * The annotations of `ids` (annotate.hl), each read once and kept: a
+ * request not annotated (its project and key do not annotate, or it is not
+ * read yet) answers 404, which is `null` here, not an error.
+ */
+export function useAnnotations(ids: string[]) {
+  return useQueries({
+    queries: ids.map((id) => {
+      const init = { params: { path: { request_id: id } } };
+      return {
+        queryKey: ['/admin/v1/annotations/{request_id}', init] as const,
+        queryFn: async (): Promise<Annotation | null> => {
+          const r = await api.GET('/admin/v1/annotations/{request_id}', init);
+          if (r.response.status === 404) return null;
+          if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+          return r.data;
+        },
+        staleTime: 30_000,
+        retry: false,
+      };
+    }),
+  });
+}
+
 /** Turns of one conversation read at most, newest first. */
 const TURNS_MAX = 2000;
 
@@ -127,7 +152,7 @@ const TURNS_MAX = 2000;
  * pages to at most `TURNS_MAX`. Its key is under `/admin/v1/usage`, so the
  * event stream refreshes it as turns land.
  */
-export function useAllUsage(query: { conversation?: string; metadata?: string[] }) {
+export function useAllUsage(query: { conversation: string }) {
   return useQuery({
     queryKey: ['/admin/v1/usage', { all: query }],
     queryFn: async () => {

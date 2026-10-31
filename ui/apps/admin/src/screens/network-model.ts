@@ -118,6 +118,13 @@ export function buildGraph(fleet: Fleet): Graph {
       join(named, target);
     } else member('model', r.requested_model);
     if (context.repository) join(project, member('repository', context.repository, 'Caller-supplied metadata.repository; a label, not verified repository ownership.'));
+    // its conversation, the prompt_cache_key it was sent with: whatever client
+    if (r.conversation) {
+      const c = member('context:conversation', r.conversation, "The request's conversation: the prompt_cache_key its client sent, as its usage record keeps it.");
+      const v = vertices.get(c);
+      if (v && !v.href) v.href = link('usage', 'c', r.conversation);
+      join(project, c);
+    }
     for (const [key, value] of Object.entries(r.metadata)) {
       if (key === 'repository' || typeof value !== 'string' || !value.trim()) continue;
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));

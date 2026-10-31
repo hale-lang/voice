@@ -184,8 +184,9 @@ function isContext(it: Item): boolean {
  * longest run of them found in `history` in order (a client may drop or
  * reshape a part it resends, reasoning most of all), counted only when it
  * reaches the last thing the model answered (`answer` marks the history's
- * answers; reasoning is not one). A prompt that was never answered is no
- * evidence: its retry is said again. Otherwise the client sent only what
+ * answers; reasoning is not one), and matched only up to it: what was said
+ * after the last answer (a prompt that failed) is no evidence, and its
+ * retry is said again. Otherwise the client sent only what
  * is new, and none of it is a replay: a message is new whenever it is said
  * again, whatever it says.
  */
@@ -193,11 +194,13 @@ function replays(history: string[], answer: boolean[], asked: string[]): number 
   let anchor = history.length - 1;
   while (anchor >= 0 && (!answer[anchor] || history[anchor]!.startsWith('reasoning:'))) anchor--;
   if (anchor < 0) return 0;
+  // the answered history only: its unanswered tail is never replayed
+  const answered = history.slice(0, anchor + 1);
   let j = 0;
   let last = -1;
   let n = 0;
-  while (n < asked.length) {
-    const at = history.indexOf(asked[n]!, j);
+  while (n < asked.length && last < anchor) {
+    const at = answered.indexOf(asked[n]!, j);
     if (at < 0) {
       // reasoning resent reshaped is still the replay
       if (asked[n]!.startsWith('reasoning:')) {
@@ -210,7 +213,7 @@ function replays(history: string[], answer: boolean[], asked: string[]): number 
     j = at + 1;
     n++;
   }
-  return last >= anchor ? n : 0;
+  return last === anchor ? n : 0;
 }
 
 /** What makes two parts the same part, however a client resends it. */

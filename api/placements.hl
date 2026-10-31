@@ -83,6 +83,148 @@ locus Placements {
         // the seats a placement creates and removes (nodes.hl): the api's
         // own, which tell the node its assignment, behind the same gate
         seats: Seats;
+        // voice's default picks (suggestions.hl): catalog/picks.json, read
+        // at start, "" when none was found
+        picks: String = "";
+    }
+
+    /// `suggestNodeModels`: for each category voice ships, the model it
+    /// would place on node `r` (suggestions.hl).
+    fn suggest(r: NodeRef) -> NodeSuggestions fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.suggest_in_gate(r.node) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn suggest_in_gate(node: String) -> NodeSuggestions fallible(CtlError) {
+        let n = self.store.node(node) or fail store_down(err);
+        if !n.present || n.revoked { fail missing("no node " + node); }
+        let mut out = NodeSuggestions { node: node };
+        let cats = pick_categories(self.picks);
+        let f = self.store.fleet(node) or fail store_down(err);
+        let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
+        let declared = len(hw) > 0 && std::json::valid_object(hw);
+        let os = if declared { std::json::find_string_field(hw, "os") } else { "" };
+        let tier = if declared {
+            node_tier(std::json::find_int_field(hw, "memory_bytes"))
+        } else {
+            0
+        };
+        if declared {
+            out.has_os = true;
+            out.os = os;
+            if tier > 0 {
+                out.has_tier_gb = true;
+                out.tier_gb = tier;
+            }
+        }
+        // what the node's placements hold of its memory for models, and
+        // the recipe each serves there, `<recipe>\t<placement>` a line
+        let existing = self.store.placements() or fail store_down(err);
+        let mut held = 0;
+        let mut serving = "\n";
+        for p in existing.rows {
+            if !p.removed && std::json::find_string_field(p.body, "leader") == node {
+                held = held + (self.held_by(p) or raise);
+                serving = serving + std::json::find_string_field(p.body, "recipe") + "\t" + p.id
+                    + "\n";
+            }
+        }
+        let room = if declared {
+            std::json::find_int_field(hw, "model_memory_bytes") - held
+        } else {
+            0
+        };
+        let usable = self.runtimes.usable_in_gate() or raise;
+        let mut rest = cats;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let cat = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            let mut s = NodeSuggestion { category: cat };
+            if !declared {
+                s.reason = "node " + node
+                    + " has declared no hardware, so nothing can be judged to fit it";
+            } else {
+                s = self.suggest_one(cat, os, tier, hw, usable, room, held, serving) or raise;
+            }
+            push(out.data, s) or discard;
+        }
+        return out;
+    }
+
+    /// Category `cat`'s suggestion for a machine of `os` at `tier`: the
+    /// first of its picks, from that tier down, that is placed there
+    /// already, or that the operator has and that fits what is left.
+    fn suggest_one(
+        cat: String,
+        os: String,
+        tier: Int,
+        hw: String,
+        usable: RuntimeList,
+        room: Int,
+        held: Int,
+        serving: String
+    ) -> NodeSuggestion fallible(CtlError) {
+        let mut s = NodeSuggestion { category: cat };
+        let picks = picks_down(self.picks, os, cat, tier);
+        if len(picks) == 0 {
+            s.reason = "voice suggests no " + cat + " model for a " + os + " machine of "
+                + to_string(tier) + " GB yet";
+            return s;
+        }
+        let mut why = "";
+        let mut rest = picks;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let line = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            let tab = std::str::index_of(line, "\t");
+            let t = std::str::parse_int(line[0..tab]) or 0;
+            let id = line[(tab + 1)..len(line)];
+            let at_serving = std::str::index_of(serving, "\n" + id + "\t");
+            if at_serving >= 0 {
+                let from = at_serving + len(id) + 2;
+                let after = serving[from..len(serving)];
+                s.has_recipe = true;
+                s.recipe = id;
+                s.has_tier_gb = true;
+                s.tier_gb = t;
+                s.has_placed = true;
+                s.placed = after[0..std::str::index_of(after, "\n")];
+                s.reason = "placed here as " + s.placed;
+                return s;
+            }
+            let recipe = self.recipes.get_in_gate(id) or Recipe { };
+            if len(recipe.id) == 0 {
+                if len(why) == 0 {
+                    why = "recipe " + id + " is not one voice ships or the operator allows";
+                }
+                continue;
+            }
+            let judged = judge_recipe(recipe.variants.text, hw, usable, room, held);
+            if judged.best < 0 {
+                why = id + ": " + reasons(judged.fit);
+                continue;
+            }
+            let chosen = at(judged.fit, judged.best) or VariantFit { };
+            s.has_recipe = true;
+            s.recipe = id;
+            s.has_variant = true;
+            s.variant = chosen.variant;
+            s.has_runtime = chosen.has_runtime;
+            s.runtime = chosen.runtime;
+            s.has_tier_gb = true;
+            s.tier_gb = t;
+            s.reason = chosen.reason;
+            return s;
+        }
+        s.reason = "nothing voice suggests fits: " + why;
+        return s;
     }
 
     /// What placement `r` holds of its node's memory for models: what it
@@ -205,29 +347,14 @@ locus Placements {
                 "runtime"
             );
         }
-        let mut best = -1;
-        let mut best_rank = 0;
-        let mut best_memory = 0;
+        let judged = judge_recipe(recipe.variants.text, hw, usable, room, held);
+        out.fit = judged.fit;
+        let best = judged.best;
         let mut named = -1;
         let mut i = 0;
-        let mut it = std::json::array_first(recipe.variants.text);
-        while !it.done {
-            let v = it.element;
-            let judged = judge_variant(v, hw, usable, room, held);
-            push(out.fit, judged) or discard;
-            let rank = format_rank(std::json::find_string_field(v, "format"), hw)
-                + (if judged.has_runtime && runs_on_cpu(usable, judged.runtime) { 10 } else { 0 });
-            let memory = std::json::find_int_field(v, "memory_bytes");
-            if c.has_variant && judged.variant == c.variant { named = i; }
-            if judged.fits
-                && (best < 0 || rank < best_rank || (rank == best_rank && memory > best_memory))
-            {
-                best = i;
-                best_rank = rank;
-                best_memory = memory;
-            }
+        for f in out.fit {
+            if c.has_variant && f.variant == c.variant { named = i; }
             i = i + 1;
-            it = std::json::array_next(it);
         }
         if c.has_variant {
             if named < 0 {
@@ -641,6 +768,39 @@ fn accelerator_kinds(hw: String) -> String {
     }
     let b = out.snapshot() or b",";
     return std::str::from_bytes(b);
+}
+
+/// Every variant of a recipe judged against a machine (`judge_variant`),
+/// and the one a placement takes when none is named: of those that fit, the
+/// format the machine serves best (`format_rank`), off the CPU, then the
+/// biggest, the most faithful weights it has room for; -1 when none fits.
+type Judged { fit: bounded[VariantFit; 8]; best: Int = -1; }
+
+@bounded_by(variants)
+fn judge_recipe(variants: String, hw: String, rts: RuntimeList, room: Int, held: Int) -> Judged {
+    let mut out = Judged { };
+    let mut best_rank = 0;
+    let mut best_memory = 0;
+    let mut i = 0;
+    let mut it = std::json::array_first(variants);
+    while !it.done {
+        let v = it.element;
+        let judged = judge_variant(v, hw, rts, room, held);
+        push(out.fit, judged) or discard;
+        let rank = format_rank(std::json::find_string_field(v, "format"), hw)
+            + (if judged.has_runtime && runs_on_cpu(rts, judged.runtime) { 10 } else { 0 });
+        let memory = std::json::find_int_field(v, "memory_bytes");
+        if judged.fits
+            && (out.best < 0 || rank < best_rank || (rank == best_rank && memory > best_memory))
+        {
+            out.best = i;
+            best_rank = rank;
+            best_memory = memory;
+        }
+        i = i + 1;
+        it = std::json::array_next(it);
+    }
+    return out;
 }
 
 /// One variant judged against a machine's hardware and the runtimes that

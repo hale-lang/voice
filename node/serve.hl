@@ -77,15 +77,43 @@ locus Server {
         }
     }
 
-    /// One turn: a request handed it is served; else a sleep, where the
-    /// next arrives.
+    /// One turn: a request handed it is served; else its connection
+    /// tended and a sleep, where the next arrives.
     fn step() {
         if self.waiting {
             self.waiting = false;
             self.serve(self.work);
         } else {
+            self.tend();
             std::time::sleep(5ms);
         }
+    }
+
+    /// Read what the broker sent: its PINGs answered (the client answers
+    /// only while read), a connection it closed found closed.
+    fn tend() {
+        if !self.client.connected { return; }
+        let mut n = 0;
+        while n < 8 && self.client.read_msg(1ms) { n = n + 1; }
+    }
+
+    /// Publish on the request's broker, connected again and sent once more
+    /// when the connection is gone.
+    fn send(subject: String, reply: String, data: Bytes) {
+        self.client.pub_msg(subject, reply, data) or {
+            self.client.close();
+            if self.reach(self.work) {
+                self.client.pub_msg(subject, reply, data) or {
+                    log_error(
+                        "a slot could not publish its request's answer",
+                        fields2(
+                            std::log::kv("subject", subject),
+                            std::log::kv("why", err.kind + ": " + err.detail),
+                        ),
+                    );
+                };
+            }
+        };
     }
 
     fn on_job(w: ServeWork) {
@@ -99,6 +127,8 @@ locus Server {
 
     /// The broker `w` names, connected to (again, when it changed).
     fn reach(w: ServeWork) -> Bool {
+        // a connection the broker closed while the slot was idle is found so
+        self.tend();
         if self.client.connected
             && self.client.url == w.nats_url
             && self.client.user == w.nats_user
@@ -116,6 +146,7 @@ locus Server {
     /// A look at the bus, where a `cancel` for this request arrives.
     fn look() {
         self.looked = std::time::monotonic_ns();
+        self.tend();
         std::time::sleep(1ms);
     }
 
@@ -182,14 +213,14 @@ locus Server {
                         if first < 0 && is_output(ev) {
                             first = (std::time::monotonic_ns() - t0) / 1000000;
                         }
-                        self.client.pub_msg(
+                        self.send(
                             reply_to + ".event",
                             "",
                             std::bytes::from_string(
                                 "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
                                     + "}",
                             ),
-                        ) or discard;
+                        );
                     }
                 }
                 if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
@@ -212,14 +243,14 @@ locus Server {
                         if first < 0 && is_output(ev) {
                             first = (std::time::monotonic_ns() - t0) / 1000000;
                         }
-                        self.client.pub_msg(
+                        self.send(
                             reply_to + ".event",
                             "",
                             std::bytes::from_string(
                                 "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + ev
                                     + "}",
                             ),
-                        ) or discard;
+                        );
                     }
                 }
                 if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
@@ -247,13 +278,13 @@ locus Server {
                 if first < 0 && is_output(line) {
                     first = (std::time::monotonic_ns() - t0) / 1000000;
                 }
-                self.client.pub_msg(
+                self.send(
                     reply_to + ".event",
                     "",
                     std::bytes::from_string(
                         "{\"type\":\"event\",\"request_id\":" + q(id) + ",\"event\":" + line + "}",
                     ),
-                ) or discard;
+                );
                 // a look costs up to a millisecond when nothing waits, so
                 // a run of events looks every 50 ms, not after each
                 if std::time::monotonic_ns() - self.looked > 50000000 { self.look(); }
@@ -267,7 +298,7 @@ locus Server {
         } else {
             result_message(id, run, if first < 0 { 0 } else { first }, elapsed)
         };
-        self.client.pub_msg(reply_to + ".result", "", std::bytes::from_string(result)) or discard;
+        self.send(reply_to + ".result", "", std::bytes::from_string(result));
         done.ok = !self.cancelled && run.outcome != "failed";
         done.input_tokens = run.input_tokens;
         done.output_tokens = run.output_tokens;

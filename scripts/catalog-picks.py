@@ -55,13 +55,13 @@ def main():
         not_at[cells[0]] = {t.strip() for t in cells[-2].split(",") if t.strip() not in ("", "-")}
     # a decision model (the sim's `sys1`, a Jev-style release, which the sim
     # marks not servable: it knows llama.cpp and vLLM only) is served where a
-    # shipped jev-style runtime reads one of its recipe's formats: the
+    # shipped decision runtime reads one of its recipe's formats: the
     # recipe named for it, or else the decision recipe that fits the tier
     decision_formats = {}
     for f in sorted(os.listdir(os.path.join(ROOT, "runtimes"))):
         if f.endswith(".json"):
             r = json.load(open(os.path.join(ROOT, "runtimes", f)))
-            if r.get("server") == "jev-style":
+            if r.get("server") == "decision":
                 for p in r.get("platforms", []):
                     decision_formats.setdefault(p["os"], set()).update(r.get("formats", []))
     decision = {}

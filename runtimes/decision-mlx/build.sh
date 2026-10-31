@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Build voice's Jev-Style MLX runtime archive (runtimes/jev-style-0.3.0-mlx.json):
+# Build voice's decision runtime archive for MLX (runtimes/decision-0.3.0-mlx.json):
 # a standalone CPython, Jev-Style 0.3.0 and MLX from hash-locked wheels, the
 # release's own runtime file pinned by its sha256, and a launcher. Nothing in
 # it is fetched at run time, and a model download brings no code: the
 # runtime file a Jev-Style release ships beside its weights is this one,
 # reviewed and pinned, never the copy in the download.
 #
-#   runtimes/jev-style-mlx/build.sh OUT_DIR
+#   runtimes/decision-mlx/build.sh OUT_DIR
 #
 # Runs on macOS 14 and later. Writes
-# OUT_DIR/jev-style-0.3.0-mlx-darwin-arm64.tar.gz and prints its
+# OUT_DIR/decision-0.3.0-mlx-darwin-arm64.tar.gz and prints its
 # sha256 and size. Byte for byte the same each run: files in name order,
 # owned by 0:0, dated SOURCE_DATE_EPOCH, no bytecode. Runs on macOS arm64.
 set -euo pipefail
@@ -20,7 +20,7 @@ out=$(cd "$out" && pwd)
 # a fixed place: pip writes the build's own path into the console scripts it
 # installs (and their hashes into each RECORD), so the same path each run is
 # the same bytes each run; the launcher runs `python -m`, never those scripts
-work=/tmp/voice-jev-style-build
+work=/tmp/voice-decision-mlx-build
 rm -rf "$work"
 mkdir -p "$work"
 trap 'rm -rf "$work"' EXIT
@@ -36,7 +36,7 @@ SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-1793404800}
 
 fetch() { curl -fsSL --retry 3 -o "$2" "$1"; echo "$3  $2" | shasum -a 256 -c - >/dev/null || { echo "build.sh: $1 is not the pinned file" >&2; exit 1; }; }
 
-root="$work/jev-style-0.3.0-mlx"
+root="$work/decision-0.3.0-mlx"
 mkdir -p "$root/share/licenses"
 fetch "$PY_URL" "$work/python.tar.gz" "$PY_SHA256"
 tar -xzf "$work/python.tar.gz" -C "$root"
@@ -54,7 +54,7 @@ PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 "$root/python/bin/python3" -m
   -r "$here/requirements.lock"
 "$root/python/bin/python3" -c 'import jev_style, mlx.core, mlx_lm, fastapi, uvicorn'
 # at the top, where a node looks for a runtime's program
-install -m 0755 "$here/jev-style-serve" "$root/jev-style-serve"
+install -m 0755 "$here/voice-decide" "$root/voice-decide"
 # every package's license, as each distribution states it
 "$root/python/bin/python3" - "$root/share/licenses" <<'PY'
 import importlib.metadata as md, pathlib, sys
@@ -69,7 +69,7 @@ PY
 # no bytecode, no caches: what runs is the source shipped
 find "$root" -name '__pycache__' -type d -prune -exec rm -rf {} +
 find "$root" -exec touch -h -t "$(date -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)" {} +
-name=jev-style-0.3.0-mlx-darwin-arm64.tar.gz
-(cd "$work" && find jev-style-0.3.0-mlx -print0 | LC_ALL=C sort -z \
+name=decision-0.3.0-mlx-darwin-arm64.tar.gz
+(cd "$work" && find decision-0.3.0-mlx -print0 | LC_ALL=C sort -z \
   | tar --null -T - --no-recursion --uid 0 --gid 0 --uname root --gname wheel -cf - | gzip -n -9 > "$out/$name")
 echo "$(shasum -a 256 "$out/$name" | cut -d' ' -f1) $(stat -f %z "$out/$name") $out/$name"

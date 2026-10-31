@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""jev-serve's answers held to the Jev release's own runtime, on one GGUF.
+"""voice-decide's answers held to the Jev release's own runtime, on one GGUF.
 
-    scripts/jev-parity-live.py RELEASE_DIR GGUF SCORER URL [SCENARIOS.jsonl]
+    scripts/decide-parity-live.py RELEASE_DIR GGUF SCORER URL [SCENARIOS.jsonl]
 
 RELEASE_DIR is a checkout of the GGUF release (its jev_style_decision_gguf.py
-and tokenizer/); GGUF the weights jev-serve at URL serves; SCORER the
-jev-score-v2 both run. Each request goes to jev-serve and, through
+and tokenizer/); GGUF the weights voice-decide at URL serves; SCORER the
+jev-score-v2 both run. Each request goes to voice-decide and, through
 jev_style's adapter, to the release's runtime (its Python renderer and the
 release's tokenizer.json): the answers must agree to within --tol on every
 probability, with the same choice. jevsploration's routed views over its
@@ -88,7 +88,7 @@ for body in requests(a.scenarios):
         pg = g.get("probabilities", {"true": g.get("noul")})
         for k, v in pw.items():
             worst = max(worst, abs(v - pg[k]))
-    print(f"{n}: jev-serve {1000 * (t1 - t0):.0f} ms, release {1000 * (t2 - t1):.0f} ms, "
+    print(f"{n}: voice-decide {1000 * (t1 - t0):.0f} ms, release {1000 * (t2 - t1):.0f} ms, "
           f"{want['usage']['input_tokens']} tokens", file=sys.stderr)
 print(json.dumps({"requests": n, "failed": failed, "max_abs_dp": worst, "tol": a.tol}))
 sys.exit(1 if failed or worst > a.tol else 0)

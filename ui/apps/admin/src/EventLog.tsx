@@ -1,8 +1,9 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { count } from '@hale/components';
 import { subscribeAdminEvents, subscribeFlights, type Flight } from './api/events';
 import { api, type Schemas, type UsageRecord } from './api/client';
 import { go } from './route';
+import { DEFAULT, clamp, dragged, keyed, room as roomFor, type Size } from './resize';
 import s from './EventLog.module.css';
 
 type AdminEvent = Schemas['AdminEvent'];
@@ -25,11 +26,24 @@ type Line = { key: string; at: number; tag: string; tone: Tone; text: string; de
  * tells, one line an event. A request taking off (in flight), landing (its
  * usage), a node coming or going, a change an operator made. The stream is
  * the one the screens already share; the log opens nothing of its own.
- * Folded to its title bar, or open, as the viewer last left it.
+ * Folded to its title bar, or open, as the viewer last left it, and as
+ * tall: its top edge drags (or takes the arrow keys) to resize it, and a
+ * double-click there folds or reopens it.
  */
 export function EventLog() {
   const [lines, setLines] = useState<Line[]>([]);
   const [open, setOpen] = useRemembered('voice.event-log', true);
+  const [height, setHeight] = useRememberedNumber('voice.event-log.height', DEFAULT);
+  const log = useRef<HTMLElement>(null);
+  const room = useRoom(log, open);
+  const shown = clamp(height, room);
+  const size: Size = { open, height: shown };
+  const resize = (next: Size, keep: boolean) => {
+    if (next.open !== open) setOpen(next.open);
+    setHeight(next.height, keep);
+  };
+  // a drag: where it began, held while the pointer is down
+  const drag = useRef<{ y: number; from: Size } | null>(null);
   const [paused, setPaused] = useState(false);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
@@ -74,14 +88,49 @@ export function EventLog() {
   useLayoutEffect(() => {
     const el = body.current;
     if (el && stuck.current) el.scrollTop = el.scrollHeight;
-  }, [lines, open]);
+  }, [lines, open, shown]);
   useEffect(() => {
     if (open) setUnseen(0);
   }, [open, lines]);
 
   const live = lines.filter((l) => !l.replayed).length;
   return (
-    <section className={`${s.log} ${open ? s.open : ''}`} aria-label="Event log">
+    <section ref={log} className={`${s.log} ${open ? s.open : ''}`} aria-label="Event log">
+      <div
+        className={s.handle}
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="Resize the event log"
+        aria-valuemin={0}
+        aria-valuemax={room}
+        aria-valuenow={open ? shown : 0}
+        tabIndex={0}
+        onPointerDown={(e) => {
+          if (e.button !== 0) return;
+          e.currentTarget.setPointerCapture(e.pointerId);
+          drag.current = { y: e.clientY, from: size };
+          e.preventDefault();
+        }}
+        onPointerMove={(e) => {
+          const d = drag.current;
+          if (d) resize(dragged(d.from, d.y - e.clientY, room), false);
+        }}
+        onPointerUp={(e) => {
+          const d = drag.current;
+          drag.current = null;
+          if (d) resize(dragged(d.from, d.y - e.clientY, room), true);
+        }}
+        onPointerCancel={() => {
+          drag.current = null;
+        }}
+        onDoubleClick={() => setOpen(!open)}
+        onKeyDown={(e) => {
+          const next = keyed(e.key, e.shiftKey, size, room);
+          if (!next) return;
+          e.preventDefault();
+          resize(next, true);
+        }}
+      />
       <header className={s.bar}>
         <button type="button" className={s.toggle} onClick={() => setOpen(!open)} aria-expanded={open}>
           <span className={paused ? s.dotPaused : s.dot} />
@@ -100,6 +149,7 @@ export function EventLog() {
       {open && (
         <div
           className={s.body}
+          style={{ height: shown }}
           ref={body}
           onScroll={(e) => {
             const el = e.currentTarget;
@@ -237,4 +287,52 @@ function useRemembered(name: string, initial: boolean): [boolean, (v: boolean) =
       }
     },
   ];
+}
+
+/**
+ * A number kept in this browser: set while it changes (a drag), kept when
+ * `keep` says it has settled.
+ */
+function useRememberedNumber(name: string, initial: number): [number, (v: number, keep: boolean) => void] {
+  const [v, set] = useState<number>(() => {
+    try {
+      const n = Number(localStorage.getItem(name));
+      return Number.isFinite(n) && n > 0 ? n : initial;
+    } catch {
+      return initial;
+    }
+  });
+  return [
+    v,
+    (x: number, keep: boolean) => {
+      set(x);
+      if (!keep) return;
+      try {
+        localStorage.setItem(name, String(x));
+      } catch {
+        // kept for this visit only
+      }
+    },
+  ];
+}
+
+/**
+ * The tallest the log's body may be as the screen is laid out: what it has
+ * and what the page above it (the screen's `main`) could give, measured
+ * when it opens or folds and as the window changes. Unbounded until the
+ * first measure, which comes before the first paint.
+ */
+function useRoom(log: RefObject<HTMLElement | null>, open: boolean): number {
+  const [room, setRoom] = useState(Number.MAX_SAFE_INTEGER);
+  useLayoutEffect(() => {
+    const measure = () => {
+      const body = open ? (log.current?.lastElementChild?.getBoundingClientRect().height ?? 0) : 0;
+      const page = document.querySelector('main')?.getBoundingClientRect().height ?? 0;
+      setRoom(roomFor(window.innerHeight, body, page));
+    };
+    measure();
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [log, open]);
+  return room;
 }

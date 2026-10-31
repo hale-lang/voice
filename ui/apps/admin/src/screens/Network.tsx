@@ -114,7 +114,12 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
     return subscribeFlights((now) => {
       setFlying((old) => {
         const next = new Map<string, { record: UsageRecord; at: number }>();
-        for (const f of now) next.set(f.id, old.get(f.id) ?? { record: provisional(f), at: Date.now() });
+        for (const f of now) {
+          // a retry keeps the request's id on another seat: lit where it is now
+          const was = old.get(f.id);
+          const same = was && was.record.served?.seat === f.seat && was.record.served?.account === f.account;
+          next.set(f.id, same ? was : { record: provisional(f), at: Date.now() });
+        }
         return next;
       });
     });

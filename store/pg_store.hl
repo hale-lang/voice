@@ -1765,6 +1765,82 @@ locus PgStore {
         ) or raise;
     }
 
+    fn put_flight(row: FlightRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_flight_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_flight_locked(row: FlightRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.project);
+        a.add(row.key);
+        a.add(row.model);
+        a.add(row.seat);
+        a.add(row.account);
+        a.add(std::time::iso8601(row.started_at));
+        // written anew, so a later attempt on another seat is told too
+        self.write(
+            "INSERT INTO in_flight (request_id, project, key, model, seat, account, started_at) VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz) ON CONFLICT (request_id) DO UPDATE SET seq = nextval('in_flight_seq_seq'), seat = excluded.seat, account = excluded.account, started_at = excluded.started_at",
+            a,
+        ) or raise;
+    }
+
+    fn drop_flight(request_id: String) fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(request_id);
+        self.write("DELETE FROM in_flight WHERE request_id = $1", a) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.flights_after_locked(seq, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn flights_after_locked(seq: Int, limit: Int) -> FlightRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(to_string(seq));
+        a.add(to_string(if limit > 100 { 100 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT seq, request_id, project, key, model, seat, account, started_at FROM in_flight WHERE seq > $1::bigint AND started_at > now() - interval '1 hour' ORDER BY seq LIMIT $2::int) t",
+            a,
+        ) or raise;
+        let mut out = FlightRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, FlightRow {
+                seq: std::json::find_int_field(line, "seq"),
+                request_id: pg_text(line, "request_id"),
+                project: pg_text(line, "project"),
+                key: pg_text(line, "key"),
+                model: pg_text(line, "model"),
+                seat: pg_text(line, "seat"),
+                account: pg_text(line, "account"),
+                started_at: pg_time(pg_text(line, "started_at")),
+            }) or discard;
+        }
+        return out;
+    }
+
     fn put_peek(row: PeekRow) fallible(StoreError) {
         self.lock.enter();
         self.put_peek_locked(row) or {

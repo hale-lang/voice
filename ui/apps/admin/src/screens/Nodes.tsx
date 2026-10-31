@@ -8,6 +8,7 @@ import { href, go } from '../route';
 import { readout } from '../readout';
 import { toneOf } from '../tone';
 import { ContextWindow } from '../context';
+import { Value } from '../values';
 
 type Seat = Schemas['Seat'];
 
@@ -332,7 +333,7 @@ function SeatInspector({ node, seat }: { node: Node; seat: SeatView }) {
           { k: 'assigned', v: seat.enabled === false ? 'disabled' : `enabled · ${seat.concurrency ?? 1} at once` },
           { k: 'context', v: seat.context ? <ContextWindow served={seat.context} native={nativeOf(seat)} /> : nativeOf(seat) ? <span className="faint">not said yet; made for {nativeOf(seat)!.toLocaleString()}</span> : '–' },
           { k: 'in flight', v: seat.in_flight },
-          { k: 'config', v: <Mono>{JSON.stringify(seat.config ?? {})}</Mono> },
+          { k: 'config', v: <Value v={seat.config ?? {}} /> },
         ]}
       />
       {w.pending && <p className="c-wait">Proposed, pending review: {w.pending}</p>}

@@ -4,6 +4,7 @@ import { useGet, type Change } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
+import { Diff } from '../values';
 
 /** The audit log: every applied admin write, before and after. */
 export function Changes({ route, setInspector }: ScreenProps) {
@@ -39,11 +40,6 @@ export function Changes({ route, setInspector }: ScreenProps) {
 }
 
 function ChangeInspector({ change: c }: { change: Change }) {
-  const pre = (v: unknown) => (
-    <pre className="mono" style={{ margin: 0, whiteSpace: 'pre-wrap', fontSize: 'var(--size-sm)' }}>
-      {v == null ? '–' : JSON.stringify(v, null, 2)}
-    </pre>
-  );
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-3)' }}>
@@ -57,10 +53,8 @@ function ChangeInspector({ change: c }: { change: Change }) {
           { k: 'by', v: c.principal ?? 'no principal' },
         ]}
       />
-      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Before</h3>
-      {pre(c.before)}
-      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>After</h3>
-      {pre(c.after)}
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>What changed</h3>
+      <Diff before={c.before} after={c.after} />
     </>
   );
 }

@@ -1,0 +1,46 @@
+#!/bin/sh
+# voice's launcher for Jev-Style on MLX: serves the weights in --weights
+# (a Jev-Style MLX release's files, as a recipe placed them) with the
+# runtime file this archive pins, not one from the download.
+#   jev-style-serve --weights DIR --host H --port P [--precision bf16|8bit]
+# (the precision, left out, is the folder the weights hold)
+set -eu
+here=$(cd "$(dirname "$0")" && pwd)
+weights="" host=127.0.0.1 port=8791 precision=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --weights) weights=$2; shift 2;;
+    --host) host=$2; shift 2;;
+    --port) port=$2; shift 2;;
+    --precision) precision=$2; shift 2;;
+    *) echo "jev-style-serve: unknown $1" >&2; exit 2;;
+  esac
+done
+[ -d "$weights" ] || { echo "jev-style-serve: --weights is not a directory" >&2; exit 2; }
+# the precision is the one the placed variant holds, unless said
+if [ -z "$precision" ]; then
+  for p in bf16 8bit; do [ -d "$weights/$p" ] && precision=$p; done
+fi
+[ -n "$precision" ] || { echo "jev-style-serve: the weights hold no bf16/ or 8bit/" >&2; exit 2; }
+# the weights' release: its repo names the runtime file this archive pins
+# for it (share/<repo>/), and the release Jev-Style loads
+repo=$("$here/python/bin/python3" -c 'import json, sys; print(json.load(open(sys.argv[1]))["repo"])' "$weights/release_config.json")
+# a repo is owner/name, nothing else: it only ever names a file here
+case "$repo" in
+  */*/*|*..*|"") echo "jev-style-serve: release_config.json names no repo" >&2; exit 2;;
+esac
+printf '%s' "$repo" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$' \
+  || { echo "jev-style-serve: release_config.json names no repo" >&2; exit 2; }
+runtime="$here/share/$repo/jev_style_decision_mlx.py"
+[ -f "$runtime" ] || { echo "jev-style-serve: this runtime serves no release $repo" >&2; exit 2; }
+# the model folder Jev-Style reads: the weights as placed, and that file
+model=$(mktemp -d "${TMPDIR:-/tmp}/jev-style.XXXXXX")
+for f in "$weights"/*; do ln -s "$f" "$model/$(basename "$f")"; done
+cp "$runtime" "$model/jev_style_decision_mlx.py"
+# which release the weights are: the one whose build is their repo
+release=$("$here/python/bin/python3" -c 'import json, sys
+from jev_style import models
+print(next(k for k, r in models.RELEASES.items() if any(b.repo == sys.argv[1] for b in r.builds.values())))' "$repo")
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+exec "$here/python/bin/python3" -m jev_style serve --backend mlx --release "$release" --model-dir "$model" \
+  --precision "$precision" --host "$host" --port "$port"

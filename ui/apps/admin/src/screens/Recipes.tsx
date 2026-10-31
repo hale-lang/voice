@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextArea, Button, Confirm, bytes, when } from '@hale/components';
+import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, TextArea, Button, Confirm, bytes, when } from '@hale/components';
 import { useGet, type Recipe, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -17,7 +17,7 @@ export function Recipes({ route, setInspector }: ScreenProps) {
   const creating = selected === 'new';
 
   useEffect(() => {
-    setInspector(creating ? <AllowJson what="recipe" path="/admin/v1/recipes" back="recipes" /> : recipe ? <RecipeInspector recipe={recipe} /> : null);
+    setInspector(creating ? <AllowRecipe /> : recipe ? <RecipeInspector recipe={recipe} /> : null);
   }, [creating, recipe, setInspector]);
 
   if (q.isPending) return <Loading what="recipes" />;
@@ -114,41 +114,142 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
   );
 }
 
+type VariantDraft = { id: string; format: Variant['format']; quantization: string; repo: string; revision: string; files: string; memory_gib: number | null };
+
+const blankVariant = (): VariantDraft => ({ id: '', format: 'safetensors', quantization: '', repo: '', revision: '', files: '', memory_gib: null });
+
 /**
- * Allow a recipe or a runtime: its document, pasted whole, as the files
- * voice ships are (recipes/, runtimes/). Every check is the api's: the
- * weights pinned by commit and digest, the artifact by digest.
+ * A variant's files as typed, one a line: `sha256 bytes path`, the form
+ * `sha256sum` and `ls -l` give. A line that is not one is told by its number.
  */
-export function AllowJson({ what, path, back }: { what: 'recipe' | 'runtime'; path: '/admin/v1/recipes' | '/admin/v1/runtimes'; back: string }) {
+function parseFiles(text: string): { files: Variant['files'] } | { bad: string } {
+  const files: Variant['files'] = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = (lines[i] ?? '').trim();
+    if (!line) continue;
+    const m = /^([0-9a-f]{64})\s+(\d+)\s+(\S+)$/.exec(line);
+    if (!m || !m[1] || !m[2] || !m[3]) return { bad: `line ${i + 1} is not "sha256 bytes path": ${line.slice(0, 60)}` };
+    files.push({ sha256: m[1], bytes: Number(m[2]), path: m[3] });
+  }
+  return { files };
+}
+
+/**
+ * Allow a recipe: the weights, pinned. Each variant names its source by
+ * commit and lists every file it needs by digest; every check is the api's.
+ */
+function AllowRecipe() {
   const w = useWrite();
-  const [text, setText] = useState('');
+  const [id, setId] = useState('');
+  const [license, setLicense] = useState('');
+  const [licenseUrl, setLicenseUrl] = useState('');
+  const [context, setContext] = useState<number | null>(null);
+  const [kv, setKv] = useState<number | null>(null);
+  const [variants, setVariants] = useState<VariantDraft[]>([blankVariant()]);
   const [bad, setBad] = useState<string | null>(null);
+  const put = (i: number, d: Partial<VariantDraft>) => setVariants(variants.map((v, j) => (j === i ? { ...v, ...d } : v)));
   return (
     <>
-      <h2 style={{ marginBottom: 'var(--space-3)' }}>Allow a {what}</h2>
+      <h2 style={{ marginBottom: 'var(--space-3)' }}>Allow a recipe</h2>
       <Form
         error={bad ?? w.error}
         onSubmit={async () => {
-          let body: unknown;
-          try { body = JSON.parse(text); } catch (e) { setBad(`not JSON: ${e instanceof Error ? e.message : String(e)}`); return; }
+          const vs: Variant[] = [];
+          for (const v of variants) {
+            const f = parseFiles(v.files);
+            if ('bad' in f) { setBad(`variant ${v.id || vs.length + 1}: ${f.bad}`); return; }
+            vs.push({
+              id: v.id,
+              format: v.format,
+              quantization: v.quantization,
+              source: { hub: 'huggingface', repo: v.repo, revision: v.revision },
+              files: f.files,
+              memory_bytes: Math.round((v.memory_gib ?? 0) * 2 ** 30),
+            });
+          }
           setBad(null);
-          const r = path === '/admin/v1/recipes'
-            ? await w.write('post', path, { body: body as Schemas['RecipeCreate'] })
-            : await w.write('post', path, { body: body as Schemas['RuntimeCreate'] });
-          if (r && 'id' in r) go(back, r.id);
+          const body: Schemas['RecipeCreate'] = {
+            id,
+            license: { name: license, url: licenseUrl },
+            variants: vs,
+            ...(context ? { context_length: context } : {}),
+            ...(kv ? { kv_bytes_per_token: kv } : {}),
+          };
+          const r = await w.write('post', '/admin/v1/recipes', { body });
+          if (r && 'id' in r) go('recipes', r.id);
         }}
         actions={
           <>
-            <Button type="submit" tone="primary" disabled={w.busy || !text.trim()}>allow</Button>
-            <Button onClick={() => go(back)}>cancel</Button>
+            <Button type="submit" tone="primary" disabled={w.busy}>allow</Button>
+            <Button onClick={() => go('recipes')}>cancel</Button>
           </>
         }
       >
-        <Field label={`${what} (JSON)`} required help={`the ${what}'s document, as voice's own ${what}s/*.json are`}>
-          <TextArea mono value={text} onChange={setText} required rows={18} placeholder='{"id": "...", "license": {...}, ...}' />
+        <Field label="id" required help="stable; never reused for other weights">
+          <TextInput mono value={id} onChange={setId} required pattern="[a-z0-9][a-z0-9.\-]{0,62}" placeholder="qwen3-8b" />
         </Field>
+        <Field label="license" required>
+          <TextInput value={license} onChange={setLicense} required placeholder="apache-2.0" />
+        </Field>
+        <Field label="license url" required>
+          <TextInput type="url" value={licenseUrl} onChange={setLicenseUrl} required placeholder="https://…" />
+        </Field>
+        <Field label="context length" help="the longest context it is made for, in tokens (its config's max_position_embeddings)">
+          <NumberInput value={context} onChange={setContext} min={1} step={1} />
+        </Field>
+        <Field label="KV bytes per token" help="what one more token of context costs in KV cache at 16 bits; sizes a seat's prompt cache">
+          <NumberInput value={kv} onChange={setKv} min={1} step={1} />
+        </Field>
+        {variants.map((v, i) => (
+          <fieldset key={i}>
+            <legend>
+              variant {i + 1}
+              {variants.length > 1 && (
+                <>
+                  {' '}
+                  <Button onClick={() => setVariants(variants.filter((_, j) => j !== i))}>drop</Button>
+                </>
+              )}
+            </legend>
+            <Field label="id" required help="distinct within the recipe">
+              <TextInput mono value={v.id} onChange={(x) => put(i, { id: x })} required pattern="[a-z0-9][a-z0-9_.\-]{0,62}" placeholder="gguf-q4_k_m" />
+            </Field>
+            <Field label="format" required>
+              <Select value={v.format} onChange={(x) => put(i, { format: x as Variant['format'] })} options={[{ value: 'safetensors' }, { value: 'gguf' }, { value: 'mlx' }]} required />
+            </Field>
+            <Field label="quantization" required>
+              <TextInput mono value={v.quantization} onChange={(x) => put(i, { quantization: x })} required placeholder="bf16, q4_k_m, 4bit" />
+            </Field>
+            <Field label="Hugging Face repo" required>
+              <TextInput mono value={v.repo} onChange={(x) => put(i, { repo: x })} required pattern="[A-Za-z0-9][A-Za-z0-9._\-]*/[A-Za-z0-9][A-Za-z0-9._\-]*" placeholder="Qwen/Qwen3-8B" />
+            </Field>
+            <Field label="revision" required help="a commit, never a branch or a tag">
+              <TextInput mono value={v.revision} onChange={(x) => put(i, { revision: x })} required pattern="[0-9a-f]{40}" placeholder="40 hex digits" />
+            </Field>
+            <Field label="memory" required help="what serving it needs, weights and the engine's own, before any context; GiB">
+              <NumberInput value={v.memory_gib} onChange={(x) => put(i, { memory_gib: x })} min={0.01} step={0.01} required />
+            </Field>
+            <Field label="files" required help="every file it needs, one a line: sha256 bytes path (up to 300)">
+              <TextArea mono value={v.files} onChange={(x) => put(i, { files: x })} required rows={8} placeholder={'9f86d0…0a08  4022 config.json\n2c26b4…7ae2  5368709120 model-00001-of-00002.safetensors'} />
+            </Field>
+            {v.files.trim() && <FilesTally text={v.files} />}
+          </fieldset>
+        ))}
+        {variants.length < 8 && (
+          <p>
+            <Button onClick={() => setVariants([...variants, blankVariant()])}>add a variant</Button>
+          </p>
+        )}
       </Form>
     </>
   );
 }
 
+/** What the files typed come to, or the first line that is not one. */
+function FilesTally({ text }: { text: string }) {
+  const f = parseFiles(text);
+  if ('bad' in f) return <p className="c-fail" style={{ fontSize: 'var(--size-sm)' }}>{f.bad}</p>;
+  const total = f.files.reduce((n, x) => n + x.bytes, 0);
+  return <p className="faint" style={{ fontSize: 'var(--size-sm)' }}>{f.files.length} file{f.files.length === 1 ? '' : 's'}, {bytes(total)}</p>;
+}

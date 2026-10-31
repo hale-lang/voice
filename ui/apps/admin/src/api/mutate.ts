@@ -50,5 +50,44 @@ export function useWrite() {
     }
   }
 
-  return { write, error, busy, pending, clear: () => setError(null) };
+  /**
+   * Create a resource under an id of voice's making: `base`, else `base-2`,
+   * `base-3`… An id taken by a live resource is skipped (`taken`); one the
+   * api refuses because a removed resource held it (a model or placement id
+   * is never reused, and the lists do not show removed ones) is passed over
+   * for the next. Answers the id made, or null with the error set.
+   */
+  async function createFresh(path: '/admin/v1/models' | '/admin/v1/placements', base: string, taken: Set<string>, bodyOf: (id: string) => Record<string, unknown>): Promise<string | null> {
+    setBusy(true);
+    setError(null);
+    setPending(null);
+    try {
+      for (let n = 1; n <= 50; n++) {
+        const id = n === 1 ? base : `${base}-${n}`;
+        if (taken.has(id)) continue;
+        const r = (await (api.POST as (p: string, i: unknown) => Promise<{ data?: unknown; error?: unknown; response: Response }>)(path, { body: bodyOf(id) }));
+        if (r.error !== undefined) {
+          const why = describe(r.error, r.response.status);
+          if (r.response.status === 409 && why.includes('never reused')) continue;
+          setError(why);
+          return null;
+        }
+        if (r.response.status === 202) {
+          const pc = r.data as { id?: string; review?: string | null } | undefined;
+          setPending(pc?.review ?? pc?.id ?? 'pending review');
+        }
+        await qc.invalidateQueries();
+        return id;
+      }
+      setError(`no free id after ${base}-50`);
+      return null;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return { write, createFresh, error, busy, pending, clear: () => setError(null) };
 }

@@ -299,12 +299,6 @@ function slug(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-+/, '').slice(0, 60).replace(/-+$/, '');
 }
 
-/** `base`, or `base-2`, `base-3`… the first not in `taken`. */
-function free(base: string, taken: Set<string>): string {
-  if (!taken.has(base)) return base;
-  for (let n = 2; ; n++) if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
-}
-
 /**
  * What voice would place here, a model per category it ships, from its
  * default catalog for the node's platform and memory tier
@@ -330,17 +324,20 @@ function Suggested({ node }: { node: Node }) {
     // first; a model's id says nothing of its weights, so one of the same
     // id with another recipe is not it, and a new one takes a free id
     const bound = all.find((m) => m.id === recipe && m.recipe === recipe) ?? all.find((m) => m.kind === 'local' && m.recipe === recipe);
-    let model = bound?.id;
+    let model = bound?.id ?? null;
     if (!model) {
-      model = free(recipe, new Set(all.map((m) => m.id)));
-      const made = await w.write('post', '/admin/v1/models', { body: { id: model, owned_by: 'local', kind: 'local', recipe } });
-      if (!made) return;
+      model = await w.createFresh('/admin/v1/models', recipe, new Set(all.map((m) => m.id)), (id) => ({ id, owned_by: 'local', kind: 'local', recipe }));
+      if (!model) return;
     }
+    const chosen = model;
     // a placement's id is a slug, never reused, even once removed
-    const taken = new Set((placements.data?.data ?? []).map((p) => p.id));
-    await w.write('post', '/admin/v1/placements', {
-      body: { id: free(slug(`${recipe}-on-${node.id}`), taken), model, account: payer, nodes: [node.id], variant: s.variant ?? undefined },
-    });
+    await w.createFresh('/admin/v1/placements', slug(`${recipe}-on-${node.id}`), new Set((placements.data?.data ?? []).map((p) => p.id)), (id) => ({
+      id,
+      model: chosen,
+      account: payer,
+      nodes: [node.id],
+      ...(s.variant ? { variant: s.variant } : {}),
+    }));
   };
   return (
     <>

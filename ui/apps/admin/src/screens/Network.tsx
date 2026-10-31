@@ -55,6 +55,9 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
   const [hovered, setHovered] = useState<string | null>(null);
   const [traceSelection, setTrace] = useState<UsageRecord | null>(null);
   const [pulses, setPulses] = useState<Pulse[]>([]);
+  // requests a seat is serving now (the stream's `request` events), lit
+  // until their usage is told, as provisional records
+  const [flying, setFlying] = useState<Map<string, { record: UsageRecord; at: number }>>(new Map());
   const [arrivals, setArrivals] = useState<UsageRecord[]>([]);
   const [filters, setFilters] = useState<Filters>({});
   const [hidden, setHidden] = useState<Kind[]>([]);
@@ -67,11 +70,13 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
   const running = useMemo(() => demo ? demoInFlight(data, clock.tick, clock.now) : [], [demo,data,clock]);
   const activeIds = new Set(running.map(job => job.record.id));
   const traceInFlight = !!trace && activeIds.has(trace.id);
-  const motion: Pulse[] = demo ? running.map(job => ({ record: job.record, at: clock.now, inFlight: true, color: job.color })) : pulses;
+  const motion: Pulse[] = demo
+    ? running.map(job => ({ record: job.record, at: clock.now, inFlight: true, color: job.color }))
+    : [...pulses, ...[...flying.values()].map(f => ({ record: f.record, at: f.at, inFlight: true }))];
   const fullData = useMemo(() => {
-    const usage = [...new Map([...data.usage, ...(trace ? [trace] : []), ...running.map(job => job.record), ...arrivals].map(r => [r.id, r])).values()];
+    const usage = [...new Map([...[...flying.values()].map(f => f.record), ...data.usage, ...(trace ? [trace] : []), ...running.map(job => job.record), ...arrivals].map(r => [r.id, r])).values()];
     return { ...data, usage, contexts: demo ? Object.fromEntries(usage.map(r => [r.id, demoContext(r)])) : undefined };
-  }, [data, arrivals, demo, trace, running]);
+  }, [data, arrivals, demo, trace, running, flying]);
   const filtered = useMemo(() => filterFleet(fullData, filters), [fullData, filters]);
   const options = useMemo(() => filterOptions(fullData), [fullData]);
   const fullGraph = useMemo(() => buildGraph(fullData), [fullData]);
@@ -88,6 +93,14 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
     const interval = setInterval(() => {
       const now = Date.now();
       setPulses((old) => old.filter((p) => now - p.at < 7000));
+      // one whose usage never came (its api stopped) goes after an hour
+      setFlying((old) => {
+        const stale = [...old.values()].filter((f) => now - f.at > 3_600_000);
+        if (!stale.length) return old;
+        const next = new Map(old);
+        for (const f of stale) next.delete(f.record.id);
+        return next;
+      });
       if (demo && !pausedRef.current) setClock((old) => ({ tick: old.tick + 1, now }));
     }, DEMO_TICK_MS);
     return () => clearInterval(interval);
@@ -105,9 +118,23 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
   useEffect(() => {
     if (demo) return;
     return subscribeAdminEvents((event) => {
-      if (event.type === 'reset') { setArrivals([]); setPulses([]); seen.current.clear(); return; }
+      if (event.type === 'reset') { setArrivals([]); setPulses([]); setFlying(new Map()); seen.current.clear(); return; }
+      if (event.type === 'request') {
+        const f = event.data;
+        if (seen.current.has(f.id)) return;
+        // a provisional record: what lights its path until its usage comes
+        const record = { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {} } as unknown as UsageRecord;
+        setFlying((old) => new Map(old).set(f.id, { record, at: Date.now() }));
+        return;
+      }
       if (event.type !== 'usage' || seen.current.has(event.data.id)) return;
       const record = event.data;
+      setFlying((old) => {
+        if (!old.has(record.id)) return old;
+        const next = new Map(old);
+        next.delete(record.id);
+        return next;
+      });
       seen.current.add(record.id);
       if (seen.current.size > 512) seen.current.delete(seen.current.values().next().value!);
       setArrivals((old) => [record, ...old].slice(0, 8));
@@ -135,7 +162,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
 
   return <>
     <div className={s.readout}>
-      <span className={demo || stub ? 'c-wait' : 'muted'}>{demo ? 'DEMO · SIMULATED TRAFFIC · NO REQUESTS SENT' : stub ? 'API FIXTURE · CANNED SNAPSHOTS' : 'API DATA · PULSES ON NEW USAGE EVENTS'}</span>
+      <span className={demo || stub ? 'c-wait' : 'muted'}>{demo ? 'DEMO · SIMULATED TRAFFIC · NO REQUESTS SENT' : stub ? 'API FIXTURE · CANNED SNAPSHOTS' : 'API DATA · LIT WHILE A REQUEST RUNS'}</span>
       <span>{data.projects.length} projects · {fullGraph.vertices.filter(v => v.kind === 'repository').length} repositories · {data.accounts.length} accounts · {fullGraph.vertices.filter(v => v.kind === 'model').length} models · {data.nodes.length} nodes · {data.nodes.reduce((sum, n) => sum + n.seats.length, 0)} seats · {inFlight} {demo ? 'simulated' : 'reported'} in flight</span>
     </div>
     <section className={s.explorer} aria-label="Explore the network">

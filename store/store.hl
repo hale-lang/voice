@@ -137,6 +137,23 @@ type PeekRow {
 /// Recorded requests, newest first: their bodies left out ("") when listed.
 type PeekRows { rows: bounded[PeekRow; 200]; }
 
+/// A request being served now: on which seat, since when (inference.hl). A
+/// row is written as each attempt is offered and gone once it ends; the
+/// admin event stream tells each new one (`request`), so a live view lights
+/// a request for as long as it runs. `seq` numbers them as written.
+type FlightRow {
+    seq: Int = 0;
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    seat: String = "";
+    account: String = "";
+    started_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type FlightRows { rows: bounded[FlightRow; 100]; }
+
 /// The days a recorded request is kept.
 const PEEK_DAYS: Int = 7;
 
@@ -501,6 +518,12 @@ interface Store {
     fn usage_rows(q: UsageQuery) -> UsageRows fallible(StoreError);
     /// Up to `limit` rows written after `seq`, oldest first.
     fn usage_after(seq: Int, limit: Int) -> UsageRows fallible(StoreError);
+    /// A request offered to a seat: its row written anew (a new `seq`).
+    fn put_flight(row: FlightRow) fallible(StoreError);
+    /// The request's attempt ended: its row gone.
+    fn drop_flight(request_id: String) fallible(StoreError);
+    /// Rows written after `seq`, oldest first, at most `limit`.
+    fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError);
     /// Totals over the matching rows, grouped.
     fn usage_summary(q: UsageSummaryQuery) -> UsageGroups fallible(StoreError);
 
@@ -648,6 +671,9 @@ locus MemoryStore {
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
+        // requests being served now, and the last `seq` given one
+        flight_rows: FlightRows = FlightRows { };
+        flight_seq: Int = 0;
         // the operator token: a standalone api's is kept in its state
         // directory and handed in here (api/operator.hl)
         operator: String = "";
@@ -1305,6 +1331,36 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.seat_state_rows.set(r);
+    }
+
+    fn put_flight(row: FlightRow) fallible(StoreError) {
+        self.flight_seq = self.flight_seq + 1;
+        let mut next = FlightRows { };
+        for held in self.flight_rows.rows {
+            if held.request_id != row.request_id && count(next.rows) < 99 {
+                push(next.rows, held) or discard;
+            }
+        }
+        let mut r = row;
+        r.seq = self.flight_seq;
+        push(next.rows, r) or discard;
+        self.flight_rows = next;
+    }
+
+    fn drop_flight(request_id: String) fallible(StoreError) {
+        let mut next = FlightRows { };
+        for held in self.flight_rows.rows {
+            if held.request_id != request_id { push(next.rows, held) or discard; }
+        }
+        self.flight_rows = next;
+    }
+
+    fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError) {
+        let mut out = FlightRows { };
+        for r in self.flight_rows.rows {
+            if r.seq > seq && count(out.rows) < limit { push(out.rows, r) or discard; }
+        }
+        return out;
     }
 
     fn put_peek(row: PeekRow) fallible(StoreError) {

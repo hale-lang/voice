@@ -17,7 +17,7 @@
 // moves onto `http::Rest`).
 
 /// The `type`s a subscriber may ask for.
-const EVENT_TYPES: String = "node usage change";
+const EVENT_TYPES: String = "node usage change request";
 
 /// A node's place in the stream: its id and status, as a number. The
 /// nodes' marks are numbers so that a subscriber holds no text between
@@ -48,6 +48,9 @@ locus EventTick {
         quiet: Bool = false;
         usage_mark: Int = 0;
         change_mark: Int = 0;
+        // the last request in flight told (not in the stream's place: one
+        // that resumes is told what is in flight then)
+        flight_mark: Int = 0;
         node_marks: NodeMarks = NodeMarks { };
     }
 
@@ -76,12 +79,31 @@ locus EventTick {
             self.usage_mark = (at(u.rows, 0) or st::UsageRow { }).seq;
             let c = self.store.changes(st::ChangeQuery { limit: 1 }) or fail store_down(err);
             self.change_mark = (at(c.rows, 0) or st::ChangeRow { }).seq;
+            let mut f = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
+            while count(f.rows) > 0 {
+                self.flight_mark = (at(f.rows, count(f.rows) - 1) or st::FlightRow { }).seq;
+                f = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
+            }
         } else {
             if self.wants("usage") {
                 let rows = self.store.usage_after(self.usage_mark, 100) or fail store_down(err);
                 for r in rows.rows {
                     self.usage_mark = r.seq;
                     self.tell("usage", "usage_" + to_string(r.seq), r.created_at, r.record);
+                }
+            }
+            // a request offered to a seat, for as long as it runs: a live
+            // view lights it until its usage is told
+            if self.wants("request") {
+                let rows = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
+                for f in rows.rows {
+                    self.flight_mark = f.seq;
+                    self.tell(
+                        "request",
+                        "request_" + to_string(f.seq),
+                        f.started_at,
+                        flight_json(f),
+                    );
                 }
             }
             if self.wants("change") {
@@ -174,6 +196,7 @@ locus AdminEvents {
         // the last ledger row and change told, and each node's place
         usage_mark: Int = 0;
         change_mark: Int = 0;
+        flight_mark: Int = 0;
         node_marks: NodeMarks = NodeMarks { };
     }
 
@@ -188,10 +211,12 @@ locus AdminEvents {
             quiet: quiet,
             usage_mark: self.usage_mark,
             change_mark: self.change_mark,
+            flight_mark: self.flight_mark,
             node_marks: self.node_marks,
         };
         self.usage_mark = t.usage_mark;
         self.change_mark = t.change_mark;
+        self.flight_mark = t.flight_mark;
         self.node_marks = t.node_marks;
     }
 
@@ -262,4 +287,12 @@ fn read_event_types(path: String) -> st::Names fallible(CtlError) {
         }
     }
     return asked;
+}
+
+/// A request in flight as the `request` event carries it: what it is, and
+/// the seat it is on.
+fn flight_json(f: st::FlightRow) -> String {
+    return "{\"id\": " + jq(f.request_id) + ", \"project\": " + jq(f.project) + ", \"key\": "
+        + jq(f.key) + ", \"requested_model\": " + jq(f.model) + ", \"seat\": " + jq(f.seat)
+        + ", \"account\": " + jq(f.account) + ", \"started_at\": " + jtime(f.started_at) + "}";
 }

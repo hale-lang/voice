@@ -26,6 +26,9 @@ const AFFECTS: Record<string, string[]> = {
   account: ['/admin/v1/accounts', '/admin/v1/routes'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
   change: ['/admin/v1/changes'],
+  // a request a seat is serving: told to listeners (the Network view), no
+  // query changes until its usage is recorded
+  request: [],
 };
 
 /** One server-sent event: its `event`, `data` and `id`, and a `retry`. */
@@ -65,6 +68,7 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
       try {
         const event = JSON.parse(data) as AdminEvent;
         if (!event || typeof event.id !== 'string' || typeof event.at !== 'string' || !event.data || seen.has(event.id)) return;
+        if (event.type === 'request' && (typeof event.data.id !== 'string' || typeof event.data.seat !== 'string' || typeof event.data.project !== 'string')) return;
         if (event.type === 'usage' && (typeof event.data.id !== 'string' || typeof event.data.project !== 'string' || typeof event.data.requested_model !== 'string' || !event.data.timing || typeof event.data.input_tokens !== 'number' || typeof event.data.output_tokens !== 'number')) return;
         seen.add(event.id);
         if (seen.size > 512) seen.delete(seen.values().next().value!);

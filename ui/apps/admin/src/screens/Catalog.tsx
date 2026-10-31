@@ -33,7 +33,7 @@ export function Catalog({ route, setInspector }: ScreenProps) {
           onSelect={(m) => go('catalog', m.id)}
           columns={[
             { key: 'id', header: 'Model', render: (m) => <Mono>{m.id}</Mono> },
-            { key: 'kind', header: 'Kind', render: (m) => `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}` },
+            { key: 'kind', header: 'Kind', render: (m) => `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}${m.contract === 'decision' ? ' · decisions' : ''}` },
             { key: 'ctx', header: 'Context', num: true, render: (m) => <ContextWindow served={m.served_context_length} native={m.context_length} /> },
             { key: 'out', header: 'Max out', num: true, render: (m) => m.max_output_tokens?.toLocaleString() ?? '–' },
             { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => (m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} · ${micros(m.price.output_per_mtok_micros, m.price.currency)}` : <span className="faint">free</span>) },
@@ -56,6 +56,8 @@ function ModelForm({ model }: { model?: CatalogModel }) {
   const [ownedBy, setOwnedBy] = useState(model?.owned_by ?? 'local');
   const [kind, setKind] = useState<'local' | 'hosted'>(model?.kind ?? 'local');
   const [recipe, setRecipe] = useState(model?.recipe ?? '');
+  // what it answers; "" is its recipe's (else generative) on create
+  const [contract, setContract] = useState<'' | 'generative' | 'decision'>(model?.contract ?? '');
   const recipes = useGet('/admin/v1/recipes');
   const [ctx, setCtx] = useState<number | null>(model?.context_length ?? null);
   const [maxOut, setMaxOut] = useState<number | null>(model?.max_output_tokens ?? null);
@@ -68,7 +70,7 @@ function ModelForm({ model }: { model?: CatalogModel }) {
       <Form
         error={w.error}
         onSubmit={async () => {
-          const body = { owned_by: ownedBy, kind, context_length: ctx ?? undefined, max_output_tokens: maxOut ?? undefined, price };
+          const body = { owned_by: ownedBy, kind, context_length: ctx ?? undefined, max_output_tokens: maxOut ?? undefined, price, ...(contract ? { contract } : {}) };
           const r = model
             ? await w.write('patch', '/admin/v1/models/{model}', { params: { path: { model: model.id } }, body })
             : await w.write('post', '/admin/v1/models', { body: { id, ...body, recipe: kind === 'local' && recipe ? recipe : undefined } });
@@ -96,6 +98,13 @@ function ModelForm({ model }: { model?: CatalogModel }) {
         )}
         <Field label="owned by" help="the provider, or local">
           <TextInput value={ownedBy} onChange={setOwnedBy} />
+        </Field>
+        <Field label="answers" help="decision: only a structured request (a JSON schema of choices, yes/no and scores), with each answer's probability; for a Jev-style model, local or behind a service">
+          <Select
+            value={contract}
+            onChange={(v) => setContract(v as typeof contract)}
+            options={[...(model ? [] : [{ value: '', label: "its recipe's, else text" }]), { value: 'generative', label: 'text (generative)' }, { value: 'decision', label: 'decisions' }]}
+          />
         </Field>
         <Field label="context length" help="tokens the model is made for; one made from a recipe takes the recipe's when left empty">
           <NumberInput value={ctx} onChange={setCtx} min={1} />
@@ -128,6 +137,7 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
         rows={[
           { k: 'kind', v: `${m.kind ?? 'local'} · ${m.owned_by ?? 'local'}` },
           { k: 'recipe', v: m.recipe ? <a href={href('recipes', m.recipe)}><Mono>{m.recipe}</Mono></a> : '–' },
+          { k: 'answers', v: m.contract === 'decision' ? 'decisions: a structured request only, with probabilities' : 'text' },
           { k: 'context', v: m.context_length ? `${m.context_length.toLocaleString()} tokens, made for` : '–' },
           { k: 'served', v: m.served_context_length ? <ContextWindow served={m.served_context_length} native={m.context_length} /> : <span className="faint">no seat has said</span> },
           { k: 'max output', v: m.max_output_tokens?.toLocaleString() ?? '–' },

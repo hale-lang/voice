@@ -4,23 +4,26 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
 (`LICENSE`, beside this file).
 
 - `realtime/nats/`: `adapter.hl`, `client.hl`, `jetstream.hl`, `proto.hl`,
-  `types.hl` and `log.hl` of hale v0.25.1's `dna/core/pond/realtime/nats`,
-  which is pond's `realtime/nats` with hale's changes since (among them a
-  password from a `std::secret` vault entry, hale-lang/hale#989): the NATS
-  client, the bus adapter and JetStream; the test fake is not taken. The
-  api (`api/link.hl`, and the organization's events: `api/main.hl`) and
-  the node (`node/session.hl`) import it. Three changes of voice's own,
-  marked `voice:`: `NatsPublisher` (`adapter.hl`) logs through `std::log`
-  rather than printing bare, and `NatsClient.open_as` (`client.hl`) dials
-  with `std::io::tcp::connect_within`, bounded by the client's timeout,
-  rather than `connect`, which waits about two minutes on an address
-  that never answers, and `NatsClient.inbox_prefix` puts a request's
-  reply inbox under a prefix of the caller's (`_INBOX` by default), for
-  the habitat's broker account, whose subjects are one prefix. A pond issue the brain works around
-  without changing it: `NatsClient.open` dials with `std::io::tcp::connect`,
-  which waits about two minutes on an address that never answers; the
-  brain's notifier probes the address with `std::io::tcp::connect_within`
-  first.
+  `types.hl` and `log.hl` of pond's `realtime/nats` at `v0.9.0`
+  (`81500c0`), merged with what hale's copy of it (hale v0.25.1's
+  `dna/core/pond/realtime/nats`, pond at `ef90234`) changed and pond does
+  not have yet: `NatsConn`'s `untyped` prefix and the `NatsInbound` topic
+  (hale-lang/hale#987, with `Outbound.ack`), `NatsPublisher`
+  (hale-lang/hale#986), and `max_ack_pending` on a JetStream consumer;
+  the test fake is not taken. The api (`api/link.hl`, and the
+  organization's events: `api/main.hl`), the node (`node/session.hl`) and
+  the brain (its route table's version, `brain/main.hl`) import it.
+  Changes of voice's own, marked `voice:`: `NatsPublisher` (`adapter.hl`)
+  logs through `std::log` rather than printing bare;
+  `NatsClient.inbox_prefix` (`client.hl`) puts a request's reply inbox
+  under a prefix of the caller's (`_INBOX` by default), for the habitat's
+  broker account, whose subjects are one prefix; and a latest-value write
+  (`Delivery::Latest`) the server has not confirmed in
+  `latest_confirm_ms` drops the connection, dialled again after a wait
+  that doubles from 1 s to `latest_backoff_max_ms`, reset only by a
+  confirmed write, so a server that takes the connection and goes silent
+  is not written to forever (`adapter.hl`). All three are for pond. Pond's
+  own bounded dial (`NatsConn.timeout`, `connect_within`) replaced voice's.
 - `pq/` and `db/`: taken from hale v0.24.0's `dna/core/pond/`, which is
   pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
   with hale's changes since (among them a password from a `std::secret`

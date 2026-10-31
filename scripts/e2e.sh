@@ -517,8 +517,9 @@ if [ -n "${DATABASE_URL:-}" ]; then
   ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
   echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
   # a NATS that takes the connection and then never answers a PING: the
-  # notifier backs off (1, 2, 4, 8 s on top of its 2 s flush), so the wait
-  # between dials grows past 8 s; a dial alone does not reset it
+  # brain's NATS connection drops a version it has not had confirmed in 2 s
+  # and dials again after 1, 2, 4, 8 s (lib/pond, `latest_confirm_ms`), so
+  # the wait between dials grows past 8 s; a dial alone does not reset it
   kill "${pids[${#pids[@]}-1]}" 2>/dev/null || true
   : >"$work/silent.log"
   python3 scripts/silent-nats.py "$SILENT_PORT" "$work/silent.log" &
@@ -529,7 +530,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   sleep 30
   spacing=$(python3 -c 'import sys; t=[float(l) for l in open(sys.argv[1]) if l.strip()]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
   python3 -c 'import sys; g=[float(x) for x in sys.argv[1:]]; sys.exit(0 if g and max(g) >= 8 and all(b >= a - 0.5 for a, b in zip(g, g[1:])) else 1)' $spacing \
-    || { echo "the notifier dialled a silent NATS without backing off: waits of $spacing s"; cat "$work/brain5.log"; exit 1; }
+    || { echo "the brain dialled a silent NATS without backing off: waits of $spacing s"; cat "$work/brain5.log"; exit 1; }
   echo "a NATS that handshakes and goes silent was dialled again after waits of $spacing s"
 fi
 

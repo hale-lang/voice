@@ -12,10 +12,12 @@
 /// held (each instance in a transaction of its own, a failure logged and
 /// left for the next tick), then, in one transaction, writes each node's
 /// liveness and the route table (`route_table`, store.md), and publishes
-/// the table's new version to the notifier (notifier.hl), which tells
-/// `<root>.route` (`voice.route` standalone; internal.yaml) on a thread of its own, so an api
-/// instance can tell a newer table is there and the tick never waits on
-/// NATS. Per-tick work runs in a method, so each tick's memory is
+/// the table's new version, `RouteWritten`, which a pinned NATS connection
+/// tells on `<root>.route` (`voice.route` standalone; internal.yaml) on a
+/// thread of its own, so the tick never waits on NATS. The binding keeps
+/// only the newest version (pond's `Delivery::Latest`): one that NATS
+/// cannot take now is replaced by the next, and the newest is told once
+/// NATS is back. Per-tick work runs in a method, so each tick's memory is
 /// reclaimed. It needs Postgres 14 or newer (`idle_session_timeout`), and
 /// says so and stops on an older one.
 
@@ -24,6 +26,13 @@ import "../store" as st;
 import "../lib/broker" as broker;
 import "../lib/pond/pq" as pq;
 import "../lib/pond/db" as db;
+import "../lib/pond/realtime/nats" as nats;
+
+/// A route table's version, written (internal.yaml `RouteNotice`).
+type Version { version: Int = -1; }
+
+/// The route table's newest version, on `<root>.route`.
+topic RouteWritten { payload: Version; subject: "route"; }
 
 /// The lock every brain asks for: one key for voice's one brain.
 const BRAIN_LOCK: String = "SELECT pg_try_advisory_lock(hashtext('voice.brain'))";
@@ -41,12 +50,18 @@ main locus Brain {
         said: String = "";
         // the last trouble writing the table, said once
         trouble: String = "";
-        // tells NATS each version, on its own thread
-        notifier: Notifier = Notifier { };
+        // tells NATS each version, on its own thread: grafted, as the
+        // habitat broker's account, its subjects under the broker's root;
+        // with no NATS (`url` ""), it dials nothing and tells no one
+        route_conn: nats::NatsConn = nats::NatsConn { };
     }
 
     placement {
-        notifier: pinned;
+        route_conn: pinned;
+    }
+
+    bindings {
+        RouteWritten: nats::NatsAdapter { delivery: nats::Delivery::Latest };
     }
 
     bus {
@@ -131,7 +146,7 @@ main locus Brain {
         }
         let version = self.written();
         if version < 0 { return; }
-        // the notifier tells NATS; the tick never waits on it
+        // the pinned connection tells NATS; the tick never waits on it
         RouteWritten <- Version { version: version };
         self.trouble_is("");
     }
@@ -414,6 +429,16 @@ fn main() {
     Brain {
         database: database,
         nats: b.url,
-        notifier: Notifier { url: b.url, user: b.user, vault: b.vault, subjects: b.root },
+        route_conn: nats::NatsConn {
+            url: b.url,
+            user: b.user,
+            name: "voice-brain",
+            subject_prefix: b.root + ".",
+            timeout: 2s,
+            // an address that does not answer is dialled again after a
+            // wait that grows to 30 s
+            reconnect_max_ms: 30000,
+            credential: std::secret::Credential { vault: b.vault },
+        },
     };
 }

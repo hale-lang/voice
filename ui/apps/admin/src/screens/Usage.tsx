@@ -1,19 +1,28 @@
-import { useEffect } from 'react';
-import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, micros, count, when, ago } from '@hale/components';
+import { useEffect, useState } from 'react';
+import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, micros, count, when, ago } from '@hale/components';
 import { toneOf } from '../tone';
 import { useGet, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 
-/** Summaries first, then the records behind them. */
+/** Requests a page holds. */
+const PAGE = 50;
+
+/** Summaries first, then the records behind them, a page at a time. */
 export function Usage({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
-  const records = useGet('/admin/v1/usage', { params: { query: { limit: 100 } } });
-  const record = records.data?.data.find((r) => r.id === selected);
+  // the cursors of the pages before this one, newest first: older pushes
+  // the page's `next_cursor`, newer pops it
+  const [cursors, setCursors] = useState<string[]>([]);
+  const cursor = cursors[cursors.length - 1];
+  const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...(cursor ? { cursor } : {}) } } });
+  const onPage = records.data?.data.find((r) => r.id === selected);
   useEffect(() => {
-    setInspector(record ? <RecordInspector record={record} /> : null);
-  }, [record, setInspector]);
+    setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
+  }, [selected, onPage, setInspector]);
+  const next = records.data?.next_cursor ?? null;
+  const page = cursors.length + 1;
 
   return (
     <>
@@ -22,7 +31,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         <Summary group="project" />
         <Summary group="account" />
       </PanelGrid>
-      <Panel title="Requests" readout={readout(records, records.data ? `${records.data.data.length}` : null)}>
+      <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
         {records.isPending ? (
           <Loading what="usage" />
         ) : records.isError ? (
@@ -50,9 +59,23 @@ export function Usage({ route, setInspector }: ScreenProps) {
             empty="No requests yet."
           />
         )}
+        <p style={{ marginBottom: 0, display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+          <Button onClick={() => setCursors([])} disabled={cursors.length === 0}>newest</Button>
+          <Button onClick={() => setCursors(cursors.slice(0, -1))} disabled={cursors.length === 0}>newer</Button>
+          <Button onClick={() => next && setCursors([...cursors, next])} disabled={!next}>older</Button>
+          <span className="muted">page {page}{next ? '' : ', the oldest'}</span>
+        </p>
       </Panel>
     </>
   );
+}
+
+/** A record that is not on the page shown: read by its id. */
+function RecordById({ id }: { id: string }) {
+  const q = useGet('/admin/v1/usage/{request_id}', { params: { path: { request_id: id } } });
+  if (q.isPending) return <Loading what="the request" />;
+  if (q.isError) return <Unavailable what="The request" detail={q.error.message} />;
+  return <RecordInspector record={q.data} />;
 }
 
 function Summary({ group }: { group: 'project' | 'account' }) {

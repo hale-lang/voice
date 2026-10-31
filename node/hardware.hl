@@ -33,7 +33,17 @@ fn measured_hardware(data: String, file: String) -> String {
                 std::log::kv("gpus", to_string(gpus)),
             );
         }
-        nvidia_accelerators(smi, memory)
+        let nvidia = nvidia_accelerators(smi, memory);
+        // a machine with no NVIDIA GPU may have AMD's or Intel's: ROCm for an
+        // AMD card when its compute device is there, Vulkan for either
+        if gpus > 0 {
+            nvidia
+        } else {
+            other_accelerators(
+                run_out("sh\n-c\n" + DRM_GPUS),
+                std::io::fs::file_exists("/dev/kfd"),
+            )
+        }
     };
     return hardware_json(
         os,
@@ -180,6 +190,54 @@ fn nvidia_accelerators(smi: String, memory: Int) -> String {
                     accelerator_json("cuda", std::str::trim(line[0..comma]), memory, true)
                 },
             );
+        }
+    }
+    let b = out.snapshot() or b"";
+    return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// The machine's GPUs as the kernel's DRM devices say them, one a line:
+/// `<vendor id> <dedicated memory in bytes> <name>`. An integrated GPU
+/// reports a small carve-out, a discrete one its own memory.
+const DRM_GPUS: String = "for d in /sys/class/drm/card[0-9]*; do case \"$d\" in *-*) continue;; esac; v=$(cat \"$d/device/vendor\" 2>/dev/null) || continue; m=$(cat \"$d/device/mem_info_vram_total\" 2>/dev/null || echo 0); s=$(basename \"$(readlink -f \"$d/device\")\"); n=$(lspci -s \"$s\" 2>/dev/null | sed 's/^[^:]*: //'); echo \"$v $m ${n:-GPU}\"; done";
+
+/// A GPU worth placing on: dedicated memory of at least 2 GiB, not an
+/// integrated one's carve-out.
+const DISCRETE_MIN_BYTES: Int = 2147483648;
+
+/// The non-NVIDIA GPUs in `drm` (`DRM_GPUS`' lines) as accelerators: an
+/// AMD card (`0x1002`) is `rocm` when the machine has ROCm's compute device
+/// (`kfd`) and `vulkan` too; an Intel card (`0x8086`) is `vulkan`. Each
+/// with its own memory; only discrete cards, the first `ACCELERATORS_MAX`.
+@bounded_by(drm)
+fn other_accelerators(drm: String, kfd: Bool) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
+    let mut kept = 0;
+    let v = std::str::bytes_view(drm);
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        let line = std::str::trim(std::str::slice(v, start, nl));
+        start = nl + 1;
+        let sp = std::str::index_of(line, " ");
+        if sp < 0 { continue; }
+        let vendor = line[0..sp];
+        let rest = line[(sp + 1)..len(line)];
+        let sp2 = std::str::index_of(rest, " ");
+        let mem = std::str::parse_int(if sp2 < 0 { rest } else { rest[0..sp2] }) or 0;
+        let name = if sp2 < 0 { "GPU" } else { std::str::trim(rest[(sp2 + 1)..len(rest)]) };
+        if mem < DISCRETE_MIN_BYTES { continue; }
+        let amd = vendor == "0x1002";
+        if !amd && vendor != "0x8086" { continue; }
+        if amd && kfd && kept < ACCELERATORS_MAX {
+            if kept > 0 { out.append_str(", "); }
+            out.append_str(accelerator_json("rocm", name, mem, false));
+            kept = kept + 1;
+        }
+        if kept < ACCELERATORS_MAX {
+            if kept > 0 { out.append_str(", "); }
+            out.append_str(accelerator_json("vulkan", name, mem, false));
+            kept = kept + 1;
         }
     }
     let b = out.snapshot() or b"";

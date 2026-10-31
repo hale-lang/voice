@@ -701,15 +701,25 @@ fn managed_config(
 
 // ---- the fit ----------------------------------------------------------
 
+/// How a runtime's accelerator ranks on a machine that has it, lower first:
+/// a GPU through its native API (CUDA, ROCm, Metal), then through Vulkan,
+/// then the processors.
+fn accelerator_rank(on: String) -> Int {
+    if on == "cpu" { return 2; }
+    if on == "vulkan" { return 1; }
+    return 0;
+}
+
 /// The runtime among `rts` that reads `format` on a machine, as its
-/// hardware says: one for its platform, on one of its accelerators before
-/// one on its processors; "" when none does.
+/// hardware says: one for its platform, on the best of its accelerators it
+/// runs on (`accelerator_rank`), its processors last; "" when none does.
 @bounded_by(rts)
 fn runtime_for(format: String, hw: String, rts: RuntimeList) -> String {
     let os = std::json::find_string_field(hw, "os");
     let arch = std::json::find_string_field(hw, "arch");
     let accel = accelerator_kinds(hw);
-    let mut cpu = "";
+    let mut best = "";
+    let mut best_rank = 3;
     for r in rts.data {
         let mut reads = false;
         for f in r.formats {
@@ -721,14 +731,14 @@ fn runtime_for(format: String, hw: String, rts: RuntimeList) -> String {
         }
         if reads && here {
             let on = runtime_accelerator_name(r.accelerator);
-            if on == "cpu" {
-                if len(cpu) == 0 { cpu = r.id; }
-            } else if std::str::contains(accel, "," + on + ",") {
-                return r.id;
+            let rank = accelerator_rank(on);
+            if (on == "cpu" || std::str::contains(accel, "," + on + ",")) && rank < best_rank {
+                best = r.id;
+                best_rank = rank;
             }
         }
     }
-    return cpu;
+    return best;
 }
 
 /// True when the runtime `id` runs on processors, not an accelerator.
@@ -753,6 +763,10 @@ fn format_rank(format: String, hw: String) -> Int {
     let accel = accelerator_kinds(hw);
     if std::str::contains(accel, ",metal,") { return if format == "mlx" { 0 } else { 1 }; }
     if std::str::contains(accel, ",cuda,") { return if format == "safetensors" { 0 } else { 1 }; }
+    // an AMD or Intel GPU is served by llama.cpp: its own format first
+    if std::str::contains(accel, ",rocm,") || std::str::contains(accel, ",vulkan,") {
+        return if format == "gguf" { 0 } else { 1 };
+    }
     return 0;
 }
 

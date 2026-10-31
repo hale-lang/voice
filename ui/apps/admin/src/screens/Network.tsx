@@ -192,7 +192,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
         <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}</div>
-        <div className={s.mapNote}>Requests follow project → API → host → seat → account → served model. Dotted links carry request context; hosts contain seats; the account layer shows budget attribution. Missing context is simply absent.</div>
+        <div className={s.mapNote}>Requests follow project → API → host → seat → account → served model; one asked by an alias runs through the alias (a project's name for a model) to the model it named. Dotted links carry request context; hosts contain seats; the account layer shows budget attribution. Missing context is simply absent.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">
@@ -227,7 +227,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
 }
 
 function Marker({ kind }: { kind: Kind }) {
-  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
+  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'alias' ? <path d="M7 13H25L33 20L25 27H7Z" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
 }
 
 /** A request in flight as a record the graph can light: what it is, and the seat it is on. */
@@ -261,7 +261,7 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
   return <>
     <div className={s.layoutTools}><span>NEURAL LAYERS <span className="muted">/ drag to arrange · select to inspect</span></span><button onClick={() => { settled.current = undefined; setPins(new Map()); }}>Reset layout{pins.size ? ` · ${pins.size} pinned` : ''}</button></div>
     <p className={s.dragHint}>Flow moves toward models → · drag to pin · arrow keys to move · Escape to release</p>
-    <div className={s.mapScroll}><div ref={ref} className={s.map} style={{ minHeight: Math.max(740, (layout.vertices.filter(v => v.kind === 'model').length - 1) * 32 + 160) }} aria-label="Fleet relationship graph">
+    <div className={s.mapScroll}><div ref={ref} className={s.map} style={{ minHeight: Math.max(740, (layout.vertices.filter(v => v.kind === 'model' || v.kind === 'alias').length - 1) * 32 + 160) }} aria-label="Fleet relationship graph">
     <div className={s.flowGuides} aria-hidden="true"><span>CONTEXT</span><span>PROJECT → API → HOST → SEAT</span><span>MODELS / INFERENCE</span></div>
     <svg className={s.wires} width="100%" height="100%" viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true">
       <defs><marker id={arrowId} markerWidth="8" markerHeight="8" refX="25" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z" fill="#80bdcf" /></marker></defs>

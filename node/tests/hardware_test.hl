@@ -98,4 +98,54 @@ fn main() {
         "the first GPU's memory",
     );
     std::test::assert_eq_int(node::gpu_memory_of("{\"accelerators\": []}"), 0, "none");
+
+    // AMD and Intel: the kernel's DRM devices, as lin1 has them (a Radeon RX
+    // 9070 XT and the Ryzen's own small Radeon)
+    let drm = "0x1002 17095983104 Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE] (rev c0)\n0x1002 536870912 Advanced Micro Devices, Inc. [AMD/ATI] Granite Ridge [Radeon Graphics] (rev cb)\n";
+    let rocm = node::other_accelerators(drm, true);
+    std::test::assert(
+        std::str::contains(rocm, "\"kind\": \"rocm\"")
+            && std::str::contains(rocm, "\"kind\": \"vulkan\"")
+            && std::str::contains(rocm, "\"memory_bytes\": 17095983104"),
+        "a discrete AMD card is rocm and vulkan, with its own memory: " + rocm,
+    );
+    std::test::assert(
+        !std::str::contains(rocm, "Granite Ridge"),
+        "the integrated one is not placed on",
+    );
+    let vk = node::other_accelerators(drm, false);
+    std::test::assert(
+        !std::str::contains(vk, "rocm") && std::str::contains(vk, "\"kind\": \"vulkan\""),
+        "without ROCm's compute device, Vulkan only: " + vk,
+    );
+    let arc = node::other_accelerators(
+        "0x8086 17179869184 Intel Corporation DG2 [Arc A770]\n",
+        true,
+    );
+    std::test::assert(
+        std::str::contains(arc, "\"kind\": \"vulkan\"") && !std::str::contains(arc, "rocm"),
+        "an Intel card is Vulkan: " + arc,
+    );
+    std::test::assert_eq_str(node::other_accelerators("", true), "[]", "no DRM device, no GPU");
+
+    // the collector itself, on sysfs as each driver lays it out: AMD's
+    // memory counter, Intel's (i915) own, and a card with neither
+    let root = node::run_out("mktemp\n-d");
+    let r = std::str::trim(root);
+    node::run_out(
+        "sh\n-c\nmkdir -p $0/sys/class/drm/card0/device $0/sys/class/drm/card1/device $0/sys/class/drm/card2/device $0/sys/class/drm/card0-DP-1 && echo 0x1002 > $0/sys/class/drm/card0/device/vendor && echo 17095983104 > $0/sys/class/drm/card0/device/mem_info_vram_total && echo 0x8086 > $0/sys/class/drm/card1/device/vendor && echo 17179869184 > $0/sys/class/drm/card1/lmem_total_bytes && echo 0x8086 > $0/sys/class/drm/card2/device/vendor\n"
+            + r,
+    );
+    let listed = node::run_out("sh\n-c\n" + node::DRM_GPUS + "\nsh\n" + r);
+    let found = node::other_accelerators(listed, false);
+    std::test::assert(
+        std::str::contains(found, "\"memory_bytes\": 17095983104")
+            && std::str::contains(found, "\"memory_bytes\": 17179869184"),
+        "AMD's and Intel's memory, each through its own driver's counter: " + listed,
+    );
+    std::test::assert(
+        std::str::contains(listed, "0x8086 0 "),
+        "a card with neither counter reads 0, and is not placed on: " + listed,
+    );
+    node::run_out("rm\n-rf\n" + r);
 }

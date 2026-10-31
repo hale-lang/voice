@@ -180,7 +180,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
           { k: 'models', v: p.models ? (p.models.length ? p.models.join(', ') : <span className="c-wait">none</span>) : 'the whole catalog' },
-          { k: 'models by name', v: <Aliases project={p} /> },
+          { k: 'aliases', v: <Aliases project={p} /> },
           ...(p.parent ? [{ k: 'parent', v: <a href={`#/projects/${p.parent}`}><Mono>{p.parent}</Mono></a> }] : []),
           { k: 'accounts', v: p.inherits ? <>{p.parent}'s, inherited</> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
           { k: 'position', v: p.position ?? '–' },

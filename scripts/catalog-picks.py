@@ -53,11 +53,24 @@ def main():
             continue
         recipe_of[cells[0]] = m.group(1)
         not_at[cells[0]] = {t.strip() for t in cells[-2].split(",") if t.strip() not in ("", "-")}
+    # a decision model (the sim's `sys1`, a Jev-style release, which the sim
+    # marks not servable: it knows llama.cpp and vLLM only) is served where a
+    # shipped jev-style runtime runs, from the recipe named for it
+    decision_os = set()
+    for f in sorted(os.listdir(os.path.join(ROOT, "runtimes"))):
+        if f.endswith(".json"):
+            r = json.load(open(os.path.join(ROOT, "runtimes", f)))
+            if r.get("server") == "jev-style":
+                decision_os |= {p["os"] for p in r.get("platforms", [])}
     picks = []
     for sim_os, os_name in PLATFORMS.items():
         for cells in rows(sim, sim_os):
             tier, klass, model, servable = cells[0], cells[1], cells[2], cells[-1]
             category = next((c for c, k in CATEGORIES.items() if k == klass), None)
+            if category == "decide" and model != "-" and os_name in decision_os \
+                    and os.path.exists(os.path.join(ROOT, "recipes", model + ".json")):
+                picks.append({"os": os_name, "tier_gb": int(tier), "category": category, "recipe": model})
+                continue
             if category is None or servable != "yes" or model == "-":
                 continue
             model = re.sub(r"\s*\(chat\)$", "", model)

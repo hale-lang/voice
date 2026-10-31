@@ -935,3 +935,111 @@ fn upstream_over_wire(id: String, model: String, body: String, c: CompatConfig) 
 fn run_compat(id: String, model: String, body: String, c: CompatConfig) -> StaticRun {
     return drain(upstream_over_wire(id, model, body, c));
 }
+
+// ---- decision models ------------------------------------------------
+
+/// The one event a decision model's run plays: its upstream's answer, whole
+/// (protocol.yaml `SystemOneAnswer`).
+fn systemone_event(answer: String) -> String {
+    return "{\"type\":\"systemone.answer\",\"answer\":" + one_line(answer) + "}";
+}
+
+/// JSON on one line: a run's script is an event a line, and an upstream may
+/// lay its answer out over many. A line break in JSON is only ever space
+/// between tokens (inside a string it is escaped), so each becomes a space.
+fn one_line(json: String) -> String {
+    let v = std::str::bytes_view(json);
+    let b = std::bytes::BytesBuilder { initial_cap: v.n };
+    let mut i = 0;
+    while i < v.n {
+        let c = std::str::byte_at(v, i);
+        if c == 10 || c == 13 { b.append_str(" "); } else { b.append_u8(c); }
+        i = i + 1;
+    }
+    return std::str::from_bytes(b.snapshot() or b"");
+}
+
+/// `body`, a systemone request, naming `model` for the upstream: any
+/// `model` it carried is replaced, the rest kept as it was.
+fn systemone_request(body: String, model: String) -> String {
+    let b = std::str::trim(body);
+    if !std::json::valid_object(b) { return b; }
+    let inner = std::str::trim(b[1..(len(b) - 1)]);
+    let mut kept = "";
+    let mut it = std::json::object_first(b);
+    while !it.done {
+        if !std::json::obj_key_eq(it, b, "model") {
+            kept = kept + (if len(kept) > 0 { "," } else { "" })
+                + q(std::json::obj_key_string(it, b))
+                + ":" + std::json::obj_value_raw(it, b);
+        }
+        it = std::json::object_next(it, b);
+    }
+    return "{\"model\":" + q(model)
+        + (if len(inner) > 0 && len(kept) > 0 { "," + kept } else { "" }) + "}";
+}
+
+/// A decision model's request posted whole, keyed with the seat's API key
+/// when it has one (a revealed key is written in the statement that reveals
+/// it, as `HttpSse.whole` does).
+locus SystemOnePost {
+    params { vault: String = ""; }
+
+    @unbounded
+    fn post(url: std::http::Url, body: String) -> std::http::ClientResponse {
+        if len(self.vault) == 0 {
+            return std::http::request(
+                std::http::ClientRequest {
+                    method: "POST",
+                    url: url,
+                    headers: "Content-Type: application/json\r\nAccept: application/json",
+                    body: std::bytes::from_string(body),
+                },
+            ) or std::http::ClientResponse { status: 0, body: b"" };
+        }
+        let credential = std::secret::Credential { vault: self.vault };
+        return std::http::request(
+            std::http::ClientRequest {
+                method: "POST",
+                url: url,
+                headers: "Content-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer "
+                    + credential.reveal_text(),
+                body: std::bytes::from_string(body),
+            },
+        ) or std::http::ClientResponse { status: 0, body: b"" };
+    }
+}
+
+/// A decision model's request (`serve` with `endpoint: systemone`): the
+/// body posted whole to `<base_url>/systemone`, the upstream's answer played
+/// as one `systemone.answer` event. A refused or unreachable upstream is a
+/// failed run, with the upstream's own error, so the coordinator moves on.
+@unbounded
+fn run_systemone(model: String, engine_model: String, body: String, c: CompatConfig) -> StaticRun {
+    let served = if len(engine_model) > 0 { engine_model } else { c.model };
+    if len(c.problem) > 0 { return compat_failed(c, served, c.problem); }
+    let parsed = std::http::parse_url(c.base_url + "/systemone") or {
+        return compat_failed(c, served, "the upstream at " + c.base_url + " is no URL");
+    };
+    let r = SystemOnePost { vault: c.key_vault }.post(parsed, systemone_request(body, served));
+    if r.status == 0 {
+        return compat_failed(c, served, "the upstream at " + c.base_url + " could not be reached");
+    }
+    let text = std::str::trim(std::str::from_bytes(r.body));
+    if r.status < 200 || r.status >= 300 {
+        return compat_failed(c, served, error_datum(r.status, text).failure);
+    }
+    if !std::json::valid_object(text) || std::json::string_field(text, "answers").kind != "object" {
+        return compat_failed(c, served, "the upstream's answer is not a systemone answer");
+    }
+    let ran = std::json::string_field(text, "model");
+    let input = std::json::find_int_field(std::json::find_field_raw(text, "usage"), "input_tokens");
+    return StaticRun {
+        script: line(systemone_event(text)),
+        outcome: "served",
+        model: if ran.kind == "string" && len(ran.text) > 0 { ran.text } else { served },
+        input_tokens: if input > 0 { input } else { 0 },
+        output_tokens: 0,
+        cost_micros: compat_cost(c, if input > 0 { input } else { 0 }, 0)
+    };
+}

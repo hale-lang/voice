@@ -8,7 +8,11 @@ A caller names a model and presents a project key. Voice picks a seat that
 can serve the model, enforces the project's limits and budget, and records
 what the request used against the project, the key and the account that pays.
 It speaks the OpenAI-compatible `/v1/chat/completions` and `/v1/responses`,
-streamed or not.
+streamed or not, and serves many requests at once.
+
+A seat is a hosted model under one of your accounts (an agent CLI logged in
+per account, or any OpenAI-compatible endpoint) or a model voice runs itself
+on your own GPUs, pinned to the byte.
 
 Voice is written in [Hale](https://github.com/hale-lang/hale).
 
@@ -16,7 +20,7 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
 
 ```
  caller ──HTTP──▶ api ──NATS──▶ node ──▶ seat (an engine under an account)
-                   │  ▲                   static, openai-compatible, claude-cli (a login per account), ...
+                   │  ▲                   managed, openai-compatible, claude-cli, static
                    ▼  │
                  Postgres ◀── brain (ranks seats into the route table)
 ```
@@ -25,11 +29,18 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
   accounts, projects, keys, budgets, limits, nodes and seats. Its
   configuration lives in Postgres.
 - **node** runs on a machine that can reach a model. It offers that
-  machine's engines as **seats** and serves the requests the api assigns it.
+  machine's engines as **seats** and serves the requests the api assigns it:
+  - `managed`: a local model voice fetches, verifies and runs (llama.cpp on
+    Metal, vLLM or llama.cpp on CUDA), as the operator places it;
+  - `openai-compatible`: an endpoint that speaks the OpenAI API;
+  - `claude-cli`: Claude Code, logged in as one account per seat;
+  - `static`: a canned answer, for trying voice and for tests.
 - **brain** turns the state of the fleet into a ranked route table.
 
 A request is checked against its key, its project's limits and budget, sent
-to a seat over NATS, streamed back, and metered.
+to a seat over NATS, streamed back, and metered. A conversation's turns (its
+`prompt_cache_key`) go to the same seat each time, so that seat's prompt
+cache holds what was said, and its usage records are grouped by it.
 
 ## Getting started
 
@@ -46,7 +57,7 @@ toolchain's nursery with `hale habitat graft voice`; it needs no checkout or
 build of its own (hale's habitat chapter, in `docs/src/habitat.md`, has the rest).
 
 This starts Postgres, NATS, the api (on `localhost:8080`, with the admin UI
-at `/`) and the brain: the coordinator. Nodes serve the models, each on its
+at `/`; its live hub on `8085`) and the brain: the coordinator. Nodes serve the models, each on its
 own machine, natively, where its GPU is: in a habitat, `hale habitat organism
 place voice node --host <h>` (`--host local` for the habitat's own machine);
 by hand, [docs/adding-a-node.md](docs/adding-a-node.md), this machine's
@@ -96,16 +107,63 @@ curl $api/v1/chat/completions -H 'Authorization: Bearer vk-...' -H "$json" \
 Add `"stream": true` to get server-sent events. `GET /admin/v1/changes`
 lists every configuration change you just made.
 
+## Local models
+
+The operator decides which weights and which servers may run:
+
+- a **recipe** pins a model's weights: one commit of one Hugging Face repo,
+  every file by its sha256, and only tensor, tokenizer and settings files
+  (never a pickle or code, so nothing runs when they load);
+- a **runtime** pins the server that runs them (vLLM or llama-server) by its
+  container digest or archive sha256;
+- a **placement** puts a catalog model on a node: voice picks the variant
+  and runtime that fit the node's hardware, the node fetches and checks every
+  file, and the seat comes up.
+
+Voice ships a default catalog of recipes per memory tier and platform
+([`recipes/README.md`](./recipes/README.md),
+[`docs/catalog-recipes.md`](./docs/catalog-recipes.md)) and its runtimes in
+[`runtimes/`](./runtimes/); the operator allows more on the admin plane.
+Hardening the runtime's container is tracked in
+[#109](https://github.com/hale-lang/voice/issues/109).
+
+## The admin UI
+
+Served by the api at `/`, under the operator token:
+
+- **Overview**, **Network** (the fleet as a graph, lit while each request
+  runs, the api instances live over the hub), **Route table**;
+- **Usage**: a live board of conversations, the ledger with filters, and a
+  request's recording (for a project or key that **peeks**: kept seven days)
+  read as a conversation, its context beside the back and forth;
+- **Nodes**, **Accounts**, **Catalog**, **Placements**, **Recipes**,
+  **Runtimes**, **Projects** (subprojects, keys, limits, budgets, peek),
+  **Changes** (every admin change, field by field), **API** (the contract);
+- an event log docked at the foot of every screen: requests taking off and
+  landing, nodes, changes.
+
 ## Developing
 
-With the [Hale toolchain](https://github.com/hale-lang/hale) (the version
-in [`Dockerfile`](./Dockerfile)):
+With the [Hale toolchain](https://github.com/hale-lang/hale) at the release
+voice pins (`[dna] toolchain` in [`hale.toml`](./hale.toml), v0.31.0; the
+Dockerfile and CI use the same):
 
 ```sh
 hale build api && hale test api
 hale build node && hale test node
 hale build brain && hale test brain
+hale test store   # and over Postgres: VOICE_TEST_DATABASE_URL=postgres://...
 ```
+
+The UI (`ui/`, React) against a running api:
+
+```sh
+cd ui && npm ci && VOICE_API=http://127.0.0.1:8080 npm run dev
+```
+
+The api's own ports: `--port` (8080), the hub's `VOICE_HUB_PORT` (8085) and
+the runtime probes' `VOICE_PROBE_PORT` (9090). Two api processes on one host
+need their own of each.
 
 | Path | What |
 |---|---|
@@ -114,15 +172,21 @@ hale build brain && hale test brain
 | [`brain/`](./brain/) | the route table |
 | [`store/`](./store/) | the Postgres schema and migrations |
 | [`ui/`](./ui/) | the admin UI |
-| [`spec/`](./spec/) | the contract: OpenAPI, the node and internal protocols |
+| [`spec/`](./spec/) | the contract: OpenAPI, the node and internal protocols, the store's schema |
+| [`recipes/`](./recipes/), [`runtimes/`](./runtimes/) | the models and servers voice ships |
+| [`scripts/`](./scripts/) | end-to-end, race and catalog scripts |
+
+CI checks format and `hale verify`, the tests (the store's over Postgres too),
+the api's export against the contract, the UI's build, a node on macOS, an
+end-to-end run over Postgres and NATS, a fresh clone as a graft takes it, and the image.
 
 ## Status
 
-Configuration, the caller's endpoints, the node plane, the brain and
-inference on a node's static seat are real, and so are usage reporting and
-the admin event stream: each served request is a row in the store's ledger,
-which the admin usage reads sum, and the stream tells the rows and changes
-that follow a subscriber's connection.
+Running: configuration, the caller's endpoints (streamed and not, many at
+once), the node plane, the brain, agent-CLI, OpenAI-compatible and managed
+local seats, usage metering and the ledger, peek recordings, the admin event
+stream and the live hub, and voice as a habitat organism (a provider of
+models to the habitat's other organisms, each a project under the habitat's).
 
 ## More
 

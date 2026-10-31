@@ -1,0 +1,129 @@
+// Model aliases: a project names catalog models; a child's are its own over
+// its parent's, name by name; a name is a slug, given once, never a model's
+// own, and names a model the catalog has. Callers see an alias in
+// /v1/models as the model by that name.
+import ".." as api;
+import "../../store" as st;
+
+fn alias(name: String, model: String) -> api::ModelAlias {
+    return api::ModelAlias { name: name, model: model };
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let catalog = api::Catalog { store: store };
+    catalog.create(api::CatalogModelCreate { id: "coder-big" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "coder-small" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "thinker" }) or discard;
+    let projects = api::Projects { store: store };
+
+    let mut habitat = api::ProjectCreate { id: "habitat", name: "Habitat" };
+    push(habitat.aliases, alias("coding", "coder-big")) or discard;
+    push(habitat.aliases, alias("reasoning", "thinker")) or discard;
+    let mut first = "";
+    let h = projects.create(habitat) or {
+        first = api::ctl_message(err);
+        api::Project { status: api::Lifecycle::active }
+    };
+    std::test::assert_eq_str(first, "", "made");
+    std::test::assert_eq_int(count(h.aliases), 2, "a project keeps its aliases");
+
+    let mut org = api::ProjectCreate {
+        id: "org",
+        name: "Org",
+        has_parent: true,
+        parent: "habitat",
+    };
+    push(org.aliases, alias("coding", "coder-small")) or discard;
+    let o = projects.create(org) or api::Project { status: api::Lifecycle::active };
+    let mut seen = "";
+    for a in o.resolved_aliases {
+        seen = seen + a.name + "=" + a.model + "@" + a.from + " ";
+    }
+    std::test::assert_eq_str(
+        seen,
+        "coding=coder-small@org reasoning=thinker@habitat ",
+        "a child's own over its parent's, name by name",
+    );
+
+    // moved out of band: the parent's change reaches the child at once
+    let mut moved = api::ProjectUpdate { project: "habitat", has_aliases: true };
+    push(moved.aliases, alias("reasoning", "coder-big")) or discard;
+    projects.update(moved) or discard;
+    let row = store.project("org") or st::ProjectRow { };
+    std::test::assert_eq_str(
+        api::alias_target(store, row, "reasoning") or "",
+        "coder-big",
+        "an alias moved on the parent is the child's next request",
+    );
+    std::test::assert_eq_str(
+        api::alias_target(store, row, "coding") or "",
+        "coder-small",
+        "its own still stands",
+    );
+    std::test::assert_eq_str(
+        api::alias_target(store, row, "coder-big") or "x",
+        "",
+        "a model's own name is no alias",
+    );
+
+    let mut why = "";
+    let mut bad = api::ProjectCreate { id: "bad", name: "Bad" };
+    push(bad.aliases, alias("coding", "nope")) or discard;
+    projects.create(bad) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert_eq_str(
+        why,
+        "alias coding: no model nope in the catalog",
+        "a model the catalog has",
+    );
+    why = "";
+    let mut twice = api::ProjectCreate { id: "twice", name: "Twice" };
+    push(twice.aliases, alias("coding", "thinker")) or discard;
+    push(twice.aliases, alias("coding", "coder-big")) or discard;
+    projects.create(twice) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert_eq_str(why, "alias coding is given twice", "given once");
+    why = "";
+    let mut shadow = api::ProjectCreate { id: "shadow", name: "Shadow" };
+    push(shadow.aliases, alias("thinker", "coder-big")) or discard;
+    projects.create(shadow) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(
+        std::str::contains(why, "is the name of a catalog model"),
+        "never a model's own name: " + why,
+    );
+    why = "";
+    let mut caps = api::ProjectCreate { id: "caps", name: "Caps" };
+    push(caps.aliases, alias("Coding", "thinker")) or discard;
+    projects.create(caps) or {
+        why = api::ctl_message(err);
+    };
+    std::test::assert(std::str::contains(why, "lowercase"), "a slug: " + why);
+
+    // a model made later by an alias's name is that model, not the alias
+    catalog.create(api::CatalogModelCreate { id: "reasoning" }) or discard;
+    std::test::assert_eq_str(
+        api::alias_target(store, row, "reasoning") or "x",
+        "",
+        "a model made after the alias takes its own name back",
+    );
+
+    // the change record carries what an alias edit changed
+    let mut edit = api::ProjectUpdate { project: "org", has_aliases: true };
+    push(edit.aliases, alias("coding", "thinker")) or discard;
+    projects.update(edit) or discard;
+    let changes = store.changes(st::ChangeQuery { target: "projects/org" }) or st::ChangeRows { };
+    let mut recorded = false;
+    for ch in changes.rows {
+        if ch.action == "update" && std::str::contains(ch.before, "coder-small")
+            && std::str::contains(ch.after, "thinker")
+        {
+            recorded = true;
+        }
+    }
+    std::test::assert(recorded, "an alias-only update is in the change log, before and after");
+}

@@ -37,6 +37,9 @@ type InferenceRequest {
     // the voice.deadline as written, "" for none
     deadline: String = "";
     body: String = "{}";
+    // the alias the caller asked for, when `model` is the catalog model its
+    // project names by it (aliases.hl); "" when it asked for the model itself
+    alias: String = "";
 }
 
 /// `Served`: what actually served a request.
@@ -149,7 +152,8 @@ locus Inference {
     /// Hold the request to its rate limits, admit it, then offer it to
     /// each eligible seat in turn until one serves it. A limit is policy:
     /// it refuses before anything is looked for to serve.
-    fn serve(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+    fn serve(asked: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+        let r = self.resolved(asked, ctx) or raise;
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         let mut s = self.serve_held(r, ctx, candidates) or raise;
@@ -278,10 +282,11 @@ locus Inference {
     /// keep-alive span, nothing is sent, so a request every seat refuses is
     /// answered whole, as a `502`.
     fn stream(
-        r: InferenceRequest,
+        asked: InferenceRequest,
         ctx: std::api::Context,
         out: EventStream
     ) -> std::http::Response fallible(ApiError) {
+        let r = self.resolved(asked, ctx) or raise;
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         return self.stream_held(r, ctx, out, candidates, held) or raise;
@@ -736,6 +741,27 @@ locus Inference {
             };
         }
         if self.pulse { UsageToTell <- usage_event(r, s); }
+    }
+
+    /// `r` as it is served: a model its caller's project names by an alias
+    /// (aliases.hl) asked for as that catalog model, the alias kept for its
+    /// usage. Read when it is admitted, so an alias moved out of band takes
+    /// the next request; a caller that is no key is refused after, by `hold`.
+    fn resolved(
+        r: InferenceRequest,
+        ctx: std::api::Context
+    ) -> InferenceRequest fallible(ApiError) {
+        if !r.has_model { return r; }
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        if !k.present { return r; }
+        let p = self.store.project(k.project) or fail metering_failed(err);
+        if !p.present { return r; }
+        let target = alias_target(self.store, p, r.model) or fail metering_failed(err);
+        if len(target) == 0 { return r; }
+        let mut out = r;
+        out.alias = r.model;
+        out.model = target;
+        return out;
     }
 
     /// Admit `r` for the caller `ctx` names: the seats it may be offered,

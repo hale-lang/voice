@@ -261,6 +261,7 @@ function NodeInspector({ node }: { node: Node }) {
       )}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Hardware</h3>
       <Hardware node={node} />
+      {node.status !== 'revoked' && <Suggested node={node} />}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
       {local ? (
         <Kv
@@ -287,6 +288,99 @@ function NodeInspector({ node }: { node: Node }) {
       <p className="faint" style={{ fontSize: 'var(--size-xs)', marginTop: 'var(--space-4)' }}>
         <a href={href('nodes')}>all nodes</a>
       </p>
+    </>
+  );
+}
+
+type Suggestion = Schemas['NodeSuggestion'];
+
+/** `s` as a placement id: lowercase letters, digits and dashes, at most 63. */
+function slug(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-+/, '').slice(0, 60).replace(/-+$/, '');
+}
+
+/**
+ * What voice would place here, a model per category it ships, from its
+ * default catalog for the node's platform and memory tier
+ * (`suggestNodeModels`): what fits, or is placed already, or why nothing
+ * does. Placing one adds its recipe to the catalog as a model when none is
+ * there yet, then places it on this node, spending the account chosen.
+ */
+function Suggested({ node }: { node: Node }) {
+  const q = useGet('/admin/v1/nodes/{node}/suggestions', { params: { path: { node: node.id } } });
+  const models = useGet('/admin/v1/models');
+  const accounts = useGet('/admin/v1/accounts');
+  const w = useWrite();
+  const [account, setAccount] = useState('');
+  const options = (accounts.data?.data ?? []).filter((a) => a.status !== 'archived');
+  // an account that bills no one is the natural payer of a local seat
+  const payer = account || (options.find((a) => (a.billing ?? 'none') === 'none') ?? options[0])?.id || '';
+  const placements = useGet('/admin/v1/placements');
+  const place = async (s: Suggestion) => {
+    if (!s.recipe || !payer) return;
+    const recipe = s.recipe;
+    const all = models.data?.data ?? [];
+    // the catalog model whose weights are this recipe: one named for it
+    // first; a model's id says nothing of its weights, so one of the same
+    // id with another recipe is not it, and a new one takes a free id
+    const bound = all.find((m) => m.id === recipe && m.recipe === recipe) ?? all.find((m) => m.kind === 'local' && m.recipe === recipe);
+    let model = bound?.id ?? null;
+    if (!model) {
+      model = await w.createFresh('/admin/v1/models', recipe, new Set(all.map((m) => m.id)), (id) => ({ id, owned_by: 'local', kind: 'local', recipe }));
+      if (!model) return;
+    }
+    const chosen = model;
+    // a placement's id is a slug, never reused, even once removed
+    await w.createFresh('/admin/v1/placements', slug(`${recipe}-on-${node.id}`), new Set((placements.data?.data ?? []).map((p) => p.id)), (id) => ({
+      id,
+      model: chosen,
+      account: payer,
+      nodes: [node.id],
+      ...(s.variant ? { variant: s.variant } : {}),
+    }));
+  };
+  return (
+    <>
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>
+        Suggested models
+        {q.data?.tier_gb != null && <span className="faint" style={{ fontWeight: 400 }}> · {q.data.os} {q.data.tier_gb} GB tier</span>}
+      </h3>
+      {q.isPending ? (
+        <Loading what="suggestions" />
+      ) : q.isError ? (
+        <Unavailable what="Suggestions" detail={q.error.message} />
+      ) : (
+        <>
+          <Kv
+            rows={q.data.data.map((s) => ({
+              k: s.category,
+              v: s.recipe ? (
+                <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
+                  <Mono>{s.recipe}</Mono>
+                  {s.variant && <span className="muted">{s.variant}</span>}
+                  {s.placed ? (
+                    <a href={href('placements', s.placed)}>placed as {s.placed}</a>
+                  ) : (
+                    <Button onClick={() => void place(s)} disabled={w.busy || !payer}>place</Button>
+                  )}
+                  <div className="faint" style={{ flexBasis: '100%', fontSize: 'var(--size-xs)' }}>{s.reason}</div>
+                </div>
+              ) : (
+                <span className="faint">{s.reason}</span>
+              ),
+            }))}
+          />
+          {options.length > 1 && (
+            <div style={{ marginTop: 'var(--space-2)', display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+              <span className="faint">spending</span>
+              <Select value={payer} onChange={setAccount} options={options.map((a) => ({ value: a.id }))} />
+            </div>
+          )}
+          {!payer && <p className="c-wait">No account to spend: add one on Accounts to place a model.</p>}
+          {w.pending && <p className="c-wait">Proposed, pending review: {w.pending}</p>}
+          {w.error && <p className="c-fail">{w.error}</p>}
+        </>
+      )}
     </>
   );
 }

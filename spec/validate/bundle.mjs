@@ -51,6 +51,7 @@ const MAP = {
   RuntimeCreate: 'RuntimeCreate',
   RuntimeList: 'GET /admin/v1/runtimes',
   Placement: 'Placement',
+  NodeSuggestions: 'NodeSuggestions',
   PlacementCreate: 'PlacementCreate',
   PlacementList: 'GET /admin/v1/placements',
   Project: 'Project',

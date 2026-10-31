@@ -65,4 +65,5 @@ COPY --from=build /src/node/node /usr/local/bin/voice-node
 COPY store/migrations /usr/share/voice/migrations
 COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui
 COPY recipes /usr/share/voice/recipes
+COPY catalog /usr/share/voice/catalog
 COPY runtimes /usr/share/voice/runtimes

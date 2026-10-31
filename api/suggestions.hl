@@ -1,0 +1,97 @@
+// What voice suggests placing on a node, a model for each category it ships
+// (`GET /admin/v1/nodes/{node}/suggestions`, `Placements.suggest`). Its
+// picks are the default catalog's (catalog/picks.json, written by
+// scripts/catalog-picks.py from the simulation, read at start with
+// `--picks`): for each platform, memory tier and category, the recipe that
+// suits a machine of that tier. A node is offered the pick of its tier, or,
+// when that is not one the operator has (or does not fit what the node has
+// left for models), the next tier down's, and so on.
+
+/// One category's suggestion: the recipe and the variant that would be
+/// placed, and why; or, when none can be, why not. `placed` names the
+/// placement already serving it there.
+type NodeSuggestion {
+    category: String = "";
+    has_recipe: Bool = false;
+    recipe: String = "";
+    has_variant: Bool = false;
+    variant: String = "";
+    has_runtime: Bool = false;
+    runtime: String = "";
+    // the tier whose pick it is
+    has_tier_gb: Bool = false;
+    tier_gb: Int = 0;
+    has_placed: Bool = false;
+    placed: String = "";
+    reason: String = "";
+}
+
+/// `NodeSuggestions`: a node's platform and tier, and a suggestion a category.
+type NodeSuggestions {
+    node: String = "";
+    has_os: Bool = false;
+    os: String = "";
+    has_tier_gb: Bool = false;
+    tier_gb: Int = 0;
+    data: bounded[NodeSuggestion; 8];
+}
+
+/// The memory tiers the catalog is simulated at, in GB, the biggest first.
+const PICK_TIERS: String = "512 256 128 64 32 16 8 4";
+
+/// The tier of a machine with `memory_bytes`: the biggest whose size it
+/// has, within a tenth, since a machine reports a little less than it is
+/// sold as (a 128 GB DGX Spark says 122 GiB); 0 below the smallest.
+fn node_tier(memory_bytes: Int) -> Int {
+    // in bytes, so the tenth is not lost to rounding down to whole GiB
+    let mut rest = PICK_TIERS;
+    while len(rest) > 0 {
+        let sp = std::str::index_of(rest, " ");
+        let t = std::str::parse_int(if sp < 0 { rest } else { rest[0..sp] }) or 0;
+        rest = if sp < 0 { "" } else { rest[(sp + 1)..len(rest)] };
+        if memory_bytes * 10 >= t * 1073741824 * 9 { return t; }
+    }
+    return 0;
+}
+
+/// The categories the picks name, one a line, in their order.
+@bounded_by(picks)
+fn pick_categories(picks: String) -> String {
+    let mut out = "";
+    let mut it = std::json::array_first(std::json::find_field_raw(picks, "categories"));
+    while !it.done {
+        let c = std::str::trim(it.element);
+        if std::str::starts_with(c, "\"") && len(c) >= 2 {
+            out = out + std::json::unescape_string(c[1..(len(c) - 1)]) + "\n";
+        }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The picks for `category` on `os` at `tier` and every tier below it, the
+/// biggest first, each `<tier>\t<recipe>` a line.
+@bounded_by(picks)
+fn picks_down(picks: String, os: String, category: String, tier: Int) -> String {
+    let all = std::json::find_field_raw(picks, "picks");
+    let mut out = "";
+    let mut rest = PICK_TIERS;
+    while len(rest) > 0 {
+        let sp = std::str::index_of(rest, " ");
+        let t = std::str::parse_int(if sp < 0 { rest } else { rest[0..sp] }) or 0;
+        rest = if sp < 0 { "" } else { rest[(sp + 1)..len(rest)] };
+        if t > tier { continue; }
+        let mut it = std::json::array_first(all);
+        while !it.done {
+            let p = it.element;
+            if std::json::find_string_field(p, "os") == os
+                && std::json::find_string_field(p, "category") == category
+                && std::json::find_int_field(p, "tier_gb") == t
+            {
+                out = out + to_string(t) + "\t" + std::json::find_string_field(p, "recipe") + "\n";
+            }
+            it = std::json::array_next(it);
+        }
+    }
+    return out;
+}

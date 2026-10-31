@@ -55,21 +55,47 @@ def main():
         not_at[cells[0]] = {t.strip() for t in cells[-2].split(",") if t.strip() not in ("", "-")}
     # a decision model (the sim's `sys1`, a Jev-style release, which the sim
     # marks not servable: it knows llama.cpp and vLLM only) is served where a
-    # shipped jev-style runtime runs, from the recipe named for it
-    decision_os = set()
+    # shipped jev-style runtime reads one of its recipe's formats: the
+    # recipe named for it, or else the decision recipe that fits the tier
+    decision_formats = {}
     for f in sorted(os.listdir(os.path.join(ROOT, "runtimes"))):
         if f.endswith(".json"):
             r = json.load(open(os.path.join(ROOT, "runtimes", f)))
             if r.get("server") == "jev-style":
-                decision_os |= {p["os"] for p in r.get("platforms", [])}
+                for p in r.get("platforms", []):
+                    decision_formats.setdefault(p["os"], set()).update(r.get("formats", []))
+    decision = {}
+    for f in sorted(os.listdir(os.path.join(ROOT, "recipes"))):
+        if f.endswith(".json"):
+            r = json.load(open(os.path.join(ROOT, "recipes", f)))
+            if r.get("contract") == "decision":
+                decision[r["id"]] = r
+
+    def decision_pick(os_name, tier, model):
+        """The decision recipe served on `os_name` at `tier` GB: the sim's, or
+        the one whose smallest servable variant there fits the tier, the
+        largest such; None when none does."""
+        formats = decision_formats.get(os_name, set())
+
+        def smallest(r):
+            room = [v.get("memory_bytes", 0) for v in r["variants"] if v["format"] in formats]
+            return min(room) if room else None
+
+        if model in decision and smallest(decision[model]) is not None:
+            return model
+        fits = [(smallest(r), rid) for rid, r in decision.items()
+                if smallest(r) is not None and smallest(r) <= tier * 2**30]
+        return max(fits)[1] if fits else None
+
     picks = []
     for sim_os, os_name in PLATFORMS.items():
         for cells in rows(sim, sim_os):
             tier, klass, model, servable = cells[0], cells[1], cells[2], cells[-1]
             category = next((c for c, k in CATEGORIES.items() if k == klass), None)
-            if category == "decide" and model != "-" and os_name in decision_os \
-                    and os.path.exists(os.path.join(ROOT, "recipes", model + ".json")):
-                picks.append({"os": os_name, "tier_gb": int(tier), "category": category, "recipe": model})
+            if category == "decide" and model != "-":
+                pick = decision_pick(os_name, int(tier), model)
+                if pick:
+                    picks.append({"os": os_name, "tier_gb": int(tier), "category": category, "recipe": pick})
                 continue
             if category is None or servable != "yes" or model == "-":
                 continue

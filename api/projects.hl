@@ -68,6 +68,8 @@ locus Projects {
             name: c.name,
             peek_set: c.has_peek,
             peek: c.peek,
+            annotate_set: c.has_annotate,
+            annotate: c.annotate,
             models: restriction_of(c.has_models, c.models),
             accounts: accounts_restriction(c.has_accounts, c.accounts) or raise,
             created_at: now_seconds()
@@ -190,11 +192,26 @@ locus Projects {
             row.peek_set = false;
             row.peek = false;
         }
+        if u.has_annotate {
+            // an annotation is a request of voice's own project: annotating
+            // its own requests would ask about the asking, without end
+            if row.internal && u.annotate {
+                fail bad(row.id + "'s own requests are never annotated", "annotate");
+            }
+            row.annotate_set = true;
+            row.annotate = u.annotate;
+        } else if u.clear_annotate {
+            row.annotate_set = false;
+            row.annotate = false;
+        }
         if u.has_data_classes { row.data_classes.items = u.data_classes; }
         if u.has_aliases { row.aliases = aliases_json(self.store, u.aliases, "aliases") or raise; }
         if u.has_models || u.clear_models { row.models = restriction_of(u.has_models, u.models); }
         // its parent first, so the same change may make it inherit
         if u.has_parent {
+            if row.internal {
+                fail bad(row.id + " is voice's own project, a child of none", "parent");
+            }
             self.check_parent(row.id, u.parent) or raise;
             row.parent = u.parent;
         } else if u.clear_parent && len(row.parent) > 0 {
@@ -262,6 +279,7 @@ locus Projects {
         let p = self.store.project(parent) or fail store_down(err);
         if !p.present { fail bad("no project " + parent, "parent"); }
         if p.archived { fail bad("project " + parent + " is archived", "parent"); }
+        if p.internal { fail bad(parent + " is voice's own project, a parent of none", "parent"); }
         if len(p.parent) > 0 {
             fail bad(
                 "project " + parent + " is itself a child of " + p.parent
@@ -309,6 +327,12 @@ locus Projects {
     fn archive_held(r: ProjectRef) -> Project fallible(CtlError) {
         let mut row = self.known(r.project) or raise;
         if row.archived { return self.view(row) or raise; }
+        if row.internal {
+            fail clash(
+                row.id
+                    + " is voice's own project, the requests voice makes for itself: it is never archived"
+            );
+        }
         let before = self.view(row) or raise;
         row.archived = true;
         row.archived_at = now_seconds();
@@ -558,7 +582,11 @@ locus Projects {
             inherits: r.inherits,
             has_peek: r.peek_set,
             peek: r.peek,
-            peeks: peeks(self.store, r.peek_set, r.peek, r.parent) or false
+            peeks: peeks(self.store, r.peek_set, r.peek, r.parent) or false,
+            has_annotate: r.annotate_set,
+            annotate: r.annotate,
+            annotates: annotates(self.store, r) or false,
+            internal: r.internal
         };
         v.models = r.models.names.items;
         v.accounts = r.accounts.names.items;
@@ -636,6 +664,12 @@ locus Keys {
                 ""
             );
         }
+        if p.internal {
+            fail bad(
+                c.project + " is voice's own project: no caller has its key, and it takes no other",
+                ""
+            );
+        }
         check_name(c.name) or raise;
         let models = restriction_of(c.has_models, c.models);
         let accounts = accounts_restriction(c.has_accounts, c.accounts) or raise;
@@ -661,7 +695,8 @@ locus Keys {
             created_at: now,
             expires: c.has_expires_at,
             expires_at: c.expires_at,
-            peek: c.peek
+            peek: c.peek,
+            annotate: c.annotate
         };
         row.limits.items = c.limits;
         let mut v = key_view(row, now);
@@ -718,6 +753,9 @@ locus Keys {
     fn update_held(u: KeyUpdate) -> Key fallible(CtlError) {
         let mut k = self.known(u.project, u.key) or raise;
         let held = self.project_of(u.project) or raise;
+        if held.internal {
+            fail bad(k.id + " is voice's own key: it serves voice's own requests as it is", "");
+        }
         // a key is held within what its project spends: its parent's for an
         // inheriting child
         let p = as_in_force(self.store, held) or fail store_down(err);
@@ -728,6 +766,7 @@ locus Keys {
             k.name = u.name;
         }
         if u.has_peek { k.peek = u.peek; }
+        if u.has_annotate { k.annotate = u.annotate; }
         if u.has_models || u.clear_models {
             let models = restriction_of(u.has_models, u.models);
             within(p.models, models, "models") or raise;
@@ -781,6 +820,9 @@ locus Keys {
         let mut k = self.known(r.project, r.key) or raise;
         let now = now_seconds();
         if k.revoked { return key_view(k, now); }
+        if k.project == st::SYSTEM_PROJECT {
+            fail clash(k.id + " is voice's own key, which no token names: it is never revoked");
+        }
         let before = key_view(k, now);
         k.revoked = true;
         k.revoked_at = now;
@@ -879,7 +921,8 @@ fn key_view(k: st::KeyRow, now: Time) -> Key {
         status: key_status(k, now),
         has_revoked_at: k.revoked,
         revoked_at: k.revoked_at,
-        peek: k.peek
+        peek: k.peek,
+        annotate: k.annotate
     };
     v.models = k.models.names.items;
     v.accounts = k.accounts.names.items;

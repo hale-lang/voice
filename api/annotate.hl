@@ -1,0 +1,615 @@
+// Annotate: a project or key that annotates has each request it sends
+// read, once it is answered, by a decision model (decision.hl): what the
+// request was and what its response did, each answer with its probability,
+// and the two paired (asked for code, gave code). Off unless set on the
+// project (its parent's when it sets none) or the key (`annotate`).
+//
+// The questions are asked as requests of voice's own project,
+// `voice-system` (st::SYSTEM_PROJECT), under its key of the same id, which
+// no token names: their usage, limits, budget and accounts are its own, so
+// an annotation never spends what the caller's project may, and the
+// operator sees what annotating costs there. `voice-system`'s `decide`
+// alias names the decision model asked, and its accounts what it may
+// spend; with neither, nothing is asked, and the annotation says why. A
+// decision model is asked, never a generative one: one that is not a
+// decision model is refused, as is any fallback to the caller.
+//
+// The caller waits for none of it: the data plane answers the caller first,
+// closes its connection, and only then asks, on that connection's own
+// coroutine (data_plane.hl, `infer`). The request's text is read to ask
+// about it and never kept: an annotation keeps the answers alone.
+//
+// The questions are voice's, the same for every project:
+//
+//   before, of the request: its task (code, debug, writing, research,
+//     analysis, planning, chat, other), its domain, whether it takes
+//     several steps, asks for code, holds secrets or personal data, or
+//     leans on earlier turns; how hard it is, and how large an answer it
+//     needs (1 to 5);
+//   after, of its response, read beside the request: its outcome
+//     (answered, partly answered, refused, asked back, error), whether it
+//     holds code and kept the form asked for, how complete it is (1 to 4);
+//     whether it called a tool is read from the response itself.
+//
+// and the pairs: asked for code, gave code; a question, answered; several
+// steps, mostly or wholly complete; a form asked, kept.
+
+/// The most of a request's (and of a response's) text a decision model
+/// reads: its start and its end, what lies between left out and said so.
+/// A decision model reads at most 25,600 tokens; the two together stay
+/// well inside it.
+const ANNOTATE_REQUEST_TEXT: Int = 32768;
+const ANNOTATE_RESPONSE_TEXT: Int = 24576;
+
+/// The model `voice-system` asks: its alias for its decision model.
+const ANNOTATE_MODEL: String = "decide";
+
+const ANNOTATE_BEFORE: String = """
+    {"type": "object", "properties": {
+      "task": {"type": "string", "description": "What kind of work does the request ask for?", "oneOf": [
+        {"const": "code", "description": "write, change or review code"},
+        {"const": "debug", "description": "find or fix a fault"},
+        {"const": "writing", "description": "write or edit prose"},
+        {"const": "research", "description": "find or gather information"},
+        {"const": "analysis", "description": "examine, compare or explain something given"},
+        {"const": "planning", "description": "plan, design or decide a course"},
+        {"const": "chat", "description": "conversation, or a quick question"},
+        {"const": "other", "description": "none of these"}]},
+      "domain": {"type": "string", "description": "What field is the request about?", "oneOf": [
+        {"const": "software", "description": "programs, libraries, tools"},
+        {"const": "infrastructure", "description": "systems, networks, deployment, operations"},
+        {"const": "data", "description": "data, analytics, machine learning"},
+        {"const": "security", "description": "security, access, secrets"},
+        {"const": "business", "description": "business, finance, law, product"},
+        {"const": "science", "description": "science, mathematics, engineering"},
+        {"const": "creative", "description": "stories, art, design"},
+        {"const": "personal", "description": "everyday life, health, people"},
+        {"const": "other", "description": "none of these"}]},
+      "multi_step": {"type": "boolean", "description": "Does doing it take several steps?"},
+      "asks_for_code": {"type": "boolean", "description": "Does it ask for code to be written or changed?"},
+      "sensitive": {"type": "boolean", "description": "Does it hold secrets, credentials or personal data?"},
+      "depends_on_context": {"type": "boolean", "description": "Does it depend on earlier turns of the conversation?"},
+      "difficulty": {"type": "integer", "description": "How hard is it?", "oneOf": [
+        {"const": 1, "description": "trivial"}, {"const": 2, "description": "easy"},
+        {"const": 3, "description": "moderate"}, {"const": 4, "description": "hard"},
+        {"const": 5, "description": "expert"}]},
+      "size": {"type": "integer", "description": "How large an answer does it need?", "oneOf": [
+        {"const": 1, "description": "a line"}, {"const": 2, "description": "a paragraph"},
+        {"const": 3, "description": "a page"}, {"const": 4, "description": "several pages"},
+        {"const": 5, "description": "a whole project"}]}
+    }}
+    """;
+
+const ANNOTATE_AFTER: String = """
+    {"type": "object", "properties": {
+      "outcome": {"type": "string", "description": "What did the response do with the request?", "oneOf": [
+        {"const": "answered", "description": "did what was asked"},
+        {"const": "partly_answered", "description": "did some of what was asked"},
+        {"const": "refused", "description": "declined to do it"},
+        {"const": "asked_back", "description": "asked a question back instead"},
+        {"const": "error", "description": "failed, or says it could not"}]},
+      "contains_code": {"type": "boolean", "description": "Does the response hold code?"},
+      "followed_format": {"type": "boolean", "description": "Did the response keep the form the request asked for (format, length, language)?"},
+      "completeness": {"type": "integer", "description": "How complete is the response?", "oneOf": [
+        {"const": 1, "description": "not at all"}, {"const": 2, "description": "partly"},
+        {"const": 3, "description": "mostly"}, {"const": 4, "description": "wholly"}]}
+    }}
+    """;
+
+// ---- the admin plane ----------------------------------------------------
+
+/// `listAnnotations`.
+type AnnotationAsk {
+    project: String = "";
+    key: String = "";
+    task: String = "";
+    outcome: String = "";
+    limit: Int = -1;
+}
+
+type AnnotationRef { request_id: String; }
+
+/// `Annotation`: `task` and `outcome` null and `annotations` left out when
+/// it was not annotated.
+type Annotation {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    status: String = "";
+    reason: String = "";
+    has_task: Bool = false;
+    task: String = "";
+    has_outcome: Bool = false;
+    outcome: String = "";
+    has_annotations: Bool = false;
+    annotations: std::json::Value = std::json::Value::null();
+}
+
+type AnnotationList { data: bounded[Annotation; 200]; }
+
+locus Annotations {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl)
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `listAnnotations`: newest first, at most `limit` (50 by default, 200 at most).
+    fn list(a: AnnotationAsk) -> AnnotationList fallible(CtlError) {
+        self.gate.enter();
+        let rows = self.store.annotations(
+            a.project,
+            a.key,
+            a.task,
+            a.outcome,
+            if a.limit < 1 { 50 } else { a.limit },
+        ) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotationList { };
+        for r in rows.rows { push(out.data, annotation_view(r)) or discard; }
+        return out;
+    }
+
+    /// `getAnnotation`.
+    fn get(r: AnnotationRef) -> Annotation fallible(CtlError) {
+        self.gate.enter();
+        let row = self.store.annotation(r.request_id) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        if !row.present {
+            fail missing(
+                "no annotation of request " + r.request_id
+                    + ": its project and key do not annotate, or it has not been read yet"
+            );
+        }
+        return annotation_view(row);
+    }
+}
+
+fn annotation_view(r: st::AnnotationRow) -> Annotation {
+    let annotated = r.status == "annotated";
+    return Annotation {
+        request_id: r.request_id,
+        project: r.project,
+        key: r.key,
+        model: r.model,
+        created_at: r.created_at,
+        status: r.status,
+        reason: r.reason,
+        has_task: annotated && len(r.task) > 0,
+        task: r.task,
+        has_outcome: annotated && len(r.outcome) > 0,
+        outcome: r.outcome,
+        has_annotations: annotated,
+        annotations: std::json::Value::parse(r.body) or std::json::Value::null(),
+    };
+}
+
+// ---- asking -------------------------------------------------------------
+
+/// A request answered, to annotate: what it asked, as it was served, and
+/// its final response. Built where it is answered (inference.hl);
+/// `present` false for a request whose project and key do not annotate.
+type AnnotationJob {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    // the model the caller named
+    model: String = "";
+    data_class: String = "internal";
+    // the standard request as served, and the final response, each JSON
+    input: String = "";
+    output: String = "";
+    present: Bool = false;
+}
+
+/// One question's answer: as JSON (`{answer, probability, probabilities}`),
+/// with what the pairs read of it.
+type Answered {
+    json: String = "";
+    // a choice's option, a score's level ("" for a noul)
+    choice: String = "";
+    // a noul's probability of yes; a choice's of its option
+    p: Float = 0.0;
+    // a score's probability of its upper half (completeness 3 or 4)
+    high: Float = 0.0;
+}
+
+/// One side's answers: their JSON, and the model's tokens and request.
+type Side {
+    ok: Bool = false;
+    reason: String = "";
+    answers: String = "";
+    request_id: String = "";
+    model: String = "";
+    tokens: Int = 0;
+}
+
+locus Annotator {
+    params {
+        store: st::Store;
+        // voice-system's requests are served as any project's are: its own
+        // limits, held in its own counters
+        inference: Inference;
+    }
+
+    /// `j` annotated, or why not, kept. Never fails the caller, who has
+    /// had its answer: a store that cannot keep it is logged.
+    @unbounded
+    fn annotate(j: AnnotationJob) {
+        if !j.present || j.project == st::SYSTEM_PROJECT { return; }
+        let row = self.annotated(j);
+        self.store.put_annotation(row) or {
+            log_error(
+                "an annotation could not be kept",
+                fields2(std::log::kv("request", j.request_id), std::log::kv("error", err.message)),
+            );
+        };
+    }
+
+    @unbounded
+    fn annotated(j: AnnotationJob) -> st::AnnotationRow {
+        let mut row = st::AnnotationRow {
+            request_id: j.request_id,
+            project: j.project,
+            key: j.key,
+            model: j.model,
+            created_at: now_seconds(),
+            status: "not_annotated",
+        };
+        let why = self.unready(j);
+        if len(why) > 0 {
+            row.reason = why;
+            return row;
+        }
+        let asked = request_text(j.input);
+        let before = self.ask(j, "before", ANNOTATE_BEFORE, clipped(asked, ANNOTATE_REQUEST_TEXT));
+        if !before.ok {
+            row.reason = before.reason;
+            return row;
+        }
+        let answered = response_text(j.output);
+        let after = self.ask(
+            j,
+            "after",
+            ANNOTATE_AFTER,
+            "The request:\n" + clipped(asked, ANNOTATE_REQUEST_TEXT / 2) + "\n\nThe response:\n"
+                + clipped(answered, ANNOTATE_RESPONSE_TEXT),
+        );
+        if !after.ok {
+            row.reason = after.reason;
+            return row;
+        }
+        let task = answer_of(before.answers, "task");
+        let outcome = answer_of(after.answers, "outcome");
+        let tools = used_tools(j.output);
+        let after_json = "{" + side_answers(after.answers) + ", \"used_tools\": {\"answer\": "
+            + jbool(tools) + ", \"probability\": 1, \"read_from\": \"response\"}}";
+        row.status = "annotated";
+        row.task = task.choice;
+        row.outcome = outcome.choice;
+        row.body = "{\"before\": {" + side_answers(before.answers) + "}, \"after\": " + after_json
+            + ", \"pairs\": " + pairs_json(before.answers, after.answers) + ", \"by\": ["
+            + jq(before.request_id) + ", " + jq(after.request_id) + "], \"model\": "
+            + jq(after.model) + ", \"input_tokens\": " + to_string(before.tokens + after.tokens)
+            + "}";
+        return row;
+    }
+
+    /// Why voice-system cannot ask about `j` now, "" when it can: its
+    /// `decide` names no decision model, or its project may not send `j`'s
+    /// data.
+    fn unready(j: AnnotationJob) -> String {
+        let p = self.store.project(st::SYSTEM_PROJECT) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        if !p.present { return "voice-system is missing: the store has not been migrated"; }
+        let target = alias_target(self.store, p, ANNOTATE_MODEL) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        let named = if len(target) > 0 { target } else { ANNOTATE_MODEL };
+        let m = self.store.model(named) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        if !m.present || m.removed {
+            return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
+        }
+        if m.contract != "decision" {
+            return "no decision model: voice-system's `decide` is " + m.id
+                + ", which is not a decision model";
+        }
+        if !has_name(p.data_classes.items, j.data_class) {
+            return "voice-system may not read data of class " + j.data_class
+                + " (give it that data class)";
+        }
+        return "";
+    }
+
+    /// One side's questions asked of `state`, as voice-system's request.
+    @unbounded
+    fn ask(j: AnnotationJob, side: String, schema: String, state: String) -> Side {
+        let body = "{\"model\": " + jq(ANNOTATE_MODEL) + ", \"input\": " + jq(state)
+            + ", \"text\": {\"format\": {\"type\": \"json_schema\", \"name\": " + jq(side)
+            + ", \"schema\": " + std::str::trim(schema) + "}}, \"metadata\": {\"annotates\": "
+            + jq(j.request_id) + ", \"side\": " + jq(side) + "}, \"voice\": {\"data_class\": "
+            + jq(j.data_class) + "}}";
+        let r = read_inference(body, "responses") or {
+            return Side { reason: "failed: " + err.message };
+        };
+        let who = std::api::Principal {
+            mode: "internal",
+            name: st::SYSTEM_PROJECT,
+            via: "internal",
+        };
+        let ctx = std::api::Context { caller: who, role: "caller", via: "internal" };
+        let s = self.inference.serve(r, ctx) or {
+            return Side { reason: refusal_reason(err) };
+        };
+        // its answers, each question's probabilities (inference.hl)
+        let answers = std::str::trim(s.voice.decision);
+        if !std::json::valid_object(answers) {
+            return Side { reason: "failed: " + s.voice.served.model + " gave no decision answers" };
+        }
+        return Side {
+            ok: true,
+            answers: answers,
+            request_id: s.request_id,
+            model: s.voice.served.model,
+            tokens: s.input_tokens,
+        };
+    }
+}
+
+/// Why voice-system's request was refused, as an annotation says it.
+fn refusal_reason(e: ApiError) -> String {
+    if e.status == 429 { return "voice-system is past its limits: " + e.message; }
+    if e.code == ErrorCode::model_not_found {
+        return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
+    }
+    if e.status == 403 || e.code == ErrorCode::no_eligible_seat {
+        return "voice-system may not use its decision model: " + e.message;
+    }
+    return "failed: " + e.message;
+}
+
+// ---- the answers --------------------------------------------------------
+
+/// One answer of a systemone `answers`, as `{answer, probability,
+/// probabilities}`: a choice by its option, a noul as true or false, a
+/// score by its level's value.
+fn answer_of(answers: String, name: String) -> Answered {
+    let a = std::str::trim(std::json::find_field_raw(answers, name));
+    let t = std::json::find_string_field(a, "type");
+    if t == "noul" {
+        let p = noul_of(a);
+        let yes = p >= 0.5;
+        return Answered {
+            json: "{\"answer\": " + jbool(yes) + ", \"probability\": "
+                + to_string(if yes { p } else { 1.0 - p }) + ", \"probabilities\": {\"true\": "
+                + to_string(p) + ", \"false\": " + to_string(1.0 - p) + "}}",
+            p: p,
+        };
+    }
+    let probs = std::str::trim(std::json::find_field_raw(a, "probabilities"));
+    if t == "choice" {
+        let c = std::json::find_string_field(a, "choice");
+        let p = number_at(probs, c);
+        return Answered {
+            json: "{\"answer\": " + jq(c) + ", \"probability\": " + to_string(p)
+                + ", \"probabilities\": "
+                + (if std::json::valid_object(probs) { probs } else { "{}" })
+                + "}",
+            choice: c,
+            p: p,
+        };
+    }
+    // a score: its levels by their values, the likeliest its answer
+    let legend = std::json::find_field_raw(a, "legend");
+    let levels = st::JsonList { };
+    let mut best = "";
+    let mut best_p = -1.0;
+    let mut high = 0.0;
+    let mut it = std::json::object_first(probs);
+    while !it.done {
+        let k = std::json::obj_key_string(it, probs);
+        let p = std::str::parse_float(std::str::trim(std::json::obj_value_raw(it, probs))) or 0.0;
+        it = std::json::object_next(it, probs);
+        let label = std::str::trim(std::json::find_string_field(legend, k));
+        levels.add(jq(label) + ": " + to_string(p));
+        if (std::str::parse_int(label) or 0) >= 3 { high = high + p; }
+        if p > best_p {
+            best_p = p;
+            best = label;
+        }
+    }
+    return Answered {
+        json: "{\"answer\": " + (if len(best) > 0 && is_number(best) { best } else { jq(best) })
+            + ", \"probability\": " + to_string(best_p) + ", \"probabilities\": {" + levels.text()
+            + "}}",
+        choice: best,
+        p: best_p,
+        high: high,
+    };
+}
+
+/// `answers`' questions each as `"name": {answer, probability,
+/// probabilities}`, an object's members.
+fn side_answers(answers: String) -> String {
+    let out = st::JsonList { };
+    let mut it = std::json::object_first(answers);
+    while !it.done {
+        let name = std::json::obj_key_string(it, answers);
+        it = std::json::object_next(it, answers);
+        out.add(jq(name) + ": " + answer_of(answers, name).json);
+    }
+    return out.text();
+}
+
+/// The before and after paired: each `{pair, applies, met, probability}`,
+/// `probability` that of its being met.
+fn pairs_json(before: String, after: String) -> String {
+    let code = answer_of(after, "contains_code");
+    let outcome = answer_of(after, "outcome");
+    let complete = answer_of(after, "completeness");
+    let format = answer_of(after, "followed_format");
+    let answered = number_at(
+        std::str::trim(
+            std::json::find_field_raw(std::json::find_field_raw(after, "outcome"), "probabilities"),
+        ),
+        "answered",
+    );
+    return "["
+        + pair(
+            "asked for code, gave code",
+            answer_of(before, "asks_for_code").p >= 0.5,
+            code.p >= 0.5,
+            code.p,
+        )
+        + ", " + pair("a question, answered", true, outcome.choice == "answered", answered) + ", "
+        + pair(
+            "several steps, complete",
+            answer_of(before, "multi_step").p >= 0.5,
+            complete.high >= 0.5,
+            complete.high,
+        )
+        + ", " + pair("a form asked, kept", true, format.p >= 0.5, format.p) + "]";
+}
+
+fn pair(name: String, applies: Bool, met: Bool, p: Float) -> String {
+    return "{\"pair\": " + jq(name) + ", \"applies\": " + jbool(applies) + ", \"met\": "
+        + jbool(applies && met) + ", \"probability\": " + to_string(p) + "}";
+}
+
+/// The number `obj` holds under `name`, 0 when none.
+fn number_at(obj: String, name: String) -> Float {
+    let mut it = std::json::object_first(obj);
+    while !it.done {
+        if std::json::obj_key_string(it, obj) == name {
+            return std::str::parse_float(std::str::trim(std::json::obj_value_raw(it, obj))) or 0.0;
+        }
+        it = std::json::object_next(it, obj);
+    }
+    return 0.0;
+}
+
+// ---- the texts read -----------------------------------------------------
+
+/// A standard request as the text a decision model reads: its instructions,
+/// then each turn by its role, a tool's call and its result named, what is
+/// not text (an image, a file) said so.
+@unbounded
+fn request_text(body: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let instructions = std::json::string_field(body, "instructions");
+    if instructions.kind == "string" && len(instructions.text) > 0 {
+        out.append_str("system: " + instructions.text + "\n\n");
+    }
+    let input = std::str::trim(std::json::find_field_raw(body, "input"));
+    if std::str::starts_with(input, "\"") {
+        out.append_str("user: " + std::json::find_string_field(body, "input"));
+    } else {
+        let mut it = std::json::array_first(input);
+        while !it.done {
+            let item = std::str::trim(it.element);
+            it = std::json::array_next(it);
+            out.append_str(item_text(item));
+        }
+    }
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// A response's output as text: its messages, the tools it called.
+@unbounded
+fn response_text(response: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        let item = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        out.append_str(item_text(item));
+    }
+    let status = std::json::find_string_field(response, "status");
+    if status != "completed" && len(status) > 0 {
+        out.append_str("[the response is " + status + "]\n");
+    }
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// One input or output item as a line or two of text; reasoning is left out.
+fn item_text(item: String) -> String {
+    let t = std::json::find_string_field(item, "type");
+    if t == "function_call" {
+        return "assistant called " + std::json::find_string_field(item, "name") + "("
+            + clipped(std::json::find_string_field(item, "arguments"), 2048) + ")\n\n";
+    }
+    if t == "function_call_output" {
+        return "tool returned: " + clipped(std::json::find_string_field(item, "output"), 4096)
+            + "\n\n";
+    }
+    if t == "reasoning" { return ""; }
+    if t != "message" && len(t) > 0 {
+        return "[" + t + "]\n\n";
+    }
+    let role = std::json::find_string_field(item, "role");
+    let content = std::str::trim(std::json::find_field_raw(item, "content"));
+    if std::str::starts_with(content, "\"") {
+        return role + ": " + std::json::find_string_field(item, "content") + "\n\n";
+    }
+    let out = std::bytes::BytesBuilder { initial_cap: 1024 };
+    out.append_str(role + ":");
+    let mut it = std::json::array_first(content);
+    while !it.done {
+        let part = it.element;
+        it = std::json::array_next(it);
+        let pt = std::json::find_string_field(part, "type");
+        out.append_str(" ");
+        if pt == "input_text" || pt == "output_text" || pt == "text" {
+            out.append_str(std::json::find_string_field(part, "text"));
+        } else if pt == "refusal" {
+            out.append_str("[refused] " + std::json::find_string_field(part, "refusal"));
+        } else {
+            out.append_str("[" + pt + "]");
+        }
+    }
+    out.append_str("\n\n");
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// `text` at most `max` bytes: its start and its end, the middle left out
+/// and said so; cut at a character's start.
+fn clipped(text: String, max: Int) -> String {
+    if len(text) <= max { return text; }
+    let head = utf8_start(text, max / 4);
+    let tail = utf8_start(text, len(text) - (max - max / 4));
+    return text[0..head] + "\n[… " + to_string(tail - head) + " bytes left out …]\n"
+        + text[tail..len(text)];
+}
+
+/// The start of the character at or after byte `at`.
+fn utf8_start(text: String, at: Int) -> Int {
+    let mut i = at;
+    while i < len(text) && (std::str::byte_at_unchecked(text, i) / 64) == 2 { i = i + 1; }
+    return i;
+}
+
+/// Whether a response called a tool: an output item of a call's type.
+fn used_tools(response: String) -> Bool {
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        let t = std::json::find_string_field(it.element, "type");
+        it = std::json::array_next(it);
+        if t == "function_call" || std::str::ends_with(t, "_call") { return true; }
+    }
+    return false;
+}

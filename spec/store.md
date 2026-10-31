@@ -765,3 +765,46 @@ update runtime set body = jsonb_set(body, '{server}', '"decision"') where body->
 update placement set body = jsonb_set(body, '{runtime}', '"decision-0.3.0-mlx"') where body->>'runtime' = 'jev-style-0.3.0-mlx';
 update placement set body = jsonb_set(body, '{fit}', (select jsonb_agg(case when f->>'runtime' = 'jev-style-0.3.0-mlx' then jsonb_set(f, '{runtime}', '"decision-0.3.0-mlx"') else f end order by n) from jsonb_array_elements(body->'fit') with ordinality as e(f, n))) where body->'fit' @> '[{"runtime": "jev-style-0.3.0-mlx"}]';
 ```
+
+### Migration 23: annotate
+
+A project or a key may annotate: after each request it sends is answered,
+voice asks a decision model what the request was (its task, its domain,
+whether it is several steps, asks for code, holds secrets or personal data,
+or leans on earlier turns, how hard and how large it is) and what the
+response did (answered, partly, refused, asked back or failed; whether it
+holds code and kept the form asked for; how complete it is), and pairs the
+two (asked for code, gave code). `annotate` follows the parent as `peek`
+does: null on a project is its parent's.
+
+The questions are asked as requests of voice's own project, `voice-system`,
+made here: internal, never archived, no caller's, with a key of its own that
+no token names. Its usage, limits, budget and accounts are its own, so an
+annotation never spends what the caller's project may; its `decide` alias
+names the decision model asked. It spends no account until the operator
+gives it one. Its own requests are never annotated.
+
+An annotation is kept per request: annotated, its answers in `body` (the
+request's text is never kept for it), or not, and why. `task` and `outcome`
+are its two headline answers, for listing by them.
+
+```sql
+alter table project add column annotate boolean;
+alter table project add column internal boolean not null default false;
+alter table api_key add column annotate boolean not null default false;
+insert into project (id, name, owners, data_classes, accounts, internal) values ('voice-system', 'voice-system', '{voice}', '{internal}', '{}', true) on conflict (id) do nothing;
+insert into api_key (id, project, name, prefix, secret_digest) values ('voice-system', 'voice-system', 'voice-system', '', '\x'::bytea) on conflict (id) do nothing;
+create table annotation (
+  request_id text primary key,
+  project    text not null references project,
+  key        text not null,
+  model      text not null,
+  created_at timestamptz not null,
+  status     text not null check (status in ('annotated', 'not_annotated')),
+  reason     text not null default '',
+  task       text not null default '',
+  outcome    text not null default '',
+  body       jsonb not null default '{}'
+);
+create index annotation_by_project on annotation (project, created_at desc);
+```

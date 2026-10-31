@@ -1,0 +1,423 @@
+// Annotate: a request whose project or key annotates is answered as any
+// request, then a decision model is asked about it, as voice-system's own
+// requests, which spend voice-system's usage and never the caller's. With no
+// decision model, or one that is not a decision model, it is not
+// annotated, and says why. voice-system is kept as voice's own: never
+// archived, never annotating, taking no key, a parent of none.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+
+/// A decision model's answers to the questions of each side, as a decision
+/// server gives them.
+const BEFORE: String = "{\"model\": \"jev-2b\", \"answers\": {\"task\": {\"type\": \"choice\", \"choice\": \"code\", \"confidence\": 0.8, \"probabilities\": {\"code\": 0.85, \"debug\": 0.05, \"writing\": 0.02, \"research\": 0.02, \"analysis\": 0.02, \"planning\": 0.02, \"chat\": 0.01, \"other\": 0.01}}, \"domain\": {\"type\": \"choice\", \"choice\": \"software\", \"confidence\": 0.9, \"probabilities\": {\"software\": 0.9, \"other\": 0.1}}, \"multi_step\": {\"type\": \"noul\", \"noul\": 0.8}, \"asks_for_code\": {\"type\": \"noul\", \"noul\": 0.9}, \"sensitive\": {\"type\": \"noul\", \"noul\": 0.1}, \"depends_on_context\": {\"type\": \"noul\", \"noul\": 0.2}, \"difficulty\": {\"type\": \"score\", \"score\": 1.9, \"confidence\": 0.5, \"legend\": {\"0\": \"1\", \"1\": \"2\", \"2\": \"3\", \"3\": \"4\", \"4\": \"5\"}, \"probabilities\": {\"0\": 0.1, \"1\": 0.2, \"2\": 0.4, \"3\": 0.2, \"4\": 0.1}}, \"size\": {\"type\": \"score\", \"score\": 1.0, \"confidence\": 0.5, \"legend\": {\"0\": \"1\", \"1\": \"2\", \"2\": \"3\", \"3\": \"4\", \"4\": \"5\"}, \"probabilities\": {\"0\": 0.3, \"1\": 0.5, \"2\": 0.1, \"3\": 0.05, \"4\": 0.05}}}, \"usage\": {\"input_tokens\": 30, \"output_tokens\": 0}}";
+
+const AFTER: String = "{\"model\": \"jev-2b\", \"answers\": {\"outcome\": {\"type\": \"choice\", \"choice\": \"answered\", \"confidence\": 0.7, \"probabilities\": {\"answered\": 0.75, \"partly_answered\": 0.15, \"refused\": 0.02, \"asked_back\": 0.05, \"error\": 0.03}}, \"contains_code\": {\"type\": \"noul\", \"noul\": 0.2}, \"followed_format\": {\"type\": \"noul\", \"noul\": 0.95}, \"completeness\": {\"type\": \"score\", \"score\": 2.6, \"confidence\": 0.6, \"legend\": {\"0\": \"1\", \"1\": \"2\", \"2\": \"3\", \"3\": \"4\"}, \"probabilities\": {\"0\": 0.05, \"1\": 0.1, \"2\": 0.15, \"3\": 0.7}}}, \"usage\": {\"input_tokens\": 50, \"output_tokens\": 0}}";
+
+/// A link to one node, in process: a decision request is answered with the
+/// side's answers above, any other by the static engine. It keeps what it
+/// was last asked, and how many decision requests it was offered.
+locus Nodes {
+    params {
+        decisions: Int = 0;
+        last_state: String = "";
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, reply_to: String, body: String) -> api::Offer {
+        let id = std::json::find_string_field(body, "request_id");
+        let model = std::json::find_string_field(body, "model");
+        let asked = std::str::trim(std::json::find_field_raw(body, "body"));
+        if std::json::find_string_field(body, "endpoint") == "decision" {
+            self.decisions = self.decisions + 1;
+            self.last_state = std::json::find_field_raw(asked, "state");
+            let qs = std::json::find_field_raw(asked, "questions");
+            let answer = if std::json::string_field(qs, "task").kind == "object" {
+                BEFORE
+            } else {
+                AFTER
+            };
+            let run = node::StaticRun {
+                script: node::decision_event(answer) + "\n",
+                outcome: "served",
+                model: model,
+                input_tokens: std::json::find_int_field(
+                    std::json::find_field_raw(answer, "usage"),
+                    "input_tokens",
+                ),
+            };
+            return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+        }
+        let run = node::run_static(
+            id,
+            model,
+            "echo",
+            asked,
+            node::static_config("{\"text\": \"hello from voice\", \"chunk_chars\": 8}"),
+        );
+        return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+    }
+}
+
+/// One offer, scripted: its events, then its result.
+locus Scripted {
+    params {
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+    }
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "accepted" }; }
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if len(line) > 0 { return api::LinkMsg { kind: "event", json: line }; }
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn finish() { self.ended = true; }
+}
+
+fn ask(e: api::DataPlane, key: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer " + key,
+            body: body,
+        },
+    );
+}
+
+const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
+
+/// A node with one seat serving the chat model and the decision model, up.
+fn bring_up(e: api::DataPlane) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: "laptop" }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let mut sc = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1", has_engine_name: true, engine_name: "echo" })
+    or discard;
+    push(sc.serves, st::SeatModel { model: "jev-2b" }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat: " + api::ctl_problem(err).message);
+    };
+    let reg = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/register",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+                + ", \"local\": " + LOCAL + "}",
+        },
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    let up = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/seats",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}",
+        },
+    );
+    std::test::assert_eq_int(up.status, 204, "the seat is up: " + up.body);
+}
+
+fn annotation(store: st::Store, id: String) -> st::AnnotationRow {
+    return store.annotation(id) or st::AnnotationRow { };
+}
+
+fn main() {
+    let nodes = Nodes { };
+    let e = api::DataPlane { link: nodes };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let annotations = api::Annotations { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "jev-2b",
+            has_contract: true,
+            contract: api::ModelContract::decision,
+        },
+    ) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    projects.create(
+        api::ProjectCreate { id: "work", name: "Work", has_annotate: true, annotate: true },
+    ) or discard;
+    let key = (keys.create(api::KeyCreate { project: "work", name: "ci" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    }).secret;
+    bring_up(e);
+
+    // voice-system is there from the start: voice's own, annotating nothing
+    let sys = projects.get(api::ProjectRef { project: "voice-system" }) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert(sys.internal, "voice-system is voice's own project");
+    std::test::assert(!sys.annotates, "and annotates nothing");
+    let work = projects.get(api::ProjectRef { project: "work" }) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert(work.annotates && !work.internal, "work annotates");
+
+    // no decision model yet: the caller is answered, the annotation says why
+    let first = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"write me a sort function\"}");
+    std::test::assert_eq_int(first.status, 200, "answered: " + first.body);
+    let first_id = std::json::find_string_field(first.body, "id");
+    let none = annotation(e.store, first_id);
+    std::test::assert_eq_str(none.status, "not_annotated", "not annotated");
+    std::test::assert(
+        std::str::starts_with(none.reason, "no decision model"),
+        "for want of a decision model: " + none.reason,
+    );
+    std::test::assert_eq_int(nodes.decisions, 0, "and nothing was asked");
+
+    // `decide` names a model that is not a decision model: still not
+    let mut wrong = api::ProjectUpdate { project: "voice-system", has_aliases: true };
+    push(wrong.aliases, api::ModelAlias { name: "decide", model: "echo-1" }) or discard;
+    projects.update(wrong) or {
+        std::test::assert(false, "an alias: " + api::ctl_problem(err).message);
+    };
+    let second = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"again\"}");
+    let generative = annotation(e.store, std::json::find_string_field(second.body, "id"));
+    std::test::assert(
+        std::str::contains(generative.reason, "not a decision model"),
+        "a generative model is never asked: " + generative.reason,
+    );
+    std::test::assert_eq_int(nodes.decisions, 0, "nothing asked of it");
+
+    // a decision model, but no account voice-system may spend
+    let mut decide = api::ProjectUpdate { project: "voice-system", has_aliases: true };
+    push(decide.aliases, api::ModelAlias { name: "decide", model: "jev-2b" }) or discard;
+    projects.update(decide) or discard;
+    let third = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"once more\"}");
+    let unspent = annotation(e.store, std::json::find_string_field(third.body, "id"));
+    std::test::assert(
+        std::str::starts_with(unspent.reason, "voice-system may not use its decision model"),
+        "voice-system spends no account it was not given: " + unspent.reason,
+    );
+
+    // given one: annotated, as voice-system's requests
+    let mut spend = api::ProjectUpdate { project: "voice-system", has_accounts: true };
+    push(spend.accounts, "static") or discard;
+    projects.update(spend) or {
+        std::test::assert(false, "accounts: " + api::ctl_problem(err).message);
+    };
+    let r = ask(
+        e,
+        key,
+        "{\"model\": \"echo-1\", \"instructions\": \"Answer in Python.\", \"input\": [{\"type\": \"message\", \"role\": \"user\", \"content\": \"write me a sort function\"}]}",
+    );
+    std::test::assert_eq_int(r.status, 200, "answered: " + r.body);
+    std::test::assert(std::str::contains(r.body, "\"hello from voice\""), "with the seat's answer");
+    let id = std::json::find_string_field(r.body, "id");
+    let a = annotation(e.store, id);
+    std::test::assert_eq_str(a.status, "annotated", "annotated: " + a.reason);
+    std::test::assert_eq_str(a.task, "code", "its task");
+    std::test::assert_eq_str(a.outcome, "answered", "its outcome");
+    std::test::assert_eq_str(a.project, "work", "under the caller's project");
+    std::test::assert_eq_int(nodes.decisions, 2, "one request for each side");
+    std::test::assert(
+        std::str::contains(nodes.last_state, "write me a sort function")
+            && std::str::contains(nodes.last_state, "hello from voice"),
+        "the response read beside the request: " + nodes.last_state,
+    );
+    let before = std::json::find_field_raw(a.body, "before");
+    std::test::assert(
+        std::str::contains(
+            std::json::find_field_raw(before, "task"),
+            "\"answer\": \"code\", \"probability\": 0.85",
+        ),
+        "each answer with its probability: " + before,
+    );
+    std::test::assert(
+        std::str::contains(
+            std::json::find_field_raw(before, "asks_for_code"),
+            "\"answer\": true, \"probability\": 0.9",
+        ),
+        "a yes or no as true or false",
+    );
+    std::test::assert(
+        std::str::contains(
+            std::json::find_field_raw(before, "difficulty"),
+            "\"answer\": 3, \"probability\": 0.4",
+        ),
+        "a score as its level's value",
+    );
+    let after = std::json::find_field_raw(a.body, "after");
+    std::test::assert(
+        std::str::contains(std::json::find_field_raw(after, "used_tools"), "\"answer\": false"),
+        "whether it called a tool, read from the response",
+    );
+    let pairs = std::json::find_field_raw(a.body, "pairs");
+    std::test::assert(
+        std::str::contains(
+            pairs,
+            "{\"pair\": \"asked for code, gave code\", \"applies\": true, \"met\": false",
+        )
+            && std::str::contains(
+                pairs,
+                "{\"pair\": \"a question, answered\", \"applies\": true, \"met\": true, \"probability\": 0.75}",
+            )
+            && std::str::contains(
+                pairs,
+                "{\"pair\": \"several steps, complete\", \"applies\": true, \"met\": true, \"probability\": 0.85",
+            ),
+        "the pairs: " + pairs,
+    );
+    std::test::assert_eq_int(
+        std::json::find_int_field(a.body, "input_tokens"),
+        80,
+        "what the questions read",
+    );
+
+    // voice-system's usage, never the caller's: two requests that name it
+    let usage = api::Usage { store: e.store };
+    let theirs = usage.list(api::UsageAsk { project: "voice-system" }) or api::UsageList { };
+    let mut naming = 0;
+    for u in theirs.data {
+        if std::str::contains(u.metadata.text, id) { naming = naming + 1; }
+    }
+    std::test::assert_eq_int(naming, 2, "voice-system's usage names the request it annotated");
+    let mine = usage.list(api::UsageAsk { project: "work" }) or api::UsageList { };
+    std::test::assert_eq_int(count(mine.data), 4, "the caller's project has only its own requests");
+
+    // streamed: annotated too
+    let s = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"stream it\", \"stream\": true}");
+    std::test::assert_eq_int(s.status, 200, "a stream: " + s.body);
+    std::test::assert_eq_int(nodes.decisions, 4, "a streamed request is annotated");
+
+    // listed, and by task
+    let coded = annotations.list(
+        api::AnnotationAsk { project: "work", task: "code" },
+    ) or api::AnnotationList { };
+    std::test::assert_eq_int(count(coded.data), 2, "the two annotated, by their task");
+    let all = annotations.list(api::AnnotationAsk { project: "work" }) or api::AnnotationList { };
+    std::test::assert_eq_int(count(all.data), 5, "every request, annotated or not");
+    let one = annotations.get(api::AnnotationRef { request_id: id }) or api::Annotation { };
+    std::test::assert(one.has_task && one.task == "code" && one.has_annotations, "one, whole");
+
+    // a key that annotates in a project that does not
+    projects.create(api::ProjectCreate { id: "quiet", name: "Quiet" }) or discard;
+    let loud = (
+        keys.create(api::KeyCreate { project: "quiet", name: "loud", annotate: true }) or api::Key {
+            status: api::KeyStatus::revoked,
+        }).secret;
+    let hushed = (keys.create(api::KeyCreate { project: "quiet", name: "hushed" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    }).secret;
+    let before_keys = nodes.decisions;
+    ask(e, hushed, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    std::test::assert_eq_int(nodes.decisions, before_keys, "a key that does not annotate is not");
+    ask(e, loud, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    std::test::assert_eq_int(nodes.decisions, before_keys + 2, "one that does, is");
+
+    // a child follows its parent's setting, its own over it
+    projects.create(
+        api::ProjectCreate { id: "child", name: "Child", has_parent: true, parent: "work" },
+    ) or {
+        std::test::assert(false, "a child: " + api::ctl_problem(err).message);
+    };
+    let child = projects.get(api::ProjectRef { project: "child" }) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert(
+        child.annotates && !child.has_annotate,
+        "a child annotates as its parent does",
+    );
+    let off = projects.update(
+        api::ProjectUpdate { project: "child", has_annotate: true, annotate: false },
+    ) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert(!off.annotates, "its own setting over its parent's");
+
+    // voice-system is kept as voice's own
+    projects.archive(api::ProjectRef { project: "voice-system" }) or {
+        std::test::assert(
+            std::str::contains(api::ctl_problem(err).message, "never archived"),
+            "never archived: " + api::ctl_problem(err).message,
+        );
+        api::Project { status: api::Lifecycle::archived }
+    };
+    let still = projects.get(api::ProjectRef { project: "voice-system" }) or api::Project {
+        status: api::Lifecycle::archived,
+    };
+    std::test::assert(still.status == api::Lifecycle::active, "still active");
+    let mut refused = "";
+    projects.update(
+        api::ProjectUpdate { project: "voice-system", has_annotate: true, annotate: true },
+    ) or {
+        refused = api::ctl_problem(err).message;
+        api::Project { status: api::Lifecycle::archived }
+    };
+    std::test::assert(
+        std::str::contains(refused, "never annotated"),
+        "never annotating: " + refused,
+    );
+    refused = "";
+    keys.create(api::KeyCreate { project: "voice-system", name: "mine" }) or {
+        refused = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    std::test::assert(std::str::contains(refused, "takes no other"), "taking no key: " + refused);
+    refused = "";
+    keys.revoke(api::KeyRef { project: "voice-system", key: "voice-system" }) or {
+        refused = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    std::test::assert(
+        std::str::contains(refused, "never revoked"),
+        "its key never revoked: " + refused,
+    );
+    refused = "";
+    projects.update(
+        api::ProjectUpdate { project: "quiet", has_parent: true, parent: "voice-system" },
+    ) or {
+        refused = api::ctl_problem(err).message;
+        api::Project { status: api::Lifecycle::archived }
+    };
+    std::test::assert(
+        std::str::contains(refused, "a parent of none"),
+        "a parent of none: " + refused,
+    );
+    // no token names its key
+    let named = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer ",
+            body: "{\"model\": \"decide\", \"input\": \"x\"}",
+        },
+    );
+    std::test::assert_eq_int(named.status, 401, "no token is voice-system's");
+}

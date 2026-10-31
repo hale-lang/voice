@@ -691,10 +691,10 @@ locus PgStore {
             "voice holds at most 64 projects",
         ) or raise;
         let n = self.step(
-            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits, parent, peek, aliases) VALUES ($1, $2, $3, "
+            "INSERT INTO project (id, name, status, owners, data_classes, models, accounts, position, created_at, archived_at, inherits, parent, peek, aliases, annotate) VALUES ($1, $2, $3, "
                 + names_param(4) + ", " + names_param(5) + ", " + restriction_param(6) + ", "
                 + restriction_param(7)
-                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean, $12, $13::boolean, $14::jsonb) ON CONFLICT (id) DO NOTHING",
+                + ", $8, $9::timestamptz, $10::timestamptz, $11::boolean, $12, $13::boolean, $14::jsonb, $15::boolean) ON CONFLICT (id) DO NOTHING",
             project_args(row),
         ) or raise;
         if n == 0 {
@@ -721,7 +721,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean, aliases = $14::jsonb WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean, aliases = $14::jsonb, annotate = $15::boolean WHERE id = $1",
             project_args(row),
         ) or raise;
         self.project_parts(row) or raise;
@@ -751,7 +751,7 @@ locus PgStore {
             "UPDATE project SET name = $2, status = $3, owners = " + names_param(4)
                 + ", data_classes = " + names_param(5) + ", models = " + restriction_param(6)
                 + ", accounts = " + restriction_param(7)
-                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean, aliases = $14::jsonb WHERE id = $1",
+                + ", position = $8, created_at = $9::timestamptz, archived_at = $10::timestamptz, inherits = $11::boolean, parent = $12, peek = $13::boolean, aliases = $14::jsonb, annotate = $15::boolean WHERE id = $1",
             project_args(row),
         ) or raise;
         for k in revoked.keys {
@@ -821,6 +821,9 @@ locus PgStore {
     }
 
     fn key_by_digest(digest: String) -> KeyRow fallible(StoreError) {
+        // no token digests to nothing: voice-system's key, which has none,
+        // is named by none
+        if len(digest) == 0 { return KeyRow { }; }
         self.lock.enter();
         let taken = self.key_by_digest_locked(digest) or {
             self.lock.leave();
@@ -890,9 +893,9 @@ locus PgStore {
             "a project holds at most 64 keys",
         ) or raise;
         let n = self.step(
-            "INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at, peek) VALUES ($1, $2, $3, $4, decode($5, 'hex'), "
+            "INSERT INTO api_key (id, project, name, prefix, secret_digest, models, accounts, status, created_at, expires_at, last_used_at, revoked_at, peek, annotate) VALUES ($1, $2, $3, $4, decode($5, 'hex'), "
                 + restriction_param(6) + ", " + restriction_param(7)
-                + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz, $13::boolean) ON CONFLICT (id) DO NOTHING",
+                + ", $8, $9::timestamptz, $10::timestamptz, $11::timestamptz, $12::timestamptz, $13::boolean, $14::boolean) ON CONFLICT (id) DO NOTHING",
             key_args(row),
         ) or raise;
         if n == 0 {
@@ -918,7 +921,7 @@ locus PgStore {
         self.step(
             "UPDATE api_key SET project = $2, name = $3, prefix = $4, secret_digest = decode($5, 'hex'), models = "
                 + restriction_param(6) + ", accounts = " + restriction_param(7)
-                + ", status = $8, created_at = $9::timestamptz, expires_at = $10::timestamptz, last_used_at = $11::timestamptz, revoked_at = $12::timestamptz, peek = $13::boolean WHERE id = $1",
+                + ", status = $8, created_at = $9::timestamptz, expires_at = $10::timestamptz, last_used_at = $11::timestamptz, revoked_at = $12::timestamptz, peek = $13::boolean, annotate = $14::boolean WHERE id = $1",
             key_args(row),
         ) or raise;
         self.key_limits(row) or raise;
@@ -1931,6 +1934,101 @@ locus PgStore {
         return peek_row(line);
     }
 
+    fn put_annotation(row: AnnotationRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_annotation_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_annotation_locked(row: AnnotationRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.project);
+        a.add(row.key);
+        a.add(row.model);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(row.status);
+        a.add(row.reason);
+        a.add(row.task);
+        a.add(row.outcome);
+        a.add(if len(row.body) > 0 { row.body } else { "{}" });
+        self.write(
+            "INSERT INTO annotation (request_id, project, key, model, created_at, status, reason, task, outcome, body) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8, $9, $10::jsonb) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, task = excluded.task, outcome = excluded.outcome, body = excluded.body",
+            a,
+        ) or raise;
+    }
+
+    fn annotations(
+        project: String,
+        key: String,
+        task: String,
+        outcome: String,
+        limit: Int
+    ) -> AnnotationRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.annotations_locked(project, key, task, outcome, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn annotations_locked(
+        project: String,
+        key: String,
+        task: String,
+        outcome: String,
+        limit: Int
+    ) -> AnnotationRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(key);
+        a.add(task);
+        a.add(outcome);
+        a.add(to_string(if limit > 200 { 200 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at, status, reason, task, outcome, body FROM annotation WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR task = $3) AND ($4 = '' OR outcome = $4) ORDER BY created_at DESC, request_id LIMIT $5::int) t",
+            a,
+        ) or raise;
+        let mut out = AnnotationRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, annotation_row(line)) or discard;
+        }
+        return out;
+    }
+
+    fn annotation(request_id: String) -> AnnotationRow fallible(StoreError) {
+        self.lock.enter();
+        let out = self.annotation_locked(request_id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn annotation_locked(request_id: String) -> AnnotationRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(request_id);
+        let one = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at, status, reason, task, outcome, body FROM annotation WHERE request_id = $1) t",
+            a,
+        ) or raise;
+        let line = std::str::trim(one);
+        if len(line) == 0 { return AnnotationRow { }; }
+        return annotation_row(line);
+    }
+
     fn windows(account: String) -> String fallible(StoreError) {
         self.lock.enter();
         let taken = self.windows_locked(account) or {
@@ -2163,9 +2261,9 @@ fn restriction_param(n: Int) -> String {
 
 const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_output_tokens, price, created_at, removed_at, recipe, contract FROM catalog_model";
 
-const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.peek, p.aliases, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
+const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.peek, p.annotate, p.internal, p.aliases, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
 
-const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, k.peek, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
+const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, k.peek, k.annotate, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
 
 const ACCOUNT_COLUMNS: String = "SELECT a.id, a.name, a.provider, a.billing, a.status, a.created_at, a.archived_at, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE account = a.id AND scope = 'account') AS limits FROM account a";
 
@@ -2433,6 +2531,9 @@ fn project_row(j: String) -> ProjectRow {
         parent: pg_text(j, "parent"),
         peek_set: std::json::string_field(j, "peek").kind == "bool",
         peek: std::json::find_bool_field(j, "peek"),
+        annotate_set: std::json::string_field(j, "annotate").kind == "bool",
+        annotate: std::json::find_bool_field(j, "annotate"),
+        internal: std::json::find_bool_field(j, "internal"),
         aliases: raw_or_empty_list(j, "aliases"),
         present: true
     };
@@ -2454,6 +2555,7 @@ fn project_args(r: ProjectRow) -> db::Args {
     if len(r.parent) > 0 { a.add(r.parent); } else { a.add_null(); }
     if r.peek_set { a.add(if r.peek { "true" } else { "false" }); } else { a.add_null(); }
     a.add(if len(r.aliases) > 0 { r.aliases } else { "[]" });
+    if r.annotate_set { a.add(if r.annotate { "true" } else { "false" }); } else { a.add_null(); }
     return a;
 }
 
@@ -2493,6 +2595,23 @@ fn key_row(j: String) -> KeyRow {
         revoked: pg_text(j, "status") == "revoked",
         revoked_at: pg_time(pg_text(j, "revoked_at")),
         peek: std::json::find_bool_field(j, "peek"),
+        annotate: std::json::find_bool_field(j, "annotate"),
+        present: true
+    };
+}
+
+fn annotation_row(j: String) -> AnnotationRow {
+    return AnnotationRow {
+        request_id: pg_text(j, "request_id"),
+        project: pg_text(j, "project"),
+        key: pg_text(j, "key"),
+        model: pg_text(j, "model"),
+        created_at: pg_time(pg_text(j, "created_at")),
+        status: pg_text(j, "status"),
+        reason: pg_text(j, "reason"),
+        task: pg_text(j, "task"),
+        outcome: pg_text(j, "outcome"),
+        body: raw_or_empty(j, "body"),
         present: true
     };
 }
@@ -2525,6 +2644,7 @@ fn key_args(r: KeyRow) -> db::Args {
     add_time(a, r.used, r.last_used_at);
     add_time(a, r.revoked, r.revoked_at);
     a.add(if r.peek { "true" } else { "false" });
+    a.add(if r.annotate { "true" } else { "false" });
     return a;
 }
 

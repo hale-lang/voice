@@ -780,6 +780,84 @@ fn ledger(s: st::Store, label: String) {
 
 /// The operator token: none until one is kept, then the first one kept,
 /// whatever a later api mints.
+/// Voice's own project and its key, as a store has them from the start.
+fn system(s: st::Store, label: String) {
+    let p = s.project(st::SYSTEM_PROJECT) or st::ProjectRow { };
+    std::test::assert(p.present && p.internal, label + ": voice-system is there, internal");
+    std::test::assert(!p.annotate_set, label + ": annotating nothing of its own");
+    std::test::assert(
+        !p.accounts.any && count(p.accounts.names.items) == 0,
+        label + ": spending no account",
+    );
+    let k = s.key(st::SYSTEM_PROJECT) or st::KeyRow { };
+    std::test::assert(k.present && k.project == st::SYSTEM_PROJECT, label + ": with its key");
+    let none = s.key_by_digest("") or st::KeyRow { };
+    std::test::assert(!none.present, label + ": which no token names");
+}
+
+/// A request's annotation kept, listed by project, key, task and outcome,
+/// and replaced.
+fn annotations(s: st::Store, label: String) {
+    s.insert_project(
+        st::ProjectRow { id: "noted", name: "Noted", annotate_set: true, annotate: true },
+        ch("create", "projects/noted"),
+    ) or discard;
+    let p = s.project("noted") or st::ProjectRow { };
+    std::test::assert(p.annotate_set && p.annotate, label + ": a project that annotates");
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "resp_a",
+            project: "noted",
+            key: "k_1",
+            model: "echo-1",
+            created_at: `2026-10-31T10:00:00Z`,
+            task: "code",
+            outcome: "answered",
+            body: "{\"before\": {}}",
+        },
+    ) or { std::test::assert(false, label + ": kept: " + err.message); };
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "resp_b",
+            project: "noted",
+            key: "k_2",
+            model: "echo-1",
+            created_at: `2026-10-31T10:01:00Z`,
+            status: "not_annotated",
+            reason: "no decision model",
+        },
+    ) or discard;
+    let all = s.annotations("noted", "", "", "", 50) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(all.rows), 2, label + ": both");
+    std::test::assert_eq_str(
+        (at(all.rows, 0) or st::AnnotationRow { }).request_id,
+        "resp_b",
+        label + ": newest first",
+    );
+    let coded = s.annotations("noted", "", "code", "", 50) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(coded.rows), 1, label + ": by task");
+    let keyed = s.annotations("noted", "k_2", "", "", 50) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(keyed.rows), 1, label + ": by key");
+    let one = s.annotation("resp_a") or st::AnnotationRow { };
+    std::test::assert(one.present && one.outcome == "answered", label + ": one");
+    std::test::assert(std::str::contains(one.body, "before"), label + ": its body: " + one.body);
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "resp_b",
+            project: "noted",
+            key: "k_2",
+            model: "echo-1",
+            created_at: `2026-10-31T10:01:00Z`,
+            task: "chat",
+            outcome: "answered",
+        },
+    ) or discard;
+    let again = s.annotation("resp_b") or st::AnnotationRow { };
+    std::test::assert(again.status == "annotated" && again.task == "chat", label + ": replaced");
+    let missing = s.annotation("resp_none") or st::AnnotationRow { present: true };
+    std::test::assert(!missing.present, label + ": none for a request not annotated");
+}
+
 fn operator(s: st::Store, label: String) {
     std::test::assert_eq_str(s.operator_token("") or "?", "", label + ": none kept yet");
     std::test::assert_eq_str(s.operator_token("va-one") or "", "va-one", label + ": kept");
@@ -894,9 +972,13 @@ fn main() {
     crowded(st::MemoryStore { }, "memory");
     bounded(st::MemoryStore { }, "memory");
     operator(st::MemoryStore { }, "memory");
+    system(st::MemoryStore { }, "memory");
+    annotations(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
+    // as migrated, before the tests below empty it
+    system(pg, "postgres");
     pg.conn.exec(
         "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
     );
@@ -911,4 +993,6 @@ fn main() {
     bounded(pg, "postgres");
     pg.conn.exec("TRUNCATE operator_token");
     operator(pg, "postgres");
+    pg.conn.exec("TRUNCATE annotation");
+    annotations(pg, "postgres");
 }

@@ -50,6 +50,21 @@ locus DataPlane {
             pulse: self.pulse,
             governed: self.governed,
         };
+        // asks a decision model about each request whose project or key
+        // annotates, as voice-system's requests (annotate.hl)
+        annotator: Annotator = Annotator {
+            store: self.store,
+            inference: Inference {
+                instance: self.instance,
+                store: self.store,
+                link: self.link,
+                held: self.held,
+                first: self.first_s * 1s,
+                idle: self.idle_s * 1s,
+                pulse: self.pulse,
+                governed: self.governed,
+            },
+        };
         nodes: Nodes = Nodes { store: self.store, link: self.link };
         changes: Changes = Changes { store: self.store };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
@@ -262,20 +277,52 @@ locus DataPlane {
         if r.stream {
             // the standard event stream, on this connection (stream.hl)
             let out = EventStream { conn_fd: req.conn_fd };
-            return self.inference.stream(r, ctx, out) or raise;
+            let streamed = self.inference.stream(r, ctx, out) or raise;
+            if !out.job.present { return streamed; }
+            // no connection: answered in process (a test), after its annotation
+            if req.conn_fd < 0 {
+                self.annotator.annotate(out.job);
+                return streamed;
+            }
+            // annotated (annotate.hl): the stream ends and its connection
+            // closes first, then the annotation is asked on this
+            // connection's own coroutine; the caller waits for none of it
+            out.close();
+            self.annotator.annotate(out.job);
+            return taken_over();
         }
-        if endpoint == "chat" {
-            let s = self.inference.chat(r, ctx) or raise;
-            return served_answer(s, chat_completion_json(s));
+        let s = if endpoint == "chat" {
+            self.inference.chat(r, ctx) or raise
+        } else {
+            self.inference.respond(r, ctx) or raise
+        };
+        let answer = served_answer(
+            s,
+            if endpoint == "chat" { chat_completion_json(s) } else { response_json(s) },
+        );
+        if !s.job.present { return answer; }
+        if req.conn_fd < 0 {
+            self.annotator.annotate(s.job);
+            return answer;
         }
-        let s = self.inference.respond(r, ctx) or raise;
-        return served_answer(s, response_json(s));
+        // annotated: the caller is answered, as the Server would (it closes
+        // every connection after its answer), then the annotation is asked
+        let conn = std::io::tcp::Stream { conn_fd: req.conn_fd, owns_fd: false };
+        std::http::write_response(conn, answer);
+        std::io::tcp::close_fd(req.conn_fd);
+        self.annotator.annotate(s.job);
+        return taken_over();
     }
 
     /// The node an enrollment token names.
     fn node_ctx(req: std::http::Request) -> std::api::Context fallible(ApiError) {
         return self.node_bearer.context(std::http::header(req, "Authorization")) or raise;
     }
+}
+
+/// What a handler returns when it has answered on its connection itself.
+fn taken_over() -> std::http::Response {
+    return std::http::Response { status: 200, body: "", takeover_raw: true };
 }
 
 /// A JSON answer.

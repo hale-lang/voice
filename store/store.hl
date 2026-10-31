@@ -99,6 +99,13 @@ type ProjectRow {
     // its own setting when `peek_set`, else its parent's
     peek_set: Bool = false;
     peek: Bool = false;
+    // after each request it sends is answered, a decision model is asked
+    // what it was and what its response did (api/annotate.hl): its own
+    // setting when `annotate_set`, else its parent's
+    annotate_set: Bool = false;
+    annotate: Bool = false;
+    // voice's own project (`SYSTEM_PROJECT`), never a caller's
+    internal: Bool = false;
     // the names it gives models (projects.hl): its own, a JSON list of
     // `{"name", "model"}`; a child's are these over its parent's
     aliases: String = "[]";
@@ -124,8 +131,35 @@ type KeyRow {
     revoked_at: Time = `1970-01-01T00:00:00Z`;
     // each request it sends is recorded whole, prompt and output (peek.hl)
     peek: Bool = false;
+    // each request it sends is annotated (api/annotate.hl)
+    annotate: Bool = false;
     present: Bool = false;
 }
+
+/// A request's annotation (api/annotate.hl): `annotated`, its answers in
+/// `body`, `task` and `outcome` its two headline answers; or
+/// `not_annotated`, and `reason` why. The request's text is never kept.
+type AnnotationRow {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    status: String = "annotated";
+    reason: String = "";
+    task: String = "";
+    outcome: String = "";
+    body: String = "{}";
+    present: Bool = false;
+}
+
+/// Annotations, newest first.
+type AnnotationRows { rows: bounded[AnnotationRow; 200]; }
+
+/// Voice's own project: the requests voice makes for itself (annotations)
+/// are its, never a caller's, under its key of the same id, which no token
+/// names. Made by migration 23, and by the store in memory at its birth.
+const SYSTEM_PROJECT: String = "voice-system";
 
 /// A request recorded whole, for a project or key that peeks: its standard
 /// request as served and its final response, each the JSON it was.
@@ -600,6 +634,20 @@ interface Store {
     fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError);
     /// One recorded request whole; `present` false when there is none.
     fn peek(request_id: String) -> PeekRow fallible(StoreError);
+    /// Keep a request's annotation, replacing one it had.
+    fn put_annotation(row: AnnotationRow) fallible(StoreError);
+    /// Annotations, newest first, at most `limit`: a project's (and a key's,
+    /// when `key` is not ""), all when `project` is ""; with `task` or
+    /// `outcome` not "", only those.
+    fn annotations(
+        project: String,
+        key: String,
+        task: String,
+        outcome: String,
+        limit: Int
+    ) -> AnnotationRows fallible(StoreError);
+    /// One request's annotation; `present` false when there is none.
+    fn annotation(request_id: String) -> AnnotationRow fallible(StoreError);
     fn windows(account: String) -> String fallible(StoreError);
     fn put_windows(account: String, json: String) fallible(StoreError);
 }
@@ -705,6 +753,8 @@ locus MemoryStore {
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
+        // annotations, newest first, the last 200 (api/annotate.hl)
+        annotation_rows: AnnotationRows = AnnotationRows { };
         // requests being served now, and the last `seq` given one
         flight_rows: FlightRows = FlightRows { };
         flight_seq: Int = 0;
@@ -712,6 +762,33 @@ locus MemoryStore {
         // directory and handed in here (api/operator.hl)
         operator: String = "";
         habitat_grant: String = "";
+    }
+
+    /// Voice's own project and its key, as migration 23 makes them.
+    birth() {
+        let mut p = ProjectRow {
+            id: SYSTEM_PROJECT,
+            name: SYSTEM_PROJECT,
+            internal: true,
+            // it spends no account until the operator gives it one
+            accounts: Restriction { any: false },
+            created_at: std::time::current(),
+            present: true,
+        };
+        push(p.owners.items, "voice") or discard;
+        push(p.data_classes.items, "internal") or discard;
+        self.project_rows.set(p);
+        self.project_order.push(SYSTEM_PROJECT);
+        self.key_rows.set(
+            KeyRow {
+                id: SYSTEM_PROJECT,
+                project: SYSTEM_PROJECT,
+                name: SYSTEM_PROJECT,
+                created_at: std::time::current(),
+                present: true,
+            },
+        );
+        self.key_order.push(SYSTEM_PROJECT);
     }
 
     fn kind() -> String { return "memory"; }
@@ -955,6 +1032,9 @@ locus MemoryStore {
     }
 
     fn key_by_digest(digest: String) -> KeyRow fallible(StoreError) {
+        // no token digests to nothing: voice-system's key, which has none,
+        // is named by none
+        if len(digest) == 0 { return KeyRow { }; }
         let d = self.digests.get(digest) or DigestRow { };
         if !d.present { return KeyRow { }; }
         return self.key_rows.get(d.key) or KeyRow { };
@@ -1445,6 +1525,45 @@ locus MemoryStore {
             if r.request_id == request_id { return r; }
         }
         return PeekRow { };
+    }
+
+    fn put_annotation(row: AnnotationRow) fallible(StoreError) {
+        let mut next = AnnotationRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.annotation_rows.rows {
+            if count(next.rows) < 200 && held.request_id != row.request_id {
+                push(next.rows, held) or discard;
+            }
+        }
+        self.annotation_rows = next;
+    }
+
+    fn annotations(
+        project: String,
+        key: String,
+        task: String,
+        outcome: String,
+        limit: Int
+    ) -> AnnotationRows fallible(StoreError) {
+        let mut out = AnnotationRows { };
+        for r in self.annotation_rows.rows {
+            if count(out.rows) >= limit { break; }
+            if (len(project) == 0 || r.project == project) && (len(key) == 0 || r.key == key)
+                && (len(task) == 0 || r.task == task) && (len(outcome) == 0 || r.outcome == outcome)
+            {
+                push(out.rows, r) or discard;
+            }
+        }
+        return out;
+    }
+
+    fn annotation(request_id: String) -> AnnotationRow fallible(StoreError) {
+        for r in self.annotation_rows.rows {
+            if r.request_id == request_id { return r; }
+        }
+        return AnnotationRow { };
     }
 
     fn windows(account: String) -> String fallible(StoreError) {

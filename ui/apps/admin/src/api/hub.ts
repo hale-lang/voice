@@ -30,16 +30,28 @@ export function useHubState(): HubState {
 /** An instance not heard from for this long is shown as gone (it beats every 5 s). */
 export const INSTANCE_LAPSE_MS = 15_000;
 
+// An instance's beat reaches only the hub of its own process, so the
+// instances shown are those the hub connected to now hears: a connection
+// to another instance (a reconnect behind a balancer) starts them again,
+// rather than keeping the last one's beats, which would lapse while it
+// is alive.
 const instances = new Map<string, Instance>();
 let snapshot: Instance[] = [];
 const watchers = new Set<() => void>();
-function beat(i: Instance) {
-  instances.set(i.id, i);
+function told() {
   snapshot = [...instances.values()].sort((a, b) => a.id.localeCompare(b.id));
   for (const w of watchers) w();
 }
+function beat(i: Instance) {
+  instances.set(i.id, i);
+  told();
+}
+function forget() {
+  instances.clear();
+  told();
+}
 
-/** The api instances the hub has announced, each with its last beat. */
+/** The api instances the hub connected to now has announced, each with its last beat. */
 export function useInstances(): Instance[] {
   return useSyncExternalStore((w) => { watchers.add(w); return () => { watchers.delete(w); }; }, () => snapshot);
 }
@@ -73,6 +85,7 @@ export function useHub(): HubState {
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
       socket = new WebSocket(`${scheme}://${location.hostname}:${port}/?access_token=${encodeURIComponent(token)}`);
       socket.onopen = () => {
+        forget();
         for (const topic of ['NodeObserved', 'InstanceBeat']) socket?.send(JSON.stringify({ type: 'subscribe', topic }));
       };
       socket.onmessage = (m) => {

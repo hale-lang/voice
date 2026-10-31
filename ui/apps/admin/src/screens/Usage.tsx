@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, micros, count, when, ago } from '@hale/components';
+import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, Select, TextInput, micros, count, when, ago } from '@hale/components';
 import { toneOf } from '../tone';
 import { useGet, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
@@ -17,7 +17,13 @@ export function Usage({ route, setInspector }: ScreenProps) {
   // the page's `next_cursor`, newer pops it
   const [cursors, setCursors] = useState<string[]>([]);
   const cursor = cursors[cursors.length - 1];
-  const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...(cursor ? { cursor } : {}) } } });
+  const [filter, setFilterState] = useState<Filter>(NO_FILTER);
+  // a new filter starts again at the newest page
+  const setFilter = (f: Filter) => {
+    setFilterState(f);
+    setCursors([]);
+  };
+  const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...query(filter), ...(cursor ? { cursor } : {}) } } });
   const onPage = records.data?.data.find((r) => r.id === selected);
   useEffect(() => {
     setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
@@ -33,6 +39,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         <Summary group="account" />
       </PanelGrid>
       <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
+        <Filters value={filter} onChange={setFilter} />
         {records.isPending ? (
           <Loading what="usage" />
         ) : records.isError ? (
@@ -108,9 +115,12 @@ function Summary({ group }: { group: 'project' | 'account' }) {
 function RecordInspector({ record: r }: { record: UsageRecord }) {
   return (
     <>
-      <h2 style={{ marginBottom: 'var(--space-3)' }}>
-        <Mono>{r.id}</Mono>
+      <h2 style={{ marginBottom: 'var(--space-1)' }}>
+        <Mono>{r.id}</Mono> <Status tone={toneOf(r.status)} label={r.status} />
       </h2>
+      <p className="muted" style={{ marginTop: 0 }}>
+        {r.served?.model ?? r.requested_model} on <Mono>{r.served?.seat ?? '–'}</Mono> · {count(r.input_tokens)} in · {count(r.output_tokens)} out · {r.timing.wall_ms} ms · {when(r.created_at)}
+      </p>
       <Kv
         rows={[
           { k: 'status', v: <Status tone={toneOf(r.status)} label={r.status} /> },
@@ -125,11 +135,103 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'price', v: micros(r.price_micros, r.currency) },
           { k: 'timing', v: `wall ${r.timing.wall_ms} · queue ${r.timing.queue_ms} · load ${r.timing.load_ms} ms` },
           { k: 'attempts', v: (r.attempts ?? []).map((a, i) => <div key={i}><Mono>{a.seat}</Mono> <Status tone={a.outcome === 'served' ? 'quiet' : 'fail'} label={a.outcome} />{a.error ? <span className="muted"> {a.error}</span> : null}</div>) },
-          { k: 'metadata', v: <Mono>{JSON.stringify(r.metadata)}</Mono> },
+          { k: 'metadata', v: <Metadata of={r.metadata} /> },
         ]}
       />
       <PeekSection id={r.id} />
     </>
+  );
+}
+
+/** A request's metadata, `name = value` each, as the caller set it. */
+function Metadata({ of }: { of: unknown }) {
+  const pairs = of && typeof of === 'object' ? Object.entries(of as Record<string, unknown>) : [];
+  if (!pairs.length) return <span className="faint">none</span>;
+  return (
+    <>
+      {pairs.map(([k, v]) => (
+        <div key={k}>
+          <Mono>{k}</Mono> <span className="faint">=</span> <Mono>{typeof v === 'string' ? v : JSON.stringify(v)}</Mono>
+        </div>
+      ))}
+    </>
+  );
+}
+
+/**
+ * What the requests are narrowed to: each "" for any. `from` is the
+ * cutoff `since` chose, fixed when it was chosen, so the query (and its
+ * cache) stays the same across renders and pages.
+ */
+type Filter = { project: string; key: string; model: string; account: string; metadata: string; since: string; from: string };
+
+const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', metadata: '', since: '', from: '' };
+
+/** The time ranges offered, as how far back, in seconds. */
+const SINCE: { value: string; label: string }[] = [
+  { value: '', label: 'any time' },
+  { value: '3600', label: 'the last hour' },
+  { value: '86400', label: 'the last day' },
+  { value: '604800', label: 'the last week' },
+];
+
+/** The metadata pair asked for, `name=value`; the api takes one. */
+function metadataPair(m: string): string | null {
+  const t = m.trim();
+  return /^[^=,\s]+=[^,]*$/.test(t) ? t : null;
+}
+
+/** The filter as listUsage's query. */
+function query(f: Filter) {
+  const pair = metadataPair(f.metadata);
+  return {
+    ...(f.project ? { project: [f.project] } : {}),
+    ...(f.key ? { key: [f.key.trim()] } : {}),
+    ...(f.model ? { model: [f.model] } : {}),
+    ...(f.account ? { account: [f.account] } : {}),
+    ...(pair ? { metadata: [pair] } : {}),
+    ...(f.from ? { from: f.from } : {}),
+  };
+}
+
+/** The filters over the requests: projects, models and accounts as voice knows them. */
+function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) => void }) {
+  const projects = useGet('/admin/v1/projects', { params: { query: { include_archived: true } } });
+  const models = useGet('/admin/v1/models');
+  const accounts = useGet('/admin/v1/accounts');
+  const set = (k: keyof Filter) => (v: string) => onChange({ ...f, [k]: v });
+  // the cutoff is fixed now, when the range is chosen
+  const since = (v: string) => onChange({ ...f, since: v, from: v ? new Date(Date.now() - Number(v) * 1000).toISOString() : '' });
+  const badPair = f.metadata.trim() !== '' && !metadataPair(f.metadata);
+  const any = Object.values(f).some(Boolean);
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)', alignItems: 'end', marginBottom: 'var(--space-3)' }}>
+      <label>
+        <div className="faint">project</div>
+        <Select value={f.project} onChange={set('project')} empty="any" options={(projects.data?.data ?? []).map((p) => ({ value: p.id }))} />
+      </label>
+      <label>
+        <div className="faint">model</div>
+        <Select value={f.model} onChange={set('model')} empty="any" options={(models.data?.data ?? []).map((m) => ({ value: m.id }))} />
+      </label>
+      <label>
+        <div className="faint">account</div>
+        <Select value={f.account} onChange={set('account')} empty="any" options={(accounts.data?.data ?? []).map((a) => ({ value: a.id }))} />
+      </label>
+      <label>
+        <div className="faint">key</div>
+        <TextInput mono value={f.key} onChange={set('key')} placeholder="k_…" />
+      </label>
+      <label>
+        <div className={badPair ? 'c-wait' : 'faint'}>{badPair ? 'metadata: one name=value' : 'metadata'}</div>
+        <TextInput mono value={f.metadata} onChange={set('metadata')} placeholder="session=abc" />
+      </label>
+      <label>
+        <div className="faint">when</div>
+        <Select value={f.since} onChange={since} options={SINCE} />
+      </label>
+      {any && <Button onClick={() => onChange(NO_FILTER)}>clear</Button>}
+    </div>
   );
 }
 

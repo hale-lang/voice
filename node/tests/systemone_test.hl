@@ -53,6 +53,15 @@ fn stub_conn(s: std::io::tcp::Stream) {
         answer(s, "401 Unauthorized", "{\"error\":{\"message\":\"bad key\"}}");
         return;
     }
+    // a managed Jev-Style seat's own server on loopback: no key
+    if std::str::starts_with(req, "POST /v4/systemone ") {
+        if !std::str::contains(req, "Authorization:") && std::str::contains(req, "\"questions\":") {
+            answer(s, "200 OK", ANSWER);
+            return;
+        }
+        answer(s, "400 Bad Request", "{\"error\":{\"message\":\"unexpected\"}}");
+        return;
+    }
     if std::str::starts_with(req, "POST /v2/systemone ") {
         answer(s, "500 Internal Server Error", "{\"error\":{\"message\":\"engine crashed\"}}");
         return;
@@ -166,6 +175,72 @@ main locus App {
             "the upstream answered 422 (invalid_question): choice needs criteria",
             "a refused question keeps the upstream's code",
         );
+        // a managed seat whose server is Jev-Style's serves a decision
+        // model's request from its own server, and nothing else
+        let jev_seat = "{\"model\": \"jev-2b\", \"runtime\": {\"server\": \"jev-style\"}}";
+        let llama_seat = "{\"model\": \"qwen\", \"runtime\": {\"server\": \"llama-server\"}}";
+        let own = node::compat_config(
+            "{\"base_url\": \"" + self.base + "/v4\", \"model\": \"jev-2b\"}",
+        );
+        let ask_s1 = "{\"endpoint\": \"systemone\"}";
+        let jev_run = node::decision_dispatch("managed", jev_seat, ask_s1, "decide", ASK, own);
+        std::test::assert_eq_str(
+            jev_run.outcome,
+            "served",
+            "a Jev-Style seat answers: " + jev_run.failure,
+        );
+        std::test::assert(
+            std::str::starts_with(jev_run.script, "{\"type\":\"systemone.answer\""),
+            "with the one answer event",
+        );
+        let jev_chat = node::decision_dispatch("managed", jev_seat, "{}", "decide", ASK, own);
+        std::test::assert_eq_str(
+            jev_chat.failure,
+            "this seat serves only a decision model's requests",
+            "and refuses a generative request",
+        );
+        let llama_s1 = node::decision_dispatch("managed", llama_seat, ask_s1, "decide", ASK, own);
+        std::test::assert_eq_str(
+            llama_s1.failure,
+            "this seat serves no decision model",
+            "another managed seat refuses a decision model's request",
+        );
+        let llama_chat = node::decision_dispatch("managed", llama_seat, "{}", "qwen", "{}", own);
+        std::test::assert_eq_str(
+            llama_chat.outcome,
+            "",
+            "and leaves its own requests to its usual run",
+        );
+        std::test::assert_eq_str(
+            node::server_args(
+                "jev-style",
+                "/data/models/s",
+                "/data/models/s/x",
+                9000,
+                "127.0.0.1",
+                "jev-2b",
+                "",
+                0,
+            ),
+            "--weights\n/data/models/s\n--host\n127.0.0.1\n--port\n9000",
+            "Jev-Style's server is started on the placed weights, on loopback",
+        );
+        std::test::assert_eq_str(
+            node::server_program("jev-style"),
+            "jev-style-serve",
+            "by the archive's launcher",
+        );
+        std::test::assert_eq_str(
+            node::health_path("jev-style"),
+            "/healthz",
+            "and healthy once /healthz answers",
+        );
+        std::test::assert_eq_str(
+            node::health_path("llama-server"),
+            "/health",
+            "the others' health is /health",
+        );
+
         let away = node::run_systemone(
             "decide",
             "",

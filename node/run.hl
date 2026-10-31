@@ -51,6 +51,8 @@ type Run {
     context: Int = 0;
     // times it was asked for its context since it answered
     asked: Int = 0;
+    // what it holds of the memory for models (`footprint`)
+    footprint: Int = 0;
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -75,6 +77,9 @@ locus Runner {
         heard: Bool = false;
         // the memory the GPU gives a server (hardware.hl), 0 for none
         gpu_memory: Int = 0;
+        // the memory the node gives models (hardware.hl `model_memory`):
+        // the seats it runs hold at most this together; 0 for unknown
+        model_memory: Int = 0;
     }
 
     bus {
@@ -174,10 +179,13 @@ locus Runner {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
         }
-        // what the placement reserved for it (its variant and its prompt
-        // cache), or, placed before voice sized that, its variant's need
+        // what it holds once it runs (`footprint`): what the placement
+        // reserved for it (its variant and its prompt cache), or, placed
+        // before voice sized that, its variant's need, and its server's own.
+        // It is started only beside what the node's other seats hold, never
+        // past what the node gives models, as the placement judged it
         let reserved = std::json::find_int_field(config, "reserved_bytes");
-        let share = gpu_share(
+        let need = footprint(
             if reserved > 0 {
                 reserved
             } else {
@@ -186,8 +194,26 @@ locus Runner {
                     "memory_bytes",
                 )
             },
-            self.gpu_memory,
         );
+        let mut held = 0;
+        for r in self.runs.items { held = held + r.footprint; }
+        let over = misfit(need, held, self.model_memory);
+        if len(over) > 0 {
+            self.tell(seat, "down", over, "");
+            return;
+        }
+        let share = gpu_share(need, self.gpu_memory);
+        // vLLM takes nine tenths of the GPU's memory unless told otherwise:
+        // with no share to give it, it is not started
+        if server == "vllm" && len(share) == 0 {
+            self.tell(
+                seat,
+                "down",
+                "its GPU's memory is not known, so vLLM's share of it cannot be held to the seat's",
+                "",
+            );
+            return;
+        }
         let port = free_port(PORT_FROM + count(self.runs.items));
         if port < 0 {
             self.tell(seat, "down", "no free port on loopback for its server", "");
@@ -197,6 +223,7 @@ locus Runner {
             seat: seat,
             server: server,
             port: port,
+            footprint: need,
             health: "http://127.0.0.1:" + to_string(port) + health_path(server),
             endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
         };
@@ -432,13 +459,38 @@ locus Runner {
     }
 }
 
-/// The share of a GPU's `gpu` bytes a server needs for a variant of `need`
-/// bytes and its cache (2 GiB beside the weights), as vLLM takes it: from
-/// 0.05 to 0.90, two places; "" when the GPU's memory is not known.
+/// What a seat's server takes beside what its placement reserved (its
+/// weights and prompt cache): the process, its GPU context, its compute
+/// buffers and activations; the api counts the same (placements.hl).
+const SEAT_OVERHEAD_BYTES: Int = 2147483648;
+
+/// What a seat holds of the memory for models once it runs: what was
+/// reserved for it and its server's own.
+fn footprint(reserved: Int) -> Int {
+    return reserved + SEAT_OVERHEAD_BYTES;
+}
+
+/// Why a seat that holds `need` is not started beside seats that hold
+/// `held` on a node that gives models `memory` (0 for unknown); "" when it
+/// fits. A node whose placements were made before it kept room for its
+/// system may hold more than it can: the seats past it stay down, saying
+/// so, and none is stopped for them.
+fn misfit(need: Int, held: Int, memory: Int) -> String {
+    if memory <= 0 || held + need <= memory { return ""; }
+    let free = if memory > held { memory - held } else { 0 };
+    return "it does not fit: it needs " + gib(need) + ", and " + gib(free) + " of the "
+        + gib(memory)
+        + " this node gives models is free beside its other seats";
+}
+
+/// The share of a GPU's `gpu` bytes vLLM is given for a seat that holds
+/// `need` (`footprint`): rounded up to a hundredth, from 0.01 to 0.90; ""
+/// when the GPU's memory is not known. It is what the seat was counted at,
+/// so it is never more than a hundredth of the GPU past it.
 fn gpu_share(need: Int, gpu: Int) -> String {
     if gpu <= 0 { return ""; }
-    let mut pct = ((need + 2147483648) * 100 + gpu - 1) / gpu;
-    if pct < 5 { pct = 5; }
+    let mut pct = (need * 100 + gpu - 1) / gpu;
+    if pct < 1 { pct = 1; }
     if pct > 90 { pct = 90; }
     return if pct < 10 { "0.0" + to_string(pct) } else { "0." + to_string(pct) };
 }

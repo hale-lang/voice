@@ -53,10 +53,36 @@ fn main() {
     std::test::assert_eq_int(n, 16, "and the first sixteen declared, as the api takes them");
 
     let plain = "{\"max_in_flight\": 1, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
-    std::test::assert_eq_int(node::model_memory(plain, 1000), 1000, "models may use it all");
-    let held = "{\"max_in_flight\": 1, \"hardware\": {\"model_memory_bytes\": 600}, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
-    std::test::assert_eq_int(node::model_memory(held, 1000), 600, "the operator holds some back");
-    std::test::assert_eq_int(node::model_memory(held, 500), 500, "and can only lower it");
+    // a machine keeps a sixteenth for its system, at least 4 GiB: of 128
+    // GiB, 8 GiB, so models may use 120 GiB; of 16 GiB, 4 GiB
+    let gib = 1073741824;
+    std::test::assert_eq_int(
+        node::model_memory(plain, 128 * gib),
+        120 * gib,
+        "models never take the system's share",
+    );
+    std::test::assert_eq_int(node::model_memory(plain, 16 * gib), 12 * gib, "at least 4 GiB of it");
+    std::test::assert_eq_int(
+        node::model_memory(plain, 2 * gib),
+        0,
+        "a machine too small offers none",
+    );
+    let held = "{\"max_in_flight\": 1, \"hardware\": {\"model_memory_bytes\": 64424509440}, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+    std::test::assert_eq_int(
+        node::model_memory(held, 128 * gib),
+        60 * gib,
+        "the operator holds some back",
+    );
+    std::test::assert_eq_int(
+        node::model_memory(held, 64 * gib),
+        60 * gib,
+        "and can only lower it: 64 GiB keeps 4 GiB, so 60 GiB either way",
+    );
+    std::test::assert_eq_int(
+        node::model_memory(held, 48 * gib),
+        44 * gib,
+        "past the system's share it is the machine's less that (4 GiB)",
+    );
     std::test::assert_eq_str(node::capabilities_problem(held), "", "a file that holds memory back");
     let bad = "{\"max_in_flight\": 1, \"hardware\": {\"model_memory_bytes\": \"lots\"}, \"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
     std::test::assert(len(node::capabilities_problem(bad)) > 0, "not a number is refused");
@@ -72,24 +98,43 @@ fn main() {
         "with the hardware in them",
     );
 
-    // vLLM's share of the GPU: what the variant needs and its cache, from
-    // 5 to 90 hundredths, nothing when the GPU's memory is not known
+    // vLLM's share of the GPU: what the seat holds (`footprint`: what was
+    // reserved, and its server's 2 GiB), rounded up to a hundredth, from 1
+    // to 90 hundredths, nothing when the GPU's memory is not known
+    std::test::assert_eq_int(node::footprint(1000000000), 3147483648, "the server's own beside it");
     std::test::assert_eq_str(
-        node::gpu_share(1000000000, 128000000000),
-        "0.05",
-        "a small model on a large GPU: the floor",
+        node::gpu_share(node::footprint(1000000000), 128000000000),
+        "0.03",
+        "a small model on a large GPU: what it holds, not a floor past it",
     );
     std::test::assert_eq_str(
-        node::gpu_share(3000000000, 24000000000),
+        node::gpu_share(node::footprint(3000000000), 24000000000),
         "0.22",
-        "its need and its cache, rounded up",
+        "its need, its cache and its server's own, rounded up",
     );
+    std::test::assert_eq_str(node::gpu_share(1000, 128000000000), "0.01", "at least a hundredth");
     std::test::assert_eq_str(
         node::gpu_share(80000000000, 80000000000),
         "0.90",
         "never more than nine tenths",
     );
     std::test::assert_eq_str(node::gpu_share(3000000000, 0), "", "no GPU known, no share");
+
+    // a seat is started only beside what the node's other seats hold
+    std::test::assert_eq_str(node::misfit(10 * gib, 100 * gib, 120 * gib), "", "it fits");
+    std::test::assert_eq_str(
+        node::misfit(28 * gib, 104 * gib, 120 * gib),
+        "it does not fit: it needs 28.0 GiB, and 16.0 GiB of the 120.0 GiB this node gives models is free beside its other seats",
+        "past it, it stays down, with the numbers",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::misfit(1 * gib, 125 * gib, 120 * gib),
+            "and 0.0 GiB of the 120.0 GiB",
+        ),
+        "a node already over says none is free",
+    );
+    std::test::assert_eq_str(node::misfit(500 * gib, 0, 0), "", "no memory known, no refusal");
     std::test::assert_eq_int(
         node::gpu_memory_of(
             "{\"accelerators\": [{\"kind\": \"cuda\", \"memory_bytes\": 137000000000, \"unified\": true}]}",

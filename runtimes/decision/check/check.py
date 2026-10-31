@@ -2,7 +2,7 @@
 
     python3 check.py RUNTIME_DIR MODEL_DIR
 
-RUNTIME_DIR is build.sh's jev-runtime; MODEL_DIR the Jev-Style-2B-Decision-v3-GGUF
+RUNTIME_DIR is build.sh's decision-runtime; MODEL_DIR the Jev-Style-2B-Decision-v3-GGUF
 repository at the revision the scorer is vendored from (its Q8_0 GGUF, tokenizer/,
 readout_config.json and jev_style_decision_gguf.py, the reference runtime). Needs
 numpy and tokenizers. It checks, on whatever backend the build runs:

@@ -51,7 +51,7 @@
 // {"cmd":"reset"} clears the memory; {"cmd":"info"} reports the context; {"cmd":"vocab","ids":[..]}
 // returns the GGUF vocabulary text of those token ids (tokenizer check); {"cmd":"quit"} exits.
 //
-// voice: two more commands, so a server needs no tokenizer of its own (voice's jev-serve). Text is
+// voice: two more commands, so a server needs no tokenizer of its own (voice-decide). Text is
 // tokenised with the GGUF's vocabulary, no BOS/EOS, and special tokens in the text split as plain
 // text, never control tokens (add_special = parse_special = false), as the reference renderer's
 // tokenizer does (encode_special_tokens = True):

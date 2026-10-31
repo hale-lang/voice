@@ -1,18 +1,18 @@
 #!/bin/sh
-# Builds Jev-Style's scorer, jev-score-v2 (jev_score_v2.cpp, vendored with
-# voice's changes), for one backend, against llama.cpp at the commit the
-# Jev-Style release was tested with:
+# Builds the decision runtime's scorer, jev-score-v2 (Jev-Style's
+# jev_score_v2.cpp, vendored with voice's changes), for one backend, against
+# llama.cpp at the commit the Jev-Style 2B release was tested with:
 #
-#   runtimes/jev/build.sh metal|cpu|vulkan|rocm|cuda OUT_DIR
+#   runtimes/decision/build.sh metal|cpu|vulkan|rocm|cuda OUT_DIR
 #
-# OUT_DIR/jev-runtime holds the program and the llama.cpp libraries it
+# OUT_DIR/decision-runtime holds the program and the llama.cpp libraries it
 # loads, side by side (it finds them, and the backends built as their own
-# libraries, beside itself), and the licenses. With JEV_SERVE_BIN, the
-# built jev/ seed, it holds voice's server too, as jev-style-serve: the
-# program a jev-style runtime is, which runs the scorer beside itself. metal builds on macOS arm64;
-# the others on Linux, in the builder `runtimes/jev/Dockerfile` names for
-# each, which holds their toolchains (CUDA, ROCm, the Vulkan SDK) to a
-# digest.
+# libraries, beside itself), and the licenses. With DECIDE_BIN, the built
+# decide/ seed, it holds voice's server too, as voice-decide: the program a
+# decision runtime runs, which runs the scorer beside itself. metal builds
+# on macOS arm64; the others on Linux, in the builder
+# `runtimes/decision/Dockerfile` names for each, which holds their
+# toolchains (CUDA, ROCm, the Vulkan SDK) to a digest.
 set -eu
 
 BACKEND=${1:?usage: build.sh metal|cpu|vulkan|rocm|cuda OUT_DIR}
@@ -30,7 +30,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
 WORK="$OUT/work"
-DEST="$OUT/jev-runtime"
+DEST="$OUT/decision-runtime"
 
 # Linux builds are portable: no tuning for the machine that builds, the
 # CPU's code in a library per instruction set, loaded for the CPU it runs on
@@ -80,7 +80,7 @@ if [ "$BACKEND" = metal ]; then rpath="$rpath -mmacosx-version-min=14.0"; fi
     "$HERE/jev_score_v2.cpp" -o "$DEST/jev-score-v2" \
     -L"$DEST" -lllama -lggml -lggml-base $rpath
 
-if [ -n "${JEV_SERVE_BIN:-}" ]; then cp "$JEV_SERVE_BIN" "$DEST/jev-style-serve"; fi
+if [ -n "${DECIDE_BIN:-}" ]; then cp "$DECIDE_BIN" "$DEST/voice-decide"; fi
 
 cp "$HERE/LICENSE" "$DEST/licenses/jev-style.LICENSE"
 cp "$HERE/NOTICE" "$DEST/licenses/jev-style.NOTICE"

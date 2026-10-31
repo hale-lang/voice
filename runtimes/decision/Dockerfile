@@ -1,13 +1,13 @@
-# Voice's Jev-Style runtime for Linux, one image per backend (cpu, vulkan,
-# rocm, cuda): jev-style-serve, voice's server (the jev/ seed), and the
-# scorer it runs, jev-score-v2, built by runtimes/jev/build.sh in a builder
-# per backend, each held to a digest.
+# Voice's decision runtime for Linux, one image per backend (cpu, vulkan,
+# rocm, cuda): voice-decide, voice's server (the decide/ seed), and the
+# scorer it runs, jev-score-v2, built by runtimes/decision/build.sh in a
+# builder per backend, each held to a digest.
 #
-#   docker build -f runtimes/jev/Dockerfile --build-arg BACKEND=cpu .
+#   docker build -f runtimes/decision/Dockerfile --build-arg BACKEND=cpu .
 #
-# is the image: /jev-runtime, its program jev-style-serve, which the node
+# is the image: /decision-runtime, its program voice-decide, which the node
 # runs with the weights at /models. `--target scorer --output
-# type=local,dest=out` writes the scorer alone, out/jev-runtime.
+# type=local,dest=out` writes the scorer alone, out/decision-runtime.
 ARG BACKEND=cpu
 # the release hale.toml declares ([dna] toolchain); CI checks they agree
 ARG HALE_VERSION=v0.31.0
@@ -38,13 +38,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 FROM builder-${BACKEND} AS build
 ARG BACKEND
-COPY runtimes/jev /src
+COPY runtimes/decision /src
 RUN /src/build.sh "$BACKEND" /out
 
 FROM scratch AS scorer
-COPY --from=build /out/jev-runtime /jev-runtime
+COPY --from=build /out/decision-runtime /decision-runtime
 
-# jev-style-serve, by hale's released toolchain, as the repo's Dockerfile
+# voice-decide, by hale's released toolchain, as the repo's Dockerfile
 # builds voice's other programs
 FROM docker.io/library/ubuntu:24.04@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852 AS serve
 ARG HALE_VERSION
@@ -71,8 +71,8 @@ RUN set -eu; \
     hale --version
 WORKDIR /src
 COPY lib lib
-COPY jev jev
-RUN hale test jev && hale build jev
+COPY decide decide
+RUN hale test decide && hale build decide
 
 # what each backend's image runs on: the libraries its build loads (OpenMP
 # for the CPU's code, the Vulkan loader and Mesa's drivers, CUDA's or ROCm's
@@ -96,6 +96,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 libssl
     && rm -rf /var/lib/apt/lists/*
 
 FROM runtime-${BACKEND} AS image
-COPY --from=build /out/jev-runtime /jev-runtime
-COPY --from=serve /src/jev/jev /jev-runtime/jev-style-serve
-ENTRYPOINT ["/jev-runtime/jev-style-serve"]
+COPY --from=build /out/decision-runtime /decision-runtime
+COPY --from=serve /src/decide/decide /decision-runtime/voice-decide
+ENTRYPOINT ["/decision-runtime/voice-decide"]

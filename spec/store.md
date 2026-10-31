@@ -683,3 +683,16 @@ create table peek (
 );
 create index peek_by_project on peek (project, created_at desc);
 ```
+
+### Migration 17: peek follows the parent
+
+A project's `peek` is its own setting or, null, its parent's, read when a
+request is admitted: one setting on a habitat's project covers every caller
+under it, made since or yet to be, unless one sets its own. What was stored
+`false` becomes null, still off for a project of its own.
+
+```sql
+alter table project alter column peek drop not null;
+alter table project alter column peek drop default;
+update project set peek = null where peek = false;
+```

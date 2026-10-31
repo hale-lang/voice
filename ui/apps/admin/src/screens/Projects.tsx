@@ -162,13 +162,16 @@ function ProjectInspector({ project: p }: { project: Project }) {
             k: 'peek',
             v: (
               <>
-                {p.peek ? <span className="c-wait">recording each request whole </span> : <span className="muted">off </span>}
+                {p.peeks ? <span className="c-wait">recording each request whole</span> : <span className="muted">off</span>}
+                {p.peek == null && p.parent ? <span className="muted"> · {p.parent}'s</span> : null}{' '}
                 {p.status !== 'archived' && (
-                  <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}', { params: { path: { project: p.id } }, body: { peek: !p.peek } }); }} disabled={w.busy}>
-                    {p.peek ? 'stop' : 'peek'}
-                  </Button>
+                  <Select
+                    value={p.peek == null ? (p.parent ? 'parent' : 'off') : p.peek ? 'on' : 'off'}
+                    onChange={async (v) => { await w.write('patch', '/admin/v1/projects/{project}', { params: { path: { project: p.id } }, body: { peek: v === 'parent' ? null : v === 'on' } }); }}
+                    options={[...(p.parent ? [{ value: 'parent', label: `${p.parent}'s` }] : []), { value: 'on', label: 'on' }, { value: 'off', label: 'off' }]}
+                  />
                 )}
-                {p.peek && <span className="muted"> · shown on each request in Usage</span>}
+                {p.peeks && <span className="muted"> · shown on each request in Usage</span>}
               </>
             ),
           },
@@ -349,7 +352,7 @@ function Keys({ project }: { project: Project }) {
               render: (k) =>
                 k.status === 'active' ? (
                   <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { peek: !k.peek } }); }} disabled={w.busy}>
-                    {k.peek ? 'recording · stop' : project.peek ? 'by the project' : 'peek'}
+                    {k.peek ? 'recording · stop' : project.peeks ? 'by the project' : 'peek'}
                   </Button>
                 ) : (
                   <span className="faint">–</span>

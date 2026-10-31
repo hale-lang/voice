@@ -39,7 +39,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         onOpen={(f) => {
           // a conversation narrows the requests to its turns
           if (f.conversation) setFilter({ ...NO_FILTER, conversation: f.conversation });
-          go('usage', f.last.id);
+          go('usage', f.last_request);
         }}
       />
       <PanelGrid>

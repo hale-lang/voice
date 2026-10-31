@@ -529,7 +529,11 @@ if [ -n "${DATABASE_URL:-}" ]; then
   pids+=($!)
   sleep 30
   spacing=$(python3 -c 'import sys; t=[float(l) for l in open(sys.argv[1]) if l.strip()]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
-  python3 -c 'import sys; g=[float(x) for x in sys.argv[1:]]; sys.exit(0 if g and max(g) >= 8 and all(b >= a - 0.5 for a, b in zip(g, g[1:])) else 1)' $spacing \
+  # the first wait is not a backoff: the brain dials at start but writes
+  # nothing until it holds the lock (it may stand by first), so that dial
+  # lasts as long as standing by took, plus the 2 s it gives an unconfirmed
+  # write; the waits after it are the backoff, and they grow
+  python3 -c 'import sys; g=[float(x) for x in sys.argv[1:]][1:]; sys.exit(0 if g and max(g) >= 8 and all(b >= a - 0.5 for a, b in zip(g, g[1:])) else 1)' $spacing \
     || { echo "the brain dialled a silent NATS without backing off: waits of $spacing s"; cat "$work/brain5.log"; exit 1; }
   echo "a NATS that handshakes and goes silent was dialled again after waits of $spacing s"
 fi

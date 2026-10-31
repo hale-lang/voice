@@ -40,6 +40,11 @@ type InferenceRequest {
     // the alias the caller asked for, when `model` is the catalog model its
     // project names by it (aliases.hl); "" when it asked for the model itself
     alias: String = "";
+    // how a seat is asked (protocol.yaml `Serve.endpoint`): `responses`, or
+    // `systemone` for a decision model (decision.hl), `served_body` then the
+    // systemone request made of `body`
+    seat_endpoint: String = "responses";
+    served_body: String = "";
 }
 
 /// `Served`: what actually served a request.
@@ -85,6 +90,9 @@ type VoiceExtension {
     first_output_ms: Int = 0;
     engine_ms: Int = 0;
     attempts: bounded[Attempt; 8];
+    // a decision model's answers, each question's probabilities (decision.hl);
+    // "" for a generative model
+    decision: String = "";
 }
 
 /// A served request. `response` is the standard response object the node
@@ -206,7 +214,7 @@ locus Inference {
                         wall_ms: ms,
                     },
                 ) or discard;
-                let s = served(
+                let mut s = served(
                     request_id,
                     r.model,
                     k,
@@ -216,11 +224,20 @@ locus Inference {
                     attempts.items,
                     (std::time::monotonic_ns() - started) / 1000000,
                 );
+                // a decision model's answer, as the whole resource asked for
+                if len(o.decision) > 0 {
+                    s.response = decision_resource(o.response, request_id, r);
+                }
                 self.settled(r, s, candidates.peek);
                 return s;
             }
             let reason = failure_of(o);
             why = c.seat.ref + ": " + reason;
+            // a decision model that refused the questions themselves refuses
+            // them on any seat: the caller is told, as its own mistake
+            if r.seat_endpoint == "systemone" && std::str::contains(reason, "answered 422") {
+                fail decision_refusal(reason, "response_format");
+            }
             push(
                 attempts.items,
                 Attempt {
@@ -414,7 +431,7 @@ locus Inference {
                         wall_ms: ms,
                     },
                 ) or discard;
-                let s = served(
+                let mut s = served(
                     request_id,
                     r.model,
                     k,
@@ -424,12 +441,21 @@ locus Inference {
                     attempts.items,
                     (std::time::monotonic_ns() - started) / 1000000,
                 );
+                // a decision model's answer, as the whole resource asked for
+                if len(o.decision) > 0 {
+                    s.response = decision_resource(o.response, request_id, r);
+                }
                 finish_stream(out, st, ending, s);
                 self.settled(r, s, candidates.peek);
                 return out.end();
             }
             let reason = failure_of(o);
             why = c.seat.ref + ": " + reason;
+            // a decision model that refused the questions themselves refuses
+            // them on any seat: the caller is told, as its own mistake
+            if r.seat_endpoint == "systemone" && std::str::contains(reason, "answered 422") {
+                fail decision_refusal(reason, "response_format");
+            }
             push(
                 attempts.items,
                 Attempt {
@@ -757,10 +783,24 @@ locus Inference {
         let p = self.store.project(k.project) or fail metering_failed(err);
         if !p.present { return r; }
         let target = alias_target(self.store, p, r.model) or fail metering_failed(err);
-        if len(target) == 0 { return r; }
         let mut out = r;
-        out.alias = r.model;
-        out.model = target;
+        if len(target) > 0 {
+            out.alias = r.model;
+            out.model = target;
+        }
+        // a decision model answers only what its contract allows, asked as
+        // systemone asks it (decision.hl)
+        let m = self.store.model(out.model) or fail metering_failed(err);
+        if m.present && !m.removed && m.contract == "decision" {
+            if out.stream {
+                fail decision_refusal(
+                    "a decision model answers whole; send `stream: false`",
+                    "stream"
+                );
+            }
+            out.served_body = decision_body(out.body) or raise;
+            out.seat_endpoint = "systemone";
+        }
         return out;
     }
 
@@ -1000,7 +1040,8 @@ fn served(
         wall_ms: wall_ms,
         has_engine_timing: output > 0 && o.engine_ms >= o.first_output_ms,
         first_output_ms: o.first_output_ms,
-        engine_ms: o.engine_ms
+        engine_ms: o.engine_ms,
+        decision: o.decision
     };
     voice.attempts = attempts;
     return Served {
@@ -1074,7 +1115,8 @@ fn serve_message(
         + ", \"model\": " + jq(r.model) + ", \"engine_model\": "
         + (if len(c.engine_name) > 0 { jq(c.engine_name) } else { "null" })
         + ", \"deadline\": " + (if len(r.deadline) > 0 { jq(r.deadline) } else { "null" })
-        + ", \"body\": " + r.body + "}";
+        + ", \"endpoint\": " + jq(r.seat_endpoint) + ", \"body\": "
+        + (if len(r.served_body) > 0 { r.served_body } else { r.body }) + "}";
 }
 
 // ---- the wire ----------------------------------------------------------
@@ -1311,7 +1353,43 @@ fn chat_body(body: String) -> String fallible(ApiError) {
         out = out + ", \"parallel_tool_calls\": "
             + std::str::trim(std::json::find_field_raw(body, "parallel_tool_calls"));
     }
+    // a structured answer: Chat's `response_format` is the standard's
+    // `text.format` (a `json_schema` there names its fields at the top)
+    if kind_of(body, "response_format") == "object" {
+        out = out + ", \"text\": {\"format\": " + (chat_format(body) or raise) + "}";
+    }
     return out + "}";
+}
+
+/// Chat's `response_format` as the standard's `text.format`.
+fn chat_format(body: String) -> String fallible(ApiError) {
+    let rf = std::str::trim(std::json::find_field_raw(body, "response_format"));
+    let t = std::json::find_string_field(rf, "type");
+    if t == "text" || t == "json_object" { return "{\"type\": " + jq(t) + "}"; }
+    if t != "json_schema" {
+        fail invalid(
+            "`response_format.type` is text, json_object or json_schema",
+            "response_format"
+        );
+    }
+    let js = std::str::trim(std::json::find_field_raw(rf, "json_schema"));
+    if !std::json::valid_object(js) {
+        fail invalid(
+            "`response_format.json_schema` is an object with the `schema`",
+            "response_format"
+        );
+    }
+    let out = st::JsonList { };
+    out.add("\"type\": \"json_schema\"");
+    let mut it = std::json::object_first(js);
+    while !it.done {
+        out.add(
+            jq(std::json::obj_key_string(it, js)) + ": "
+                + std::str::trim(std::json::obj_value_raw(it, js)),
+        );
+        it = std::json::object_next(it, js);
+    }
+    return "{" + out.text() + "}";
 }
 
 /// One Chat Completions message as input items, onto `out`.
@@ -1599,7 +1677,8 @@ fn voice_json(v: VoiceExtension) -> String {
         + ", \"price_micros\": " + to_string(v.price_micros) + ", \"currency\": " + jq(v.currency)
         + ", \"timing\": "
         + timing_json(v.wall_ms, v.has_engine_timing, v.first_output_ms, v.engine_ms)
-        + ", \"attempts\": " + attempts + "}";
+        + ", \"attempts\": " + attempts
+        + (if len(v.decision) > 0 { ", \"decision\": " + v.decision } else { "" }) + "}";
 }
 
 /// `Timing`: the coordinator's wall time, and, when the seat produced

@@ -1,0 +1,133 @@
+// A decision model's contract: a request's schema as the questions a
+// systemone request asks, what the contract refuses, and the answer as the
+// JSON the schema asked for.
+import ".." as api;
+
+fn asked(format: String, extra: String) -> String {
+    return "{\"model\": \"decide\", \"input\": [{\"type\": \"message\", \"role\": \"user\", \"content\": \"I was charged twice.\"}], \"text\": {\"format\": "
+        + format + "}" + extra + "}";
+}
+
+const SCHEMA: String = "{\"type\": \"json_schema\", \"name\": \"triage\", \"schema\": {\"type\": \"object\", \"properties\": {\"route\": {\"type\": \"string\", \"description\": \"Which team should handle it?\", \"oneOf\": [{\"const\": \"billing\", \"description\": \"Charges and refunds.\"}, {\"const\": \"security\"}]}, \"refund\": {\"type\": \"boolean\", \"description\": \"Is it a duplicate charge?\"}, \"urgency\": {\"type\": \"integer\", \"enum\": [1, 2, 3]}}}}";
+
+fn refused(body: String) -> String {
+    let mut why = "";
+    api::decision_body(body) or {
+        why = err.message;
+        ""
+    };
+    return why;
+}
+
+fn main() {
+    let s1 = api::decision_body(asked(SCHEMA, "")) or "";
+    std::test::assert(
+        std::str::contains(
+            s1,
+            "\"route\": {\"type\": \"choice\", \"instructions\": \"Which team should handle it?\", \"criteria\": {\"billing\": \"Charges and refunds.\", \"security\": null}}",
+        ),
+        "a described choice: " + s1,
+    );
+    std::test::assert(
+        std::str::contains(
+            s1,
+            "\"refund\": {\"type\": \"noul\", \"instructions\": \"Is it a duplicate charge?\"}",
+        ),
+        "a boolean is a noul",
+    );
+    std::test::assert(
+        std::str::contains(
+            s1,
+            "\"urgency\": {\"type\": \"score\", \"instructions\": \"urgency\", \"criteria\": [{\"label\": \"1\"}, {\"label\": \"2\"}, {\"label\": \"3\"}]}",
+        ),
+        "an integer enum is a score, named for its property when undescribed",
+    );
+    std::test::assert(
+        std::str::contains(
+            s1,
+            "\"state\": [{\"role\": \"user\", \"content\": \"I was charged twice.\"}]",
+        ),
+        "the messages are the state",
+    );
+
+    std::test::assert(
+        std::str::contains(refused(asked("{\"type\": \"text\"}", "")), "only a structured request"),
+        "no schema, refused",
+    );
+    std::test::assert(
+        std::str::contains(refused(asked(SCHEMA, ", \"temperature\": 0.2")), "`temperature`"),
+        "a sampling setting, refused by name",
+    );
+    std::test::assert(
+        std::str::contains(refused(asked(SCHEMA, ", \"tools\": []")), "`tools`"),
+        "tools, refused",
+    );
+    let free = "{\"type\": \"json_schema\", \"name\": \"x\", \"schema\": {\"type\": \"object\", \"properties\": {\"note\": {\"type\": \"string\"}}}}";
+    std::test::assert(
+        std::str::contains(refused(asked(free, "")), "property `note`"),
+        "free text, refused by property",
+    );
+    let image = "{\"model\": \"decide\", \"input\": [{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_image\", \"image_url\": \"x\"}]}], \"text\": {\"format\": "
+        + SCHEMA + "}}";
+    std::test::assert(std::str::contains(refused(image), "text only"), "an image, refused");
+
+    let answer = "{\"model\": \"jev-2b\", \"answers\": {\"route\": {\"type\": \"choice\", \"choice\": \"billing\", \"confidence\": 0.9, \"probabilities\": {\"billing\": 0.95, \"security\": 0.05}}, \"refund\": {\"type\": \"noul\", \"noul\": 0.97}, \"urgency\": {\"type\": \"score\", \"score\": 0.3, \"confidence\": 0.7, \"legend\": {\"0\": \"1\", \"1\": \"2\", \"2\": \"3\"}, \"probabilities\": {\"0\": 0.75, \"1\": 0.2, \"2\": 0.05}}}, \"usage\": {\"input_tokens\": 41, \"output_tokens\": 0}}";
+    let r = api::decision_response(answer, "decide");
+    std::test::assert(
+        std::str::contains(
+            r,
+            "\"text\": \"{\\\"route\\\": \\\"billing\\\", \\\"refund\\\": true, \\\"urgency\\\": 1}\"",
+        ),
+        "the answer is the schema's JSON: " + r,
+    );
+    std::test::assert(
+        std::str::contains(r, "\"model\": \"jev-2b\""),
+        "named for the model that answered",
+    );
+    std::test::assert(
+        std::str::contains(r, "\"input_tokens\": 41, \"output_tokens\": 0"),
+        "its usage, input only",
+    );
+
+    // a constraint the answer could not keep is refused, not dropped
+    let fixed = "{\"type\": \"json_schema\", \"name\": \"x\", \"schema\": {\"type\": \"object\", \"properties\": {\"approved\": {\"type\": \"boolean\", \"const\": true}}}}";
+    std::test::assert(
+        std::str::contains(refused(asked(fixed, "")), "`const`"),
+        "a boolean held to one value, refused",
+    );
+    let ranged = "{\"type\": \"json_schema\", \"name\": \"x\", \"schema\": {\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\", \"enum\": [1, 2], \"minimum\": 2}}}}";
+    std::test::assert(
+        std::str::contains(refused(asked(ranged, "")), "`minimum`"),
+        "a bound, refused",
+    );
+    let fractional = "{\"type\": \"json_schema\", \"name\": \"x\", \"schema\": {\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\", \"enum\": [1, 1.5]}}}}";
+    std::test::assert(
+        std::str::contains(refused(asked(fractional, "")), "integers"),
+        "an integer score's levels are integers",
+    );
+    let nested = "{\"type\": \"json_schema\", \"name\": \"x\", \"schema\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"boolean\"}}, \"patternProperties\": {}}}";
+    std::test::assert(
+        std::str::contains(refused(asked(nested, "")), "`patternProperties`"),
+        "a schema-level constraint, refused",
+    );
+
+    // the answer as the whole resource asked for
+    let req = api::InferenceRequest {
+        model: "decide",
+        body: asked(SCHEMA, ", \"metadata\": {\"run\": \"7\"}"),
+    };
+    let whole = api::decision_resource(r, "resp_abc", req);
+    std::test::assert(
+        std::str::contains(whole, "\"id\": \"resp_abc\"")
+            && std::str::contains(whole, "\"status\": \"completed\"")
+            && std::str::contains(whole, "\"completed_at\": ")
+            && std::str::contains(whole, "\"metadata\": {\"run\": \"7\"}")
+            && std::str::contains(whole, "\"input_tokens_details\"")
+            && std::str::contains(
+                whole,
+                "\"text\": {\"format\": {\"type\": \"json_schema\", \"name\": \"triage\", \"description\": null, \"schema\": null, \"strict\": false}}",
+            ),
+        "a complete resource: its id, times, the request's format and metadata, full usage: "
+            + whole,
+    );
+}

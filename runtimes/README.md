@@ -40,7 +40,9 @@ list only weights, settings and the tokenizer. The archive holds:
   serves the placed weights with that file, offline, on loopback.
 - **Licenses:** every package's.
 
-`jev-style-mlx/build.sh OUT_DIR` rebuilds it byte for byte. It's published as a
-release asset of this repository, and the node runs it under the macOS sandbox
+`jev-style-mlx/build.sh OUT_DIR` rebuilds it byte for byte. CI builds it
+([`runtime-jev-style-mlx.yml`](../.github/workflows/runtime-jev-style-mlx.yml)):
+a pull request that touches it is held to the pinned sha256, and the release
+asset is published only by running that workflow, from a build that matches the pin, and the node runs it under the macOS sandbox
 like every archive runtime.
 

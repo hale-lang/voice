@@ -183,12 +183,16 @@ function isContext(it: Item): boolean {
  * How many of a turn's leading parts replay what was said before: the
  * longest run of them found in `history` in order (a client may drop or
  * reshape a part it resends, reasoning most of all), counted only when it
- * reaches the last part said before that is not reasoning. Otherwise the
- * client sent only what is new, and none of it is a replay: a message is
- * new whenever it is said again, whatever it says.
+ * reaches the last thing the model answered (`answer` marks the history's
+ * answers; reasoning is not one). A prompt that was never answered is no
+ * evidence: its retry is said again. Otherwise the client sent only what
+ * is new, and none of it is a replay: a message is new whenever it is said
+ * again, whatever it says.
  */
-function replays(history: string[], asked: string[]): number {
-  if (!history.length) return 0;
+function replays(history: string[], answer: boolean[], asked: string[]): number {
+  let anchor = history.length - 1;
+  while (anchor >= 0 && (!answer[anchor] || history[anchor]!.startsWith('reasoning:'))) anchor--;
+  if (anchor < 0) return 0;
   let j = 0;
   let last = -1;
   let n = 0;
@@ -206,9 +210,7 @@ function replays(history: string[], asked: string[]): number {
     j = at + 1;
     n++;
   }
-  let anchor = history.length - 1;
-  while (anchor >= 0 && history[anchor]!.startsWith('reasoning:')) anchor--;
-  return anchor < 0 || last >= anchor ? n : 0;
+  return last >= anchor ? n : 0;
 }
 
 /** What makes two parts the same part, however a client resends it. */
@@ -224,7 +226,7 @@ type ThreadContext = { context: ReactNode[]; tools: Tool[]; opening: string | nu
 type Thread = { threads: ThreadContext[]; turns: Turn[] };
 
 /** A thread as it is read: its history so far, in order, as the client last told it, and its latest request. */
-type Open = { history: string[]; latest: Record<string, unknown> | null; opening: string | null; shown: boolean };
+type Open = { history: string[]; answer: boolean[]; latest: Record<string, unknown> | null; opening: string | null; shown: boolean };
 
 /**
  * The turns as threads, each turn's parts not said before (`replays`), then
@@ -254,7 +256,7 @@ function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } 
     let best = -1;
     let replayed = 0;
     open.forEach((th, k) => {
-      const n = replays(th.history, ids);
+      const n = replays(th.history, th.answer, ids);
       if (n > replayed) {
         replayed = n;
         best = k;
@@ -262,7 +264,7 @@ function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } 
     });
     if (best < 0) {
       if (current < 0 || (asked[0] && isContext(asked[0]))) {
-        open.push({ history: [], latest: null, opening: null, shown: false });
+        open.push({ history: [], answer: [], latest: null, opening: null, shown: false });
         best = open.length - 1;
       } else {
         best = current;
@@ -294,10 +296,19 @@ function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } 
     const answered = (Array.isArray(output?.output) ? output.output : []) as Item[];
     // a client that resent the history told it whole; one that sent only
     // what is new adds to it
-    th.history = [...(replayed > 0 ? [] : th.history), ...ids, ...answered.map(identity)];
+    const told = replayed > 0 ? { history: [] as string[], answer: [] as boolean[] } : th;
+    // what the client resent counts as answered where the history it replays said so
+    const resent = ids.map((id) => replayed > 0 && answeredBefore(th, id));
+    th.history = [...told.history, ...ids, ...answered.map(identity)];
+    th.answer = [...told.answer, ...resent, ...answered.map(() => true)];
     out.push({ record, recorded: true, thread: best, said, earlier, answered, failure: typeof output?.error === 'string' ? output.error : null });
   });
   return { threads: open.map((th) => contextOf(th.latest, th.opening)), turns: out };
+}
+
+/** True when the thread's history holds `id` as something the model answered. */
+function answeredBefore(th: Open, id: string): boolean {
+  return th.history.some((h, i) => h === id && th.answer[i]);
 }
 
 /** What set a thread up, from its latest request. */

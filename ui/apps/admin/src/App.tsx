@@ -1,5 +1,6 @@
 import { useIsFetching, useQueryClient } from '@tanstack/react-query';
 import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button, Select, DETAIL_LAYOUTS, type DetailLayout } from '@hale/components';
+import { EventLog } from './EventLog';
 import { useRoute, href, go } from './route';
 import { useGet } from './api/client';
 import { Overview } from './screens/Overview';
@@ -94,6 +95,7 @@ function Admin() {
       layout={layout}
       onClose={close}
       evidence={<EvidenceStrip />}
+      dock={<EventLog />}
     >
       <Screen route={route} setInspector={setInspector} />
     </Shell>

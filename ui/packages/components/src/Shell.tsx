@@ -8,7 +8,8 @@ import { DetailContext, type DetailLayout, type DetailState } from './Detail';
  * over the list (kept, hidden, so its filters and page survive), a drawer
  * over it, or in place under the row clicked (at the top of the canvas when
  * no table shows it there). `onClose` closes it: the back link, Esc, or the
- * drawer's backdrop.
+ * drawer's backdrop. `dock`, when given, sits between the canvas and the
+ * evidence strip, across the canvas's width (a live log).
  */
 export function Shell(props: {
   rail: ReactNode;
@@ -17,6 +18,7 @@ export function Shell(props: {
   layout?: DetailLayout;
   onClose?: () => void;
   evidence: ReactNode;
+  dock?: ReactNode;
   children: ReactNode;
 }) {
   const layout = props.layout ?? 'page';
@@ -73,6 +75,7 @@ export function Shell(props: {
             {props.children}
           </div>
         </main>
+        {props.dock && <div className={s.dock}>{props.dock}</div>}
         <footer className={s.evidence} aria-label="Evidence">
           {props.evidence}
         </footer>

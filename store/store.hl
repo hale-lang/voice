@@ -104,7 +104,8 @@ type ProjectRow {
     // setting when `annotate_set`, else its parent's
     annotate_set: Bool = false;
     annotate: Bool = false;
-    // voice's own project (`SYSTEM_PROJECT`), never a caller's
+    // voice's old global project for its own requests, retired
+    // (`RETIRED_SYSTEM_PROJECT`), never a caller's
     internal: Bool = false;
     // the names it gives models (projects.hl): its own, a JSON list of
     // `{"name", "model"}`; a child's are these over its parent's
@@ -133,6 +134,9 @@ type KeyRow {
     peek: Bool = false;
     // each request it sends is annotated (api/annotate.hl)
     annotate: Bool = false;
+    // its project's own key for the requests voice makes for it
+    // (`system_key`): no token names it, and it is never revoked
+    internal: Bool = false;
     present: Bool = false;
 }
 
@@ -180,6 +184,9 @@ type AnnotationRow {
     reason: String = "";
     clipped: Bool = false;
     body: String = "{}";
+    // its place among annotations, in the order they were kept (the admin
+    // event stream's `annotation`)
+    seq: Int = 0;
     present: Bool = false;
 }
 
@@ -266,10 +273,53 @@ const BUILTIN_RULE_FORM_KEPT: String = """
     form-kept	{"name": "a form asked, kept", "enabled": true, "expect": {"annotator": "response-basics", "question": "followed_format", "answer": "true"}}
     """;
 
-/// Voice's own project: the requests voice makes for itself (annotations)
-/// are its, never a caller's, under its key of the same id, which no token
-/// names. Made by migration 23, and by the store in memory at its birth.
-const SYSTEM_PROJECT: String = "voice-system";
+/// The built-in title annotator (migration 24): a conversation's title,
+/// written by the project's text model.
+const BUILTIN_ANNOTATOR_CONVERSATION_TITLE: String = """
+    conversation-title	{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}
+    """;
+
+/// Voice's old global project for its own requests (migration 23), retired
+/// by migration 24: archived, its key revoked. Each project's own `-system`
+/// key makes voice's requests for it instead (`system_key`).
+const RETIRED_SYSTEM_PROJECT: String = "voice-system";
+
+/// A project's own key for the requests voice makes for it (annotations,
+/// titles): its id and its name, made with the project, which no token
+/// names. Its usage is the project's, apart from its callers' keys; its
+/// limits cap what voice spends for it.
+fn system_key(project: String) -> String {
+    return project + "-system";
+}
+
+/// A project's system key, as the store makes it with the project.
+fn system_key_row(project: String, at: Time) -> KeyRow {
+    return KeyRow {
+        id: system_key(project),
+        project: project,
+        name: system_key(project),
+        created_at: at,
+        internal: true,
+        present: true,
+    };
+}
+
+/// A conversation's title (api/annotate.hl): written by the title
+/// annotator's model, under the `task` its request was answered as then.
+type TitleRow {
+    project: String = "";
+    conversation: String = "";
+    title: String = "";
+    task: String = "";
+    model: String = "";
+    annotator: String = "";
+    version: Int = 0;
+    made_at: Time = `1970-01-01T00:00:00Z`;
+    present: Bool = false;
+}
+
+/// Titles, the newest made first.
+type TitleRows { rows: bounded[TitleRow; 500]; }
 
 /// A request recorded whole, for a project or key that peeks: its standard
 /// request as served and its final response, each the JSON it was.
@@ -503,6 +553,9 @@ type UsageQuery {
     to: Time = `1970-01-01T00:00:00Z`;
     limit: Int = 100;
     cursor: Int = 0;
+    // a project's system key's rows (`system_key`): voice's own requests
+    // for it, left out unless asked for, or unless `key` names one
+    include_internal: Bool = false;
 }
 
 type UsageRows { rows: bounded[UsageRow; 1000]; more: Bool = false; }
@@ -570,6 +623,7 @@ fn conversation_of(r: UsageRow) -> String {
 
 /// True when `r` is one `q` asks for (all but the cursor and the limit).
 fn usage_matches(r: UsageRow, q: UsageQuery) -> Bool {
+    if !q.include_internal && len(q.key) == 0 && r.key == system_key(r.project) { return false; }
     if len(q.project) > 0 && r.project != q.project { return false; }
     if len(q.key) > 0 && r.key != q.key { return false; }
     if len(q.account) > 0 && r.account != q.account { return false; }
@@ -805,7 +859,7 @@ interface Store {
     /// One recorded request whole; `present` false when there is none.
     fn peek(request_id: String) -> PeekRow fallible(StoreError);
     /// Recorded requests a backfill reads (api/annotate.hl): of `project`
-    /// and `key` where not "", within the times set, never voice-system's,
+    /// and `key` where not "", within the times set, never a system key's,
     /// newest first, at most `limit`; their bodies left out.
     fn recorded(
         project: String,
@@ -845,6 +899,16 @@ interface Store {
     fn answers(request_id: String) -> AnswerRows fallible(StoreError);
     /// The annotations `q` keeps, newest first, at most `q.limit`.
     fn annotations(q: AnswerQuery) -> AnnotationRows fallible(StoreError);
+    /// Up to `limit` annotations kept after `seq`, oldest first.
+    fn annotations_after(seq: Int, limit: Int) -> AnnotationRows fallible(StoreError);
+    /// Keep a conversation's title, replacing the one it had.
+    fn put_title(row: TitleRow) fallible(StoreError);
+    /// A conversation's title; `present` false for none.
+    fn title(project: String, conversation: String) -> TitleRow fallible(StoreError);
+    /// Titles, the newest made first, at most `limit`: a project's (its
+    /// children's too) when `project` is not "", one conversation's when
+    /// `conversation` is not "".
+    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError);
     /// How many of the requests `q` keeps gave each answer to `annotator`'s
     /// `question` (not skipped, at `q.min_probability` or more).
     fn answer_counts(
@@ -978,7 +1042,10 @@ locus MemoryStore {
         // annotations, newest first, the last 200, and their answers: an
         // answer whose request is "" is gone, its slot free
         annotation_rows: AnnotationRows = AnnotationRows { };
+        annotation_seq: Int = 0;
         answer_log: AnswerLog = AnswerLog { };
+        // conversations' titles, the newest made first, the last 500
+        title_rows: TitleRows = TitleRows { };
         // requests being served now, and the last `seq` given one
         flight_rows: FlightRows = FlightRows { };
         flight_seq: Int = 0;
@@ -988,34 +1055,13 @@ locus MemoryStore {
         habitat_grant: String = "";
     }
 
-    /// Voice's own project and its key, as migration 23 makes them.
+    /// The annotators and rules voice ships, as migrations 23 and 24 make
+    /// them.
     birth() {
-        let mut p = ProjectRow {
-            id: SYSTEM_PROJECT,
-            name: SYSTEM_PROJECT,
-            internal: true,
-            // it spends no account until the operator gives it one
-            accounts: Restriction { any: false },
-            created_at: std::time::current(),
-            present: true,
-        };
-        push(p.owners.items, "voice") or discard;
-        push(p.data_classes.items, "internal") or discard;
-        self.project_rows.set(p);
-        self.project_order.push(SYSTEM_PROJECT);
-        self.key_rows.set(
-            KeyRow {
-                id: SYSTEM_PROJECT,
-                project: SYSTEM_PROJECT,
-                name: SYSTEM_PROJECT,
-                created_at: std::time::current(),
-                present: true,
-            },
-        );
-        self.key_order.push(SYSTEM_PROJECT);
         // the annotators and rules voice ships
         self.seed_annotator(BUILTIN_ANNOTATOR_REQUEST_BASICS);
         self.seed_annotator(BUILTIN_ANNOTATOR_RESPONSE_BASICS);
+        self.seed_annotator(BUILTIN_ANNOTATOR_CONVERSATION_TITLE);
         self.seed_rule(BUILTIN_RULE_ASKED_FOR_CODE);
         self.seed_rule(BUILTIN_RULE_ANSWERED);
         self.seed_rule(BUILTIN_RULE_SEVERAL_STEPS_COMPLETE);
@@ -1260,6 +1306,10 @@ locus MemoryStore {
         r.present = true;
         self.project_rows.set(r);
         self.project_order.push(r.id);
+        // its own key for the requests voice makes for it, made with it
+        let k = system_key_row(r.id, r.created_at);
+        self.key_rows.set(k);
+        self.key_order.push(k.id);
         self.append(change);
         return true;
     }
@@ -1929,7 +1979,7 @@ locus MemoryStore {
             if count(out.rows) >= limit { break; }
             let at = std::time::unix(r.created_at);
             if (len(project) > 0 && r.project != project) || (len(key) > 0 && r.key != key)
-                || r.project == SYSTEM_PROJECT || (has_from && at < std::time::unix(from))
+                || r.key == system_key(r.project) || (has_from && at < std::time::unix(from))
                 || (has_to && at > std::time::unix(to))
             {
                 continue;
@@ -1947,6 +1997,9 @@ locus MemoryStore {
         let mut next = AnnotationRows { };
         let mut r = row;
         r.present = true;
+        // kept anew: told anew on the event stream
+        self.annotation_seq = self.annotation_seq + 1;
+        r.seq = self.annotation_seq;
         // one it had is replaced where it is; a new one is the newest
         let mut had = false;
         for held in self.annotation_rows.rows {
@@ -2074,6 +2127,54 @@ locus MemoryStore {
         for r in self.annotation_rows.rows {
             if count(out.rows) >= q.limit { break; }
             if self.annotation_kept(r, q) { push(out.rows, r) or discard; }
+        }
+        return out;
+    }
+
+    fn annotations_after(seq: Int, limit: Int) -> AnnotationRows fallible(StoreError) {
+        // kept newest first: walk back from the oldest
+        let mut out = AnnotationRows { };
+        let mut i = count(self.annotation_rows.rows) - 1;
+        while i >= 0 {
+            let r = at(self.annotation_rows.rows, i) or AnnotationRow { };
+            i = i - 1;
+            if r.seq <= seq { continue; }
+            if count(out.rows) >= limit { break; }
+            push(out.rows, r) or discard;
+        }
+        return out;
+    }
+
+    @unbounded
+    fn put_title(row: TitleRow) fallible(StoreError) {
+        let mut next = TitleRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.title_rows.rows {
+            if held.project == row.project && held.conversation == row.conversation { continue; }
+            if count(next.rows) < 500 { push(next.rows, held) or discard; }
+        }
+        self.title_rows = next;
+    }
+
+    fn title(project: String, conversation: String) -> TitleRow fallible(StoreError) {
+        for r in self.title_rows.rows {
+            if r.project == project && r.conversation == conversation { return r; }
+        }
+        return TitleRow { };
+    }
+
+    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError) {
+        let mut out = TitleRows { };
+        for r in self.title_rows.rows {
+            if count(out.rows) >= limit { break; }
+            if len(conversation) > 0 && r.conversation != conversation { continue; }
+            if len(project) > 0 && r.project != project {
+                let p = self.project_rows.get(r.project) or ProjectRow { };
+                if p.parent != project { continue; }
+            }
+            push(out.rows, r) or discard;
         }
         return out;
     }

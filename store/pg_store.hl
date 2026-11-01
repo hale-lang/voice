@@ -702,6 +702,16 @@ locus PgStore {
             return false;
         }
         self.project_parts(row) or raise;
+        // its own key for the requests voice makes for it, made with it
+        let k = system_key_row(row.id, row.created_at);
+        let ka = db::Args { };
+        ka.add(k.id);
+        ka.add(k.project);
+        ka.add(std::time::iso8601(k.created_at));
+        self.step(
+            "INSERT INTO api_key (id, project, name, prefix, secret_digest, created_at, internal) VALUES ($1, $2, $1, '', '\\x'::bytea, $3::timestamptz, true) ON CONFLICT (id) DO NOTHING",
+            ka,
+        ) or raise;
         self.commit_with(change) or raise;
         return true;
     }
@@ -1967,9 +1977,10 @@ locus PgStore {
         add_time(a, has_from, from);
         add_time(a, has_to, to);
         a.add(to_string(if limit > 200 { 200 } else { limit }));
-        a.add(SYSTEM_PROJECT);
+        a.add(system_key(""));
+        // never a system key's: voice's own requests for a project
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz) AND ($4::timestamptz IS NULL OR created_at <= $4::timestamptz) AND project <> $6 ORDER BY created_at DESC, request_id LIMIT $5::int) t",
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz) AND ($4::timestamptz IS NULL OR created_at <= $4::timestamptz) AND key <> project || $6 ORDER BY created_at DESC, request_id LIMIT $5::int) t",
             a,
         ) or raise;
         let mut out = PeekRows { };
@@ -2268,7 +2279,7 @@ locus PgStore {
         a.add(if row.clipped { "true" } else { "false" });
         a.add(if len(row.body) > 0 { row.body } else { "{}" });
         self.step(
-            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body",
+            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body, seq = nextval(pg_get_serial_sequence('annotation', 'seq'))",
             a,
         ) or raise;
         // each annotator's answers replace the ones it gave before
@@ -2311,7 +2322,7 @@ locus PgStore {
 
     fn annotation_locked(request_id: String) -> AnnotationRow fallible(StoreError) {
         let line = self.row(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body FROM annotation a WHERE a.request_id = $1) t",
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE a.request_id = $1) t",
             single_value(request_id),
         ) or raise;
         if len(line) == 0 { return AnnotationRow { }; }
@@ -2360,7 +2371,7 @@ locus PgStore {
         let cond = answer_where(q, a, 1);
         a.add(to_string(if q.limit > 200 { 200 } else { q.limit }));
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body FROM annotation a WHERE "
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE "
                 + cond
                 + " ORDER BY a.created_at DESC, a.request_id LIMIT $" + to_string(a.count())
                 + "::int) t",
@@ -2374,6 +2385,120 @@ locus PgStore {
             let line = std::str::trim(std::str::slice(v, start, nl));
             start = nl + 1;
             if len(line) > 0 { push(out.rows, annotation_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn annotations_after(seq: Int, limit: Int) -> AnnotationRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.annotations_after_locked(seq, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn annotations_after_locked(seq: Int, limit: Int) -> AnnotationRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(to_string(seq));
+        a.add(to_string(if limit > 200 { 200 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE a.seq > $1::bigint ORDER BY a.seq LIMIT $2::int) t",
+            a,
+        ) or raise;
+        let mut out = AnnotationRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, annotation_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn put_title(row: TitleRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_title_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_title_locked(row: TitleRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.project);
+        a.add(row.conversation);
+        a.add(row.title);
+        a.add(row.task);
+        a.add(row.model);
+        a.add(row.annotator);
+        a.add(to_string(row.version));
+        a.add(std::time::iso8601(row.made_at));
+        self.write(
+            "INSERT INTO conversation_title (project, conversation, title, task, model, annotator, version, made_at) VALUES ($1, $2, $3, $4, $5, $6, $7::int, $8::timestamptz) ON CONFLICT (project, conversation) DO UPDATE SET title = excluded.title, task = excluded.task, model = excluded.model, annotator = excluded.annotator, version = excluded.version, made_at = excluded.made_at",
+            a,
+        ) or raise;
+    }
+
+    fn title(project: String, conversation: String) -> TitleRow fallible(StoreError) {
+        self.lock.enter();
+        let out = self.title_locked(project, conversation) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn title_locked(project: String, conversation: String) -> TitleRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(conversation);
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (" + TITLE_COLUMNS
+                + " WHERE c.project = $1 AND c.conversation = $2) t",
+            a,
+        ) or raise;
+        if len(line) == 0 { return TitleRow { }; }
+        return title_row(line);
+    }
+
+    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.titles_locked(project, conversation, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn titles_locked(
+        project: String,
+        conversation: String,
+        limit: Int
+    ) -> TitleRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(conversation);
+        a.add(to_string(if limit > 500 { 500 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (" + TITLE_COLUMNS
+                + " WHERE ($1 = '' OR c.project = $1 OR c.project IN (SELECT id FROM project WHERE parent = $1)) AND ($2 = '' OR c.conversation = $2) ORDER BY c.made_at DESC, c.project, c.conversation LIMIT $3::int) t",
+            a,
+        ) or raise;
+        let mut out = TitleRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, title_row(line)) or discard; }
         }
         return out;
     }
@@ -2711,7 +2836,9 @@ const MODEL_COLUMNS: String = "SELECT id, owned_by, kind, context_length, max_ou
 
 const PROJECT_COLUMNS: String = "SELECT p.id, p.name, p.status, p.owners, p.data_classes, p.models, p.accounts, p.inherits, p.parent, p.peek, p.annotate, p.internal, p.aliases, p.position, p.created_at, p.archived_at, (SELECT row_to_json(b) FROM (SELECT allowance_micros, currency, period, period_anchor FROM budget WHERE project = p.id) b) AS budget, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE project = p.id AND key IS NULL AND scope IN ('project', 'model')) AS limits FROM project p";
 
-const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, k.peek, k.annotate, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
+const TITLE_COLUMNS: String = "SELECT c.project, c.conversation, c.title, c.task, c.model, c.annotator, c.version, c.made_at FROM conversation_title c";
+
+const KEY_COLUMNS: String = "SELECT k.id, k.project, k.name, k.prefix, encode(k.secret_digest, 'hex') AS digest, k.models, k.accounts, k.status, k.created_at, k.expires_at, k.last_used_at, k.revoked_at, k.peek, k.annotate, k.internal, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE key = k.id) AS limits FROM api_key k";
 
 const ACCOUNT_COLUMNS: String = "SELECT a.id, a.name, a.provider, a.billing, a.status, a.created_at, a.archived_at, (SELECT coalesce(json_agg(json_build_object('scope', scope, 'model', model_id, 'account', account, 'window_seconds', window_seconds, 'requests', requests, 'input_tokens', input_tokens, 'output_tokens', output_tokens, 'concurrent', concurrent) ORDER BY id), '[]') FROM \"limit\" WHERE account = a.id AND scope = 'account') AS limits FROM account a";
 
@@ -2752,7 +2879,10 @@ fn usage_where(q: UsageQuery, a: db::Args) -> String {
     if q.has_to { a.add(std::time::iso8601(q.to)); } else { a.add_null(); }
     a.add(to_string(q.cursor));
     a.add(q.conversation);
-    let mut cond = "($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR requested_model = $3 OR served->>'model' = $3) AND ($4 = '' OR account = $4) AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz) AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz) AND ($7::bigint = 0 OR seq < $7::bigint) AND ($8 = '' OR record->>'conversation' = $8)";
+    let mut cond = "($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR requested_model = $3 OR served->>'model' = $3) AND ($4 = '' OR account = $4) AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz) AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz) AND ($7::bigint = 0 OR seq < $7::bigint) AND ($8 = '' OR record->>'conversation' = $8)"
+    // a project's system key's rows, voice's own requests for it: left
+    // out unless asked for, or unless the key asked for is one
+        + (if q.include_internal { "" } else { " AND ($2 <> '' OR key <> project || '-system')" });
     let mut n = 9;
     for pair in q.metadata.items {
         let eq = std::str::index_of(pair, "=");
@@ -3044,6 +3174,7 @@ fn key_row(j: String) -> KeyRow {
         revoked_at: pg_time(pg_text(j, "revoked_at")),
         peek: std::json::find_bool_field(j, "peek"),
         annotate: std::json::find_bool_field(j, "annotate"),
+        internal: std::json::find_bool_field(j, "internal"),
         present: true
     };
 }
@@ -3059,6 +3190,21 @@ fn annotation_row(j: String) -> AnnotationRow {
         reason: pg_text(j, "reason"),
         clipped: std::json::find_bool_field(j, "clipped"),
         body: raw_or_empty(j, "body"),
+        seq: std::json::find_int_field(j, "seq"),
+        present: true
+    };
+}
+
+fn title_row(j: String) -> TitleRow {
+    return TitleRow {
+        project: pg_text(j, "project"),
+        conversation: pg_text(j, "conversation"),
+        title: pg_text(j, "title"),
+        task: pg_text(j, "task"),
+        model: pg_text(j, "model"),
+        annotator: pg_text(j, "annotator"),
+        version: std::json::find_int_field(j, "version"),
+        made_at: pg_time(pg_text(j, "made_at")),
         present: true
     };
 }

@@ -1,13 +1,15 @@
 // Annotate: a request whose project or key annotates is answered as any
 // request, then the annotators in force for it are asked about it, one
 // decision request a stage (two when a response annotator reads the
-// request's answers), as voice-system's own requests, which spend
-// voice-system's usage and never the caller's. Every answer is kept, a row
-// each, naming its annotator and version, and searchable; rules pair them.
-// Annotators are data: made, versioned, conditioned, disabled; the built-in
-// ones never removed. With no decision model, or one that is not a decision
-// model, a request is not annotated, and says why. Recorded requests are
-// annotated later from their recordings. voice-system is kept as voice's own.
+// request's answers), as requests of its project's system key, whose usage
+// is kept apart from the project's. Every answer is kept, a row each,
+// naming its annotator and version, and searchable; rules pair them. A
+// conversation's title is written by the project's text model. Annotators
+// are data: made, versioned, conditioned, disabled; the built-in ones never
+// removed. Annotate is refused with no decision model behind `decide`, and a
+// request is not annotated, saying why, when that model goes. Recorded
+// requests are annotated later from their recordings. A system key is no
+// caller's.
 import ".." as api;
 import "../../node" as node;
 import "../../store" as st;
@@ -270,16 +272,8 @@ fn main() {
         },
     ) or discard;
     accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
-    projects.create(
-        api::ProjectCreate {
-            id: "work",
-            name: "Work",
-            has_annotate: true,
-            annotate: true,
-            has_peek: true,
-            peek: true,
-        },
-    ) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work", has_peek: true, peek: true })
+    or discard;
     let key = (keys.create(api::KeyCreate { project: "work", name: "ci" }) or api::Key {
         status: api::KeyStatus::revoked,
     }).secret;
@@ -287,58 +281,94 @@ fn main() {
 
     // voice ships its annotators and rules
     let shipped = annotators.list() or api::AnnotatorList { };
-    std::test::assert_eq_int(count(shipped.data), 2, "two built-in annotators");
+    std::test::assert_eq_int(count(shipped.data), 3, "three built-in annotators");
     for a in shipped.data {
         std::test::assert(
             a.builtin && a.version == 1 && a.enabled,
             "built in, at version 1: " + a.id,
         );
     }
+    let titler = annotators.get(
+        api::AnnotatorRef { annotator: "conversation-title" },
+    ) or api::Annotator { };
+    std::test::assert(
+        titler.stage == api::AnnotatorStage::title && titler.has_title
+            && titler.title.model == "general",
+        "the title annotator, on the project's general model",
+    );
     let shipped_rules = rules.list() or api::AnnotationRuleList { };
     std::test::assert_eq_int(count(shipped_rules.data), 4, "four built-in rules");
-    let sys = projects.get(api::ProjectRef { project: "voice-system" }) or api::Project {
-        status: api::Lifecycle::archived,
+
+    // every project has its own system key, which no token names
+    let held = keys.list(api::ProjectRef { project: "work" }) or api::KeyList { };
+    let mut system = api::Key { status: api::KeyStatus::revoked };
+    for k in held.data {
+        if k.id == "work-system" { system = k; }
+    }
+    std::test::assert(system.internal && system.name == "work-system", "work's system key");
+    let mut bad = "";
+    keys.revoke(api::KeyRef { project: "work", key: "work-system" }) or {
+        bad = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
     };
-    std::test::assert(
-        sys.internal && !sys.annotates,
-        "voice-system is voice's own, annotating nothing",
-    );
+    refused(bad, "a system key is never revoked", "never revoked");
+    bad = "";
+    keys.update(
+        api::KeyUpdate { project: "work", key: "work-system", has_name: true, name: "x" },
+    ) or {
+        bad = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    refused(bad, "nor renamed", "system key");
+    bad = "";
+    keys.create(api::KeyCreate { project: "work", name: "work-system" }) or {
+        bad = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    refused(bad, "no other key takes its name", "system key");
 
-    // no decision model yet: the caller is answered, the annotation says why
-    let first = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"write me a sort function\"}");
-    std::test::assert_eq_int(first.status, 200, "answered: " + first.body);
-    let none = read(annotations, std::json::find_string_field(first.body, "id"));
-    std::test::assert(none.status == api::AnnotationStatus::not_annotated, "not annotated");
-    refused(none.reason, "for want of a decision model", "no decision model");
-    std::test::assert_eq_int(nodes.decisions, 0, "and nothing was asked");
-
-    // `decide` names a model that is not a decision model: still not
-    let mut wrong = api::ProjectUpdate { project: "voice-system", has_aliases: true };
+    // annotate is refused with no decision model behind `decide`
+    bad = "";
+    projects.update(api::ProjectUpdate { project: "work", has_annotate: true, annotate: true }) or {
+        bad = api::ctl_problem(err).message;
+        api::Project { status: api::Lifecycle::archived }
+    };
+    refused(bad, "no decision model, no annotating", "names none `decide`");
+    bad = "";
+    let mut wrong = api::ProjectUpdate {
+        project: "work",
+        has_aliases: true,
+        has_annotate: true,
+        annotate: true,
+    };
     push(wrong.aliases, api::ModelAlias { name: "decide", model: "echo-1" }) or discard;
-    projects.update(wrong) or discard;
-    let second = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"again\"}");
-    refused(
-        read(annotations, std::json::find_string_field(second.body, "id")).reason,
-        "a generative model is never asked",
-        "not a decision model",
-    );
-    std::test::assert_eq_int(nodes.decisions, 0, "nothing asked of it");
+    projects.update(wrong) or {
+        bad = api::ctl_problem(err).message;
+        api::Project { status: api::Lifecycle::archived }
+    };
+    refused(bad, "a generative model is never asked", "not a decision model");
+    bad = "";
+    keys.create(api::KeyCreate { project: "work", name: "annotating", annotate: true }) or {
+        bad = api::ctl_problem(err).message;
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    refused(bad, "nor does a key annotate without one", "names none `decide`");
+    std::test::assert_eq_int(nodes.decisions, 0, "nothing asked");
 
-    // a decision model, but no account voice-system may spend
-    let mut decide = api::ProjectUpdate { project: "voice-system", has_aliases: true };
+    // the project's decision model and text model: annotating
+    let mut decide = api::ProjectUpdate {
+        project: "work",
+        has_aliases: true,
+        has_annotate: true,
+        annotate: true,
+    };
     push(decide.aliases, api::ModelAlias { name: "decide", model: "jev-2b" }) or discard;
-    projects.update(decide) or discard;
-    let third = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"once more\"}");
-    refused(
-        read(annotations, std::json::find_string_field(third.body, "id")).reason,
-        "voice-system spends no account it was not given",
-        "voice-system may not use its decision model",
-    );
-
-    // given one: annotated, one decision request a stage
-    let mut spend = api::ProjectUpdate { project: "voice-system", has_accounts: true };
-    push(spend.accounts, "static") or discard;
-    projects.update(spend) or discard;
+    push(decide.aliases, api::ModelAlias { name: "general", model: "echo-1" }) or discard;
+    let on = projects.update(decide) or {
+        std::test::assert(false, "annotate on: " + api::ctl_problem(err).message);
+        api::Project { status: api::Lifecycle::archived }
+    };
+    std::test::assert(on.annotates, "it annotates");
     let r = ask(
         e,
         key,
@@ -357,6 +387,41 @@ fn main() {
         std::str::contains(nodes.last_state, "write me a sort function")
             && std::str::contains(nodes.last_state, "hello from voice"),
         "the response read beside the request: " + nodes.last_state,
+    );
+    // each run kept: the two stages, then the title
+    std::test::assert_eq_int(count(a.runs), 3, "three runs");
+    let stage1 = at(a.runs, 0) or api::AnnotationRun { };
+    std::test::assert(
+        stage1.stage == "request" && stage1.status == "annotated" && stage1.model == "jev-2b"
+            && stage1.input_tokens == 40 && count(stage1.annotators) == 1,
+        "the request stage's run: " + stage1.reason,
+    );
+    let titled = at(a.runs, 2) or api::AnnotationRun { };
+    std::test::assert(
+        titled.stage == "title" && titled.status == "annotated",
+        "the title's run: " + titled.reason,
+    );
+    // the conversation's title
+    std::test::assert(a.has_title && a.title == "hello from voice", "titled: " + a.title);
+    let titles = annotations.titles(
+        api::ConversationAsk { project: "work" },
+    ) or api::ConversationTitleList { };
+    let t1 = at(titles.data, 0) or api::ConversationTitle { };
+    std::test::assert(
+        count(titles.data) == 1 && t1.conversation == "conv-1" && t1.title == "hello from voice"
+            && t1.task == "code" && t1.annotator == "conversation-title",
+        "listed, with the task it was written under",
+    );
+    // the same task again: no new title
+    let again = ask(
+        e,
+        key,
+        "{\"model\": \"echo-1\", \"prompt_cache_key\": \"conv-1\", \"input\": \"and sort it backwards\"}",
+    );
+    let a_again = read(annotations, std::json::find_string_field(again.body, "id"));
+    std::test::assert(
+        count(a_again.runs) == 2 && !a_again.has_title,
+        "a conversation's title is written once a task",
     );
     let task = answer_of(a, "request-basics", "task");
     std::test::assert(
@@ -417,22 +482,60 @@ fn main() {
         "several steps, complete: levels 3 and 4 together",
     );
 
-    // voice-system's usage, never the caller's
+    // the system key's usage is kept apart from the project's
     let usage = api::Usage { store: e.store };
-    let theirs = usage.list(api::UsageAsk { project: "voice-system" }) or api::UsageList { };
-    std::test::assert_eq_int(count(theirs.data), 2, "voice-system's two requests");
+    let mine = usage.list(api::UsageAsk { project: "work" }) or api::UsageList { };
+    std::test::assert_eq_int(
+        count(mine.data),
+        2,
+        "the project's usage is its callers' requests alone",
+    );
+    let all = usage.list(
+        api::UsageAsk { project: "work", include_internal: true },
+    ) or api::UsageList { };
+    std::test::assert_eq_int(count(all.data), 7, "and voice's five for it, asked for");
+    let theirs = usage.list(api::UsageAsk { key: "work-system" }) or api::UsageList { };
+    std::test::assert_eq_int(count(theirs.data), 5, "by its system key");
+    std::test::assert((at(theirs.data, 0) or api::UsageRecord { }).internal, "marked internal");
     let both = usage.list(
-        api::UsageAsk { metadata: "{\"annotates\": \"" + id + "\", \"side\": \"request\"}" },
+        api::UsageAsk {
+            metadata: "{\"annotates\": \"" + id + "\", \"side\": \"request\"}",
+            include_internal: true,
+        },
     ) or api::UsageList { };
     std::test::assert_eq_int(count(both.data), 1, "several metadata pairs, all matched");
-    let mine = usage.list(api::UsageAsk { project: "work" }) or api::UsageList { };
-    std::test::assert_eq_int(count(mine.data), 4, "the caller's project has only its own requests");
+    let summed = usage.summary(
+        api::UsageSummaryAsk { group_by: "project" },
+    ) or api::UsageSummary { };
+    let g = at(summed.data, 0) or api::UsageGroupOut { };
+    std::test::assert_eq_int(g.requests, 2, "the project's totals leave voice's out");
+
+    // its decision model gone: not annotated, saying why
+    let mut gone = api::ProjectUpdate { project: "work", has_aliases: true };
+    push(gone.aliases, api::ModelAlias { name: "decide", model: "echo-1" }) or discard;
+    push(gone.aliases, api::ModelAlias { name: "general", model: "echo-1" }) or discard;
+    projects.update(gone) or discard;
+    let lost = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"once more\"}");
+    refused(
+        read(annotations, std::json::find_string_field(lost.body, "id")).reason,
+        "a generative model is never asked",
+        "not a decision model",
+    );
+    projects.update(decide) or discard;
+    let stats = annotators.stats(
+        api::AnnotatorStatsAsk { annotator: "request-basics" },
+    ) or api::AnnotatorStats { };
+    std::test::assert(
+        stats.runs == 2 && stats.annotated == 2 && stats.not_annotated == 1 && stats.has_last_error
+            && std::str::contains(stats.last_error, "not a decision model"),
+        "an annotator's runs, and why one was not made",
+    );
 
     // searchable
     let coded = annotations.list(
         api::AnnotationAsk { answer: "request-basics.task=code" },
     ) or api::AnnotationList { };
-    std::test::assert_eq_int(count(coded.data), 1, "by an answer");
+    std::test::assert_eq_int(count(coded.data), 2, "by an answer");
     let likely = annotations.list(
         api::AnnotationAsk {
             answer: "{\"request-basics.task\": \"code\", \"response-basics.outcome\": \"answered\"}",
@@ -443,16 +546,16 @@ fn main() {
     let in_conv = annotations.list(
         api::AnnotationAsk { conversation: "conv-1" },
     ) or api::AnnotationList { };
-    std::test::assert_eq_int(count(in_conv.data), 1, "by conversation");
+    std::test::assert_eq_int(count(in_conv.data), 2, "by conversation");
     let facets = annotations.facets(
         api::AnnotationFacetAsk { question: "response-basics.outcome" },
     ) or api::AnnotationFacets { };
-    std::test::assert_eq_int(facets.total, 1, "an answer counted");
+    std::test::assert_eq_int(facets.total, 2, "each answer counted");
     let trend = annotations.trend(
         api::AnnotationTrendAsk { question: "request-basics.task", bucket: "hour" },
     ) or api::AnnotationTrend { };
     std::test::assert_eq_int(count(trend.points), 1, "by the hour");
-    let mut bad = "";
+    bad = "";
     annotations.list(api::AnnotationAsk { answer: "task=code" }) or {
         bad = api::ctl_problem(err).message;
         api::AnnotationList { }
@@ -577,7 +680,7 @@ fn main() {
     );
     annotators.remove(api::AnnotatorRef { annotator: "code-review" }) or discard;
     let after_removal = annotators.list() or api::AnnotatorList { };
-    std::test::assert_eq_int(count(after_removal.data), 2, "an operator's annotator removed");
+    std::test::assert_eq_int(count(after_removal.data), 3, "an operator's annotator removed");
     annotators.update(
         api::AnnotatorUpdate { annotator: "response-basics", has_enabled: true, enabled: true },
     ) or discard;
@@ -682,34 +785,39 @@ fn main() {
     );
     std::test::assert(std::str::contains(nodes.last_state, "bytes left out"), "its middle marked");
 
-    // voice-system is kept as voice's own
-    bad = "";
-    projects.archive(api::ProjectRef { project: "voice-system" }) or {
-        bad = api::ctl_problem(err).message;
-        api::Project { status: api::Lifecycle::archived }
+    // the project's limits count its callers' requests, never voice's for it
+    let mut capped = api::LimitsRequest { project: "work" };
+    let cap = st::Limit {
+        scope: st::LimitScope::project,
+        window_seconds: 3600,
+        has_requests: true,
+        requests: 2,
     };
-    refused(bad, "never archived", "never archived");
-    bad = "";
-    keys.revoke(api::KeyRef { project: "voice-system", key: "voice-system" }) or {
-        bad = api::ctl_problem(err).message;
-        api::Key { status: api::KeyStatus::revoked }
+    push(capped.limits, cap) or discard;
+    projects.set_limits(capped) or {
+        std::test::assert(false, "capped: " + api::ctl_problem(err).message);
+        api::LimitSet { }
     };
-    refused(bad, "its key never revoked", "never revoked");
-    // nor is a key of it, however made, any caller's
-    e.store.insert_key(
-        st::KeyRow {
-            id: "k_planted",
-            project: st::SYSTEM_PROJECT,
-            name: "planted",
-            prefix: "vk-plan",
-            digest: api::secret_digest("vk-planted"),
-            created_at: std::time::current(),
-        },
-        st::ChangeRow { action: "create", target: "projects/voice-system/keys/k_planted" },
-    ) or discard;
-    std::test::assert_eq_int(
-        ask(e, "vk-planted", "{\"model\": \"echo-1\", \"input\": \"x\"}").status,
-        401,
-        "a key of voice-system is no caller's",
+    let before_cap = nodes.decisions;
+    let c1 = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"one\"}");
+    std::test::assert(nodes.decisions > before_cap, "annotated, by the system key");
+    let c2 = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"two\"}");
+    std::test::assert(
+        c1.status == 200 && c2.status == 200,
+        "two of its own, past voice's: " + c2.body,
     );
+    std::test::assert_eq_int(
+        ask(e, key, "{\"model\": \"echo-1\", \"input\": \"three\"}").status,
+        429,
+        "its third is past its limit",
+    );
+
+    // a system key is no caller's, whatever a token says
+    std::test::assert_eq_int(
+        ask(e, "", "{\"model\": \"echo-1\", \"input\": \"x\"}").status,
+        401,
+        "no token, no caller",
+    );
+    let planted = e.store.key("work-system") or st::KeyRow { };
+    std::test::assert(planted.internal && len(planted.digest) == 0, "its key holds no secret");
 }

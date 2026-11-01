@@ -9,15 +9,17 @@
 // its ledger row (`usage`, the whole record), a key, project, account,
 // model, node or seat changed is its change row (`change`), and a node
 // registered, lost, drained or revoked is its status moving (`node`, the
-// whole node as `GET /admin/v1/nodes/{id}` answers it). A place is the
-// marks of those rows: the last ledger row and change told, and each
+// whole node as `GET /admin/v1/nodes/{id}` answers it), and a request
+// annotated is its annotation kept (`annotation`: its answers, its runs,
+// and the conversation's title when it wrote one). A place is the marks
+// of those rows: the last ledger row, change and annotation told, and each
 // node's status. The api's HTTP server answers one request at a time, so
 // each answer is short and the browser's EventSource reconnects at the
 // `retry` it is given (the stream stays open instead once the router
 // moves onto `http::Rest`).
 
 /// The `type`s a subscriber may ask for.
-const EVENT_TYPES: String = "node usage change request";
+const EVENT_TYPES: String = "node usage change request annotation";
 
 /// A node's place in the stream: its id and status, as a number. The
 /// nodes' marks are numbers so that a subscriber holds no text between
@@ -48,6 +50,9 @@ locus EventTick {
         quiet: Bool = false;
         usage_mark: Int = 0;
         change_mark: Int = 0;
+        // the last annotation told; -1 not known (a place from before
+        // annotations were told), taken at the head without telling
+        annotation_mark: Int = 0;
         // the last request in flight told (not in the stream's place: one
         // that resumes is told what is in flight then)
         flight_mark: Int = 0;
@@ -79,6 +84,7 @@ locus EventTick {
             self.usage_mark = (at(u.rows, 0) or st::UsageRow { }).seq;
             let c = self.store.changes(st::ChangeQuery { limit: 1 }) or fail store_down(err);
             self.change_mark = (at(c.rows, 0) or st::ChangeRow { }).seq;
+            self.annotation_head() or raise;
             let mut f = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
             while count(f.rows) > 0 {
                 self.flight_mark = (at(f.rows, count(f.rows) - 1) or st::FlightRow { }).seq;
@@ -90,6 +96,23 @@ locus EventTick {
                 for r in rows.rows {
                     self.usage_mark = r.seq;
                     self.tell("usage", "usage_" + to_string(r.seq), r.created_at, r.record);
+                }
+            }
+            if self.annotation_mark < 0 { self.annotation_head() or raise; }
+            if self.wants("annotation") {
+                let rows = self.store.annotations_after(
+                    self.annotation_mark,
+                    100,
+                ) or fail store_down(err);
+                for r in rows.rows {
+                    self.annotation_mark = r.seq;
+                    let answers = self.store.answers(r.request_id) or fail store_down(err);
+                    self.tell(
+                        "annotation",
+                        "annotation_" + to_string(r.seq),
+                        r.created_at,
+                        annotation_event_json(r, answers),
+                    );
                 }
             }
             // a request offered to a seat, for as long as it runs: a live
@@ -164,6 +187,17 @@ locus EventTick {
         self.node_marks = fresh;
     }
 
+    /// The newest annotation's place, told nothing of what came before.
+    fn annotation_head() fallible(CtlError) {
+        let mut mark = if self.annotation_mark < 0 { 0 } else { self.annotation_mark };
+        let mut rows = self.store.annotations_after(mark, 200) or fail store_down(err);
+        while count(rows.rows) > 0 {
+            mark = (at(rows.rows, count(rows.rows) - 1) or st::AnnotationRow { }).seq;
+            rows = self.store.annotations_after(mark, 200) or fail store_down(err);
+        }
+        self.annotation_mark = mark;
+    }
+
     /// One event on the stream.
     fn tell(t: String, id: String, when: Time, data: String) {
         self.out.send_with(
@@ -193,9 +227,10 @@ locus AdminEvents {
         changes: Changes;
         // the `type`s asked for; none means all
         types: st::Names = st::Names { };
-        // the last ledger row and change told, and each node's place
+        // the last ledger row, change and annotation told, and each node's place
         usage_mark: Int = 0;
         change_mark: Int = 0;
+        annotation_mark: Int = 0;
         flight_mark: Int = 0;
         node_marks: NodeMarks = NodeMarks { };
     }
@@ -211,11 +246,13 @@ locus AdminEvents {
             quiet: quiet,
             usage_mark: self.usage_mark,
             change_mark: self.change_mark,
+            annotation_mark: self.annotation_mark,
             flight_mark: self.flight_mark,
             node_marks: self.node_marks,
         };
         self.usage_mark = t.usage_mark;
         self.change_mark = t.change_mark;
+        self.annotation_mark = t.annotation_mark;
         self.flight_mark = t.flight_mark;
         self.node_marks = t.node_marks;
     }
@@ -228,8 +265,8 @@ locus AdminEvents {
         for m in marks {
             nodes = nodes + (if len(nodes) > 0 { "," } else { "" }) + to_string(m);
         }
-        return "u" + to_string(self.usage_mark) + ".c" + to_string(self.change_mark) + ".n"
-            + nodes;
+        return "u" + to_string(self.usage_mark) + ".c" + to_string(self.change_mark) + ".a"
+            + to_string(self.annotation_mark) + ".n" + nodes;
     }
 
     /// Take the marks from an event id `place` wrote; false when it is
@@ -238,9 +275,18 @@ locus AdminEvents {
         let dc = std::str::index_of(id, ".c");
         let dn = std::str::index_of(id, ".n");
         if !std::str::starts_with(id, "u") || dc < 0 || dn < dc { return false; }
+        // `.a<n>` between them: the annotation told last; a place from
+        // before annotations were told has none, and starts at their head
+        let da = std::str::index_of(id, ".a");
+        let ends = if da > dc && da < dn { da } else { dn };
         self.usage_mark = std::str::parse_int(id[1..dc]) or - 1;
-        self.change_mark = std::str::parse_int(id[(dc + 2)..dn]) or - 1;
+        self.change_mark = std::str::parse_int(id[(dc + 2)..ends]) or - 1;
         if self.usage_mark < 0 || self.change_mark < 0 { return false; }
+        self.annotation_mark = if ends == da {
+            std::str::parse_int(id[(da + 2)..dn]) or - 1
+        } else {
+                -1
+        };
         let mut rest = id[(dn + 2)..len(id)];
         let mut marks = NodeMarks { };
         while len(rest) > 0 {
@@ -296,4 +342,28 @@ fn flight_json(f: st::FlightRow) -> String {
         + jq(f.key) + ", \"requested_model\": " + jq(f.model) + ", \"seat\": " + jq(f.seat)
         + ", \"account\": " + jq(f.account) + ", \"started_at\": " + jtime(f.started_at)
         + ", \"instance\": " + jstring_or_null(len(f.instance) > 0, f.instance) + "}";
+}
+
+/// An annotation as the `annotation` event carries it: the request, its
+/// status, each answer given (not those skipped), its runs, and the
+/// conversation's title when it wrote one.
+@unbounded
+fn annotation_event_json(r: st::AnnotationRow, answers: st::AnswerRows) -> String {
+    let given = st::JsonList { };
+    for a in answers.rows {
+        if a.skipped { continue; }
+        given.add(
+            "{\"annotator\": " + jq(a.annotator) + ", \"stage\": " + jq(a.stage)
+                + ", \"question\": " + jq(a.question) + ", \"answer\": " + jq(a.answer)
+                + ", \"probability\": " + to_string(a.probability) + "}",
+        );
+    }
+    let title = std::json::find_string_field(r.body, "title");
+    let runs = std::str::trim(std::json::find_field_raw(r.body, "runs"));
+    return "{\"request_id\": " + jq(r.request_id) + ", \"project\": " + jq(r.project)
+        + ", \"key\": " + jq(r.key) + ", \"conversation\": "
+        + jstring_or_null(len(r.conversation) > 0, r.conversation) + ", \"status\": "
+        + jq(r.status) + ", \"reason\": " + jq(r.reason) + ", \"title\": "
+        + jstring_or_null(len(title) > 0, title) + ", \"answers\": [" + given.text()
+        + "], \"runs\": " + (if std::str::starts_with(runs, "[") { runs } else { "[]" }) + "}";
 }

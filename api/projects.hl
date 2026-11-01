@@ -93,6 +93,9 @@ locus Projects {
         if count(row.data_classes.items) == 0 {
             push(row.data_classes.items, "internal") or discard;
         }
+        if c.has_annotate && c.annotate {
+            annotating_ready(self.store, row) or raise;
+        }
         if c.has_parent {
             // the hierarchy is held from this check to the project's write
             self.store.hold(HIERARCHY) or fail store_down(err);
@@ -193,10 +196,8 @@ locus Projects {
             row.peek = false;
         }
         if u.has_annotate {
-            // an annotation is a request of voice's own project: annotating
-            // its own requests would ask about the asking, without end
             if row.internal && u.annotate {
-                fail bad(row.id + "'s own requests are never annotated", "annotate");
+                fail bad(row.id + " is retired, and annotates nothing", "annotate");
             }
             row.annotate_set = true;
             row.annotate = u.annotate;
@@ -249,6 +250,11 @@ locus Projects {
         // when it inherits
         let spending = as_in_force(self.store, row) or fail store_down(err);
         self.keys_within(spending) or raise;
+        // turned on, it has a decision model to ask (annotate.hl), the one
+        // its `decide` names as this change leaves it
+        if u.has_annotate && u.annotate {
+            annotating_ready(self.store, row) or raise;
+        }
         let after = self.view(row) or raise;
         self.store.update_project(
             row,
@@ -671,6 +677,14 @@ locus Keys {
             );
         }
         check_name(c.name) or raise;
+        if c.name == st::system_key(c.project) {
+            fail bad(
+                c.name
+                    + " is the name of the project's system key, which voice made: name this one another",
+                "name"
+            );
+        }
+        if c.annotate { annotating_ready(self.store, p) or raise; }
         let models = restriction_of(c.has_models, c.models);
         let accounts = accounts_restriction(c.has_accounts, c.accounts) or raise;
         within(p.models, models, "models") or raise;
@@ -754,7 +768,27 @@ locus Keys {
         let mut k = self.known(u.project, u.key) or raise;
         let held = self.project_of(u.project) or raise;
         if held.internal {
-            fail bad(k.id + " is voice's own key: it serves voice's own requests as it is", "");
+            fail bad(k.id + " is the retired project's key: it is never changed", "");
+        }
+        // a project's system key: what it may spend and its limits change,
+        // what makes it the key voice's own requests go by never does
+        if k.internal
+            && (
+                u.has_name || u.has_peek || u.has_annotate || u.has_expires_at || u.clear_expires_at
+            )
+        {
+            fail bad(
+                k.id + " is the project's system key: only its models, accounts and limits change",
+                if u.has_name {
+                    "name"
+                } else if u.has_peek {
+                    "peek"
+                } else if u.has_annotate {
+                    "annotate"
+                } else {
+                    "expires_at"
+                }
+            );
         }
         // a key is held within what its project spends: its parent's for an
         // inheriting child
@@ -763,10 +797,23 @@ locus Keys {
         let before = key_view(k, now);
         if u.has_name {
             check_name(u.name) or raise;
+            if u.name == st::system_key(k.project) {
+                fail bad(
+                    u.name
+                        + " is the name of the project's system key, which voice made: name this one another",
+                    "name"
+                );
+            }
             k.name = u.name;
         }
         if u.has_peek { k.peek = u.peek; }
-        if u.has_annotate { k.annotate = u.annotate; }
+        if u.has_annotate {
+            if u.annotate && !k.annotate {
+                let kp = self.project_of(k.project) or raise;
+                annotating_ready(self.store, kp) or raise;
+            }
+            k.annotate = u.annotate;
+        }
         if u.has_models || u.clear_models {
             let models = restriction_of(u.has_models, u.models);
             within(p.models, models, "models") or raise;
@@ -820,8 +867,11 @@ locus Keys {
         let mut k = self.known(r.project, r.key) or raise;
         let now = now_seconds();
         if k.revoked { return key_view(k, now); }
-        if k.project == st::SYSTEM_PROJECT {
-            fail clash(k.id + " is voice's own key, which no token names: it is never revoked");
+        if k.internal {
+            fail clash(
+                k.id
+                    + " is the project's system key, which no token names: it is never revoked (archive the project instead)"
+            );
         }
         let before = key_view(k, now);
         k.revoked = true;
@@ -884,7 +934,7 @@ locus KeyBearer {
         let p = self.store.project(k.project) or fail metering_failed(err);
         // voice's own project's requests are voice's alone (annotate.hl): no
         // caller's token names a key of it, whichever way the key was made
-        if !p.present || p.archived || p.internal { fail invalid_key(); }
+        if !p.present || p.archived || p.internal || k.internal { fail invalid_key(); }
         let now = now_seconds();
         if !k.used || std::time::unix(now) - std::time::unix(k.last_used_at) >= 60 {
             self.store.touch_key(k.id, now) or fail metering_failed(err);
@@ -924,7 +974,8 @@ fn key_view(k: st::KeyRow, now: Time) -> Key {
         has_revoked_at: k.revoked,
         revoked_at: k.revoked_at,
         peek: k.peek,
-        annotate: k.annotate
+        annotate: k.annotate,
+        internal: k.internal
     };
     v.models = k.models.names.items;
     v.accounts = k.accounts.names.items;
@@ -1014,4 +1065,17 @@ fn entropy_failed(message: String) -> ApiError {
         code: ErrorCode::internal_error,
         message: message,
     };
+}
+
+/// Refused with why, when `p` has no decision model to ask the questions
+/// of its annotators (annotate.hl): its `decide`, its own or its parent's,
+/// names none, or names a generative model.
+fn annotating_ready(store: st::Store, p: st::ProjectRow) fallible(CtlError) {
+    let why = decision_problem(store, p) or fail store_down(err);
+    if len(why) > 0 {
+        fail clash(
+            "annotate needs a decision model: " + why
+                + "; set it on Projects (aliases), then turn annotate on"
+        );
+    }
 }

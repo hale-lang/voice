@@ -628,6 +628,8 @@ paths:
           $ref: '#/components/responses/Malformed'
         '422':
           $ref: '#/components/responses/AdminInvalid'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -644,7 +646,9 @@ paths:
         Archiving revokes the project's keys and refuses new requests. Its
         usage history stays queryable; the id is never reused. The change
         log records each key's revocation under the key, with the archive.
-        Voice's own project, `voice-system`, is never archived (`409`).
+        The retired `voice-system` project, voice's old project for its own
+        requests (now each project's system key's), is never archived again
+        (`409`). Archiving a project revokes its system key with its keys.
       security:
         - operatorToken: []
       responses:
@@ -859,6 +863,8 @@ paths:
           $ref: '#/components/responses/Malformed'
         '422':
           $ref: '#/components/responses/AdminInvalid'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -918,6 +924,8 @@ paths:
           $ref: '#/components/responses/Malformed'
         '422':
           $ref: '#/components/responses/AdminInvalid'
+        '409':
+          $ref: '#/components/responses/AdminConflict'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -930,8 +938,10 @@ paths:
       tags: [keys]
       operationId: revokeKey
       summary: Revoke a key
-      description: Revocation is immediate at the coordinator; in-flight requests finish.
-        `voice-system`'s own key, which no token names, is never revoked (`409`).
+      description: |
+        Revocation is immediate at the coordinator; in-flight requests finish.
+        A project's system key (`Key.internal`), which no token names, is
+        never revoked (`409`); archive the project instead.
       security:
         - operatorToken: []
       responses:
@@ -971,6 +981,7 @@ paths:
         - $ref: '#/components/parameters/To'
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/IncludeInternal'
       responses:
         '200':
           description: A page of usage records.
@@ -1003,7 +1014,9 @@ paths:
         model, account, seat, node, conversation and time bucket. The
         tracking view: what each project and each of its keys spent over a
         period, and which account paid for it. Groups come most recently
-        active first: at most 1000, the least recent left out.
+        active first: at most 1000, the least recent left out. Voice's own
+        requests for its projects (their system keys') are left out of the
+        totals unless `include_internal` is `true`.
       security:
         - operatorToken: []
       parameters:
@@ -1027,6 +1040,7 @@ paths:
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
+        - $ref: '#/components/parameters/IncludeInternal'
       responses:
         '200':
           description: One row per group.
@@ -1294,6 +1308,83 @@ paths:
           $ref: '#/components/responses/AdminNotFound'
         '409':
           $ref: '#/components/responses/AdminConflict'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/annotators/{annotator}/stats:
+    parameters:
+      - name: annotator
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [annotations]
+      operationId: annotatorStats
+      summary: What an annotator's runs did
+      description: |
+        Over the newest 200 annotations in the range: the runs that asked
+        this annotator, how many were made, skipped or not made and why,
+        the tokens of those runs, and the newest reason one was not made.
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+      responses:
+        '200':
+          description: Its runs, counted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnotatorStats'
+        '400':
+          $ref: '#/components/responses/AdminInvalid'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/conversations:
+    get:
+      tags: [usage]
+      operationId: listConversationTitles
+      summary: List conversations' titles
+      description: |
+        Conversations' titles, the newest written first: a project's (its
+        children's too), or one conversation's. A title is written by the
+        title annotator (`AnnotatorStage` `title`) on a conversation's first
+        annotated request, and again when a later one is answered as
+        another task.
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AnnotationProject'
+        - $ref: '#/components/parameters/AnnotationConversation'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        '200':
+          description: The titles.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ConversationTitle' }
+        '400':
+          $ref: '#/components/responses/AdminInvalid'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -1623,7 +1714,8 @@ paths:
         newest 200 at most that `project`, `key`, `from` and `to` keep.
         Voice keeps no other text, so a request not recorded cannot be. It
         answers at once with how many it will ask about, then asks, as
-        `voice-system`'s requests; each answer names the version asked.
+        requests of each one's project's system key; each answer names the
+        version asked.
         A response annotator reads the request answers already kept.
       security:
         - operatorToken: []
@@ -3231,6 +3323,14 @@ components:
       in: query
       description: Only the turns of this conversation (`UsageRecord.conversation`).
       schema: { type: string }
+    IncludeInternal:
+      name: include_internal
+      in: query
+      description: |
+        Voice's own requests for its projects, under each project's system
+        key (`UsageRecord.internal`: annotations, conversation titles), are
+        left out unless this is `true`, or `key` names a system key.
+      schema: { type: boolean, default: false }
     AnnotationProject:
       name: project
       in: query
@@ -4089,11 +4189,15 @@ components:
             After each request it sends is answered, a decision model is asked
             the questions of the annotators in force for it (`listAnnotators`),
             off the request's path: the caller waits for none of it. The
-            questions are asked as requests of `voice-system`, voice's own
-            project, whose usage, limits and accounts they spend, never this
-            one's. Left out, a child follows its parent's, read when a request
-            is admitted, and a project of its own does not annotate. A
-            request is annotated when its project annotates or its key does.
+            questions are asked of the decision model its `decide` alias
+            names (its own, else its parent's), as requests of its system
+            key (`Key.internal`): they spend its accounts, their usage is
+            kept apart from its callers' (`UsageRecord.internal`) and held
+            to that key's limits alone. `true` is refused (`409`) while
+            `decide` names no decision model. Left out, a child follows its
+            parent's, read when a request is admitted, and a project of its
+            own does not annotate. A request is annotated when its project
+            annotates or its key does.
         aliases:
           type: array
           maxItems: 32
@@ -4169,8 +4273,9 @@ components:
           description: |
             `true` or `false` sets its own; `null` follows its parent's again
             (off for a project of its own). Each request it sends is annotated
-            (`getAnnotation`), as `voice-system`'s requests. `voice-system`
-            itself never annotates.
+            (`getAnnotation`), as requests of its system key. `true` is
+            refused (`409`) while its `decide` alias, as this update leaves
+            it, names no decision model.
         aliases:
           type: array
           maxItems: 32
@@ -4229,10 +4334,9 @@ components:
         internal:
           type: boolean
           description: |
-            Voice's own project, `voice-system`: the requests voice makes for
-            itself (annotations) are its, never a caller's. It cannot be
-            archived, takes no key, and never annotates; the operator gives it
-            accounts, limits and the `decide` alias of the decision model it asks.
+            The retired `voice-system` project, where voice once made its own
+            requests: archived, its key revoked, never a caller's. Each
+            project's own system key makes them now (`Key.internal`).
         aliases:
           type: array
           description: Its own model aliases.
@@ -4337,8 +4441,10 @@ components:
           type: boolean
           description: |
             Each request it sends is annotated (`getAnnotation`), by the
-            annotators in force for it, as `voice-system`'s requests. A
-            request is annotated when its project or its key annotates.
+            annotators in force for it, as requests of its project's system
+            key; refused (`409`) while its project's `decide` names no
+            decision model. A request is annotated when its project or its
+            key annotates.
         models:
           type: [array, 'null']
           description: Restrict the key to these models. Null means the project's catalog.
@@ -4376,8 +4482,10 @@ components:
           type: boolean
           description: |
             Each request it sends is annotated (`getAnnotation`), by the
-            annotators in force for it, as `voice-system`'s requests. A
-            request is annotated when its project or its key annotates.
+            annotators in force for it, as requests of its project's system
+            key; refused (`409`) while its project's `decide` names no
+            decision model. A request is annotated when its project or its
+            key annotates.
         models:
           type: [array, 'null']
           items: { type: string }
@@ -4404,6 +4512,14 @@ components:
         annotate:
           type: boolean
           description: Each request it sends is annotated (`getAnnotation`).
+        internal:
+          type: boolean
+          description: |
+            Its project's system key, `<project>-system`, made with the
+            project: voice's own requests for it (annotations, titles) are
+            made under it. No token names it; it is never revoked, renamed,
+            peeked or annotated; its models, accounts and limits are the
+            operator's to set, the only limits voice's requests are held to.
         project: { type: string }
         name: { type: string }
         prefix:
@@ -4531,6 +4647,16 @@ components:
             The conversation the request was a turn of: its
             `prompt_cache_key`, the same on each turn. `null` when the caller
             sent none. The ledger's turns of one conversation share it.
+        internal:
+          type: boolean
+          description: |
+            A request of its project's system key (`Key.internal`): voice's
+            own for the project, an annotation or a conversation's title,
+            its `metadata` naming the request it annotated (`annotates`) and
+            its stage (`side`). Left out of usage lists and summaries unless
+            asked for (`include_internal`), out of the project's limits and
+            out of the usage told to the organization. Its account still
+            pays the provider for it.
         metadata:
           $ref: '#/components/schemas/Metadata'
 
@@ -5079,8 +5205,25 @@ components:
       type: string
       description: |
         When an annotator asks: `request`, of the request; `response`, of its
-        response, read beside the request.
-      enum: [request, response]
+        response, read beside the request; `title`, which asks no questions
+        but writes the conversation's title with its project's text model
+        (`AnnotatorTitle`), on the conversation's first request and again
+        when a later one is answered as another `task`.
+      enum: [request, response, title]
+
+    AnnotatorTitle:
+      type: object
+      description: |
+        A `title` annotator's model, by the alias its project gives a text
+        model, and what it is asked: a few words. Its runs are requests of
+        the project's system key.
+      required: [model, instruction, max_output_tokens]
+      properties:
+        model:
+          type: string
+          description: The project's alias for the text model asked, e.g. `general`.
+        instruction: { type: string, minLength: 1, maxLength: 1000 }
+        max_output_tokens: { type: integer, minimum: 4, maximum: 64 }
 
     AnnotationCondition:
       type: object
@@ -5155,13 +5298,15 @@ components:
         stage: { $ref: '#/components/schemas/AnnotatorStage' }
         questions:
           type: array
-          minItems: 1
           maxItems: 64
           description: |
-            Its questions. The enabled annotators of one stage ask at most 64
-            together, in one request to the decision model; at most 64 KiB as
-            JSON.
+            Its questions, at least one; a `title` annotator asks none (`[]`).
+            The enabled annotators of one stage ask at most 64 together, in
+            one request to the decision model; at most 64 KiB as JSON.
           items: { $ref: '#/components/schemas/AnnotatorQuestion' }
+        title:
+          $ref: '#/components/schemas/AnnotatorTitle'
+          description: A `title` annotator's model and instruction, which it needs; no other has one.
         scope: { $ref: '#/components/schemas/AnnotatorScope' }
         reads_request:
           type: boolean
@@ -5180,12 +5325,12 @@ components:
         name: { type: string, minLength: 1, maxLength: 128 }
         questions:
           type: array
-          minItems: 1
           maxItems: 64
           items: { $ref: '#/components/schemas/AnnotatorQuestion' }
         scope: { $ref: '#/components/schemas/AnnotatorScope' }
         reads_request: { type: boolean }
         enabled: { type: boolean }
+        title: { $ref: '#/components/schemas/AnnotatorTitle' }
 
     Annotator:
       type: object
@@ -5206,8 +5351,84 @@ components:
         builtin:
           type: boolean
           description: Voice's own, shipped; edited and disabled, never removed.
+        title:
+          $ref: '#/components/schemas/AnnotatorTitle'
+          description: A `title` annotator's; left out for any other.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    AnnotatorStats:
+      type: object
+      description: |
+        What one annotator's runs did, over the newest 200 annotations in the
+        range: how many asked it, what they came to, why the others were not
+        made, and the tokens of the requests that asked it (shared by the
+        annotators asked in one request).
+      required: [annotator, annotations, runs, annotated, skipped, not_annotated, reasons, input_tokens, output_tokens]
+      properties:
+        annotator: { type: string }
+        annotations: { type: integer, description: The annotations read. }
+        runs: { type: integer }
+        annotated: { type: integer }
+        skipped: { type: integer, description: Runs whose questions' conditions all did not hold. }
+        not_annotated: { type: integer }
+        reasons:
+          type: array
+          items:
+            type: object
+            required: [reason, count]
+            properties:
+              reason: { type: string }
+              count: { type: integer }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        last_error:
+          type: string
+          description: The newest reason one was not made; left out when none was.
+        last_error_at:
+          type: string
+          format: date-time
+
+    AnnotationRun:
+      type: object
+      description: |
+        One request voice made for an annotation, as a request of the
+        project's system key: a stage's questions asked of the decision
+        model, or a conversation's title written.
+      required: [stage, annotators, request_id, model, input_tokens, output_tokens, ms, status, reason]
+      properties:
+        stage: { $ref: '#/components/schemas/AnnotatorStage' }
+        annotators:
+          type: array
+          description: The annotators it asked for, `<id>@<version>` each.
+          items: { type: string }
+        request_id:
+          type: [string, 'null']
+          description: Its own request (its usage record, `internal`); null when none was made.
+        model: { type: [string, 'null'] }
+        input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        ms: { type: integer, description: How long it took. }
+        status:
+          type: string
+          enum: [annotated, skipped, not_annotated]
+        reason: { type: string, description: Why it was not made or was skipped; empty when it was made. }
+
+    ConversationTitle:
+      type: object
+      description: A conversation's title, as the title annotator last wrote it.
+      required: [project, conversation, title, model, annotator, version, made_at]
+      properties:
+        project: { type: string }
+        conversation: { type: string }
+        title: { type: string }
+        task:
+          type: string
+          description: The request's `task` it was written under; left out when none was asked.
+        model: { type: string }
+        annotator: { type: string }
+        version: { type: integer }
+        made_at: { type: string, format: date-time }
 
     AnnotationExpect:
       type: object
@@ -5283,13 +5504,17 @@ components:
         reason:
           type: string
           description: |
-            Why it was not annotated, empty when it was: `voice-system` has no
-            decision model it may use, is past its limits, or the model failed.
+            Why it was not annotated, empty when it was: its project has no
+            decision model it may use, its system key is past its limits, or
+            the model failed.
         clipped:
           type: boolean
           description: |
             A text read was cut to fit the decision model: its start and end
             were read, the middle left out and marked so.
+        title:
+          type: string
+          description: The conversation's title, when this request's annotation wrote it; left out otherwise.
 
     AnnotationAnswer:
       type: object
@@ -5341,13 +5566,17 @@ components:
               description: The decision model that answered; left out when none did.
             input_tokens:
               type: integer
-              description: What its questions read, as `voice-system`'s requests.
+              description: What its questions read, as requests of its project's system key.
             answers:
               type: array
               items: { $ref: '#/components/schemas/AnnotationAnswer' }
             pairs:
               type: array
               items: { $ref: '#/components/schemas/AnnotationPair' }
+            runs:
+              type: array
+              description: Each request voice made for it, in order.
+              items: { $ref: '#/components/schemas/AnnotationRun' }
 
     AnnotationFacets:
       type: object
@@ -5701,6 +5930,44 @@ components:
                 instance:
                   type: [string, 'null']
                   description: The api instance that admitted it (`UsageRecord.instance`).
+        - type: object
+          required: [id, at, type, data]
+          description: |
+            A request annotated (or not, and why), told once each time its
+            annotation is kept: the answers given (not those skipped), the
+            runs that gave them, and the conversation's title when this one
+            wrote it.
+          properties:
+            id: { type: string }
+            at: { type: string, format: date-time }
+            type: { type: string, const: annotation }
+            data:
+              type: object
+              required: [request_id, project, key, conversation, status, reason, title, answers, runs]
+              properties:
+                request_id: { type: string }
+                project: { type: string }
+                key: { type: string }
+                conversation: { type: [string, 'null'] }
+                status:
+                  type: string
+                  enum: [annotated, not_annotated]
+                reason: { type: string }
+                title: { type: [string, 'null'] }
+                answers:
+                  type: array
+                  items:
+                    type: object
+                    required: [annotator, stage, question, answer, probability]
+                    properties:
+                      annotator: { type: string }
+                      stage: { $ref: '#/components/schemas/AnnotatorStage' }
+                      question: { type: string }
+                      answer: { type: string }
+                      probability: { type: number }
+                runs:
+                  type: array
+                  items: { $ref: '#/components/schemas/AnnotationRun' }
         - type: object
           required: [id, at, type, data]
           properties:

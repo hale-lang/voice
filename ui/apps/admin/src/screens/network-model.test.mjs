@@ -20,7 +20,8 @@ test('a refused request without an attributed seat never lights a machine or pay
   const record = { ...demoRequest(fleet, 2, 1_800_000_000_000), served: null, status: 'no_capacity' };
   const graph = buildGraph({ ...fleet, usage: [record] });
   const lit = requestEdges(record, graph);
-  assert.equal(lit.size, 1);
+  // no host, seat or account: what it does light is only its project's own context
+  assert(![...lit].some((id) => /(^|>)(node|seat|account):/.test(id) || id.includes('node:') || id.includes('seat:') || id.includes('account:')));
   assert(!lit.has(edgeId(entityId('project', record.project), entityId('model', record.requested_model))));
 });
 
@@ -74,11 +75,11 @@ test('policy defaults and idle filtering follow the seat contract', () => {
 
 test('unified layout is independent of response ordering and supports newly reported dimensions', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
-  const graph = buildGraph(fleet);
+  const graph = buildGraph(fleet, { context: true });
   const points = layoutGraph(graph, 940, 740);
   assert.deepEqual(points, layoutGraph({ ...graph, vertices: [...graph.vertices].reverse(), edges: [...graph.edges].reverse() }, 940, 740));
   const record = { ...fleet.usage[1], id: 'extra', metadata: { branch: 'feature/new' } };
-  const expanded = buildGraph({ ...fleet, usage: [...fleet.usage, record] });
+  const expanded = buildGraph({ ...fleet, usage: [...fleet.usage, record] }, { context: true });
   const next = layoutGraph(expanded, 940, 740, new Map(), points);
   assert(next.has('context:branch:feature/new'));
   for (const p of next.values()) assert(Number.isFinite(p.x) && p.x >= 65 && p.x <= 875 && p.y >= 55 && p.y <= 675);
@@ -101,7 +102,7 @@ test('a request fuses all seven participants without borrowing another request p
   const second = { ...first, id: 'second', project: 'product', metadata: { repository: 'repo-b' }, served: { ...first.served, node: 'historical-host', seat: 'historical-host/seat' } };
   fleet.usage = [first,second];
   fleet.contexts = { first: { apiInstance: 'api-a' }, second: { apiInstance: 'api-b' } };
-  const graph = buildGraph(fleet);
+  const graph = buildGraph(fleet, { context: true });
   const path = requestVertices(first, graph);
   assert.equal(path.size, 7);
   assert.equal(requestEdges(first, graph).size, 6);
@@ -114,7 +115,7 @@ test('a request fuses all seven participants without borrowing another request p
 test('caller metadata cannot spoof API instance identity; missing context stays absent', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
   const record = { ...fleet.usage[0], metadata: { apiInstance: 'spoofed', api_instance: 'spoofed' }, served: null };
-  const graph = buildGraph({ ...fleet, usage: [record] });
+  const graph = buildGraph({ ...fleet, usage: [record] }, { context: true });
   assert.equal(requestContext(record).apiInstance, undefined);
   assert(!graph.vertices.some(v => v.kind === 'api' || v.kind === 'repository'));
   assert.deepEqual([...requestVertices(record, graph)].sort(), [`project:${record.project}`, `model:${record.requested_model}`, 'context:apiInstance:spoofed', 'context:api_instance:spoofed'].sort());
@@ -146,7 +147,7 @@ test('composable selection intersects whole requests and can explicitly union th
   const a = { ...fleet.usage[1], id: 'a', project: 'research', metadata: { repository: 'a' } };
   const b = { ...a, id: 'b', project: 'product', metadata: { repository: 'b' } };
   fleet.usage = [a,b];
-  const graph = buildGraph(fleet);
+  const graph = buildGraph(fleet, { context: true });
   assert.deepEqual(matchingRequests(['project:research','repository:a'],fleet.usage,graph).map(r=>r.id),['a']);
   assert.equal(matchingRequests(['project:research','repository:b'],fleet.usage,graph).length,0);
   assert.equal(matchingRequests(['project:research','repository:b'],fleet.usage,graph,'any').length,2);
@@ -154,10 +155,10 @@ test('composable selection intersects whole requests and can explicitly union th
 test('optional metadata dimensions emerge without a type registry entry', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
   const a = { ...fleet.usage[1], metadata: { workflow: 'review', 'dna.attempt_id': 'a-41' } };
-  const graph = buildGraph({ ...fleet, usage: [a] });
+  const graph = buildGraph({ ...fleet, usage: [a] }, { context: true });
   assert(graphKinds(graph).includes('context:dna.attempt_id'));
   assert(requestVertices(a,graph).has('context:workflow:review'));
-  const bare = buildGraph({ ...fleet, usage: [{ ...a, metadata: {} }] });
+  const bare = buildGraph({ ...fleet, usage: [{ ...a, metadata: {} }] }, { context: true });
   assert(!bare.vertices.some(v => v.kind.startsWith('context:') || v.kind === 'repository'));
 });
 test('execution ends at the served model, through its account, while requested model remains context', () => {
@@ -283,13 +284,13 @@ test('an alias is its own vertex: its project names the model by it, and a reque
 test('a request draws its conversation, keyed by its prompt_cache_key whatever the client, and metadata stays a label', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
   const record = { ...demoRequest(fleet, 1, 1_800_000_000_000), id: 'turn', conversation: 'b909ae4b', metadata: { team: 'search' } };
-  const graph = buildGraph({ ...fleet, usage: [record] });
+  const graph = buildGraph({ ...fleet, usage: [record] }, { context: true });
   const c = graph.vertices.find((v) => v.id === entityId('context:conversation', 'b909ae4b'));
   assert(c, 'the conversation is a context node');
   assert.equal(c.href, '#/usage/c/b909ae4b');
   assert(graph.edges.some((e) => e.id === edgeId(entityId('project', record.project), c.id)));
   assert(graph.vertices.some((v) => v.id === entityId('context:team', 'search')), 'a metadata pair is still a label');
-  const none = buildGraph({ ...fleet, usage: [{ ...record, conversation: null }] });
+  const none = buildGraph({ ...fleet, usage: [{ ...record, conversation: null }] }, { context: true });
   assert(!none.vertices.some((v) => v.kind === 'context:conversation'), 'none without a conversation');
 });
 
@@ -305,4 +306,24 @@ test("voice's own request for a project is drawn apart: project → its system k
   assert(edges.has(edgeId(key, entityId('model', 'jev-2b'))));
   assert.equal(requestFlowEdges(record, graph).size, 0, 'no flow: it never inflates the project');
   assert(!graph.edges.some((e) => e.target === entityId('seat', base.served.seat) && e.flow), 'and it lights no seat');
+});
+
+test('by default a project is the source of its requests: no conversation, repository or metadata node, and the project joined to the api that admitted it', () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const record = { ...demoRequest(fleet, 1, 1_800_000_000_000), id: 'turn', conversation: 'b909ae4b', metadata: { repository: 'repo-a', team: 'search', 'codex.session_id': '463f08e1' } };
+  const graph = buildGraph({ ...fleet, usage: [record], contexts: { turn: { apiInstance: 'api-1' } } });
+  assert(!graph.vertices.some((v) => v.kind === 'repository' || v.kind.startsWith('context:')), 'no request context by default');
+  const flow = requestFlowEdges(record, graph);
+  assert(flow.has(edgeId(entityId('project', record.project), entityId('api', 'api-1'))), 'project → api, a flow edge');
+  assert(flow.has(edgeId(entityId('api', 'api-1'), entityId('node', record.served.node))), 'api → host');
+  assert(!flow.has(edgeId(entityId('project', record.project), entityId('node', record.served.node))), 'never around the api when it is known');
+});
+
+test('a request whose record names no api instance still flows from its project, straight to its host', () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const record = { ...demoRequest(fleet, 1, 1_800_000_000_000), id: 'old', metadata: {} };
+  delete record.instance;
+  const graph = buildGraph({ ...fleet, usage: [record] });
+  assert(!requestVertices(record, graph).has('api:undefined'));
+  assert(requestFlowEdges(record, graph).has(edgeId(entityId('project', record.project), entityId('node', record.served.node))), 'project → host, so the project is never apart from its flow');
 });

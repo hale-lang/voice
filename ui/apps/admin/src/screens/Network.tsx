@@ -19,6 +19,15 @@ export function Network(_: ScreenProps) {
   // voice's own requests for the projects (their system keys'): a layer of
   // their own, off until asked for
   const [internal, setInternal] = useState(false);
+  // each request's caller-supplied context (its conversation, repository and
+  // metadata) beside its project: off unless this viewer turned it on
+  const [context, setContext] = useState(() => {
+    try { return localStorage.getItem('voice.network.context') === 'on'; } catch { return false; }
+  });
+  const toggleContext = () => {
+    setContext(!context);
+    try { localStorage.setItem('voice.network.context', context ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
+  };
   const usage = useGet('/admin/v1/usage', { params: { query: { limit: 100, ...(internal ? { include_internal: true } : {}) } } });
   const [choice, setChoice] = useState<'api' | 'demo' | null>(() => {
     try { const saved = sessionStorage.getItem('voice.network.source'); return saved === 'api' || saved === 'demo' ? saved : null; } catch { return null; }
@@ -50,17 +59,18 @@ export function Network(_: ScreenProps) {
       <div className={s.sources} role="group" aria-label="Network data source">
         <button aria-pressed={source === 'api'} onClick={() => chooseSource('api')}>API {stub ? 'fixture' : 'data'}</button>
         <button aria-pressed={source === 'demo'} onClick={() => chooseSource('demo')}>Demo fleet</button>
+        <button aria-pressed={context} onClick={toggleContext} title="each request's conversation, repository and metadata beside its project">Request context</button>
         <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project (annotations, titles), under its system key: dotted, apart from the project's flow">Internal runs</button>
       </div>
     </header>
     {source === 'api' && failure ? <Unavailable what="Network" detail={failure.error?.message} /> : source === 'api' && pending ? <Loading what="the fleet" /> :
-      <FleetNetwork key={source} fleet={source === 'demo' ? EMPTY : fleet} demo={source === 'demo'} stub={stub} />}
+      <FleetNetwork key={source} fleet={source === 'demo' ? EMPTY : fleet} demo={source === 'demo'} stub={stub} context={context} />}
   </div>;
 }
 
 type Pulse = { record: UsageRecord; at: number; inFlight?: boolean; color?: string };
 
-function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub: boolean }) {
+function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean }) {
   const [clock, setClock] = useState(() => ({ tick: 0, now: Date.now() }));
   const [paused, setPaused] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -94,13 +104,13 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
   }, [data, arrivals, demo, trace, running, flying]);
   const filtered = useMemo(() => filterFleet(fullData, filters), [fullData, filters]);
   const options = useMemo(() => filterOptions(fullData), [fullData]);
-  const fullGraph = useMemo(() => buildGraph(fullData), [fullData]);
+  const fullGraph = useMemo(() => buildGraph(fullData, { context }), [fullData, context]);
   const graph = useMemo(() => {
-    const g = buildGraph(filtered);
+    const g = buildGraph(filtered, { context });
     const vertices = g.vertices.filter(v => !hidden.includes(v.kind));
     const ids = new Set(vertices.map(v => v.id));
     return { ...g, vertices, edges: g.edges.filter(e => ids.has(e.source) && ids.has(e.target)) };
-  }, [filtered, hidden]);
+  }, [filtered, hidden, context]);
   const changeFilter = (key: keyof Filters, value: string) => { setFilters(old => ({ ...old, [key]: value })); setSelectedIds([]); setTrace(null); setHovered(null); };
   const filterCount = Object.values(filters).filter(Boolean).length;
 
@@ -196,7 +206,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
         <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}</div>
-        <div className={s.mapNote}>Requests follow project → API → host → seat → account → served model; one asked by an alias runs through the alias (a project's name for a model) to the model it named. Dotted links carry request context; hosts contain seats; the account layer shows budget attribution. Missing context is simply absent.</div>
+        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias runs through the alias (a project's name for a model) to the model it named. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">
@@ -266,7 +276,7 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
     <div className={s.layoutTools}><span>NEURAL LAYERS <span className="muted">/ drag to arrange · select to inspect</span></span><button onClick={() => { settled.current = undefined; setPins(new Map()); }}>Reset layout{pins.size ? ` · ${pins.size} pinned` : ''}</button></div>
     <p className={s.dragHint}>Flow moves toward models → · drag to pin · arrow keys to move · Escape to release</p>
     <div className={s.mapScroll}><div ref={ref} className={s.map} style={{ minHeight: Math.max(740, (layout.vertices.filter(v => v.kind === 'model' || v.kind === 'alias').length - 1) * 32 + 160) }} aria-label="Fleet relationship graph">
-    <div className={s.flowGuides} aria-hidden="true"><span>CONTEXT</span><span>PROJECT → API → HOST → SEAT</span><span>MODELS / INFERENCE</span></div>
+    <div className={s.flowGuides} aria-hidden="true">{layout.vertices.some((v) => v.kind === 'repository' || v.kind.startsWith('context:')) ? <><span>CONTEXT</span><span>PROJECT → API → HOST → SEAT</span></> : <><span>PROJECTS</span><span>API → HOST → SEAT</span></>}<span>MODELS / INFERENCE</span></div>
     <svg className={s.wires} width="100%" height="100%" viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true">
       <defs><marker id={arrowId} markerWidth="8" markerHeight="8" refX="25" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z" fill="#80bdcf" /></marker></defs>
       {graph.edges.map((e) => <path markerEnd={e.flow ? `url(#${arrowId})` : undefined} key={e.id} className={`${s.wire} ${e.flow ? s.flowWire : s.observed} ${focused && !focusedEdges.has(e.id) ? s.dim : ''} ${focusedEdges.has(e.id) ? s.focusWire : ''}`} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} />)}

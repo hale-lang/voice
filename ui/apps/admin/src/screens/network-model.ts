@@ -43,8 +43,11 @@ export function requestContext(record: UsageRecord, contexts?: Fleet['contexts']
   return { repository: record.metadata.repository?.trim() || undefined, ...(instance ? { apiInstance: instance } : {}), ...contexts?.[record.id] };
 }
 
+/** What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source. */
+export type GraphOptions = { context?: boolean };
+
 /** Each request is a hyperedge: a correlated set of participants, rendered as links. */
-export function buildGraph(fleet: Fleet): Graph {
+export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   const vertices = new Map<string, Vertex>();
   const edges = new Map<string, Edge>();
   const requests = new Map<string, RequestPath>();
@@ -138,15 +141,15 @@ export function buildGraph(fleet: Fleet): Graph {
       // a resolution, not a hop: the flow reaches the model through its account
       join(named, target);
     } else member('model', r.requested_model);
-    if (context.repository) join(project, member('repository', context.repository, 'Caller-supplied metadata.repository; a label, not verified repository ownership.'));
+    if (options.context && context.repository) join(project, member('repository', context.repository, 'Caller-supplied metadata.repository; a label, not verified repository ownership.'));
     // its conversation, the prompt_cache_key it was sent with: whatever client
-    if (r.conversation) {
+    if (options.context && r.conversation) {
       const c = member('context:conversation', r.conversation, "The request's conversation: the prompt_cache_key its client sent, as its usage record keeps it.");
       const v = vertices.get(c);
       if (v && !v.href) v.href = link('usage', 'c', r.conversation);
       join(project, c);
     }
-    for (const [key, value] of Object.entries(r.metadata)) {
+    if (options.context) for (const [key, value] of Object.entries(r.metadata)) {
       if (key === 'repository' || typeof value !== 'string' || !value.trim()) continue;
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));
     }
@@ -158,7 +161,11 @@ export function buildGraph(fleet: Fleet): Graph {
       const account = member('account', r.served.account);
       const servedModel = member('model', r.served.model, 'Model reported by the serving engine; the terminal inference target.');
       join(host, seat, true); join(seat, account, true); join(account, servedModel, true);
+      // the project reaches the host through the api instance that admitted
+      // it, or straight there when the record predates naming one: a
+      // project is never left apart from its flow
       if (api) join(api, host, true);
+      else join(project, host, true);
     }
     requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context });
   }

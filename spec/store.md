@@ -875,3 +875,46 @@ insert into annotation_rule (id, body, builtin) values ('answered', '{"name": "a
 insert into annotation_rule (id, body, builtin) values ('several-steps-complete', '{"name": "several steps, complete", "enabled": true, "condition": {"annotator": "request-basics", "question": "multi_step", "answer": "true", "min_probability": 0.5}, "expect": {"annotator": "response-basics", "question": "completeness", "at_least": "3"}}', true);
 insert into annotation_rule (id, body, builtin) values ('form-kept', '{"name": "a form asked, kept", "enabled": true, "expect": {"annotator": "response-basics", "question": "followed_format", "answer": "true"}}', true);
 ```
+
+### Migration 24: a system key per project, and conversations' titles
+
+The requests voice makes for a project (its annotations, its conversations'
+titles) are the project's own, under its system key, `<project>-system`:
+made with every project, an existing one here, it is internal, so no token
+names it, it is never revoked, and its requests are never peeked or
+annotated. They resolve the project's own aliases (`decide` for the
+annotators' decision model, `general` for titles) and spend its accounts.
+Their usage rows carry that key: they are left out of the project's usage
+and summaries, the project's limits and the usage told to the organization,
+held to the key's own limits alone. The global project that made them
+before, `voice-system` (migration 23), is retired: archived, its key
+revoked, its rows kept.
+
+An annotation is numbered as it is kept (`seq`), so the admin event stream
+tells each one. A conversation's title is written by the title annotator
+voice ships, `conversation-title`, on the conversation's first request and
+again when a later one is answered as another task; it is kept per project
+and conversation.
+
+```sql
+alter table api_key add column internal boolean not null default false;
+insert into api_key (id, project, name, prefix, secret_digest, created_at, internal) select id || '-system', id, id || '-system', '', '\x'::bytea, created_at, true from project where not internal on conflict (id) do nothing;
+update api_key set status = 'revoked', revoked_at = coalesce(revoked_at, now()) where id = 'voice-system';
+update project set status = 'archived', archived_at = coalesce(archived_at, now()) where id = 'voice-system';
+alter table annotation add column seq bigserial;
+create index annotation_by_seq on annotation (seq);
+create table conversation_title (
+  project      text not null references project,
+  conversation text not null,
+  title        text not null,
+  task         text not null default '', -- the request's task it was written under
+  model        text not null default '',
+  annotator    text not null,
+  version      int not null,
+  made_at      timestamptz not null,
+  primary key (project, conversation)
+);
+create index conversation_title_by_made on conversation_title (made_at desc);
+insert into annotator (id, version, body, builtin) values ('conversation-title', 1, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}', true) on conflict (id) do nothing;
+insert into annotator_version (annotator, version, body) values ('conversation-title', 1, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}') on conflict (annotator, version) do nothing;
+```

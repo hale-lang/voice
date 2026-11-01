@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Panel, Loading, Unavailable, count, ago } from '@hale/components';
-import { useGet, useGetOnce, type UsageRecord, type UsageSummary } from '../api/client';
+import { useGet, useGetOnce, useAnnotations, type UsageRecord, type UsageSummary, type Schemas } from '../api/client';
 import { readout } from '../readout';
+import { useTitles } from '../titles';
 import s from './Board.module.css';
 
 /** How far back the board looks, in seconds. */
@@ -52,14 +53,21 @@ function flights(groups: Group[]): Flight[] {
   return [...by.values()].sort((a, b) => Date.parse(b.last_at) - Date.parse(a.last_at)).slice(0, ROWS);
 }
 
-type Remark = { label: string; tone: 'live' | 'ok' | 'fail' | 'quiet' };
+type State = { label: string; tone: 'live' | 'ok' | 'fail' | 'quiet' };
 
-/** What the board says of a conversation: boarding while its turns keep coming, else how its last ended. */
-function remark(f: Flight, last: UsageRecord | undefined, now: number): Remark {
-  if (last && !FINE.has(last.status)) return { label: last.status.replace(/_/g, ' '), tone: 'fail' };
-  if (now - Date.parse(f.last_at) < ACTIVE * 1000) return { label: 'boarding', tone: 'live' };
-  return { label: f.turns > 1 ? 'landed' : 'served', tone: f.turns > 1 ? 'ok' : 'quiet' };
+/** A conversation's status: in flight while its turns keep coming, else how its latest ended (served, failed, refused). */
+function state(f: Flight, last: UsageRecord | undefined, now: number): State {
+  if (last && !FINE.has(last.status)) {
+    // a limit, a budget or no seat to take it: refused; anything else failed
+    const refused = last.status === 'rate_limited' || last.status === 'budget_exhausted' || last.status === 'no_capacity';
+    return { label: refused ? 'refused' : last.status === 'cancelled' ? 'cancelled' : 'failed', tone: 'fail' };
+  }
+  if (now - Date.parse(f.last_at) < ACTIVE * 1000) return { label: 'in flight', tone: 'live' };
+  return { label: 'served', tone: f.turns > 1 ? 'ok' : 'quiet' };
 }
+
+/** How long a request may wait for its annotation before the board stops saying it is coming, in seconds. */
+const ANNOTATING = 180;
 
 /** A hue of its own for each conversation, the same every time it shows. */
 function hue(root: string): number {
@@ -83,6 +91,9 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
   const [from] = useState(() => new Date(Date.now() - WINDOW * 1000).toISOString());
   const q = useGet('/admin/v1/usage/summary', { params: { query: { group_by: ['conversation'], from } } });
   const rows = useMemo(() => flights(q.data?.data ?? []), [q.data]);
+  // the projects that annotate: a turn of one waits for its tags
+  const projects = useGet('/admin/v1/projects');
+  const annotating = useMemo(() => new Set((projects.data?.data ?? []).filter((p) => p.annotates).map((p) => p.id)), [projects.data]);
   // the clock a remark reads, so boarding ends without a new turn
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -107,10 +118,10 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
             <span role="columnheader" className={s.num}>turns</span>
             <span role="columnheader" className={s.num}>in</span>
             <span role="columnheader" className={s.num}>out</span>
-            <span role="columnheader">remark</span>
+            <span role="columnheader">status · tags</span>
           </div>
           {rows.map((f) => (
-            <Row key={f.conversation ?? ''} flight={f} now={now} onOpen={onOpen} />
+            <Row key={f.conversation ?? ''} flight={f} now={now} annotating={annotating} onOpen={onOpen} />
           ))}
         </div>
       )}
@@ -119,18 +130,26 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
 }
 
 /** A conversation's row: its totals, and what its latest turn says. */
-function Row({ flight: f, now, onOpen }: { flight: Flight; now: number; onOpen: (f: Flight) => void }) {
+function Row({ flight: f, now, annotating, onOpen }: { flight: Flight; now: number; annotating: Set<string>; onOpen: (f: Flight) => void }) {
   const last = useGet('/admin/v1/usage/{request_id}', { params: { path: { request_id: f.last_request } } }).data;
   // the turn a title is read from: the first the board saw, so a new turn
   // does not fetch the recording again
   const [titled] = useState(f.last_request);
-  const r = remark(f, last, now);
+  const r = state(f, last, now);
+  const titleOf = useTitles();
+  const named = f.conversation ? titleOf(f.conversation, last?.project) : null;
   return (
     <button type="button" role="row" className={`${s.row} ${s[r.tone]}`} style={{ ['--hue' as string]: hue(f.conversation ?? '') }} onClick={() => onOpen(f)}>
       <span className={s.time}>{ago(f.last_at)}</span>
       {/* keyed by the latest turn: a new turn flips the title */}
       <span className={s.title} key={f.last_request}>
-        {f.conversation ? <Title last={last} id={titled} fallback={f.conversation} /> : <span className={s.key}>requests of no conversation</span>}
+        {named ? (
+          <span title={f.conversation ?? ''}>{named}</span>
+        ) : f.conversation ? (
+          <Title last={last} id={titled} fallback={f.conversation} />
+        ) : (
+          <span className={s.key}>requests of no conversation</span>
+        )}
       </span>
       <span className={s.cell}>{last?.project ?? ''}</span>
       <span className={s.cell}>
@@ -140,8 +159,65 @@ function Row({ flight: f, now, onOpen }: { flight: Flight; now: number; onOpen: 
       <span className={s.num}>{f.turns}</span>
       <span className={s.num}>{count(f.input)}</span>
       <span className={s.num}>{count(f.output)}</span>
-      <span className={s.remark}>{r.label}</span>
+      <span className={s.remark}>
+        <span className={s.state}>{r.label}</span>
+        <Tags id={f.last_request} waiting={!!last && annotating.has(last.project) && now - Date.parse(f.last_at) < ANNOTATING * 1000} />
+      </span>
     </button>
+  );
+}
+
+type Annotation = Schemas['Annotation'];
+const pct = (p: number) => `${Math.round(p * 100)}%`;
+
+/** The answers worth a chip: the request's task and the response's outcome first, then each yes, then any other choice. */
+function chips(a: Annotation): { label: string; title: string }[] {
+  const given = a.answers.filter((x) => !x.skipped && x.answer != null);
+  const head = (annotator: string, question: string) => given.find((x) => x.annotator === annotator && x.question === question);
+  const out: { label: string; title: string }[] = [];
+  const seen = new Set<string>();
+  const add = (x: (typeof given)[number], label: string) => {
+    const k = `${x.annotator}.${x.question}`;
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push({ label, title: `${k} = ${x.answer} · ${pct(x.probability)}` });
+  };
+  for (const [an, q] of [['request-basics', 'task'], ['response-basics', 'outcome']] as const) {
+    const x = head(an, q);
+    if (x) add(x, `${q}: ${x.answer!.replace(/_/g, ' ')}`);
+  }
+  for (const x of given) if (x.answer === 'true' && x.probability >= 0.5) add(x, x.question.replace(/_/g, '-'));
+  for (const x of given) if (x.answer !== 'true' && x.answer !== 'false' && x.score == null) add(x, `${x.question}: ${x.answer!.replace(/_/g, ' ')}`);
+  return out;
+}
+
+/**
+ * A turn's tags, as its annotation lands (the event stream's `annotation`
+ * refreshes it): its answers as chips, the probability on hover; a pending
+ * mark while it is still being read; a failed one's reason on hover.
+ */
+function Tags({ id, waiting }: { id: string; waiting: boolean }) {
+  // read as the conversation view reads it, one cache: none yet is null
+  const q = useAnnotations([id])[0]!;
+  const a = q.data;
+  if (!a) return waiting ? <span className={s.pending} title="its annotation is being read">annotating</span> : null;
+  if (a.status !== 'annotated') return <span className={s.failed} title={a.reason}>not annotated</span>;
+  const all = chips(a);
+  const shown = all.slice(0, 4);
+  const rest = all.slice(4);
+  return (
+    <>
+      {shown.map((c) => (
+        <span key={c.label} className={s.chip} title={c.title}>
+          {c.label}
+        </span>
+      ))}
+      {rest.length > 0 && (
+        <span className={s.chip} title={rest.map((c) => c.title).join('\n')}>
+          +{rest.length}
+        </span>
+      )}
+    </>
   );
 }
 

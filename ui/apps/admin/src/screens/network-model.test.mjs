@@ -292,3 +292,17 @@ test('a request draws its conversation, keyed by its prompt_cache_key whatever t
   const none = buildGraph({ ...fleet, usage: [{ ...record, conversation: null }] });
   assert(!none.vertices.some((v) => v.kind === 'context:conversation'), 'none without a conversation');
 });
+
+test("voice's own request for a project is drawn apart: project → its system key → model, dotted, never through the project's flow", () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const base = demoRequest(fleet, 1, 1_800_000_000_000);
+  const record = { ...base, id: 'resp_internal', key: `${base.project}-system`, internal: true, requested_model: 'decide', served: { ...base.served, model: 'jev-2b' }, metadata: { annotates: base.id, side: 'request' } };
+  const graph = buildGraph({ ...fleet, usage: [record] });
+  const key = entityId('system', `${base.project}-system`);
+  assert(graph.vertices.some((v) => v.id === key && v.kind === 'system'));
+  const edges = requestEdges(record, graph);
+  assert(edges.has(edgeId(entityId('project', base.project), key)));
+  assert(edges.has(edgeId(key, entityId('model', 'jev-2b'))));
+  assert.equal(requestFlowEdges(record, graph).size, 0, 'no flow: it never inflates the project');
+  assert(!graph.edges.some((e) => e.target === entityId('seat', base.served.seat) && e.flow), 'and it lights no seat');
+});

@@ -296,7 +296,7 @@ fn exercise(s: st::Store, label: String) {
         label + ": a key's last use",
     );
     let ks = s.keys("work") or st::KeyRows { };
-    std::test::assert_eq_int(count(ks.rows), 1, label + ": the project's keys");
+    std::test::assert_eq_int(count(ks.rows), 2, label + ": the project's keys, its system key too");
     let mut archived = pr2;
     archived.archived = true;
     archived.archived_at = at;
@@ -780,19 +780,127 @@ fn ledger(s: st::Store, label: String) {
 
 /// The operator token: none until one is kept, then the first one kept,
 /// whatever a later api mints.
-/// Voice's own project and its key, as a store has them from the start.
+/// A project is made with its own system key, which no token names; the
+/// requests voice makes for it are left out of its usage unless asked for;
+/// annotations are numbered as they are kept; conversations keep a title.
 fn system(s: st::Store, label: String) {
-    let p = s.project(st::SYSTEM_PROJECT) or st::ProjectRow { };
-    std::test::assert(p.present && p.internal, label + ": voice-system is there, internal");
-    std::test::assert(!p.annotate_set, label + ": annotating nothing of its own");
+    s.insert_project(
+        st::ProjectRow { id: "sysk", name: "Sysk", created_at: std::time::current() },
+        ch("create", "projects/sysk"),
+    ) or discard;
+    let k = s.key(st::system_key("sysk")) or st::KeyRow { };
     std::test::assert(
-        !p.accounts.any && count(p.accounts.names.items) == 0,
-        label + ": spending no account",
+        k.present && k.internal && k.project == "sysk" && k.name == "sysk-system",
+        label + ": a project's system key, made with it",
     );
-    let k = s.key(st::SYSTEM_PROJECT) or st::KeyRow { };
-    std::test::assert(k.present && k.project == st::SYSTEM_PROJECT, label + ": with its key");
     let none = s.key_by_digest("") or st::KeyRow { };
     std::test::assert(!none.present, label + ": which no token names");
+    let listed = s.keys("sysk") or st::KeyRows { };
+    std::test::assert_eq_int(count(listed.rows), 1, label + ": listed with its keys");
+    // its usage, apart
+    s.insert_usage(
+        st::UsageRow {
+            id: "u_caller",
+            project: "sysk",
+            key: "k_caller",
+            status: "served",
+            created_at: std::time::current(),
+            record: "{}",
+        },
+    ) or discard;
+    s.insert_usage(
+        st::UsageRow {
+            id: "u_voice",
+            project: "sysk",
+            key: "sysk-system",
+            status: "served",
+            created_at: std::time::current(),
+            record: "{}",
+        },
+    ) or discard;
+    let theirs = s.usage_rows(st::UsageQuery { project: "sysk" }) or st::UsageRows { };
+    std::test::assert_eq_int(
+        count(theirs.rows),
+        1,
+        label + ": a project's usage leaves voice's out",
+    );
+    let all = s.usage_rows(
+        st::UsageQuery { project: "sysk", include_internal: true },
+    ) or st::UsageRows { };
+    std::test::assert_eq_int(count(all.rows), 2, label + ": unless asked for");
+    let mut by = st::Names { };
+    push(by.items, "internal") or discard;
+    let split = s.usage_summary(
+        st::UsageSummaryQuery {
+            by: by,
+            q: st::UsageQuery { project: "sysk", include_internal: true },
+        },
+    ) or st::UsageGroups { };
+    std::test::assert_eq_int(count(split.rows), 2, label + ": grouped by internal, a line each");
+    let by_key = s.usage_rows(st::UsageQuery { key: "sysk-system" }) or st::UsageRows { };
+    std::test::assert_eq_int(count(by_key.rows), 1, label + ": or its key is");
+    // annotations numbered as they are kept
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "q_1",
+            project: "sysk",
+            key: "k_caller",
+            created_at: std::time::current(),
+        },
+        st::AnswerRows { },
+    ) or discard;
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "q_2",
+            project: "sysk",
+            key: "k_caller",
+            created_at: std::time::current(),
+        },
+        st::AnswerRows { },
+    ) or discard;
+    let marks = s.annotations_after(0, 10) or st::AnnotationRows { };
+    let one = at(marks.rows, count(marks.rows) - 2) or st::AnnotationRow { };
+    let two = at(marks.rows, count(marks.rows) - 1) or st::AnnotationRow { };
+    std::test::assert(
+        one.request_id == "q_1" && two.request_id == "q_2" && two.seq > one.seq,
+        label + ": oldest first, in the order kept",
+    );
+    let past = s.annotations_after(two.seq, 10) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(past.rows), 0, label + ": none past the last");
+    // a conversation's title, replaced
+    s.put_title(
+        st::TitleRow {
+            project: "sysk",
+            conversation: "c1",
+            title: "Sort a list",
+            task: "code",
+            model: "m",
+            annotator: "conversation-title",
+            version: 1,
+            made_at: std::time::current(),
+        },
+    ) or discard;
+    s.put_title(
+        st::TitleRow {
+            project: "sysk",
+            conversation: "c1",
+            title: "Fix the sort",
+            task: "debug",
+            model: "m",
+            annotator: "conversation-title",
+            version: 1,
+            made_at: std::time::current(),
+        },
+    ) or discard;
+    let t = s.title("sysk", "c1") or st::TitleRow { };
+    std::test::assert(
+        t.present && t.title == "Fix the sort" && t.task == "debug",
+        label + ": its title, replaced",
+    );
+    let titles = s.titles("sysk", "", 10) or st::TitleRows { };
+    std::test::assert_eq_int(count(titles.rows), 1, label + ": one a conversation");
+    let other = s.titles("", "c2", 10) or st::TitleRows { };
+    std::test::assert_eq_int(count(other.rows), 0, label + ": by conversation");
 }
 
 /// A request's annotation kept with its answers, an annotator's answers
@@ -800,7 +908,7 @@ fn system(s: st::Store, label: String) {
 /// annotators versioned, rules kept; and what voice ships there from the start.
 fn annotations(s: st::Store, label: String) {
     let built = s.annotators() or st::AnnotatorRows { };
-    std::test::assert_eq_int(count(built.rows), 2, label + ": the built-in annotators");
+    std::test::assert_eq_int(count(built.rows), 3, label + ": the built-in annotators");
     let req = s.annotator("request-basics") or st::AnnotatorRow { };
     std::test::assert(
         req.present && req.builtin && req.version == 1,
@@ -951,7 +1059,7 @@ fn annotations(s: st::Store, label: String) {
         "day",
     ) or st::TrendPoints { };
     std::test::assert_eq_int(count(day.rows), 2, label + ": a day, by answer");
-    // the recordings a backfill reads: the range before the limit, never voice-system's
+    // the recordings a backfill reads: the range before the limit, never a system key's
     s.put_peek(
         st::PeekRow {
             request_id: "rec_old",
@@ -988,8 +1096,8 @@ fn annotations(s: st::Store, label: String) {
     s.put_peek(
         st::PeekRow {
             request_id: "rec_sys",
-            project: st::SYSTEM_PROJECT,
-            key: st::SYSTEM_PROJECT,
+            project: "noted",
+            key: st::system_key("noted"),
             model: "m",
             created_at: `2026-10-31T09:00:00Z`,
             input: "{}",
@@ -1013,7 +1121,7 @@ fn annotations(s: st::Store, label: String) {
     std::test::assert_eq_str(
         (at(window.rows, 0) or st::PeekRow { }).request_id,
         "rec_mid",
-        label + ": inside it, never voice-system's",
+        label + ": inside it, never a system key's",
     );
     let older = s.recorded(
         "noted",
@@ -1176,15 +1284,6 @@ fn main() {
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
-    // as migration 23 makes it: made again here, as the migration's own
-    // statements do, since an earlier step over this database (CI's e2e)
-    // may have emptied its projects
-    pg.conn.exec(
-        "INSERT INTO project (id, name, owners, data_classes, accounts, internal) VALUES ('voice-system', 'voice-system', '{voice}', '{internal}', '{}', true) ON CONFLICT (id) DO NOTHING",
-    );
-    pg.conn.exec(
-        "INSERT INTO api_key (id, project, name, prefix, secret_digest) VALUES ('voice-system', 'voice-system', 'voice-system', '', '\\x'::bytea) ON CONFLICT (id) DO NOTHING",
-    );
     system(pg, "postgres");
     pg.conn.exec(
         "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
@@ -1202,8 +1301,10 @@ fn main() {
     operator(pg, "postgres");
     pg.conn.exec("TRUNCATE annotation_answer, annotation");
     pg.conn.exec(
-        "DELETE FROM annotator_version WHERE annotator NOT IN ('request-basics', 'response-basics')",
+        "DELETE FROM annotator_version WHERE annotator NOT IN ('request-basics', 'response-basics', 'conversation-title')",
     );
-    pg.conn.exec("DELETE FROM annotator WHERE id NOT IN ('request-basics', 'response-basics')");
+    pg.conn.exec(
+        "DELETE FROM annotator WHERE id NOT IN ('request-basics', 'response-basics', 'conversation-title')",
+    );
     annotations(pg, "postgres");
 }

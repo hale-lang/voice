@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Status, Form, Field, TextInput, TextArea, Select, Checkbox, Button, Confirm, when } from '@hale/components';
+import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Status, Form, Field, TextInput, TextArea, Select, Checkbox, Button, Confirm, when, ago, count } from '@hale/components';
 import { useGet, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -9,13 +9,16 @@ import { readout } from '../readout';
 type Annotator = Schemas['Annotator'];
 type Rule = Schemas['AnnotationRule'];
 type Question = Schemas['AnnotatorQuestion'];
+type Stage = Annotator['stage'];
 
 /**
  * The annotators: the questions a decision model is asked about each request
- * whose project or key annotates, at the request stage or the response's;
- * and the rules that pair their answers. Each edit of an annotator is a new
- * version, which every answer names. Voice ships two annotators and four
- * rules: edited and disabled, never removed.
+ * whose project or key annotates, at the request stage or the response's,
+ * and the one that writes a conversation's title; and the rules that pair
+ * their answers. Each edit of an annotator is a new version, which every
+ * answer names. Voice ships three annotators and four rules: edited and
+ * disabled, never removed. Each runs as a request of the project's system
+ * key, kept apart from its usage; an annotator's runs are counted here.
  */
 export function Annotators({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
@@ -53,7 +56,7 @@ export function Annotators({ route, setInspector }: ScreenProps) {
             { key: 'id', header: 'Annotator', render: (a) => <><Mono>{a.id}</Mono>{a.builtin && <span className="faint"> · voice's own</span>}</> },
             { key: 'name', header: 'Name', render: (a) => a.name },
             { key: 'stage', header: 'Stage', render: (a) => a.stage + (a.reads_request ? ' · reads the request\'s answers' : '') },
-            { key: 'q', header: 'Questions', num: true, render: (a) => a.questions.length },
+            { key: 'q', header: 'Questions', num: true, render: (a) => (a.stage === 'title' ? <span className="faint">a title</span> : a.questions.length) },
             { key: 'v', header: 'Version', num: true, render: (a) => a.version },
             { key: 'scope', header: 'Scope', render: (a) => scopeLine(a.scope) },
             { key: 'on', header: 'State', render: (a) => <Status tone={a.enabled ? 'active' : 'quiet'} label={a.enabled ? 'asking' : 'disabled'} /> },
@@ -119,8 +122,21 @@ function AnnotatorInspector({ annotator: a }: { annotator: Annotator }) {
           { k: 'edited', v: when(a.updated_at) },
         ]}
       />
-      <h3>Questions{version !== a.version ? ` at version ${version}` : ''}</h3>
-      {shown.questions.map((qn) => <QuestionView key={qn.name} q={qn} />)}
+      {shown.stage === 'title' && shown.title ? (
+        <>
+          <h3>Title{version !== a.version ? ` at version ${version}` : ''}</h3>
+          <p>
+            written by its project's <Mono>{shown.title.model}</Mono> model, at most {shown.title.max_output_tokens} tokens, on a conversation's first annotated request and when a later one is another task
+          </p>
+          <p className="muted">{shown.title.instruction}</p>
+        </>
+      ) : (
+        <>
+          <h3>Questions{version !== a.version ? ` at version ${version}` : ''}</h3>
+          {shown.questions.map((qn) => <QuestionView key={qn.name} q={qn} />)}
+        </>
+      )}
+      <Runs annotator={a.id} />
       <p style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
         <Button onClick={() => setEditing(true)}>edit: a new version</Button>
         <Button onClick={async () => { await w.write('patch', '/admin/v1/annotators/{annotator}', { params: { path: { annotator: a.id } }, body: { enabled: !a.enabled } }); }} disabled={w.busy}>
@@ -144,6 +160,52 @@ function QuestionView({ q }: { q: Question }) {
   );
 }
 
+const RANGES: Record<string, number> = { 'the last hour': 3600, 'the last day': 86400, 'the last week': 7 * 86400 };
+
+/** What an annotator's runs did over a range: runs, made, skipped and not made with why, tokens, and the newest error. */
+function Runs({ annotator }: { annotator: string }) {
+  const [range, setRange] = useState('the last day');
+  const [from] = useState(() => Date.now());
+  const since = new Date(from - (RANGES[range] ?? 86400) * 1000).toISOString();
+  const q = useGet('/admin/v1/annotators/{annotator}/stats', { params: { path: { annotator }, query: { from: since } } });
+  return (
+    <section>
+      <h3 style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
+        Runs <Select value={range} onChange={setRange} options={Object.keys(RANGES).map((value) => ({ value }))} />
+      </h3>
+      {q.isPending ? (
+        <Loading />
+      ) : q.isError ? (
+        <Unavailable what="Its runs" detail={q.error.message} />
+      ) : q.data.runs + q.data.not_annotated === 0 ? (
+        <p className="faint">No runs {range.replace('the last', 'in the last')}, of {q.data.annotations} annotations read.</p>
+      ) : (
+        <>
+          <Kv
+            rows={[
+              { k: 'runs', v: `${q.data.runs} of ${q.data.annotations} annotations` },
+              { k: 'made', v: String(q.data.annotated) },
+              { k: 'skipped', v: q.data.skipped ? <span className="faint">{q.data.skipped}: no question's condition held</span> : '0' },
+              { k: 'not made', v: q.data.not_annotated ? <span className="c-wait">{q.data.not_annotated}</span> : '0' },
+              { k: 'tokens', v: `${count(q.data.input_tokens)} in, ${count(q.data.output_tokens)} out, under each project's system key` },
+              ...(q.data.last_error ? [{ k: 'last error', v: <span className="c-fail" title={q.data.last_error}>{q.data.last_error}{q.data.last_error_at ? ` · ${ago(q.data.last_error_at)}` : ''}</span> }] : []),
+            ]}
+          />
+          {q.data.reasons.length > 0 && (
+            <div className="muted">
+              {q.data.reasons.map((r) => (
+                <div key={r.reason}>
+                  {r.count} × {r.reason}
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
 /** Ask this annotator of past requests whose recording still exists (peek, seven days). */
 function Backfill({ annotator: a }: { annotator: Annotator }) {
   const w = useWrite();
@@ -162,7 +224,7 @@ function Backfill({ annotator: a }: { annotator: Annotator }) {
       <Field label="past requests" help="the newest 200 recorded (peek keeps a request seven days); voice keeps no other text">
         <Select value={project} onChange={setProject} empty="every project" options={(projects.data?.data ?? []).filter((p) => !p.internal).map((p) => ({ value: p.id }))} />
       </Field>
-      {queued != null && <p className="muted">{queued} recorded request{queued === 1 ? '' : 's'} being asked, as voice-system's requests</p>}
+      {queued != null && <p className="muted">{queued} recorded request{queued === 1 ? '' : 's'} being asked, as each project's system key's requests</p>}
     </Form>
   );
 }
@@ -174,8 +236,11 @@ function AnnotatorEditor({ annotator: a, done }: { annotator?: Annotator; done?:
   const w = useWrite();
   const [id, setId] = useState('');
   const [name, setName] = useState(a?.name ?? '');
-  const [stage, setStage] = useState<'request' | 'response'>(a?.stage ?? 'request');
+  const [stage, setStage] = useState<Stage>(a?.stage ?? 'request');
   const [questions, setQuestions] = useState(a ? JSON.stringify(a.questions, null, 2) : '');
+  const [titleModel, setTitleModel] = useState(a?.title?.model ?? 'general');
+  const [instruction, setInstruction] = useState(a?.title?.instruction ?? 'Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes. Answer with the title alone.');
+  const [maxTokens, setMaxTokens] = useState(String(a?.title?.max_output_tokens ?? 24));
   const [reads, setReads] = useState(a?.reads_request ?? false);
   const [projects, setProjects] = useState((a?.scope.projects ?? []).join(', '));
   const [keys, setKeys] = useState((a?.scope.keys ?? []).join(', '));
@@ -185,6 +250,15 @@ function AnnotatorEditor({ annotator: a, done }: { annotator?: Annotator; done?:
     <Form
       error={bad ?? w.error}
       onSubmit={async () => {
+        const scope = { projects: list(projects), keys: list(keys) };
+        if (stage === 'title') {
+          setBad(null);
+          const title = { model: titleModel.trim(), instruction, max_output_tokens: Number(maxTokens) };
+          if (a) {
+            if (await w.write('patch', '/admin/v1/annotators/{annotator}', { params: { path: { annotator: a.id } }, body: { name, scope, title } })) done?.();
+          } else if (await w.write('post', '/admin/v1/annotators', { body: { id, name, stage, questions: [], scope, title, reads_request: false, enabled: true } })) go('annotators', id);
+          return;
+        }
         let parsed: Question[];
         try {
           parsed = JSON.parse(questions) as Question[];
@@ -193,7 +267,6 @@ function AnnotatorEditor({ annotator: a, done }: { annotator?: Annotator; done?:
           return;
         }
         setBad(null);
-        const scope = { projects: list(projects), keys: list(keys) };
         if (a) {
           if (await w.write('patch', '/admin/v1/annotators/{annotator}', { params: { path: { annotator: a.id } }, body: { name, questions: parsed, scope, reads_request: reads } })) done?.();
         } else if (await w.write('post', '/admin/v1/annotators', { body: { id, name, stage, questions: parsed, scope, reads_request: reads, enabled: true } })) go('annotators', id);
@@ -215,14 +288,28 @@ function AnnotatorEditor({ annotator: a, done }: { annotator?: Annotator; done?:
         <TextInput value={name} onChange={setName} required />
       </Field>
       {!a && (
-        <Field label="stage" help="request: asked of the request's text; response: of its response, read beside the request">
-          <Select value={stage} onChange={(v) => setStage(v as 'request' | 'response')} options={[{ value: 'request' }, { value: 'response' }]} />
+        <Field label="stage" help="request: asked of the request's text; response: of its response, read beside the request; title: writes the conversation's title with the project's text model">
+          <Select value={stage} onChange={(v) => setStage(v as Stage)} options={[{ value: 'request' }, { value: 'response' }, { value: 'title' }]} />
         </Field>
       )}
       {stage === 'response' && <Checkbox checked={reads} onChange={setReads} label="reads the request's answers too (its answers are marked conditioned)" />}
-      <Field label="questions" required help={`choice (1–255 options), noul (yes or no), score (2–10 integer levels in order); a response question may carry a condition on a request answer. e.g. ${QUESTION_HELP}`}>
-        <TextArea mono rows={14} value={questions} onChange={setQuestions} required />
-      </Field>
+      {stage === 'title' ? (
+        <>
+          <Field label="model" required help="the alias its project gives a text model, e.g. general (a decision model writes no text)">
+            <TextInput mono value={titleModel} onChange={setTitleModel} required />
+          </Field>
+          <Field label="instruction" required>
+            <TextArea rows={4} value={instruction} onChange={setInstruction} required />
+          </Field>
+          <Field label="at most tokens" help="4 to 64">
+            <TextInput mono value={maxTokens} onChange={setMaxTokens} />
+          </Field>
+        </>
+      ) : (
+        <Field label="questions" required help={`choice (1–255 options), noul (yes or no), score (2–10 integer levels in order); a response question may carry a condition on a request answer. e.g. ${QUESTION_HELP}`}>
+          <TextArea mono rows={14} value={questions} onChange={setQuestions} required />
+        </Field>
+      )}
       <Field label="projects" help="its scope: these projects and their children; with no keys either, every request that annotates">
         <TextInput mono value={projects} onChange={setProjects} placeholder="work, research" />
       </Field>

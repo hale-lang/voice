@@ -228,7 +228,7 @@ import json, sys
 m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
 assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
 PY
-curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 2, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
 curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and not p.get("parent"), p' || { echo "the habitat's project is not as it should be"; exit 1; }
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
@@ -244,7 +244,7 @@ curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -
 [ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
 # renamed by the operator, it is still the tenant's: rotated, the old value
 # stops and the new one serves; removed, it stops
-tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')
+tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print([k for k in json.load(sys.stdin)["data"] if not k["internal"]][0]["id"])')
 curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys/$tkey" -H 'content-type: application/json' -d '{"name": "organism a"}' >/dev/null
 tenant_new=$(openssl rand -hex 16)
 printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
@@ -253,28 +253,16 @@ printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
 echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
-# a tenant is never voice's own project: in a habitat named voice, the
-# member labelled system names voice-system (`<habitat>-<label>`), and its
-# key is refused, nothing provisioned for it (api/tenants.hl, annotate.hl)
-SYSTEM_PORT=${SYSTEM_PORT:-18097}
-system_key=$(openssl rand -hex 16)
-printf '%s' "$system_key" >"$work/vault/secret-dna_voice-tenant-key--system"
-chmod 600 "$work/vault/secret-dna_voice-tenant-key--system"
-# an api of its own, in memory, on ports of its own (its probes too)
-HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_voice-tenant-key-- HALE_DNA_HABITAT_NAME=voice \
-  VOICE_PROBE_PORT="$((SYSTEM_PORT + 2))" VOICE_HUB_PORT="$((SYSTEM_PORT + 1))" \
-  api/api --port "$SYSTEM_PORT" --nats "$NATS_URL" --state "$work/state-system" >"$work/api-system.log" 2>&1 &
-system_pid=$!
-pids+=($system_pid)
-for i in $(seq 1 50); do curl -fsS "http://127.0.0.1:$SYSTEM_PORT/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
-curl -fsS "http://127.0.0.1:$SYSTEM_PORT/healthz" >/dev/null 2>&1 || { echo "the voice habitat's api did not start"; cat "$work/api-system.log"; exit 1; }
-code=$(curl -s -o "$work/system.out" -w '%{http_code}' "http://127.0.0.1:$SYSTEM_PORT/v1/models" -H "Authorization: Bearer $system_key" || true)
-[ "$code" = 401 ] || { echo "a tenant labelled system was let in as voice-system ($code): $(cat "$work/system.out")"; exit 1; }
-api/api admin-token --state "$work/state-system" >"$work/admin-system.token"
-curl -fsS -H "Authorization: Bearer $(cat "$work/admin-system.token")" "http://127.0.0.1:$SYSTEM_PORT/admin/v1/projects/voice-system/keys" \
-  | python3 -c 'import json,sys; ks=json.load(sys.stdin)["data"]; assert [k["id"] for k in ks] == ["voice-system"], ks' || { echo "a key was provisioned in voice-system"; exit 1; }
-kill "$system_pid" 2>/dev/null || true
-echo "a tenant labelled system in a habitat named voice is no caller of voice-system"
+# every project has its own system key for the requests voice makes for it
+# (annotate.hl): listed with its keys, internal, and no token names it
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects" \
+  | python3 -c 'import json,sys; print("\n".join(p["id"] for p in json.load(sys.stdin)["data"] if p["status"] == "active"))' >"$work/projects.txt"
+while read -r pid; do
+  curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/$pid/keys" \
+    | python3 -c 'import json,sys; pid=sys.argv[1]; ks={k["id"]: k for k in json.load(sys.stdin)["data"]}; k=ks.get(pid + "-system"); assert k and k["internal"] and k["status"] == "active", (pid, list(ks))' "$pid" \
+    || { echo "project $pid has no system key"; exit 1; }
+done <"$work/projects.txt"
+echo "every project has its system key, internal"
 
 # grafted: the nodes' account on the broker, as registration hands it over.
 # laptop serves only because it connected with it (the broker takes no

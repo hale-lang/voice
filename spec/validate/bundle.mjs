@@ -101,6 +101,8 @@ const MAP = {
   AnnotationRuleList: 'GET /admin/v1/annotation-rules',
   AnnotationFacets: 'AnnotationFacets',
   AnnotationTrend: 'AnnotationTrend',
+  AnnotatorStats: 'AnnotatorStats',
+  ConversationTitleList: 'GET /admin/v1/conversations',
   ServedBy: 'Served',
   BudgetRequest: 'BudgetSet',
   LimitsRequest: 'LimitSet',
@@ -126,7 +128,7 @@ const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
-const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend']);
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend', 'AnnotatorStats', 'ConversationTitleList']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;

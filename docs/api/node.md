@@ -346,6 +346,9 @@ Type: object
 
 One rate limit. Null counters are unlimited. `remaining` and
 `resets_at` are read-only and ignored on writes.
+A project's limits (and its model-scope ones) count its callers'
+requests, never voice's own for it under its system key
+(`Key.internal`): only limits set on that key cap those.
 
 Type: object
 

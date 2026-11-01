@@ -21,14 +21,22 @@
 // an annotation is read, so a rule changed applies to old annotations too.
 // Voice ships four, the same way.
 //
-// The questions are asked as requests of voice's own project,
-// `voice-system` (st::SYSTEM_PROJECT), under its key of the same id, which
-// no token names: their usage, limits, budget and accounts are its own, so
-// an annotation never spends what the caller's project may.
-// `voice-system`'s `decide` alias names the decision model asked, and its
-// accounts what it may spend; with neither, nothing is asked, and the
-// annotation says why. A decision model is asked, never a generative one,
-// and never as the caller.
+// The questions are asked as requests of the caller's project under its
+// system key (st::system_key, `<project>-system`), which no token names:
+// the project's own `decide` alias names the decision model asked, and its
+// accounts what is spent. Their usage is kept apart from its callers' (left
+// out of the project's usage, its limits and what is told to the
+// organization), held to the system key's own limits alone. With no
+// decision model behind `decide`, nothing is asked, and the annotation says
+// why; turning annotate on is refused then (projects.hl). A decision model
+// is asked, never a generative one, and never as the caller.
+//
+// A third stage, `title`, writes a conversation's title: the project's text
+// model (the annotator's `title.model`, `general` by default) asked for a
+// few words on the conversation's first request, and again when a later
+// request is answered as another `task`. Voice ships one,
+// `conversation-title`. Each run (a stage asked, or a title written) is
+// kept with the annotation: what asked it, its model, tokens and time.
 //
 // One decision request a stage carries every annotator's questions there,
 // so the text is read once; a response stage asks twice when some of its
@@ -60,14 +68,26 @@ const STAGE_QUESTIONS_MAX: Int = 64;
 
 // ---- annotators ---------------------------------------------------------
 
-type AnnotatorStage = enum { request, response };
+type AnnotatorStage = enum { request, response, title };
 
 fn stage_name(s: AnnotatorStage) -> String {
     return match s {
         AnnotatorStage::request -> "request",
         AnnotatorStage::response -> "response",
+        AnnotatorStage::title -> "title",
     };
 }
+
+/// A title annotator's model, by the alias its project gives it, and what
+/// it is asked: a title of a few words for a conversation.
+type AnnotatorTitle {
+    model: String = "general";
+    instruction: String = "";
+    max_output_tokens: Int = 24;
+}
+
+/// The most a title may be, in bytes: what a model writes past it is cut.
+const TITLE_MAX: Int = 120;
 
 /// The requests an annotator reads, of those that annotate: these projects'
 /// (and their children's) and these keys'; both empty, every one.
@@ -87,6 +107,9 @@ type AnnotatorCreate {
     scope: AnnotatorScope = AnnotatorScope { };
     reads_request: Bool = false;
     enabled: Bool = true;
+    // a `title` annotator's model and instruction
+    has_title: Bool = false;
+    title: AnnotatorTitle = AnnotatorTitle { };
 }
 
 /// `AnnotatorUpdate`, for the annotator the path names: what it sets makes a
@@ -107,6 +130,8 @@ type AnnotatorUpdate {
     reads_request: Bool = false;
     has_enabled: Bool = false;
     enabled: Bool = true;
+    has_title: Bool = false;
+    title: AnnotatorTitle = AnnotatorTitle { };
 }
 
 /// An annotator at its current version, or at `version` (0: its current).
@@ -123,6 +148,9 @@ type Annotator {
     reads_request: Bool = false;
     enabled: Bool = true;
     builtin: Bool = false;
+    // a `title` annotator's model and instruction
+    has_title: Bool = false;
+    title: AnnotatorTitle = AnnotatorTitle { };
     created_at: Time = `1970-01-01T00:00:00Z`;
     updated_at: Time = `1970-01-01T00:00:00Z`;
 }
@@ -247,9 +275,31 @@ type AnnotationSummary {
     status: AnnotationStatus = AnnotationStatus::annotated;
     reason: String = "";
     clipped: Bool = false;
+    // the conversation's title, when this request's annotation wrote it
+    has_title: Bool = false;
+    title: String = "";
 }
 
 type AnnotationList { data: bounded[AnnotationSummary; 200]; }
+
+/// `AnnotationRun`: one request voice made for an annotation, under the
+/// project's system key: a stage's questions asked, or a title written.
+type AnnotationRun {
+    // request | response | title
+    stage: String = "";
+    // the annotators it asked for, `<id>@<version>` each
+    annotators: bounded[String; 64];
+    has_request_id: Bool = false;
+    request_id: String = "";
+    has_model: Bool = false;
+    model: String = "";
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    ms: Int = 0;
+    // annotated | skipped | not_annotated
+    status: String = "";
+    reason: String = "";
+}
 
 /// `AnnotationAnswer`: `answer` null when skipped, `score` for a score.
 type AnnotationAnswer {
@@ -293,7 +343,56 @@ type Annotation {
     input_tokens: Int = 0;
     answers: bounded[AnnotationAnswer; 128];
     pairs: bounded[AnnotationPair; 64];
+    // each request voice made for it, in order
+    runs: bounded[AnnotationRun; 8];
+    has_title: Bool = false;
+    title: String = "";
 }
+
+/// `GET /admin/v1/annotators/{annotator}/stats`'s: the annotator, and the
+/// times of the annotations read (RFC 3339 text).
+type AnnotatorStatsAsk { annotator: String; from: String = ""; to: String = ""; }
+
+/// A reason annotations were not made, and how many.
+type ReasonCount { reason: String = ""; count: Int = 0; }
+
+/// `AnnotatorStats`: what one annotator's runs did, over the newest 200
+/// annotations in the range.
+type AnnotatorStats {
+    annotator: String = "";
+    // the annotations read, of the newest 200 in the range
+    annotations: Int = 0;
+    runs: Int = 0;
+    annotated: Int = 0;
+    skipped: Int = 0;
+    not_annotated: Int = 0;
+    reasons: bounded[ReasonCount; 32];
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    has_last_error: Bool = false;
+    last_error: String = "";
+    has_last_error_at: Bool = false;
+    last_error_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// `GET /admin/v1/conversations`'s filters.
+type ConversationAsk { project: String = ""; conversation: String = ""; limit: Int = -1; }
+
+/// `ConversationTitle`: a conversation's title, as the title annotator
+/// last wrote it.
+type ConversationTitle {
+    project: String = "";
+    conversation: String = "";
+    title: String = "";
+    has_task: Bool = false;
+    task: String = "";
+    model: String = "";
+    annotator: String = "";
+    version: Int = 0;
+    made_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type ConversationTitleList { data: bounded[ConversationTitle; 500]; }
 
 type AnswerCountView { answer: String = ""; count: Int = 0; }
 
@@ -383,6 +482,8 @@ locus Annotators {
             c.scope,
             c.reads_request,
             c.enabled,
+            c.has_title,
+            c.title,
         ) or raise;
         let now = now_seconds();
         let row = st::AnnotatorRow {
@@ -430,6 +531,8 @@ locus Annotators {
             if u.has_scope { u.scope } else { before.scope },
             if u.has_reads_request { u.reads_request } else { before.reads_request },
             if u.has_enabled { u.enabled } else { before.enabled },
+            u.has_title || before.has_title,
+            if u.has_title { u.title } else { before.title },
         ) or raise;
         let mut row = cur;
         row.version = cur.version + 1;
@@ -480,6 +583,76 @@ locus Annotators {
         if !a.present || a.removed { fail missing("no annotator " + id); }
         return a;
     }
+
+    /// `annotatorStats`: its runs over the newest 200 annotations in the
+    /// range: how many asked it, what they came to, why not, and what
+    /// they spent.
+    @unbounded
+    fn stats(a: AnnotatorStatsAsk) -> AnnotatorStats fallible(CtlError) {
+        let q = answer_query("", "", "", "", "", 0.0, a.from, a.to) or raise;
+        let mut ask = q;
+        ask.limit = 200;
+        self.gate.enter();
+        self.known(a.annotator) or {
+            self.gate.leave();
+            fail err;
+        };
+        let rows = self.store.annotations(ask) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotatorStats { annotator: a.annotator };
+        for r in rows.rows {
+            out.annotations = out.annotations + 1;
+            let runs = std::str::trim(std::json::find_field_raw(r.body, "runs"));
+            let mut ran = false;
+            let mut it = std::json::array_first(runs);
+            while !it.done {
+                let run = it.element;
+                it = std::json::array_next(it);
+                if !lists_annotator(std::json::find_field_raw(run, "annotators"), a.annotator) {
+                    continue;
+                }
+                ran = true;
+                out.runs = out.runs + 1;
+                out.input_tokens = out.input_tokens
+                    + std::json::find_int_field(run, "input_tokens");
+                out.output_tokens = out.output_tokens
+                    + std::json::find_int_field(run, "output_tokens");
+                let status = std::json::find_string_field(run, "status");
+                if status == "annotated" {
+                    out.annotated = out.annotated + 1;
+                } else if status == "skipped" {
+                    out.skipped = out.skipped + 1;
+                } else {
+                    out.not_annotated = out.not_annotated + 1;
+                    let why = std::json::find_string_field(run, "reason");
+                    out = counted_reason(out, why);
+                    if !out.has_last_error {
+                        out.has_last_error = true;
+                        out.last_error = why;
+                        out.has_last_error_at = true;
+                        out.last_error_at = r.created_at;
+                    }
+                }
+            }
+            // not annotated before any run, with it in force
+            if !ran && r.status == "not_annotated"
+                && lists_annotator(std::json::find_field_raw(r.body, "panel"), a.annotator)
+            {
+                out.not_annotated = out.not_annotated + 1;
+                out = counted_reason(out, r.reason);
+                if !out.has_last_error {
+                    out.has_last_error = true;
+                    out.last_error = r.reason;
+                    out.has_last_error_at = true;
+                    out.last_error_at = r.created_at;
+                }
+            }
+        }
+        return out;
+    }
 }
 
 /// An annotator's row as the contract's `Annotator`.
@@ -497,13 +670,23 @@ fn annotator_view(r: st::AnnotatorRow) -> Annotator {
         push(scope.keys, json_text(it.element)) or discard;
         it = std::json::array_next(it);
     }
+    let stage = std::json::find_string_field(b, "stage");
+    let t = std::json::find_field_raw(b, "title");
     return Annotator {
         id: r.id,
         name: std::json::find_string_field(b, "name"),
-        stage: if std::json::find_string_field(b, "stage") == "response" {
+        stage: if stage == "response" {
             AnnotatorStage::response
+        } else if stage == "title" {
+            AnnotatorStage::title
         } else {
             AnnotatorStage::request
+        },
+        has_title: stage == "title",
+        title: AnnotatorTitle {
+            model: std::json::find_string_field(t, "model"),
+            instruction: std::json::find_string_field(t, "instruction"),
+            max_output_tokens: std::json::find_int_field(t, "max_output_tokens"),
         },
         version: r.version,
         questions: std::json::Value::parse(
@@ -539,10 +722,25 @@ fn annotator_body(
     questions: String,
     scope: AnnotatorScope,
     reads_request: Bool,
-    enabled: Bool
+    enabled: Bool,
+    has_title: Bool,
+    title: AnnotatorTitle
 ) -> String fallible(CtlError) {
     let sname = stage_name(stage);
     let qs = std::str::trim(questions);
+    if stage == AnnotatorStage::title {
+        return title_body(
+            store,
+            name,
+            qs,
+            scope,
+            reads_request,
+            enabled,
+            has_title,
+            title,
+        ) or raise;
+    }
+    if has_title { fail bad("only a `title` annotator has `title`", "title"); }
     if !std::str::starts_with(qs, "[") {
         fail bad("`questions` is a list of questions", "questions");
     }
@@ -606,6 +804,57 @@ fn annotator_body(
         + st::jnames(scope.keys) + "}, \"reads_request\": " + jbool(reads_request)
         + ", \"enabled\": "
         + jbool(enabled) + "}";
+}
+
+/// A `title` annotator's body: no questions, its model (an alias its
+/// project gives a text model) and its instruction, its scope as any
+/// annotator's.
+fn title_body(
+    store: st::Store,
+    name: String,
+    questions: String,
+    scope: AnnotatorScope,
+    reads_request: Bool,
+    enabled: Bool,
+    has_title: Bool,
+    title: AnnotatorTitle
+) -> String fallible(CtlError) {
+    if len(questions) > 0 && questions != "[]" && questions != "null" {
+        fail bad("a `title` annotator asks no questions: it writes a title", "questions");
+    }
+    if reads_request {
+        fail bad("only a response annotator reads the request's answers", "reads_request");
+    }
+    if !has_title {
+        fail bad("a `title` annotator needs `title`: its model and instruction", "title");
+    }
+    if !is_slug(title.model) {
+        fail bad(
+            "`title.model` is the alias of a text model its project gives, such as general",
+            "title"
+        );
+    }
+    let instruction = std::str::trim(title.instruction);
+    if len(instruction) == 0 || len(instruction) > 1000 {
+        fail bad("`title.instruction` is 1 to 1000 characters", "title");
+    }
+    if title.max_output_tokens < 4 || title.max_output_tokens > 64 {
+        fail bad("`title.max_output_tokens` is 4 to 64", "title");
+    }
+    for p in scope.projects {
+        let row = store.project(p) or fail store_down(err);
+        if !row.present { fail bad("no project " + p, "scope"); }
+    }
+    for k in scope.keys {
+        let row = store.key(k) or fail store_down(err);
+        if !row.present { fail bad("no key " + k, "scope"); }
+    }
+    return "{\"name\": " + jq(name)
+        + ", \"stage\": \"title\", \"questions\": [], \"title\": {\"model\": "
+        + jq(title.model) + ", \"instruction\": " + jq(instruction) + ", \"max_output_tokens\": "
+        + to_string(title.max_output_tokens) + "}, \"scope\": {\"projects\": "
+        + st::jnames(scope.projects) + ", \"keys\": " + st::jnames(scope.keys)
+        + "}, \"reads_request\": false, \"enabled\": " + jbool(enabled) + "}";
 }
 
 /// How many members a JSON array has.
@@ -1114,11 +1363,54 @@ locus Annotations {
             has_model: len(model) > 0,
             model: model,
             input_tokens: std::json::find_int_field(row.body, "input_tokens"),
+            has_title: s.has_title,
+            title: s.title,
         };
+        let mut it = std::json::array_first(
+            std::str::trim(std::json::find_field_raw(row.body, "runs")),
+        );
+        while !it.done {
+            push(out.runs, run_view(it.element)) or discard;
+            it = std::json::array_next(it);
+        }
         for a in answers.rows { push(out.answers, answer_view(a)) or discard; }
         for rule in rules.rows {
             let v = rule_view(rule);
             if v.enabled { push(out.pairs, scored(v, answers)) or discard; }
+        }
+        return out;
+    }
+
+    /// `listConversationTitles`: the newest made first, at most `limit`
+    /// (100 by default, 500 at most).
+    fn titles(a: ConversationAsk) -> ConversationTitleList fallible(CtlError) {
+        let mut limit = 100;
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > 500 { fail bad("`limit` is 1 to 500", "limit"); }
+            limit = a.limit;
+        }
+        self.gate.enter();
+        let rows = self.store.titles(a.project, a.conversation, limit) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = ConversationTitleList { };
+        for t in rows.rows {
+            push(
+                out.data,
+                ConversationTitle {
+                    project: t.project,
+                    conversation: t.conversation,
+                    title: t.title,
+                    has_task: len(t.task) > 0,
+                    task: t.task,
+                    model: t.model,
+                    annotator: t.annotator,
+                    version: t.version,
+                    made_at: t.made_at,
+                },
+            ) or discard;
         }
         return out;
     }
@@ -1259,7 +1551,64 @@ fn summary_of(r: st::AnnotationRow) -> AnnotationSummary {
         },
         reason: r.reason,
         clipped: r.clipped,
+        has_title: len(std::json::find_string_field(r.body, "title")) > 0,
+        title: std::json::find_string_field(r.body, "title"),
     };
+}
+
+/// One kept run (`run_json`) as the contract's `AnnotationRun`.
+fn run_view(raw: String) -> AnnotationRun {
+    let request_id = std::json::string_field(raw, "request_id");
+    let model = std::json::string_field(raw, "model");
+    let mut out = AnnotationRun {
+        stage: std::json::find_string_field(raw, "stage"),
+        has_request_id: request_id.kind == "string",
+        request_id: request_id.text,
+        has_model: model.kind == "string",
+        model: model.text,
+        input_tokens: std::json::find_int_field(raw, "input_tokens"),
+        output_tokens: std::json::find_int_field(raw, "output_tokens"),
+        ms: std::json::find_int_field(raw, "ms"),
+        status: std::json::find_string_field(raw, "status"),
+        reason: std::json::find_string_field(raw, "reason"),
+    };
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(raw, "annotators")),
+    );
+    while !it.done {
+        push(out.annotators, json_text(it.element)) or discard;
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// Whether a run, or a panel, lists `annotator` (at any version).
+fn lists_annotator(names: String, annotator: String) -> Bool {
+    let mut it = std::json::array_first(std::str::trim(names));
+    while !it.done {
+        let n = json_text(it.element);
+        it = std::json::array_next(it);
+        if n == annotator || std::str::starts_with(n, annotator + "@") { return true; }
+    }
+    return false;
+}
+
+/// `ReasonCount`s with `reason` counted once more.
+fn counted_reason(stats: AnnotatorStats, reason: String) -> AnnotatorStats {
+    let mut out = stats;
+    let mut next = AnnotatorStats { };
+    let mut found = false;
+    for r in stats.reasons {
+        if r.reason == reason {
+            push(next.reasons, ReasonCount { reason: r.reason, count: r.count + 1 }) or discard;
+            found = true;
+        } else {
+            push(next.reasons, r) or discard;
+        }
+    }
+    if !found { push(next.reasons, ReasonCount { reason: reason, count: 1 }) or discard; }
+    out.reasons = next.reasons;
+    return out;
 }
 
 fn answer_view(a: st::AnswerRow) -> AnnotationAnswer {
@@ -1385,7 +1734,9 @@ type AnnotationJob {
     present: Bool = false;
 }
 
-/// One decision request's answers: kept rows, and its model and tokens.
+/// One request voice made for the annotation: a stage's questions asked of
+/// the decision model, or a title written. `run` is its record, kept with
+/// the annotation (`AnnotationRun`).
 type Asked {
     ok: Bool = false;
     reason: String = "";
@@ -1393,12 +1744,14 @@ type Asked {
     request_id: String = "";
     model: String = "";
     tokens: Int = 0;
+    run: String = "";
 }
 
 /// The annotators asked of one request: their current versions, by stage.
 type Panel {
     request: st::AnnotatorRows = st::AnnotatorRows { };
     response: st::AnnotatorRows = st::AnnotatorRows { };
+    title: st::AnnotatorRows = st::AnnotatorRows { };
 }
 
 /// A request's texts as a decision model reads them, and whether either
@@ -1408,27 +1761,27 @@ type Texts { request: String = ""; response: String = ""; clipped: Bool = false;
 locus AnnotationRunner {
     params {
         store: st::Store;
-        // voice-system's requests are served as any project's are: its own
-        // limits, held in its own counters
+        // a project's system key's requests are served as any are: its
+        // own limits, held in its own counters
         inference: Inference;
     }
 
     /// `j` annotated by the annotators in force for it, or why not, kept.
     /// Never fails the caller, who has had its answer: a store that cannot
-    /// keep it is logged.
+    /// keep it is logged. A system key's own requests are never annotated.
     @unbounded
     fn annotate(j: AnnotationJob) {
-        if !j.present || j.project == st::SYSTEM_PROJECT { return; }
+        if !j.present || j.key == st::system_key(j.project) { return; }
         let panel = self.panel(j) or {
             self.keep(
-                not_annotated(j, "failed: the store did not answer (" + err.message + ")"),
+                not_annotated(j, "failed: the store did not answer (" + err.message + ")", "", ""),
                 st::AnswerRows { },
             );
             return;
         };
-        if count(panel.request.rows) + count(panel.response.rows) == 0 {
+        if count(panel.request.rows) + count(panel.response.rows) + count(panel.title.rows) == 0 {
             self.keep(
-                not_annotated(j, "no annotator is in force for its project and key"),
+                not_annotated(j, "no annotator is in force for its project and key", "", ""),
                 st::AnswerRows { },
             );
             return;
@@ -1442,27 +1795,34 @@ locus AnnotationRunner {
     @unbounded
     fn backfill(j: AnnotationJob, annotator: st::AnnotatorRow) {
         let mut panel = Panel { };
-        if annotator_view(annotator).stage == AnnotatorStage::request {
+        let stage = annotator_view(annotator).stage;
+        if stage == AnnotatorStage::request {
             push(panel.request.rows, annotator) or discard;
-        } else {
+        } else if stage == AnnotatorStage::response {
             push(panel.response.rows, annotator) or discard;
+        } else {
+            push(panel.title.rows, annotator) or discard;
         }
         let kept = self.store.answers(j.request_id) or st::AnswerRows { };
         self.ask_panel(j, panel, kept, true);
     }
 
-    /// The panel's questions asked, and what they answered kept with the
-    /// annotation; `kept`, request answers given before (a backfill's).
+    /// The panel's questions asked, its title written, and what they gave
+    /// kept with the annotation; `kept`, request answers given before (a
+    /// backfill's).
     @unbounded
     fn ask_panel(j: AnnotationJob, panel: Panel, kept: st::AnswerRows, backfill: Bool) {
-        let why = self.unready(j);
+        let names = panel_names(panel);
+        let deciding = count(panel.request.rows) + count(panel.response.rows) > 0;
+        let why = if deciding { self.unready(j) } else { "" };
         if len(why) > 0 {
-            if !backfill { self.keep(not_annotated(j, why), st::AnswerRows { }); }
+            self.fail(j, why, names, "", backfill);
             return;
         }
         let texts = texts_of(j);
         let mut answers = st::AnswerRows { };
         let by = st::JsonList { };
+        let runs = st::JsonList { };
         let mut model = "";
         let mut tokens = 0;
         // the request's answers: asked now, else those kept
@@ -1476,15 +1836,18 @@ locus AnnotationRunner {
                 st::AnswerRows { },
                 texts.request,
             );
+            if len(asked.run) > 0 { runs.add(asked.run); }
             if !asked.ok {
-                if !backfill { self.keep(not_annotated(j, asked.reason), st::AnswerRows { }); }
+                self.fail(j, asked.reason, names, runs.text(), backfill);
                 return;
             }
             answers = asked.answers;
             request_answers = asked.answers;
-            by.add(jq(asked.request_id));
-            model = asked.model;
-            tokens = tokens + asked.tokens;
+            if len(asked.request_id) > 0 {
+                by.add(jq(asked.request_id));
+                model = asked.model;
+                tokens = tokens + asked.tokens;
+            }
         }
         if count(panel.response.rows) > 0 {
             let state = "The request:\n" + clipped(texts.request, ANNOTATE_REQUEST_TEXT / 2)
@@ -1515,8 +1878,9 @@ locus AnnotationRunner {
                         state
                     },
                 );
+                if len(asked.run) > 0 { runs.add(asked.run); }
                 if !asked.ok {
-                    if !backfill { self.keep(not_annotated(j, asked.reason), st::AnswerRows { }); }
+                    self.fail(j, asked.reason, names, runs.text(), backfill);
                     return;
                 }
                 for a in asked.answers.rows { push(answers.rows, a) or discard; }
@@ -1527,6 +1891,16 @@ locus AnnotationRunner {
                 }
             }
         }
+        // the conversation's title, from the first of the title annotators
+        // in force: written on its first request, and again when this one
+        // is answered as another task
+        let mut title = "";
+        let first = at(panel.title.rows, 0) or st::AnnotatorRow { };
+        if first.present && len(j.conversation) > 0 {
+            let written = self.title(j, first, texts.request, task_of(request_answers));
+            if len(written.run) > 0 { runs.add(written.run); }
+            if written.ok && len(written.reason) > 0 { title = written.reason; }
+        }
         let mut row = st::AnnotationRow {
             request_id: j.request_id,
             project: j.project,
@@ -1536,17 +1910,40 @@ locus AnnotationRunner {
             status: "annotated",
             clipped: texts.clipped,
             body: "{\"by\": [" + by.text() + "], \"model\": " + jq(model) + ", \"input_tokens\": "
-                + to_string(tokens) + "}",
+                + to_string(tokens) + ", \"panel\": " + names + ", \"runs\": [" + runs.text() + "]"
+                + (if len(title) > 0 { ", \"title\": " + jq(title) } else { "" }) + "}",
         };
         if backfill {
-            // the annotation it had keeps its own record of what asked
             let had = self.store.annotation(j.request_id) or st::AnnotationRow { };
             if had.present && had.status == "annotated" {
-                row.body = had.body;
+                // the annotation it had keeps its own record of what asked,
+                // and gains the runs this backfill made
+                row.body = with_runs(had.body, runs.text());
                 row.clipped = had.clipped || texts.clipped;
+            } else if had.present {
+                // one not made before is made now: the runs it made then,
+                // which spent tokens, before this backfill's
+                row.body = with_prior_runs(row.body, runs_of(had.body));
             }
         }
         self.keep(row, answers);
+    }
+
+    /// `j` not annotated, and why, its runs so far kept (each made one a
+    /// request that spent tokens). A backfill leaves the annotation it had
+    /// as it was but for those runs, added to its record.
+    fn fail(j: AnnotationJob, why: String, names: String, runs: String, backfill: Bool) {
+        if backfill {
+            let had = self.store.annotation(j.request_id) or st::AnnotationRow { };
+            if had.present {
+                if len(runs) == 0 { return; }
+                let mut row = had;
+                row.body = with_runs(had.body, runs);
+                self.keep(row, st::AnswerRows { });
+                return;
+            }
+        }
+        self.keep(not_annotated(j, why, names, runs), st::AnswerRows { });
     }
 
     fn keep(row: st::AnnotationRow, answers: st::AnswerRows) {
@@ -1571,45 +1968,31 @@ locus AnnotationRunner {
             if !v.enabled || !in_scope(v.scope, p, j.key) { continue; }
             if v.stage == AnnotatorStage::request {
                 push(out.request.rows, a) or discard;
-            } else {
+            } else if v.stage == AnnotatorStage::response {
                 push(out.response.rows, a) or discard;
+            } else {
+                push(out.title.rows, a) or discard;
             }
         }
         return out;
     }
 
-    /// Why voice-system cannot ask about `j` now, "" when it can: its
-    /// `decide` names no decision model, or its project may not read `j`'s
-    /// data.
+    /// Why `j`'s project cannot have its questions asked now, "" when it
+    /// can: its `decide` names no decision model.
     fn unready(j: AnnotationJob) -> String {
-        let p = self.store.project(st::SYSTEM_PROJECT) or {
+        let p = self.store.project(j.project) or {
             return "failed: the store did not answer (" + err.message + ")";
         };
-        if !p.present { return "voice-system is missing: the store has not been migrated"; }
-        let target = alias_target(self.store, p, ANNOTATE_MODEL) or {
+        let why = decision_problem(self.store, p) or {
             return "failed: the store did not answer (" + err.message + ")";
         };
-        let named = if len(target) > 0 { target } else { ANNOTATE_MODEL };
-        let m = self.store.model(named) or {
-            return "failed: the store did not answer (" + err.message + ")";
-        };
-        if !m.present || m.removed {
-            return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
-        }
-        if m.contract != "decision" {
-            return "no decision model: voice-system's `decide` is " + m.id
-                + ", which is not a decision model";
-        }
-        if !has_name(p.data_classes.items, j.data_class) {
-            return "voice-system may not read data of class " + j.data_class
-                + " (give it that data class)";
-        }
-        return "";
+        return why;
     }
 
     /// The questions of `group`, at `stage`, asked of `state` in one
-    /// voice-system request; a response question whose condition does not
-    /// hold on `request_answers` is not asked, and kept skipped.
+    /// request of `j`'s project's system key; a response question whose
+    /// condition does not hold on `request_answers` is not asked, and kept
+    /// skipped.
     @unbounded
     fn ask(
         j: AnnotationJob,
@@ -1641,29 +2024,69 @@ locus AnnotationRunner {
                 asking = asking + 1;
             }
         }
-        if asking == 0 { return out; }
+        let annotators = group_names(group);
+        if asking == 0 {
+            out.run = run_json(
+                stage,
+                annotators,
+                "",
+                "",
+                0,
+                0,
+                0,
+                "skipped",
+                "every question's condition does not hold",
+            );
+            return out;
+        }
         let body = "{\"model\": " + jq(ANNOTATE_MODEL) + ", \"input\": " + jq(state)
             + ", \"text\": {\"format\": {\"type\": \"json_schema\", \"name\": " + jq(stage)
             + ", \"schema\": {\"type\": \"object\", \"properties\": {" + props.text()
             + "}}}}, \"metadata\": {\"annotates\": " + jq(j.request_id) + ", \"side\": " + jq(stage)
             + "}, \"voice\": {\"data_class\": " + jq(j.data_class) + "}}";
+        let started = std::time::monotonic_ns();
         let r = read_inference(body, "responses") or {
-            return Asked { reason: "failed: " + err.message };
+            let why = "failed: " + err.message;
+            return Asked {
+                reason: why,
+                run: run_json(stage, annotators, "", "", 0, 0, 0, "not_annotated", why),
+            };
         };
-        let who = std::api::Principal {
-            mode: "internal",
-            name: st::SYSTEM_PROJECT,
-            via: "internal",
+        let s = self.inference.serve(r, system_context(j.project)) or {
+            let why = refusal_reason(err, j.project);
+            return Asked {
+                reason: why,
+                run: run_json(
+                    stage,
+                    annotators,
+                    "",
+                    "",
+                    0,
+                    0,
+                    elapsed_ms(started),
+                    "not_annotated",
+                    why,
+                ),
+            };
         };
-        let ctx = std::api::Context { caller: who, role: "caller", via: "internal" };
-        let s = self.inference.serve(r, ctx) or {
-            return Asked { reason: refusal_reason(err) };
-        };
+        let ms = elapsed_ms(started);
         // its answers, each question's probabilities (inference.hl)
         let given = std::str::trim(s.voice.decision);
         if !std::json::valid_object(given) {
+            let why = "failed: " + s.voice.served.model + " gave no decision answers";
             return Asked {
-                reason: "failed: " + s.voice.served.model + " gave no decision answers",
+                reason: why,
+                run: run_json(
+                    stage,
+                    annotators,
+                    s.request_id,
+                    s.voice.served.model,
+                    s.input_tokens,
+                    s.output_tokens,
+                    ms,
+                    "not_annotated",
+                    why,
+                ),
             };
         }
         for a in group.rows {
@@ -1684,8 +2107,191 @@ locus AnnotationRunner {
         out.request_id = s.request_id;
         out.model = s.voice.served.model;
         out.tokens = s.input_tokens;
+        out.run = run_json(
+            stage,
+            annotators,
+            s.request_id,
+            out.model,
+            s.input_tokens,
+            s.output_tokens,
+            ms,
+            "annotated",
+            "",
+        );
         return out;
     }
+
+    /// `j`'s conversation's title, written by `a`'s model when it has none,
+    /// or when `task` is not the task it was written under; `reason` holds
+    /// the title written, "" when none was. A run is said only when one
+    /// was written, or failed.
+    @unbounded
+    fn title(j: AnnotationJob, a: st::AnnotatorRow, request: String, task: String) -> Asked {
+        let had = self.store.title(j.project, j.conversation) or {
+            return Asked { ok: false };
+        };
+        if had.present && (len(task) == 0 || task == had.task) { return Asked { ok: true }; }
+        let v = annotator_view(a);
+        let names = "[" + jq(a.id + "@" + to_string(a.version)) + "]";
+        let body = "{\"model\": " + jq(v.title.model) + ", \"instructions\": "
+            + jq(v.title.instruction) + ", \"input\": "
+            + jq(clipped(request, ANNOTATE_RESPONSE_TEXT / 4)) + ", \"max_output_tokens\": "
+            + to_string(v.title.max_output_tokens) + ", \"metadata\": {\"annotates\": "
+            + jq(j.request_id) + ", \"side\": \"title\"}, \"voice\": {\"data_class\": "
+            + jq(j.data_class) + "}}";
+        let started = std::time::monotonic_ns();
+        let r = read_inference(body, "responses") or {
+            let why = "failed: " + err.message;
+            return Asked { run: run_json("title", names, "", "", 0, 0, 0, "not_annotated", why) };
+        };
+        let s = self.inference.serve(r, system_context(j.project)) or {
+            let why = title_refusal(err, j.project, v.title.model);
+            return Asked {
+                run: run_json(
+                    "title",
+                    names,
+                    "",
+                    "",
+                    0,
+                    0,
+                    elapsed_ms(started),
+                    "not_annotated",
+                    why,
+                ),
+            };
+        };
+        let ms = elapsed_ms(started);
+        let written = title_text(s.text);
+        let run = run_json(
+            "title",
+            names,
+            s.request_id,
+            s.voice.served.model,
+            s.input_tokens,
+            s.output_tokens,
+            ms,
+            if len(written) > 0 { "annotated" } else { "not_annotated" },
+            if len(written) > 0 {
+                ""
+            } else {
+                "failed: " + s.voice.served.model + " wrote no title"
+            },
+        );
+        if len(written) == 0 { return Asked { run: run }; }
+        self.store.put_title(
+            st::TitleRow {
+                project: j.project,
+                conversation: j.conversation,
+                title: written,
+                task: task,
+                model: s.voice.served.model,
+                annotator: a.id,
+                version: a.version,
+                made_at: now_seconds(),
+            },
+        ) or {
+            return Asked { run: run };
+        };
+        return Asked { ok: true, reason: written, run: run };
+    }
+}
+
+/// The caller voice's own requests for `project` are made as: its system
+/// key, which no token names.
+fn system_context(project: String) -> std::api::Context {
+    let who = std::api::Principal {
+        mode: "internal",
+        name: st::system_key(project),
+        via: "internal",
+    };
+    return std::api::Context { caller: who, role: "caller", via: "internal" };
+}
+
+/// Why `p` has no decision model to ask its annotators' questions, "" when
+/// it has one: its `decide` alias (its own, else its parent's) names none,
+/// or names a generative model.
+fn decision_problem(store: st::Store, p: st::ProjectRow) -> String fallible(st::StoreError) {
+    let target = alias_target(store, p, ANNOTATE_MODEL) or raise;
+    let named = if len(target) > 0 { target } else { ANNOTATE_MODEL };
+    let m = store.model(named) or raise;
+    if !m.present || m.removed {
+        return "no decision model: project " + p.id
+            + " names none `decide` (give it a `decide` alias)";
+    }
+    if m.contract != "decision" {
+        return "no decision model: project " + p.id + "'s `decide` is " + m.id
+            + ", which is not a decision model";
+    }
+    return "";
+}
+
+/// The task the request stage answered, "" when none was asked.
+fn task_of(answers: st::AnswerRows) -> String {
+    for a in answers.rows {
+        if a.stage == "request" && a.question == "task" && !a.skipped { return a.answer; }
+    }
+    return "";
+}
+
+/// A title as a model wrote it, made a title: its first line, without the
+/// quotes and the full stop it may add, at most `TITLE_MAX` bytes.
+fn title_text(raw: String) -> String {
+    let mut t = std::str::trim(raw);
+    let nl = std::str::index_of(t, "\n");
+    if nl >= 0 { t = std::str::trim(t[0..nl]); }
+    while len(t) > 0 && (std::str::starts_with(t, "\"") || std::str::starts_with(t, "'")) {
+        t = std::str::trim(t[1..len(t)]);
+    }
+    while len(t) > 0
+        && (
+            std::str::ends_with(t, "\"")
+                || std::str::ends_with(t, "'")
+                || std::str::ends_with(t, ".")
+        )
+    {
+        t = std::str::trim(t[0..(len(t) - 1)]);
+    }
+    if len(t) > TITLE_MAX { t = t[0..utf8_start(t, TITLE_MAX)]; }
+    return t;
+}
+
+/// The annotators of `group`, `<id>@<version>` each, as a JSON list.
+fn group_names(group: st::AnnotatorRows) -> String {
+    let l = st::JsonList { };
+    for a in group.rows { l.add(jq(a.id + "@" + to_string(a.version))); }
+    return "[" + l.text() + "]";
+}
+
+/// Every annotator of the panel, `<id>@<version>` each, as a JSON list.
+fn panel_names(p: Panel) -> String {
+    let l = st::JsonList { };
+    for a in p.request.rows { l.add(jq(a.id + "@" + to_string(a.version))); }
+    for a in p.response.rows { l.add(jq(a.id + "@" + to_string(a.version))); }
+    for a in p.title.rows { l.add(jq(a.id + "@" + to_string(a.version))); }
+    return "[" + l.text() + "]";
+}
+
+/// One run as the annotation keeps it (`AnnotationRun`).
+fn run_json(
+    stage: String,
+    annotators: String,
+    request_id: String,
+    model: String,
+    input_tokens: Int,
+    output_tokens: Int,
+    ms: Int,
+    status: String,
+    reason: String
+) -> String {
+    return "{\"stage\": " + jq(stage) + ", \"annotators\": " + annotators + ", \"request_id\": "
+        + jstring_or_null(len(request_id) > 0, request_id) + ", \"model\": "
+        + jstring_or_null(len(model) > 0, model) + ", \"input_tokens\": " + to_string(input_tokens)
+        + ", \"output_tokens\": " + to_string(output_tokens) + ", \"ms\": " + to_string(ms)
+        + ", \"status\": " + jq(status) + ", \"reason\": " + jq(reason) + "}";
+}
+
+fn elapsed_ms(started: Int) -> Int {
+    return (std::time::monotonic_ns() - started) / 1000000;
 }
 
 /// Whether a request of `p` (or its parent) and `key` is in `scope`.
@@ -1700,7 +2306,12 @@ fn in_scope(scope: AnnotatorScope, p: st::ProjectRow, key: String) -> Bool {
     return false;
 }
 
-fn not_annotated(j: AnnotationJob, reason: String) -> st::AnnotationRow {
+fn not_annotated(
+    j: AnnotationJob,
+    reason: String,
+    panel: String,
+    runs: String
+) -> st::AnnotationRow {
     return st::AnnotationRow {
         request_id: j.request_id,
         project: j.project,
@@ -1709,7 +2320,60 @@ fn not_annotated(j: AnnotationJob, reason: String) -> st::AnnotationRow {
         created_at: j.created_at,
         status: "not_annotated",
         reason: reason,
+        body: "{\"panel\": " + (if len(panel) > 0 { panel } else { "[]" }) + ", \"runs\": [" + runs
+            + "]}",
     };
+}
+
+/// The runs an annotation's body records, comma-joined; "" for none.
+fn runs_of(body: String) -> String {
+    let r = std::str::trim(std::json::find_field_raw(std::str::trim(body), "runs"));
+    return if std::str::starts_with(r, "[") { std::str::trim(r[1..(len(r) - 1)]) } else { "" };
+}
+
+/// An annotation's body with `prior` runs put before the ones it records.
+@unbounded
+fn with_prior_runs(body: String, prior: String) -> String {
+    if len(prior) == 0 { return body; }
+    let mine = runs_of(body);
+    let b = std::str::trim(body);
+    let out = st::JsonList { };
+    let mut it = std::json::object_first(b);
+    while !it.done {
+        let k = std::json::obj_key_string(it, b);
+        if k != "runs" { out.add(jq(k) + ": " + std::str::trim(std::json::obj_value_raw(it, b))); }
+        it = std::json::object_next(it, b);
+    }
+    out.add("\"runs\": [" + prior + (if len(mine) > 0 { ", " + mine } else { "" }) + "]");
+    return "{" + out.text() + "}";
+}
+
+/// An annotation's body with `runs` (run objects, comma-joined) added after
+/// the runs it records.
+@unbounded
+fn with_runs(body: String, runs: String) -> String {
+    let b = std::str::trim(body);
+    if len(runs) == 0 || !std::json::valid_object(b) { return b; }
+    let out = st::JsonList { };
+    let mut had = "";
+    let mut it = std::json::object_first(b);
+    while !it.done {
+        let k = std::json::obj_key_string(it, b);
+        let v = std::str::trim(std::json::obj_value_raw(it, b));
+        if k == "runs" {
+            had = v;
+        } else {
+            out.add(jq(k) + ": " + v);
+        }
+        it = std::json::object_next(it, b);
+    }
+    let inner = if std::str::starts_with(had, "[") {
+        std::str::trim(had[1..(len(had) - 1)])
+    } else {
+        ""
+    };
+    out.add("\"runs\": [" + inner + (if len(inner) > 0 { ", " } else { "" }) + runs + "]");
+    return "{" + out.text() + "}";
 }
 
 fn answer_row(
@@ -1828,14 +2492,31 @@ fn request_block(answers: st::AnswerRows) -> String {
     return std::str::from_bytes(b.snapshot() or b"");
 }
 
-/// Why voice-system's request was refused, as an annotation says it.
-fn refusal_reason(e: ApiError) -> String {
-    if e.status == 429 { return "voice-system is past its limits: " + e.message; }
+/// Why a decision request of `project`'s system key was refused, as an
+/// annotation says it.
+fn refusal_reason(e: ApiError, project: String) -> String {
+    if e.status == 429 {
+        return "project " + project + "'s system key is past its limits: " + e.message;
+    }
     if e.code == ErrorCode::model_not_found {
-        return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
+        return "no decision model: project " + project
+            + " names none `decide` (give it a `decide` alias)";
     }
     if e.status == 403 || e.code == ErrorCode::no_eligible_seat {
-        return "voice-system may not use its decision model: " + e.message;
+        return "project " + project + " may not use its decision model: " + e.message;
+    }
+    return "failed: " + e.message;
+}
+
+/// Why a title request of `project`'s system key was refused.
+fn title_refusal(e: ApiError, project: String, model: String) -> String {
+    if e.status == 429 {
+        return "project " + project + "'s system key is past its limits: " + e.message;
+    }
+    if e.code == ErrorCode::model_not_found {
+        return "no text model: project " + project + " names none `" + model + "` (give it a `"
+            + model
+            + "` alias)";
     }
     return "failed: " + e.message;
 }

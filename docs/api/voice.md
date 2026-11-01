@@ -179,7 +179,7 @@ client can pace itself instead of discovering the wall by failing.
 - [capabilities](#tag-capabilities) (1)
 - [projects](#tag-projects) (9)
 - [keys](#tag-keys) (5)
-- [usage](#tag-usage) (10)
+- [usage](#tag-usage) (11)
 - [models](#tag-models) (5)
 - [recipes](#tag-recipes) (4)
 - [runtimes](#tag-runtimes) (4)
@@ -191,7 +191,7 @@ client can pace itself instead of discovering the wall by failing.
 - [routes](#tag-routes) (2)
 - [node](#tag-node) (8)
 - [health](#tag-health) (2)
-- [annotations](#tag-annotations) (10)
+- [annotations](#tag-annotations) (11)
 - [Schemas](#schemas)
 
 ## Authentication
@@ -468,7 +468,7 @@ Schema: [ProjectCreate](#schema-projectcreate)
 | `id` | [ProjectIdValue](#schema-projectidvalue) | yes |  |  |
 | `name` | string | yes |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not peek. A request is recorded when its project peeks or its key does. |  |
-| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked as requests of `voice-system`, voice's own project, whose usage, limits and accounts they spend, never this one's. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
+| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | The names it gives models: a caller asks for `coding` and is served the catalog model the alias names, moved out of band. Voice's categories (`general`, `coding`, `reasoning`, `decide`) are the names it suggests. A child's are its own over its parent's, name by name. | items ≤ 32 |
 | `owners` | array of string |  | Principals who may administer the project. The creator is always added. |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
@@ -535,7 +535,7 @@ Schema: [ProjectUpdate](#schema-projectupdate)
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is recorded whole (`listPeeks`), kept seven days. |  |
-| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as `voice-system`'s requests. `voice-system` itself never annotates. |  |
+| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases, whole; its parent's still apply where it gives none. | items ≤ 32 |
 | `owners` | array of string |  |  |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  |  |  |
@@ -554,6 +554,7 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 409 | The request conflicts with the state it meets (a resource with that id exists, a restriction a key outruns). `Hale-Error-Class: conflict`. | `application/json` [AdminConflict](#schema-adminconflict) |
 | 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
@@ -566,7 +567,9 @@ Authentication: operatorToken
 Archiving revokes the project's keys and refuses new requests. Its
 usage history stays queryable; the id is never reused. The change
 log records each key's revocation under the key, with the archive.
-Voice's own project, `voice-system`, is never archived (`409`).
+The retired `voice-system` project, voice's old project for its own
+requests (now each project's system key's), is never archived again
+(`409`). Archiving a project revokes its system key with its keys.
 
 Parameters:
 
@@ -778,7 +781,7 @@ Schema: [KeyCreate](#schema-keycreate)
 |---|---|---|---|---|
 | `name` | string | yes | Name the client this key is for; usage is broken down by key. | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. A request is recorded when its project or its key peeks. |  |
-| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as `voice-system`'s requests. A request is annotated when its project or its key annotates. |  |
+| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as requests of its project's system key; refused (`409`) while its project's `decide` names no decision model. A request is annotated when its project or its key annotates. |  |
 | `models` | array \| null |  | Restrict the key to these models. Null means the project's catalog. |  |
 | `accounts` | array \| null |  | Restrict the key to these accounts, within the project's. Null means the project's. A key for client work names the work account here, so everything it sends is billed there. |  |
 | `limits` | array of [Limit](#schema-limit) |  | Key-scope limits, on top of the project's. |  |
@@ -793,6 +796,7 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 409 | The request conflicts with the state it meets (a resource with that id exists, a restriction a key outruns). `Hale-Error-Class: conflict`. | `application/json` [AdminConflict](#schema-adminconflict) |
 | 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
@@ -842,7 +846,7 @@ Schema: [KeyUpdate](#schema-keyupdate)
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. A request is recorded when its project or its key peeks. |  |
-| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as `voice-system`'s requests. A request is annotated when its project or its key annotates. |  |
+| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as requests of its project's system key; refused (`409`) while its project's `decide` names no decision model. A request is annotated when its project or its key annotates. |  |
 | `models` | array \| null |  |  |  |
 | `accounts` | array \| null |  |  |  |
 | `limits` | array of [Limit](#schema-limit) |  |  |  |
@@ -858,6 +862,7 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 409 | The request conflicts with the state it meets (a resource with that id exists, a restriction a key outruns). `Hale-Error-Class: conflict`. | `application/json` [AdminConflict](#schema-adminconflict) |
 | 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
@@ -867,7 +872,9 @@ Responses:
 
 Authentication: operatorToken
 
-Revocation is immediate at the coordinator; in-flight requests finish. `voice-system`'s own key, which no token names, is never revoked (`409`).
+Revocation is immediate at the coordinator; in-flight requests finish.
+A project's system key (`Key.internal`), which no token names, is
+never revoked (`409`); archive the project instead.
 
 Parameters:
 
@@ -915,6 +922,7 @@ Parameters:
 | `to` | query | string (date-time) |  |  |
 | `limit` | query | integer |  |  |
 | `cursor` | query | string |  |  |
+| `include_internal` | query | boolean |  | Voice's own requests for its projects, under each project's system key (`UsageRecord.internal`: annotations, conversation titles), are left out unless this is `true`, or `key` names a system key. |
 
 Responses:
 
@@ -935,13 +943,18 @@ Totals of requests, tokens and spend, grouped by any of project, key,
 model, account, seat, node, conversation and time bucket. The
 tracking view: what each project and each of its keys spent over a
 period, and which account paid for it. Groups come most recently
-active first: at most 1000, the least recent left out.
+active first: at most 1000, the least recent left out. Voice's own
+requests for its projects (their system keys') are left out of the
+totals unless `include_internal` is `true`. Grouped by `internal`
+too (`"true"` or `"false"`), they are a line of their own: with
+`group_by=account,internal&include_internal=true`, each account's
+spend for its callers and what voice itself spent through it.
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
-| `group_by` | query | array of string, one of `project`, `key`, `model`, `account`, `seat`, `node`, `conversation`, `day`, `hour` | yes |  |
+| `group_by` | query | array of string, one of `project`, `key`, `model`, `account`, `seat`, `node`, `conversation`, `internal`, `day`, `hour` | yes |  |
 | `project` | query | array of string |  | Only these projects. Repeatable. |
 | `key` | query | array of string |  | Only these keys. Repeatable. |
 | `model` | query | array of string |  | Only these requested models. Repeatable. |
@@ -950,6 +963,7 @@ Parameters:
 | `metadata` | query | string |  | Only requests whose `metadata` has every pair asked: one pair written `name=value`, or several as a JSON object of them, `{"name": "value", …}` (at most 16), all of which must match. The parameter is given once. |
 | `from` | query | string (date-time) |  |  |
 | `to` | query | string (date-time) |  |  |
+| `include_internal` | query | boolean |  | Voice's own requests for its projects, under each project's system key (`UsageRecord.internal`: annotations, conversation titles), are left out unless this is `true`, or `key` names a system key. |
 
 Responses:
 
@@ -1030,6 +1044,36 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/conversations`
+
+**List conversations' titles** · `listConversationTitles`
+
+Authentication: operatorToken
+
+Conversations' titles, the newest written first: a project's (its
+children's too), or one conversation's. A title is written by the
+title annotator (`AnnotatorStage` `title`) on a conversation's first
+annotated request, and again when a later one is answered as
+another task.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `project` | query | string |  | Only this project's requests. |
+| `conversation` | query | string |  | Only the turns of this conversation (`UsageRecord.conversation`). |
+| `limit` | query | integer |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The titles. | `application/json` object |
+| 400 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/admin/v1/annotations`
@@ -1173,7 +1217,8 @@ requests whose recording still exists (`peek`, seven days), the
 newest 200 at most that `project`, `key`, `from` and `to` keep.
 Voice keeps no other text, so a request not recorded cannot be. It
 answers at once with how many it will ask about, then asks, as
-`voice-system`'s requests; each answer names the version asked.
+requests of each one's project's system key; each answer names the
+version asked.
 A response annotator reads the request answers already kept.
 
 Request body
@@ -2678,7 +2723,8 @@ Schema: [AnnotatorCreate](#schema-annotatorcreate)
 | `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `name` | string | yes |  | length ≥ 1; length ≤ 128 |
 | `stage` | [AnnotatorStage](#schema-annotatorstage) | yes |  |  |
-| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) | yes | Its questions. The enabled annotators of one stage ask at most 64 together, in one request to the decision model; at most 64 KiB as JSON. | items ≥ 1; items ≤ 64 |
+| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) | yes | Its questions, at least one; a `title` annotator asks none (`[]`). The enabled annotators of one stage ask at most 64 together, in one request to the decision model; at most 64 KiB as JSON. | items ≤ 64 |
+| `title` | [AnnotatorTitle](#schema-annotatortitle) |  | A `title` annotator's model and instruction, which it needs; no other has one. |  |
 | `scope` | [AnnotatorScope](#schema-annotatorscope) |  |  |  |
 | `reads_request` | boolean |  | A response annotator that also reads the request's answers, as a short labelled block beside the text: its answers are `conditioned`, searchable apart from those given on the text alone. | default `false` |
 | `enabled` | boolean |  |  | default `true` |
@@ -2746,10 +2792,11 @@ Schema: [AnnotatorUpdate](#schema-annotatorupdate)
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `name` | string |  |  | length ≥ 1; length ≤ 128 |
-| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) |  |  | items ≥ 1; items ≤ 64 |
+| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) |  |  | items ≤ 64 |
 | `scope` | [AnnotatorScope](#schema-annotatorscope) |  |  |  |
 | `reads_request` | boolean |  |  |  |
 | `enabled` | boolean |  |  |  |
+| `title` | [AnnotatorTitle](#schema-annotatortitle) |  |  |  |
 
 Responses:
 
@@ -2788,6 +2835,35 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 409 | The request conflicts with the state it meets (a resource with that id exists, a restriction a key outruns). `Hale-Error-Class: conflict`. | `application/json` [AdminConflict](#schema-adminconflict) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/annotators/{annotator}/stats`
+
+**What an annotator's runs did** · `annotatorStats`
+
+Authentication: operatorToken
+
+Over the newest 200 annotations in the range: the runs that asked
+this annotator, how many were made, skipped or not made and why,
+the tokens of those runs, and the newest reason one was not made.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `annotator` | path | string | yes |  |
+| `from` | query | string (date-time) |  |  |
+| `to` | query | string (date-time) |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | Its runs, counted. | `application/json` [AnnotatorStats](#schema-annotatorstats) |
+| 400 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/admin/v1/annotation-rules`
@@ -3287,6 +3363,9 @@ Type: object
 
 One rate limit. Null counters are unlimited. `remaining` and
 `resets_at` are read-only and ignored on writes.
+A project's limits (and its model-scope ones) count its callers'
+requests, never voice's own for it under its system key
+(`Key.internal`): only limits set on that key cap those.
 
 Type: object
 
@@ -3365,7 +3444,7 @@ Type: object
 | `id` | [ProjectIdValue](#schema-projectidvalue) | yes |  |  |
 | `name` | string | yes |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not peek. A request is recorded when its project peeks or its key does. |  |
-| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked as requests of `voice-system`, voice's own project, whose usage, limits and accounts they spend, never this one's. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
+| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | The names it gives models: a caller asks for `coding` and is served the catalog model the alias names, moved out of band. Voice's categories (`general`, `coding`, `reasoning`, `decide`) are the names it suggests. A child's are its own over its parent's, name by name. | items ≤ 32 |
 | `owners` | array of string |  | Principals who may administer the project. The creator is always added. |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
@@ -3402,7 +3481,7 @@ Type: object
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is recorded whole (`listPeeks`), kept seven days. |  |
-| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as `voice-system`'s requests. `voice-system` itself never annotates. |  |
+| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases, whole; its parent's still apply where it gives none. | items ≤ 32 |
 | `owners` | array of string |  |  |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  |  |  |
@@ -3424,7 +3503,7 @@ Type: object
 | `peeks` | boolean |  | Whether its requests are recorded whole now (`listPeeks`): its own `peek`, else its parent's. |  |
 | `annotate` | boolean \| null |  | Its own setting; `null` when it follows its parent's. |  |
 | `annotates` | boolean |  | Whether its requests are annotated now (`getAnnotation`): its own `annotate`, else its parent's. |  |
-| `internal` | boolean |  | Voice's own project, `voice-system`: the requests voice makes for itself (annotations) are its, never a caller's. It cannot be archived, takes no key, and never annotates; the operator gives it accounts, limits and the `decide` alias of the decision model it asks. |  |
+| `internal` | boolean |  | The retired `voice-system` project, where voice once made its own requests: archived, its key revoked, never a caller's. Each project's own system key makes them now (`Key.internal`). |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases. |  |
 | `resolved_aliases` | array of object |  | The aliases in force for it: its own, then its parent's it gives none of. `from` is the project each is set on. |  |
 | `resolved_aliases[].name` | string | yes |  |  |
@@ -3471,7 +3550,7 @@ Type: object
 |---|---|---|---|---|
 | `name` | string | yes | Name the client this key is for; usage is broken down by key. | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. A request is recorded when its project or its key peeks. |  |
-| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as `voice-system`'s requests. A request is annotated when its project or its key annotates. |  |
+| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as requests of its project's system key; refused (`409`) while its project's `decide` names no decision model. A request is annotated when its project or its key annotates. |  |
 | `models` | array \| null |  | Restrict the key to these models. Null means the project's catalog. |  |
 | `accounts` | array \| null |  | Restrict the key to these accounts, within the project's. Null means the project's. A key for client work names the work account here, so everything it sends is billed there. |  |
 | `limits` | array of [Limit](#schema-limit) |  | Key-scope limits, on top of the project's. |  |
@@ -3489,7 +3568,7 @@ Type: object
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. A request is recorded when its project or its key peeks. |  |
-| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as `voice-system`'s requests. A request is annotated when its project or its key annotates. |  |
+| `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`), by the annotators in force for it, as requests of its project's system key; refused (`409`) while its project's `decide` names no decision model. A request is annotated when its project or its key annotates. |  |
 | `models` | array \| null |  |  |  |
 | `accounts` | array \| null |  |  |  |
 | `limits` | array of [Limit](#schema-limit) |  |  |  |
@@ -3506,6 +3585,7 @@ Type: object
 | `id` | string | yes |  |  |
 | `peek` | boolean |  | Each request it sends is recorded whole (`listPeeks`). |  |
 | `annotate` | boolean |  | Each request it sends is annotated (`getAnnotation`). |  |
+| `internal` | boolean |  | Its project's system key, `<project>-system`, made with the project: voice's own requests for it (annotations, titles) are made under it. No token names it; it is never revoked, renamed, peeked or annotated; its models, accounts and limits are the operator's to set, the only limits voice's requests are held to. |  |
 | `project` | string | yes |  |  |
 | `name` | string | yes |  |  |
 | `prefix` | string |  | The first characters of the secret, for recognition. |  |
@@ -3565,6 +3645,7 @@ Type: object
 | `attempts` | array of [Attempt](#schema-attempt) |  |  |  |
 | `instance` | string \| null |  | The api instance that admitted the request (`api-<id>`, the id the hub's `InstanceBeat` announces): which of an api's replicas the caller reached. `null` for a record from before instances were kept. |  |
 | `conversation` | string \| null |  | The conversation the request was a turn of: its `prompt_cache_key`, the same on each turn. `null` when the caller sent none. The ledger's turns of one conversation share it. |  |
+| `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 
 <a id="schema-usagesummary"></a>
@@ -3838,9 +3919,28 @@ Type: [PeekSummary](#schema-peeksummary) & object
 ### AnnotatorStage
 
 When an annotator asks: `request`, of the request; `response`, of its
-response, read beside the request.
+response, read beside the request; `title`, which asks no questions
+but writes the conversation's title with its project's text model
+(`AnnotatorTitle`), on the conversation's first request and again
+when a later one is answered as another `task`.
 
-Type: string, one of `request`, `response`
+Type: string, one of `request`, `response`, `title`
+
+<a id="schema-annotatortitle"></a>
+
+### AnnotatorTitle
+
+A `title` annotator's model, by the alias its project gives a text
+model, and what it is asked: a few words. Its runs are requests of
+the project's system key.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `model` | string | yes | The project's alias for the text model asked, e.g. `general`. |  |
+| `instruction` | string | yes |  | length ≥ 1; length ≤ 1000 |
+| `max_output_tokens` | integer | yes |  | ≥ 4; ≤ 64 |
 
 <a id="schema-annotationcondition"></a>
 
@@ -3908,7 +4008,8 @@ Type: object
 | `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `name` | string | yes |  | length ≥ 1; length ≤ 128 |
 | `stage` | [AnnotatorStage](#schema-annotatorstage) | yes |  |  |
-| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) | yes | Its questions. The enabled annotators of one stage ask at most 64 together, in one request to the decision model; at most 64 KiB as JSON. | items ≥ 1; items ≤ 64 |
+| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) | yes | Its questions, at least one; a `title` annotator asks none (`[]`). The enabled annotators of one stage ask at most 64 together, in one request to the decision model; at most 64 KiB as JSON. | items ≤ 64 |
+| `title` | [AnnotatorTitle](#schema-annotatortitle) |  | A `title` annotator's model and instruction, which it needs; no other has one. |  |
 | `scope` | [AnnotatorScope](#schema-annotatorscope) |  |  |  |
 | `reads_request` | boolean |  | A response annotator that also reads the request's answers, as a short labelled block beside the text: its answers are `conditioned`, searchable apart from those given on the text alone. | default `false` |
 | `enabled` | boolean |  |  | default `true` |
@@ -3924,10 +4025,11 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `name` | string |  |  | length ≥ 1; length ≤ 128 |
-| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) |  |  | items ≥ 1; items ≤ 64 |
+| `questions` | array of [AnnotatorQuestion](#schema-annotatorquestion) |  |  | items ≤ 64 |
 | `scope` | [AnnotatorScope](#schema-annotatorscope) |  |  |  |
 | `reads_request` | boolean |  |  |  |
 | `enabled` | boolean |  |  |  |
+| `title` | [AnnotatorTitle](#schema-annotatortitle) |  |  |  |
 
 <a id="schema-annotator"></a>
 
@@ -3946,8 +4048,77 @@ Type: object
 | `reads_request` | boolean | yes |  |  |
 | `enabled` | boolean | yes |  |  |
 | `builtin` | boolean | yes | Voice's own, shipped; edited and disabled, never removed. |  |
+| `title` | [AnnotatorTitle](#schema-annotatortitle) |  | A `title` annotator's; left out for any other. |  |
 | `created_at` | string (date-time) | yes |  |  |
 | `updated_at` | string (date-time) | yes |  |  |
+
+<a id="schema-annotatorstats"></a>
+
+### AnnotatorStats
+
+What one annotator's runs did, over the newest 200 annotations in the
+range: how many asked it, what they came to, why the others were not
+made, and the tokens of the requests that asked it (shared by the
+annotators asked in one request).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `annotator` | string | yes |  |  |
+| `annotations` | integer | yes | The annotations read. |  |
+| `runs` | integer | yes |  |  |
+| `annotated` | integer | yes |  |  |
+| `skipped` | integer | yes | Runs whose questions' conditions all did not hold. |  |
+| `not_annotated` | integer | yes |  |  |
+| `reasons` | array of object | yes |  |  |
+| `reasons[].reason` | string | yes |  |  |
+| `reasons[].count` | integer | yes |  |  |
+| `input_tokens` | integer | yes |  |  |
+| `output_tokens` | integer | yes |  |  |
+| `last_error` | string |  | The newest reason one was not made; left out when none was. |  |
+| `last_error_at` | string (date-time) |  |  |  |
+
+<a id="schema-annotationrun"></a>
+
+### AnnotationRun
+
+One request voice made for an annotation, as a request of the
+project's system key: a stage's questions asked of the decision
+model, or a conversation's title written.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `stage` | [AnnotatorStage](#schema-annotatorstage) | yes |  |  |
+| `annotators` | array of string | yes | The annotators it asked for, `<id>@<version>` each. |  |
+| `request_id` | string \| null | yes | Its own request (its usage record, `internal`); null when none was made. |  |
+| `model` | string \| null | yes |  |  |
+| `input_tokens` | integer | yes |  |  |
+| `output_tokens` | integer | yes |  |  |
+| `ms` | integer | yes | How long it took. |  |
+| `status` | string, one of `annotated`, `skipped`, `not_annotated` | yes |  |  |
+| `reason` | string | yes | Why it was not made or was skipped; empty when it was made. |  |
+
+<a id="schema-conversationtitle"></a>
+
+### ConversationTitle
+
+A conversation's title, as the title annotator last wrote it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `project` | string | yes |  |  |
+| `conversation` | string | yes |  |  |
+| `title` | string | yes |  |  |
+| `task` | string |  | The request's `task` it was written under; left out when none was asked. |  |
+| `model` | string | yes |  |  |
+| `annotator` | string | yes |  |  |
+| `version` | integer | yes |  |  |
+| `made_at` | string (date-time) | yes |  |  |
 
 <a id="schema-annotationexpect"></a>
 
@@ -4025,8 +4196,9 @@ Type: object
 | `conversation` | string |  | Its conversation (`UsageRecord.conversation`); left out when it has none. |  |
 | `created_at` | string (date-time) | yes |  |  |
 | `status` | string, one of `annotated`, `not_annotated` | yes |  |  |
-| `reason` | string | yes | Why it was not annotated, empty when it was: `voice-system` has no decision model it may use, is past its limits, or the model failed. |  |
+| `reason` | string | yes | Why it was not annotated, empty when it was: its project has no decision model it may use, its system key is past its limits, or the model failed. |  |
 | `clipped` | boolean | yes | A text read was cut to fit the decision model: its start and end were read, the middle left out and marked so. |  |
+| `title` | string |  | The conversation's title, when this request's annotation wrote it; left out otherwise. |  |
 
 <a id="schema-annotationanswer"></a>
 
@@ -4073,9 +4245,10 @@ Type: [AnnotationSummary](#schema-annotationsummary) & object
 |---|---|---|---|---|
 | … | all of [AnnotationSummary](#schema-annotationsummary) |  |  |  |
 | `model` | string |  | The decision model that answered; left out when none did. |  |
-| `input_tokens` | integer | yes | What its questions read, as `voice-system`'s requests. |  |
+| `input_tokens` | integer | yes | What its questions read, as requests of its project's system key. |  |
 | `answers` | array of [AnnotationAnswer](#schema-annotationanswer) | yes |  |  |
 | `pairs` | array of [AnnotationPair](#schema-annotationpair) | yes |  |  |
+| `runs` | array of [AnnotationRun](#schema-annotationrun) | yes | Each request voice made for it, in order. |  |
 
 <a id="schema-annotationfacets"></a>
 
@@ -4182,6 +4355,13 @@ Type: object
 <a id="schema-account"></a>
 
 ### Account
+
+What pays and has limits. Its spend includes voice's own requests
+for the projects it serves (each project's system key's,
+`UsageRecord.internal`: annotations, titles), which it paid the
+provider for; its usage summary shows them as their own line
+(`summarizeUsage` with `group_by=account,internal` and
+`include_internal=true`).
 
 Type: [AccountCreate](#schema-accountcreate) & object
 
@@ -4311,7 +4491,7 @@ Type: object
 
 One event on the admin stream. `data` is the resource as it now is.
 
-Type: object \| object \| object \| object \| object \| object \| object
+Type: object \| object \| object \| object \| object \| object \| object \| object
 
 <a id="schema-change"></a>
 

@@ -1,9 +1,9 @@
 import type { Account, Node, Schemas, UsageRecord } from '../api/client';
 
-export type CoreKind = 'project' | 'repository' | 'alias' | 'model' | 'api' | 'node' | 'seat' | 'account';
+export type CoreKind = 'project' | 'repository' | 'alias' | 'model' | 'api' | 'node' | 'seat' | 'account' | 'system';
 export type Kind = CoreKind | `context:${string}`;
-export const KINDS: CoreKind[] = ['project', 'repository', 'alias', 'model', 'api', 'node', 'seat', 'account'];
-export const kindName = (kind: Kind): string => kind.startsWith('context:') ? kind.slice(8) : ({ project: 'Project', repository: 'Repository', alias: 'Alias', model: 'Model', api: 'API instance', node: 'Execution host', seat: 'Seat', account: 'Account' }[kind as CoreKind]);
+export const KINDS: CoreKind[] = ['project', 'repository', 'alias', 'model', 'api', 'node', 'seat', 'account', 'system'];
+export const kindName = (kind: Kind): string => kind.startsWith('context:') ? kind.slice(8) : ({ project: 'Project', repository: 'Repository', alias: 'Alias', model: 'Model', api: 'API instance', node: 'Execution host', seat: 'Seat', account: 'Account', system: 'System key' }[kind as CoreKind]);
 export const graphKinds = (graph: Graph): Kind[] => [...new Set(graph.vertices.map(v => v.kind))].sort((a, b) => kindName(a).localeCompare(kindName(b)));
 
 export type RequestContext = { repository?: string; apiInstance?: string };
@@ -95,6 +95,27 @@ export function buildGraph(fleet: Fleet): Graph {
     connect(id, model(a.model, 'Named by an alias; not evidence of a seat that serves it.'), 'resolves');
   }
   for (const r of fleet.usage) {
+    // voice's own request for a project (its system key's: an annotation, a
+    // title), drawn apart and dotted: project → its system key → the model,
+    // never through the project's own flow
+    if ((r as { internal?: boolean }).internal) {
+      const members: string[] = [];
+      const links: string[] = [];
+      const project = entityId('project', r.project);
+      if (!vertices.has(project)) add({ id: project, name: r.project, kind: 'project', state: 'observed', active: 0, details: [['Project', r.project]] });
+      const key = entityId('system', r.key);
+      if (!vertices.has(key)) add({ id: key, name: r.key, kind: 'system', state: 'internal', active: 0, details: [['System key', r.key], ['Meaning', "Voice's own requests for the project (annotations, titles): kept out of its usage, its limits and its flow."]] });
+      const target = r.served?.model ?? r.requested_model;
+      const model = entityId('model', target);
+      if (!vertices.has(model)) add({ id: model, name: target, kind: 'model', state: 'observed', active: 0, details: [['Model', target], ['Evidence', 'Asked by a system key.']] });
+      for (const [a, b] of [[project, key], [key, model]] as const) {
+        const id = connect(a, b, 'observed', false);
+        if (id) links.push(id);
+      }
+      members.push(project, key, model);
+      requests.set(r.id, { vertices: members, edges: links, flowEdges: [], context: requestContext(r, fleet.contexts) });
+      continue;
+    }
     const context = requestContext(r, fleet.contexts);
     const members: string[] = [];
     const links: string[] = [];
@@ -182,7 +203,7 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
   for (const e of edges) { neighbors.get(e.source)?.push(e.target); neighbors.get(e.target)?.push(e.source); }
   const constrain = (p: Point) => ({ x: Math.max(65, Math.min(width - 65, p.x)), y: Math.max(55, Math.min(height - 65, p.y)) });
   const context = vertices.filter(v => v.kind === 'repository' || v.kind.startsWith('context:'));
-  const stages = (['project', 'api', 'node', 'seat', 'account', 'model'] as Kind[]).filter(kind => vertices.some(v => v.kind === kind));
+  const stages = (['project', 'system', 'api', 'node', 'seat', 'account', 'model'] as Kind[]).filter(kind => vertices.some(v => v.kind === kind));
   const anchors = new Map<string, Point>();
   const span = width - 170;
   const start = 85 + (context.length ? span * .17 : 0);

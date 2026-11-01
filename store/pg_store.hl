@@ -1934,6 +1934,57 @@ locus PgStore {
         return peek_row(line);
     }
 
+    fn recorded(
+        project: String,
+        key: String,
+        has_from: Bool,
+        from: Time,
+        has_to: Bool,
+        to: Time,
+        limit: Int
+    ) -> PeekRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.recorded_locked(project, key, has_from, from, has_to, to, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn recorded_locked(
+        project: String,
+        key: String,
+        has_from: Bool,
+        from: Time,
+        has_to: Bool,
+        to: Time,
+        limit: Int
+    ) -> PeekRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(key);
+        add_time(a, has_from, from);
+        add_time(a, has_to, to);
+        a.add(to_string(if limit > 200 { 200 } else { limit }));
+        a.add(SYSTEM_PROJECT);
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz) AND ($4::timestamptz IS NULL OR created_at <= $4::timestamptz) AND project <> $6 ORDER BY created_at DESC, request_id LIMIT $5::int) t",
+            a,
+        ) or raise;
+        let mut out = PeekRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, peek_row(line)) or discard;
+        }
+        return out;
+    }
+
     fn annotators() -> AnnotatorRows fallible(StoreError) {
         self.lock.enter();
         let out = self.annotators_locked() or {

@@ -251,7 +251,7 @@ const BUILTIN_ANNOTATOR_RESPONSE_BASICS: String = """
     """;
 
 const BUILTIN_RULE_ASKED_FOR_CODE: String = """
-    asked-for-code	{"name": "asked for code, gave code", "enabled": true, "when": {"annotator": "request-basics", "question": "asks_for_code", "answer": "true", "min_probability": 0.5}, "expect": {"annotator": "response-basics", "question": "contains_code", "answer": "true"}}
+    asked-for-code	{"name": "asked for code, gave code", "enabled": true, "condition": {"annotator": "request-basics", "question": "asks_for_code", "answer": "true", "min_probability": 0.5}, "expect": {"annotator": "response-basics", "question": "contains_code", "answer": "true"}}
     """;
 
 const BUILTIN_RULE_ANSWERED: String = """
@@ -259,7 +259,7 @@ const BUILTIN_RULE_ANSWERED: String = """
     """;
 
 const BUILTIN_RULE_SEVERAL_STEPS_COMPLETE: String = """
-    several-steps-complete	{"name": "several steps, complete", "enabled": true, "when": {"annotator": "request-basics", "question": "multi_step", "answer": "true", "min_probability": 0.5}, "expect": {"annotator": "response-basics", "question": "completeness", "at_least": "3"}}
+    several-steps-complete	{"name": "several steps, complete", "enabled": true, "condition": {"annotator": "request-basics", "question": "multi_step", "answer": "true", "min_probability": 0.5}, "expect": {"annotator": "response-basics", "question": "completeness", "at_least": "3"}}
     """;
 
 const BUILTIN_RULE_FORM_KEPT: String = """
@@ -804,6 +804,18 @@ interface Store {
     fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError);
     /// One recorded request whole; `present` false when there is none.
     fn peek(request_id: String) -> PeekRow fallible(StoreError);
+    /// Recorded requests a backfill reads (api/annotate.hl): of `project`
+    /// and `key` where not "", within the times set, never voice-system's,
+    /// newest first, at most `limit`; their bodies left out.
+    fn recorded(
+        project: String,
+        key: String,
+        has_from: Bool,
+        from: Time,
+        has_to: Bool,
+        to: Time,
+        limit: Int
+    ) -> PeekRows fallible(StoreError);
     // ---- annotators, rules and annotations (api/annotate.hl)
 
     /// The annotators not removed, each at its current version.
@@ -1900,6 +1912,34 @@ locus MemoryStore {
             push(next.rows, if x.id == r.id { r } else { x }) or discard;
         }
         self.rule_rows = next;
+    }
+
+    @unbounded
+    fn recorded(
+        project: String,
+        key: String,
+        has_from: Bool,
+        from: Time,
+        has_to: Bool,
+        to: Time,
+        limit: Int
+    ) -> PeekRows fallible(StoreError) {
+        let mut out = PeekRows { };
+        for r in self.peek_rows.rows {
+            if count(out.rows) >= limit { break; }
+            let at = std::time::unix(r.created_at);
+            if (len(project) > 0 && r.project != project) || (len(key) > 0 && r.key != key)
+                || r.project == SYSTEM_PROJECT || (has_from && at < std::time::unix(from))
+                || (has_to && at > std::time::unix(to))
+            {
+                continue;
+            }
+            let mut listed = r;
+            listed.input = "";
+            listed.output = "";
+            push(out.rows, listed) or discard;
+        }
+        return out;
     }
 
     @unbounded

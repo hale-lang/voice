@@ -2336,14 +2336,19 @@ applied.
 Each event has an `id`. A client that reconnects sends the last one
 in `Last-Event-ID` and receives what it missed, while the coordinator
 still holds it; otherwise it receives a `reset` event and should
-reread what it shows. A comment line (`: ping`) keeps an idle stream
-open every 15 seconds. The stream never ends on its own.
+reread what it shows. The stream follows the store's rows, so it
+tells what any api instance recorded, within about half a second. A
+comment line keeps an idle stream open every 15 seconds. The stream
+never ends on its own. A `request` event tells a request as it is
+offered; it runs until its `usage` event. The admin UI follows the
+same events on the hub (`GET /admin/v1/hub`) where the hub carries
+them.
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
-| `type` | query | array of string, one of `node`, `seat`, `account`, `usage`, `change`, `request` |  | Only these event types. Repeatable. |
+| `type` | query | array of string, one of `node`, `seat`, `account`, `usage`, `change`, `request`, `annotation` |  | Only these event types. Repeatable. |
 | `Last-Event-ID` | header | string |  |  |
 
 Responses:
@@ -2385,7 +2390,7 @@ Responses:
 
 ### GET `/admin/v1/hub`
 
-**Where the fleet's heartbeats stream live** · `getHub`
+**Where the admin plane streams live** · `getHub`
 
 Authentication: operatorToken
 
@@ -2395,18 +2400,43 @@ at. A client connects to `ws://<host>:<port>/` with the operator
 token (`Authorization: Bearer`, or `?access_token=` from a browser)
 and sends `{"type": "subscribe", "topic": "<topic>"}` for each topic.
 Each `{"type": "event", "topic", "seq", "payload"}` that follows is
-one report as it arrives; a gap in `seq` is reports shed for a slow
-subscriber, and the next report says the node whole again.
+one event as it happens. A slow subscriber sheds the oldest: a gap in
+a topic's `seq` is events it missed, and a client that sees one reads
+again what that topic covers. So does a client that (re)connects.
 
 - `NodeObserved`: a node made a report (`register`, `heartbeat`,
-  `seats`, `capabilities`, `local`) and it was recorded. `payload`
-  is `{node, report, at, body}`; `body` is the node as
-  `GET /admin/v1/nodes/{node}` answers it, as a JSON string.
-- `InstanceBeat`: an api instance is alive. `payload` is
-  `{instance, at}`, every five seconds per instance.
+  `seats`, `capabilities`, `local`) to this api instance and it was
+  recorded. `payload` is `{node, report, at, body}`; `body` is the
+  node as `GET /admin/v1/nodes/{node}` answers it, as a JSON string.
+- `InstanceBeat`: this api instance is alive. `payload` is
+  `{instance, at}`, every five seconds.
 
-The store keeps only each one's latest (what the other reads
-answer); the hub carries each as it happens.
+The admin plane's events, every instance's alike: each instance's
+hub follows the store's rows, so it tells what any instance (or the
+brain) recorded, within about half a second. Each `payload` is
+`{id, at, data, whole}`: `id` and `at` as the event stream's,
+`data` the event's `data` (an `AdminEvent`'s) as a JSON string. A
+`data` too large for one frame is sent as `null` with `whole` false,
+and the client reads the resource instead.
+
+- `UsageRecorded`: a request settled; `data` is its `UsageRecord`
+  (an internal request's, `internal: true`, included).
+- `ChangeMade`: a configuration change applied; `data` is the
+  `Change`.
+- `AnnotationKept`: a request's annotation kept; `data` is the
+  `annotation` event's (its answers, its runs, the conversation's
+  title when this one wrote it).
+- `NodeMoved`: a node registered, was lost, drained or revoked;
+  `data` is the node as `GET /admin/v1/nodes/{node}` answers it.
+- `RequestsInFlight`: the requests seats are serving now, told
+  whole each time the set changes; `data` is an array of the
+  `request` event's `data`, at most 99, `whole` false when there may
+  be more.
+
+`topics` lists what this instance's hub carries: an api with no
+database (one process, its store in memory) carries only
+`NodeObserved` and `InstanceBeat`, and a client follows the event
+stream (`GET /admin/v1/events`) for the rest.
 
 Responses:
 
@@ -4483,7 +4513,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `port` | integer | yes | The hub's port, on the host this api is reached at. |  |
-| `topics` | array of string, one of `NodeObserved`, `InstanceBeat` | yes | The topics a subscriber may follow. |  |
+| `topics` | array of string, one of `NodeObserved`, `InstanceBeat`, `UsageRecorded`, `ChangeMade`, `AnnotationKept`, `NodeMoved`, `RequestsInFlight` | yes | The topics this instance's hub carries, which a subscriber may follow. |  |
 
 <a id="schema-adminevent"></a>
 

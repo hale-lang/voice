@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
 
@@ -15,9 +15,8 @@ export function subscribeAdminEvents(listener: (event: AdminEvent) => void): () 
 /** A request a seat is serving now, as the stream's `request` event says it. */
 export type Flight = Extract<AdminEvent, { type: 'request' }>['data'];
 
-// Every answer of the stream tells every request in flight then, so the
-// last answer's are the requests in flight: a request leaves when an answer
-// no longer tells it, however it ended (a usage row or none).
+// The requests in flight: the hub tells the set whole each time it changes;
+// the event stream tells each as it starts, and it leaves with its usage.
 let flights: Flight[] = [];
 const flightListeners = new Set<(f: Flight[]) => void>();
 
@@ -34,19 +33,19 @@ function setFlights(next: Flight[]) {
 }
 
 /**
- * The admin event stream: each event names a resource that changed, and
- * the queries that show it are refetched. A `reset` refetches everything.
- * It takes the operator token, which EventSource cannot send, so it is read
- * with fetch: each answer is short (the api answers one request per
- * connection), and the next asks again from the last event's id
- * (`Last-Event-ID`) after the `retry` the stream gives.
+ * The admin events: each names a resource that changed, and the queries
+ * that show it are read again. They arrive on the hub (hub.ts), every api
+ * instance's, where the api has a database; otherwise on the held event
+ * stream (`GET /admin/v1/events`, `useAdminEvents`). Either way they come
+ * through `deliver`.
  */
-const AFFECTS: Record<string, string[]> = {
+export const AFFECTS: Record<string, string[]> = {
   node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements'],
   seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements'],
   account: ['/admin/v1/accounts', '/admin/v1/routes'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
-  change: ['/admin/v1/changes'],
+  // the log, and the resource the change names (`target`), below
+  change: ['/admin/v1/changes', '/admin/v1/routes'],
   // a request a seat is serving: told to listeners (the Network view), no
   // query changes until its usage is recorded
   request: [],
@@ -54,6 +53,49 @@ const AFFECTS: Record<string, string[]> = {
   // conversations' titles, and the annotators' counts
   annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/annotators'],
 };
+
+/** What a (re)connect reads again: every admin read, for what was missed. */
+export const COVERED = ['/admin/v1'];
+
+/** Read again every query under `paths` (a path, or anything below it). */
+export function refresh(qc: QueryClient, paths: string[]) {
+  const under = (k: unknown) => typeof k === 'string' && paths.some((p) => k === p || k.startsWith(`${p}/`));
+  void qc.invalidateQueries({ predicate: (q) => under(q.queryKey[0]) });
+}
+
+const seen = new Set<string>();
+
+/**
+ * One event: told to the listeners once (by id), and the queries it
+ * affects read again. A request in flight joins the set until its usage is
+ * told (the event stream's shape; the hub tells the set whole instead).
+ */
+export function deliver(qc: QueryClient, event: AdminEvent) {
+  if (!event || typeof event.id !== 'string' || typeof event.at !== 'string' || !event.data || seen.has(event.id)) return;
+  if (event.type === 'usage' && (typeof event.data.id !== 'string' || typeof event.data.project !== 'string' || typeof event.data.requested_model !== 'string' || !event.data.timing || typeof event.data.input_tokens !== 'number' || typeof event.data.output_tokens !== 'number')) return;
+  seen.add(event.id);
+  if (seen.size > 512) seen.delete(seen.values().next().value!);
+  if (event.type === 'request') {
+    const f = event.data as Flight;
+    if (typeof f?.id === 'string' && typeof f.seat === 'string' && typeof f.project === 'string') setFlights([...flights.filter((o) => o.id !== f.id), f]);
+  } else if (event.type === 'usage' && flights.some((f) => f.id === event.data.id)) {
+    setFlights(flights.filter((f) => f.id !== event.data.id));
+  }
+  for (const listener of listeners) listener(event);
+  if (event.type === 'reset') { refresh(qc, COVERED); return; }
+  const paths = [...(AFFECTS[event.type] ?? [])];
+  if (event.type === 'change' && typeof event.data.target === 'string') {
+    // `projects/work/budget` changes what `/admin/v1/projects` shows
+    const top = event.data.target.split('/')[0];
+    if (top) paths.push(`/admin/v1/${top}`);
+  }
+  refresh(qc, paths);
+}
+
+/** The requests in flight, as the hub tells them whole. */
+export function deliverFlights(next: Flight[]) {
+  setFlights(next.filter((f) => typeof f?.id === 'string' && typeof f.seat === 'string' && typeof f.project === 'string'));
+}
 
 /** One server-sent event: its `event`, `data` and `id`, and a `retry`. */
 type Sse = { event: string; data: string; id: string | null; retry: number | null };
@@ -80,49 +122,20 @@ const sleep = (ms: number, signal: AbortSignal) => new Promise<void>((done) => {
   signal.addEventListener('abort', () => { clearTimeout(t); done(); }, { once: true });
 });
 
-export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
+/**
+ * The held event stream, for an api whose hub does not carry the admin
+ * events (`enabled`): read with fetch, since EventSource cannot send the
+ * operator token. It stays open, and is opened again from the last event's
+ * id (`Last-Event-ID`) after the `retry` it gives, should it end.
+ */
+export function useAdminEvents(enabled: boolean): 'connecting' | 'open' | 'closed' | 'hub' {
   const qc = useQueryClient();
   const token = useOperatorToken();
   const [state, setState] = useState<'connecting' | 'open' | 'closed'>('connecting');
   useEffect(() => {
+    if (!enabled) return;
     if (!token) { setState('closed'); return; }
     const stop = new AbortController();
-    const seen = new Set<string>();
-    const receive = (data: string) => {
-      try {
-        const event = JSON.parse(data) as AdminEvent;
-        if (!event || typeof event.id !== 'string' || typeof event.at !== 'string' || !event.data || seen.has(event.id)) return;
-        if (event.type === 'usage' && (typeof event.data.id !== 'string' || typeof event.data.project !== 'string' || typeof event.data.requested_model !== 'string' || !event.data.timing || typeof event.data.input_tokens !== 'number' || typeof event.data.output_tokens !== 'number')) return;
-        seen.add(event.id);
-        if (seen.size > 512) seen.delete(seen.values().next().value!);
-        for (const listener of listeners) listener(event);
-      } catch { /* A malformed event does not stop subsequent valid events. */ }
-    };
-    // the requests this answer tells in flight
-    let answering: Flight[] = [];
-    const dispatch = (e: Sse) => {
-      if (e.event === 'request') {
-        // told again by every answer while it runs: a set, never deduplicated
-        try {
-          const f = (JSON.parse(e.data) as AdminEvent).data as Flight;
-          if (typeof f?.id === 'string' && typeof f.seat === 'string' && typeof f.project === 'string') answering.push(f);
-        } catch { /* a malformed event does not stop the rest */ }
-        return;
-      }
-      if (e.event === 'reset') { seen.clear(); receive(e.data); void qc.invalidateQueries(); return; }
-      const keys = AFFECTS[e.event];
-      if (!keys) return;
-      receive(e.data);
-      if (e.event === 'annotation') {
-        // a request's own annotation (`/annotations/{request_id}`), an
-        // annotator's runs, under the paths it names
-        const under = (k: unknown) => typeof k === 'string' && keys.some((p) => k === p || k.startsWith(`${p}/`));
-        receive(e.data);
-        void qc.invalidateQueries({ predicate: (q) => under(q.queryKey[0]) });
-        return;
-      }
-      for (const key of keys) void qc.invalidateQueries({ queryKey: [key] });
-    };
     void (async () => {
       let last: string | null = null;
       let retry = 2000;
@@ -134,10 +147,8 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
           if (r.status === 401) { setState('closed'); forgetOperatorToken(); return; }
           if (!r.ok || !r.body) throw new Error(String(r.status));
           setState('open');
-          // an answer that resumes a place tells what is in flight; the first
-          // (no place yet) tells nothing of it, and is not taken as the set
-          const resumed = last !== null;
-          answering = [];
+          // what was missed while it was not open
+          if (last === null) refresh(qc, COVERED);
           const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
           let buffer = '';
           for (;;) {
@@ -150,18 +161,18 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
               buffer = buffer.slice(at + 2);
               if (e.retry !== null) retry = e.retry;
               if (e.id !== null) last = e.id;
-              if (e.data) dispatch(e);
+              if (!e.data) continue;
+              try { deliver(qc, JSON.parse(e.data) as AdminEvent); } catch { /* a malformed event does not stop the rest */ }
             }
           }
-          if (resumed) setFlights(answering);
         } catch {
           if (stop.signal.aborted) return;
-          setState('connecting');
         }
+        setState('connecting');
         await sleep(retry, stop.signal);
       }
     })();
     return () => stop.abort();
-  }, [qc, token]);
-  return state;
+  }, [qc, token, enabled]);
+  return enabled ? state : 'hub';
 }

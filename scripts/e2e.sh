@@ -355,7 +355,13 @@ within() { # <label> <max ms> <command...>
 within "an admin read" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/projects"
 within "a change-log read" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/changes?limit=1"
 within "the node link" 2000 curl -fsS --max-time 10 "$api/node/v1/assignment" -H "authorization: Bearer $token"
-within "the event stream" 2000 curl -H @"$work/admin.h" -fsS --max-time 10 "$api/admin/v1/events?type=change"
+# the event stream is held open: it answers at once with the subscriber's
+# place (its first event) and stays open, read here for a moment
+first_event() {
+  curl -H @"$work/admin.h" -sS -N --max-time 1 "$api/admin/v1/events?type=change" >"$work/events.out" 2>/dev/null
+  grep -q '^id: u' "$work/events.out"
+}
+within "the event stream's first event" 2000 first_event
 t0=$(date +%s%N)
 python3 scripts/nats-publish.py "${NATS_URL#nats://}" "voice.node.laptop.cancel" '{"type": "cancel", "request_id": "'"$held_id"'"}'
 for i in $(seq 1 40); do

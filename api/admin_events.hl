@@ -13,10 +13,12 @@
 // annotated is its annotation kept (`annotation`: its answers, its runs,
 // and the conversation's title when it wrote one). A place is the marks
 // of those rows: the last ledger row, change and annotation told, and each
-// node's status. The api's HTTP server answers one request at a time, so
-// each answer is short and the browser's EventSource reconnects at the
-// `retry` it is given (the stream stays open instead once the router
-// moves onto `http::Rest`).
+// node's status. A stream is held open, looking at the rows again every
+// `FOLLOW_EVERY`. The same looks feed the api's hub (`AdminFeed`, hub.hl):
+// each event on its topic, for the admin UI.
+
+/// How often a held stream, and the hub's feed, look at the rows.
+const FOLLOW_EVERY: Duration = 500ms;
 
 /// The `type`s a subscriber may ask for.
 const EVENT_TYPES: String = "node usage change request annotation";
@@ -57,15 +59,25 @@ locus EventTick {
         // that resumes is told what is in flight then)
         flight_mark: Int = 0;
         node_marks: NodeMarks = NodeMarks { };
+        // publish each event to its hub topic (hub.hl) instead of telling
+        // `out` (`AdminFeed`), the requests in flight told whole, as a set
+        feed: Bool = false;
+        // the set of requests in flight last told (their seqs), in a feed
+        flight_set: String = "";
+        // why the rows could not be read, "" when they were: its owner says
+        failure: String = "";
+    }
+
+    bus {
+        publish UsageRecorded;
+        publish ChangeMade;
+        publish AnnotationKept;
+        publish NodeMoved;
+        publish RequestsInFlight;
     }
 
     birth() {
-        self.look() or {
-            log_error(
-                "the admin event stream could not be read",
-                std::log::kv("error", CtlError::api_encode(err)),
-            );
-        };
+        self.look() or { self.failure = CtlError::api_encode(err); };
     }
 
     /// True when the subscriber wants events of type `t`.
@@ -117,7 +129,9 @@ locus EventTick {
             }
             // a request offered to a seat, for as long as it runs: a live
             // view lights it until its usage is told
-            if self.wants("request") {
+            if self.feed {
+                self.flights_whole() or raise;
+            } else if self.wants("request") {
                 let rows = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
                 for f in rows.rows {
                     self.flight_mark = f.seq;
@@ -198,8 +212,38 @@ locus EventTick {
         self.annotation_mark = mark;
     }
 
-    /// One event on the stream.
+    /// The requests in flight, told whole to the hub when the set is not
+    /// the one last told: at most `FLIGHTS_TOLD`, `whole` false past them.
+    fn flights_whole() fallible(CtlError) {
+        let rows = self.store.flights_after(0, FLIGHTS_TOLD + 1) or fail store_down(err);
+        let set = std::bytes::BytesBuilder { };
+        let data = st::JsonList { };
+        let mut n = 0;
+        for f in rows.rows {
+            set.append_str(to_string(f.seq) + ",");
+            n = n + 1;
+            if n <= FLIGHTS_TOLD { data.add(flight_json(f)); }
+        }
+        let now = std::str::clone(set.text_view());
+        if now == self.flight_set { return; }
+        self.flight_set = now;
+        self.publish(
+            "requests",
+            AdminRecord {
+                id: "requests_" + to_string(std::time::monotonic_ns()),
+                at: now_seconds(),
+                data: "[" + data.text() + "]",
+                whole: n <= FLIGHTS_TOLD,
+            },
+        );
+    }
+
+    /// One event on the stream, or on its hub topic in a feed.
     fn tell(t: String, id: String, when: Time, data: String) {
+        if self.feed {
+            self.publish(t, AdminRecord { id: id, at: when, data: data });
+            return;
+        }
         self.out.send_with(
             t,
             id,
@@ -207,7 +251,35 @@ locus EventTick {
                 + ", \"data\": " + data + "}",
         );
     }
+
+    /// `r` on the topic of events of type `t`: its `data` as it is, or
+    /// `null` with `whole` false when it would not fit one bus frame.
+    fn publish(t: String, r: AdminRecord) {
+        let rec = if len(r.data) > FRAME_DATA_MAX {
+            AdminRecord { id: r.id, at: r.at, data: "null", whole: false }
+        } else {
+            r
+        };
+        if t == "usage" {
+            UsageRecorded <- rec;
+        } else if t == "change" {
+            ChangeMade <- rec;
+        } else if t == "annotation" {
+            AnnotationKept <- rec;
+        } else if t == "node" {
+            NodeMoved <- rec;
+        } else if t == "requests" {
+            RequestsInFlight <- rec;
+        }
+    }
 }
+
+/// The most requests in flight a hub event tells: one fewer than a read of
+/// them returns (the store's 100), so a full read says there may be more.
+const FLIGHTS_TOLD: Int = 99;
+/// The most `data` one hub event carries: a bus frame is 64 KiB, its
+/// header and the record's other fields included.
+const FRAME_DATA_MAX: Int = 60000;
 
 /// The nodes' marks, as many as the store holds nodes.
 type NodeMarks { items: bounded[Int; 64]; }
@@ -255,6 +327,9 @@ locus AdminEvents {
         self.annotation_mark = t.annotation_mark;
         self.flight_mark = t.flight_mark;
         self.node_marks = t.node_marks;
+        if len(t.failure) > 0 {
+            log_error("the admin event stream could not be read", std::log::kv("error", t.failure));
+        }
     }
 
     /// The place the stream has reached, as an event id: the last ledger
@@ -299,12 +374,15 @@ locus AdminEvents {
         return true;
     }
 
-    /// One answer of the stream. The api's HTTP server answers one request
-    /// at a time, so a stream held open would hold every other request
-    /// off: the answer is what happened past the subscriber's place, then
-    /// its new place as the id the browser sends back as `Last-Event-ID`
-    /// when it reconnects (`retry` says how soon). A subscriber with no
-    /// place is at the head: it is told nothing of what came before.
+    /// The stream, held open: what happened past the subscriber's place,
+    /// then, every `FOLLOW_EVERY`, what has happened since, each place sent
+    /// as the id the browser sends back as `Last-Event-ID` should it
+    /// reconnect (`retry` says how soon), with a keep-alive when it is
+    /// quiet. The front serves each connection on a coroutine of its own
+    /// (front.hl), so a held stream holds no other request off; it ends when
+    /// its subscriber goes. Answered in process (a test, no connection), it
+    /// is the one look. A subscriber with no place is at the head: it is
+    /// told nothing of what came before.
     fn follow(out: EventStream, last: String) -> std::http::Response {
         out.raw("retry: 2000\n\n");
         if self.resume(last) {
@@ -313,6 +391,18 @@ locus AdminEvents {
             self.look(out, true);
         }
         out.send_with("", self.place(), "");
+        if out.conn_fd < 0 { return out.end(); }
+        let mut told = self.place();
+        while !out.gone {
+            std::time::sleep(FOLLOW_EVERY);
+            self.look(out, false);
+            let now = self.place();
+            if now != told {
+                out.send_with("", now, "");
+                told = now;
+            }
+            out.keep_alive(15s);
+        }
         return out.end();
     }
 }
@@ -366,4 +456,76 @@ fn annotation_event_json(r: st::AnnotationRow, answers: st::AnswerRows) -> Strin
         + jq(r.status) + ", \"reason\": " + jq(r.reason) + ", \"title\": "
         + jstring_or_null(len(title) > 0, title) + ", \"answers\": [" + given.text()
         + "], \"runs\": " + (if std::str::starts_with(runs, "[") { runs } else { "[]" }) + "}";
+}
+
+/// The admin plane's events on the api's hub (hub.hl): every
+/// `FOLLOW_EVERY`, one look at the store's rows past its marks, each event
+/// published to its topic, the requests in flight whole when they change.
+/// Every instance runs one, over its own connection to the store, so each
+/// instance's hub tells what any instance (or the brain) recorded. It
+/// starts at the head: a UI reads what is there when it connects. Pinned
+/// (main.hl): its looks wait on Postgres on a thread of their own.
+locus AdminFeed {
+    params {
+        store: st::Store = st::MemoryStore { };
+        // with no database there is no row another instance wrote: the
+        // feed tells nothing, and `GET /admin/v1/hub` sends the UI to the
+        // event stream instead
+        live: Bool = false;
+        nodes: Nodes = Nodes { store: self.store, link: NatsLink { } };
+        changes: Changes = Changes { store: self.store };
+        usage_mark: Int = 0;
+        change_mark: Int = 0;
+        annotation_mark: Int = 0;
+        flight_mark: Int = 0;
+        flight_set: String = "";
+        node_marks: NodeMarks = NodeMarks { };
+        // the last failure was said; said again only after a look succeeds
+        failing: Bool = false;
+    }
+
+    run() {
+        if !self.live { return; }
+        self.tick(true);
+        while true {
+            std::time::sleep(FOLLOW_EVERY);
+            self.tick(false);
+        }
+    }
+
+    /// One look, quiet (to the head) or publishing; the marks move on.
+    fn tick(quiet: Bool) {
+        let t = EventTick {
+            store: self.store,
+            nodes: self.nodes,
+            changes: self.changes,
+            out: EventStream { },
+            quiet: quiet,
+            feed: true,
+            usage_mark: self.usage_mark,
+            change_mark: self.change_mark,
+            annotation_mark: self.annotation_mark,
+            flight_mark: self.flight_mark,
+            flight_set: self.flight_set,
+            node_marks: self.node_marks,
+        };
+        self.usage_mark = t.usage_mark;
+        self.change_mark = t.change_mark;
+        self.annotation_mark = t.annotation_mark;
+        self.flight_mark = t.flight_mark;
+        self.flight_set = t.flight_set;
+        self.node_marks = t.node_marks;
+        if len(t.failure) > 0 {
+            if !self.failing {
+                log_error(
+                    "the hub's admin events could not be read",
+                    std::log::kv("error", t.failure),
+                );
+            }
+            self.failing = true;
+        } else if self.failing {
+            log_info("the hub's admin events are read again", "");
+            self.failing = false;
+        }
+    }
 }

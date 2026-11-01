@@ -1,0 +1,121 @@
+// The hub's admin events (admin_events.hl `AdminFeed`, hub.hl): a feed
+// starts at the head, then publishes each row past its marks on its topic,
+// whoever wrote it; the requests in flight go whole, and only when the set
+// changes; a `data` too large for a bus frame goes as `null`, `whole` false.
+import ".." as api;
+import "../../store" as st;
+
+locus Watch {
+    params {
+        usage: Int = 0;
+        usage_data: String = "";
+        usage_whole: Bool = true;
+        changes: Int = 0;
+        flights: Int = 0;
+        flights_data: String = "";
+    }
+
+    bus {
+        subscribe api::UsageRecorded as on_usage;
+        subscribe api::ChangeMade as on_change;
+        subscribe api::RequestsInFlight as on_flights;
+    }
+
+    fn on_usage(r: api::AdminRecord) {
+        self.usage = self.usage + 1;
+        self.usage_data = r.data;
+        self.usage_whole = r.whole;
+    }
+
+    fn on_change(r: api::AdminRecord) {
+        self.changes = self.changes + 1;
+    }
+
+    fn on_flights(r: api::AdminRecord) {
+        self.flights = self.flights + 1;
+        self.flights_data = r.data;
+    }
+}
+
+fn usage_row(id: String, record: String) -> st::UsageRow {
+    return st::UsageRow {
+        id: id,
+        project: "work",
+        key: "k1",
+        requested_model: "echo",
+        status: "served",
+        record: record,
+        present: true,
+    };
+}
+
+main locus App {
+    params {
+        watch: Watch = Watch { };
+        feed: api::AdminFeed = api::AdminFeed { };
+    }
+
+    run() {
+        // what was there before the feed started is not told
+        self.feed.store.insert_usage(
+            usage_row("resp_before", "{\"id\": \"resp_before\"}"),
+        ) or discard;
+        self.feed.tick(true);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.usage, 0, "a feed starts at the head");
+
+        // a request recorded (by any instance: the feed reads the rows)
+        self.feed.store.insert_usage(
+            usage_row("resp_1", "{\"id\": \"resp_1\", \"project\": \"work\"}"),
+        ) or discard;
+        self.feed.store.put_flight(
+            st::FlightRow {
+                request_id: "resp_2",
+                project: "work",
+                key: "k1",
+                model: "echo",
+                seat: "n1/s1",
+                account: "a1",
+                started_at: std::time::current(),
+            },
+        ) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.usage, 1, "a usage row is published once");
+        std::test::assert(
+            std::str::contains(self.watch.usage_data, "\"resp_1\""),
+            "with its record: " + self.watch.usage_data,
+        );
+        std::test::assert_eq_int(self.watch.flights, 1, "the requests in flight, whole");
+        std::test::assert(
+            std::str::contains(self.watch.flights_data, "\"resp_2\""),
+            "naming the one in flight: " + self.watch.flights_data,
+        );
+
+        // nothing new: nothing told, the set unchanged is not told again
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.usage, 1, "a row is told once");
+        std::test::assert_eq_int(self.watch.flights, 1, "an unchanged set is not told again");
+
+        // the request settles: the set is told empty
+        self.feed.store.drop_flight("resp_2") or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.flights, 2, "a changed set is told");
+        std::test::assert_eq_str(self.watch.flights_data, "[]", "now empty");
+
+        // a record too large for one bus frame goes without its data
+        let big = "{\"id\": \"resp_big\", \"pad\": \"" + std::str::repeat("x", 70000) + "\"}";
+        self.feed.store.insert_usage(usage_row("resp_big", big)) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.usage, 2, "a large record is still told");
+        std::test::assert_eq_str(self.watch.usage_data, "null", "without its data");
+        std::test::assert(!self.watch.usage_whole, "and says so");
+    }
+}
+
+fn main() {
+    App { };
+}

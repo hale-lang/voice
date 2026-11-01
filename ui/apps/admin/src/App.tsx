@@ -19,6 +19,7 @@ import { Placements } from './screens/Placements';
 import { Annotators } from './screens/Annotators';
 import { useAdminEvents } from './api/events';
 import { useHub, useHubCarriesAdmin } from './api/hub';
+import { setEventsLive } from './api/live';
 import { useOperatorToken, keepOperatorToken } from './api/token';
 import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
@@ -138,11 +139,9 @@ function EvidenceStrip() {
   const fetching = useIsFetching();
   const qc = useQueryClient();
   // with the events live, nothing is read again on a timer; while they are
-  // not, a slow read keeps the screens converging
+  // not, a slow read keeps the screens converging (live.ts)
   const live = carries ? hub === 'open' : stream === 'open';
-  useEffect(() => {
-    qc.setDefaultOptions({ queries: { ...qc.getDefaultOptions().queries, refetchInterval: live ? false : 30_000 } });
-  }, [live, qc]);
+  useEffect(() => { setEventsLive(live); }, [live]);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);

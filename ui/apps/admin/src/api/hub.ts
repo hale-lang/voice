@@ -148,7 +148,9 @@ export function useHub(): HubState {
             const before = last.get(f.topic);
             last.set(f.topic, f.seq);
             const admin = ADMIN_TOPICS[f.topic];
-            if (admin && before !== undefined && f.seq > before + 1) refresh(qc, AFFECTS[admin] ?? COVERED);
+            // a change shed names a resource no event left can say: every
+            // admin read again; another topic's gap, what that topic covers
+            if (admin && before !== undefined && f.seq > before + 1) refresh(qc, admin === 'change' ? COVERED : AFFECTS[admin] ?? COVERED);
             if (admin && f.payload) adminFrame(qc, f.topic, f.payload);
             else if (f.topic === 'NodeObserved' && typeof f.payload?.body === 'string') {
               observed(qc, JSON.parse(f.payload.body) as Node);

@@ -13,12 +13,20 @@ locus Watch {
         changes: Int = 0;
         flights: Int = 0;
         flights_data: String = "";
+        nodes: Int = 0;
+        node_data: String = "";
     }
 
     bus {
         subscribe api::UsageRecorded as on_usage;
         subscribe api::ChangeMade as on_change;
         subscribe api::RequestsInFlight as on_flights;
+        subscribe api::NodeMoved as on_node;
+    }
+
+    fn on_node(r: api::AdminRecord) {
+        self.nodes = self.nodes + 1;
+        self.node_data = r.data;
     }
 
     fn on_usage(r: api::AdminRecord) {
@@ -104,6 +112,85 @@ main locus App {
         std::time::sleep(50ms);
         std::test::assert_eq_int(self.watch.flights, 2, "a changed set is told");
         std::test::assert_eq_str(self.watch.flights_data, "[]", "now empty");
+
+        // a seat's state moves, reported through another instance, its
+        // node's status unchanged: the node is told as it now is
+        self.feed.store.insert_node(
+            st::NodeRow { id: "n1", name: "n1", token_digest: "d", present: true },
+            st::ChangeRow { id: "chg_n1", action: "create", target: "nodes/n1" },
+        ) or discard;
+        self.feed.store.insert_seat(
+            st::SeatRow {
+                ref: "n1/s1",
+                node: "n1",
+                id: "s1",
+                engine: "static",
+                account: "a1",
+                present: true,
+            },
+            st::ChangeRow { id: "chg_s1", action: "create", target: "nodes/n1/seats/s1" },
+        ) or discard;
+        // registered and beating, its assignment applied: what it reports
+        // of its seats stands
+        self.feed.store.put_fleet(
+            st::FleetRow {
+                node: "n1",
+                version: "0.1.0",
+                capabilities: "{\"max_in_flight\": 1, \"engines\": []}",
+                registered_at: std::time::current(),
+                applied_version: 99,
+                present: true,
+            },
+        ) or discard;
+        self.feed.store.put_beat("n1", std::time::current(), 0) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        let after_create = self.watch.nodes;
+        // beats alone, with what it reported unchanged, tell nothing
+        self.feed.store.put_beat("n1", std::time::current(), 1) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(
+            self.watch.nodes,
+            after_create,
+            "a node unchanged is not told again",
+        );
+        self.feed.store.put_seat_state(
+            st::SeatStateRow {
+                ref: "n1/s1",
+                node: "n1",
+                seat: "s1",
+                status: "fetching",
+                has_progress: true,
+                done_bytes: 10,
+                total_bytes: 100,
+            },
+        ) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(
+            self.watch.nodes,
+            after_create + 1,
+            "a seat's state moved: its node is told",
+        );
+        std::test::assert(
+            std::str::contains(self.watch.node_data, "\"fetching\""),
+            "with the seat as it now is: " + self.watch.node_data,
+        );
+        self.feed.store.put_seat_state(
+            st::SeatStateRow {
+                ref: "n1/s1",
+                node: "n1",
+                seat: "s1",
+                status: "fetching",
+                has_progress: true,
+                done_bytes: 60,
+                total_bytes: 100,
+            },
+        ) or discard;
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.nodes, after_create + 2, "and its fetch progress");
 
         // a record too large for one bus frame goes without its data
         let big = "{\"id\": \"resp_big\", \"pad\": \"" + std::str::repeat("x", 70000) + "\"}";

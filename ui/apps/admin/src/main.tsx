@@ -9,10 +9,10 @@ const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       // The admin events (the hub, else the event stream) read again what
-      // they name; while neither is open the shell sets a slow refetch
-      // (App.tsx), so nothing is read on a timer while they are.
+      // they name; each query that follows them takes its refetch interval
+      // from whether they flow (api/live.ts), so nothing is read on a timer
+      // while they do.
       staleTime: 5_000,
-      refetchInterval: 30_000,
       retry: 1,
     },
   },

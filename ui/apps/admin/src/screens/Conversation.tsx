@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Loading, Unavailable, Mono, Button, count, when } from '@hale/components';
 import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecord } from '../api/client';
-import { AnnotationLine, tally, TallyLine } from '../annotation';
+import { AnnotationLine, AnnotationsPanel } from '../annotation';
 import { href } from '../route';
 import { Fold, ItemView, texts, parse, type Item } from '../peek';
 import s from './Conversation.module.css';
@@ -47,11 +47,7 @@ export function ConversationView({ conversation }: { conversation: string }) {
         {all.length} turn{all.length === 1 ? '' : 's'}
         {q.data.truncated ? ' (the latest 2000)' : ''} · {last.project} · {last.served?.model ?? last.requested_model} · {count(all.reduce((n, t) => n + t.input_tokens, 0))} in · {count(all.reduce((n, t) => n + t.output_tokens, 0))} out · {when(first.created_at)} → {when(last.created_at)}
       </p>
-      {[...noteOf.values()].some(Boolean) && (
-        <p style={{ marginTop: 0 }}>
-          <TallyLine t={tally([...noteOf.values()])} />
-        </p>
-      )}
+      {[...noteOf.values()].some(Boolean) && <AnnotationsPanel slice={{ conversation }} title="This conversation's annotations" />}
       {!read ? (
         <Loading what="what was said" />
       ) : (

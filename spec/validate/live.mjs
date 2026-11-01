@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -53,6 +53,11 @@ await setup('/admin/v1/recipes', recipe('live-placed'));
 await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
 await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
 await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], account: 'claude-work', runtime: 'llama-server-b11913-cuda' });
+// an annotator and a rule of the operator's (the ones the deletes remove)
+const annotator = (id, stage) => ({ id, name: 'Live', stage, questions: [{ name: 'polite', type: 'noul', instructions: 'Is it polite?' }] });
+await setup('/admin/v1/annotators', annotator('live-sample', 'response'));
+const rule = id => ({ id, name: 'live', expect: { annotator: 'response-basics', question: 'outcome', answer: 'answered' } });
+await setup('/admin/v1/annotation-rules', rule('live-sample'));
 const auth = { authorization: `Bearer ${key.secret}` };
 
 // the bodies the real handlers take; anything else gets the generic one
@@ -75,6 +80,11 @@ const bodies = {
   createSeat: { id: 'live', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1', as: null }], data_classes: ['public', 'internal'], concurrency: 2, config: { text: 'hi', chunk_chars: 4 } },
   updateSeat: { concurrency: 4 },
   createChatCompletion: { model: 'echo-1', messages: [{ role: 'user', content: 'hi' }] },
+  createAnnotator: annotator('live-2', 'request'),
+  updateAnnotator: { name: 'Live, edited' },
+  createAnnotationRule: rule('live-2'),
+  updateAnnotationRule: { name: 'live, edited' },
+  backfillAnnotations: { annotator: 'request-basics', project: 'work' },
 };
 
 // the node plane: the node's enrollment token, and the bodies it sends
@@ -104,10 +114,12 @@ const refusals = {
   getUsage: { json: [404, 'not_found', 'NotFound'] },
   // nor, so, any request recorded whole
   getPeek: { json: [404, 'not_found', 'NotFound'] },
+  // nor, so, any request annotated
+  getAnnotation: { json: [404, 'not_found', 'NotFound'] },
 };
 
 // the query an operation needs to be answered at all
-const queries = { summarizeUsage: '?group_by=project,account' };
+const queries = { summarizeUsage: '?group_by=project,account', annotationFacets: '?question=request-basics.task', annotationTrend: '?question=request-basics.task&bucket=hour' };
 
 const calls = [], last = [];
 for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object.entries(item)) {

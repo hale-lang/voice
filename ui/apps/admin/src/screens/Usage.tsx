@@ -6,7 +6,7 @@ import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
-import { AnnotationSection, tally, TallyLine } from '../annotation';
+import { AnnotationSection, AnnotationsPanel } from '../annotation';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
@@ -52,7 +52,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         <Summary group="project" />
         <Summary group="account" />
       </PanelGrid>
-      <Annotations project={filter.project} keyId={filter.key.trim()} />
+      <AnnotationsPanel slice={{ project: filter.project || undefined, key: filter.key.trim() || undefined }} />
       <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
         <Filters value={filter} onChange={setFilter} />
         {records.isPending ? (
@@ -160,43 +160,6 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
   );
 }
 
-/**
- * What the requests were and what their responses did, as voice-system's
- * decision model read them (for a project or key that annotates): every one
- * of the latest 200 together, then by model.
- */
-function Annotations({ project, keyId }: { project: string; keyId: string }) {
-  const q = useGet('/admin/v1/annotations', { params: { query: { limit: 200, ...(project ? { project } : {}), ...(keyId ? { key: keyId } : {}) } } });
-  const all = q.data?.data ?? [];
-  const byModel = new Map<string, typeof all>();
-  for (const a of all) byModel.set(a.model, [...(byModel.get(a.model) ?? []), a]);
-  return (
-    <Panel title="Annotations" readout={readout(q, q.data ? `latest ${all.length}` : null)}>
-      {q.isPending ? (
-        <Loading />
-      ) : q.isError ? (
-        <Unavailable what="Annotations" detail={q.error.message} />
-      ) : !all.length ? (
-        <p className="faint">None yet: a project or key annotates when set to on Projects, and voice-system needs a decision model it may use.</p>
-      ) : (
-        <>
-          <p style={{ marginTop: 0 }}>
-            <TallyLine t={tally(all)} />
-          </p>
-          <Table
-            rows={[...byModel.entries()]}
-            rowKey={([m]) => m}
-            columns={[
-              { key: 'm', header: 'Model', render: ([m]) => <Mono>{m}</Mono> },
-              { key: 't', header: 'Tasks, outcomes', render: ([, as]) => <TallyLine t={tally(as)} /> },
-              { key: 'n', header: 'Not annotated', num: true, render: ([, as]) => count(as.filter((a) => a.status !== 'annotated').length) },
-            ]}
-          />
-        </>
-      )}
-    </Panel>
-  );
-}
 
 /** A request's metadata, `name = value` each, as the caller set it. */
 function Metadata({ of }: { of: unknown }) {

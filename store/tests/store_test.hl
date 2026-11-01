@@ -795,67 +795,188 @@ fn system(s: st::Store, label: String) {
     std::test::assert(!none.present, label + ": which no token names");
 }
 
-/// A request's annotation kept, listed by project, key, task and outcome,
-/// and replaced.
+/// A request's annotation kept with its answers, an annotator's answers
+/// replaced and the others' kept; searched by answer, counted, and by time;
+/// annotators versioned, rules kept; and what voice ships there from the start.
 fn annotations(s: st::Store, label: String) {
+    let built = s.annotators() or st::AnnotatorRows { };
+    std::test::assert_eq_int(count(built.rows), 2, label + ": the built-in annotators");
+    let req = s.annotator("request-basics") or st::AnnotatorRow { };
+    std::test::assert(
+        req.present && req.builtin && req.version == 1,
+        label + ": request-basics at version 1",
+    );
+    std::test::assert(
+        std::str::contains(req.body, "asks_for_code"),
+        label + ": its questions: " + req.body,
+    );
+    let rules = s.rules() or st::RuleRows { };
+    std::test::assert_eq_int(count(rules.rows), 4, label + ": the built-in rules");
+
+    let now = std::time::current();
+    s.insert_annotator(
+        st::AnnotatorRow {
+            id: "tone",
+            version: 1,
+            body: "{\"name\": \"Tone\"}",
+            created_at: now,
+            updated_at: now,
+        },
+        ch("create", "annotators/tone"),
+    ) or discard;
+    s.update_annotator(
+        st::AnnotatorRow {
+            id: "tone",
+            version: 2,
+            body: "{\"name\": \"Tone 2\"}",
+            created_at: now,
+            updated_at: now,
+        },
+        ch("update", "annotators/tone"),
+    ) or discard;
+    let tone = s.annotator("tone") or st::AnnotatorRow { };
+    std::test::assert(
+        tone.version == 2 && std::str::contains(tone.body, "Tone 2"),
+        label + ": its current version",
+    );
+    let v1 = s.annotator_version("tone", 1) or st::AnnotatorRow { };
+    std::test::assert(
+        v1.present && std::str::contains(v1.body, "\"Tone\""),
+        label + ": its first, kept",
+    );
+    s.remove_annotator(tone, ch("delete", "annotators/tone")) or discard;
+    let gone = s.annotator("tone") or st::AnnotatorRow { };
+    std::test::assert(gone.removed, label + ": removed, its id kept");
+    std::test::assert(
+        !(
+            s.insert_annotator(
+                st::AnnotatorRow { id: "tone", version: 1, body: "{}" },
+                ch("create", "annotators/tone"),
+            ) or true
+        ),
+        label + ": an id never reused",
+    );
+
     s.insert_project(
         st::ProjectRow { id: "noted", name: "Noted", annotate_set: true, annotate: true },
         ch("create", "projects/noted"),
     ) or discard;
     let p = s.project("noted") or st::ProjectRow { };
     std::test::assert(p.annotate_set && p.annotate, label + ": a project that annotates");
+    let at = `2026-10-31T10:00:00Z`;
+    let mut ans = st::AnswerRows { };
+    push(ans.rows, answer("resp_a", "request-basics", "task", "code", 0.85, at)) or discard;
+    push(ans.rows, answer("resp_a", "response-basics", "outcome", "answered", 0.75, at)) or discard;
     s.put_annotation(
         st::AnnotationRow {
             request_id: "resp_a",
             project: "noted",
             key: "k_1",
-            model: "echo-1",
-            created_at: `2026-10-31T10:00:00Z`,
-            task: "code",
-            outcome: "answered",
-            body: "{\"before\": {}}",
+            conversation: "c-1",
+            created_at: at,
+            body: "{\"model\": \"jev-2b\"}",
         },
+        ans,
     ) or { std::test::assert(false, label + ": kept: " + err.message); };
+    let later = `2026-10-31T12:30:00Z`;
+    let mut ans_b = st::AnswerRows { };
+    push(ans_b.rows, answer("resp_b", "request-basics", "task", "chat", 0.6, later)) or discard;
     s.put_annotation(
-        st::AnnotationRow {
-            request_id: "resp_b",
-            project: "noted",
-            key: "k_2",
-            model: "echo-1",
-            created_at: `2026-10-31T10:01:00Z`,
-            status: "not_annotated",
-            reason: "no decision model",
-        },
+        st::AnnotationRow { request_id: "resp_b", project: "noted", key: "k_2", created_at: later },
+        ans_b,
     ) or discard;
-    let all = s.annotations("noted", "", "", "", 50) or st::AnnotationRows { };
+    let one = s.annotation("resp_a") or st::AnnotationRow { };
+    std::test::assert(
+        one.present && one.conversation == "c-1" && std::str::contains(one.body, "jev-2b"),
+        label + ": one",
+    );
+    let rows = s.answers("resp_a") or st::AnswerRows { };
+    std::test::assert_eq_int(count(rows.rows), 2, label + ": its answers");
+    // one annotator's answers replaced, the other's kept
+    let mut again = st::AnswerRows { };
+    push(again.rows, answer("resp_a", "request-basics", "task", "debug", 0.7, at)) or discard;
+    s.put_annotation(one, again) or discard;
+    let rows2 = s.answers("resp_a") or st::AnswerRows { };
+    std::test::assert_eq_int(
+        count(rows2.rows),
+        2,
+        label + ": one annotator's replaced, the other's kept",
+    );
+    let mut task = "";
+    for r in rows2.rows { if r.question == "task" { task = r.answer; } }
+    std::test::assert_eq_str(task, "debug", label + ": the new answer");
+
+    let all = s.annotations(st::AnswerQuery { project: "noted" }) or st::AnnotationRows { };
     std::test::assert_eq_int(count(all.rows), 2, label + ": both");
     std::test::assert_eq_str(
         (at(all.rows, 0) or st::AnnotationRow { }).request_id,
         "resp_b",
         label + ": newest first",
     );
-    let coded = s.annotations("noted", "", "code", "", 50) or st::AnnotationRows { };
-    std::test::assert_eq_int(count(coded.rows), 1, label + ": by task");
-    let keyed = s.annotations("noted", "k_2", "", "", 50) or st::AnnotationRows { };
+    let mut by_answer = st::AnswerQuery { project: "noted" };
+    push(by_answer.terms.items, "request-basics\ttask\tchat") or discard;
+    let chats = s.annotations(by_answer) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(chats.rows), 1, label + ": by an answer");
+    by_answer.min_probability = 0.9;
+    let none = s.annotations(by_answer) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(none.rows), 0, label + ": at a probability it lacks");
+    let keyed = s.annotations(st::AnswerQuery { key: "k_2" }) or st::AnnotationRows { };
     std::test::assert_eq_int(count(keyed.rows), 1, label + ": by key");
-    let one = s.annotation("resp_a") or st::AnnotationRow { };
-    std::test::assert(one.present && one.outcome == "answered", label + ": one");
-    std::test::assert(std::str::contains(one.body, "before"), label + ": its body: " + one.body);
-    s.put_annotation(
-        st::AnnotationRow {
-            request_id: "resp_b",
-            project: "noted",
-            key: "k_2",
-            model: "echo-1",
-            created_at: `2026-10-31T10:01:00Z`,
-            task: "chat",
-            outcome: "answered",
-        },
-    ) or discard;
-    let again = s.annotation("resp_b") or st::AnnotationRow { };
-    std::test::assert(again.status == "annotated" && again.task == "chat", label + ": replaced");
+    let conv = s.annotations(st::AnswerQuery { conversation: "c-1" }) or st::AnnotationRows { };
+    std::test::assert_eq_int(count(conv.rows), 1, label + ": by conversation");
+    let counts = s.answer_counts(
+        st::AnswerQuery { project: "noted" },
+        "request-basics",
+        "task",
+    ) or st::AnswerCounts { };
+    std::test::assert_eq_int(counts.total, 2, label + ": counted");
+    std::test::assert_eq_int(count(counts.rows), 2, label + ": two answers");
+    let trend = s.answer_trend(
+        st::AnswerQuery { project: "noted" },
+        "request-basics",
+        "task",
+        "hour",
+    ) or st::TrendPoints { };
+    std::test::assert_eq_int(count(trend.rows), 2, label + ": two hours");
+    std::test::assert(
+        std::time::unix(
+            (at(trend.rows, 0) or st::TrendPoint { }).at,
+        ) == std::time::unix(`2026-10-31T10:00:00Z`),
+        label + ": oldest first, on the hour",
+    );
+    let day = s.answer_trend(
+        st::AnswerQuery { project: "noted" },
+        "request-basics",
+        "task",
+        "day",
+    ) or st::TrendPoints { };
+    std::test::assert_eq_int(count(day.rows), 2, label + ": a day, by answer");
     let missing = s.annotation("resp_none") or st::AnnotationRow { present: true };
     std::test::assert(!missing.present, label + ": none for a request not annotated");
+}
+
+fn answer(
+    id: String,
+    annotator: String,
+    question: String,
+    a: String,
+    p: Float,
+    at: Time
+) -> st::AnswerRow {
+    return st::AnswerRow {
+        request_id: id,
+        project: "noted",
+        key: if id == "resp_a" { "k_1" } else { "k_2" },
+        conversation: if id == "resp_a" { "c-1" } else { "" },
+        created_at: at,
+        annotator: annotator,
+        version: 1,
+        stage: if annotator == "request-basics" { "request" } else { "response" },
+        question: question,
+        answer: a,
+        probability: p,
+        probabilities: "{\"" + a + "\": " + to_string(p) + "}",
+    };
 }
 
 fn operator(s: st::Store, label: String) {
@@ -1001,6 +1122,10 @@ fn main() {
     bounded(pg, "postgres");
     pg.conn.exec("TRUNCATE operator_token");
     operator(pg, "postgres");
-    pg.conn.exec("TRUNCATE annotation");
+    pg.conn.exec("TRUNCATE annotation_answer, annotation");
+    pg.conn.exec(
+        "DELETE FROM annotator_version WHERE annotator NOT IN ('request-basics', 'response-basics')",
+    );
+    pg.conn.exec("DELETE FROM annotator WHERE id NOT IN ('request-basics', 'response-basics')");
     annotations(pg, "postgres");
 }

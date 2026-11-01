@@ -118,6 +118,15 @@ type Served {
     job: AnnotationJob = AnnotationJob { };
 }
 
+/// What a request is served as (`Inference.served_as`): its model, the
+/// alias it was asked by, and a decision model's systemone request.
+type Resolution {
+    model: String = "";
+    alias: String = "";
+    decision: Bool = false;
+    served_body: String = "";
+}
+
 /// One seat a request could be offered, and its own name for the model.
 type Candidate { seat: st::SeatRow = st::SeatRow { }; engine_name: String = ""; }
 
@@ -169,8 +178,17 @@ locus Inference {
     /// Hold the request to its rate limits, admit it, then offer it to
     /// each eligible seat in turn until one serves it. A limit is policy:
     /// it refuses before anything is looked for to serve.
-    fn serve(asked: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
-        let r = self.resolved(asked, ctx) or raise;
+    fn serve(r: InferenceRequest, ctx: std::api::Context) -> Served fallible(ApiError) {
+        // admitted here, by this instance, as what it is served as: set on
+        // the request where it is held, in this frame, which serves it
+        let res = self.served_as(r, ctx) or raise;
+        r.instance = self.instance;
+        r.model = res.model;
+        r.alias = res.alias;
+        if res.decision {
+            r.served_body = res.served_body;
+            r.seat_endpoint = "decision";
+        }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         let mut s = self.serve_held(r, ctx, candidates) or raise;
@@ -309,11 +327,20 @@ locus Inference {
     /// keep-alive span, nothing is sent, so a request every seat refuses is
     /// answered whole, as a `502`.
     fn stream(
-        asked: InferenceRequest,
+        r: InferenceRequest,
         ctx: std::api::Context,
         out: EventStream
     ) -> std::http::Response fallible(ApiError) {
-        let r = self.resolved(asked, ctx) or raise;
+        // admitted here, by this instance, as what it is served as: set on
+        // the request where it is held, in this frame, which serves it
+        let res = self.served_as(r, ctx) or raise;
+        r.instance = self.instance;
+        r.model = res.model;
+        r.alias = res.alias;
+        if res.decision {
+            r.served_body = res.served_body;
+            r.seat_endpoint = "decision";
+        }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         return self.stream_held(r, ctx, out, candidates, held) or raise;
@@ -781,24 +808,21 @@ locus Inference {
         if self.pulse { UsageToTell <- usage_event(r, s); }
     }
 
-    /// `r` as it is served: a model its caller's project names by an alias
+    /// What `r` is served as: a model its caller's project names by an alias
     /// (aliases.hl) asked for as that catalog model, the alias kept for its
-    /// usage. Read when it is admitted, so an alias moved out of band takes
-    /// the next request; a caller that is no key is refused after, by `hold`.
-    fn resolved(
-        given: InferenceRequest,
-        ctx: std::api::Context
-    ) -> InferenceRequest fallible(ApiError) {
-        // admitted here, by this instance
-        let mut r = given;
-        r.instance = self.instance;
-        if !r.has_model { return r; }
+    /// usage; a decision model's request asked as systemone asks it. Read
+    /// when it is admitted, so an alias moved out of band takes the next
+    /// request; a caller that is no key is refused after, by `hold`. Only
+    /// what changes comes back, never the request: its body may be 12 MiB,
+    /// and a copy of it is that again.
+    fn served_as(r: InferenceRequest, ctx: std::api::Context) -> Resolution fallible(ApiError) {
+        let mut out = Resolution { model: r.model };
+        if !r.has_model { return out; }
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
-        if !k.present { return r; }
+        if !k.present { return out; }
         let p = self.store.project(k.project) or fail metering_failed(err);
-        if !p.present { return r; }
+        if !p.present { return out; }
         let target = alias_target(self.store, p, r.model) or fail metering_failed(err);
-        let mut out = r;
         if len(target) > 0 {
             out.alias = r.model;
             out.model = target;
@@ -807,14 +831,14 @@ locus Inference {
         // systemone asks it (decision.hl)
         let m = self.store.model(out.model) or fail metering_failed(err);
         if m.present && !m.removed && m.contract == "decision" {
-            if out.stream {
+            if r.stream {
                 fail decision_refusal(
                     "a decision model answers whole; send `stream: false`",
                     "stream"
                 );
             }
-            out.served_body = decision_body(out.body) or raise;
-            out.seat_endpoint = "decision";
+            out.served_body = decision_body(r.body) or raise;
+            out.decision = true;
         }
         return out;
     }

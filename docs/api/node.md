@@ -491,7 +491,7 @@ Type: object
 | `os` | string, one of `linux`, `darwin` | yes |  |  |
 | `arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `memory_bytes` | integer | yes | The machine's memory. | ≥ 1 |
-| `model_memory_bytes` | integer | yes | What models may use of it: `memory_bytes`, unless the node's operator holds some back in the capabilities file, which only lowers it. | ≥ 0 |
+| `model_memory_bytes` | integer | yes | What models may use of it: `memory_bytes` less what the machine keeps for its own system (a sixteenth, at least 4 GiB; on a machine whose GPU shares its memory, the one pool both draw on), or less when the node's operator holds some back in the capabilities file, which only lowers it. The seats the node runs hold at most this together: a seat that would take more is not started, and says so. | ≥ 0 |
 | `accelerators` | array of [Accelerator](#schema-accelerator) | yes | At most 16; a machine with more declares its first 16, and its node says so in its log. | items ≤ 16 |
 | `disk_free_bytes` | integer | yes | Free space under the node's data directory, where weights are kept. | ≥ 0 |
 

@@ -4242,7 +4242,7 @@ Type: [AnnotationSummary](#schema-annotationsummary) & object
 | `input_tokens` | integer | yes | What its questions read, as requests of its project's system key. |  |
 | `answers` | array of [AnnotationAnswer](#schema-annotationanswer) | yes |  |  |
 | `pairs` | array of [AnnotationPair](#schema-annotationpair) | yes |  |  |
-| `runs` | array of [AnnotationRun](#schema-annotationrun) |  | Each request voice made for it, in order. |  |
+| `runs` | array of [AnnotationRun](#schema-annotationrun) | yes | Each request voice made for it, in order. |  |
 
 <a id="schema-annotationfacets"></a>
 

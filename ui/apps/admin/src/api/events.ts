@@ -50,6 +50,9 @@ const AFFECTS: Record<string, string[]> = {
   // a request a seat is serving: told to listeners (the Network view), no
   // query changes until its usage is recorded
   request: [],
+  // a request annotated: its annotation, the searches over them, the
+  // conversations' titles, and the annotators' counts
+  annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/annotators'],
 };
 
 /** One server-sent event: its `event`, `data` and `id`, and a `retry`. */
@@ -110,6 +113,14 @@ export function useAdminEvents(): 'connecting' | 'open' | 'closed' {
       const keys = AFFECTS[e.event];
       if (!keys) return;
       receive(e.data);
+      if (e.event === 'annotation') {
+        // a request's own annotation (`/annotations/{request_id}`), an
+        // annotator's runs, under the paths it names
+        const under = (k: unknown) => typeof k === 'string' && keys.some((p) => k === p || k.startsWith(`${p}/`));
+        receive(e.data);
+        void qc.invalidateQueries({ predicate: (q) => under(q.queryKey[0]) });
+        return;
+      }
       for (const key of keys) void qc.invalidateQueries({ queryKey: [key] });
     };
     void (async () => {

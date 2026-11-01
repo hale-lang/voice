@@ -17,7 +17,7 @@ const SEED = 20;
 /** An event older than this when it arrives is history, shown quiet, in seconds. */
 const LIVE = 60;
 
-type Tone = 'req' | 'ok' | 'warn' | 'fail' | 'node' | 'change' | 'quiet';
+type Tone = 'req' | 'ok' | 'warn' | 'fail' | 'node' | 'change' | 'quiet' | 'note';
 
 type Line = { key: string; at: number; tag: string; tone: Tone; text: string; detail?: string; open?: () => void; replayed: boolean };
 
@@ -157,7 +157,7 @@ export function EventLog() {
           }}
         >
           {lines.length === 0 ? (
-            <div className={s.empty}>listening… requests, nodes and changes show here as they happen</div>
+            <div className={s.empty}>listening… requests, annotations, nodes and changes show here as they happen</div>
           ) : (
             lines.map((l) => (
               <div
@@ -227,6 +227,28 @@ function lineOf(e: AdminEvent): Line | null {
         replayed,
       };
     }
+    case 'annotation': {
+      const a = e.data;
+      const pick = (q: string) => a.answers.find((x) => x.question === q)?.answer;
+      const task = pick('task');
+      const outcome = pick('outcome');
+      const flags = a.answers.filter((x) => x.answer === 'true' && x.probability >= 0.5).map((x) => x.question.replace(/_/g, '-'));
+      const said = [task && outcome ? `${task} → ${outcome.replace(/_/g, ' ')}` : (task ?? outcome), ...flags.slice(0, 3)].filter(Boolean).join(' · ');
+      const tokens = a.runs.reduce((n, r) => n + r.input_tokens, 0);
+      const not = a.status !== 'annotated';
+      return {
+        key: `annotation:${e.id}`,
+        at,
+        tag: not ? '◌ unread' : '◇ read',
+        tone: not ? 'warn' : 'note',
+        text: not
+          ? `${a.project} · not annotated: ${a.reason}`
+          : `${a.project} · ${said || `${a.answers.length} answers`}${a.title ? ` · “${a.title}”` : ''} · ${a.runs.length} run${a.runs.length === 1 ? '' : 's'}, ${count(tokens)} tok`,
+        detail: a.conversation ?? a.request_id,
+        open: () => go('usage', a.request_id),
+        replayed,
+      };
+    }
     default:
       return null;
   }
@@ -240,12 +262,15 @@ function landing(r: UsageRecord, at: number, replayed: boolean): Line {
   const secs = t.wall_ms / 1000;
   const rate = t.first_output_ms != null && t.engine_ms != null && t.engine_ms > t.first_output_ms && r.output_tokens > 0 ? ` · ${((1000 * r.output_tokens) / (t.engine_ms - t.first_output_ms)).toFixed(0)} tok/s` : '';
   const failed = !FINE.has(r.status);
+  // voice's own request for the project (its system key's): an annotation's
+  // stage or a title, quiet beside the project's own
+  const side = r.internal ? String((r.metadata as Record<string, unknown> | null)?.side ?? 'internal') : '';
   return {
     key: `usage:${r.id}`,
     at,
-    tag: failed ? '✕ ' + r.status.replace(/_/g, ' ') : '■ done',
-    tone: failed ? 'fail' : r.status === 'incomplete' ? 'warn' : 'ok',
-    text: `${r.project} · ${r.served?.model ?? r.requested_model} on ${r.served?.seat ?? '–'} · ${count(r.input_tokens)} → ${count(r.output_tokens)} tok · ${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s${rate}`,
+    tag: failed ? '✕ ' + r.status.replace(/_/g, ' ') : r.internal ? '· internal' : '■ done',
+    tone: failed ? 'fail' : r.internal ? 'quiet' : r.status === 'incomplete' ? 'warn' : 'ok',
+    text: `${r.project}${r.internal ? ` · ${side === 'title' ? 'title' : `${side} stage`}` : ''} · ${r.served?.model ?? r.requested_model} on ${r.served?.seat ?? '–'} · ${count(r.input_tokens)} → ${count(r.output_tokens)} tok · ${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s${rate}`,
     detail: r.conversation ?? r.id,
     open: () => go('usage', r.id),
     replayed,

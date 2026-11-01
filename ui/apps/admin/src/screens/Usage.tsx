@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, Select, TextInput, micros, count, when, ago } from '@hale/components';
+import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, Select, TextInput, Checkbox, micros, count, when, ago } from '@hale/components';
 import { toneOf } from '../tone';
 import { useGet, type UsageRecord } from '../api/client';
 import type { ScreenProps } from '../App';
@@ -10,6 +10,7 @@ import { AnnotationSection, AnnotationsPanel } from '../annotation';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
+import { ConversationName } from '../titles';
 
 /** Requests a page holds. */
 const PAGE = 50;
@@ -67,8 +68,8 @@ export function Usage({ route, setInspector }: ScreenProps) {
             onSelect={(r) => go('usage', r.id)}
             columns={[
               { key: 'when', header: 'When', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
-              { key: 'id', header: 'Request', render: (r) => <Mono>{r.id}</Mono> },
-              { key: 'project', header: 'Project / key', render: (r) => <><Mono>{r.project}</Mono> <span className="muted">{r.key}</span></> },
+              { key: 'id', header: 'Request', render: (r) => <><Mono>{r.id}</Mono>{r.internal && <Internal record={r} />}</> },
+              { key: 'project', header: 'Project / key', render: (r) => <><Mono>{r.project}</Mono> <span className="muted">{r.key}</span>{r.conversation && <div className="faint"><ConversationName conversation={r.conversation} project={r.project} /></div>}</> },
               { key: 'model', header: 'Model', render: (r) => r.served?.model ?? r.requested_model },
               { key: 'account', header: 'Account', render: (r) => <Mono>{r.served?.account ?? '–'}</Mono> },
               { key: 'status', header: 'Status', render: (r) => <Status tone={toneOf(r.status)} label={r.status} /> },
@@ -141,11 +142,11 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'status', v: <Status tone={toneOf(r.status)} label={r.status} /> },
           { k: 'created', v: when(r.created_at) },
           { k: 'project', v: <Mono>{r.project}</Mono> },
-          { k: 'key', v: <Mono>{r.key}</Mono> },
+          { k: 'key', v: <><Mono>{r.key}</Mono>{r.internal && <Internal record={r} />}</> },
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
-          { k: 'conversation', v: r.conversation ? <><Mono>{r.conversation}</Mono> <a href={href('usage', 'c', r.conversation)}>read it</a></> : <span className="faint">none</span> },
+          { k: 'conversation', v: r.conversation ? <><ConversationName conversation={r.conversation} project={r.project} mono /> <a href={href('usage', 'c', r.conversation)}>read it</a></> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
           { k: 'tokens', v: `${count(r.input_tokens)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
@@ -160,6 +161,27 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
   );
 }
 
+
+/**
+ * What a request of a project's system key was: voice's own for the
+ * project, an annotation's stage (or a title) for the request it names,
+ * kept apart from the project's usage.
+ */
+function Internal({ record: r }: { record: UsageRecord }) {
+  const m = (r.metadata ?? {}) as Record<string, unknown>;
+  const of = typeof m.annotates === 'string' ? m.annotates : null;
+  const side = typeof m.side === 'string' ? m.side : null;
+  return (
+    <div className="faint" title="voice's own request for the project, under its system key: not in its usage, its limits or what is told to the organization">
+      internal{side ? ` · ${side === 'title' ? 'its title' : `the ${side} stage`}` : ''}
+      {of && (
+        <>
+          {' '}of <a href={href('usage', of)} onClick={(e) => e.stopPropagation()}><Mono>{of}</Mono></a>
+        </>
+      )}
+    </div>
+  );
+}
 
 /** A request's metadata, `name = value` each, as the caller set it. */
 function Metadata({ of }: { of: unknown }) {
@@ -181,9 +203,9 @@ function Metadata({ of }: { of: unknown }) {
  * cutoff `since` chose, fixed when it was chosen, so the query (and its
  * cache) stays the same across renders and pages.
  */
-type Filter = { project: string; key: string; model: string; account: string; conversation: string; metadata: string; since: string; from: string };
+type Filter = { project: string; key: string; model: string; account: string; conversation: string; metadata: string; since: string; from: string; internal: boolean };
 
-const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', conversation: '', metadata: '', since: '', from: '' };
+const NO_FILTER: Filter = { project: '', key: '', model: '', account: '', conversation: '', metadata: '', since: '', from: '', internal: false };
 
 /** The time ranges offered, as how far back, in seconds. */
 const SINCE: { value: string; label: string }[] = [
@@ -216,6 +238,7 @@ function query(f: Filter) {
     ...(f.conversation.trim() ? { conversation: f.conversation.trim() } : {}),
     ...(pairs ? { metadata: pairs } : {}),
     ...(f.from ? { from: f.from } : {}),
+    ...(f.internal ? { include_internal: true } : {}),
   };
 }
 
@@ -224,7 +247,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
   const projects = useGet('/admin/v1/projects', { params: { query: { include_archived: true } } });
   const models = useGet('/admin/v1/models');
   const accounts = useGet('/admin/v1/accounts');
-  const set = (k: keyof Filter) => (v: string) => onChange({ ...f, [k]: v });
+  const set = (k: Exclude<keyof Filter, 'internal'>) => (v: string) => onChange({ ...f, [k]: v });
   // the cutoff is fixed now, when the range is chosen
   const since = (v: string) => onChange({ ...f, since: v, from: v ? new Date(Date.now() - Number(v) * 1000).toISOString() : '' });
   const badPair = f.metadata.trim() !== '' && !metadataPairs(f.metadata);
@@ -259,6 +282,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
         <div className="faint">when</div>
         <Select value={f.since} onChange={since} options={SINCE} />
       </label>
+      <Checkbox checked={f.internal} onChange={(v) => onChange({ ...f, internal: v })} label="show internal: voice's own requests for each project (annotations, titles)" />
       {any && <Button onClick={() => onChange(NO_FILTER)}>clear</Button>}
     </div>
   );

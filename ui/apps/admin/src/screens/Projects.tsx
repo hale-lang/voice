@@ -179,13 +179,19 @@ function ProjectInspector({ project: p }: { project: Project }) {
           p.internal
             ? {
                 k: 'annotate',
-                v: <span className="muted">voice's own project: the requests voice makes for itself (annotations) are its, spending its accounts and limits; its <Mono>decide</Mono> alias names the decision model asked</span>,
+                v: <span className="muted">retired: voice's old project for its own requests, which each project's own system key makes now</span>,
               }
             : {
                 k: 'annotate',
                 v: (
                   <>
-                    {p.annotates ? <span className="c-wait">each request read by voice-system's decision model</span> : <span className="muted">off</span>}
+                    {p.annotates ? (
+                      <span className="c-wait">
+                        each request read by its <Mono>decide</Mono> model, under <Mono>{p.id}-system</Mono>
+                      </span>
+                    ) : (
+                      <span className="muted">off</span>
+                    )}
                     {p.annotate == null && p.parent ? <span className="muted"> · {p.parent}'s</span> : null}{' '}
                     {p.status !== 'archived' && (
                       <Select
@@ -194,7 +200,12 @@ function ProjectInspector({ project: p }: { project: Project }) {
                         options={[...(p.parent ? [{ value: 'parent', label: `${p.parent}'s` }] : []), { value: 'on', label: 'on' }, { value: 'off', label: 'off' }]}
                       />
                     )}
-                    {p.annotates && <span className="muted"> · spending voice-system's usage, not this project's</span>}
+                    {p.annotates && <span className="muted"> · kept apart from this project's usage and limits</span>}
+                    {w.error && /decision model/.test(w.error) && (
+                      <div className="c-wait">
+                        pick a model first: give it a <Mono>decide</Mono> alias naming a decision model (aliases, below), then turn annotate on
+                      </div>
+                    )}
                   </>
                 ),
               },
@@ -365,7 +376,7 @@ function Keys({ project }: { project: Project }) {
           rowClass={(k) => (k.id === secret?.id ? 'afterglow' : undefined)}
           columns={[
             { key: 'id', header: 'Key', render: (k) => <Mono>{k.id}</Mono> },
-            { key: 'name', header: 'Name', render: (k) => k.name },
+            { key: 'name', header: 'Name', render: (k) => (k.internal ? <span title="no token names it; its usage is kept apart from the project's, held to its own limits">{k.name} <span className="faint">· system key: voice's own requests for {project.id}</span></span> : k.name) },
             { key: 'prefix', header: 'Prefix', render: (k) => <Mono>{k.prefix ?? '–'}…</Mono> },
             { key: 'accounts', header: 'Accounts', render: (k) => (k.accounts ? k.accounts.join(', ') : <span className="muted">the project's</span>) },
             { key: 'status', header: 'State', render: (k) => <Status tone={toneOf(k.status)} label={k.status} /> },
@@ -374,7 +385,7 @@ function Keys({ project }: { project: Project }) {
               key: 'peek',
               header: 'Peek',
               render: (k) =>
-                k.status === 'active' ? (
+                k.status === 'active' && !k.internal ? (
                   <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { peek: !k.peek } }); }} disabled={w.busy}>
                     {k.peek ? 'recording · stop' : project.peeks ? 'by the project' : 'peek'}
                   </Button>
@@ -386,7 +397,7 @@ function Keys({ project }: { project: Project }) {
               key: 'annotate',
               header: 'Annotate',
               render: (k) =>
-                k.status === 'active' && !project.internal ? (
+                k.status === 'active' && !project.internal && !k.internal ? (
                   <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { annotate: !k.annotate } }); }} disabled={w.busy}>
                     {k.annotate ? 'annotating · stop' : project.annotates ? 'by the project' : 'annotate'}
                   </Button>
@@ -398,7 +409,7 @@ function Keys({ project }: { project: Project }) {
               key: 'x',
               header: '',
               render: (k) =>
-                k.status === 'active' ? (
+ k.status === 'active' && !k.internal ? (
                   <Confirm label="revoke" confirm="revoke now" onConfirm={async () => { await w.write('delete', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } } }); }} />
                 ) : null,
             },

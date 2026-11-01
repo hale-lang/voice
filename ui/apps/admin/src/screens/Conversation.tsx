@@ -1,7 +1,8 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Loading, Unavailable, Mono, Button, count, when } from '@hale/components';
 import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecord } from '../api/client';
-import { AnnotationLine, AnnotationsPanel } from '../annotation';
+import { AnnotationLine, AnnotationsPanel, Runs } from '../annotation';
+import { useTitles } from '../titles';
 import { href } from '../route';
 import { Fold, ItemView, texts, parse, type Item } from '../peek';
 import s from './Conversation.module.css';
@@ -32,6 +33,7 @@ export function ConversationView({ conversation }: { conversation: string }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [loaded, turns.map((t) => t.id).join(','), hidden],
   );
+  const titleOf = useTitles();
   const name = conversation;
   if (q.isPending) return <Loading what="the conversation" />;
   if (q.isError) return <Unavailable what="The conversation" detail={q.error.message} />;
@@ -41,7 +43,7 @@ export function ConversationView({ conversation }: { conversation: string }) {
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-1)' }}>
-        <Mono>{name}</Mono>
+        {titleOf(name, all[all.length - 1]!.project) ? <span title={name}>{titleOf(name, all[all.length - 1]!.project)}</span> : <Mono>{name}</Mono>}
       </h2>
       <p className="muted" style={{ marginTop: 0 }}>
         {all.length} turn{all.length === 1 ? '' : 's'}
@@ -121,6 +123,12 @@ function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; not
         {r.status !== 'served' && <span className="c-wait">{r.status}</span>}
         {note && <AnnotationLine a={note} />}
       </a>
+      {note && note.runs.length > 0 && (
+        <div className={s.runs}>
+          <span className="faint">annotations</span>
+          <Runs runs={note.runs} project={note.project} />
+        </div>
+      )}
       {!t.recorded ? (
         <p className="faint">Not recorded: peek was off for it, or it is past seven days.</p>
       ) : (

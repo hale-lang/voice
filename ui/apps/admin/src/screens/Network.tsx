@@ -16,7 +16,10 @@ export function Network(_: ScreenProps) {
   const nodes = useGet('/admin/v1/nodes');
   const accounts = useGet('/admin/v1/accounts');
   const projects = useGet('/admin/v1/projects');
-  const usage = useGet('/admin/v1/usage', { params: { query: { limit: 100 } } });
+  // voice's own requests for the projects (their system keys'): a layer of
+  // their own, off until asked for
+  const [internal, setInternal] = useState(false);
+  const usage = useGet('/admin/v1/usage', { params: { query: { limit: 100, ...(internal ? { include_internal: true } : {}) } } });
   const [choice, setChoice] = useState<'api' | 'demo' | null>(() => {
     try { const saved = sessionStorage.getItem('voice.network.source'); return saved === 'api' || saved === 'demo' ? saved : null; } catch { return null; }
   });
@@ -47,6 +50,7 @@ export function Network(_: ScreenProps) {
       <div className={s.sources} role="group" aria-label="Network data source">
         <button aria-pressed={source === 'api'} onClick={() => chooseSource('api')}>API {stub ? 'fixture' : 'data'}</button>
         <button aria-pressed={source === 'demo'} onClick={() => chooseSource('demo')}>Demo fleet</button>
+        <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project (annotations, titles), under its system key: dotted, apart from the project's flow">Internal runs</button>
       </div>
     </header>
     {source === 'api' && failure ? <Unavailable what="Network" detail={failure.error?.message} /> : source === 'api' && pending ? <Loading what="the fleet" /> :
@@ -227,7 +231,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
 }
 
 function Marker({ kind }: { kind: Kind }) {
-  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'alias' ? <path d="M7 13H25L33 20L25 27H7Z" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
+  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'alias' ? <path d="M7 13H25L33 20L25 27H7Z" /> : kind === 'system' ? <path d="M12 9H28V31H12Z M16 15H24 M16 20H24 M16 25H21" fill="none" strokeDasharray="3 2" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
 }
 
 /** A request in flight as a record the graph can light: what it is, and the seat it is on. */

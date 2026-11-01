@@ -7,6 +7,7 @@ import { Fold } from './peek';
 import s from './annotation.module.css';
 
 type Answer = Schemas['AnnotationAnswer'];
+type Run = Schemas['AnnotationRun'];
 type Annotator = Schemas['Annotator'];
 
 const pct = (p: number) => `${Math.round(p * 100)}%`;
@@ -40,9 +41,12 @@ export function AnnotationSection({ id }: { id: string }) {
   const a = q.data;
   if (a.status !== 'annotated') {
     return (
-      <p>
-        <Status tone="wait" label="not annotated" /> <span className="muted">{a.reason}</span>
-      </p>
+      <section>
+        <p>
+          <Status tone="wait" label="not annotated" /> <span className="muted">{a.reason}</span>
+        </p>
+        <Runs runs={a.runs} project={a.project} />
+      </section>
     );
   }
   const byAnnotator = new Map<string, Answer[]>();
@@ -53,9 +57,15 @@ export function AnnotationSection({ id }: { id: string }) {
         Annotation <span className="faint" style={{ fontWeight: 'normal' }}>· <AnnotationLine a={a} /></span>
       </h3>
       <p className="muted" style={{ marginTop: 0 }}>
-        annotated by voice-system{a.model ? <> with <Mono>{a.model}</Mono></> : null}, {count(a.input_tokens)} tokens
+        annotated under <Mono>{a.project}-system</Mono>{a.model ? <> with <Mono>{a.model}</Mono></> : null}, {count(a.input_tokens)} tokens, kept apart from its project's usage
         {a.clipped && <span className="c-wait"> · a text was cut to fit: its start and end were read</span>}
       </p>
+      {a.title && (
+        <p style={{ marginTop: 0 }}>
+          <span className="faint">titled its conversation </span>“{a.title}”
+        </p>
+      )}
+      <Runs runs={a.runs} project={a.project} />
       {a.pairs.filter((p) => p.applies).map((p) => (
         <div key={p.rule}>
           <Status tone={p.met ? 'ok' : 'fail'} label={p.name} /> <span className="faint">{pct(p.probability)}</span>
@@ -81,6 +91,34 @@ export function AnnotationSection({ id }: { id: string }) {
         />
       ))}
     </section>
+  );
+}
+
+/**
+ * The requests voice made for an annotation, one line each: its stage and
+ * the annotators it asked for, its model, tokens and time, and how it went
+ * (a reason when it was skipped or not made). Each made one is a usage
+ * record of the project's system key, kept apart from its usage.
+ */
+export function Runs({ runs, project }: { runs: Run[]; project: string }) {
+  if (!runs.length) return null;
+  return (
+    <div className={s.runs} aria-label="annotation runs">
+      {runs.map((r, i) => (
+        <div key={i} className={s.run}>
+          <Status tone={r.status === 'annotated' ? 'ok' : r.status === 'skipped' ? 'quiet' : 'wait'} label={r.stage} />{' '}
+          <Mono>{r.annotators.join(', ')}</Mono>
+          {r.model && <span className="faint"> · {r.model}</span>}
+          <span className="faint"> · {count(r.input_tokens)} in, {count(r.output_tokens)} out · {r.ms} ms</span>
+          {r.request_id && (
+            <span className="faint">
+              {' '}· <a href={href('usage', r.request_id)} title={`its usage record, under ${project}-system`}>run</a>
+            </span>
+          )}
+          {r.status !== 'annotated' && <span className="c-wait"> · {r.status.replace('_', ' ')}{r.reason ? `: ${r.reason}` : ''}</span>}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -174,7 +212,7 @@ export function AnnotationsPanel({ slice, title = 'Annotations' }: { slice: Slic
       ) : facets.isError ? (
         <Unavailable what="Annotations" detail={facets.error.message} />
       ) : !facets.data.counts.length ? (
-        <p className="faint">No answers to {question} here: a project or key annotates when set to on Projects, and voice-system needs a decision model it may use.</p>
+        <p className="faint">No answers to {question} here: a project or key annotates when set to on Projects, once its `decide` alias names a decision model.</p>
       ) : (
         <div className={s.chart}>
           <Facets counts={facets.data.counts} total={facets.data.total} chosen={chosen[question]} onPick={toggle} />

@@ -6,7 +6,7 @@
 # OpenSSL headers beside it (see hale's own Dockerfile).
 
 # the release hale.toml declares ([dna] toolchain); CI checks they agree
-ARG HALE_VERSION=v0.31.0
+ARG HALE_VERSION=v0.32.0
 
 # The admin UI, built once and served by the api from its own origin.
 FROM node:22-bookworm-slim AS ui

@@ -25,6 +25,11 @@ on:
       - decide/**
       - .github/workflows/runtime-decision.yml
   workflow_dispatch:
+    inputs:
+      backends:
+        description: "The backends to publish, space-separated (metal cpu vulkan rocm cuda); all when empty"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -74,9 +79,18 @@ jobs:
         if: matrix.backend == 'metal'
       - name: Build (macOS)
         if: matrix.backend == 'metal'
+        env:
+          # every program in the archive runs on macOS 14 and later, the
+          # floor the scorer's build sets too (build.sh)
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           hale test decide && hale build decide
           DECIDE_BIN="$PWD/decide/decide" runtimes/decision/build.sh metal "$RUNNER_TEMP/out"
+          for p in voice-decide jev-score-v2; do
+            minos=$(otool -l "$RUNNER_TEMP/out/decision-runtime/$p" | awk '/LC_BUILD_VERSION/ {f=1} f && $1 == "minos" {print $2; exit}')
+            echo "$p: macOS $minos and later"
+            [ "$minos" = "14.0" ] || { echo "::error::$p is built for macOS $minos, not 14.0"; exit 1; }
+          done
       # one builder per backend and architecture, its layers cached, so the
       # image (by hand, below) and the CPU image's check reuse what the
       # scorer's build compiled instead of compiling it again
@@ -164,13 +178,13 @@ jobs:
 
       # by hand: the image pushed by its digest, joined under one tag below
       - uses: docker/login-action@v3
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push the image by its digest
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         id: push
         uses: docker/build-push-action@v6
         with:
@@ -183,12 +197,12 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
       - name: Its digest
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         run: |
           mkdir -p "$RUNNER_TEMP/digests"
           echo "${{ steps.push.outputs.digest }}" > "$RUNNER_TEMP/digests/${{ matrix.backend }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         with:
           name: digest-${{ matrix.backend }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -211,7 +225,10 @@ jobs:
       contents: write
       packages: write
     steps:
+      # none when only the Metal archive is asked for; an image asked for
+      # without its digests fails below, at its own name
       - uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           pattern: digest-*
           path: digests
@@ -229,14 +246,25 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKENDS: ${{ inputs.backends || 'metal cpu vulkan rocm cuda' }}
         run: |
           set -eu
+          # the backends asked for, the Linux images among them apart
+          images=""
+          for b in $BACKENDS; do
+            case "$b" in
+              metal) ;;
+              cpu|vulkan|rocm|cuda) images="$images $b" ;;
+              *) echo "::error::no backend $b (metal cpu vulkan rocm cuda)"; exit 1 ;;
+            esac
+          done
+          metal=$(case " $BACKENDS " in *" metal "*) echo yes ;; esac)
           tag="runtime-decision-${DECISION_VERSION}-metal"
           # a published runtime never changes: refuse before publishing anything
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ -n "$metal" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release $tag exists; another build is another version"; exit 1
           fi
-          for backend in cpu vulkan rocm cuda; do
+          for backend in $images; do
             if docker buildx imagetools inspect "$IMAGE:$backend-$DECISION_VERSION" >/dev/null 2>&1; then
               echo "::error::$IMAGE:$backend-$DECISION_VERSION exists; another build is another version"; exit 1
             fi
@@ -247,7 +275,7 @@ jobs:
             echo "| runtime | artifact | pin |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for backend in cpu vulkan rocm cuda; do
+          for backend in $images; do
             refs=""
             for f in digests/$backend-*; do refs="$refs $IMAGE@$(cat "$f")"; done
             docker buildx imagetools create -t "$IMAGE:$backend-$DECISION_VERSION" $refs
@@ -255,6 +283,7 @@ jobs:
             arches=$(ls digests | sed -n "s/^$backend-//p" | tr '\n' ' ')
             echo "| decision-$DECISION_VERSION-$backend | $IMAGE:$backend-$DECISION_VERSION ($arches) | $digest |" >> "$GITHUB_STEP_SUMMARY"
           done
+          [ -n "$metal" ] || exit 0
           a=$(ls archive/*.tar.gz)
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease \
             --title "Runtime: decision-$DECISION_VERSION-metal (macOS arm64)" \

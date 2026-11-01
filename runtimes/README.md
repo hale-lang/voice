@@ -16,7 +16,6 @@ URL and sha256. A runtime names no command.
 | `llama-server-b11913-vulkan` | gguf | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-vulkan-b11913` |
 | `llama-server-b11913-metal` | gguf | Metal, macOS arm64 | llama.cpp's b11913 release for macOS arm64 |
 | `decision-0.3.0-mlx` | mlx, decision models only | Metal, macOS arm64 | voice's own archive, built by [`decision-mlx/build.sh`](decision-mlx/build.sh) |
-| `decision-0.1.0-metal` | gguf, decision models only | Metal, macOS arm64 | voice's own archive: `voice-decide` and `jev-score-v2`, built by [`decision/build.sh`](decision/build.sh) |
 | `decision-0.1.0-cpu` | gguf, decision models only | CPU, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cpu-0.1.0` |
 | `decision-0.1.0-vulkan` | gguf, decision models only | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:vulkan-0.1.0` |
 | `decision-0.1.0-rocm` | gguf, decision models only | ROCm (AMD), linux x86_64 | `ghcr.io/hale-lang/voice-decision:rocm-0.1.0` |
@@ -59,9 +58,10 @@ like every archive runtime.
 Voice's decision server built natively: `voice-decide` (the
 [`decide/`](../decide) seed) and the scorer it runs, `jev-score-v2`
 ([`decision/`](decision)), on llama.cpp. It serves a decision recipe's GGUF
-on every backend a node has: an archive on macOS (Metal) and an image per
-backend on Linux (CPU, Vulkan, ROCm, CUDA), each pinned here by its sha256
-or manifest digest. The
+on every backend a node has: an image per backend on Linux (CPU, Vulkan,
+ROCm, CUDA), each pinned here by its manifest digest, and an archive on
+macOS (Metal), whose every program must run on macOS 14 (the workflow
+checks), pinned once its build does. The
 [`runtime: decision`](../.github/workflows/runtime-decision.yml) workflow
 builds and checks every backend on a pull request (the scorer against the
 release's tokenizer and answers, `voice-decide` answering a request on Metal

@@ -30,6 +30,9 @@ locus Nodes {
         decisions: Int = 0;
         last_state: String = "";
         asked: String = "";
+        // a response-stage decision request fails, as a seat with no
+        // capacity would answer it
+        fail_response: Bool = false;
     }
     fn place() -> String { return "nats://nats.test:4222"; }
     fn root() -> String { return "voice"; }
@@ -57,6 +60,16 @@ locus Nodes {
                 );
             }
             self.asked = self.asked + std::str::clone(ids.text_view()) + "\n";
+            if self.fail_response
+                && std::str::contains(std::str::clone(ids.text_view()), "response-basics.")
+            {
+                let failed = node::StaticRun {
+                    outcome: "failed",
+                    failure: "no capacity",
+                    model: model,
+                };
+                return Scripted { script: "", result: node::result_message(id, failed, 0, 0) };
+            }
             let answer = "{\"model\": \"jev-2b\", \"answers\": {" + answers.text()
                 + "}, \"usage\": {\"input_tokens\": 40, \"output_tokens\": 0}}";
             let run = node::StaticRun {
@@ -530,6 +543,47 @@ fn main() {
             + to_string(callers),
     );
 
+    // the response stage failing: not annotated, and the request stage's
+    // run, which spent tokens, still kept
+    nodes.fail_response = true;
+    let half = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"half way\"}");
+    let h = read(annotations, std::json::find_string_field(half.body, "id"));
+    nodes.fail_response = false;
+    let kept_run = at(h.runs, 0) or api::AnnotationRun { };
+    std::test::assert(
+        h.status == api::AnnotationStatus::not_annotated && count(h.runs) == 2
+            && kept_run.stage == "request"
+            && kept_run.status == "annotated"
+            && kept_run.input_tokens == 40,
+        "the runs so far kept with a failure: " + to_string(count(h.runs)) + " " + h.reason,
+    );
+
+    // a child of a project whose `decide` names a decision model inherits
+    // it: annotating from the moment it is made
+    let mut team = api::ProjectCreate { id: "team", name: "Team" };
+    push(team.aliases, api::ModelAlias { name: "decide", model: "jev-2b" }) or discard;
+    projects.create(team) or {
+        std::test::assert(false, "team: " + api::ctl_problem(err).message);
+        api::Project { status: api::Lifecycle::archived }
+    };
+    let child = projects.create(
+        api::ProjectCreate {
+            id: "team-child",
+            name: "Child",
+            has_parent: true,
+            parent: "team",
+            has_annotate: true,
+            annotate: true,
+        },
+    ) or {
+        std::test::assert(
+            false,
+            "a child annotating on its parent's decide: " + api::ctl_problem(err).message,
+        );
+        api::Project { status: api::Lifecycle::archived }
+    };
+    std::test::assert(child.annotates, "it annotates");
+
     // its decision model gone: not annotated, saying why
     let mut gone = api::ProjectUpdate { project: "work", has_aliases: true };
     push(gone.aliases, api::ModelAlias { name: "decide", model: "echo-1" }) or discard;
@@ -546,9 +600,17 @@ fn main() {
         api::AnnotatorStatsAsk { annotator: "request-basics" },
     ) or api::AnnotatorStats { };
     std::test::assert(
-        stats.runs == 2 && stats.annotated == 2 && stats.not_annotated == 1 && stats.has_last_error
+        stats.runs == 3 && stats.annotated == 3 && stats.not_annotated == 1 && stats.has_last_error
             && std::str::contains(stats.last_error, "not a decision model"),
         "an annotator's runs, and why one was not made",
+    );
+    let resp = annotators.stats(
+        api::AnnotatorStatsAsk { annotator: "response-basics" },
+    ) or api::AnnotatorStats { };
+    std::test::assert(
+        std::str::contains(resp.last_error, "no capacity")
+            || std::str::contains(resp.last_error, "not a decision model"),
+        "the response stage's failed run counted: " + resp.last_error,
     );
 
     // searchable
@@ -780,6 +842,10 @@ fn main() {
     let after = read(annotations, id);
     let polite = answer_of(after, "tone", "polite");
     std::test::assert(polite.has_answer && polite.version == 1, "a past request asked by it");
+    std::test::assert(
+        count(after.runs) == 4,
+        "its backfill's run added to the runs it had: " + to_string(count(after.runs)),
+    );
     std::test::assert(
         answer_of(after, "request-basics", "task").answer == "code",
         "its other answers stay",

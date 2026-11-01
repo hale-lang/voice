@@ -228,7 +228,7 @@ import json, sys
 m = {x["id"]: x["voice"] for x in json.load(open(sys.argv[1]))["data"]}
 assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capabilities"]["tools"] is False, m
 PY
-curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 1, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 2, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
 curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and not p.get("parent"), p' || { echo "the habitat's project is not as it should be"; exit 1; }
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }

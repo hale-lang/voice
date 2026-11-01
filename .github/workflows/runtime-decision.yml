@@ -25,6 +25,11 @@ on:
       - decide/**
       - .github/workflows/runtime-decision.yml
   workflow_dispatch:
+    inputs:
+      backends:
+        description: "The backends to publish, space-separated (metal cpu vulkan rocm cuda); all when empty"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -33,7 +38,7 @@ concurrency:
   group: runtime-decision-${{ github.event_name }}-${{ github.ref }}
 
 env:
-  DECISION_VERSION: 0.1.0
+  DECISION_VERSION: 0.1.1
   IMAGE: ghcr.io/hale-lang/voice-decision
   # the release the scorer is vendored from, and its Q8_0 weights
   JEV_REPO: chaoliangUNSW/Jev-Style-2B-Decision-v3-GGUF
@@ -74,14 +79,35 @@ jobs:
         if: matrix.backend == 'metal'
       - name: Build (macOS)
         if: matrix.backend == 'metal'
+        env:
+          # every program in the archive runs on macOS 14 and later, the
+          # floor the scorer's build sets too (build.sh)
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           hale test decide && hale build decide
           DECIDE_BIN="$PWD/decide/decide" runtimes/decision/build.sh metal "$RUNNER_TEMP/out"
+          for p in voice-decide jev-score-v2; do
+            minos=$(otool -l "$RUNNER_TEMP/out/decision-runtime/$p" | awk '/LC_BUILD_VERSION/ {f=1} f && $1 == "minos" {print $2; exit}')
+            echo "$p: macOS $minos and later"
+            [ "$minos" = "14.0" ] || { echo "::error::$p is built for macOS $minos, not 14.0"; exit 1; }
+          done
+      # one builder per backend and architecture, its layers cached, so the
+      # image (by hand, below) and the CPU image's check reuse what the
+      # scorer's build compiled instead of compiling it again
+      - uses: docker/setup-buildx-action@v3
+        if: matrix.backend != 'metal'
       - name: Build (Linux)
         if: matrix.backend != 'metal'
-        run: |
-          docker build -f runtimes/decision/Dockerfile --build-arg BACKEND=${{ matrix.backend }} \
-            --target scorer --output type=local,dest="$RUNNER_TEMP/out" .
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: runtimes/decision/Dockerfile
+          target: scorer
+          build-args: BACKEND=${{ matrix.backend }}
+          platforms: linux/${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+          outputs: type=local,dest=${{ runner.temp }}/out
+          cache-from: type=gha,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
 
       - name: The release's files
         if: matrix.check
@@ -117,11 +143,23 @@ jobs:
           ln -sf "$RUNNER_TEMP/model/Jev-Style-2B-Decision-v3-Q8_0.gguf" "$RUNNER_TEMP/model/readout_config.json" "$w/"
           "$RUNNER_TEMP/out/decision-runtime/voice-decide" --weights "$w" --port 18080 > "$RUNNER_TEMP/serve.log" 2>&1 &
           runtimes/decision/check/answers.sh http://127.0.0.1:18080 || { tail -50 "$RUNNER_TEMP/serve.log"; exit 1; }
+      - name: The CPU image
+        if: matrix.backend == 'cpu'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: runtimes/decision/Dockerfile
+          target: image
+          build-args: BACKEND=cpu
+          platforms: linux/${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
+          tags: voice-decision:check
+          load: true
+          cache-from: type=gha,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
       - name: The image answers (Linux)
         if: matrix.backend == 'cpu'
         run: |
           set -eu
-          docker build -f runtimes/decision/Dockerfile --build-arg BACKEND=cpu --target image -t voice-decision:check .
           w="$RUNNER_TEMP/weights"; mkdir -p "$w"
           cp "$RUNNER_TEMP/model/Jev-Style-2B-Decision-v3-Q8_0.gguf" "$RUNNER_TEMP/model/readout_config.json" "$w/"
           docker run -d --name decision-check -p 127.0.0.1:18080:8080 -v "$w:/models:ro" voice-decision:check \
@@ -139,16 +177,14 @@ jobs:
           retention-days: 7
 
       # by hand: the image pushed by its digest, joined under one tag below
-      - uses: docker/setup-buildx-action@v3
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
       - uses: docker/login-action@v3
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Push the image by its digest
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         id: push
         uses: docker/build-push-action@v6
         with:
@@ -159,13 +195,14 @@ jobs:
           platforms: linux/${{ matrix.arch == 'x86_64' && 'amd64' || 'arm64' }}
           provenance: false
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=decision-${{ matrix.backend }}-${{ matrix.arch }}
       - name: Its digest
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         run: |
           mkdir -p "$RUNNER_TEMP/digests"
           echo "${{ steps.push.outputs.digest }}" > "$RUNNER_TEMP/digests/${{ matrix.backend }}-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
-        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal'
+        if: github.event_name == 'workflow_dispatch' && matrix.backend != 'metal' && contains(format(' {0} ', inputs.backends || 'metal cpu vulkan rocm cuda'), format(' {0} ', matrix.backend))
         with:
           name: digest-${{ matrix.backend }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
@@ -188,6 +225,8 @@ jobs:
       contents: write
       packages: write
     steps:
+      # none when only the Metal archive is asked for (no match is no
+      # failure); a failed download fails the run
       - uses: actions/download-artifact@v4
         with:
           pattern: digest-*
@@ -206,14 +245,33 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          BACKENDS: ${{ inputs.backends || 'metal cpu vulkan rocm cuda' }}
         run: |
           set -eu
+          # the backends asked for, the Linux images among them apart
+          images=""
+          for b in $BACKENDS; do
+            case "$b" in
+              metal) ;;
+              cpu|vulkan|rocm|cuda) images="$images $b" ;;
+              *) echo "::error::no backend $b (metal cpu vulkan rocm cuda)"; exit 1 ;;
+            esac
+          done
+          metal=$(case " $BACKENDS " in *" metal "*) echo yes ;; esac)
+          # every architecture of every image asked for is here before any
+          # tag is made: a tag missing one could never be made whole
+          for b in $images; do
+            arches="x86_64 arm64"; [ "$b" = rocm ] && arches="x86_64"
+            for a in $arches; do
+              [ -s "digests/$b-$a" ] || { echo "::error::no digest for $b $a; nothing published"; exit 1; }
+            done
+          done
           tag="runtime-decision-${DECISION_VERSION}-metal"
           # a published runtime never changes: refuse before publishing anything
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [ -n "$metal" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "::error::release $tag exists; another build is another version"; exit 1
           fi
-          for backend in cpu vulkan rocm cuda; do
+          for backend in $images; do
             if docker buildx imagetools inspect "$IMAGE:$backend-$DECISION_VERSION" >/dev/null 2>&1; then
               echo "::error::$IMAGE:$backend-$DECISION_VERSION exists; another build is another version"; exit 1
             fi
@@ -224,7 +282,7 @@ jobs:
             echo "| runtime | artifact | pin |"
             echo "|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          for backend in cpu vulkan rocm cuda; do
+          for backend in $images; do
             refs=""
             for f in digests/$backend-*; do refs="$refs $IMAGE@$(cat "$f")"; done
             docker buildx imagetools create -t "$IMAGE:$backend-$DECISION_VERSION" $refs
@@ -232,6 +290,7 @@ jobs:
             arches=$(ls digests | sed -n "s/^$backend-//p" | tr '\n' ' ')
             echo "| decision-$DECISION_VERSION-$backend | $IMAGE:$backend-$DECISION_VERSION ($arches) | $digest |" >> "$GITHUB_STEP_SUMMARY"
           done
+          [ -n "$metal" ] || exit 0
           a=$(ls archive/*.tar.gz)
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease \
             --title "Runtime: decision-$DECISION_VERSION-metal (macOS arm64)" \

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Panel, Status, Mono, Select, Table, Loading, Unavailable, count, ago } from '@hale/components';
-import { useGet, type Annotation, type Schemas } from './api/client';
+import { useGet, useAnnotations, type Annotation, type Schemas } from './api/client';
 import { readout } from './readout';
 import { href } from './route';
 import { Fold } from './peek';
@@ -35,10 +35,13 @@ export function AnnotationLine({ a }: { a: Annotation | null }) {
  * rules scored on them.
  */
 export function AnnotationSection({ id }: { id: string }) {
-  const q = useGet('/admin/v1/annotations/{request_id}', { params: { path: { request_id: id } } });
+  // read as the Board and the conversation read it, under the same query:
+  // a request with no annotation (404) is `null`, not an error
+  const q = useAnnotations([id])[0]!;
   if (q.isPending) return null;
-  if (q.isError) return <p className="faint">Not annotated: annotate is off for its project and key, or it is not read yet.</p>;
+  if (q.isError) return <p className="faint">Its annotation could not be read: {q.error.message}</p>;
   const a = q.data;
+  if (a === null || a === undefined) return <p className="faint">Not annotated: annotate is off for its project and key, or it is not read yet.</p>;
   if (a.status !== 'annotated') {
     return (
       <section>

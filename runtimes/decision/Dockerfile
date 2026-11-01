@@ -10,7 +10,7 @@
 # type=local,dest=out` writes the scorer alone, out/decision-runtime.
 ARG BACKEND=cpu
 # the release hale.toml declares ([dna] toolchain); CI checks they agree
-ARG HALE_VERSION=v0.31.0
+ARG HALE_VERSION=v0.32.0
 
 # CPU and Vulkan: Ubuntu 24.04, with the Vulkan headers, loader and shader
 # compiler for Vulkan. GCC 14, as llama.cpp's own images: 13 cannot build

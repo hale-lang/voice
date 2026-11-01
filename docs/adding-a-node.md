@@ -22,11 +22,17 @@ the coordinator runs on included.
 - On Linux, docker: voice runs a model's runtime there as a container. A
   Mac runs its runtime itself. (`[dna.host.node] requires` says both, per
   platform, so a habitat refuses a host that lacks them before installing.)
-- The hale toolchain at the release voice declares (`[dna] toolchain` in
-  [`hale.toml`](../hale.toml)), and voice's source at the revision the api
-  runs. A habitat provisions both on a host before it runs the install, and
-  runs it with hale at an absolute path; nothing the install leaves running
-  needs hale, which may not be on PATH.
+- The node program for the revision the api runs. A habitat installs the
+  one published for that commit (`node/install.sh`, with the revision as
+  `HALE_DNA_REVISION`): on Linux, `voice-node` taken out of voice's image,
+  `ghcr.io/hale-lang/voice:<commit>`; on a Mac on Apple silicon, the darwin
+  build published beside it, `ghcr.io/hale-lang/voice-node:<commit>-darwin-arm64`,
+  checked against its sha256 before it runs. Nothing is compiled on the
+  host. Only where none is published (no revision handed, an unreleased
+  commit, another platform) is it built here, from voice's source at that
+  revision, with the hale toolchain at the release voice declares
+  (`[dna] toolchain` in [`hale.toml`](../hale.toml)). Nothing the install
+  leaves running needs hale.
 - The api's URL, reachable from the machine, and the operator token. A
   habitat hands the install its own (hale.toml `[dna.secrets.operator-token]`);
   by hand, a file of it (`voice-api admin-token` on the api's host, copied
@@ -37,8 +43,11 @@ the coordinator runs on included.
 ## Install
 
 ```sh
-sudo hale run node install --id spark --api http://10.73.20.5:8080 --operator-token-file admin.token
+sudo HALE_DNA_REVISION=<commit> sh node/install.sh install --id spark --api http://10.73.20.5:8080 --operator-token-file admin.token
 ```
+
+from voice's source at that commit; without `HALE_DNA_REVISION` it builds
+the node here (`hale run node install …`, the same arguments).
 
 A habitat runs the same command for you, without the token file:
 
@@ -134,7 +143,7 @@ nodes gives each one its own port with `--readings-port`.
 ## Remove it
 
 ```sh
-sudo hale run node uninstall --id spark --api $api --operator-token-file admin.token [--purge]
+sudo HALE_DNA_REVISION=<commit> sh node/install.sh uninstall --id spark --api $api --operator-token-file admin.token [--purge]
 hale habitat organism unplace voice node --host spark      # or, in a habitat
 ```
 

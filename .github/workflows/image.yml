@@ -4,6 +4,10 @@
 # runner of its own architecture (no emulation), pushed by digest and joined
 # under one tag: the commit's full sha, which compose.yaml names
 # (ghcr.io/hale-lang/voice:${HALE_DNA_REVISION}), and a tag's name too.
+# Beside it, the node for macOS on Apple silicon, which runs natively and
+# has no docker to take it out of the image: built on macOS and pushed as an
+# OCI artifact, ghcr.io/hale-lang/voice-node:<sha>-darwin-arm64, one layer
+# holding the binary, which node/install.sh fetches and checks.
 
 name: image
 
@@ -17,6 +21,10 @@ permissions:
 
 env:
   IMAGE: ghcr.io/hale-lang/voice
+  NODE_ARTIFACT: ghcr.io/hale-lang/voice-node
+  # the OCI client the darwin node is pushed with, and its release's sha256
+  ORAS_VERSION: 1.3.6
+  ORAS_SHA256: e2b25a53234e2471c5fc81936f957fa612065ab559c21834c02d8bfbc2f62b30
 
 jobs:
   build:
@@ -91,4 +99,52 @@ jobs:
             [ "$GITHUB_REF_TYPE" = tag ] && echo "also $IMAGE:$GITHUB_REF_NAME"
             echo
             echo "digest $(docker buildx imagetools inspect "$IMAGE:$GITHUB_SHA" --format '{{json .Manifest}}' | jq -r .digest)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  node-darwin:
+    name: node darwin arm64
+    runs-on: macos-15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/hale
+      - name: Build the node, for macOS 14 and later
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: |
+          set -eu
+          hale build node
+          otool -l node/node | grep -A3 LC_BUILD_VERSION
+          # it runs on any such Mac: no library beyond the system's
+          extra=$(otool -L node/node | tail -n +2 | awk '{print $1}' | grep -v -e '^/usr/lib/' -e '^/System/Library/' || true)
+          [ -z "$extra" ] || { echo "::error::voice-node links libraries a Mac may not have: $extra"; exit 1; }
+      - name: The OCI client, checked against its release's sha256
+        run: |
+          set -eu
+          name="oras_${ORAS_VERSION}_darwin_arm64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$name" "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/$name"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$name" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/oras" && tar xzf "$RUNNER_TEMP/$name" -C "$RUNNER_TEMP/oras" oras
+          echo "$RUNNER_TEMP/oras" >> "$GITHUB_PATH"
+      - name: Push it, one layer
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          echo "$TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+          mkdir -p "$RUNNER_TEMP/push" && cp node/node "$RUNNER_TEMP/push/voice-node"
+          cd "$RUNNER_TEMP/push"
+          tags="$GITHUB_SHA-darwin-arm64"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tags="$tags,$GITHUB_REF_NAME-darwin-arm64"; fi
+          oras push "$NODE_ARTIFACT:$tags" \
+            --artifact-type application/vnd.voice.node.v1 \
+            --annotation "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "org.opencontainers.image.revision=$GITHUB_SHA" \
+            voice-node:application/vnd.voice.node.binary
+          {
+            echo "## $NODE_ARTIFACT:$GITHUB_SHA-darwin-arm64"
+            echo
+            echo "voice-node sha256 $(shasum -a 256 voice-node | cut -d' ' -f1)"
           } >> "$GITHUB_STEP_SUMMARY"

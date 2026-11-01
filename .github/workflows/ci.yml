@@ -118,7 +118,9 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
           api/api admin-token --state build/api-state > build/admin.token
           printf 'Authorization: Bearer %s\n' "$(cat build/admin.token)" > build/admin.h
-          sudo node/node install --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          # as hale.toml's [dna.host.node] runs it: node/install.sh, here with no
+          # revision published, so it builds the node (hale run node)
+          sudo env PATH="$PATH" sh node/install.sh install --id ci-linux --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
           systemd-analyze verify /etc/systemd/system/voice-node-ci-linux.service
           systemctl is-active voice-node-ci-linux
           getent group docker | grep -qw "$USER"
@@ -134,7 +136,7 @@ jobs:
           printf 'tok-work' > "$hv/secret-dna_ci-claude-token--work"
           printf 'tok-p1' > "$hv/secret-dna_ci-claude-token--personal-1"
           chmod 600 "$hv"/*
-          handed() { sudo env HALE_VAULT_DIR="$hv" HALE_SECRET_OPERATOR_TOKEN=secret-dna_ci-operator-token HALE_SECRET_CLAUDE_TOKEN="$1" node/node "${@:2}"; }
+          handed() { sudo env PATH="$PATH" HALE_VAULT_DIR="$hv" HALE_SECRET_OPERATOR_TOKEN=secret-dna_ci-operator-token HALE_SECRET_CLAUDE_TOKEN="$1" sh node/install.sh "${@:2}"; }
           before=$(pgrep -f 'voice-node --id ci-linux')
           handed "$(printf 'secret-dna_ci-claude-token--personal-1\nsecret-dna_ci-claude-token--work')" install --id ci-linux --api http://127.0.0.1:8080 --port 8083
           for i in $(seq 1 50); do pgrep -f 'voice-node --id ci-linux.*--port 8083' >/dev/null && break; sleep 0.2; done
@@ -201,6 +203,8 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8081/node/v1/capabilities >/tmp/caps.json 2>/dev/null && break; sleep 0.2; done
           kill $pid
           grep -q claude-cli /tmp/caps.json && grep -q openai-compatible /tmp/caps.json
+      - name: node/install.sh fetches a published darwin build, checks its sha256, and refuses one that is not it
+        run: sh -n node/install.sh && sh node/install_test.sh
       - name: The node installs as a LaunchDaemon, runs as the account that installed it, and is removed (docs/adding-a-node.md)
         run: |
           hale build api
@@ -209,7 +213,7 @@ jobs:
           for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1 && break; sleep 0.2; done
           api/api admin-token --state build/api-state > build/admin.token
           printf 'Authorization: Bearer %s\n' "$(cat build/admin.token)" > build/admin.h
-          sudo node/node install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          sudo env PATH="$PATH" sh node/install.sh install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
           plist=/Library/LaunchDaemons/voice-node-ci-mac.plist
           plutil -lint "$plist"
           grep -q "<string>$USER</string>" "$plist"
@@ -221,7 +225,7 @@ jobs:
           test "$(ps -o user= -p "$(pgrep -f 'voice-node --id ci-mac')")" = "$USER"
           # installing again changes nothing; uninstalling revokes it and removes the daemon
           sudo node/node install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
-          sudo node/node uninstall --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
+          sudo env PATH="$PATH" sh node/install.sh uninstall --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
           test ! -e "$plist"
           test ! -e ~/.voice/node-data
           curl -sS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac | grep -q '"revoked_at": *"'
@@ -357,56 +361,37 @@ jobs:
 
   # voice grafted as a sapling (`hale habitat graft voice`) is a fetched
   # revision: no checkout of ours, no build output. Take a fresh clone of
-  # this tree into an empty directory, run the migration exactly as
-  # hale.toml states it against Postgres, and build the compose images.
+  # this tree into an empty directory, build its compose image, and let
+  # compose's `migrate` service bring the schema up, as every apply does
+  # (hale.toml declares no heart migration): twice, the second applying
+  # nothing.
   sapling:
     name: sapling (fresh clone)
     runs-on: ubuntu-24.04
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: voice
-          POSTGRES_PASSWORD: voice
-          POSTGRES_DB: voice
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U voice -d voice"
-          --health-interval 2s
-          --health-timeout 5s
-          --health-retries 30
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.github/actions/hale
       - name: A fresh clone holds no build output
         run: |
           fresh=$(mktemp -d)
           git clone --quiet "$GITHUB_WORKSPACE" "$fresh/voice"
           echo "FRESH=$fresh/voice" >> "$GITHUB_ENV"
           test ! -e "$fresh/voice/api/api"
-      - name: The migration runs as hale.toml states it, twice (the second applies nothing)
-        env:
-          HALE_DNA_DATABASE_DSN: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
+      - name: The compose images build from the same clone
+        run: cd "$FRESH" && docker compose build
+      - name: Compose's migrate service migrates, twice (the second applies nothing)
         run: |
           cd "$FRESH"
-          for pass in 1 2; do
-            python3 - "$RUNNER_TEMP/migrate.$pass.log" <<'PY'
-          import subprocess, sys, tomllib
-          with open("hale.toml", "rb") as f:
-              cmd = tomllib.load(f)["dna"]["migrations"]["database"]["command"]
-          print("running:", cmd)
-          out = subprocess.run(cmd, check=True, capture_output=True, text=True)
-          open(sys.argv[1], "w").write(out.stdout + out.stderr)
-          print(out.stdout + out.stderr)
-          PY
-          done
+          docker compose up -d --wait postgres
+          docker compose run --rm migrate > "$RUNNER_TEMP/migrate.1.log" 2>&1 || { cat "$RUNNER_TEMP/migrate.1.log"; exit 1; }
+          docker compose run --rm migrate > "$RUNNER_TEMP/migrate.2.log" 2>&1 || { cat "$RUNNER_TEMP/migrate.2.log"; exit 1; }
+          cat "$RUNNER_TEMP/migrate.1.log" "$RUNNER_TEMP/migrate.2.log"
           n=$(ls store/migrations/*.sql | wc -l)
           grep -q "applied=$n version=$n" "$RUNNER_TEMP/migrate.1.log"
           grep -q "applied=0 version=$n" "$RUNNER_TEMP/migrate.2.log"
           test -z "$(git status --porcelain --untracked-files=all)" || { git status --short; exit 1; }
-      - name: The compose images build from the same clone
-        run: cd "$FRESH" && docker compose build
+      - name: Down
+        if: always()
+        run: cd "$FRESH" && docker compose down -v
 
   image:
     name: image

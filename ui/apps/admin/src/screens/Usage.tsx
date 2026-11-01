@@ -102,8 +102,14 @@ function RecordById({ id }: { id: string }) {
   return <RecordInspector record={q.data} />;
 }
 
+/**
+ * Totals by project or by account. A project's leave voice's own requests
+ * for it out; an account's show them as a line of their own, since the
+ * account paid for them.
+ */
 function Summary({ group }: { group: 'project' | 'account' }) {
-  const q = useGet('/admin/v1/usage/summary', { params: { query: { group_by: [group] } } });
+  const account = group === 'account';
+  const q = useGet('/admin/v1/usage/summary', { params: { query: account ? { group_by: ['account', 'internal'], include_internal: true } : { group_by: [group] } } });
   return (
     <Panel title={`By ${group}`} readout={readout(q, q.data ? `${when(q.data.from)} → ${when(q.data.to)}` : null)}>
       {q.isPending ? (
@@ -115,7 +121,20 @@ function Summary({ group }: { group: 'project' | 'account' }) {
           rows={q.data.data}
           rowKey={(r) => JSON.stringify(r.group)}
           columns={[
-            { key: 'g', header: group, render: (r) => <Mono>{Object.values(r.group).join(' · ')}</Mono> },
+            {
+              key: 'g',
+              header: group,
+              render: (r) => {
+                const g = r.group as Record<string, string>;
+                return g.internal === 'true' ? (
+                  <span title="voice's own requests for the projects it serves (annotations, titles), under their system keys">
+                    <Mono>{g.account}</Mono> <span className="faint">· voice's own</span>
+                  </span>
+                ) : (
+                  <Mono>{account ? g.account : Object.values(g).join(' · ')}</Mono>
+                );
+              },
+            },
             { key: 'req', header: 'Requests', num: true, render: (r) => count(r.requests) },
             { key: 'ref', header: 'Refused', num: true, render: (r) => (r.refused ? <span className="c-wait">{count(r.refused)}</span> : '0') },
             { key: 'in', header: 'In', num: true, render: (r) => count(r.input_tokens) },

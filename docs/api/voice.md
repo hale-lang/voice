@@ -945,13 +945,16 @@ tracking view: what each project and each of its keys spent over a
 period, and which account paid for it. Groups come most recently
 active first: at most 1000, the least recent left out. Voice's own
 requests for its projects (their system keys') are left out of the
-totals unless `include_internal` is `true`.
+totals unless `include_internal` is `true`. Grouped by `internal`
+too (`"true"` or `"false"`), they are a line of their own: with
+`group_by=account,internal&include_internal=true`, each account's
+spend for its callers and what voice itself spent through it.
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
-| `group_by` | query | array of string, one of `project`, `key`, `model`, `account`, `seat`, `node`, `conversation`, `day`, `hour` | yes |  |
+| `group_by` | query | array of string, one of `project`, `key`, `model`, `account`, `seat`, `node`, `conversation`, `internal`, `day`, `hour` | yes |  |
 | `project` | query | array of string |  | Only these projects. Repeatable. |
 | `key` | query | array of string |  | Only these keys. Repeatable. |
 | `model` | query | array of string |  | Only these requested models. Repeatable. |
@@ -3360,6 +3363,9 @@ Type: object
 
 One rate limit. Null counters are unlimited. `remaining` and
 `resets_at` are read-only and ignored on writes.
+A project's limits (and its model-scope ones) count its callers'
+requests, never voice's own for it under its system key
+(`Key.internal`): only limits set on that key cap those.
 
 Type: object
 
@@ -3639,7 +3645,7 @@ Type: object
 | `attempts` | array of [Attempt](#schema-attempt) |  |  |  |
 | `instance` | string \| null |  | The api instance that admitted the request (`api-<id>`, the id the hub's `InstanceBeat` announces): which of an api's replicas the caller reached. `null` for a record from before instances were kept. |  |
 | `conversation` | string \| null |  | The conversation the request was a turn of: its `prompt_cache_key`, the same on each turn. `null` when the caller sent none. The ledger's turns of one conversation share it. |  |
-| `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). Left out of usage lists and summaries unless asked for (`include_internal`), out of the project's limits and out of the usage told to the organization. Its account still pays the provider for it. |  |
+| `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 
 <a id="schema-usagesummary"></a>
@@ -4349,6 +4355,13 @@ Type: object
 <a id="schema-account"></a>
 
 ### Account
+
+What pays and has limits. Its spend includes voice's own requests
+for the projects it serves (each project's system key's,
+`UsageRecord.internal`: annotations, titles), which it paid the
+provider for; its usage summary shows them as their own line
+(`summarizeUsage` with `group_by=account,internal` and
+`include_internal=true`).
 
 Type: [AccountCreate](#schema-accountcreate) & object
 

@@ -3800,7 +3800,7 @@ Type: [PlacementCreate](#schema-placementcreate) & object
 | `seat` | string | yes | The seat it created, `<leader>/<id>`. |  |
 | `fit` | array of [VariantFit](#schema-variantfit) | yes | Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made. |  |
 | `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. | ≥ 1 |
-| `reserved_bytes` | integer |  | What it holds of its node's memory for models: its variant's need and its cache. A later placement on the node fits in what the others leave. | ≥ 1 |
+| `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 
 <a id="schema-peeksummary"></a>
@@ -5841,7 +5841,7 @@ Type: object
 | `os` | string, one of `linux`, `darwin` | yes |  |  |
 | `arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `memory_bytes` | integer | yes | The machine's memory. | ≥ 1 |
-| `model_memory_bytes` | integer | yes | What models may use of it: `memory_bytes`, unless the node's operator holds some back in the capabilities file, which only lowers it. | ≥ 0 |
+| `model_memory_bytes` | integer | yes | What models may use of it: `memory_bytes` less what the machine keeps for its own system (a sixteenth, at least 4 GiB; on a machine whose GPU shares its memory, the one pool both draw on), or less when the node's operator holds some back in the capabilities file, which only lowers it. The seats the node runs hold at most this together: a seat that would take more is not started, and says so. | ≥ 0 |
 | `accelerators` | array of [Accelerator](#schema-accelerator) | yes | At most 16; a machine with more declares its first 16, and its node says so in its log. | items ≤ 16 |
 | `disk_free_bytes` | integer | yes | Free space under the node's data directory, where weights are kept. | ≥ 0 |
 

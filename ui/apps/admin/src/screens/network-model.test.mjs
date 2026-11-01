@@ -279,3 +279,16 @@ test('an alias is its own vertex: its project names the model by it, and a reque
   const direct = { ...base, project, requested_model: target, resolved_model: target };
   assert(!requestVertices(direct, buildGraph({ ...fleet, projects, usage: [direct] })).has(named));
 });
+
+test('a request draws its conversation, keyed by its prompt_cache_key whatever the client, and metadata stays a label', () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const record = { ...demoRequest(fleet, 1, 1_800_000_000_000), id: 'turn', conversation: 'b909ae4b', metadata: { team: 'search' } };
+  const graph = buildGraph({ ...fleet, usage: [record] });
+  const c = graph.vertices.find((v) => v.id === entityId('context:conversation', 'b909ae4b'));
+  assert(c, 'the conversation is a context node');
+  assert.equal(c.href, '#/usage/c/b909ae4b');
+  assert(graph.edges.some((e) => e.id === edgeId(entityId('project', record.project), c.id)));
+  assert(graph.vertices.some((v) => v.id === entityId('context:team', 'search')), 'a metadata pair is still a label');
+  const none = buildGraph({ ...fleet, usage: [{ ...record, conversation: null }] });
+  assert(!none.vertices.some((v) => v.kind === 'context:conversation'), 'none without a conversation');
+});

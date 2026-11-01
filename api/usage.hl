@@ -185,8 +185,9 @@ type UsageList {
 type UsageRef { request_id: String; }
 
 /// The filters `GET /admin/v1/usage` takes. The times are RFC 3339 text and
-/// `metadata` one `name=value` pair, read when the handler runs so a bad
-/// one is refused by name.
+/// `metadata` one `name=value` pair or a JSON object of several
+/// (`metadata_pairs`), read when the handler runs so a bad one is refused by
+/// name.
 type UsageAsk {
     project: String = "";
     key: String = "";
@@ -359,6 +360,41 @@ fn record_of(text: String, id: String) -> UsageRecord fallible(CtlError) {
 
 // ---- the query ---------------------------------------------------------
 
+/// The metadata pairs a filter asks for, each `name=value`: one written so,
+/// or several as a JSON object of them, all of which a request must have.
+/// The parameter is given once (a row reads the first of a repeated query
+/// key), so several pairs travel as one object.
+fn metadata_pairs(m: String) -> st::Names fallible(CtlError) {
+    let mut out = st::Names { };
+    let t = std::str::trim(m);
+    if len(t) == 0 { return out; }
+    if !std::str::starts_with(t, "{") {
+        if std::str::index_of(t, "=") < 1 {
+            fail bad("`metadata` is written name=value, or a JSON object of pairs", "metadata");
+        }
+        push(out.items, t) or discard;
+        return out;
+    }
+    if !std::json::valid_object(t) {
+        fail bad("`metadata` is written name=value, or a JSON object of pairs", "metadata");
+    }
+    let mut it = std::json::object_first(t);
+    while !it.done {
+        let name = std::json::obj_key_string(it, t);
+        let v = std::json::string_field(t, name);
+        it = std::json::object_next(it, t);
+        if v.kind != "string" || len(name) == 0 || std::str::contains(name, "=") {
+            fail bad(
+                "`metadata`'s pairs are each a name (no `=` in it) and a string value",
+                "metadata"
+            );
+        }
+        if count(out.items) == 16 { fail bad("`metadata` asks at most 16 pairs", "metadata"); }
+        push(out.items, name + "=" + v.text) or discard;
+    }
+    return out;
+}
+
 /// The filters `GET /admin/v1/usage` and `/usage/summary` share.
 fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError) {
     let mut q = st::UsageQuery {
@@ -382,12 +418,7 @@ fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError)
             "to"
         );
     }
-    if len(a.metadata) > 0 {
-        if std::str::index_of(a.metadata, "=") < 1 {
-            fail bad("`metadata` is written name=value", "metadata");
-        }
-        push(q.metadata.items, a.metadata) or discard;
-    }
+    q.metadata = metadata_pairs(a.metadata) or raise;
     if paged {
         if a.limit != -1 {
             if a.limit < 1 || a.limit > 1000 { fail bad("`limit` is 1 to 1000", "limit"); }

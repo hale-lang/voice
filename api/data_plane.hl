@@ -50,6 +50,21 @@ locus DataPlane {
             pulse: self.pulse,
             governed: self.governed,
         };
+        // asks a decision model about each request whose project or key
+        // annotates, as voice-system's requests (annotate.hl)
+        annotator: AnnotationRunner = AnnotationRunner {
+            store: self.store,
+            inference: Inference {
+                instance: self.instance,
+                store: self.store,
+                link: self.link,
+                held: self.held,
+                first: self.first_s * 1s,
+                idle: self.idle_s * 1s,
+                pulse: self.pulse,
+                governed: self.governed,
+            },
+        };
         nodes: Nodes = Nodes { store: self.store, link: self.link };
         changes: Changes = Changes { store: self.store };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
@@ -224,6 +239,14 @@ locus DataPlane {
             return no_content();
         }
 
+        // annotations of past requests, from their recordings (annotate.hl)
+        if std::http::is_route(c, "POST", "/admin/v1/annotation-backfills") {
+            if !self.operator.admits(std::http::header(req, "Authorization")) {
+                return operator_refusal();
+            }
+            return self.backfill(req) or raise;
+        }
+
         // events
         if std::http::is_route(c, "GET", "/admin/v1/events") {
             if !self.operator.admits(std::http::header(req, "Authorization")) {
@@ -262,20 +285,134 @@ locus DataPlane {
         if r.stream {
             // the standard event stream, on this connection (stream.hl)
             let out = EventStream { conn_fd: req.conn_fd };
-            return self.inference.stream(r, ctx, out) or raise;
+            let streamed = self.inference.stream(r, ctx, out) or raise;
+            if !out.job.present { return streamed; }
+            // no connection: answered in process (a test), after its annotation
+            if req.conn_fd < 0 {
+                self.annotator.annotate(out.job);
+                return streamed;
+            }
+            // annotated (annotate.hl): the stream ends and its connection
+            // closes first, then the annotation is asked on this
+            // connection's own coroutine; the caller waits for none of it
+            out.close();
+            self.annotator.annotate(out.job);
+            return taken_over();
         }
-        if endpoint == "chat" {
-            let s = self.inference.chat(r, ctx) or raise;
-            return served_answer(s, chat_completion_json(s));
+        let s = if endpoint == "chat" {
+            self.inference.chat(r, ctx) or raise
+        } else {
+            self.inference.respond(r, ctx) or raise
+        };
+        let answer = served_answer(
+            s,
+            if endpoint == "chat" { chat_completion_json(s) } else { response_json(s) },
+        );
+        if !s.job.present { return answer; }
+        if req.conn_fd < 0 {
+            self.annotator.annotate(s.job);
+            return answer;
         }
-        let s = self.inference.respond(r, ctx) or raise;
-        return served_answer(s, response_json(s));
+        // annotated: the caller is answered, as the Server would (it closes
+        // every connection after its answer), then the annotation is asked
+        let conn = std::io::tcp::Stream { conn_fd: req.conn_fd, owns_fd: false };
+        std::http::write_response(conn, answer);
+        std::io::tcp::close_fd(req.conn_fd);
+        self.annotator.annotate(s.job);
+        return taken_over();
+    }
+
+    /// `backfillAnnotations`: the recorded requests it keeps, counted and
+    /// answered at once, then asked about one by one on this connection's
+    /// own coroutine, as `voice-system`'s requests.
+    fn backfill(req: std::http::Request) -> std::http::Response fallible(ApiError) {
+        let b = AnnotationBackfill::api_decode(req.body) or {
+            fail invalid(
+                "the body is an AnnotationBackfill (`" + err.field + "` is " + err.kind + ")",
+                err.field
+            );
+        };
+        let a = if b.version > 0 {
+            self.store.annotator_version(b.annotator, b.version) or fail metering_failed(err)
+        } else {
+            self.store.annotator(b.annotator) or fail metering_failed(err)
+        };
+        if !a.present || a.removed {
+            fail ApiError {
+                status: 404,
+                kind: "not_found",
+                code: ErrorCode::not_found,
+                message: "no annotator " + b.annotator
+                    + (if b.version > 0 { " at version " + to_string(b.version) } else { "" }),
+                has_param: true,
+                param: "annotator",
+            };
+        }
+        let from = if len(b.from) > 0 {
+            rfc3339(b.from) or fail invalid("`from` is an RFC 3339 time", "from")
+        } else {
+            now_seconds()
+        };
+        let to = if len(b.to) > 0 {
+            rfc3339(b.to) or fail invalid("`to` is an RFC 3339 time", "to")
+        } else {
+            now_seconds()
+        };
+        // the slice chosen before the newest 200 of it are taken
+        let kept = self.store.recorded(
+            b.project,
+            b.key,
+            len(b.from) > 0,
+            from,
+            len(b.to) > 0,
+            to,
+            200,
+        ) or fail metering_failed(err);
+        let answer = std::http::Response {
+            status: 202,
+            content_type: "application/json",
+            body: "{\"queued\": " + to_string(count(kept.rows)) + "}",
+        };
+        // answered first, the connection closed, as the Server would; with
+        // no connection (in process), answered once asked
+        if req.conn_fd >= 0 {
+            let conn = std::io::tcp::Stream { conn_fd: req.conn_fd, owns_fd: false };
+            std::http::write_response(conn, answer);
+            std::io::tcp::close_fd(req.conn_fd);
+        }
+        for p in kept.rows {
+            let whole = self.store.peek(p.request_id) or st::PeekRow { };
+            if !whole.present { continue; }
+            let u = self.store.usage(p.request_id) or st::UsageRow { };
+            let dc = std::json::find_string_field(u.record, "data_class");
+            self.annotator.backfill(
+                AnnotationJob {
+                    request_id: whole.request_id,
+                    project: whole.project,
+                    key: whole.key,
+                    conversation: std::json::find_string_field(u.record, "conversation"),
+                    created_at: whole.created_at,
+                    model: whole.model,
+                    data_class: if len(dc) > 0 { dc } else { "internal" },
+                    input: whole.input,
+                    output: whole.output,
+                    present: true,
+                },
+                a,
+            );
+        }
+        return if req.conn_fd >= 0 { taken_over() } else { answer };
     }
 
     /// The node an enrollment token names.
     fn node_ctx(req: std::http::Request) -> std::api::Context fallible(ApiError) {
         return self.node_bearer.context(std::http::header(req, "Authorization")) or raise;
     }
+}
+
+/// What a handler returns when it has answered on its connection itself.
+fn taken_over() -> std::http::Response {
+    return std::http::Response { status: 200, body: "", takeover_raw: true };
 }
 
 /// A JSON answer.

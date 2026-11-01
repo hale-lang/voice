@@ -201,7 +201,7 @@ function FleetNetwork({ fleet, demo, stub }: { fleet: Fleet; demo: boolean; stub
           <dl>{vertex.details.map(([name, value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
           <p className="muted">{cohort.length} requests match the selected context. Add another entity to narrow the same network.</p>
           <h3>Connected to</h3><div className={s.connections}>{graph.edges.filter((e) => e.source === vertex.id || e.target === vertex.id).map((e) => { const other = graph.vertices.find((v) => v.id === (e.source === vertex.id ? e.target : e.source))!; return <button key={e.id} onClick={() => choose(other.id)}><span className="muted">{other.kind}</span> <Mono>{other.name}</Mono></button>; })}</div>
-          {vertex.href && !demo && <a href={vertex.href}>Open {vertex.kind} →</a>}
+          {vertex.href && !demo && <a href={vertex.href}>Open {kindName(vertex.kind).toLowerCase()} →</a>}
         </> : trace ? <>
           <h3>{demo ? traceInFlight ? 'Simulated request · in flight' : 'Simulated request' : 'Recorded request'}</h3><h2 className="mono">{trace.project}</h2>
           <div className={s.participants}>{[...requestVertices(trace, fullGraph)].map(id => { const v = fullGraph.vertices.find(v => v.id === id)!; return <button key={id} onClick={() => choose(id)}><span>{kindName(v.kind)}</span>{v.name}</button>; })}</div>

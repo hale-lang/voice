@@ -1,37 +1,38 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Loading, Unavailable, Mono, Button, count, when } from '@hale/components';
-import { useAllUsage, usePeeks, type UsageRecord } from '../api/client';
+import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecord } from '../api/client';
+import { AnnotationLine, AnnotationsPanel } from '../annotation';
 import { href } from '../route';
 import { Fold, ItemView, texts, parse, type Item } from '../peek';
 import s from './Conversation.module.css';
-
-/** What a conversation is gathered by: its `prompt_cache_key`, or a metadata pair the caller set on each turn. */
-export type Root = { conversation: string } | { metadata: string };
 
 /** Turns shown at first, and more each time earlier ones are asked for. */
 const STEP = 30;
 
 /**
  * A conversation read whole: what set it up beside the back and forth.
- * The turns are the ledger's for its root, oldest first; each turn's
+ * The turns are the ledger's for its conversation, oldest first; each turn's
  * recording (when its project peeks) gives what was said. A client that
  * resends the history each turn (Codex) repeats what was said before, so
  * a part already shown is not shown again.
  */
-export function ConversationView({ root }: { root: Root }) {
-  const q = useAllUsage('conversation' in root ? { conversation: root.conversation } : { metadata: [root.metadata] });
+export function ConversationView({ conversation }: { conversation: string }) {
+  const q = useAllUsage({ conversation });
   const [shown, setShown] = useState(STEP);
   const all = q.data?.turns ?? [];
   const turns = all.slice(Math.max(0, all.length - shown));
   const hidden = all.length - turns.length;
   const peeks = usePeeks(turns.map((t) => t.id));
+  // what each turn was and did, for a project or key that annotates
+  const notes = useAnnotations(turns.map((t) => t.id));
+  const noteOf = new Map(turns.map((t, i) => [t.id, notes[i]?.data ?? null] as const));
   const loaded = peeks.every((p) => !p.isPending);
   const read = useMemo(
     () => (loaded ? thread(turns, peeks.map((p) => (p.data ? p.data : null)), hidden > 0) : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [loaded, turns.map((t) => t.id).join(','), hidden],
   );
-  const name = 'conversation' in root ? root.conversation : root.metadata;
+  const name = conversation;
   if (q.isPending) return <Loading what="the conversation" />;
   if (q.isError) return <Unavailable what="The conversation" detail={q.error.message} />;
   if (!all.length) return <p className="faint">No requests of {name}.</p>;
@@ -46,6 +47,7 @@ export function ConversationView({ root }: { root: Root }) {
         {all.length} turn{all.length === 1 ? '' : 's'}
         {q.data.truncated ? ' (the latest 2000)' : ''} · {last.project} · {last.served?.model ?? last.requested_model} · {count(all.reduce((n, t) => n + t.input_tokens, 0))} in · {count(all.reduce((n, t) => n + t.output_tokens, 0))} out · {when(first.created_at)} → {when(last.created_at)}
       </p>
+      {[...noteOf.values()].some(Boolean) && <AnnotationsPanel slice={{ conversation }} title="This conversation's annotations" />}
       {!read ? (
         <Loading what="what was said" />
       ) : (
@@ -77,7 +79,7 @@ export function ConversationView({ root }: { root: Root }) {
               </p>
             )}
             {read.turns.map((t) => (
-              <TurnView key={t.record.id} turn={t} threads={read.threads.length} />
+              <TurnView key={t.record.id} turn={t} threads={read.threads.length} note={noteOf.get(t.record.id) ?? null} />
             ))}
           </section>
         </div>
@@ -107,7 +109,7 @@ function threadHue(k: number): number {
   return (190 + k * 137) % 360;
 }
 
-function TurnView({ turn: t, threads }: { turn: Turn; threads: number }) {
+function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; note: Annotation | null }) {
   const r = t.record;
   return (
     <div className={`${s.turn} ${threads > 1 && t.thread >= 0 ? s.threaded : ''}`} style={{ ['--hue' as string]: threadHue(Math.max(0, t.thread)) }}>
@@ -117,6 +119,7 @@ function TurnView({ turn: t, threads }: { turn: Turn; threads: number }) {
         <span>{r.served?.seat ?? r.requested_model}</span>
         <span>{count(r.input_tokens)} in · {count(r.output_tokens)} out</span>
         {r.status !== 'served' && <span className="c-wait">{r.status}</span>}
+        {note && <AnnotationLine a={note} />}
       </a>
       {!t.recorded ? (
         <p className="faint">Not recorded: peek was off for it, or it is past seven days.</p>
@@ -233,7 +236,7 @@ type Open = { history: string[]; answer: boolean[]; latest: Record<string, unkno
 
 /**
  * The turns as threads, each turn's parts not said before (`replays`), then
- * its answer. One root can hold several threads at once (a Codex session's
+ * its answer. One conversation can hold several threads at once (a Codex session's
  * agent and the reviewer judging its steps share its id): a turn continues
  * the thread whose history it replays; one that opens with its own setup
  * starts a thread; one that only adds what is new (a client that sends no

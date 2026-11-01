@@ -1,0 +1,1967 @@
+// Annotate: a project or key that annotates has each request it sends
+// read, once it is answered, by a decision model (decision.hl), which
+// answers the questions of the annotators in force for it. Off unless set on
+// the project (its parent's when it sets none) or the key (`annotate`).
+//
+// An annotator is data, made and edited on the admin plane: its questions in
+// the decision format (a `choice` of options, a `noul` yes or no, a `score`
+// of levels), asked at one stage: `request`, of the request's text; or
+// `response`, of its response read beside the request. A response question
+// may carry a `condition` on the request's answers, asked only when it
+// holds, else kept `skipped`; a response annotator may read the request's
+// answers too (`reads_request`), as a short labelled block beside the text,
+// its answers then `conditioned`. Its scope is the projects (and their
+// children) and keys it reads; none, every one that annotates. Each edit is
+// a new version, and every answer names the version that asked it. Voice
+// ships two, `request-basics` and `response-basics` (store's
+// BUILTIN_ANNOTATORS), editable and able to be disabled, never removed.
+//
+// A rule pairs a request answer with the response answer it expects ("asked
+// for code, gave code"), scored met or missed with its probability whenever
+// an annotation is read, so a rule changed applies to old annotations too.
+// Voice ships four, the same way.
+//
+// The questions are asked as requests of voice's own project,
+// `voice-system` (st::SYSTEM_PROJECT), under its key of the same id, which
+// no token names: their usage, limits, budget and accounts are its own, so
+// an annotation never spends what the caller's project may.
+// `voice-system`'s `decide` alias names the decision model asked, and its
+// accounts what it may spend; with neither, nothing is asked, and the
+// annotation says why. A decision model is asked, never a generative one,
+// and never as the caller.
+//
+// One decision request a stage carries every annotator's questions there,
+// so the text is read once; a response stage asks twice when some of its
+// annotators read the request's answers and some do not, since their texts
+// differ. The caller waits for none of it: the data plane answers the caller
+// first, closes its connection, and only then asks, on that connection's own
+// coroutine (data_plane.hl, `infer`). A text too long for the decision model
+// is read as its start and its end, the middle left out and marked so, and
+// the annotation says it was cut. The request's text is read to ask about
+// it and never kept: the answers alone are, a row each, searchable.
+//
+// Past requests whose recording still exists (peek.hl, seven days) can be
+// annotated later by one annotator (`backfillAnnotations`): voice keeps no
+// other text.
+
+/// The most of a request's (and of a response's) text a decision model
+/// reads: its start and its end, what lies between left out and said so.
+/// A decision model reads at most 25,600 tokens; the two together stay well
+/// inside it.
+const ANNOTATE_REQUEST_TEXT: Int = 32768;
+const ANNOTATE_RESPONSE_TEXT: Int = 24576;
+
+/// The model `voice-system` asks: its alias for its decision model.
+const ANNOTATE_MODEL: String = "decide";
+
+/// The enabled annotators of one stage ask at most this many questions
+/// together: one request to the decision model (decision.hl).
+const STAGE_QUESTIONS_MAX: Int = 64;
+
+// ---- annotators ---------------------------------------------------------
+
+type AnnotatorStage = enum { request, response };
+
+fn stage_name(s: AnnotatorStage) -> String {
+    return match s {
+        AnnotatorStage::request -> "request",
+        AnnotatorStage::response -> "response",
+    };
+}
+
+/// The requests an annotator reads, of those that annotate: these projects'
+/// (and their children's) and these keys'; both empty, every one.
+type AnnotatorScope {
+    projects: bounded[String; 32];
+    keys: bounded[String; 32];
+}
+
+/// `AnnotatorCreate`. Its questions are the contract's `AnnotatorQuestion`s,
+/// checked when it is made (`annotator_body`).
+type AnnotatorCreate {
+    id: String;
+    name: String;
+    stage: AnnotatorStage;
+    questions: std::json::Value;
+    has_scope: Bool = false;
+    scope: AnnotatorScope = AnnotatorScope { };
+    reads_request: Bool = false;
+    enabled: Bool = true;
+}
+
+/// `AnnotatorUpdate`, for the annotator the path names: what it sets makes a
+/// new version. Its id and stage are refused by name, not ignored.
+type AnnotatorUpdate {
+    annotator: String;
+    has_id: Bool = false;
+    id: String = "";
+    has_stage: Bool = false;
+    stage: std::json::Value = std::json::Value::null();
+    has_name: Bool = false;
+    name: String = "";
+    has_questions: Bool = false;
+    questions: std::json::Value = std::json::Value::null();
+    has_scope: Bool = false;
+    scope: AnnotatorScope = AnnotatorScope { };
+    has_reads_request: Bool = false;
+    reads_request: Bool = false;
+    has_enabled: Bool = false;
+    enabled: Bool = true;
+}
+
+/// An annotator at its current version, or at `version` (0: its current).
+type AnnotatorRef { annotator: String; version: Int = 0; }
+
+/// `Annotator`.
+type Annotator {
+    id: String = "";
+    name: String = "";
+    stage: AnnotatorStage = AnnotatorStage::request;
+    version: Int = 0;
+    questions: std::json::Value = std::json::Value::null();
+    scope: AnnotatorScope = AnnotatorScope { };
+    reads_request: Bool = false;
+    enabled: Bool = true;
+    builtin: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    updated_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type AnnotatorList { data: bounded[Annotator; 64]; }
+
+// ---- rules --------------------------------------------------------------
+
+/// A request answer: holds when `annotator`'s `question` gave `answer` a
+/// probability of `min_probability` or more.
+type AnnotationCondition {
+    annotator: String = "";
+    question: String = "";
+    answer: String = "";
+    min_probability: Float = 0.5;
+}
+
+/// The response answer a rule expects: `answer`, or for a score `at_least`,
+/// a level's value or a higher one.
+type AnnotationExpect {
+    annotator: String = "";
+    question: String = "";
+    has_answer: Bool = false;
+    answer: String = "";
+    has_at_least: Bool = false;
+    at_least: String = "";
+}
+
+type AnnotationRuleCreate {
+    id: String;
+    name: String;
+    has_condition: Bool = false;
+    condition: AnnotationCondition = AnnotationCondition { };
+    expect: AnnotationExpect;
+    enabled: Bool = true;
+}
+
+type AnnotationRuleUpdate {
+    rule: String;
+    has_name: Bool = false;
+    name: String = "";
+    has_condition: Bool = false;
+    condition: AnnotationCondition = AnnotationCondition { };
+    clear_condition: Bool = false;
+    has_expect: Bool = false;
+    expect: AnnotationExpect = AnnotationExpect { };
+    has_enabled: Bool = false;
+    enabled: Bool = true;
+}
+
+type AnnotationRuleRef { rule: String; }
+
+/// `AnnotationRule`: `condition` null when it always applies.
+type AnnotationRule {
+    id: String = "";
+    name: String = "";
+    has_condition: Bool = false;
+    condition: AnnotationCondition = AnnotationCondition { };
+    expect: AnnotationExpect = AnnotationExpect { };
+    enabled: Bool = true;
+    builtin: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    updated_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type AnnotationRuleList { data: bounded[AnnotationRule; 64]; }
+
+// ---- annotations --------------------------------------------------------
+
+type AnnotationStatus = enum { annotated, not_annotated };
+
+/// The filters the searches share: `answer` one `<annotator>.<question>=<answer>`
+/// or a JSON object of several, `metadata` likewise (usage.hl), the times
+/// RFC 3339 text; read when the handler runs so a bad one is refused by name.
+type AnnotationAsk {
+    project: String = "";
+    key: String = "";
+    conversation: String = "";
+    metadata: String = "";
+    answer: String = "";
+    min_probability: Float = 0.0;
+    from: String = "";
+    to: String = "";
+    limit: Int = -1;
+}
+
+type AnnotationFacetAsk {
+    question: String;
+    project: String = "";
+    key: String = "";
+    conversation: String = "";
+    metadata: String = "";
+    answer: String = "";
+    min_probability: Float = 0.0;
+    from: String = "";
+    to: String = "";
+}
+
+type AnnotationTrendAsk {
+    question: String;
+    bucket: String = "day";
+    project: String = "";
+    key: String = "";
+    conversation: String = "";
+    metadata: String = "";
+    answer: String = "";
+    min_probability: Float = 0.0;
+    from: String = "";
+    to: String = "";
+}
+
+type AnnotationRef { request_id: String; }
+
+/// `AnnotationSummary`.
+type AnnotationSummary {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    has_conversation: Bool = false;
+    conversation: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    status: AnnotationStatus = AnnotationStatus::annotated;
+    reason: String = "";
+    clipped: Bool = false;
+}
+
+type AnnotationList { data: bounded[AnnotationSummary; 200]; }
+
+/// `AnnotationAnswer`: `answer` null when skipped, `score` for a score.
+type AnnotationAnswer {
+    annotator: String = "";
+    version: Int = 0;
+    stage: AnnotatorStage = AnnotatorStage::request;
+    question: String = "";
+    has_answer: Bool = false;
+    answer: String = "";
+    probability: Float = 0.0;
+    probabilities: std::json::Value = std::json::Value::null();
+    has_score: Bool = false;
+    score: Float = 0.0;
+    conditioned: Bool = false;
+    skipped: Bool = false;
+}
+
+/// A rule scored on one annotation.
+type AnnotationPair {
+    rule: String = "";
+    name: String = "";
+    applies: Bool = false;
+    met: Bool = false;
+    probability: Float = 0.0;
+}
+
+/// `Annotation`: its summary, the decision model that answered and what it
+/// read, every answer and every enabled rule scored.
+type Annotation {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    has_conversation: Bool = false;
+    conversation: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    status: AnnotationStatus = AnnotationStatus::annotated;
+    reason: String = "";
+    clipped: Bool = false;
+    has_model: Bool = false;
+    model: String = "";
+    input_tokens: Int = 0;
+    answers: bounded[AnnotationAnswer; 128];
+    pairs: bounded[AnnotationPair; 64];
+}
+
+type AnswerCountView { answer: String = ""; count: Int = 0; }
+
+type AnnotationFacets {
+    question: String = "";
+    total: Int = 0;
+    counts: bounded[AnswerCountView; 256];
+}
+
+type TrendPointView { at: Time = `1970-01-01T00:00:00Z`; answer: String = ""; count: Int = 0; }
+
+type AnnotationTrend {
+    question: String = "";
+    bucket: String = "day";
+    points: bounded[TrendPointView; 1000];
+}
+
+// ---- the admin plane: annotators ----------------------------------------
+
+locus Annotators {
+    params {
+        store: st::Store;
+        // serializes the store's use across requests (store/lock.hl)
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `listAnnotators`.
+    fn list() -> AnnotatorList fallible(CtlError) {
+        self.gate.enter();
+        let rows = self.store.annotators() or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotatorList { };
+        for r in rows.rows { push(out.data, annotator_view(r)) or discard; }
+        return out;
+    }
+
+    /// `getAnnotator`: its current version, or `version`.
+    fn get(r: AnnotatorRef) -> Annotator fallible(CtlError) {
+        self.gate.enter();
+        let row = self.read(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return annotator_view(row);
+    }
+
+    fn read(r: AnnotatorRef) -> st::AnnotatorRow fallible(CtlError) {
+        if r.version > 0 {
+            let v = self.store.annotator_version(r.annotator, r.version) or fail store_down(err);
+            if !v.present {
+                fail missing("no annotator " + r.annotator + " at version " + to_string(r.version));
+            }
+            return v;
+        }
+        return self.known(r.annotator) or raise;
+    }
+
+    /// `createAnnotator`.
+    fn create(c: AnnotatorCreate) -> Annotator fallible(CtlError) {
+        self.gate.enter();
+        let out = self.create_in_gate(c) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn create_in_gate(c: AnnotatorCreate) -> Annotator fallible(CtlError) {
+        if !is_slug(c.id) {
+            fail bad(
+                "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                "id"
+            );
+        }
+        check_name(c.name) or raise;
+        let body = annotator_body(
+            self.store,
+            c.id,
+            c.name,
+            c.stage,
+            c.questions.text,
+            c.scope,
+            c.reads_request,
+            c.enabled,
+        ) or raise;
+        let now = now_seconds();
+        let row = st::AnnotatorRow {
+            id: c.id,
+            version: 1,
+            body: body,
+            created_at: now,
+            updated_at: now,
+        };
+        let v = annotator_view(row);
+        let added = self.store.insert_annotator(
+            row,
+            checked_change("create", "annotators/" + c.id, "", Annotator::api_encode(v)) or raise,
+        ) or fail store_down(err);
+        if !added {
+            fail clash("annotator " + c.id + " exists, or was removed: an id is never reused");
+        }
+        return v;
+    }
+
+    /// `updateAnnotator`: a new version.
+    fn update(u: AnnotatorUpdate) -> Annotator fallible(CtlError) {
+        self.gate.enter();
+        let out = self.update_in_gate(u) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn update_in_gate(u: AnnotatorUpdate) -> Annotator fallible(CtlError) {
+        if u.has_id { fail bad("an annotator's id never changes", "id"); }
+        if u.has_stage { fail bad("an annotator's stage never changes: make another", "stage"); }
+        let cur = self.known(u.annotator) or raise;
+        let before = annotator_view(cur);
+        let name = if u.has_name { u.name } else { before.name };
+        check_name(name) or raise;
+        let body = annotator_body(
+            self.store,
+            cur.id,
+            name,
+            before.stage,
+            if u.has_questions { u.questions.text } else { before.questions.text },
+            if u.has_scope { u.scope } else { before.scope },
+            if u.has_reads_request { u.reads_request } else { before.reads_request },
+            if u.has_enabled { u.enabled } else { before.enabled },
+        ) or raise;
+        let mut row = cur;
+        row.version = cur.version + 1;
+        row.body = body;
+        row.updated_at = now_seconds();
+        let after = annotator_view(row);
+        self.store.update_annotator(
+            row,
+            checked_change(
+                "update",
+                "annotators/" + cur.id,
+                Annotator::api_encode(before),
+                Annotator::api_encode(after),
+            ) or raise,
+        ) or fail store_down(err);
+        return after;
+    }
+
+    /// `removeAnnotator`: never a built-in one.
+    fn remove(r: AnnotatorRef) -> Annotator fallible(CtlError) {
+        self.gate.enter();
+        let out = self.remove_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn remove_in_gate(r: AnnotatorRef) -> Annotator fallible(CtlError) {
+        let cur = self.known(r.annotator) or raise;
+        if cur.builtin {
+            fail clash(
+                cur.id
+                    + " is voice's own annotator: disable it (`enabled: false`) rather than remove it"
+            );
+        }
+        let v = annotator_view(cur);
+        self.store.remove_annotator(
+            cur,
+            checked_change("delete", "annotators/" + cur.id, Annotator::api_encode(v), "") or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+
+    fn known(id: String) -> st::AnnotatorRow fallible(CtlError) {
+        let a = self.store.annotator(id) or fail store_down(err);
+        if !a.present || a.removed { fail missing("no annotator " + id); }
+        return a;
+    }
+}
+
+/// An annotator's row as the contract's `Annotator`.
+fn annotator_view(r: st::AnnotatorRow) -> Annotator {
+    let b = r.body;
+    let mut scope = AnnotatorScope { };
+    let s = std::json::find_field_raw(b, "scope");
+    let mut it = std::json::array_first(std::json::find_field_raw(s, "projects"));
+    while !it.done {
+        push(scope.projects, json_text(it.element)) or discard;
+        it = std::json::array_next(it);
+    }
+    it = std::json::array_first(std::json::find_field_raw(s, "keys"));
+    while !it.done {
+        push(scope.keys, json_text(it.element)) or discard;
+        it = std::json::array_next(it);
+    }
+    return Annotator {
+        id: r.id,
+        name: std::json::find_string_field(b, "name"),
+        stage: if std::json::find_string_field(b, "stage") == "response" {
+            AnnotatorStage::response
+        } else {
+            AnnotatorStage::request
+        },
+        version: r.version,
+        questions: std::json::Value::parse(
+            std::str::trim(std::json::find_field_raw(b, "questions")),
+        )
+        or std::json::Value::null(),
+        scope: scope,
+        reads_request: std::json::find_bool_field(b, "reads_request"),
+        enabled: std::json::string_field(b, "enabled").kind != "bool"
+            || std::json::find_bool_field(b, "enabled"),
+        builtin: r.builtin,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    };
+}
+
+/// A JSON string's text.
+fn json_text(raw: String) -> String {
+    return std::json::find_string_field("{\"v\": " + std::str::trim(raw) + "}", "v");
+}
+
+/// An annotator's body as it is kept, checked: its questions (1 to 64,
+/// each as `AnnotatorQuestion` says, a response question's condition on an
+/// existing request annotator's answer), its scope (projects and keys that
+/// exist), and, enabled, the questions of its stage's enabled annotators 64
+/// at most together.
+@unbounded
+fn annotator_body(
+    store: st::Store,
+    id: String,
+    name: String,
+    stage: AnnotatorStage,
+    questions: String,
+    scope: AnnotatorScope,
+    reads_request: Bool,
+    enabled: Bool
+) -> String fallible(CtlError) {
+    let sname = stage_name(stage);
+    let qs = std::str::trim(questions);
+    if !std::str::starts_with(qs, "[") {
+        fail bad("`questions` is a list of questions", "questions");
+    }
+    if reads_request && stage != AnnotatorStage::response {
+        fail bad("only a response annotator reads the request's answers", "reads_request");
+    }
+    let out = st::JsonList { };
+    let names = std::bytes::BytesBuilder { };
+    names.append_str("\n");
+    let mut n = 0;
+    let mut it = std::json::array_first(qs);
+    while !it.done {
+        let q = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        n = n + 1;
+        if n > STAGE_QUESTIONS_MAX {
+            fail bad(
+                "an annotator asks at most " + to_string(STAGE_QUESTIONS_MAX) + " questions",
+                "questions"
+            );
+        }
+        let checked = question_body(store, sname, q, n) or raise;
+        let qname = std::json::find_string_field(checked, "name");
+        if std::str::contains(std::str::clone(names.text_view()), "\n" + qname + "\n") {
+            fail bad("question " + qname + " is asked twice", "questions");
+        }
+        names.append_str(qname + "\n");
+        out.add(checked);
+    }
+    if n == 0 { fail bad("an annotator asks at least one question", "questions"); }
+    for p in scope.projects {
+        let row = store.project(p) or fail store_down(err);
+        if !row.present { fail bad("no project " + p, "scope"); }
+    }
+    for k in scope.keys {
+        let row = store.key(k) or fail store_down(err);
+        if !row.present { fail bad("no key " + k, "scope"); }
+    }
+    if enabled {
+        let all = store.annotators() or fail store_down(err);
+        let mut together = n;
+        for a in all.rows {
+            if a.id == id { continue; }
+            let v = annotator_view(a);
+            if v.enabled && v.stage == stage {
+                together = together + count_items(v.questions.text);
+            }
+        }
+        if together > STAGE_QUESTIONS_MAX {
+            fail bad(
+                "the enabled " + sname + " annotators would ask " + to_string(together)
+                    + " questions together; a decision model is asked at most "
+                    + to_string(STAGE_QUESTIONS_MAX) + " at once: disable one, or ask fewer",
+                "questions"
+            );
+        }
+    }
+    return "{\"name\": " + jq(name) + ", \"stage\": " + jq(sname) + ", \"questions\": ["
+        + out.text()
+        + "], \"scope\": {\"projects\": " + st::jnames(scope.projects) + ", \"keys\": "
+        + st::jnames(scope.keys) + "}, \"reads_request\": " + jbool(reads_request)
+        + ", \"enabled\": "
+        + jbool(enabled) + "}";
+}
+
+/// How many members a JSON array has.
+fn count_items(array: String) -> Int {
+    let mut n = 0;
+    let mut it = std::json::array_first(std::str::trim(array));
+    while !it.done {
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    return n;
+}
+
+/// One question checked, as it is kept: `{name, type, instructions,
+/// options?, condition?}`.
+@unbounded
+fn question_body(store: st::Store, stage: String, q: String, n: Int) -> String fallible(CtlError) {
+    let at = "questions[" + to_string(n - 1) + "]";
+    if !std::json::valid_object(q) { fail bad(at + " is an object", "questions"); }
+    let name = std::json::find_string_field(q, "name");
+    if !is_question_name(name) {
+        fail bad(
+            at + ": `name` is lowercase letters, digits and underscores, 1 to 64",
+            "questions"
+        );
+    }
+    let t = std::json::find_string_field(q, "type");
+    let ins = std::json::find_string_field(q, "instructions");
+    if len(std::str::trim(ins)) == 0 || len(ins) > 2000 {
+        fail bad(at + ": `instructions` is the question, 1 to 2000 characters", "questions");
+    }
+    let opts = std::str::trim(std::json::find_field_raw(q, "options"));
+    let has_opts = std::str::starts_with(opts, "[");
+    let options = st::JsonList { };
+    let values = std::bytes::BytesBuilder { };
+    values.append_str("\n");
+    let mut k = 0;
+    let mut last = 0;
+    if t == "noul" {
+        if has_opts && opts != "[]" {
+            fail bad(at + ": a noul is yes or no (true, false), and takes no options", "questions");
+        }
+    } else if t == "choice" || t == "score" {
+        let mut it = std::json::array_first(if has_opts { opts } else { "[]" });
+        while !it.done {
+            let o = std::str::trim(it.element);
+            it = std::json::array_next(it);
+            k = k + 1;
+            let value = std::json::find_string_field(o, "value");
+            let d = std::json::string_field(o, "description");
+            if len(value) == 0 || len(value) > 128 || (d.kind != "missing" && d.kind != "string")
+                || (d.kind == "string" && len(d.text) > 500)
+            {
+                fail bad(
+                    at
+                        + ": each option is a `value` (1 to 128) and an optional `description` (at most 500)",
+                    "questions"
+                );
+            }
+            if std::str::contains(std::str::clone(values.text_view()), "\n" + value + "\n") {
+                fail bad(at + ": option " + value + " is given twice", "questions");
+            }
+            if t == "score" {
+                let level = std::str::parse_int(value) or {
+                    fail bad(at + ": a score's levels are integers, in order", "questions");
+                };
+                if k > 1 && level <= last {
+                    fail bad(at + ": a score's levels are integers, in order", "questions");
+                }
+                last = level;
+            }
+            values.append_str(value + "\n");
+            options.add(
+                "{\"value\": " + jq(value)
+                    + (if d.kind == "string" { ", \"description\": " + jq(d.text) } else { "" })
+                    + "}",
+            );
+        }
+        if t == "choice" && (k < 1 || k > 255) {
+            fail bad(at + ": a choice has 1 to 255 options", "questions");
+        }
+        if t == "score" && (k < 2 || k > 10) {
+            fail bad(at + ": a score has 2 to 10 levels", "questions");
+        }
+    } else {
+        fail bad(at + ": `type` is choice, noul or score", "questions");
+    }
+    let cond = std::str::trim(std::json::find_field_raw(q, "condition"));
+    let mut cond_body = "";
+    if std::str::starts_with(cond, "{") {
+        if stage != "response" {
+            fail bad(
+                at + ": only a response question has a condition, on the request's answers",
+                "questions"
+            );
+        }
+        let c = AnnotationCondition::api_decode(cond) or {
+            fail bad(
+                at + ": `condition` is an annotator, a question, an answer and a least probability",
+                "questions"
+            );
+        };
+        check_condition(store, c, at + ".condition") or raise;
+        cond_body = ", \"condition\": " + condition_json(c);
+    }
+    return "{\"name\": " + jq(name) + ", \"type\": " + jq(t) + ", \"instructions\": " + jq(ins)
+        + (if t == "noul" { "" } else { ", \"options\": [" + options.text() + "]" }) + cond_body
+        + "}";
+}
+
+/// `^[a-z0-9_]{1,64}$`.
+fn is_question_name(s: String) -> Bool {
+    let n = len(s);
+    if n == 0 || n > 64 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at_unchecked(s, i);
+        if !((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A condition checked: a request annotator's question and one of its answers.
+fn check_condition(
+    store: st::Store,
+    c: AnnotationCondition,
+    at: String
+) -> Bool fallible(CtlError) {
+    if c.min_probability < 0.0 || c.min_probability > 1.0 {
+        fail bad(at + ": `min_probability` is 0 to 1", "condition");
+    }
+    check_answer(store, c.annotator, c.question, c.answer, "request", at) or raise;
+    return true;
+}
+
+/// Whether `annotator` (of `stage`) asks `question`, and `answer` is one it
+/// can give.
+fn check_answer(
+    store: st::Store,
+    annotator: String,
+    question: String,
+    answer: String,
+    stage: String,
+    at: String
+) -> Bool fallible(CtlError) {
+    let a = store.annotator(annotator) or fail store_down(err);
+    if !a.present || a.removed { fail bad(at + ": no annotator " + annotator, "condition"); }
+    let v = annotator_view(a);
+    if stage_name(v.stage) != stage {
+        fail bad(
+            at + ": " + annotator + " asks at the " + stage_name(v.stage) + " stage, not the "
+                + stage,
+            "condition"
+        );
+    }
+    let q = annotator_question(v.questions.text, question);
+    if len(q) == 0 {
+        fail bad(at + ": " + annotator + " asks no question " + question, "condition");
+    }
+    if !answers_to(q, answer) {
+        fail bad(at + ": " + question + " has no answer " + answer, "condition");
+    }
+    return true;
+}
+
+/// The question `name` of a questions list, "" when none.
+fn annotator_question(questions: String, name: String) -> String {
+    let mut it = std::json::array_first(std::str::trim(questions));
+    while !it.done {
+        if std::json::find_string_field(it.element, "name") == name {
+            return std::str::trim(it.element);
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// Whether `answer` is one `q` can give: an option's value, true or false.
+fn answers_to(q: String, answer: String) -> Bool {
+    if std::json::find_string_field(q, "type") == "noul" {
+        return answer == "true" || answer == "false";
+    }
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(q, "options")));
+    while !it.done {
+        if std::json::find_string_field(it.element, "value") == answer { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+fn condition_json(c: AnnotationCondition) -> String {
+    return "{\"annotator\": " + jq(c.annotator) + ", \"question\": " + jq(c.question)
+        + ", \"answer\": "
+        + jq(c.answer) + ", \"min_probability\": " + to_string(c.min_probability) + "}";
+}
+
+// ---- the admin plane: rules ---------------------------------------------
+
+locus AnnotationRules {
+    params {
+        store: st::Store;
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `listAnnotationRules`.
+    fn list() -> AnnotationRuleList fallible(CtlError) {
+        self.gate.enter();
+        let rows = self.store.rules() or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotationRuleList { };
+        for r in rows.rows { push(out.data, rule_view(r)) or discard; }
+        return out;
+    }
+
+    /// `getAnnotationRule`.
+    fn get(r: AnnotationRuleRef) -> AnnotationRule fallible(CtlError) {
+        self.gate.enter();
+        let row = self.known(r.rule) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return rule_view(row);
+    }
+
+    /// `createAnnotationRule`.
+    fn create(c: AnnotationRuleCreate) -> AnnotationRule fallible(CtlError) {
+        self.gate.enter();
+        let out = self.create_in_gate(c) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn create_in_gate(c: AnnotationRuleCreate) -> AnnotationRule fallible(CtlError) {
+        if !is_slug(c.id) {
+            fail bad(
+                "`id` is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                "id"
+            );
+        }
+        let body = rule_body(
+            self.store,
+            c.name,
+            c.has_condition,
+            c.condition,
+            c.expect,
+            c.enabled,
+        ) or raise;
+        let now = now_seconds();
+        let row = st::RuleRow { id: c.id, body: body, created_at: now, updated_at: now };
+        let v = rule_view(row);
+        let added = self.store.insert_rule(
+            row,
+            checked_change(
+                "create",
+                "annotation-rules/" + c.id,
+                "",
+                AnnotationRule::api_encode(v),
+            ) or raise,
+        ) or fail store_down(err);
+        if !added {
+            fail clash(
+                "annotation rule " + c.id + " exists, or was removed: an id is never reused"
+            );
+        }
+        return v;
+    }
+
+    /// `updateAnnotationRule`.
+    fn update(u: AnnotationRuleUpdate) -> AnnotationRule fallible(CtlError) {
+        self.gate.enter();
+        let out = self.update_in_gate(u) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn update_in_gate(u: AnnotationRuleUpdate) -> AnnotationRule fallible(CtlError) {
+        let cur = self.known(u.rule) or raise;
+        let before = rule_view(cur);
+        let has_condition = if u.has_condition {
+            true
+        } else if u.clear_condition {
+            false
+        } else {
+            before.has_condition
+        };
+        let body = rule_body(
+            self.store,
+            if u.has_name { u.name } else { before.name },
+            has_condition,
+            if u.has_condition { u.condition } else { before.condition },
+            if u.has_expect { u.expect } else { before.expect },
+            if u.has_enabled { u.enabled } else { before.enabled },
+        ) or raise;
+        let mut row = cur;
+        row.body = body;
+        row.updated_at = now_seconds();
+        let after = rule_view(row);
+        self.store.update_rule(
+            row,
+            checked_change(
+                "update",
+                "annotation-rules/" + cur.id,
+                AnnotationRule::api_encode(before),
+                AnnotationRule::api_encode(after),
+            ) or raise,
+        ) or fail store_down(err);
+        return after;
+    }
+
+    /// `removeAnnotationRule`: never a built-in one.
+    fn remove(r: AnnotationRuleRef) -> AnnotationRule fallible(CtlError) {
+        self.gate.enter();
+        let out = self.remove_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn remove_in_gate(r: AnnotationRuleRef) -> AnnotationRule fallible(CtlError) {
+        let cur = self.known(r.rule) or raise;
+        if cur.builtin {
+            fail clash(cur.id + " is voice's own rule: disable it rather than remove it");
+        }
+        let v = rule_view(cur);
+        self.store.remove_rule(
+            cur,
+            checked_change(
+                "delete",
+                "annotation-rules/" + cur.id,
+                AnnotationRule::api_encode(v),
+                "",
+            ) or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+
+    fn known(id: String) -> st::RuleRow fallible(CtlError) {
+        let r = self.store.rule(id) or fail store_down(err);
+        if !r.present || r.removed { fail missing("no annotation rule " + id); }
+        return r;
+    }
+}
+
+/// A rule's body as it is kept, checked: its condition a request answer,
+/// its expectation a response answer, or for a score a level or higher.
+fn rule_body(
+    store: st::Store,
+    name: String,
+    has_condition: Bool,
+    c: AnnotationCondition,
+    e: AnnotationExpect,
+    enabled: Bool
+) -> String fallible(CtlError) {
+    check_name(name) or raise;
+    if has_condition { check_condition(store, c, "condition") or raise; }
+    if e.has_answer == e.has_at_least {
+        fail bad("`expect` names an `answer`, or for a score `at_least`, one of the two", "expect");
+    }
+    check_answer(
+        store,
+        e.annotator,
+        e.question,
+        if e.has_answer { e.answer } else { e.at_least },
+        "response",
+        "expect",
+    ) or raise;
+    if e.has_at_least {
+        let a = store.annotator(e.annotator) or fail store_down(err);
+        let q = annotator_question(annotator_view(a).questions.text, e.question);
+        if std::json::find_string_field(q, "type") != "score" {
+            fail bad(
+                "`expect.at_least` is a score's level; " + e.question + " is no score",
+                "expect"
+            );
+        }
+    }
+    return "{\"name\": " + jq(name) + ", \"enabled\": " + jbool(enabled)
+        + (if has_condition { ", \"condition\": " + condition_json(c) } else { "" })
+        + ", \"expect\": {\"annotator\": " + jq(e.annotator) + ", \"question\": " + jq(e.question)
+        + (
+            if e.has_answer {
+                ", \"answer\": " + jq(e.answer)
+            } else {
+                ", \"at_least\": " + jq(e.at_least)
+            }
+        )
+        + "}}";
+}
+
+fn rule_view(r: st::RuleRow) -> AnnotationRule {
+    let b = r.body;
+    let c = std::str::trim(std::json::find_field_raw(b, "condition"));
+    let e = std::json::find_field_raw(b, "expect");
+    return AnnotationRule {
+        id: r.id,
+        name: std::json::find_string_field(b, "name"),
+        has_condition: std::str::starts_with(c, "{"),
+        condition: condition_of(c),
+        expect: AnnotationExpect {
+            annotator: std::json::find_string_field(e, "annotator"),
+            question: std::json::find_string_field(e, "question"),
+            has_answer: std::json::string_field(e, "answer").kind == "string",
+            answer: std::json::find_string_field(e, "answer"),
+            has_at_least: std::json::string_field(e, "at_least").kind == "string",
+            at_least: std::json::find_string_field(e, "at_least"),
+        },
+        enabled: std::json::string_field(b, "enabled").kind != "bool"
+            || std::json::find_bool_field(b, "enabled"),
+        builtin: r.builtin,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+    };
+}
+
+fn condition_of(c: String) -> AnnotationCondition {
+    let p = std::str::trim(std::json::find_field_raw(c, "min_probability"));
+    return AnnotationCondition {
+        annotator: std::json::find_string_field(c, "annotator"),
+        question: std::json::find_string_field(c, "question"),
+        answer: std::json::find_string_field(c, "answer"),
+        min_probability: std::str::parse_float(p) or 0.5,
+    };
+}
+
+// ---- the admin plane: annotations ---------------------------------------
+
+locus Annotations {
+    params {
+        store: st::Store;
+        gate: st::Lock = st::Lock { };
+    }
+
+    /// `listAnnotations`: newest first, at most `limit` (50 by default, 200 at most).
+    fn list(a: AnnotationAsk) -> AnnotationList fallible(CtlError) {
+        let mut q = answer_query(
+            a.project,
+            a.key,
+            a.conversation,
+            a.metadata,
+            a.answer,
+            a.min_probability,
+            a.from,
+            a.to,
+        ) or raise;
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > 200 { fail bad("`limit` is 1 to 200", "limit"); }
+            q.limit = a.limit;
+        }
+        self.gate.enter();
+        let rows = self.store.annotations(q) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotationList { };
+        for r in rows.rows { push(out.data, summary_of(r)) or discard; }
+        return out;
+    }
+
+    /// `getAnnotation`: its answers, and every enabled rule scored on them.
+    fn get(r: AnnotationRef) -> Annotation fallible(CtlError) {
+        self.gate.enter();
+        let out = self.get_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return out;
+    }
+
+    fn get_in_gate(r: AnnotationRef) -> Annotation fallible(CtlError) {
+        let row = self.store.annotation(r.request_id) or fail store_down(err);
+        if !row.present {
+            fail missing(
+                "no annotation of request " + r.request_id
+                    + ": its project and key do not annotate, or it has not been read yet"
+            );
+        }
+        let answers = self.store.answers(r.request_id) or fail store_down(err);
+        let rules = self.store.rules() or fail store_down(err);
+        let s = summary_of(row);
+        let model = std::json::find_string_field(row.body, "model");
+        let mut out = Annotation {
+            request_id: s.request_id,
+            project: s.project,
+            key: s.key,
+            has_conversation: s.has_conversation,
+            conversation: s.conversation,
+            created_at: s.created_at,
+            status: s.status,
+            reason: s.reason,
+            clipped: s.clipped,
+            has_model: len(model) > 0,
+            model: model,
+            input_tokens: std::json::find_int_field(row.body, "input_tokens"),
+        };
+        for a in answers.rows { push(out.answers, answer_view(a)) or discard; }
+        for rule in rules.rows {
+            let v = rule_view(rule);
+            if v.enabled { push(out.pairs, scored(v, answers)) or discard; }
+        }
+        return out;
+    }
+
+    /// `annotationFacets`.
+    fn facets(a: AnnotationFacetAsk) -> AnnotationFacets fallible(CtlError) {
+        let q = answer_query(
+            a.project,
+            a.key,
+            a.conversation,
+            a.metadata,
+            a.answer,
+            a.min_probability,
+            a.from,
+            a.to,
+        ) or raise;
+        let dot = question_parts(a.question) or raise;
+        self.gate.enter();
+        let counts = self.store.answer_counts(q, dot.annotator, dot.question) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotationFacets { question: a.question, total: counts.total };
+        for c in counts.rows {
+            push(out.counts, AnswerCountView { answer: c.answer, count: c.count }) or discard;
+        }
+        return out;
+    }
+
+    /// `annotationTrend`.
+    fn trend(a: AnnotationTrendAsk) -> AnnotationTrend fallible(CtlError) {
+        if a.bucket != "hour" && a.bucket != "day" {
+            fail bad("`bucket` is hour or day", "bucket");
+        }
+        let q = answer_query(
+            a.project,
+            a.key,
+            a.conversation,
+            a.metadata,
+            a.answer,
+            a.min_probability,
+            a.from,
+            a.to,
+        ) or raise;
+        let dot = question_parts(a.question) or raise;
+        self.gate.enter();
+        let points = self.store.answer_trend(q, dot.annotator, dot.question, a.bucket) or {
+            self.gate.leave();
+            fail store_down(err);
+        };
+        self.gate.leave();
+        let mut out = AnnotationTrend { question: a.question, bucket: a.bucket };
+        for p in points.rows {
+            push(
+                out.points,
+                TrendPointView { at: p.at, answer: p.answer, count: p.count },
+            ) or discard;
+        }
+        return out;
+    }
+}
+
+/// `<annotator>.<question>`, apart.
+type QuestionParts { annotator: String = ""; question: String = ""; }
+
+fn question_parts(s: String) -> QuestionParts fallible(CtlError) {
+    let dot = std::str::index_of(s, ".");
+    if dot < 1 || dot == len(s) - 1 {
+        fail bad("`question` is <annotator>.<question>", "question");
+    }
+    return QuestionParts { annotator: s[0..dot], question: s[(dot + 1)..len(s)] };
+}
+
+/// The filters the searches share, read: `answer` and `metadata` each one
+/// pair or a JSON object of several, the times RFC 3339.
+@unbounded
+fn answer_query(
+    project: String,
+    key: String,
+    conversation: String,
+    metadata: String,
+    m: String,
+    min: Float,
+    from: String,
+    to: String
+) -> st::AnswerQuery fallible(CtlError) {
+    if min < 0.0 || min > 1.0 { fail bad("`min_probability` is 0 to 1", "min_probability"); }
+    let mut q = st::AnswerQuery {
+        project: project,
+        key: key,
+        conversation: conversation,
+        min_probability: min,
+        metadata: metadata_pairs(metadata) or raise,
+    };
+    let terms = metadata_pairs(m) or {
+        fail bad("`answer` is <annotator>.<question>=<answer>, or a JSON object of them", "answer");
+    };
+    for t in terms.items {
+        let eq = std::str::index_of(t, "=");
+        let parts = question_parts(t[0..eq]) or {
+            fail bad("`answer` names each answer as <annotator>.<question>=<answer>", "answer");
+        };
+        push(
+            q.terms.items,
+            parts.annotator + "\t" + parts.question + "\t" + t[(eq + 1)..len(t)],
+        ) or discard;
+    }
+    if len(from) > 0 {
+        q.has_from = true;
+        q.from = rfc3339(from) or fail bad(
+            "`from` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
+            "from"
+        );
+    }
+    if len(to) > 0 {
+        q.has_to = true;
+        q.to = rfc3339(to) or fail bad(
+            "`to` is an RFC 3339 time, such as 2026-10-01T00:00:00Z",
+            "to"
+        );
+    }
+    return q;
+}
+
+fn summary_of(r: st::AnnotationRow) -> AnnotationSummary {
+    return AnnotationSummary {
+        request_id: r.request_id,
+        project: r.project,
+        key: r.key,
+        has_conversation: len(r.conversation) > 0,
+        conversation: r.conversation,
+        created_at: r.created_at,
+        status: if r.status == "annotated" {
+            AnnotationStatus::annotated
+        } else {
+            AnnotationStatus::not_annotated
+        },
+        reason: r.reason,
+        clipped: r.clipped,
+    };
+}
+
+fn answer_view(a: st::AnswerRow) -> AnnotationAnswer {
+    return AnnotationAnswer {
+        annotator: a.annotator,
+        version: a.version,
+        stage: if a.stage == "response" {
+            AnnotatorStage::response
+        } else {
+            AnnotatorStage::request
+        },
+        question: a.question,
+        has_answer: !a.skipped,
+        answer: a.answer,
+        probability: a.probability,
+        probabilities: std::json::Value::parse(
+            if len(a.probabilities) > 0 { a.probabilities } else { "{}" },
+        )
+        or std::json::Value::null(),
+        has_score: a.has_score,
+        score: a.score,
+        conditioned: a.conditioned,
+        skipped: a.skipped,
+    };
+}
+
+/// A rule scored on a request's answers: it applies when its condition
+/// holds (or it has none) and the response question it expects was asked;
+/// its probability is the expected answer's (a score's: the levels at
+/// `at_least` or above, together), met at one half or more.
+fn scored(r: AnnotationRule, answers: st::AnswerRows) -> AnnotationPair {
+    let mut out = AnnotationPair { rule: r.id, name: r.name };
+    if r.has_condition && !holds(r.condition, answers) { return out; }
+    let e = r.expect;
+    let mut found = false;
+    let mut p = 0.0;
+    for a in answers.rows {
+        if a.annotator == e.annotator
+            && a.question == e.question
+            && a.stage == "response"
+            && !a.skipped
+        {
+            found = true;
+            p = if e.has_answer {
+                number_at(a.probabilities, e.answer)
+            } else {
+                at_least(a.probabilities, e.at_least)
+            };
+        }
+    }
+    if !found { return out; }
+    out.applies = true;
+    out.probability = p;
+    out.met = p >= 0.5;
+    return out;
+}
+
+/// The probabilities of a score's levels at `least` or above, together.
+fn at_least(probs: String, least: String) -> Float {
+    let floor = std::str::parse_int(least) or 0;
+    let mut p = 0.0;
+    let mut it = std::json::object_first(probs);
+    while !it.done {
+        let level = std::str::parse_int(std::json::obj_key_string(it, probs)) or(floor - 1);
+        if level >= floor {
+            p = p
+                + (
+                    std::str::parse_float(
+                        std::str::trim(std::json::obj_value_raw(it, probs)),
+                    ) or 0.0
+                );
+        }
+        it = std::json::object_next(it, probs);
+    }
+    return p;
+}
+
+/// Whether a request answer holds: `c.annotator`'s `c.question` gave
+/// `c.answer` `c.min_probability` or more.
+fn holds(c: AnnotationCondition, answers: st::AnswerRows) -> Bool {
+    for a in answers.rows {
+        if a.annotator == c.annotator
+            && a.question == c.question
+            && a.stage == "request"
+            && !a.skipped
+        {
+            return number_at(a.probabilities, c.answer) >= c.min_probability;
+        }
+    }
+    return false;
+}
+
+/// `AnnotationBackfill`: an annotator, at its current version by default,
+/// asked of the recorded requests of `project` and `key` between `from` and
+/// `to` (each "" for any).
+type AnnotationBackfill {
+    annotator: String;
+    version: Int = 0;
+    project: String = "";
+    key: String = "";
+    from: String = "";
+    to: String = "";
+}
+
+// ---- asking -------------------------------------------------------------
+
+/// A request answered, to annotate: what it asked, as it was served, and
+/// its final response. Built where it is answered (inference.hl), or from a
+/// recording (`backfillAnnotations`); `present` false for a request whose
+/// project and key do not annotate.
+type AnnotationJob {
+    request_id: String = "";
+    project: String = "";
+    key: String = "";
+    conversation: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    // the model the caller named
+    model: String = "";
+    data_class: String = "internal";
+    // the standard request as served, and the final response, each JSON
+    input: String = "";
+    output: String = "";
+    present: Bool = false;
+}
+
+/// One decision request's answers: kept rows, and its model and tokens.
+type Asked {
+    ok: Bool = false;
+    reason: String = "";
+    answers: st::AnswerRows = st::AnswerRows { };
+    request_id: String = "";
+    model: String = "";
+    tokens: Int = 0;
+}
+
+/// The annotators asked of one request: their current versions, by stage.
+type Panel {
+    request: st::AnnotatorRows = st::AnnotatorRows { };
+    response: st::AnnotatorRows = st::AnnotatorRows { };
+}
+
+/// A request's texts as a decision model reads them, and whether either
+/// was cut to fit.
+type Texts { request: String = ""; response: String = ""; clipped: Bool = false; }
+
+locus AnnotationRunner {
+    params {
+        store: st::Store;
+        // voice-system's requests are served as any project's are: its own
+        // limits, held in its own counters
+        inference: Inference;
+    }
+
+    /// `j` annotated by the annotators in force for it, or why not, kept.
+    /// Never fails the caller, who has had its answer: a store that cannot
+    /// keep it is logged.
+    @unbounded
+    fn annotate(j: AnnotationJob) {
+        if !j.present || j.project == st::SYSTEM_PROJECT { return; }
+        let panel = self.panel(j) or {
+            self.keep(
+                not_annotated(j, "failed: the store did not answer (" + err.message + ")"),
+                st::AnswerRows { },
+            );
+            return;
+        };
+        if count(panel.request.rows) + count(panel.response.rows) == 0 {
+            self.keep(
+                not_annotated(j, "no annotator is in force for its project and key"),
+                st::AnswerRows { },
+            );
+            return;
+        }
+        self.ask_panel(j, panel, st::AnswerRows { }, false);
+    }
+
+    /// `j` asked by `annotator` (at its version), from a recording: a
+    /// response annotator reads the request answers already kept; the
+    /// other annotators' answers stay as they are.
+    @unbounded
+    fn backfill(j: AnnotationJob, annotator: st::AnnotatorRow) {
+        let mut panel = Panel { };
+        if annotator_view(annotator).stage == AnnotatorStage::request {
+            push(panel.request.rows, annotator) or discard;
+        } else {
+            push(panel.response.rows, annotator) or discard;
+        }
+        let kept = self.store.answers(j.request_id) or st::AnswerRows { };
+        self.ask_panel(j, panel, kept, true);
+    }
+
+    /// The panel's questions asked, and what they answered kept with the
+    /// annotation; `kept`, request answers given before (a backfill's).
+    @unbounded
+    fn ask_panel(j: AnnotationJob, panel: Panel, kept: st::AnswerRows, backfill: Bool) {
+        let why = self.unready(j);
+        if len(why) > 0 {
+            if !backfill { self.keep(not_annotated(j, why), st::AnswerRows { }); }
+            return;
+        }
+        let texts = texts_of(j);
+        let mut answers = st::AnswerRows { };
+        let by = st::JsonList { };
+        let mut model = "";
+        let mut tokens = 0;
+        // the request's answers: asked now, else those kept
+        let mut request_answers = kept;
+        if count(panel.request.rows) > 0 {
+            let asked = self.ask(
+                j,
+                "request",
+                panel.request,
+                false,
+                st::AnswerRows { },
+                texts.request,
+            );
+            if !asked.ok {
+                if !backfill { self.keep(not_annotated(j, asked.reason), st::AnswerRows { }); }
+                return;
+            }
+            answers = asked.answers;
+            request_answers = asked.answers;
+            by.add(jq(asked.request_id));
+            model = asked.model;
+            tokens = tokens + asked.tokens;
+        }
+        if count(panel.response.rows) > 0 {
+            let state = "The request:\n" + clipped(texts.request, ANNOTATE_REQUEST_TEXT / 2)
+                + "\n\nThe response:\n"
+                + texts.response;
+            // those that read the text alone, then those that read the
+            // request's answers too: two texts, two requests
+            let mut k = 0;
+            while k < 2 {
+                let conditioned = k == 1;
+                let mut group = st::AnnotatorRows { };
+                for a in panel.response.rows {
+                    if annotator_view(a).reads_request == conditioned {
+                        push(group.rows, a) or discard;
+                    }
+                }
+                k = k + 1;
+                if count(group.rows) == 0 { continue; }
+                let asked = self.ask(
+                    j,
+                    "response",
+                    group,
+                    conditioned,
+                    request_answers,
+                    if conditioned {
+                        state + "\n\n" + request_block(request_answers)
+                    } else {
+                        state
+                    },
+                );
+                if !asked.ok {
+                    if !backfill { self.keep(not_annotated(j, asked.reason), st::AnswerRows { }); }
+                    return;
+                }
+                for a in asked.answers.rows { push(answers.rows, a) or discard; }
+                if len(asked.request_id) > 0 {
+                    by.add(jq(asked.request_id));
+                    model = asked.model;
+                    tokens = tokens + asked.tokens;
+                }
+            }
+        }
+        let mut row = st::AnnotationRow {
+            request_id: j.request_id,
+            project: j.project,
+            key: j.key,
+            conversation: j.conversation,
+            created_at: j.created_at,
+            status: "annotated",
+            clipped: texts.clipped,
+            body: "{\"by\": [" + by.text() + "], \"model\": " + jq(model) + ", \"input_tokens\": "
+                + to_string(tokens) + "}",
+        };
+        if backfill {
+            // the annotation it had keeps its own record of what asked
+            let had = self.store.annotation(j.request_id) or st::AnnotationRow { };
+            if had.present && had.status == "annotated" {
+                row.body = had.body;
+                row.clipped = had.clipped || texts.clipped;
+            }
+        }
+        self.keep(row, answers);
+    }
+
+    fn keep(row: st::AnnotationRow, answers: st::AnswerRows) {
+        self.store.put_annotation(row, answers) or {
+            log_error(
+                "an annotation could not be kept",
+                fields2(
+                    std::log::kv("request", row.request_id),
+                    std::log::kv("error", err.message),
+                ),
+            );
+        };
+    }
+
+    /// The enabled annotators in force for `j`'s project (or its parent) and key.
+    fn panel(j: AnnotationJob) -> Panel fallible(st::StoreError) {
+        let p = self.store.project(j.project) or raise;
+        let all = self.store.annotators() or raise;
+        let mut out = Panel { };
+        for a in all.rows {
+            let v = annotator_view(a);
+            if !v.enabled || !in_scope(v.scope, p, j.key) { continue; }
+            if v.stage == AnnotatorStage::request {
+                push(out.request.rows, a) or discard;
+            } else {
+                push(out.response.rows, a) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// Why voice-system cannot ask about `j` now, "" when it can: its
+    /// `decide` names no decision model, or its project may not read `j`'s
+    /// data.
+    fn unready(j: AnnotationJob) -> String {
+        let p = self.store.project(st::SYSTEM_PROJECT) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        if !p.present { return "voice-system is missing: the store has not been migrated"; }
+        let target = alias_target(self.store, p, ANNOTATE_MODEL) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        let named = if len(target) > 0 { target } else { ANNOTATE_MODEL };
+        let m = self.store.model(named) or {
+            return "failed: the store did not answer (" + err.message + ")";
+        };
+        if !m.present || m.removed {
+            return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
+        }
+        if m.contract != "decision" {
+            return "no decision model: voice-system's `decide` is " + m.id
+                + ", which is not a decision model";
+        }
+        if !has_name(p.data_classes.items, j.data_class) {
+            return "voice-system may not read data of class " + j.data_class
+                + " (give it that data class)";
+        }
+        return "";
+    }
+
+    /// The questions of `group`, at `stage`, asked of `state` in one
+    /// voice-system request; a response question whose condition does not
+    /// hold on `request_answers` is not asked, and kept skipped.
+    @unbounded
+    fn ask(
+        j: AnnotationJob,
+        stage: String,
+        group: st::AnnotatorRows,
+        conditioned: Bool,
+        request_answers: st::AnswerRows,
+        state: String
+    ) -> Asked {
+        let props = st::JsonList { };
+        let mut out = Asked { ok: true };
+        let mut asking = 0;
+        for a in group.rows {
+            let v = annotator_view(a);
+            let mut it = std::json::array_first(std::str::trim(v.questions.text));
+            while !it.done {
+                let q = std::str::trim(it.element);
+                it = std::json::array_next(it);
+                let name = std::json::find_string_field(q, "name");
+                let c = std::str::trim(std::json::find_field_raw(q, "condition"));
+                if std::str::starts_with(c, "{") && !holds(condition_of(c), request_answers) {
+                    push(
+                        out.answers.rows,
+                        answer_row(j, a, stage, name, conditioned, true),
+                    ) or discard;
+                    continue;
+                }
+                props.add(jq(a.id + "." + name) + ": " + question_schema(q));
+                asking = asking + 1;
+            }
+        }
+        if asking == 0 { return out; }
+        let body = "{\"model\": " + jq(ANNOTATE_MODEL) + ", \"input\": " + jq(state)
+            + ", \"text\": {\"format\": {\"type\": \"json_schema\", \"name\": " + jq(stage)
+            + ", \"schema\": {\"type\": \"object\", \"properties\": {" + props.text()
+            + "}}}}, \"metadata\": {\"annotates\": " + jq(j.request_id) + ", \"side\": " + jq(stage)
+            + "}, \"voice\": {\"data_class\": " + jq(j.data_class) + "}}";
+        let r = read_inference(body, "responses") or {
+            return Asked { reason: "failed: " + err.message };
+        };
+        let who = std::api::Principal {
+            mode: "internal",
+            name: st::SYSTEM_PROJECT,
+            via: "internal",
+        };
+        let ctx = std::api::Context { caller: who, role: "caller", via: "internal" };
+        let s = self.inference.serve(r, ctx) or {
+            return Asked { reason: refusal_reason(err) };
+        };
+        // its answers, each question's probabilities (inference.hl)
+        let given = std::str::trim(s.voice.decision);
+        if !std::json::valid_object(given) {
+            return Asked {
+                reason: "failed: " + s.voice.served.model + " gave no decision answers",
+            };
+        }
+        for a in group.rows {
+            let v = annotator_view(a);
+            let mut it = std::json::array_first(std::str::trim(v.questions.text));
+            while !it.done {
+                let q = std::str::trim(it.element);
+                it = std::json::array_next(it);
+                let name = std::json::find_string_field(q, "name");
+                let raw = std::str::trim(std::json::find_field_raw(given, a.id + "." + name));
+                if len(raw) == 0 { continue; }
+                push(
+                    out.answers.rows,
+                    answered(answer_row(j, a, stage, name, conditioned, false), raw),
+                ) or discard;
+            }
+        }
+        out.request_id = s.request_id;
+        out.model = s.voice.served.model;
+        out.tokens = s.input_tokens;
+        return out;
+    }
+}
+
+/// Whether a request of `p` (or its parent) and `key` is in `scope`.
+fn in_scope(scope: AnnotatorScope, p: st::ProjectRow, key: String) -> Bool {
+    if count(scope.projects) == 0 && count(scope.keys) == 0 { return true; }
+    for s in scope.projects {
+        if s == p.id || (len(p.parent) > 0 && s == p.parent) { return true; }
+    }
+    for k in scope.keys {
+        if k == key { return true; }
+    }
+    return false;
+}
+
+fn not_annotated(j: AnnotationJob, reason: String) -> st::AnnotationRow {
+    return st::AnnotationRow {
+        request_id: j.request_id,
+        project: j.project,
+        key: j.key,
+        conversation: j.conversation,
+        created_at: j.created_at,
+        status: "not_annotated",
+        reason: reason,
+    };
+}
+
+fn answer_row(
+    j: AnnotationJob,
+    a: st::AnnotatorRow,
+    stage: String,
+    question: String,
+    conditioned: Bool,
+    skipped: Bool
+) -> st::AnswerRow {
+    return st::AnswerRow {
+        request_id: j.request_id,
+        project: j.project,
+        key: j.key,
+        conversation: j.conversation,
+        created_at: j.created_at,
+        annotator: a.id,
+        version: a.version,
+        stage: stage,
+        question: question,
+        conditioned: conditioned,
+        skipped: skipped,
+    };
+}
+
+/// A question as its JSON schema property (decision.hl): a choice a string
+/// of its options, a noul a boolean, a score an integer of its levels.
+fn question_schema(q: String) -> String {
+    let t = std::json::find_string_field(q, "type");
+    let desc = jq(std::json::find_string_field(q, "instructions"));
+    if t == "noul" { return "{\"type\": \"boolean\", \"description\": " + desc + "}"; }
+    let opts = st::JsonList { };
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(q, "options")));
+    while !it.done {
+        let o = it.element;
+        it = std::json::array_next(it);
+        let value = std::json::find_string_field(o, "value");
+        let d = std::json::string_field(o, "description");
+        opts.add(
+            "{\"const\": " + (if t == "score" { value } else { jq(value) })
+                + (
+                    if d.kind == "string" && len(d.text) > 0 {
+                        ", \"description\": " + jq(d.text)
+                    } else {
+                        ""
+                    }
+                )
+                + "}",
+        );
+    }
+    return "{\"type\": " + (if t == "score" { "\"integer\"" } else { "\"string\"" })
+        + ", \"description\": "
+        + desc + ", \"oneOf\": [" + opts.text() + "]}";
+}
+
+/// `row` with a systemone answer's: a choice by its option, a noul as true
+/// or false, a score by its level's value, its expected level its score.
+fn answered(row: st::AnswerRow, a: String) -> st::AnswerRow {
+    let mut out = row;
+    let t = std::json::find_string_field(a, "type");
+    if t == "noul" {
+        let p = noul_of(a);
+        out.answer = if p >= 0.5 { "true" } else { "false" };
+        out.probability = if p >= 0.5 { p } else { 1.0 - p };
+        out.probabilities = "{\"true\": " + to_string(p) + ", \"false\": " + to_string(1.0 - p)
+            + "}";
+        return out;
+    }
+    let probs = std::str::trim(std::json::find_field_raw(a, "probabilities"));
+    if t == "choice" {
+        out.answer = std::json::find_string_field(a, "choice");
+        out.probability = number_at(probs, out.answer);
+        out.probabilities = if std::json::valid_object(probs) { probs } else { "{}" };
+        return out;
+    }
+    // a score: its levels by their values
+    let legend = std::json::find_field_raw(a, "legend");
+    let levels = st::JsonList { };
+    let mut best = "";
+    let mut best_p = -1.0;
+    let mut expected = 0.0;
+    let mut it = std::json::object_first(probs);
+    while !it.done {
+        let k = std::json::obj_key_string(it, probs);
+        let p = std::str::parse_float(std::str::trim(std::json::obj_value_raw(it, probs))) or 0.0;
+        it = std::json::object_next(it, probs);
+        let label = std::str::trim(std::json::find_string_field(legend, k));
+        levels.add(jq(label) + ": " + to_string(p));
+        expected = expected + std::math::int_to_float(std::str::parse_int(label) or 0) * p;
+        if p > best_p {
+            best_p = p;
+            best = label;
+        }
+    }
+    out.answer = best;
+    out.probability = best_p;
+    out.probabilities = "{" + levels.text() + "}";
+    out.has_score = true;
+    out.score = expected;
+    return out;
+}
+
+/// The request's answers, as a response annotator that reads them is given
+/// them: a short labelled block, one a line.
+@unbounded
+fn request_block(answers: st::AnswerRows) -> String {
+    let b = std::bytes::BytesBuilder { initial_cap: 1024 };
+    b.append_str("What the request was, as read before (answer, probability):\n");
+    for a in answers.rows {
+        if a.stage != "request" || a.skipped { continue; }
+        b.append_str(
+            "- " + a.annotator + "." + a.question + ": " + a.answer + " ("
+                + to_string(a.probability) + ")\n",
+        );
+    }
+    return std::str::from_bytes(b.snapshot() or b"");
+}
+
+/// Why voice-system's request was refused, as an annotation says it.
+fn refusal_reason(e: ApiError) -> String {
+    if e.status == 429 { return "voice-system is past its limits: " + e.message; }
+    if e.code == ErrorCode::model_not_found {
+        return "no decision model: voice-system names none `decide` (give it a `decide` alias)";
+    }
+    if e.status == 403 || e.code == ErrorCode::no_eligible_seat {
+        return "voice-system may not use its decision model: " + e.message;
+    }
+    return "failed: " + e.message;
+}
+
+/// The number `obj` holds under `name`, 0 when none.
+fn number_at(obj: String, name: String) -> Float {
+    let mut it = std::json::object_first(obj);
+    while !it.done {
+        if std::json::obj_key_string(it, obj) == name {
+            return std::str::parse_float(std::str::trim(std::json::obj_value_raw(it, obj))) or 0.0;
+        }
+        it = std::json::object_next(it, obj);
+    }
+    return 0.0;
+}
+
+// ---- the texts read -----------------------------------------------------
+
+/// `j`'s request and response as a decision model reads them, each clipped
+/// to fit, and whether either was (the request is read at half its room
+/// beside a response).
+fn texts_of(j: AnnotationJob) -> Texts {
+    let asked = request_text(j.input);
+    let answered = response_text(j.output);
+    return Texts {
+        request: clipped(asked, ANNOTATE_REQUEST_TEXT),
+        response: clipped(answered, ANNOTATE_RESPONSE_TEXT),
+        clipped: len(asked) > ANNOTATE_REQUEST_TEXT / 2 || len(answered) > ANNOTATE_RESPONSE_TEXT,
+    };
+}
+
+/// A standard request as the text a decision model reads: its instructions,
+/// then each turn by its role, a tool's call and its result named, what is
+/// not text (an image, a file) said so.
+@unbounded
+fn request_text(body: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let instructions = std::json::string_field(body, "instructions");
+    if instructions.kind == "string" && len(instructions.text) > 0 {
+        out.append_str("system: " + instructions.text + "\n\n");
+    }
+    let input = std::str::trim(std::json::find_field_raw(body, "input"));
+    if std::str::starts_with(input, "\"") {
+        out.append_str("user: " + std::json::find_string_field(body, "input"));
+    } else {
+        let mut it = std::json::array_first(input);
+        while !it.done {
+            let item = std::str::trim(it.element);
+            it = std::json::array_next(it);
+            out.append_str(item_text(item));
+        }
+    }
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// A response's output as text: its messages, the tools it called.
+@unbounded
+fn response_text(response: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        let item = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        out.append_str(item_text(item));
+    }
+    let status = std::json::find_string_field(response, "status");
+    if status != "completed" && len(status) > 0 {
+        out.append_str("[the response is " + status + "]\n");
+    }
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// One input or output item as a line or two of text; reasoning is left out.
+@unbounded
+fn item_text(item: String) -> String {
+    let t = std::json::find_string_field(item, "type");
+    if t == "function_call" {
+        return "assistant called " + std::json::find_string_field(item, "name") + "("
+            + clipped(std::json::find_string_field(item, "arguments"), 2048) + ")\n\n";
+    }
+    if t == "function_call_output" {
+        return "tool returned: " + clipped(std::json::find_string_field(item, "output"), 4096)
+            + "\n\n";
+    }
+    if t == "reasoning" { return ""; }
+    if t != "message" && len(t) > 0 { return "[" + t + "]\n\n"; }
+    let role = std::json::find_string_field(item, "role");
+    let content = std::str::trim(std::json::find_field_raw(item, "content"));
+    if std::str::starts_with(content, "\"") {
+        return role + ": " + std::json::find_string_field(item, "content") + "\n\n";
+    }
+    let out = std::bytes::BytesBuilder { initial_cap: 1024 };
+    out.append_str(role + ":");
+    let mut it = std::json::array_first(content);
+    while !it.done {
+        let part = it.element;
+        it = std::json::array_next(it);
+        let pt = std::json::find_string_field(part, "type");
+        out.append_str(" ");
+        if pt == "input_text" || pt == "output_text" || pt == "text" {
+            out.append_str(std::json::find_string_field(part, "text"));
+        } else if pt == "refusal" {
+            out.append_str("[refused] " + std::json::find_string_field(part, "refusal"));
+        } else {
+            out.append_str("[" + pt + "]");
+        }
+    }
+    out.append_str("\n\n");
+    return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// `text` at most `max` bytes: its start and its end, the middle left out
+/// and said so; cut at a character's start.
+fn clipped(text: String, max: Int) -> String {
+    if len(text) <= max { return text; }
+    let head = utf8_start(text, max / 4);
+    let tail = utf8_start(text, len(text) - (max - max / 4));
+    return text[0..head] + "\n[… " + to_string(tail - head) + " bytes left out …]\n"
+        + text[tail..len(text)];
+}
+
+/// The start of the character at or after byte `at`.
+fn utf8_start(text: String, at: Int) -> Int {
+    let mut i = at;
+    while i < len(text) && (std::str::byte_at_unchecked(text, i) / 64) == 2 { i = i + 1; }
+    return i;
+}

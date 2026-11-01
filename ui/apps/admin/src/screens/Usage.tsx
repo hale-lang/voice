@@ -6,6 +6,7 @@ import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
+import { AnnotationSection, AnnotationsPanel } from '../annotation';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
@@ -15,11 +16,9 @@ const PAGE = 50;
 
 /** The board of conversations, live; summaries; then the records behind them, a page at a time. */
 export function Usage({ route, setInspector }: ScreenProps) {
-  // `usage/<request>`, or a conversation: `usage/c/<prompt_cache_key>` or
-  // `usage/m/<name=value>`, the turns that set that metadata pair
-  const kind = route.parts[1] === 'c' || route.parts[1] === 'm' ? route.parts[1] : null;
-  const root = kind ? (route.parts[2] ?? '') : null;
-  const selected = kind ? undefined : route.parts[1];
+  // `usage/<request>`, or a conversation, `usage/c/<prompt_cache_key>`
+  const conversation = route.parts[1] === 'c' ? (route.parts[2] ?? '') : null;
+  const selected = conversation === null ? route.parts[1] : undefined;
   // the cursors of the pages before this one, newest first: older pushes
   // the page's `next_cursor`, newer pops it
   const [cursors, setCursors] = useState<string[]>([]);
@@ -33,9 +32,9 @@ export function Usage({ route, setInspector }: ScreenProps) {
   const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...query(filter), ...(cursor ? { cursor } : {}) } } });
   const onPage = records.data?.data.find((r) => r.id === selected);
   useEffect(() => {
-    if (kind && root) setInspector(<ConversationView key={kind + root} root={kind === 'c' ? { conversation: root } : { metadata: root }} />);
+    if (conversation) setInspector(<ConversationView key={conversation} conversation={conversation} />);
     else setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
-  }, [kind, root, selected, onPage, setInspector]);
+  }, [conversation, selected, onPage, setInspector]);
   const next = records.data?.next_cursor ?? null;
   const page = cursors.length + 1;
 
@@ -53,6 +52,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
         <Summary group="project" />
         <Summary group="account" />
       </PanelGrid>
+      <AnnotationsPanel slice={{ project: filter.project || undefined, key: filter.key.trim() || undefined }} />
       <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
         <Filters value={filter} onChange={setFilter} />
         {records.isPending ? (
@@ -154,10 +154,12 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'metadata', v: <Metadata of={r.metadata} /> },
         ]}
       />
+      <AnnotationSection id={r.id} />
       <PeekSection id={r.id} />
     </>
   );
 }
+
 
 /** A request's metadata, `name = value` each, as the caller set it. */
 function Metadata({ of }: { of: unknown }) {
@@ -168,13 +170,6 @@ function Metadata({ of }: { of: unknown }) {
       {pairs.map(([k, v]) => (
         <div key={k}>
           <Mono>{k}</Mono> <span className="faint">=</span> <Mono>{typeof v === 'string' ? v : JSON.stringify(v)}</Mono>
-          {/* the requests that set the same pair, read as one conversation */}
-          {typeof v === 'string' && v && !k.includes('=') && (
-            <>
-              {' '}
-              <a href={href('usage', 'm', `${k}=${v}`)}>as a conversation</a>
-            </>
-          )}
         </div>
       ))}
     </>
@@ -198,22 +193,28 @@ const SINCE: { value: string; label: string }[] = [
   { value: '604800', label: 'the last week' },
 ];
 
-/** The metadata pair asked for, `name=value`; the api takes one. */
-function metadataPair(m: string): string | null {
-  const t = m.trim();
-  return /^[^=,\s]+=[^,]*$/.test(t) ? t : null;
+/**
+ * The metadata pairs asked for, each `name=value`, several apart by commas,
+ * as the api takes them: one pair as it is, several as a JSON object, all
+ * of which a request must have. null when one is not a pair.
+ */
+function metadataPairs(m: string): string | null {
+  const parts = m.split(',').map((p) => p.trim()).filter(Boolean);
+  if (!parts.length || parts.some((p) => !/^[^=\s]+=.*$/.test(p))) return null;
+  if (parts.length === 1) return parts[0]!;
+  return JSON.stringify(Object.fromEntries(parts.map((p) => [p.slice(0, p.indexOf('=')), p.slice(p.indexOf('=') + 1)])));
 }
 
 /** The filter as listUsage's query. */
 function query(f: Filter) {
-  const pair = metadataPair(f.metadata);
+  const pairs = metadataPairs(f.metadata);
   return {
     ...(f.project ? { project: [f.project] } : {}),
     ...(f.key ? { key: [f.key.trim()] } : {}),
     ...(f.model ? { model: [f.model] } : {}),
     ...(f.account ? { account: [f.account] } : {}),
     ...(f.conversation.trim() ? { conversation: f.conversation.trim() } : {}),
-    ...(pair ? { metadata: [pair] } : {}),
+    ...(pairs ? { metadata: pairs } : {}),
     ...(f.from ? { from: f.from } : {}),
   };
 }
@@ -226,7 +227,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
   const set = (k: keyof Filter) => (v: string) => onChange({ ...f, [k]: v });
   // the cutoff is fixed now, when the range is chosen
   const since = (v: string) => onChange({ ...f, since: v, from: v ? new Date(Date.now() - Number(v) * 1000).toISOString() : '' });
-  const badPair = f.metadata.trim() !== '' && !metadataPair(f.metadata);
+  const badPair = f.metadata.trim() !== '' && !metadataPairs(f.metadata);
   const any = Object.values(f).some(Boolean);
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)', alignItems: 'end', marginBottom: 'var(--space-3)' }}>
@@ -251,8 +252,8 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
         <TextInput mono value={f.conversation} onChange={set('conversation')} placeholder="its prompt_cache_key" />
       </label>
       <label>
-        <div className={badPair ? 'c-wait' : 'faint'}>{badPair ? 'metadata: one name=value' : 'metadata'}</div>
-        <TextInput mono value={f.metadata} onChange={set('metadata')} placeholder="session=abc" />
+        <div className={badPair ? 'c-wait' : 'faint'}>{badPair ? 'metadata: name=value, …' : 'metadata'}</div>
+        <TextInput mono value={f.metadata} onChange={set('metadata')} placeholder="team=search, run=7" />
       </label>
       <label>
         <div className="faint">when</div>

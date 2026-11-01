@@ -89,6 +89,18 @@ const MAP = {
   Peek: 'Peek',
   PeekSummary: 'PeekSummary',
   PeekList: 'GET /admin/v1/peeks',
+  Annotation: 'Annotation',
+  AnnotationList: 'GET /admin/v1/annotations',
+  Annotator: 'Annotator',
+  AnnotatorCreate: 'AnnotatorCreate',
+  AnnotatorUpdate: 'AnnotatorUpdate',
+  AnnotatorList: 'GET /admin/v1/annotators',
+  AnnotationRule: 'AnnotationRule',
+  AnnotationRuleCreate: 'AnnotationRuleCreate',
+  AnnotationRuleUpdate: 'AnnotationRuleUpdate',
+  AnnotationRuleList: 'GET /admin/v1/annotation-rules',
+  AnnotationFacets: 'AnnotationFacets',
+  AnnotationTrend: 'AnnotationTrend',
   ServedBy: 'Served',
   BudgetRequest: 'BudgetSet',
   LimitsRequest: 'LimitSet',
@@ -104,7 +116,7 @@ const NOT_COMPARED = {
 };
 
 // Fields of a row's request that are the path's or the query's.
-const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'include_archived']);
+const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'include_archived', 'annotator', 'rule']);
 // Records that stand for a list: the list rides in `items`. A row's list
 // is a `bounded` field of its own; these are left only inside a record
 // that stands for a value or null (`Restriction.names`).
@@ -114,7 +126,7 @@ const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
-const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem']);
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;
@@ -277,6 +289,7 @@ const RULES = [
   [/List\.data\[\]\.(secret|enrollment_token)$/, 'wire', 'the list shares the type of the create answer; the wire leaves the secret out'],
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
   [/^(AccountUpdate|CatalogModelUpdate|NodeUpdate|SeatUpdate|ProjectUpdate)\.(id|budget|limits|recipe)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
+  [/^AnnotatorUpdate\.(id|stage)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
   [/^UsageSummary\.data\[\]\.refused$/, 'wire', 'a summary counts the requests the ledger holds, and refusals are not written to it'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard

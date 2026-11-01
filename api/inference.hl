@@ -113,6 +113,9 @@ type Served {
     voice: VoiceExtension = VoiceExtension { };
     // the rate-limit headers its answer carries (admission.hl), "" for none
     headers: String = "";
+    // what its project or key annotating asks (annotate.hl): the data
+    // plane annotates it once the caller has its answer
+    job: AnnotationJob = AnnotationJob { };
 }
 
 /// One seat a request could be offered, and its own name for the model.
@@ -123,6 +126,8 @@ type Candidates {
     serving: Int = 0;
     // its project or its key peeks: the request is recorded whole (peek.hl)
     peek: Bool = false;
+    // its project or its key annotates (annotate.hl)
+    annotate: Bool = false;
 }
 
 locus Inference {
@@ -233,6 +238,7 @@ locus Inference {
                     s.response = decision_resource(o.response, request_id, r);
                 }
                 self.settled(r, s, candidates.peek);
+                if candidates.annotate { s.job = annotation_job(r, s); }
                 return s;
             }
             let reason = failure_of(o);
@@ -451,6 +457,7 @@ locus Inference {
                 }
                 finish_stream(out, st, ending, s);
                 self.settled(r, s, candidates.peek);
+                if candidates.annotate { out.job = annotation_job(r, s); }
                 return out.end();
             }
             let reason = failure_of(o);
@@ -884,7 +891,11 @@ locus Inference {
         let seats = self.store.seats() or fail metering_failed(err);
         let table = self.store.route_table() or fail metering_failed(err);
         let peeking = peeks(self.store, p.peek_set, p.peek, p.parent) or fail metering_failed(err);
-        let mut out = Candidates { peek: peeking || k.peek };
+        let annotating = annotates(self.store, p) or fail metering_failed(err);
+        let mut out = Candidates {
+            peek: peeking || k.peek,
+            annotate: annotating || (k.annotate && !p.internal),
+        };
         if len(table) > 0 {
             // the brain judged which seats are up: offer the model's seats
             // in the table's order, held only to what this request may spend
@@ -1179,7 +1190,7 @@ fn first_for(c: Candidates, key: String) -> Candidates {
         }
         i = i + 1;
     }
-    let mut out = Candidates { serving: c.serving, peek: c.peek };
+    let mut out = Candidates { serving: c.serving, peek: c.peek, annotate: c.annotate };
     let chosen = at(c.items, pick) or Candidate { };
     push(out.items, chosen) or discard;
     i = 0;
@@ -1800,4 +1811,20 @@ fn seat_ready(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError)
         if st.seat == s.id { return st.status == "up"; }
     }
     return false;
+}
+
+/// What annotating `r`, served as `s`, asks (annotate.hl).
+fn annotation_job(r: InferenceRequest, s: Served) -> AnnotationJob {
+    return AnnotationJob {
+        request_id: s.request_id,
+        project: s.voice.project,
+        key: s.voice.key,
+        conversation: std::json::find_string_field(r.body, "prompt_cache_key"),
+        created_at: now_seconds(),
+        model: s.model,
+        data_class: r.data_class,
+        input: r.body,
+        output: s.response,
+        present: true,
+    };
 }

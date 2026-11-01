@@ -1,15 +1,39 @@
 #!/bin/sh
-# node/install_test.sh: node/install.sh's macOS path against a registry of
-# our own on loopback, on a Mac on Apple silicon (CI's macOS job). The
-# artifact for a revision is fetched, checked against its layer's sha256 and
-# run with the arguments given; one whose download is not its layer is
-# never run. VOICE_NODE_REGISTRY points the script at the fixture.
+# node/install_test.sh: node/install.sh's paths. Everywhere: its fallback
+# finds the toolchain voice pins where a habitat provisions it, with no hale
+# on PATH, and builds with it; a bad subcommand is 2. On a Mac on Apple
+# silicon (CI's macOS job), its macOS path against a registry of our own on
+# loopback: the artifact for a revision is fetched, checked against its
+# layer's sha256 and run with the arguments given; one whose download is not
+# its layer is never run. VOICE_NODE_REGISTRY points the script at the
+# fixture.
 set -eu
-[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || { echo "skipped: not macOS on arm64"; exit 0; }
 
 here=$(cd "$(dirname "$0")" && pwd)
 fx=$(mktemp -d)
+srv=""
 trap 'kill "$srv" 2>/dev/null || true; rm -rf "$fx"' EXIT INT TERM
+
+# a bad subcommand: 2
+if sh "$here/install.sh" frobnicate 2>/dev/null; then echo "a bad subcommand was taken"; exit 1; fi
+sh "$here/install.sh" frobnicate 2>/dev/null || [ $? = 2 ] || { echo "a bad subcommand is not exit 2"; exit 1; }
+
+# no revision: built with the pinned toolchain from the habitat's place for
+# it, found though no hale is on PATH
+pin=$(sed -n 's/^toolchain *= *"\(v[^"]*\)".*/\1/p' "$here/../hale.toml" | head -n 1)
+mkdir -p "$fx/home/.local/share/hale/toolchains/$pin/bin"
+printf '#!/bin/sh\necho "hale: $*"\n' >"$fx/home/.local/share/hale/toolchains/$pin/bin/hale"
+chmod 755 "$fx/home/.local/share/hale/toolchains/$pin/bin/hale"
+out=$(env -u HALE_DNA_REVISION -u SUDO_USER HOME="$fx/home" PATH=/usr/bin:/bin sh "$here/install.sh" install --id x --api http://a 2>"$fx/err")
+[ "$out" = "hale: run node install --id x --api http://a" ] || { echo "the fallback did not build with the pinned toolchain: $out"; cat "$fx/err"; exit 1; }
+grep -q "built here from source" "$fx/err" || { cat "$fx/err"; exit 1; }
+# and none anywhere: 1, saying so
+if env -u HALE_DNA_REVISION -u SUDO_USER HOME="$fx/nohome" PATH=/usr/bin:/bin sh "$here/install.sh" install --id x 2>"$fx/err"; then
+    echo "with no toolchain and nothing published, the install went ahead"; exit 1
+fi
+grep -q "no hale toolchain" "$fx/err" || { cat "$fx/err"; exit 1; }
+
+[ "$(uname -s)/$(uname -m)" = Darwin/arm64 ] || { echo "node/install.sh: its fallback and usage hold (the macOS path is checked on macOS arm64)"; exit 0; }
 rev=0123456789abcdef0123456789abcdef01234567
 
 # a stand-in voice-node: says what it was asked
@@ -67,7 +91,4 @@ case "$out" in *TAMPERED*) echo "a tampered download ran"; exit 1 ;; esac
 grep -q "is not the layer its manifest names" "$fx/err" || { cat "$fx/err"; exit 1; }
 kill "$srv"; wait "$srv" 2>/dev/null || true
 
-# a bad subcommand: 2
-if sh "$here/install.sh" frobnicate 2>/dev/null; then echo "a bad subcommand was taken"; exit 1; fi
-sh "$here/install.sh" frobnicate 2>/dev/null || [ $? = 2 ] || { echo "a bad subcommand is not exit 2"; exit 1; }
-echo "node/install.sh: the artifact path, its digest check and its usage hold"
+echo "node/install.sh: its fallback, the artifact path, its digest check and its usage hold"

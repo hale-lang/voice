@@ -95,16 +95,21 @@ if [ -n "$prebuilt" ]; then
     exit $?
 fi
 
-# the toolchain: on PATH, else where hale installs it for this account or
-# for the one sudo ran as (a habitat need not put it on PATH)
-hale=$(command -v hale 2>/dev/null || true)
+# the toolchain voice pins ([dna] toolchain): where a habitat provisions it
+# for the login that installs (sudo's), or for this account; else hale on
+# PATH, else where hale's installer puts it
+pin=$(sed -n 's/^toolchain *= *"\(v[^"]*\)".*/\1/p' "$here/hale.toml" | head -n 1)
 sudo_home=""
 case "${SUDO_USER:-}" in
     "" | *[!A-Za-z0-9._-]* | -*) ;;
     *) sudo_home=$(eval echo "~$SUDO_USER") ;;
 esac
-for h in "$HOME/.hale/bin/hale" "${sudo_home:-/nonexistent}/.hale/bin/hale"; do
-    [ -n "$hale" ] || { [ -x "$h" ] && hale=$h; }
+hale=""
+for h in ${pin:+"$sudo_home/.local/share/hale/toolchains/$pin/bin/hale"} \
+    ${pin:+"$HOME/.local/share/hale/toolchains/$pin/bin/hale"} \
+    "$(command -v hale 2>/dev/null || true)" \
+    "$sudo_home/.hale/bin/hale" "$HOME/.hale/bin/hale"; do
+    if [ -z "$hale" ] && [ -n "$h" ] && [ -x "$h" ]; then hale=$h; fi
 done
 [ -n "$hale" ] || {
     say "no prebuilt voice-node for ${rev:-this checkout} on $(uname -s)/$(uname -m), and no hale toolchain to build one"

@@ -173,6 +173,7 @@ need their own of each.
 | [`store/`](./store/) | the Postgres schema and migrations |
 | [`ui/`](./ui/) | the admin UI |
 | [`spec/`](./spec/) | the contract: OpenAPI, the node and internal protocols, the store's schema |
+| [`docs/api/`](./docs/api/) | the API reference, generated from the contract: [the caller and admin API](./docs/api/voice.md), [the node's](./docs/api/node.md) (`spec/tools/apidocs.sh`) |
 | [`recipes/`](./recipes/), [`runtimes/`](./runtimes/) | the models and servers voice ships |
 | [`scripts/`](./scripts/) | end-to-end, race and catalog scripts |
 

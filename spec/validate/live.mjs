@@ -133,17 +133,41 @@ for (const [p, m, op] of [...calls, ...last]) {
   // each plane's credential; an operation that takes none (the probes) is sent none
   const who = Array.isArray(op.security) && op.security.length === 0 ? {} : p.startsWith('/node/') ? nodeAuth : p.startsWith('/admin/') ? operator : auth;
   if (op.operationId === 'streamAdminEvents') {
+    // the stream is held open: read its events as they come, until the
+    // condition holds or a few seconds pass, then let it go
+    const follow = async (headers, done) => {
+      const stop = new AbortController();
+      const timer = setTimeout(() => stop.abort(), 5000);
+      const blocks = [];
+      let status = 0, type = '';
+      try {
+        const r = await fetch(url, { headers, signal: stop.signal });
+        status = r.status; type = r.headers.get('content-type') || '';
+        const reader = r.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buffer = '';
+        while (!done(blocks)) {
+          const { value, done: end } = await reader.read();
+          if (end) break;
+          buffer += value;
+          let at;
+          while ((at = buffer.indexOf('\n\n')) >= 0) { blocks.push(buffer.slice(0, at)); buffer = buffer.slice(at + 2); }
+        }
+      } catch { /* aborted: what was read stands */ }
+      clearTimeout(timer); stop.abort();
+      return { status, type, blocks };
+    };
     // connect for a place, make a change, and ask again from that place
     n++;
-    const head = await fetch(url, { headers: who });
+    const head = await follow(who, (b) => b.some((x) => x.split('\n').some((l) => l.startsWith('id: '))));
     if (String(head.status) !== code) fail('streamAdminEvents', `status ${head.status} != ${code}`);
-    if (!(head.headers.get('content-type') || '').startsWith('text/event-stream')) fail('streamAdminEvents', 'content-type');
-    const place = (await head.text()).split('\n').filter(l => l.startsWith('id: ')).pop()?.slice(4);
+    if (!head.type.startsWith('text/event-stream')) fail('streamAdminEvents', 'content-type');
+    const place = head.blocks.flatMap((b) => b.split('\n')).filter(l => l.startsWith('id: ')).pop()?.slice(4);
     if (!place) { fail('streamAdminEvents', 'no place to resume from'); continue; }
     await setup('/admin/v1/projects', { id: 'followed', name: 'Followed' });
-    const again = await fetch(url, { headers: { ...who, 'last-event-id': place } });
+    const datasOf = (blocks) => blocks.map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(d => d && d.length > 6).map(l => JSON.parse(l.slice(6)));
+    const again = await follow({ ...who, 'last-event-id': place }, (b) => datasOf(b).some((d) => d.type === 'change' && d.data.target === 'projects/followed'));
     const f = ajv.compile(strip(content['text/event-stream'].schema));
-    const datas = (await again.text()).split('\n\n').map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(d => d && d.length > 6).map(l => JSON.parse(l.slice(6)));
+    const datas = datasOf(again.blocks);
     const told = datas.find(d => d.type === 'change' && d.data.target === 'projects/followed');
     if (!told) fail('streamAdminEvents', 'the change of a project was not told');
     for (const d of datas) if (!f(d)) fail('streamAdminEvents', JSON.stringify(f.errors.slice(0, 3)));

@@ -234,19 +234,20 @@ locus Placements {
         return s;
     }
 
-    /// What placement `r` holds of its node's memory for models: what it
-    /// reserved, or, made before voice sized it, its variant's need.
+    /// What placement `r` holds of its node's memory for models: its seat's
+    /// footprint (`footprint`) on what it reserved, or, made before voice
+    /// sized that, on its variant's need.
     fn held_by(r: st::PlacementRow) -> Int fallible(CtlError) {
         let reserved = std::json::find_int_field(r.body, "reserved_bytes");
-        if reserved > 0 { return reserved; }
+        if reserved > 0 { return footprint(reserved); }
         let recipe = self.recipes.get_in_gate(std::json::find_string_field(r.body, "recipe")) or {
-            return 0;
+            return footprint(0);
         };
         let v = variant_body_of(
             recipe.variants.text,
             std::json::find_string_field(r.body, "variant"),
         );
-        return std::json::find_int_field(v, "memory_bytes");
+        return footprint(std::json::find_int_field(v, "memory_bytes"));
     }
 
     /// `listPlacements`: those not withdrawn.
@@ -406,7 +407,12 @@ locus Placements {
         // fitted with
         let variant = variant_body_of(recipe.variants.text, out.variant);
         let need = std::json::find_int_field(variant, "memory_bytes");
-        let pool = cache_pool(room - need, recipe.kv_bytes_per_token, recipe.context_length, need);
+        let pool = cache_pool(
+            room - footprint(need),
+            recipe.kv_bytes_per_token,
+            recipe.context_length,
+            need,
+        );
         out.has_cache_tokens = true;
         out.cache_tokens = pool;
         out.has_reserved_bytes = true;
@@ -594,6 +600,21 @@ fn placement_json(p: Placement) -> String {
             }
         )
         + ", \"created_at\": " + jtime(p.created_at) + "}";
+}
+
+// ---- what a seat takes ------------------------------------------------
+
+/// What a seat's server takes beside what its placement reserved (its
+/// weights and prompt cache): the process, its GPU context, its compute
+/// buffers and activations. The node gives vLLM a share of the GPU's memory
+/// on the same sum (node/run.hl `gpu_share`).
+const SEAT_OVERHEAD_BYTES: Int = 2147483648;
+
+/// What a seat holds of its node's memory once it runs, all of it from the
+/// moment it is placed: what was reserved for it (`reserved`) and its
+/// server's own (`SEAT_OVERHEAD_BYTES`).
+fn footprint(reserved: Int) -> Int {
+    return reserved + SEAT_OVERHEAD_BYTES;
 }
 
 // ---- the prompt cache --------------------------------------------------
@@ -876,8 +897,9 @@ fn judge_variant(
         };
     }
     let runs = rt + " runs " + format + " on " + runtime_on(rts, rt);
-    let need = std::json::find_int_field(v, "memory_bytes");
-    let memory = gb(need) + " of " + gb(room) + " for models"
+    // what its seat takes, its server's own beside the weights
+    let need = footprint(std::json::find_int_field(v, "memory_bytes"));
+    let memory = gb(need) + " of " + gb(if room > 0 { room } else { 0 }) + " free for models"
         + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
     if need > room {
         return VariantFit {

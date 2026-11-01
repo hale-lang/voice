@@ -1,0 +1,165 @@
+// A node's memory, held to what its seats take together: the case of a
+// 128 GiB GB10 (one pool for the GPU and the system) that took
+// qwen3-coder-next, qwen3-0.6b and granite-4.0-h-small, placed in turn
+// from voice's own recipes and runtimes, and ran out of memory.
+//
+// The machine reports 121 GiB. Before, the node offered models all of it,
+// and a seat counted only what its placement reserved: the coder 94.9 GiB
+// (its Q8_0 and a 512k cache), the 0.6b 5.6 GiB (on vLLM) and then
+// granite, in what was left, with nothing for the system, each server's
+// own memory (its GPU context and compute buffers: the coder went from 84
+// to 108 GB loading), or the 2 GiB and rounding the node added to vLLM's
+// share. The kernel killed the coder's llama-server, then the 0.6b's vLLM
+// engine. Now the node keeps a sixteenth for the system, each seat is
+// counted at what it holds running, its server's 2 GiB with it, and
+// granite does not fit what is left.
+import ".." as api;
+import "../../store" as st;
+import "../../node" as node;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+fn main() {
+    let gib = 1073741824;
+    std::test::assert(
+        std::io::fs::file_exists(shipped("recipes") + "/qwen3-coder-next.json"),
+        "voice's shipped recipes are here",
+    );
+    let store = st::MemoryStore { };
+    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(shipped("recipes")) };
+    let catalog = api::Catalog { store: store, recipes: recipes };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let seats = api::Seats { store: store, link: api::NatsLink { } };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: seats,
+    };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+    let memory = 121 * gib;
+    let offered = node::model_memory("{}", memory);
+    store.insert_node(
+        st::NodeRow {
+            id: "spark",
+            name: "spark",
+            max_in_flight: 4,
+            created_at: api::now_seconds(),
+        },
+        api::change("create", "nodes/spark", "", "{}"),
+    ) or discard;
+    store.put_fleet(
+        st::FleetRow {
+            node: "spark",
+            capabilities: "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": "
+                + to_string(memory) + ", \"model_memory_bytes\": " + to_string(offered)
+                + ", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": "
+                + to_string(memory) + ", \"unified\": true}], \"disk_free_bytes\": 3500000000000}}",
+            present: true,
+        },
+    ) or discard;
+    std::test::assert_eq_int(
+        offered,
+        memory - memory / 16,
+        "a machine of 121 GiB (what the GB10 reports) keeps a sixteenth, 7.6 GiB, for its system",
+    );
+    let mut held = 0;
+    let mut placed = "";
+    let mut refused = "";
+    for m in ["coder:qwen3-coder-next", "small:qwen3-0.6b", "granite:granite-4.0-h-small"] {
+        let at_ = std::str::index_of(m, ":");
+        catalog.create(
+            api::CatalogModelCreate {
+                id: m[0..at_],
+                has_recipe: true,
+                recipe: m[(at_ + 1)..len(m)],
+            },
+        ) or discard;
+        let mut c = api::PlacementCreate { id: m[0..at_], model: m[0..at_], account: "local" };
+        push(c.nodes, "spark") or discard;
+        let mut why = "";
+        let p = placements.create(c) or {
+            why = api::ctl_message(err);
+            api::Placement { }
+        };
+        if len(why) == 0 {
+            held = held + api::footprint(p.reserved_bytes);
+            placed = placed + m[0..at_] + "=" + p.variant + " ";
+        } else {
+            refused = refused + m[0..at_] + ": " + why + "\n";
+        }
+    }
+    std::test::assert_eq_str(
+        placed,
+        "coder=gguf-q8_0 small=safetensors-bf16 ",
+        "the coder and the 0.6b are placed",
+    );
+    std::test::assert(held <= offered, "what they hold together fits what the node gives models");
+    std::test::assert(
+        std::str::starts_with(
+            refused,
+            "granite: no variant of recipe granite-4.0-h-small fits node spark",
+        )
+            && std::str::contains(
+                refused,
+                "needs 23.1 GB of 9.5 GB free for models (112.3 GB held by its other placements)",
+            ),
+        "granite is refused, with the numbers: " + refused,
+    );
+    // what each seat is counted at is what it holds from its start: the
+    // coder's Q8_0 and its whole cache, and its server's own
+    let coder = placements.get(api::PlacementRef { placement: "coder" }) or api::Placement { };
+    std::test::assert_eq_int(
+        coder.cache_tokens,
+        524288,
+        "the coder's cache: four conversations of 128k",
+    );
+    std::test::assert(
+        api::footprint(coder.reserved_bytes) > 95 * gib
+            && api::footprint(coder.reserved_bytes) < 97 * gib,
+        "the coder is counted at about 96 GiB (103 GB), as it was measured loaded",
+    );
+
+    // the node holds to the same sum: vLLM's share of the GPU is what the
+    // seat was counted at, rounded up to a hundredth, never a floor past it
+    let small = placements.get(api::PlacementRef { placement: "small" }) or api::Placement { };
+    std::test::assert_eq_int(
+        node::footprint(small.reserved_bytes),
+        api::footprint(small.reserved_bytes),
+        "the node counts a seat as the api does",
+    );
+    std::test::assert_eq_str(
+        node::gpu_share(node::footprint(small.reserved_bytes), memory),
+        "0.07",
+        "vLLM is given the 0.6b's 7.6 GiB, rounded up to 7% of the GPU",
+    );
+    // the two together hold 104.5 GiB: the host, running just them, was
+    // measured at 109 GiB used with its system
+    let both = api::footprint(coder.reserved_bytes) + api::footprint(small.reserved_bytes);
+    std::test::assert(
+        both > 104 * gib && both < 105 * gib,
+        "the coder and the 0.6b hold 104.5 GiB",
+    );
+    // vLLM left to its own nine tenths of the GPU (the machine's memory)
+    // would not have been started beside the coder
+    std::test::assert(
+        std::str::starts_with(
+            node::start_refusal(
+                "vllm",
+                (memory * 9) / 10,
+                node::footprint(coder.reserved_bytes),
+                offered,
+                memory,
+            ),
+            "it does not fit",
+        ),
+        "a vLLM seat at nine tenths beside the coder is refused",
+    );
+}

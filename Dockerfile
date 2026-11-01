@@ -52,6 +52,8 @@ COPY deploy/node deploy/node
 COPY spec/validate/recipes spec/validate/recipes
 COPY spec/validate/runtimes spec/validate/runtimes
 COPY runtimes runtimes
+# what voice ships, which the tests hold placements to (memory_budget_test)
+COPY recipes recipes
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build api && hale build brain && hale build node
 

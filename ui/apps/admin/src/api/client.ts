@@ -1,5 +1,6 @@
 import createClient, { type MaybeOptionalInit } from 'openapi-fetch';
 import type { PathsWithMethod, RequiredKeysOf } from 'openapi-typescript-helpers';
+import { useRefetchInterval } from './live';
 import { useQuery, useQueries } from '@tanstack/react-query';
 import type { paths, components } from './schema';
 import { operatorToken, forgetOperatorToken } from './token';
@@ -46,8 +47,10 @@ type InitParam<Init> = RequiredKeysOf<Init> extends never ? [(Init & { [key: str
  * contract change is a type error here rather than a surprise on screen.
  */
 export function useGet<P extends GetPaths>(path: P, ...init: InitParam<MaybeOptionalInit<paths[P], 'get'>>) {
+  const refetchInterval = useRefetchInterval();
   return useQuery({
     queryKey: [path, init[0] ?? null],
+    refetchInterval,
     queryFn: async () => {
       const r = await api.GET(path, ...init);
       if (r.error !== undefined || r.data === undefined) {
@@ -126,6 +129,7 @@ export function usePeeks(ids: string[]) {
  * read yet) answers 404, which is `null` here, not an error.
  */
 export function useAnnotations(ids: string[]) {
+  const refetchInterval = useRefetchInterval();
   return useQueries({
     queries: ids.map((id) => {
       const init = { params: { path: { request_id: id } } };
@@ -138,6 +142,7 @@ export function useAnnotations(ids: string[]) {
           return r.data;
         },
         staleTime: 30_000,
+        refetchInterval,
         retry: false,
       };
     }),
@@ -153,8 +158,10 @@ const TURNS_MAX = 2000;
  * event stream refreshes it as turns land.
  */
 export function useAllUsage(query: { conversation: string }) {
+  const refetchInterval = useRefetchInterval();
   return useQuery({
     queryKey: ['/admin/v1/usage', { all: query }],
+    refetchInterval,
     queryFn: async () => {
       const out: UsageRecord[] = [];
       let cursor: string | undefined;

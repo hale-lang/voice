@@ -18,7 +18,8 @@ import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
 import { Annotators } from './screens/Annotators';
 import { useAdminEvents } from './api/events';
-import { useHub } from './api/hub';
+import { useHub, useHubCarriesAdmin } from './api/hub';
+import { setEventsLive } from './api/live';
 import { useOperatorToken, keepOperatorToken } from './api/token';
 import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
@@ -131,10 +132,16 @@ export type ScreenProps = { route: ReturnType<typeof useRoute>; setInspector: (n
 /** Source, revision and freshness: what the canvas is showing, from where. */
 function EvidenceStrip() {
   const health = useGet('/readyz');
-  const stream = useAdminEvents();
   const hub = useHub();
+  const carries = useHubCarriesAdmin();
+  // the admin events on the hub where it carries them, else the event stream
+  const stream = useAdminEvents(carries === false);
   const fetching = useIsFetching();
   const qc = useQueryClient();
+  // with the events live, nothing is read again on a timer; while they are
+  // not, a slow read keeps the screens converging (live.ts)
+  const live = carries ? hub === 'open' : stream === 'open';
+  useEffect(() => { setEventsLive(live); }, [live]);
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 1000);
@@ -149,7 +156,7 @@ function EvidenceStrip() {
         { label: 'source', value: 'voice api, same origin' },
         { label: 'api', value: <span className={health.isError ? 'c-fail' : undefined}>{state} {version}</span> },
         { label: 'refreshed', value: newest ? `${ago(new Date(newest).toISOString(), now)} ago` : '–' },
-        { label: 'events', value: <span className={stream === 'open' ? undefined : stream === 'closed' ? 'c-wait' : 'faint'}>{stream}</span> },
+        { label: 'events', value: <span className={live ? undefined : stream === 'closed' ? 'c-wait' : 'faint'}>{carries ? `hub ${hub}` : stream}</span> },
         { label: 'live', value: <span className={hub === 'open' ? undefined : hub === 'closed' ? 'c-wait' : 'faint'}>{hub}</span> },
         { label: '', value: fetching ? <span className="c-active pulse">fetching</span> : <span className="faint">idle</span> },
       ]}

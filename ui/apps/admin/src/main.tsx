@@ -8,10 +8,11 @@ import { App } from './App';
 const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      // The admin event stream will invalidate what it names; until it is
-      // wired, a quiet refetch keeps the instrument roughly current.
+      // The admin events (the hub, else the event stream) read again what
+      // they name; each query that follows them takes its refetch interval
+      // from whether they flow (api/live.ts), so nothing is read on a timer
+      // while they do.
       staleTime: 5_000,
-      refetchInterval: 15_000,
       retry: 1,
     },
   },

@@ -479,8 +479,8 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
 quiet_cancel quiet "" "$UPSTREAM_PORT" "$QUIET_PORT"
 quiet_cancel nohead nohead "$NOHEAD_PORT" "$((QUIET_PORT + 1))"
 
-# annotations queued on NATS: four requests at once of a project that
-# annotates, on a decision seat that takes one at a time, each stage a
+# annotations queued on NATS: four requests of a project that annotates,
+# their annotations at once on a decision seat that takes one at a time, each stage a
 # message to the queue group; a stage that finds the seat busy waits and is
 # read again, so every one ends annotated, its steps kept in order. A
 # project that does not annotate writes no row.
@@ -498,8 +498,11 @@ routed decider/decide
 post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotate": true, "aliases": [{"name": "decide", "model": "jev-2b"}, {"name": "general", "model": "echo-1"}]}' >/dev/null
 nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
 quiet_id=$(curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "not annotated"}' | field id)
+# the four asked one after another (the chat seat takes fewer at once, and
+# voice queues no caller): each answered at once, their annotations then
+# queued together on the one-at-a-time decision seat
 for n in 1 2 3 4; do
-  curl -fsS --max-time 60 -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id" &
+  curl -fsS --max-time 60 -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id"
 done
 # each answered within a minute, or the case fails with what the api said
 wait_ids() {

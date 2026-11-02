@@ -356,6 +356,9 @@ type Annotation {
     // when a pending one gives up
     has_deadline: Bool = false;
     deadline: Time = `1970-01-01T00:00:00Z`;
+    // the request that began its user's turn, when another
+    has_turn: Bool = false;
+    turn: String = "";
 }
 
 /// One annotator's result on a request: the version and stage that asked,
@@ -926,8 +929,8 @@ fn title_body(
     if len(instruction) == 0 || len(instruction) > 1000 {
         fail bad("`title.instruction` is 1 to 1000 characters", "title");
     }
-    if title.max_output_tokens < 4 || title.max_output_tokens > 64 {
-        fail bad("`title.max_output_tokens` is 4 to 64", "title");
+    if title.max_output_tokens < 4 || title.max_output_tokens > 256 {
+        fail bad("`title.max_output_tokens` is 4 to 256", "title");
     }
     for p in scope.projects {
         let row = store.project(p) or fail store_down(err);
@@ -1449,7 +1452,17 @@ locus Annotations {
                     + ": its project and key do not annotate, or it has not been read yet"
             );
         }
-        let answers = self.store.answers(r.request_id) or fail store_down(err);
+        let mut answers = self.store.answers(r.request_id) or fail store_down(err);
+        // the last step of a turn: what its turn's first step was asked
+        // is its request's answers too
+        if len(row.turn) > 0 && row.turn != row.request_id {
+            let first = self.store.answers(row.turn) or fail store_down(err);
+            let mut all = request_rows(first);
+            for a in answers.rows {
+                if a.stage != "request" { push(all.rows, a) or discard; }
+            }
+            answers = all;
+        }
         let rules = self.store.rules() or fail store_down(err);
         let s = summary_of(row);
         let model = std::json::find_string_field(row.body, "model");
@@ -1503,6 +1516,8 @@ locus Annotations {
                 k = std::json::object_next(k, results);
             }
         }
+        out.has_turn = len(row.turn) > 0 && row.turn != row.request_id;
+        out.turn = if out.has_turn { row.turn } else { "" };
         out.has_deadline = row.status == "pending" && std::time::unix(row.deadline) > 0;
         out.deadline = row.deadline;
         for rule in rules.rows {
@@ -1510,6 +1525,13 @@ locus Annotations {
             if v.enabled { push(out.pairs, scored(v, answers)) or discard; }
         }
         return out;
+    }
+
+    /// `getAnnotateReadiness`: a project's annotation routes, now.
+    fn readiness(r: ReadinessAsk) -> AnnotateReadiness fallible(CtlError) {
+        let p = self.store.project(r.project) or fail store_down(err);
+        if !p.present { fail missing("no project " + r.project); }
+        return annotate_readiness(self.store, p) or fail store_down(err);
     }
 
     /// `listConversationTitles`: the newest made first, at most `limit`
@@ -1868,6 +1890,8 @@ type AnnotationJob {
     // what its annotation owes, as read (`<id>@<version>#<run>` each): the
     // entries its results answer
     owed: String = "";
+    // the request that began its user's turn, "" for itself
+    turn: String = "";
 }
 
 /// One stage of a request's annotation to read, as its message on the
@@ -2098,7 +2122,18 @@ type Panel {
 
 /// A request's texts as a decision model reads them, and whether either
 /// was cut to fit.
-type Texts { request: String = ""; response: String = ""; clipped: Bool = false; }
+/// What a request's annotation reads: the user's ask (`request`), the
+/// response's answer and the tools it called (`response`), `clipped` when
+/// a bound cut either; `ask_hash`, the hash of the latest user message
+/// (the turn it belongs to), "" when there is no user text; `final`, the
+/// response ends its turn (it calls no tool).
+type Texts {
+    request: String = "";
+    response: String = "";
+    clipped: Bool = false;
+    ask_hash: String = "";
+    final: Bool = true;
+}
 
 locus AnnotationRunner {
     params {
@@ -2120,7 +2155,7 @@ locus AnnotationRunner {
     @unbounded
     fn queue(j: AnnotationJob, only: String, version: Int, why: String) -> String {
         if !j.present || j.key == st::system_key(j.project) { return ""; }
-        let panel = if len(only) > 0 {
+        let found = if len(only) > 0 {
             self.panel_of(only, version) or {
                 log_warn(
                     "an annotator to ask could not be read",
@@ -2137,6 +2172,52 @@ locus AnnotationRunner {
                 return "";
             }
         };
+        // an agent's steps send its user's one ask again and again: what
+        // was asked is read once a turn, at its first step, and what was
+        // answered once, at its last (its final answer); an explicit run
+        // or a backfill reads its request as a turn of its own
+        let mut panel = found;
+        let mut turn = "";
+        if len(only) == 0 && len(why) == 0 {
+            let t = turn_of(j);
+            if t.no_user {
+                panel.request = st::AnnotatorRows { };
+                panel.title = st::AnnotatorRows { };
+                if count(panel.response.rows) > 0 || t.final {
+                    self.note(j, "skipped", "request", "", "no user text to read");
+                }
+            } else if len(j.conversation) > 0 {
+                let had = self.store.turn(j.project, j.conversation) or st::TurnRow { };
+                if had.present && had.user_hash == t.ask_hash && had.request_id != j.request_id {
+                    turn = had.request_id;
+                    panel.request = st::AnnotatorRows { };
+                    panel.title = st::AnnotatorRows { };
+                    self.note(j, "skipped", "request", "", "same turn as " + had.request_id);
+                } else {
+                    self.store.put_turn(
+                        st::TurnRow {
+                            project: j.project,
+                            conversation: j.conversation,
+                            user_hash: t.ask_hash,
+                            request_id: j.request_id,
+                            at: now_seconds(),
+                        },
+                    ) or {
+                        log_warn(
+                            "a conversation's turn could not be kept",
+                            fields2(
+                                std::log::kv("request", j.request_id),
+                                std::log::kv("error", err.message),
+                            ),
+                        );
+                    };
+                }
+            }
+            if !t.final && count(panel.response.rows) > 0 {
+                panel.response = st::AnnotatorRows { };
+                self.note(j, "skipped", "response", "", "an agent step: its turn goes on");
+            }
+        }
         let run = random_hex(4) or to_string(std::time::unix(now_seconds()));
         let owed = owed_names(panel, run);
         if len(owed) == 0 { return ""; }
@@ -2151,6 +2232,7 @@ locus AnnotationRunner {
             body: "{\"runs\": []}",
             annotations: "{}",
             owed: owed,
+            turn: turn,
             deadline: std::time::from_nanos(
                 (std::time::unix(now_seconds()) + ANNOTATE_DEADLINE_S) * 1000000000,
             ),
@@ -2162,6 +2244,7 @@ locus AnnotationRunner {
             row.clipped = had.clipped;
             row.annotations = without_keys(had.annotations, owed);
             row.owed = union_names(had.owed, owed);
+            if len(turn) == 0 { row.turn = had.turn; }
         }
         self.store.put_annotation(row, st::AnswerRows { }) or {
             log_error(
@@ -2230,6 +2313,7 @@ locus AnnotationRunner {
             created_at: row.created_at,
             present: true,
             owed: row.owed,
+            turn: row.turn,
         };
         if std::time::unix(now_seconds()) > std::time::unix(row.deadline) {
             self.missing_not_annotated(
@@ -2288,6 +2372,20 @@ locus AnnotationRunner {
                 }
             }
         }
+        // the last step of a turn reads the answers its first step gave:
+        // until they are given, it waits
+        if a.stage != "request" && len(row.turn) > 0 && row.turn != row.request_id {
+            let first = self.store.annotation(row.turn) or st::AnnotationRow { };
+            if first.present && first.status == "pending" {
+                let w = Worked {
+                    wait: true,
+                    after_ms: backoff_ms(a.attempt),
+                    reason: "waiting for its turn's request stage (" + row.turn + ")",
+                };
+                self.waiting(job, a, w);
+                return w;
+            }
+        }
         let texts = texts_of(job);
         let w = if a.stage == "title" {
             self.title_stage(job, group, texts)
@@ -2331,7 +2429,9 @@ locus AnnotationRunner {
             let asked = self.ask(j, "request", group, false, st::AnswerRows { }, texts.request);
             return self.answered(j, group, stage, asked, texts.clipped);
         }
-        let request_answers = request_rows(self.store.answers(j.request_id) or st::AnswerRows { });
+        let request_answers = request_rows(
+            self.store.answers(turn_request(j)) or st::AnswerRows { },
+        );
         let state = "The request:\n" + clipped(texts.request, ANNOTATE_REQUEST_TEXT / 2)
             + "\n\nThe response:\n"
             + texts.response;
@@ -2407,7 +2507,7 @@ locus AnnotationRunner {
             );
             return Worked { };
         }
-        let task = task_of(request_rows(self.store.answers(j.request_id) or st::AnswerRows { }));
+        let task = task_of(request_rows(self.store.answers(turn_request(j)) or st::AnswerRows { }));
         let written = self.title(j, first, texts.request, task);
         if len(written.run) > 0 { self.ran(j, written.run); }
         if written.wait { return Worked { wait: true, reason: written.reason }; }
@@ -2465,6 +2565,9 @@ locus AnnotationRunner {
                     + ", \"status\": " + jq(status) + ", \"reason\": " + jq(reason)
                     + ", \"clipped\": " + (if clipped { "true" } else { "false" }) + "}",
             );
+        }
+        if status == "not_annotated" {
+            annotation_failed(j, stage, std::json::find_string_field(run, "model"), reason);
         }
         self.store.put_annotator_results(j.request_id, "{" + keys.text() + "}", answers, run) or {
             log_error(
@@ -2879,7 +2982,8 @@ locus AnnotationRunner {
         let body = "{\"model\": " + jq(v.title.model) + ", \"instructions\": "
             + jq(v.title.instruction) + ", \"input\": "
             + jq(clipped(request, ANNOTATE_RESPONSE_TEXT / 4)) + ", \"max_output_tokens\": "
-            + to_string(v.title.max_output_tokens) + ", \"metadata\": {\"annotates\": "
+            + to_string(v.title.max_output_tokens)
+            + ", \"reasoning\": {\"effort\": \"none\"}, \"metadata\": {\"annotates\": "
             + jq(j.request_id) + ", \"side\": \"title\"}, \"voice\": {\"data_class\": "
             + jq(j.data_class) + "}}";
         self.note(j, "started", "title", v.title.model, "");
@@ -2909,6 +3013,11 @@ locus AnnotationRunner {
         };
         let ms = elapsed_ms(started);
         let written = title_text(s.text);
+        let problem = if s.status == "incomplete" {
+            "its run ended incomplete: its output ran out before the title"
+        } else {
+            title_problem(written)
+        };
         let run = run_json(
             "title",
             names,
@@ -2917,14 +3026,10 @@ locus AnnotationRunner {
             s.input_tokens,
             s.output_tokens,
             ms,
-            if len(written) > 0 { "annotated" } else { "not_annotated" },
-            if len(written) > 0 {
-                ""
-            } else {
-                "failed: " + s.voice.served.model + " wrote no title"
-            },
+            if len(problem) == 0 { "annotated" } else { "not_annotated" },
+            if len(problem) == 0 { "" } else { "failed: " + s.voice.served.model + " " + problem },
         );
-        if len(written) == 0 { return Asked { run: run }; }
+        if len(problem) > 0 { return Asked { run: run }; }
         self.store.put_title(
             st::TitleRow {
                 project: j.project,
@@ -2972,6 +3077,137 @@ fn decision_problem(store: st::Store, p: st::ProjectRow) -> String fallible(st::
     return "";
 }
 
+/// One seat on an annotation route (`AnnotateRouteSeat`).
+type AnnotateRouteSeat {
+    seat: String = "";
+    node: String = "";
+    account: String = "";
+    up: Bool = false;
+    may_spend: Bool = false;
+}
+
+/// An alias to the model it names to the seats that serve it
+/// (`AnnotateRoute`).
+type AnnotateRoute {
+    alias: String = "";
+    has_model: Bool = false;
+    model: String = "";
+    has_decision: Bool = false;
+    decision: Bool = false;
+    seats: bounded[AnnotateRouteSeat; 32];
+    ready: Bool = false;
+    has_problem: Bool = false;
+    problem: String = "";
+}
+
+/// A project's annotation routes (`AnnotateReadiness`).
+type AnnotateReadiness {
+    project: String = "";
+    decide: AnnotateRoute = AnnotateRoute { };
+    title: AnnotateRoute = AnnotateRoute { };
+    ready: Bool = false;
+}
+
+/// `getAnnotateReadiness`'s request.
+type ReadinessAsk { project: String; }
+
+/// `p`'s routes as they stand: `decide`, and its title annotator's alias.
+fn annotate_readiness(
+    store: st::Store,
+    p: st::ProjectRow
+) -> AnnotateReadiness fallible(st::StoreError) {
+    let decide = annotate_route(store, p, ANNOTATE_MODEL, true) or raise;
+    let mut title_alias = "general";
+    let all = store.annotators() or raise;
+    for a in all.rows {
+        let v = annotator_view(a);
+        if v.enabled && v.stage == AnnotatorStage::title && in_scope(v.scope, p, "") {
+            title_alias = v.title.model;
+            break;
+        }
+    }
+    let title = annotate_route(store, p, title_alias, false) or raise;
+    return AnnotateReadiness { project: p.id, decide: decide, title: title, ready: decide.ready };
+}
+
+/// `alias` for `p`: the model it names (a decision model when `decision`)
+/// and each seat serving it, up or not, spending an account `p`'s system
+/// key may or not; ready when one does both, else what is missing.
+fn annotate_route(
+    store: st::Store,
+    p: st::ProjectRow,
+    alias: String,
+    decision: Bool
+) -> AnnotateRoute fallible(st::StoreError) {
+    let mut out = AnnotateRoute { alias: alias };
+    let target = alias_target(store, p, alias) or raise;
+    let named = if len(target) > 0 { target } else { alias };
+    let m = store.model(named) or raise;
+    if !m.present || m.removed {
+        out.has_problem = true;
+        out.problem = "project " + p.id + " names no model `" + alias + "` (give it a `" + alias
+            + "` alias)";
+        return out;
+    }
+    out.has_model = true;
+    out.model = m.id;
+    out.has_decision = true;
+    out.decision = m.contract == "decision";
+    if decision && !out.decision {
+        out.has_problem = true;
+        out.problem = "project " + p.id + "'s `" + alias + "` is " + m.id
+            + ", which is not a decision model";
+        return out;
+    }
+    let key = store.key(st::system_key(p.id)) or raise;
+    // an inheriting child spends its parent's accounts as they are now
+    let mut spends = p.accounts;
+    if p.inherits && len(p.parent) > 0 {
+        let parent = store.project(p.parent) or raise;
+        if parent.present { spends = parent.accounts; }
+    }
+    let seats = store.seats() or raise;
+    let mut serving = 0;
+    let mut up = 0;
+    let mut accounts = "";
+    for s in seats.rows {
+        let mut serves = false;
+        for sm in s.serves.items {
+            if sm.model == m.id { serves = true; }
+        }
+        if !serves { continue; }
+        serving = serving + 1;
+        let ready = s.enabled && (seat_ready(store, s) or raise);
+        let spend = allows(spends, s.account) && allows(key.accounts, s.account);
+        if ready { up = up + 1; }
+        if len(accounts) == 0 || !std::str::contains(" " + accounts + " ", " " + s.account + " ") {
+            accounts = std::str::trim(accounts + " " + s.account);
+        }
+        push(
+            out.seats,
+            AnnotateRouteSeat {
+                seat: s.ref,
+                node: s.node,
+                account: s.account,
+                up: ready,
+                may_spend: spend,
+            },
+        ) or discard;
+        if ready && spend { out.ready = true; }
+    }
+    if out.ready { return out; }
+    out.has_problem = true;
+    out.problem = if serving == 0 {
+        "no seat serves " + m.id + ": place it on a node"
+    } else if up == 0 {
+        "no seat serving " + m.id + " is up"
+    } else {
+        "no seat serving " + m.id + " that is up spends an account project " + p.id
+            + " may (they spend " + accounts + ")"
+    };
+    return out;
+}
+
 /// The task the request stage answered, "" when none was asked.
 fn task_of(answers: st::AnswerRows) -> String {
     for a in answers.rows {
@@ -2983,7 +3219,7 @@ fn task_of(answers: st::AnswerRows) -> String {
 /// A title as a model wrote it, made a title: its first line, without the
 /// quotes and the full stop it may add, at most `TITLE_MAX` bytes.
 fn title_text(raw: String) -> String {
-    let mut t = std::str::trim(raw);
+    let mut t = std::str::trim(without_thinking(raw));
     let nl = std::str::index_of(t, "\n");
     if nl >= 0 { t = std::str::trim(t[0..nl]); }
     while len(t) > 0 && (std::str::starts_with(t, "\"") || std::str::starts_with(t, "'")) {
@@ -3000,6 +3236,42 @@ fn title_text(raw: String) -> String {
     }
     if len(t) > TITLE_MAX { t = t[0..utf8_start(t, TITLE_MAX)]; }
     return t;
+}
+
+/// What a model wrote with its thinking left out: each
+/// `<think>…</think>`, and a `<think>` it never closed, to the end.
+fn without_thinking(raw: String) -> String {
+    let mut t = raw;
+    while true {
+        let open = std::str::index_of(t, "<think>");
+        if open < 0 { break; }
+        let close = std::str::index_of_from(t, "</think>", open);
+        if close < 0 {
+            t = t[0..open];
+            break;
+        }
+        t = t[0..open] + t[(close + 8)..len(t)];
+    }
+    return t;
+}
+
+/// Why `title` is no title, "" when it is one: none written, markup
+/// (a model's own tags), or more than 12 words.
+fn title_problem(title: String) -> String {
+    if len(title) == 0 { return "wrote no title"; }
+    if std::str::starts_with(title, "<") { return "wrote markup, not a title"; }
+    let mut words = 0;
+    let mut inside = false;
+    let mut i = 0;
+    while i < len(title) {
+        let c = std::str::byte_at_unchecked(title, i);
+        let space = c == 32 || c == 9;
+        if !space && !inside { words = words + 1; }
+        inside = !space;
+        i = i + 1;
+    }
+    if words > 12 { return "wrote " + to_string(words) + " words, not a title"; }
+    return "";
 }
 
 /// The annotators of `group`, `<id>@<version>` each, as a JSON list.
@@ -3286,85 +3558,99 @@ fn number_at(obj: String, name: String) -> Float {
 /// to fit, and whether either was (the request is read at half its room
 /// beside a response).
 fn texts_of(j: AnnotationJob) -> Texts {
-    let asked = request_text(j.input);
-    let answered = response_text(j.output);
+    let ask = user_ask(j.input);
+    let asked = ask_text(ask);
+    let answered = answer_text(j.output);
     return Texts {
-        request: clipped(asked, ANNOTATE_REQUEST_TEXT),
-        response: clipped(answered, ANNOTATE_RESPONSE_TEXT),
-        clipped: len(asked) > ANNOTATE_REQUEST_TEXT / 2 || len(answered) > ANNOTATE_RESPONSE_TEXT,
+        request: clipped(asked.text, ANNOTATE_REQUEST_TEXT),
+        response: clipped(answered.text, ANNOTATE_RESPONSE_TEXT),
+        clipped: asked.cut || answered.cut || len(asked.text) > ANNOTATE_REQUEST_TEXT
+            || len(answered.text) > ANNOTATE_RESPONSE_TEXT,
+        ask_hash: ask_hash(ask),
+        final: ends_turn(j.output),
     };
 }
 
-/// A standard request as the text a decision model reads: its instructions,
-/// then each turn by its role, a tool's call and its result named, what is
-/// not text (an image, a file) said so.
-@unbounded
-fn request_text(body: String) -> String {
-    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
-    let instructions = std::json::string_field(body, "instructions");
-    if instructions.kind == "string" && len(instructions.text) > 0 {
-        out.append_str("system: " + instructions.text + "\n\n");
-    }
-    let input = std::str::trim(std::json::find_field_raw(body, "input"));
-    if std::str::starts_with(input, "\"") {
-        out.append_str("user: " + std::json::find_string_field(body, "input"));
-    } else {
-        let mut it = std::json::array_first(input);
-        while !it.done {
-            let item = std::str::trim(it.element);
-            it = std::json::array_next(it);
-            out.append_str(item_text(item));
-        }
-    }
-    return std::str::from_bytes(out.snapshot() or b"");
+/// The turn a request belongs to, from its text alone: the hash of its
+/// latest user message, whether there is none, and whether its response
+/// ends the turn.
+type TurnOf { ask_hash: String = ""; no_user: Bool = false; final: Bool = true; }
+
+fn turn_of(j: AnnotationJob) -> TurnOf {
+    let ask = user_ask(j.input);
+    return TurnOf {
+        ask_hash: ask_hash(ask),
+        no_user: len(ask.latest) == 0,
+        final: ends_turn(j.output),
+    };
 }
 
-/// A response's output as text: its messages, the tools it called.
+/// The request whose request-stage answers `j` reads: its turn's first.
+fn turn_request(j: AnnotationJob) -> String {
+    return if len(j.turn) > 0 { j.turn } else { j.request_id };
+}
+
+/// The most of the user's latest message, and of the one before it, a
+/// request stage reads; each kept from its start.
+const ANNOTATE_LATEST_TEXT: Int = 24576;
+const ANNOTATE_EARLIER_TEXT: Int = 4096;
+/// The most of a tool call's arguments a response stage reads.
+const ANNOTATE_CALL_TEXT: Int = 120;
+
+/// What the user asked: their latest message and the one before it, ""
+/// for none. A harness's own context sent as the user's (a block it tags,
+/// `<environment_context>…</environment_context>`, an AGENTS.md) is not.
+type UserAsk { latest: String = ""; earlier: String = ""; }
+
+/// A text and whether a bound cut it.
+type Read { text: String = ""; cut: Bool = false; }
+
+/// The user's messages of a standard request (`input`, a text or items) or
+/// of a Chat Completions one (`messages`): no instructions, no system or
+/// developer message, no tool call or output, no reasoning.
 @unbounded
-fn response_text(response: String) -> String {
-    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
-    let mut it = std::json::array_first(
-        std::str::trim(std::json::find_field_raw(response, "output")),
-    );
+fn user_ask(body: String) -> UserAsk {
+    let mut out = UserAsk { };
+    let input = std::str::trim(std::json::find_field_raw(body, "input"));
+    if std::str::starts_with(input, "\"") {
+        out.latest = std::json::find_string_field(body, "input");
+        return out;
+    }
+    let items = if std::str::starts_with(input, "[") {
+        input
+    } else {
+        std::str::trim(std::json::find_field_raw(body, "messages"))
+    };
+    let mut it = std::json::array_first(items);
     while !it.done {
         let item = std::str::trim(it.element);
         it = std::json::array_next(it);
-        out.append_str(item_text(item));
+        let t = std::json::find_string_field(item, "type");
+        if len(t) > 0 && t != "message" { continue; }
+        if std::json::find_string_field(item, "role") != "user" { continue; }
+        let text = std::str::trim(item_message_text(item));
+        if len(text) == 0 || harness_context(text) { continue; }
+        out.earlier = out.latest;
+        out.latest = text;
     }
-    let status = std::json::find_string_field(response, "status");
-    if status != "completed" && len(status) > 0 {
-        out.append_str("[the response is " + status + "]\n");
-    }
-    return std::str::from_bytes(out.snapshot() or b"");
+    return out;
 }
 
-/// One input or output item as a line or two of text; reasoning is left out.
+/// A message's text: its content, a text or parts (their texts, a line
+/// each; what is not text said so).
 @unbounded
-fn item_text(item: String) -> String {
-    let t = std::json::find_string_field(item, "type");
-    if t == "function_call" {
-        return "assistant called " + std::json::find_string_field(item, "name") + "("
-            + clipped(std::json::find_string_field(item, "arguments"), 2048) + ")\n\n";
-    }
-    if t == "function_call_output" {
-        return "tool returned: " + clipped(std::json::find_string_field(item, "output"), 4096)
-            + "\n\n";
-    }
-    if t == "reasoning" { return ""; }
-    if t != "message" && len(t) > 0 { return "[" + t + "]\n\n"; }
-    let role = std::json::find_string_field(item, "role");
+fn item_message_text(item: String) -> String {
     let content = std::str::trim(std::json::find_field_raw(item, "content"));
     if std::str::starts_with(content, "\"") {
-        return role + ": " + std::json::find_string_field(item, "content") + "\n\n";
+        return std::json::find_string_field(item, "content");
     }
-    let out = std::bytes::BytesBuilder { initial_cap: 1024 };
-    out.append_str(role + ":");
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
     let mut it = std::json::array_first(content);
     while !it.done {
         let part = it.element;
         it = std::json::array_next(it);
         let pt = std::json::find_string_field(part, "type");
-        out.append_str(" ");
+        if out.len() > 0 { out.append_str("\n"); }
         if pt == "input_text" || pt == "output_text" || pt == "text" {
             out.append_str(std::json::find_string_field(part, "text"));
         } else if pt == "refusal" {
@@ -3373,8 +3659,122 @@ fn item_text(item: String) -> String {
             out.append_str("[" + pt + "]");
         }
     }
-    out.append_str("\n\n");
     return std::str::from_bytes(out.snapshot() or b"");
+}
+
+/// A message a harness sends as the user's for its own context: a block
+/// it tags whole (`<environment_context>…</environment_context>`, `<x
+/// source="…">…</x>`), or an AGENTS.md's instructions.
+fn harness_context(text: String) -> Bool {
+    if std::str::starts_with(text, "# AGENTS.md instructions") { return true; }
+    if !std::str::starts_with(text, "<") || !std::str::ends_with(text, ">") { return false; }
+    let end = std::str::index_of(text, ">");
+    if end < 2 { return false; }
+    let mut name = text[1..end];
+    let sp = std::str::index_of(name, " ");
+    if sp > 0 { name = name[0..sp]; }
+    // the whole message one block: it closes, at its end, the tag it opens
+    let mut last = -1;
+    let mut at = std::str::index_of(text, "</");
+    while at >= 0 {
+        last = at;
+        at = std::str::index_of_from(text, "</", at + 2);
+    }
+    return last > 0 && std::str::starts_with(text[last..len(text)], "</" + name);
+}
+
+/// The text a request stage reads: the user's latest message, after the
+/// one before it for context.
+fn ask_text(a: UserAsk) -> Read {
+    let latest = kept_start(a.latest, ANNOTATE_LATEST_TEXT);
+    if len(a.earlier) == 0 {
+        return Read { text: "The user asks:\n" + latest.text, cut: latest.cut };
+    }
+    let earlier = kept_start(a.earlier, ANNOTATE_EARLIER_TEXT);
+    return Read {
+        text: "Before this, the user asked:\n" + earlier.text + "\n\nThe user asks:\n"
+            + latest.text,
+        cut: latest.cut || earlier.cut,
+    };
+}
+
+/// The hash of the user's latest message: the turn it belongs to; "" for
+/// none.
+fn ask_hash(a: UserAsk) -> String {
+    if len(a.latest) == 0 { return ""; }
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(a.latest)))[0..32];
+}
+
+/// The text a response stage reads: what the assistant wrote, and a line
+/// for each tool it called (its name and the start of its arguments); no
+/// reasoning.
+@unbounded
+fn answer_text(response: String) -> Read {
+    let out = std::bytes::BytesBuilder { initial_cap: 2048 };
+    let mut cut = false;
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        let item = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        let t = std::json::find_string_field(item, "type");
+        if t == "message" {
+            let text = std::str::trim(item_message_text(item));
+            if len(text) > 0 { out.append_str(text + "\n\n"); }
+        } else if t == "function_call" || std::str::ends_with(t, "_call") {
+            let name = std::json::find_string_field(item, "name");
+            let args = kept_start(
+                std::json::find_string_field(item, "arguments"),
+                ANNOTATE_CALL_TEXT,
+            );
+            if args.cut { cut = true; }
+            out.append_str(
+                "called " + (if len(name) > 0 { name } else { t }) + "(" + args.text + ")\n",
+            );
+        }
+    }
+    let status = std::json::find_string_field(response, "status");
+    if status != "completed" && len(status) > 0 {
+        out.append_str("[the response is " + status + "]\n");
+    }
+    return Read { text: std::str::from_bytes(out.snapshot() or b""), cut: cut };
+}
+
+/// Whether a response ends its turn: it calls no tool (an agent's step
+/// calls one, and goes on once it has its output).
+fn ends_turn(response: String) -> Bool {
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        let t = std::json::find_string_field(it.element, "type");
+        it = std::json::array_next(it);
+        if t == "function_call" || std::str::ends_with(t, "_call") { return false; }
+    }
+    return true;
+}
+
+/// `text` at most `max` bytes, kept from its start, and whether it was cut.
+fn kept_start(text: String, max: Int) -> Read {
+    if len(text) <= max { return Read { text: text }; }
+    let end = utf8_start(text, max);
+    return Read {
+        text: text[0..end] + "\n[… " + to_string(len(text) - end) + " bytes left out …]",
+        cut: true,
+    };
+}
+
+/// A failed stage or title logged once, with no text of the request.
+fn annotation_failed(j: AnnotationJob, stage: String, model: String, reason: String) {
+    let log = std::log::Logger { name: "voice.annotate" };
+    log.warn_kv(
+        "not annotated",
+        std::log::kv("request", j.request_id) + " " + std::log::kv("project", j.project) + " "
+            + std::log::kv("stage", stage) + " "
+            + std::log::kv("model", if len(model) > 0 { model } else { "-" }) + " "
+            + std::log::kv("reason", reason),
+    );
 }
 
 /// `text` at most `max` bytes: its start and its end, the middle left out

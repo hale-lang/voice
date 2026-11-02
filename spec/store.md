@@ -974,3 +974,32 @@ create table annotation_step (
 create index annotation_step_by_request on annotation_step (request_id, seq);
 create index annotation_step_by_at on annotation_step (at);
 ```
+
+### Migration 26: an agent's turn annotated once, and titles that are titles
+
+An agent client (a coding CLI) sends one request a step: the same ask,
+followed by its tool calls and their output. Its annotation is the
+user's turn, not each step: `annotation_turn` keeps, per conversation,
+the hash of its latest user message and the request that began that
+turn, and a request of the same turn is not asked about again. The turn's
+last step, its final answer, is asked about its response, beside the
+answers its first gave (`turn`, that request). Titles a reasoning model
+cut short (`<think>`) are let go, to be written again, and the built-in
+title annotator asks without reasoning and with room for its answer
+(version 2), unless the operator has made it their own.
+
+```sql
+alter table annotation add column turn text not null default '';
+create table annotation_turn (
+  project      text not null,
+  conversation text not null,
+  user_hash    text not null,
+  request_id   text not null,
+  at           timestamptz not null,
+  primary key (project, conversation)
+);
+delete from conversation_title where title like '<%';
+insert into annotator_version (annotator, version, body) select 'conversation-title', 2, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where exists (select 1 from annotator where id = 'conversation-title' and builtin and version = 1) on conflict (annotator, version) do nothing;
+update annotator set version = 2, body = '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where id = 'conversation-title' and builtin and version = 1;
+```
+

@@ -191,7 +191,7 @@ client can pace itself instead of discovering the wall by failing.
 - [routes](#tag-routes) (2)
 - [node](#tag-node) (8)
 - [health](#tag-health) (2)
-- [annotations](#tag-annotations) (11)
+- [annotations](#tag-annotations) (12)
 - [Schemas](#schemas)
 
 ## Authentication
@@ -468,7 +468,7 @@ Schema: [ProjectCreate](#schema-projectcreate)
 | `id` | [ProjectIdValue](#schema-projectidvalue) | yes |  |  |
 | `name` | string | yes |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not peek. A request is recorded when its project peeks or its key does. |  |
-| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
+| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model, or no seat serving it is up on an account the project may spend (`getAnnotateReadiness`). Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | The names it gives models: a caller asks for `coding` and is served the catalog model the alias names, moved out of band. Voice's categories (`general`, `coding`, `reasoning`, `decide`) are the names it suggests. A child's are its own over its parent's, name by name. | items ≤ 32 |
 | `owners` | array of string |  | Principals who may administer the project. The creator is always added. |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
@@ -535,7 +535,7 @@ Schema: [ProjectUpdate](#schema-projectupdate)
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is recorded whole (`listPeeks`), kept seven days. |  |
-| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model. |  |
+| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model, or no seat serving it is up on an account the project may spend (`getAnnotateReadiness`). |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases, whole; its parent's still apply where it gives none. | items ≤ 32 |
 | `owners` | array of string |  |  |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  |  |  |
@@ -3009,6 +3009,37 @@ Responses:
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+### GET `/admin/v1/projects/{project}/annotate-readiness`
+
+**Whether a project's annotations can be read now** · `getAnnotateReadiness`
+
+Authentication: operatorToken
+
+The routes a project's annotations take, as they stand now: its
+`decide` alias to the decision model its questions are asked of,
+and its title annotator's alias to the text model that writes
+titles, each to the seats that serve that model, whether each is
+up, and whether it spends an account the project's system key may
+spend. `decide` ready is what turning `annotate` on needs
+(`409` otherwise); a title route that is not ready is a warning:
+titles are optional.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `project` | path | [ProjectIdValue](#schema-projectidvalue) | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | Its routes. | `application/json` [AnnotateReadiness](#schema-annotatereadiness) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 ### GET `/admin/v1/annotation-rules`
 
 **List annotation rules** · `listAnnotationRules`
@@ -3587,7 +3618,7 @@ Type: object
 | `id` | [ProjectIdValue](#schema-projectidvalue) | yes |  |  |
 | `name` | string | yes |  | length ≤ 128 |
 | `peek` | boolean |  | Each request it sends is recorded whole, its request as served and its final response, reasoning included, for the operator to read (`listPeeks`); kept seven days. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not peek. A request is recorded when its project peeks or its key does. |  |
-| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model. Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
+| `annotate` | boolean |  | After each request it sends is answered, a decision model is asked the questions of the annotators in force for it (`listAnnotators`), off the request's path: the caller waits for none of it. The questions are asked of the decision model its `decide` alias names (its own, else its parent's), as requests of its system key (`Key.internal`): they spend its accounts, their usage is kept apart from its callers' (`UsageRecord.internal`) and held to that key's limits alone. `true` is refused (`409`) while `decide` names no decision model, or no seat serving it is up on an account the project may spend (`getAnnotateReadiness`). Left out, a child follows its parent's, read when a request is admitted, and a project of its own does not annotate. A request is annotated when its project annotates or its key does. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | The names it gives models: a caller asks for `coding` and is served the catalog model the alias names, moved out of band. Voice's categories (`general`, `coding`, `reasoning`, `decide`) are the names it suggests. A child's are its own over its parent's, name by name. | items ≤ 32 |
 | `owners` | array of string |  | Principals who may administer the project. The creator is always added. |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
@@ -3624,7 +3655,7 @@ Type: object
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
 | `peek` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is recorded whole (`listPeeks`), kept seven days. |  |
-| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model. |  |
+| `annotate` | boolean \| null |  | `true` or `false` sets its own; `null` follows its parent's again (off for a project of its own). Each request it sends is annotated (`getAnnotation`), as requests of its system key. `true` is refused (`409`) while its `decide` alias, as this update leaves it, names no decision model, or no seat serving it is up on an account the project may spend (`getAnnotateReadiness`). |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases, whole; its parent's still apply where it gives none. | items ≤ 32 |
 | `owners` | array of string |  |  |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) |  |  |  |
@@ -4083,7 +4114,7 @@ Type: object
 |---|---|---|---|---|
 | `model` | string | yes | The project's alias for the text model asked, e.g. `general`. |  |
 | `instruction` | string | yes |  | length ≥ 1; length ≤ 1000 |
-| `max_output_tokens` | integer | yes |  | ≥ 4; ≤ 64 |
+| `max_output_tokens` | integer | yes | The most its model writes. A reasoning model is asked without reasoning (`reasoning.effort` `none`); what it still thinks before its answer is left out, and a run cut short writes no title. | ≥ 4; ≤ 256 |
 
 <a id="schema-annotationcondition"></a>
 
@@ -4446,6 +4477,49 @@ Type: [AnnotationSummary](#schema-annotationsummary) & object
 | `owed` | array of string |  | The annotators it was queued for, `<id>@<version>` each. | items ≤ 64 |
 | `results` | array of [AnnotatorResult](#schema-annotatorresult) |  | Each owed annotator's result, as it answered; one not answered yet has none. | items ≤ 64 |
 | `deadline` | string (date-time) |  | When a pending one gives up, written not annotated; left out once settled. |  |
+| `turn` | string |  | The request that began its user's turn, when that is another: an agent's steps send one ask over and over, and the turn is read once. Its first request is asked about the ask, its last (the agent's final answer) about the response; this one's `answers` include the turn's request answers. Left out when it began its turn. |  |
+
+<a id="schema-annotaterouteseat"></a>
+
+### AnnotateRouteSeat
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `seat` | string | yes | The seat, `<node>/<seat>`. |  |
+| `node` | string | yes |  |  |
+| `account` | string | yes | The account it spends. |  |
+| `up` | boolean | yes | Up on a node that is up, taking requests now. |  |
+| `may_spend` | boolean | yes | Its account is one the project's system key may spend. |  |
+
+<a id="schema-annotateroute"></a>
+
+### AnnotateRoute
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `alias` | string | yes | The project's name for the model, e.g. `decide`. |  |
+| `model` | string |  | The catalog model the alias names; left out when it names none. |  |
+| `decision` | boolean |  | Whether that model is a decision model (`contract` `decision`). |  |
+| `seats` | array of [AnnotateRouteSeat](#schema-annotaterouteseat) | yes | The seats that serve the model. | items ≤ 32 |
+| `ready` | boolean | yes | A seat serving it is up and spends an account the project may. |  |
+| `problem` | string |  | What is missing, when it is not ready. |  |
+
+<a id="schema-annotatereadiness"></a>
+
+### AnnotateReadiness
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `project` | string | yes |  |  |
+| `decide` | [AnnotateRoute](#schema-annotateroute) | yes |  |  |
+| `title` | [AnnotateRoute](#schema-annotateroute) | yes |  |  |
+| `ready` | boolean | yes | Its `decide` route is ready, so annotate may be on. |  |
 
 <a id="schema-annotatorresult"></a>
 

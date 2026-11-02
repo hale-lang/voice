@@ -41,12 +41,13 @@ function setFlights(next: Flight[]) {
  * through `deliver`.
  */
 export const AFFECTS: Record<string, string[]> = {
-  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements'],
-  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements'],
-  account: ['/admin/v1/accounts', '/admin/v1/routes'],
+  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
+  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
+  account: ['/admin/v1/accounts', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
   // the log, and the resource the change names (`target`), below
-  change: ['/admin/v1/changes', '/admin/v1/routes'],
+  // a project's routes too: an alias, a model or a seat changed
+  change: ['/admin/v1/changes', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
   // a request a seat is serving: told to listeners (the Network view), no
   // query changes until its usage is recorded
   request: [],

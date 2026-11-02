@@ -6,6 +6,7 @@ import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { useLastStep, stepLabel } from '../api/steps';
 import { readout } from '../readout';
+import { AnnotateRoutes } from '../readiness';
 
 type Annotator = Schemas['Annotator'];
 type Rule = Schemas['AnnotationRule'];
@@ -69,6 +70,7 @@ export function Annotators({ route, setInspector }: ScreenProps) {
         </p>
       </Panel>
       <Queue />
+      <Routes />
       <Panel title="Rules" readout={readout(rules, `${rules.data.data.length} rules`)}>
         <Table<Rule>
           rows={rules.data.data}
@@ -430,3 +432,28 @@ function QueueStep({ id }: { id: string }) {
     </span>
   );
 }
+
+/**
+ * Each project's annotation routes, as they stand: where its questions and
+ * its titles would be read now (readiness.tsx).
+ */
+function Routes() {
+  const projects = useGet('/admin/v1/projects');
+  if (projects.isPending) return <Loading what="projects" />;
+  if (projects.isError) return <Unavailable what="Projects" detail={projects.error.message} />;
+  const live = projects.data.data.filter((p) => !p.internal && p.status !== 'archived');
+  return (
+    <Panel title="Routes" readout={readout(projects, `${live.length} projects`)}>
+      <Table
+        rows={live}
+        rowKey={(p) => p.id}
+        columns={[
+          { key: 'p', header: 'Project', render: (p) => <><Mono>{p.id}</Mono>{p.annotates ? <span className="faint"> · annotating</span> : null}</> },
+          { key: 'r', header: 'decide · title', render: (p) => <AnnotateRoutes project={p.id} /> },
+        ]}
+        empty="No projects."
+      />
+    </Panel>
+  );
+}
+

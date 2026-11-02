@@ -2283,8 +2283,9 @@ locus PgStore {
         a.add(
             if std::time::unix(row.deadline) > 0 { std::time::iso8601(row.deadline) } else { "" },
         );
+        a.add(row.turn);
         self.step(
-            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body, annotations, owed, deadline) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb, $10::jsonb, coalesce(string_to_array(nullif($11, ''), ' '), '{}'), nullif($12, '')::timestamptz) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body, annotations = excluded.annotations, owed = excluded.owed, deadline = excluded.deadline, seq = nextval(pg_get_serial_sequence('annotation', 'seq'))",
+            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body, annotations, owed, deadline, turn) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb, $10::jsonb, coalesce(string_to_array(nullif($11, ''), ' '), '{}'), nullif($12, '')::timestamptz, $13) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body, annotations = excluded.annotations, owed = excluded.owed, deadline = excluded.deadline, turn = excluded.turn, seq = nextval(pg_get_serial_sequence('annotation', 'seq'))",
             a,
         ) or raise;
         // each annotator's answers replace the ones it gave before
@@ -2484,7 +2485,7 @@ locus PgStore {
 
     fn annotation_locked(request_id: String) -> AnnotationRow fallible(StoreError) {
         let line = self.row(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE a.request_id = $1) t",
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline, a.turn FROM annotation a WHERE a.request_id = $1) t",
             single_value(request_id),
         ) or raise;
         if len(line) == 0 { return AnnotationRow { }; }
@@ -2533,7 +2534,7 @@ locus PgStore {
         let cond = answer_where(q, a, 1);
         a.add(to_string(if q.limit > 200 { 200 } else { q.limit }));
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE "
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline, a.turn FROM annotation a WHERE "
                 + cond
                 + " ORDER BY a.created_at DESC, a.request_id LIMIT $" + to_string(a.count())
                 + "::int) t",
@@ -2566,7 +2567,7 @@ locus PgStore {
         a.add(to_string(seq));
         a.add(to_string(if limit > 200 { 200 } else { limit }));
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE a.seq > $1::bigint ORDER BY a.seq LIMIT $2::int) t",
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline, a.turn FROM annotation a WHERE a.seq > $1::bigint ORDER BY a.seq LIMIT $2::int) t",
             a,
         ) or raise;
         let mut out = AnnotationRows { };
@@ -2715,6 +2716,57 @@ locus PgStore {
         };
         self.lock.leave();
         return out;
+    }
+
+    fn turn(project: String, conversation: String) -> TurnRow fallible(StoreError) {
+        self.lock.enter();
+        let out = self.turn_locked(project, conversation) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn turn_locked(project: String, conversation: String) -> TurnRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(project);
+        a.add(conversation);
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (SELECT project, conversation, user_hash, request_id, at FROM annotation_turn WHERE project = $1 AND conversation = $2) t",
+            a,
+        ) or raise;
+        if len(line) == 0 { return TurnRow { }; }
+        return TurnRow {
+            project: pg_text(line, "project"),
+            conversation: pg_text(line, "conversation"),
+            user_hash: pg_text(line, "user_hash"),
+            request_id: pg_text(line, "request_id"),
+            at: pg_time(pg_text(line, "at")),
+            present: true,
+        };
+    }
+
+    fn put_turn(row: TurnRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_turn_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_turn_locked(row: TurnRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.project);
+        a.add(row.conversation);
+        a.add(row.user_hash);
+        a.add(row.request_id);
+        a.add(std::time::iso8601(row.at));
+        self.write(
+            "INSERT INTO annotation_turn (project, conversation, user_hash, request_id, at) VALUES ($1, $2, $3, $4, $5::timestamptz) ON CONFLICT (project, conversation) DO UPDATE SET user_hash = excluded.user_hash, request_id = excluded.request_id, at = excluded.at",
+            a,
+        ) or raise;
     }
 
     fn title_locked(project: String, conversation: String) -> TitleRow fallible(StoreError) {
@@ -3459,6 +3511,7 @@ fn annotation_row(j: String) -> AnnotationRow {
         annotations: raw_or_empty(j, "annotations"),
         owed: pg_text(j, "owed"),
         deadline: pg_time(pg_text(j, "deadline")),
+        turn: pg_text(j, "turn"),
         present: true
     };
 }

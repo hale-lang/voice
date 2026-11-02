@@ -1,0 +1,556 @@
+// An agent's turn is annotated once, and from what its user asked: a
+// coding CLI sends one request a step (its own instructions first, its
+// context as the user's, then the user's ask, its tool calls and their
+// output), and only the user's ask is read, at the turn's first step; its
+// response at the last, the agent's final answer, which reads the answers
+// its first step gave. A title is the model's answer, its thinking left out
+// and a cut run kept as none. Annotate is on only where a decision model can
+// read it: a seat serving it up, on an account the project may spend.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+
+/// The decision model's answers to the built-in annotators' questions, by
+/// question id (`<annotator>.<question>`); any other question is answered
+/// its first option, likely.
+const CANNED: String = """
+    {"request-basics.task": {"type": "choice", "choice": "code", "confidence": 0.8, "probabilities": {"code": 0.85, "debug": 0.05, "writing": 0.02, "research": 0.02, "analysis": 0.02, "planning": 0.02, "chat": 0.01, "other": 0.01}}, "request-basics.domain": {"type": "choice", "choice": "software", "confidence": 0.9, "probabilities": {"software": 0.9, "other": 0.1}}, "request-basics.multi_step": {"type": "noul", "noul": 0.8}, "request-basics.asks_for_code": {"type": "noul", "noul": 0.9}, "request-basics.sensitive": {"type": "noul", "noul": 0.1}, "request-basics.depends_on_context": {"type": "noul", "noul": 0.2}, "request-basics.difficulty": {"type": "score", "score": 1.9, "confidence": 0.5, "legend": {"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, "probabilities": {"0": 0.1, "1": 0.2, "2": 0.4, "3": 0.2, "4": 0.1}}, "request-basics.size": {"type": "score", "score": 1.0, "confidence": 0.5, "legend": {"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, "probabilities": {"0": 0.3, "1": 0.5, "2": 0.1, "3": 0.05, "4": 0.05}}, "response-basics.outcome": {"type": "choice", "choice": "answered", "confidence": 0.7, "probabilities": {"answered": 0.75, "partly_answered": 0.15, "refused": 0.02, "asked_back": 0.05, "error": 0.03}}, "response-basics.contains_code": {"type": "noul", "noul": 0.2}, "response-basics.followed_format": {"type": "noul", "noul": 0.95}, "response-basics.completeness": {"type": "score", "score": 2.6, "confidence": 0.6, "legend": {"0": "1", "1": "2", "2": "3", "3": "4"}, "probabilities": {"0": 0.05, "1": 0.1, "2": 0.15, "3": 0.7}}}
+    """;
+
+/// A link to one node, in process: a decision request is answered as a
+/// decision server would, any other by the static engine. It keeps how many
+/// decision requests it was offered, the last one's state, and the question
+/// ids each asked, a line each.
+locus Nodes {
+    params {
+        decisions: Int = 0;
+        last_state: String = "";
+        asked: String = "";
+        // a response-stage decision request fails, as a seat with no
+        // capacity would answer it
+        fail_response: Bool = false;
+        // every decision request refused, as a seat at its most at once
+        busy: Bool = false;
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, reply_to: String, body: String) -> api::Offer {
+        let id = std::json::find_string_field(body, "request_id");
+        let model = std::json::find_string_field(body, "model");
+        let sent = std::str::trim(std::json::find_field_raw(body, "body"));
+        if std::json::find_string_field(body, "endpoint") == "decision" && self.busy {
+            return Scripted { refusal: "seat static is serving 1, its most at once" };
+        }
+        if std::json::find_string_field(body, "endpoint") == "decision" {
+            self.decisions = self.decisions + 1;
+            self.last_state = std::json::find_field_raw(sent, "state");
+            let qs = std::str::trim(std::json::find_field_raw(sent, "questions"));
+            let answers = st::JsonList { };
+            let ids = std::bytes::BytesBuilder { };
+            let mut it = std::json::object_first(qs);
+            while !it.done {
+                let qid = std::json::obj_key_string(it, qs);
+                let q = std::json::obj_value_raw(it, qs);
+                it = std::json::object_next(it, qs);
+                ids.append_str(qid + " ");
+                let canned = std::str::trim(std::json::find_field_raw(CANNED, qid));
+                answers.add(
+                    api::jq(qid) + ": " + (if len(canned) > 0 { canned } else { generic(q) }),
+                );
+            }
+            self.asked = self.asked + std::str::clone(ids.text_view()) + "\n";
+            if self.fail_response
+                && std::str::contains(std::str::clone(ids.text_view()), "response-basics.")
+            {
+                let failed = node::StaticRun {
+                    outcome: "failed",
+                    failure: "no capacity",
+                    model: model,
+                };
+                return Scripted { script: "", result: node::result_message(id, failed, 0, 0) };
+            }
+            let answer = "{\"model\": \"jev-2b\", \"answers\": {" + answers.text()
+                + "}, \"usage\": {\"input_tokens\": 40, \"output_tokens\": 0}}";
+            let run = node::StaticRun {
+                script: node::decision_event(answer) + "\n",
+                outcome: "served",
+                model: model,
+                input_tokens: 40,
+            };
+            return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+        }
+        let run = node::run_static(
+            id,
+            model,
+            "echo",
+            sent,
+            node::static_config("{\"text\": \"hello from voice\", \"chunk_chars\": 8}"),
+        );
+        return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+    }
+}
+
+/// A question answered as a decision server would: its first option likely.
+fn generic(q: String) -> String {
+    let t = std::json::find_string_field(q, "type");
+    if t == "noul" { return "{\"type\": \"noul\", \"noul\": 0.8}"; }
+    let crit = std::str::trim(std::json::find_field_raw(q, "criteria"));
+    if t == "choice" {
+        let mut it = std::json::object_first(crit);
+        let first = std::json::obj_key_string(it, crit);
+        let probs = st::JsonList { };
+        let mut n = 0;
+        while !it.done {
+            probs.add(
+                api::jq(std::json::obj_key_string(it, crit)) + ": "
+                    + (if n == 0 { "0.9" } else { "0.05" }),
+            );
+            n = n + 1;
+            it = std::json::object_next(it, crit);
+        }
+        return "{\"type\": \"choice\", \"choice\": " + api::jq(first)
+            + ", \"confidence\": 0.9, \"probabilities\": {" + probs.text() + "}}";
+    }
+    let legend = st::JsonList { };
+    let probs = st::JsonList { };
+    let mut n = 0;
+    let mut it = std::json::array_first(crit);
+    while !it.done {
+        legend.add(
+            api::jq(to_string(n)) + ": "
+                + api::jq(std::json::find_string_field(it.element, "label")),
+        );
+        probs.add(api::jq(to_string(n)) + ": " + (if n == 0 { "0.6" } else { "0.1" }));
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    return "{\"type\": \"score\", \"score\": 0.5, \"confidence\": 0.5, \"legend\": {"
+        + legend.text()
+        + "}, \"probabilities\": {" + probs.text() + "}}";
+}
+
+/// One offer, scripted: its events, then its result.
+locus Scripted {
+    params {
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+        // the seat's refusal, "" when it takes the request
+        refusal: String = "";
+    }
+    fn ack() -> api::ServeOutcome {
+        if len(self.refusal) > 0 {
+            return api::ServeOutcome { ack: "refused", reason: self.refusal };
+        }
+        return api::ServeOutcome { ack: "accepted" };
+    }
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if len(line) > 0 { return api::LinkMsg { kind: "event", json: line }; }
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn finish() { self.ended = true; }
+}
+
+fn ask(e: api::DataPlane, key: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer " + key,
+            body: body,
+        },
+    );
+}
+
+const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
+
+/// A node with one seat serving the chat model and the decision model, up.
+fn bring_up(e: api::DataPlane) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: "laptop" }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let mut sc = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1", has_engine_name: true, engine_name: "echo" })
+    or discard;
+    push(sc.serves, st::SeatModel { model: "jev-2b" }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat: " + api::ctl_problem(err).message);
+    };
+    let reg = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/register",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+                + ", \"local\": " + LOCAL + "}",
+        },
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    let up = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/seats",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}",
+        },
+    );
+    std::test::assert_eq_int(up.status, 204, "the seat is up: " + up.body);
+}
+
+/// A coding CLI's request at step `step` of the user's ask `ask`: its
+/// instructions, its context sent as the user's, an earlier turn, the ask,
+/// and a tool call and its output a step before this one.
+fn cli_input(ask: String, step: Int) -> String {
+    let calls = st::JsonList { };
+    let mut i = 1;
+    while i < step {
+        calls.add(
+            "{\"type\": \"function_call\", \"name\": \"exec_command\", \"call_id\": \"c"
+                + to_string(i)
+                + "\", \"arguments\": \"{\\\"cmd\\\": \\\"make\\\"}\"}",
+        );
+        calls.add(
+            "{\"type\": \"function_call_output\", \"call_id\": \"c" + to_string(i)
+                + "\", \"output\": \"error: missing semicolon on line 4\"}",
+        );
+        i = i + 1;
+    }
+    return "{\"model\": \"echo-1\", \"prompt_cache_key\": \"conv-t\", \"input\": ["
+        + "{\"type\": \"message\", \"role\": \"developer\", \"content\": [{\"type\": \"input_text\", \"text\": \"You are a coding agent running in a terminal.\"}]}, "
+        + "{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"<environment_context>\\n<cwd>/work</cwd>\\n</environment_context>\"}]}, "
+        + "{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"say hi\"}]}, "
+        + "{\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"hi\"}]}, "
+        + "{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"<codex_internal_context source=\\\"goal\\\">keep going</codex_internal_context>\"}]}, "
+        + "{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": "
+        + api::jq(ask) + "}]}"
+        + (if calls.text() == "" { "" } else { ", " + calls.text() }) + "]}";
+}
+
+/// An agent's step: it calls a tool and goes on.
+const STEP_OUTPUT: String = """
+    {"status": "completed", "output": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "I should build it"}]}, {"type": "function_call", "name": "exec_command", "call_id": "x", "arguments": "{\"cmd\": \"make\"}"}]}
+    """;
+
+/// An agent's final answer: it calls no tool.
+const FINAL_OUTPUT: String = """
+    {"status": "completed", "output": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "done thinking"}]}, {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Fixed: added the missing semicolon."}]}]}
+    """;
+
+fn job(id: String, key: String, input: String, output: String) -> api::AnnotationJob {
+    return api::AnnotationJob {
+        request_id: id,
+        project: "work",
+        key: key,
+        conversation: "conv-t",
+        created_at: std::time::current(),
+        model: "echo-1",
+        input: input,
+        output: std::str::trim(output),
+        present: true,
+    };
+}
+
+/// A request's steps, as their names, a space between.
+fn steps_of(store: st::Store, id: String) -> String {
+    let rows = store.annotation_steps(id) or st::StepRows { };
+    let b = std::bytes::BytesBuilder { };
+    for r in rows.rows {
+        if b.len() > 0 { b.append_str(" "); }
+        b.append_str(r.step + (if len(r.stage) > 0 { ":" + r.stage } else { "" }));
+    }
+    return std::str::clone(b.text_view());
+}
+
+fn has_answer(a: api::Annotation, annotator: String, question: String) -> Bool {
+    for x in a.answers {
+        if x.annotator == annotator && x.question == question { return true; }
+    }
+    return false;
+}
+
+fn problem_of(r: api::AnnotateRoute) -> String {
+    return if r.has_problem { r.problem } else { "" };
+}
+
+fn main() {
+    // what each stage reads
+    let ask = api::user_ask(cli_input("fix the failing build", 3));
+    std::test::assert_eq_str(ask.latest, "fix the failing build", "the user's latest ask");
+    std::test::assert_eq_str(ask.earlier, "say hi", "and the one before it, its context kept out");
+    let read = api::ask_text(ask).text;
+    std::test::assert(
+        std::str::contains(read, "The user asks:\nfix the failing build")
+            && std::str::contains(read, "Before this, the user asked:\nsay hi"),
+        "the request stage reads the user's asks: " + read,
+    );
+    std::test::assert(
+        !std::str::contains(read, "coding agent")
+            && !std::str::contains(read, "environment_context")
+            && !std::str::contains(read, "missing semicolon")
+            && !std::str::contains(read, "keep going"),
+        "not the harness's instructions, its context or a tool's output: " + read,
+    );
+    let answered = api::answer_text(std::str::trim(STEP_OUTPUT)).text;
+    std::test::assert(
+        std::str::contains(answered, "called exec_command({\"cmd\": \"make\"})")
+            && !std::str::contains(answered, "should build"),
+        "a response's tool calls, a line each, no reasoning: " + answered,
+    );
+    std::test::assert(
+        !api::ends_turn(std::str::trim(STEP_OUTPUT)),
+        "a step calling a tool goes on",
+    );
+    std::test::assert(api::ends_turn(std::str::trim(FINAL_OUTPUT)), "an answer ends the turn");
+    std::test::assert(
+        api::harness_context("<environment_context>\n<cwd>/x</cwd>\n</environment_context>")
+            && api::harness_context(
+                "<codex_internal_context source=\"goal\">go</codex_internal_context>",
+            )
+            && api::harness_context("# AGENTS.md instructions for /work")
+            && !api::harness_context("<b>is this bold</b> or not?")
+            && !api::harness_context("fix the build"),
+        "a harness's own blocks are its context; a user's markup is not",
+    );
+    let long = api::kept_start(std::str::repeat("x", 30000), 24576);
+    std::test::assert(
+        long.cut && std::str::starts_with(long.text, "xxx"),
+        "kept from its start, and said cut",
+    );
+
+    // titles: the model's answer, its thinking left out
+    std::test::assert_eq_str(
+        api::title_text("<think>the user wants a title</think>\n\"Fix the failing build.\""),
+        "Fix the failing build",
+        "a closed think left out",
+    );
+    std::test::assert_eq_str(
+        api::title_text("<think>still thinking about it"),
+        "",
+        "an unclosed one, to the end",
+    );
+    std::test::assert(len(api::title_problem("")) > 0, "no title, no title");
+    std::test::assert(len(api::title_problem("<think>")) > 0, "markup is no title");
+    std::test::assert(
+        len(
+            api::title_problem(
+                "one two three four five six seven eight nine ten eleven twelve thirteen",
+            ),
+        ) > 0,
+        "more than 12 words is no title",
+    );
+    std::test::assert_eq_str(api::title_problem("Fix the failing build"), "", "a title is one");
+
+    let nodes = Nodes { };
+    let e = api::DataPlane { link: nodes };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let annotations = api::Annotations { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "jev-2b",
+            has_contract: true,
+            contract: api::ModelContract::decision,
+        },
+    ) or discard;
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "jev-3",
+            has_contract: true,
+            contract: api::ModelContract::decision,
+        },
+    ) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    accounts.create(api::AccountCreate { id: "other", name: "Other" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let key = (keys.create(api::KeyCreate { project: "work", name: "cli" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    }).id;
+
+    // readiness: each missing piece said, and annotate refused for it
+    let mut r = annotations.readiness(
+        api::ReadinessAsk { project: "work" },
+    ) or api::AnnotateReadiness { };
+    std::test::assert(
+        !r.ready && std::str::contains(problem_of(r.decide), "names no model `decide`"),
+        "no `decide`: " + problem_of(r.decide),
+    );
+    let mut bad = "";
+    projects.update(api::ProjectUpdate { project: "work", has_annotate: true, annotate: true }) or {
+        bad = api::ctl_problem(err).message;
+        api::Project { status: api::Lifecycle::archived }
+    };
+    std::test::assert(
+        std::str::contains(bad, "names no model `decide`"),
+        "refused, and why: " + bad,
+    );
+    let mut gen = api::ProjectUpdate { project: "work", has_aliases: true };
+    push(gen.aliases, api::ModelAlias { name: "decide", model: "echo-1" }) or discard;
+    projects.update(gen) or discard;
+    r = annotations.readiness(api::ReadinessAsk { project: "work" }) or api::AnnotateReadiness { };
+    std::test::assert(
+        std::str::contains(problem_of(r.decide), "not a decision model"),
+        "a generative `decide`: " + problem_of(r.decide),
+    );
+    let mut unplaced = api::ProjectUpdate { project: "work", has_aliases: true };
+    push(unplaced.aliases, api::ModelAlias { name: "decide", model: "jev-3" }) or discard;
+    projects.update(unplaced) or discard;
+    r = annotations.readiness(api::ReadinessAsk { project: "work" }) or api::AnnotateReadiness { };
+    std::test::assert(
+        std::str::contains(problem_of(r.decide), "no seat serves jev-3"),
+        "a decision model no seat serves: " + problem_of(r.decide),
+    );
+    let mut placed = api::ProjectUpdate { project: "work", has_aliases: true };
+    push(placed.aliases, api::ModelAlias { name: "decide", model: "jev-2b" }) or discard;
+    push(placed.aliases, api::ModelAlias { name: "general", model: "echo-1" }) or discard;
+    projects.update(placed) or discard;
+    r = annotations.readiness(api::ReadinessAsk { project: "work" }) or api::AnnotateReadiness { };
+    std::test::assert(
+        std::str::contains(problem_of(r.decide), "no seat serving jev-2b is up")
+            || std::str::contains(problem_of(r.decide), "no seat serves jev-2b"),
+        "a seat not up yet: " + problem_of(r.decide),
+    );
+    bring_up(e);
+    let mut narrow = api::ProjectUpdate { project: "work", has_accounts: true };
+    push(narrow.accounts, "other") or discard;
+    projects.update(narrow) or discard;
+    r = annotations.readiness(api::ReadinessAsk { project: "work" }) or api::AnnotateReadiness { };
+    std::test::assert(
+        std::str::contains(problem_of(r.decide), "spends an account project work may"),
+        "a seat on an account it may not spend: " + problem_of(r.decide),
+    );
+    let mut wide = api::ProjectUpdate { project: "work", has_accounts: true };
+    push(wide.accounts, "static") or discard;
+    projects.update(wide) or discard;
+    r = annotations.readiness(api::ReadinessAsk { project: "work" }) or api::AnnotateReadiness { };
+    std::test::assert(r.ready && r.decide.ready, "ready: " + problem_of(r.decide));
+    std::test::assert(
+        count(r.decide.seats) == 1 && (at(r.decide.seats, 0) or api::AnnotateRouteSeat { }).up,
+        "its seat, up",
+    );
+    std::test::assert(
+        r.title.ready && r.title.model == "echo-1",
+        "the title route, through `general`",
+    );
+    projects.update(api::ProjectUpdate { project: "work", has_annotate: true, annotate: true }) or {
+        std::test::assert(false, "annotate on, once ready: " + api::ctl_problem(err).message);
+    };
+
+    // a five-step turn: its ask read once, its answer once
+    let base = nodes.decisions;
+    let mut step = 1;
+    while step <= 5 {
+        let out = if step < 5 { STEP_OUTPUT } else { FINAL_OUTPUT };
+        e.queue_annotation(
+            job("resp_t" + to_string(step), key, cli_input("fix the failing build", step), out),
+            "",
+            0,
+            "",
+        );
+        if step == 1 {
+            std::test::assert(
+                std::str::contains(nodes.last_state, "fix the failing build")
+                    && !std::str::contains(nodes.last_state, "coding agent")
+                    && !std::str::contains(nodes.last_state, "missing semicolon"),
+                "the first step reads the ask alone: " + nodes.last_state,
+            );
+        }
+        step = step + 1;
+    }
+    std::test::assert_eq_int(
+        nodes.decisions - base,
+        2,
+        "two decision requests for the turn: " + nodes.asked,
+    );
+    let first = annotations.get(
+        api::AnnotationRef { request_id: "resp_t1" },
+    ) or api::Annotation { };
+    std::test::assert(
+        first.status == api::AnnotationStatus::annotated
+            && has_answer(first, "request-basics", "task")
+            && !has_answer(first, "response-basics", "outcome"),
+        "its first step: the ask's answers",
+    );
+    let middle = e.store.annotation("resp_t3") or st::AnnotationRow { };
+    std::test::assert(!middle.present, "a middle step owes nothing");
+    std::test::assert(
+        std::str::contains(steps_of(e.store, "resp_t3"), "skipped:request")
+            && std::str::contains(steps_of(e.store, "resp_t3"), "skipped:response"),
+        "and says why: " + steps_of(e.store, "resp_t3"),
+    );
+    let last = annotations.get(api::AnnotationRef { request_id: "resp_t5" }) or api::Annotation { };
+    std::test::assert(
+        last.status == api::AnnotationStatus::annotated && last.has_turn && last.turn == "resp_t1",
+        "its last step: of the first's turn",
+    );
+    std::test::assert(
+        has_answer(last, "response-basics", "outcome")
+            && has_answer(last, "request-basics", "task"),
+        "its answer's answers, beside the ask's its turn gave",
+    );
+    std::test::assert(
+        std::str::contains(nodes.last_state, "Fixed: added the missing semicolon")
+            && !std::str::contains(nodes.last_state, "done thinking"),
+        "the last step reads the final answer, no reasoning: " + nodes.last_state,
+    );
+
+    // the next ask is a turn of its own
+    e.queue_annotation(
+        job("resp_t6", key, cli_input("now run the tests", 1), FINAL_OUTPUT),
+        "",
+        0,
+        "",
+    );
+    std::test::assert_eq_int(
+        nodes.decisions - base,
+        4,
+        "a new ask, read and answered: " + nodes.asked,
+    );
+    let next = annotations.get(api::AnnotationRef { request_id: "resp_t6" }) or api::Annotation { };
+    std::test::assert(
+        !next.has_turn
+            && has_answer(next, "request-basics", "task")
+            && has_answer(next, "response-basics", "outcome"),
+        "one step, one turn",
+    );
+
+    // an explicit run reads its request as a turn of its own
+    let again = e.annotator.queue(
+        job("resp_t3", key, cli_input("fix the failing build", 3), STEP_OUTPUT),
+        "",
+        0,
+        "run",
+    );
+    std::test::assert(std::str::contains(again, "request"), "a run asks its request: " + again);
+}

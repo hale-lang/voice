@@ -191,6 +191,9 @@ type AnnotationRow {
     body: String = "{}";
     annotations: String = "{}";
     owed: String = "";
+    // the request that began its user's turn (an agent's steps share one
+    // ask): itself, or the first step of its turn; "" from before turns
+    turn: String = "";
     // when a pending one gives up: not annotated, past it
     deadline: Time = `1970-01-01T00:00:00Z`;
     // its place among annotations, in the order they were kept (the admin
@@ -297,10 +300,11 @@ const BUILTIN_RULE_FORM_KEPT: String = """
     form-kept	{"name": "a form asked, kept", "enabled": true, "expect": {"annotator": "response-basics", "question": "followed_format", "answer": "true"}}
     """;
 
-/// The built-in title annotator (migration 24): a conversation's title,
-/// written by the project's text model.
+/// The built-in title annotator (migration 24, version 2 since migration
+/// 26): a conversation's title, written by the project's text model, asked
+/// without reasoning (`/no_think`) and with room for its answer.
 const BUILTIN_ANNOTATOR_CONVERSATION_TITLE: String = """
-    conversation-title	{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}
+    conversation-title	{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}
     """;
 
 /// Voice's old global project for its own requests (migration 23), retired
@@ -344,6 +348,20 @@ type TitleRow {
 
 /// Titles, the newest made first.
 type TitleRows { rows: bounded[TitleRow; 500]; }
+
+/// A conversation's current turn (migration 26): the hash of its latest
+/// user message, and the request that began the turn.
+type TurnRow {
+    project: String = "";
+    conversation: String = "";
+    user_hash: String = "";
+    request_id: String = "";
+    at: Time = `1970-01-01T00:00:00Z`;
+    present: Bool = false;
+}
+
+/// Turns, the newest first.
+type TurnRows { rows: bounded[TurnRow; 500]; }
 
 /// One step of a request's annotation as it happens (api/annotate.hl):
 /// `queued` (it will be read), `started` (a stage's request made, `model`
@@ -998,6 +1016,10 @@ interface Store {
     fn put_title(row: TitleRow) fallible(StoreError);
     /// A conversation's title; `present` false for none.
     fn title(project: String, conversation: String) -> TitleRow fallible(StoreError);
+    /// A conversation's current turn; `present` false for none.
+    fn turn(project: String, conversation: String) -> TurnRow fallible(StoreError);
+    /// Keep a conversation's current turn, replacing the one it had.
+    fn put_turn(row: TurnRow) fallible(StoreError);
     /// Titles, the newest made first, at most `limit`: a project's (its
     /// children's too) when `project` is not "", one conversation's when
     /// `conversation` is not "".
@@ -1139,6 +1161,8 @@ locus MemoryStore {
         answer_log: AnswerLog = AnswerLog { };
         // conversations' titles, the newest made first, the last 500
         title_rows: TitleRows = TitleRows { };
+        // conversations' current turns, the newest first, the last 500
+        turn_rows: TurnRows = TurnRows { };
         // the text of the annotations pending, the last 64
         input_rows: InputRows = InputRows { };
         // annotation steps, oldest first, the last 200, and the last `seq`
@@ -1159,7 +1183,8 @@ locus MemoryStore {
         // the annotators and rules voice ships
         self.seed_annotator(BUILTIN_ANNOTATOR_REQUEST_BASICS);
         self.seed_annotator(BUILTIN_ANNOTATOR_RESPONSE_BASICS);
-        self.seed_annotator(BUILTIN_ANNOTATOR_CONVERSATION_TITLE);
+        // at version 2, as migration 26 leaves an unedited one
+        self.seed_annotator_at(BUILTIN_ANNOTATOR_CONVERSATION_TITLE, 2);
         self.seed_rule(BUILTIN_RULE_ASKED_FOR_CODE);
         self.seed_rule(BUILTIN_RULE_ANSWERED);
         self.seed_rule(BUILTIN_RULE_SEVERAL_STEPS_COMPLETE);
@@ -1168,12 +1193,17 @@ locus MemoryStore {
 
     /// A built-in annotator, its line (`<id>\t<body>`), at its first version.
     fn seed_annotator(line: String) {
+        self.seed_annotator_at(line, 1);
+    }
+
+    /// A built-in annotator, its line, at `version`.
+    fn seed_annotator_at(line: String, version: Int) {
         let l = std::str::trim(line);
         let tab = std::str::index_of(l, "\t");
         let now = std::time::current();
         let a = AnnotatorRow {
             id: l[0..tab],
-            version: 1,
+            version: version,
             body: l[(tab + 1)..len(l)],
             builtin: true,
             created_at: now,
@@ -2379,6 +2409,26 @@ locus MemoryStore {
             if r.project == project && r.conversation == conversation { return r; }
         }
         return TitleRow { };
+    }
+
+    fn turn(project: String, conversation: String) -> TurnRow fallible(StoreError) {
+        for r in self.turn_rows.rows {
+            if r.project == project && r.conversation == conversation { return r; }
+        }
+        return TurnRow { };
+    }
+
+    @unbounded
+    fn put_turn(row: TurnRow) fallible(StoreError) {
+        let mut next = TurnRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.turn_rows.rows {
+            if held.project == row.project && held.conversation == row.conversation { continue; }
+            if count(next.rows) < 500 { push(next.rows, held) or discard; }
+        }
+        self.turn_rows = next;
     }
 
     fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError) {

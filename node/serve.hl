@@ -53,6 +53,11 @@ type ServeReport {
 
 topic ServeDone { payload: ServeReport; }
 
+/// How long a slot keeps looking for a hand-off once the node drains: a
+/// request the session accepted as it stopped reaches the slot within a
+/// turn of the session's loop (`Session.step`, its read at most 20 ms).
+const SLOT_LINGER_MS: Int = 1000;
+
 locus Server {
     params {
         client: nats::NatsClient = nats::NatsClient { name: "voice-node-slot" };
@@ -72,9 +77,22 @@ locus Server {
     }
 
     run() {
-        // a stop (SIGTERM, `systemctl stop`) drains the node: each loop
-        // returns, then its locus's `drain()` and `dissolve()` run
-        while !self.draining {
+        // a stop (SIGTERM, `systemctl stop`) drains the node: the session
+        // stops accepting, and a slot serves what it was handed, waiting
+        // or arriving as the session stopped, then returns once it has
+        // held nothing for `SLOT_LINGER_MS`
+        let mut quiet_from = 0;
+        while true {
+            if self.draining && !self.waiting {
+                let now = std::time::monotonic_ns();
+                if quiet_from == 0 {
+                    quiet_from = now;
+                } else if now - quiet_from > SLOT_LINGER_MS * 1000000 {
+                    return;
+                }
+            } else {
+                quiet_from = 0;
+            }
             self.step();
         }
     }

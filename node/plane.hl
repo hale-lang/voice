@@ -76,9 +76,6 @@ type PlaneState { state: String = "connecting"; detail: String = ""; }
 
 topic PlaneReport { payload: PlaneState; }
 
-/// How long a node-plane call may take, the whole exchange: a one-shot
-/// request's bound.
-const CALL_MS: Int = 30000;
 /// How long telling the api the node is stopping may hold the stop.
 const DRAINING_TOLD_MS: Int = 2000;
 
@@ -271,12 +268,39 @@ locus Plane {
 
     /// One node-plane call; a status of 0 when the api cannot be reached.
     fn call(method: String, path: String, body: String) -> std::http::ClientResponse {
-        return self.call_within(method, path, body, CALL_MS);
+        let url = std::http::parse_url(self.api + path) or std::http::Url { };
+        if len(url.host) == 0 {
+            PlaneReport <- PlaneState { state: "", detail: "bad api address: " + self.api };
+            return std::http::ClientResponse { status: 0, body: b"" };
+        }
+        // the token goes on the wire as it is held: a revealed secret is
+        // consumed by the request it is written into (spec/semantics.md,
+        // "@sealed")
+        if len(self.token) > 0 {
+            return std::http::request(
+                std::http::ClientRequest {
+                    method: method,
+                    url: url,
+                    headers: "Authorization: Bearer " + self.token
+                        + "\r\nContent-Type: application/json",
+                    body: std::bytes::from_string(body),
+                },
+            ) or self.unreachable(err);
+        }
+        return std::http::request(
+            std::http::ClientRequest {
+                method: method,
+                url: url,
+                headers: "Authorization: Bearer " + self.credential.reveal_text()
+                    + "\r\nContent-Type: application/json",
+                body: std::bytes::from_string(body),
+            },
+        ) or self.unreachable(err);
     }
 
-    /// One node-plane call within `timeout_ms`, the whole exchange (a
-    /// one-shot request's, `max_retries: 0`); a status of 0 when the api
-    /// cannot be reached in it.
+    /// One node-plane call bounded at `timeout_ms`, the whole exchange,
+    /// with no retry: what the node says as it stops, which must not hold
+    /// the stop; a status of 0 when the api cannot be reached in it.
     fn call_within(
         method: String,
         path: String,

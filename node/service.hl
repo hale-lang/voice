@@ -72,10 +72,21 @@ fn launchd_daemon_plist(s: Service) -> String {
         + "\n  </array>\n  <key>EnvironmentVariables</key><dict>\n    <key>HALE_VAULT_DIR</key>"
         + plist_string(s.vault_dir) + "\n    <key>HOME</key>" + plist_string(s.home)
         + "\n    <key>PATH</key>" + plist_string(s.path)
-        + "\n  </dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>StandardOutPath</key>"
+        + "\n    <key>LOTUS_DRAIN_GRACE_MS</key>" + plist_string(to_string(DRAIN_GRACE_MS))
+        + "\n  </dict>\n  <key>ExitTimeOut</key><integer>" + to_string(STOP_TIMEOUT_S)
+        + "</integer>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>StandardOutPath</key>"
         + plist_string(s.log) + "\n  <key>StandardErrorPath</key>" + plist_string(s.log)
         + "\n</dict></plist>\n";
 }
+
+/// How long the node's drain may take before its runtime ends it by the
+/// signal (`LOTUS_DRAIN_GRACE_MS`): its slots finishing what they hold,
+/// then each server it started given its own TERM grace (run.hl
+/// `end_process`, 5 s).
+const DRAIN_GRACE_MS: Int = 15000;
+/// How long the service manager waits for the node to stop before it
+/// kills what is left: past the drain's grace.
+const STOP_TIMEOUT_S: Int = 20;
 
 // ---- Linux ---------------------------------------------------------------
 
@@ -96,16 +107,19 @@ fn unit_value(s: String) -> String {
 
 /// The systemd unit: the node as `user`, after the network and docker,
 /// restarted when it stops, started at boot, its output in the journal.
-/// Stopping, it first stops the servers the node started (`ExecStop`,
-/// run.hl `stop_left`), so the node's group holds only the node when
-/// systemd signals it; whatever is still there after 20 s is killed,
-/// rather than after systemd's default 90; and once the node is gone, it
-/// stops any container a seat started meanwhile (`ExecStopPost`).
+/// Stopping, systemd signals the node alone (`KillMode=mixed`): it drains,
+/// telling the api it is stopping, finishing what its slots hold, then
+/// stopping the servers it started (run.hl `Runner.drain`), within its
+/// runtime's drain grace (`LOTUS_DRAIN_GRACE_MS`, 15 s). Once it is gone,
+/// `ExecStopPost` stops whatever of its is left (a node killed before it
+/// drained, a container a seat started meanwhile), and whatever is still
+/// in its group after 20 s is killed, rather than after systemd's default
+/// 90.
 @unbounded
 fn systemd_unit(s: Service) -> String {
-    // run before the node is signalled, and again once it and everything
-    // in its group are gone: a container a seat started after the first
-    // look (Docker's, not the unit's) is removed by the second
+    // run once the node is gone: the backstop for a node that did not
+    // drain, and for a container (Docker's, not the unit's) a seat started
+    // as it stopped
     let stop_seats = unit_value(s.node_bin) + " \"stop-seats\" \"--id\" " + unit_value(s.id)
         + " \"--data\" " + unit_value(s.data);
     let mut exec = unit_value(s.node_bin);
@@ -121,9 +135,9 @@ fn systemd_unit(s: Service) -> String {
         + "Environment=" + unit_value("HALE_VAULT_DIR=" + s.vault_dir) + "\n"
         + "Environment=" + unit_value("HOME=" + s.home) + "\n"
         + "Environment=" + unit_value("PATH=" + s.path) + "\n"
+        + "Environment=" + unit_value("LOTUS_DRAIN_GRACE_MS=" + to_string(DRAIN_GRACE_MS)) + "\n"
         + "ExecStart=" + exec
-        + "\nExecStop=" + stop_seats
         + "\nExecStopPost=" + stop_seats
-        + "\nKillMode=control-group\nTimeoutStopSec=20"
+        + "\nKillMode=mixed\nTimeoutStopSec=" + to_string(STOP_TIMEOUT_S)
         + "\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
 }

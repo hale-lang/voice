@@ -76,6 +76,12 @@ type PlaneState { state: String = "connecting"; detail: String = ""; }
 
 topic PlaneReport { payload: PlaneState; }
 
+/// How long a node-plane call may take, the whole exchange: a one-shot
+/// request's bound.
+const CALL_MS: Int = 30000;
+/// How long telling the api the node is stopping may hold the stop.
+const DRAINING_TOLD_MS: Int = 2000;
+
 locus Plane {
     params {
         data: String = "node-data";
@@ -112,9 +118,28 @@ locus Plane {
     }
 
     run() {
-        while true {
+        // a stop (SIGTERM, `systemctl stop`) drains the node: the loop
+        // returns, and the api is told at once, while the serve slots
+        // finish what they hold
+        while !self.draining {
             self.step();
         }
+        self.tell_stopping();
+    }
+
+    /// The api told the node is stopping (protocol.yaml: a deliberate
+    /// shutdown posts `draining`), so it sends this node no new request
+    /// until it registers again; bounded, so an api that cannot be
+    /// reached does not hold the stop.
+    fn tell_stopping() {
+        if !self.registered { return; }
+        let r = self.call_within(
+            "POST",
+            "/node/v1/draining",
+            "{\"reason\": \"the node is stopping\"}",
+            DRAINING_TOLD_MS,
+        );
+        log_info("told the api the node is stopping", std::log::kv("status", to_string(r.status)));
     }
 
     /// One turn. Its sleep is where the session's messages arrive.
@@ -246,16 +271,29 @@ locus Plane {
 
     /// One node-plane call; a status of 0 when the api cannot be reached.
     fn call(method: String, path: String, body: String) -> std::http::ClientResponse {
+        return self.call_within(method, path, body, CALL_MS);
+    }
+
+    /// One node-plane call within `timeout_ms`, the whole exchange (a
+    /// one-shot request's, `max_retries: 0`); a status of 0 when the api
+    /// cannot be reached in it.
+    fn call_within(
+        method: String,
+        path: String,
+        body: String,
+        timeout_ms: Int
+    ) -> std::http::ClientResponse {
         let url = std::http::parse_url(self.api + path) or std::http::Url { };
         if len(url.host) == 0 {
             PlaneReport <- PlaneState { state: "", detail: "bad api address: " + self.api };
             return std::http::ClientResponse { status: 0, body: b"" };
         }
+        let client = std::http::Client { timeout_ms: timeout_ms, max_retries: 0 };
         // the token goes on the wire as it is held: a revealed secret is
         // consumed by the request it is written into (spec/semantics.md,
         // "@sealed")
         if len(self.token) > 0 {
-            return std::http::request(
+            return client.request(
                 std::http::ClientRequest {
                     method: method,
                     url: url,
@@ -265,7 +303,7 @@ locus Plane {
                 },
             ) or self.unreachable(err);
         }
-        return std::http::request(
+        return client.request(
             std::http::ClientRequest {
                 method: method,
                 url: url,

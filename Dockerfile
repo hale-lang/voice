@@ -55,7 +55,7 @@ COPY runtimes runtimes
 # what voice ships, which the tests hold placements to (memory_budget_test)
 COPY recipes recipes
 RUN hale test api && hale test node && hale test store && hale test brain \
-    && hale build api && hale build brain && hale build node
+    && hale build --target-cpu baseline api && hale build --target-cpu baseline brain && hale build --target-cpu baseline node
 
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \

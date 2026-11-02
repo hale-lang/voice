@@ -4,7 +4,7 @@ import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/com
 import { useGet, type UsageRecord } from '../api/client';
 import { subscribeAdminEvents, subscribeFlights, type Flight } from '../api/events';
 import type { ScreenProps } from '../App';
-import { buildGraph, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
+import { buildGraph, resolvedModel, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
 import { demoFleet, demoInFlight, demoCompletions, demoContext, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
@@ -206,7 +206,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
         <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}</div>
-        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias runs through the alias (a project's name for a model) to the model it named. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project.</div>
+        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">
@@ -219,7 +219,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
         </> : trace ? <>
           <h3>{demo ? traceInFlight ? 'Simulated request · in flight' : 'Simulated request' : 'Recorded request'}</h3><h2 className="mono">{trace.project}</h2>
           <div className={s.participants}>{[...requestVertices(trace, fullGraph)].map(id => { const v = fullGraph.vertices.find(v => v.id === id)!; return <button key={id} onClick={() => choose(id)}><span>{kindName(v.kind)}</span>{v.name}</button>; })}</div>
-          <dl>{[['Request ID',trace.id], ['Requested model',trace.requested_model], ['Served model',trace.served?.model ?? 'not attributed'], ['Outcome',traceInFlight ? 'in flight' : trace.status], ['Input / output',traceInFlight ? 'available on completion' : `${count(trace.input_tokens)} / ${count(trace.output_tokens)} tokens`], ['Wall / queue / load',traceInFlight ? 'available on completion' : `${trace.timing.wall_ms} / ${trace.timing.queue_ms} / ${trace.timing.load_ms} ms`], ['Price',traceInFlight ? 'available on completion' : micros(trace.price_micros,trace.currency)], ['Recorded',trace.created_at]].map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
+          <dl>{[['Request ID',trace.id], ['Requested model',trace.requested_model], ...(fullGraph.requests.get(trace.id)?.askedAs ? [['Asked as', `alias ${trace.requested_model} → ${trace.resolved_model ?? resolvedModel(trace, data.projects)?.model ?? 'its model'}`]] : []), ['Served model',trace.served?.model ?? 'not attributed'], ['Outcome',traceInFlight ? 'in flight' : trace.status], ['Input / output',traceInFlight ? 'available on completion' : `${count(trace.input_tokens)} / ${count(trace.output_tokens)} tokens`], ['Wall / queue / load',traceInFlight ? 'available on completion' : `${trace.timing.wall_ms} / ${trace.timing.queue_ms} / ${trace.timing.load_ms} ms`], ['Price',traceInFlight ? 'available on completion' : micros(trace.price_micros,trace.currency)], ['Recorded',trace.created_at]].map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
           {!demo && <a href={`#/usage/${encodeURIComponent(trace.id)}`}>Open usage record →</a>}
         </> : <>
           <h3>One connected system</h3><h2>Follow the work.</h2>
@@ -241,7 +241,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
 }
 
 function Marker({ kind }: { kind: Kind }) {
-  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'alias' ? <path d="M7 13H25L33 20L25 27H7Z" /> : kind === 'system' ? <path d="M12 9H28V31H12Z M16 15H24 M16 20H24 M16 25H21" fill="none" strokeDasharray="3 2" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
+  return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'system' ? <path d="M12 9H28V31H12Z M16 15H24 M16 20H24 M16 25H21" fill="none" strokeDasharray="3 2" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
 }
 
 /** A request in flight as a record the graph can light: what it is, and the seat it is on. */
@@ -275,11 +275,11 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
   return <>
     <div className={s.layoutTools}><span>NEURAL LAYERS <span className="muted">/ drag to arrange · select to inspect</span></span><button onClick={() => { settled.current = undefined; setPins(new Map()); }}>Reset layout{pins.size ? ` · ${pins.size} pinned` : ''}</button></div>
     <p className={s.dragHint}>Flow moves toward models → · drag to pin · arrow keys to move · Escape to release</p>
-    <div className={s.mapScroll}><div ref={ref} className={s.map} style={{ minHeight: Math.max(740, (layout.vertices.filter(v => v.kind === 'model' || v.kind === 'alias').length - 1) * 32 + 160) }} aria-label="Fleet relationship graph">
+    <div className={s.mapScroll}><div ref={ref} className={s.map} style={{ minHeight: Math.max(740, (layout.vertices.filter(v => v.kind === 'model').length - 1) * 44 + 160) }} aria-label="Fleet relationship graph">
     <div className={s.flowGuides} aria-hidden="true">{layout.vertices.some((v) => v.kind === 'repository' || v.kind.startsWith('context:')) ? <><span>CONTEXT</span><span>PROJECT → API → HOST → SEAT</span></> : <><span>PROJECTS</span><span>API → HOST → SEAT</span></>}<span>MODELS / INFERENCE</span></div>
     <svg className={s.wires} width="100%" height="100%" viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true">
       <defs><marker id={arrowId} markerWidth="8" markerHeight="8" refX="25" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z" fill="#80bdcf" /></marker></defs>
-      {graph.edges.map((e) => <path markerEnd={e.flow ? `url(#${arrowId})` : undefined} key={e.id} className={`${s.wire} ${e.flow ? s.flowWire : s.observed} ${focused && !focusedEdges.has(e.id) ? s.dim : ''} ${focusedEdges.has(e.id) ? s.focusWire : ''}`} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} />)}
+      {graph.edges.map((e) => <path markerEnd={e.flow ? `url(#${arrowId})` : undefined} key={e.id} className={`${s.wire} ${e.flow ? s.flowWire : e.kind === 'standing' ? s.standing : s.observed} ${focused && !focusedEdges.has(e.id) ? s.dim : ''} ${focusedEdges.has(e.id) ? s.focusWire : ''}`} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} />)}
       {pulses.flatMap((p) => graph.edges.filter((e) => requestEdges(p.record, graph).has(e.id)).map((e) => <path key={`${p.record.id}:${e.id}`} style={{ stroke: p.color, color: p.color, animationPlayState: paused ? 'paused' : 'running' }} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} className={`${requestFlowEdges(p.record, graph).has(e.id) ? s.signal : s.contextSignal} ${p.inFlight ? s.inFlightSignal : p.record.status !== 'served' ? s.failedSignal : ''} ${focused && !focusedEdges.has(e.id) ? s.dim : ''}`} />))}
     </svg>
     {graph.vertices.map((v) => {
@@ -312,7 +312,7 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
           if (e.key === 'Escape') setPins(old => { const next = new Map(old); next.delete(v.id); return next; });
         }}
         onMouseEnter={() => onHover(v.id)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(v.id)} onBlur={() => onHover(null)} aria-label={`${v.kind} ${v.kind === 'seat' ? v.id.slice(5) : v.name}, ${v.state}${v.active ? `, ${v.active} in flight` : ''}`} aria-pressed={selected.includes(v.id)}>
-        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}
+        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}
       </button>;
     })}
     </div></div>

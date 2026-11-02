@@ -446,28 +446,47 @@ locus DataPlane {
     @unbounded
     fn queue_annotation(j: AnnotationJob, only: String, version: Int, why: String) -> String {
         let stages = self.annotator.queue(j, only, version, why);
+        // a request stage first: the stages that read its answers are
+        // asked when it is read (`Worked.then`), never polled for
+        let first = if std::str::contains(" " + stages + " ", " request ") {
+            "request"
+        } else {
+            stages
+        };
+        self.ask_stages(j.request_id, first);
+        return stages;
+    }
+
+    /// Each stage of `stages` (a space between) of a request asked.
+    fn ask_stages(request_id: String, stages: String) {
         let mut rest = stages;
         while len(rest) > 0 {
             let sp = std::str::index_of(rest, " ");
             let stage = if sp < 0 { rest } else { rest[0..sp] };
             rest = if sp < 0 { "" } else { rest[(sp + 1)..len(rest)] };
-            self.ask_stage(AnnotateAsk { request_id: j.request_id, stage: stage, attempt: 0 });
+            if len(stage) > 0 {
+                self.ask_stage(AnnotateAsk { request_id: request_id, stage: stage, attempt: 0 });
+            }
         }
-        return stages;
     }
 
     /// One stage asked: on the annotate queue for whichever instance takes
-    /// it; in process (no queue), read now, once.
+    /// it; in process (no queue), read now, once, and the stages it hands
+    /// on asked after it.
+    @unbounded
     fn ask_stage(a: AnnotateAsk) {
         if len(self.publisher.url) == 0 {
-            self.annotator.work(a);
+            let w = self.annotator.work(a);
+            if len(w.then) > 0 { self.ask_stages(a.request_id, w.then); }
             return;
         }
         self.publisher.send("annotate", std::bytes::from_string(AnnotateAsk::api_encode(a)));
     }
 
-    /// A stage taken from the annotate queue: read when a reader is free,
-    /// asked again after its wait when no seat was, until its deadline.
+    /// A stage taken from the annotate queue: read when a reader is free;
+    /// the stages it hands on asked; asked again after its wait when no
+    /// seat was free (an attempt counted), or when what it reads is not
+    /// given yet (none counted), until its deadline.
     @unbounded
     fn on_inbound(m: nats::Inbound) {
         if len(self.annotate_subject) == 0 || m.subject != self.annotate_subject { return; }
@@ -479,10 +498,15 @@ locus DataPlane {
         self.reading = self.reading + 1;
         let w = self.annotator.work(a);
         self.reading = self.reading - 1;
+        if len(w.then) > 0 { self.ask_stages(a.request_id, w.then); }
         if !w.wait { return; }
         std::time::sleep(w.after_ms * 1ms);
         self.ask_stage(
-            AnnotateAsk { request_id: a.request_id, stage: a.stage, attempt: a.attempt + 1 },
+            AnnotateAsk {
+                request_id: a.request_id,
+                stage: a.stage,
+                attempt: if w.dependent { a.attempt } else { a.attempt + 1 },
+            },
         );
     }
 

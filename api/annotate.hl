@@ -1927,7 +1927,36 @@ type AnnotationRunList { data: bounded[AnnotationRunOutcome; 500]; }
 
 /// What reading a stage came to: `wait` when no seat was free or it reads
 /// answers not given yet, to be asked again after `after_ms`.
-type Worked { wait: Bool = false; after_ms: Int = 0; reason: String = ""; }
+/// What one stage's reading came to: `wait`, read it again after
+/// `after_ms` (`dependent`, waiting on another stage's answers, not on a
+/// seat: no attempt counted); `then`, the stages of its request to ask now
+/// (a request stage done: the stages that read its answers).
+type Worked {
+    wait: Bool = false;
+    after_ms: Int = 0;
+    reason: String = "";
+    dependent: Bool = false;
+    then: String = "";
+}
+
+/// The stages after the request's that `owed` asks, a space between.
+fn later_stages(owed: st::AnnotatorRows) -> String {
+    let mut response = false;
+    let mut title = false;
+    for x in owed.rows {
+        let st = annotator_view(x).stage;
+        if st == AnnotatorStage::response { response = true; }
+        if st == AnnotatorStage::title { title = true; }
+    }
+    return std::str::trim(
+        (if response { "response" } else { "" }) + (if title { " title" } else { "" }),
+    );
+}
+
+/// How long a stage waits for the answers it reads, before it looks again:
+/// short and flat, since they come once a request stage is read, and its
+/// end asks the stages that wait on it at once.
+const ANNOTATE_DEPENDENT_MS: Int = 1000;
 
 /// How long a queued annotation is read for before what is still missing
 /// is written not annotated.
@@ -2364,8 +2393,9 @@ locus AnnotationRunner {
                 {
                     let w = Worked {
                         wait: true,
-                        after_ms: backoff_ms(a.attempt),
+                        after_ms: ANNOTATE_DEPENDENT_MS,
                         reason: "waiting for the request stage",
+                        dependent: true,
                     };
                     self.waiting(job, a, w);
                     return w;
@@ -2379,8 +2409,9 @@ locus AnnotationRunner {
             if first.present && first.status == "pending" {
                 let w = Worked {
                     wait: true,
-                    after_ms: backoff_ms(a.attempt),
+                    after_ms: ANNOTATE_DEPENDENT_MS,
                     reason: "waiting for its turn's request stage (" + row.turn + ")",
+                    dependent: true,
                 };
                 self.waiting(job, a, w);
                 return w;
@@ -2399,6 +2430,12 @@ locus AnnotationRunner {
             return told;
         }
         self.settle(a.request_id);
+        // a request stage read: the stages that read its answers, asked now
+        if a.stage == "request" {
+            let mut out = w;
+            out.then = later_stages(owed);
+            return out;
+        }
         return w;
     }
 

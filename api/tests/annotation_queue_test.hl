@@ -382,8 +382,9 @@ fn main() {
         "each annotator's key kept: " + both.annotations,
     );
 
-    // no seat free: pending, waiting, the dependent stages waiting for the
-    // request stage; read again once a seat is
+    // no seat free: pending, its request stage waiting; the stages that
+    // read its answers are not asked until it is read (no polling); a
+    // dependent stage asked anyway waits a short while, no attempt counted
     nodes.busy = true;
     let w = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"busy now\"}");
     let wid = std::json::find_string_field(w.body, "id");
@@ -393,27 +394,30 @@ fn main() {
     let wsteps = steps_of(e.store, wid);
     std::test::assert(
         std::str::contains(wsteps, "waiting:request")
-            && std::str::contains(wsteps, "waiting:response"),
-        "it waits, and the response stage waits for the request stage: " + wsteps,
+            && !std::str::contains(wsteps, "started:response"),
+        "its request stage waits; its response stage is not asked yet: " + wsteps,
     );
-    let rows = e.store.annotation_steps(wid) or st::StepRows { };
-    let mut for_request = false;
-    for s in rows.rows {
-        if s.step == "waiting"
-            && s.stage == "response"
-            && std::str::contains(s.reason, "waiting for the request stage")
-        {
-            for_request = true;
-        }
-    }
-    std::test::assert(for_request, "a dependent stage waits for the request stage");
+    let early = e.annotator.work(
+        api::AnnotateAsk { request_id: wid, stage: "response", attempt: 0 },
+    );
+    std::test::assert(
+        early.wait && early.dependent && early.after_ms == 1000,
+        "a response stage asked early waits for the request stage, briefly, no attempt counted",
+    );
     let still = e.annotator.work(
         api::AnnotateAsk { request_id: wid, stage: "request", attempt: 1 },
     );
     std::test::assert(still.wait && still.after_ms >= 2000, "still no seat: asked again later");
     nodes.busy = false;
-    e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "request", attempt: 2 });
-    e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "response", attempt: 1 });
+    let read_now = e.annotator.work(
+        api::AnnotateAsk { request_id: wid, stage: "request", attempt: 2 },
+    );
+    std::test::assert_eq_str(
+        read_now.then,
+        "response title",
+        "a request stage read hands on its stages",
+    );
+    e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "response", attempt: 0 });
     e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "title", attempt: 1 });
     let done = read(annotations, wid);
     std::test::assert(

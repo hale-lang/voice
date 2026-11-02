@@ -34,6 +34,10 @@ UPSTREAM_PORT=${UPSTREAM_PORT:-14296}
 NATS_PORT=${NATS_PORT:-14222}
 ORG_PORT=${ORG_PORT:-14298}
 NERVES_PORT=${NERVES_PORT:-14297}
+# the upstreams of the cancel and the annotation cases: ports of their own,
+# never one of the stubs' above (UPSTREAM_PORT + 1 is NERVES_PORT)
+NOHEAD_PORT=${NOHEAD_PORT:-14300}
+DECIDE_PORT=${DECIDE_PORT:-14301}
 work=$(mktemp -d)
 container=""
 org_container="voice-e2e-org-$$"
@@ -473,14 +477,13 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
   kill "$qcurl" 2>/dev/null || true
 }
 quiet_cancel quiet "" "$UPSTREAM_PORT" "$QUIET_PORT"
-quiet_cancel nohead nohead "$((UPSTREAM_PORT + 1))" "$((QUIET_PORT + 1))"
+quiet_cancel nohead nohead "$NOHEAD_PORT" "$((QUIET_PORT + 1))"
 
 # annotations queued on NATS: four requests at once of a project that
 # annotates, on a decision seat that takes one at a time, each stage a
 # message to the queue group; a stage that finds the seat busy waits and is
 # read again, so every one ends annotated, its steps kept in order. A
 # project that does not annotate writes no row.
-DECIDE_PORT=$((UPSTREAM_PORT + 2))
 python3 scripts/decide-upstream.py "$DECIDE_PORT" "$work/decide-upstream.log" 400 &
 pids+=($!)
 for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$DECIDE_PORT") 2>/dev/null && break; sleep 0.1; done

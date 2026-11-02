@@ -78,7 +78,11 @@ It:
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a
   headless Mac serves with no one logged in; log `~/.voice/node-<id>.log`), a
   systemd unit on Linux (`voice-node-<id>.service`; `journalctl -u
-  voice-node-<id>`), adding the account to the `docker` group.
+  voice-node-<id>`), adding the account to the `docker` group. Stopping the
+  unit first stops the model servers the node started (`voice-node
+  stop-seats`, its `ExecStop`), then the node; anything still in the unit
+  after 20 s is killed, and once the node is gone, any container a seat
+  started meanwhile is removed (`ExecStopPost`).
 
 It prints no secret. Running it again changes nothing that is already right;
 a node whose enrollment token is gone is given a new one. Exit codes: 0
@@ -149,6 +153,7 @@ sudo HALE_DNA_REVISION=<commit> sh node/install.sh uninstall --id spark --api $a
 hale habitat organism unplace voice node --host spark      # or, in a habitat
 ```
 
-stops and removes the service; with the operator token it revokes the node
+stops and removes the service and the model servers the node started; with
+the operator token it revokes the node
 on the api; with `--purge` it removes the node's data (the weights it
 fetched) and its enrollment token.

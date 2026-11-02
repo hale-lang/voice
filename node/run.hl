@@ -357,40 +357,9 @@ locus Runner {
         }
     }
 
-    /// What a node that stopped left running, stopped: its containers by
-    /// their names, its processes by the pids it wrote.
-    @unbounded
+    /// What a node that stopped left running, stopped (`stop_left`).
     fn clean() {
-        let names = run_out("docker\nps\n-aq\n--filter\nlabel=" + OWNER_LABEL + "=" + self.id);
-        let v = std::str::bytes_view(names);
-        let mut start = 0;
-        while start < v.n {
-            let nl = line_end(v, start);
-            let c = std::str::trim(std::str::slice(v, start, nl));
-            start = nl + 1;
-            if len(c) > 0 { run_out("docker\nrm\n-f\n" + c); }
-        }
-        let dir = self.data + "/run";
-        let n = std::io::fs::list_dir_count(dir) or 0;
-        let mut i = 0;
-        while i < n {
-            let name = std::io::fs::list_dir_at(dir, i) or "";
-            i = i + 1;
-            if std::str::ends_with(name, ".pid") {
-                let line = std::str::trim(std::io::fs::read_file(dir + "/" + name) or "");
-                let tab = std::str::index_of(line, "\t");
-                if tab > 0 {
-                    let pid = line[0..tab];
-                    let began = line[(tab + 1)..len(line)];
-                    // only the process this node started: the same pid, begun when it was
-                    let p = std::str::parse_int(pid) or 0;
-                    if p > 0 && len(began) > 0 && started_at(p) == began {
-                        run_out("kill\n" + pid);
-                    }
-                }
-                std::io::fs::unlink(dir + "/" + name) or discard;
-            }
-        }
+        stop_left(self.id, self.data);
     }
 
     /// The variant's files, linked under the names the recipe gives them in
@@ -621,7 +590,9 @@ fn container_argv(
     image: String,
     args: String
 ) -> String {
-    return "docker\nrun\n--rm\n--name\n" + name + "\n--label\n" + OWNER_LABEL + "=" + owner
+    // `--init`: the container's first process passes a stop signal on to
+    // the server rather than holding it, as a server run as PID 1 may
+    return "docker\nrun\n--rm\n--init\n--name\n" + name + "\n--label\n" + OWNER_LABEL + "=" + owner
         + "\n-p\n127.0.0.1:" + to_string(port)
         + ":8080\n-v\n" + models
         + ":/models:ro\n-v\n" + blobs + ":" + blobs + ":ro\n"
@@ -675,15 +646,89 @@ fn find_program(dir: String, program: String) -> String {
     return "";
 }
 
-/// When process `pid` began, as `ps` says it; "" for none.
+/// A process ended: asked to stop (TERM), then, if it is still there after
+/// five seconds, killed: a server that holds the signal never holds up its
+/// node's stop for the service manager's whole timeout. Called once for
+/// each of a node's pid files, its wait at most fifty looks.
+@unbounded
+fn end_process(pid: Int) {
+    run_out("kill\n" + to_string(pid));
+    let mut i = 0;
+    while i < 50 && alive(pid) {
+        std::time::sleep(100ms);
+        i = i + 1;
+    }
+    if alive(pid) { run_out("kill\n-9\n" + to_string(pid)); }
+}
+
+/// When process `pid` began, as `ps` says it; "" for none. Called once
+/// for each of a node's pid files, at most one a seat.
+@unbounded
 fn started_at(pid: Int) -> String {
     return std::str::trim(run_out("ps\n-o\nlstart=\n-p\n" + to_string(pid)));
 }
 
 /// True while process `pid` runs: there, and not a zombie left to reap.
+/// Looked at once a server each turn, and at most fifty times a process
+/// ending.
+@unbounded
 fn alive(pid: Int) -> Bool {
     let state = std::str::trim(run_out("ps\n-o\nstat=\n-p\n" + to_string(pid)));
     return len(state) > 0 && !std::str::starts_with(state, "Z");
+}
+
+/// The servers a node started, stopped: its containers by the label that
+/// names it, its processes by the pids it wrote (each only if it is the
+/// process it started). Run when the node starts, for what a node that
+/// stopped left running, and as its service stops (`voice-node
+/// stop-seats`, the unit's `ExecStop`), so nothing of its is left in the
+/// service's group for the service manager to wait on.
+@unbounded
+fn stop_left(id: String, data: String) {
+    let names = run_out("docker\nps\n-aq\n--filter\nlabel=" + OWNER_LABEL + "=" + id);
+    let v = std::str::bytes_view(names);
+    let mut start = 0;
+    while start < v.n {
+        let nl = line_end(v, start);
+        let c = std::str::trim(std::str::slice(v, start, nl));
+        start = nl + 1;
+        if len(c) > 0 { run_out("docker\nrm\n-f\n" + c); }
+    }
+    // the pid files' names first, then each: one removed would move the
+    // others' places in the directory
+    let dir = data + "/run";
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let found = std::bytes::BytesBuilder { };
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if std::str::ends_with(name, ".pid") {
+            found.append_str(name);
+            found.append_str("\n");
+        }
+    }
+    let names_v = std::str::clone(found.text_view());
+    let it = std::iter::Lines { };
+    let mut from = 0;
+    while from >= 0 {
+        let name = it.line_at(names_v, from);
+        from = it.next_idx(names_v, from);
+        if len(name) > 0 {
+            let line = std::str::trim(std::io::fs::read_file(dir + "/" + name) or "");
+            let tab = std::str::index_of(line, "\t");
+            if tab > 0 {
+                let pid = line[0..tab];
+                let began = line[(tab + 1)..len(line)];
+                // only the process this node started: the same pid, begun when it was
+                let p = std::str::parse_int(pid) or 0;
+                if p > 0 && len(began) > 0 && started_at(p) == began {
+                    end_process(p);
+                }
+            }
+            std::io::fs::unlink(dir + "/" + name) or discard;
+        }
+    }
 }
 
 /// True when a server's health check answers 200.

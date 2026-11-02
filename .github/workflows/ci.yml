@@ -151,6 +151,25 @@ jobs:
           handed secret-dna_ci-claude-token--work install --id ci-linux --api http://127.0.0.1:8080 --port 8083
           sudo test -e "$HOME/.voice/vault/claude-token--work"
           sudo test ! -e "$HOME/.voice/vault/claude-token--personal-1"
+          # stopped, nothing of the node's is left in its unit's group, and the
+          # stop does not wait out a timeout: a server it started that holds
+          # SIGTERM (as a seat's first process may) is ended by the unit's
+          # ExecStop, so the stop takes seconds, not systemd's default 90
+          unit_file=/etc/systemd/system/voice-node-ci-linux.service
+          grep -q '^ExecStop=.*"stop-seats"' "$unit_file"
+          grep -q '^ExecStopPost=.*"stop-seats"' "$unit_file"
+          grep -qx 'TimeoutStopSec=20' "$unit_file"
+          cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value voice-node-ci-linux)
+          sh -c 'trap "" TERM; exec sleep 600' & held=$!
+          echo "$held" | sudo tee "$cg/cgroup.procs" >/dev/null
+          mkdir -p "$HOME/.voice/node-data/run"
+          printf '%s\t%s\n' "$held" "$(ps -o lstart= -p "$held" | sed 's/^ *//;s/ *$//')" > "$HOME/.voice/node-data/run/held.pid"
+          t0=$(date +%s); sudo systemctl stop voice-node-ci-linux; took=$(( $(date +%s) - t0 ))
+          echo "the node's unit stopped in ${took}s"
+          test "$took" -lt 10
+          # ended: gone, or a zombie this shell has yet to reap
+          case "$(ps -o stat= -p "$held" 2>/dev/null)" in ""|Z*) ;; *) echo "the held server outlived the stop"; exit 1 ;; esac
+          test -z "$(cat "$cg/cgroup.procs" 2>/dev/null)"
           handed "" uninstall --id ci-linux --api http://127.0.0.1:8080 --purge
           # the habitat's token revoked the node
           curl -sS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-linux | grep -q '"status": *"revoked"'
@@ -227,7 +246,13 @@ jobs:
           test "$(ps -o user= -p "$(pgrep -f 'voice-node --id ci-mac')")" = "$USER"
           # installing again changes nothing; uninstalling revokes it and removes the daemon
           sudo node/node install --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --port 8082
+          # a server the node started is stopped with it: launchd stops the
+          # node alone, and no start follows an uninstall to stop what it left
+          sh -c 'exec sleep 600' & held=$!
+          mkdir -p "$HOME/.voice/node-data/run"
+          printf '%s\t%s\n' "$held" "$(ps -o lstart= -p "$held" | sed 's/^ *//;s/ *$//')" > "$HOME/.voice/node-data/run/held.pid"
           sudo env PATH="$PATH" sh node/install.sh uninstall --id ci-mac --api http://127.0.0.1:8080 --operator-token-file build/admin.token --purge
+          case "$(ps -o stat= -p "$held" 2>/dev/null)" in ""|Z*) ;; *) echo "the node's server outlived its uninstall"; exit 1 ;; esac
           test ! -e "$plist"
           test ! -e ~/.voice/node-data
           curl -sS -H @build/admin.h http://127.0.0.1:8080/admin/v1/nodes/ci-mac | grep -q '"revoked_at": *"'

@@ -1481,7 +1481,7 @@ locus Annotations {
         while !o.done {
             push(
                 out.owed,
-                std::json::find_string_field("{\"n\": " + o.element + "}", "n"),
+                without_run(std::json::find_string_field("{\"n\": " + o.element + "}", "n")),
             ) or discard;
             o = std::json::array_next(o);
         }
@@ -1865,6 +1865,9 @@ type AnnotationJob {
     input: String = "";
     output: String = "";
     present: Bool = false;
+    // what its annotation owes, as read (`<id>@<version>#<run>` each): the
+    // entries its results answer
+    owed: String = "";
 }
 
 /// One stage of a request's annotation to read, as its message on the
@@ -1938,19 +1941,68 @@ fn seat_capacity(e: ApiError) -> Bool {
     return false;
 }
 
-/// The annotators of `p`, `<id>@<version>` each, a space between.
-fn owed_names(p: Panel) -> String {
+/// The annotators of `p`, `<id>@<version>#<run>` each, a space between:
+/// `run` names this queueing, so a result written for an earlier one (at
+/// the same version or another) is told apart from one for this.
+fn owed_names(p: Panel, run: String) -> String {
     let b = std::bytes::BytesBuilder { };
     for a in p.request.rows {
-        if b.len() > 0 { b.append_str(" "); } b.append_str(a.id + "@" + to_string(a.version));
+        if b.len() > 0 {
+            b.append_str(" ");
+        }
+        b.append_str(a.id + "@" + to_string(a.version) + "#" + run);
     }
     for a in p.response.rows {
-        if b.len() > 0 { b.append_str(" "); } b.append_str(a.id + "@" + to_string(a.version));
+        if b.len() > 0 {
+            b.append_str(" ");
+        }
+        b.append_str(a.id + "@" + to_string(a.version) + "#" + run);
     }
     for a in p.title.rows {
-        if b.len() > 0 { b.append_str(" "); } b.append_str(a.id + "@" + to_string(a.version));
+        if b.len() > 0 {
+            b.append_str(" ");
+        }
+        b.append_str(a.id + "@" + to_string(a.version) + "#" + run);
     }
     return std::str::clone(b.text_view());
+}
+
+/// An owed entry as the admin plane shows it: `<id>@<version>`, its run
+/// left out.
+fn without_run(n: String) -> String {
+    let h = std::str::index_of(n, "#");
+    return if h < 0 { n } else { n[0..h] };
+}
+
+/// Owed entries, a space between, each `without_run`.
+@unbounded
+fn runs_dropped(names: String) -> String {
+    let b = std::bytes::BytesBuilder { };
+    let mut it = std::json::array_first(names_list(names));
+    while !it.done {
+        if b.len() > 0 { b.append_str(" "); }
+        b.append_str(without_run(std::json::find_string_field("{\"n\": " + it.element + "}", "n")));
+        it = std::json::array_next(it);
+    }
+    return std::str::clone(b.text_view());
+}
+
+/// The entry `owed` holds for annotator `id`, "" for none.
+fn owed_entry(owed: String, id: String) -> String {
+    let at = std::str::index_of(" " + owed, " " + id + "@");
+    if at < 0 { return ""; }
+    let rest = owed[at..len(owed)];
+    let sp = std::str::index_of(rest, " ");
+    return if sp < 0 { rest } else { rest[0..sp] };
+}
+
+/// Whether `results` holds annotator `id`'s answer to the entry `owed`
+/// holds for it now: a key written for an earlier entry is not one.
+fn answered_now(results: String, owed: String, id: String) -> Bool {
+    let k = std::str::trim(std::json::find_field_raw(results, id));
+    if !std::str::starts_with(k, "{") { return false; }
+    let entry = owed_entry(owed, id);
+    return len(entry) > 0 && std::json::find_string_field(k, "owed") == entry;
 }
 
 /// Names a space between, as a JSON list of strings.
@@ -2085,7 +2137,8 @@ locus AnnotationRunner {
                 return "";
             }
         };
-        let owed = owed_names(panel);
+        let run = random_hex(4) or to_string(std::time::unix(now_seconds()));
+        let owed = owed_names(panel, run);
         if len(owed) == 0 { return ""; }
         let had = self.store.annotation(j.request_id) or st::AnnotationRow { };
         let mut row = st::AnnotationRow {
@@ -2176,6 +2229,7 @@ locus AnnotationRunner {
             conversation: row.conversation,
             created_at: row.created_at,
             present: true,
+            owed: row.owed,
         };
         if std::time::unix(now_seconds()) > std::time::unix(row.deadline) {
             self.missing_not_annotated(
@@ -2190,7 +2244,9 @@ locus AnnotationRunner {
         }
         let mut group = st::AnnotatorRows { };
         for x in owed.rows {
-            if stage_name(annotator_view(x).stage) == a.stage && !has_key(row.annotations, x.id) {
+            if stage_name(annotator_view(x).stage) == a.stage
+                && !answered_now(row.annotations, row.owed, x.id)
+            {
                 push(group.rows, x) or discard;
             }
         }
@@ -2220,7 +2276,7 @@ locus AnnotationRunner {
         if a.stage != "request" {
             for x in owed.rows {
                 if annotator_view(x).stage == AnnotatorStage::request
-                    && !has_key(row.annotations, x.id)
+                    && !answered_now(row.annotations, row.owed, x.id)
                 {
                     let w = Worked {
                         wait: true,
@@ -2404,7 +2460,8 @@ locus AnnotationRunner {
         let keys = st::JsonList { };
         for a in group.rows {
             keys.add(
-                jq(a.id) + ": {\"version\": " + to_string(a.version) + ", \"stage\": " + jq(stage)
+                jq(a.id) + ": {\"version\": " + to_string(a.version) + ", \"owed\": "
+                    + jq(owed_entry(j.owed, a.id)) + ", \"stage\": " + jq(stage)
                     + ", \"status\": " + jq(status) + ", \"reason\": " + jq(reason)
                     + ", \"clipped\": " + (if clipped { "true" } else { "false" }) + "}",
             );
@@ -2422,7 +2479,8 @@ locus AnnotationRunner {
         let keys = st::JsonList { };
         for a in group.rows {
             keys.add(
-                jq(a.id) + ": {\"version\": " + to_string(a.version)
+                jq(a.id) + ": {\"version\": " + to_string(a.version) + ", \"owed\": "
+                    + jq(owed_entry(j.owed, a.id))
                     + ", \"stage\": \"title\", \"status\": \"annotated\", \"reason\": \"\", \"clipped\": false, \"title\": "
                     + jq(title) + "}",
             );
@@ -2451,7 +2509,7 @@ locus AnnotationRunner {
     ) {
         let mut left = st::AnnotatorRows { };
         for x in owed.rows {
-            if !has_key(row.annotations, x.id) { push(left.rows, x) or discard; }
+            if !answered_now(row.annotations, row.owed, x.id) { push(left.rows, x) or discard; }
         }
         let mut by = 0;
         while by < 3 {
@@ -2482,8 +2540,9 @@ locus AnnotationRunner {
         while !it.done {
             let id = annotator_of(std::json::find_string_field("{\"n\": " + it.element + "}", "n"));
             it = std::json::array_next(it);
+            // only an answer to the entry owed now counts
+            if !answered_now(row.annotations, names, id) { return; }
             let k = std::str::trim(std::json::find_field_raw(row.annotations, id));
-            if !std::str::starts_with(k, "{") { return; }
             let status = std::json::find_string_field(k, "status");
             if status == "annotated" {
                 annotated = true;
@@ -2521,7 +2580,7 @@ locus AnnotationRunner {
         };
         done.clipped = clipped;
         done.body = "{\"by\": [" + by.text() + "], \"model\": " + jq(model) + ", \"input_tokens\": "
-            + to_string(tokens) + ", \"panel\": " + names_list(names)
+            + to_string(tokens) + ", \"panel\": " + names_list(runs_dropped(names))
             + (if len(title) > 0 { ", \"title\": " + jq(title) } else { "" }) + "}";
         self.store.settle_annotation(done) or {
             log_error(
@@ -2559,9 +2618,11 @@ locus AnnotationRunner {
             it = std::json::array_next(it);
             let at = std::str::index_of(n, "@");
             if at < 0 { continue; }
+            let tail = n[(at + 1)..len(n)];
+            let hash = std::str::index_of(tail, "#");
             let a = self.store.annotator_version(
                 n[0..at],
-                std::str::parse_int(n[(at + 1)..len(n)]) or 0,
+                std::str::parse_int(if hash < 0 { tail } else { tail[0..hash] }) or 0,
             ) or raise;
             if a.present { push(out.rows, a) or discard; }
         }

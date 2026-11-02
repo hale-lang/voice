@@ -1,0 +1,46 @@
+// The annotate queue's publisher: a plain core-NATS PUB to a subject a
+// queue group reads, fire and forget. The subject is on voice's own NATS,
+// not a JetStream stream, so nothing acknowledges it; `NatsPublisher`
+// (pond) waits for a PubAck that never comes.
+import "../lib/pond/realtime/nats" as nats;
+
+/// Each `send` dials the server, publishes once (PUB, no reply inbox),
+/// waits for the server's PONG so the message has reached it, and hangs
+/// up: one round trip, held by nothing between sends. `url` "" sends
+/// nothing. A publish that did not reach the server is said in the log:
+/// the stage it asked for is then read again by `runAnnotation`.
+locus CorePublisher {
+    params {
+        url: String = "";
+        subject_prefix: String = "";
+        name: String = "voice-core-publisher";
+        user: String = "";
+        // `user`'s password, sealed: revealed only on the CONNECT line
+        credential: std::secret::Credential = std::secret::Credential { };
+    }
+
+    fn send(subject: String, bytes: Bytes) {
+        if len(self.url) == 0 { return; }
+        let c = nats::NatsClient { url: self.url, name: self.name, user: self.user, timeout: 2s };
+        let log = std::log::Logger { name: "nats" };
+        if !c.open_as(self.credential) {
+            log.warn_kv("core publisher: could not connect", "error=" + c.last_error);
+            return;
+        }
+        c.pub_msg(self.subject_prefix + subject, "", bytes) or {
+            log.warn_kv(
+                "core publisher: the publish failed",
+                "subject=" + self.subject_prefix + subject + " error=" + c.last_error,
+            );
+            c.close();
+            return;
+        };
+        c.flush() or {
+            log.warn_kv(
+                "core publisher: the server did not confirm",
+                "subject=" + self.subject_prefix + subject + " error=" + c.last_error,
+            );
+        };
+        c.close();
+    }
+}

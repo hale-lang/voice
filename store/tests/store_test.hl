@@ -1251,7 +1251,7 @@ fn queued(s: st::Store, label: String) {
     push(ans.rows, answer("resp_q", "request-basics", "task", "code", 0.85, at)) or discard;
     s.put_annotator_results(
         "resp_q",
-        "{\"request-basics\": {\"version\": 1, \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        "{\"request-basics\": {\"version\": 1, \"owed\": \"request-basics@1\", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
         ans,
         "{\"stage\": \"request\", \"input_tokens\": 40}",
     ) or {
@@ -1259,10 +1259,47 @@ fn queued(s: st::Store, label: String) {
     };
     s.put_annotator_results(
         "resp_q",
-        "{\"response-basics\": {\"version\": 1, \"stage\": \"response\", \"status\": \"not_annotated\", \"reason\": \"failed\"}}",
+        "{\"response-basics\": {\"version\": 1, \"owed\": \"response-basics@1\", \"stage\": \"response\", \"status\": \"not_annotated\", \"reason\": \"failed\"}}",
         st::AnswerRows { },
         "{\"stage\": \"response\", \"input_tokens\": 12}",
     ) or discard;
+    // a stale write (an entry no longer owed): its key and answers dropped,
+    // its run kept
+    let mut stale = st::AnswerRows { };
+    push(stale.rows, answer("resp_q", "request-basics", "task", "chat", 0.6, at)) or discard;
+    s.put_annotator_results(
+        "resp_q",
+        "{\"request-basics\": {\"version\": 0, \"owed\": \"request-basics@0\", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        stale,
+        "{\"stage\": \"request\", \"input_tokens\": 7}",
+    ) or discard;
+    let fenced = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(fenced.annotations, "request-basics@1")
+            && !std::str::contains(fenced.annotations, "request-basics@0"),
+        label + ": a stale result does not land: " + fenced.annotations,
+    );
+    std::test::assert(
+        std::str::contains(fenced.body, "\"input_tokens\": 7")
+            || std::str::contains(fenced.body, "\"input_tokens\":7"),
+        label + ": its run kept: " + fenced.body,
+    );
+    let still = s.answers("resp_q") or st::AnswerRows { };
+    let first_answer = at(still.rows, 0) or st::AnswerRow { };
+    std::test::assert(
+        count(still.rows) == 1 && first_answer.answer == "code",
+        label + ": nor its answers",
+    );
+    // settled for an owed list it no longer has: nothing written
+    let mut moved = fenced;
+    moved.owed = "request-basics@2";
+    moved.status = "annotated";
+    s.settle_annotation(moved) or discard;
+    let unmoved = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        unmoved.status == "pending",
+        label + ": a settle for an older owed list writes nothing",
+    );
     let p = s.annotation("resp_q") or st::AnnotationRow { };
     std::test::assert(
         p.status == "pending" && std::str::contains(p.annotations, "request-basics")

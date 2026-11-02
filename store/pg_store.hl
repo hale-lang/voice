@@ -2336,18 +2336,35 @@ locus PgStore {
         run: String
     ) fallible(StoreError) {
         self.begin() or raise;
+        // what it owes now, the row held until the commit: a key for an
+        // entry no longer owed (asked again since) is dropped, its run kept
+        let o = db::Args { };
+        o.add(request_id);
+        let held = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT array_to_string(owed, ' ') AS owed FROM annotation WHERE request_id = $1 FOR UPDATE) t",
+            o,
+        ) or {
+            self.held = false;
+            self.conn.rollback();
+            fail err;
+        };
+        let kept = owed_results(
+            results,
+            std::json::find_string_field(std::str::trim(held), "owed"),
+        );
+        let fenced = owed_answers(answers, kept);
         // one statement: the keys merged over the ones it had, the run
         // added to its runs, whatever another annotator wrote kept
         let a = db::Args { };
         a.add(request_id);
-        a.add(if len(results) > 0 { results } else { "{}" });
+        a.add(kept);
         a.add(if len(run) > 0 { "[" + run + "]" } else { "[]" });
         self.step(
             "UPDATE annotation SET annotations = annotations || $2::jsonb, body = jsonb_set(body, '{runs}', coalesce(body->'runs', '[]'::jsonb) || $3::jsonb) WHERE request_id = $1",
             a,
         ) or raise;
         let mut gone = "\n";
-        for x in answers.rows {
+        for x in fenced.rows {
             if !std::str::contains(gone, "\n" + x.annotator + "\n") {
                 gone = gone + x.annotator + "\n";
                 let d = db::Args { };
@@ -2359,7 +2376,7 @@ locus PgStore {
                 ) or raise;
             }
         }
-        for x in answers.rows {
+        for x in fenced.rows {
             self.step(
                 "INSERT INTO annotation_answer (request_id, project, key, conversation, created_at, annotator, version, stage, question, answer, probability, score, probabilities, conditioned, skipped) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7::int, $8, $9, $10, $11::float8, $12::float8, $13::jsonb, $14::boolean, $15::boolean)",
                 answer_args(x),
@@ -2390,11 +2407,19 @@ locus PgStore {
         a.add(row.reason);
         a.add(if row.clipped { "true" } else { "false" });
         a.add(if len(row.body) > 0 { row.body } else { "{}" });
-        // the runs as they are now, whatever was added since it was read
-        self.step(
-            "UPDATE annotation SET status = $2, reason = $3, clipped = $4::boolean, body = $5::jsonb || jsonb_build_object('runs', coalesce(body->'runs', '[]'::jsonb)), seq = nextval(pg_get_serial_sequence('annotation', 'seq')) WHERE request_id = $1",
+        a.add(row.owed);
+        // the runs as they are now, whatever was added since it was read;
+        // only while it is pending and owes what it owed when read
+        let n = self.step(
+            "UPDATE annotation SET status = $2, reason = $3, clipped = $4::boolean, body = $5::jsonb || jsonb_build_object('runs', coalesce(body->'runs', '[]'::jsonb)), seq = nextval(pg_get_serial_sequence('annotation', 'seq')) WHERE request_id = $1 AND status = 'pending' AND array_to_string(owed, ' ') = $6",
             a,
         ) or raise;
+        if n == 0 {
+            self.held = false;
+            let c = self.conn.commit();
+            if !c.ok { self.conn.rollback(); }
+            return;
+        }
         let d = db::Args { };
         d.add(row.request_id);
         self.step("DELETE FROM annotation_input WHERE request_id = $1", d) or raise;

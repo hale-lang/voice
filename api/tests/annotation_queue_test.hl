@@ -357,22 +357,28 @@ fn main() {
     );
 
     // two annotators writing one request: neither clobbers the other
+    let settled_row = e.store.annotation(id) or st::AnnotationRow { };
+    let req_entry = api::owed_entry(settled_row.owed, "request-basics");
+    let resp_entry = api::owed_entry(settled_row.owed, "response-basics");
     e.store.put_annotator_results(
         id,
-        "{\"x-one\": {\"version\": 1, \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        "{\"request-basics\": {\"version\": 1, \"owed\": " + api::jq(req_entry)
+            + ", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"one\"}}",
         st::AnswerRows { },
         "",
     ) or discard;
     e.store.put_annotator_results(
         id,
-        "{\"x-two\": {\"version\": 1, \"stage\": \"response\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        "{\"response-basics\": {\"version\": 1, \"owed\": " + api::jq(resp_entry)
+            + ", \"stage\": \"response\", \"status\": \"annotated\", \"reason\": \"two\"}}",
         st::AnswerRows { },
         "",
     ) or discard;
     let both = e.store.annotation(id) or st::AnnotationRow { };
     std::test::assert(
-        api::has_key(both.annotations, "x-one") && api::has_key(both.annotations, "x-two")
-            && api::has_key(both.annotations, "request-basics"),
+        std::str::contains(both.annotations, "\"one\"")
+            && std::str::contains(both.annotations, "\"two\"")
+            && api::has_key(both.annotations, "conversation-title"),
         "each annotator's key kept: " + both.annotations,
     );
 
@@ -453,6 +459,78 @@ fn main() {
     std::test::assert(!no_retry.wait, "a refusal is not asked again");
     std::test::assert_eq_int(nodes.decisions, asked, "nothing asked of a seat");
     projects.update(decide) or discard;
+
+    // fenced: a worker that read request-basics@1 finishes after it was
+    // edited to version 2 and run again: its result does not land (its run
+    // is kept), version 2 stays owed, and is then answered
+    nodes.busy = true;
+    let fr = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"fenced\"}");
+    let fid = std::json::find_string_field(fr.body, "id");
+    let old = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(old.owed, "request-basics@1#"),
+        "owed at version 1: " + old.owed,
+    );
+    let annotators = api::Annotators { store: e.store };
+    annotators.update(
+        api::AnnotatorUpdate {
+            annotator: "request-basics",
+            has_name: true,
+            name: "Request basics, edited",
+        },
+    ) or {
+        std::test::assert(false, "edited: " + api::ctl_problem(err).message);
+    };
+    let rerun = run(
+        e,
+        "/admin/v1/annotations/" + fid + "/run",
+        "{\"annotator\": \"request-basics\"}",
+    );
+    std::test::assert_eq_int(rerun.status, 202, "run at version 2: " + rerun.body);
+    let now_owed = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(now_owed.owed, "request-basics@2#")
+            && !std::str::contains(now_owed.owed, "request-basics@1#"),
+        "version 2 owed: " + now_owed.owed,
+    );
+    let v1 = e.store.annotator_version("request-basics", 1) or st::AnnotatorRow { };
+    let mut stale_group = st::AnnotatorRows { };
+    push(stale_group.rows, v1) or discard;
+    let before_stale = read(annotations, fid);
+    let runs_before = count(before_stale.runs);
+    e.annotator.results(
+        api::AnnotationJob { request_id: fid, present: true, owed: old.owed },
+        stale_group,
+        "request",
+        "annotated",
+        "",
+        false,
+        st::AnswerRows { },
+        "{\"stage\": \"request\", \"status\": \"annotated\", \"input_tokens\": 40}",
+    );
+    let after_stale = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        !api::answered_now(after_stale.annotations, after_stale.owed, "request-basics")
+            && after_stale.status == "pending",
+        "the old worker's result does not land: " + after_stale.annotations,
+    );
+    let stale_kept = read(annotations, fid);
+    std::test::assert_eq_int(count(stale_kept.runs), runs_before + 1, "its run still kept");
+    nodes.busy = false;
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "request", attempt: 1 });
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "response", attempt: 1 });
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "title", attempt: 1 });
+    let answered2 = read(annotations, fid);
+    let mut at_v2 = false;
+    for x in answered2.results {
+        if x.annotator == "request-basics" && x.version == 2 && x.status == "annotated" {
+            at_v2 = true;
+        }
+    }
+    std::test::assert(
+        answered2.status == api::AnnotationStatus::annotated && at_v2,
+        "version 2 then answered: " + answered2.reason,
+    );
 
     // run again: every annotator in force, or one named; from its recording
     let ran = run(e, "/admin/v1/annotations/" + rid + "/run", "");

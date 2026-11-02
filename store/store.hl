@@ -967,6 +967,9 @@ interface Store {
     /// ones those annotators gave it before; `run`, the request that gave
     /// them (an `AnnotationRun`, "" for none), added to its `body.runs`.
     /// Concurrent writes of other annotators' keys are kept.
+    /// (Each key lands only while the row still owes the entry it names,
+    /// `owed_results`; a stale key and its answers are dropped, its run
+    /// still kept.)
     fn put_annotator_results(
         request_id: String,
         results: String,
@@ -977,6 +980,8 @@ interface Store {
     /// `clipped` written, its place among annotations taken anew (told on
     /// the event stream), and its held text let go. Its `annotations` and
     /// answers are left as the annotators wrote them.
+    /// Nothing is written when the row is no longer pending, or owes
+    /// other than `row.owed`: it was asked again since it was read.
     fn settle_annotation(row: AnnotationRow) fallible(StoreError);
     /// Hold a request's text while its annotation is pending.
     fn put_annotation_input(row: InputRow) fallible(StoreError);
@@ -2259,20 +2264,23 @@ locus MemoryStore {
         let had = self.annotation(request_id) or raise;
         if !had.present { return; }
         let mut r = had;
-        r.annotations = json_merged(had.annotations, results);
+        // only what is still owed lands; the run is kept either way
+        let kept = owed_results(results, had.owed);
+        r.annotations = json_merged(had.annotations, kept);
         if len(run) > 0 { r.body = with_run(had.body, run); }
         let mut next = AnnotationRows { };
         for held in self.annotation_rows.rows {
             push(next.rows, if held.request_id == request_id { r } else { held }) or discard;
         }
         self.annotation_rows = next;
-        self.replace_answers(answers);
+        self.replace_answers(owed_answers(answers, kept));
     }
 
     @unbounded
     fn settle_annotation(row: AnnotationRow) fallible(StoreError) {
         let had = self.annotation(row.request_id) or raise;
-        if !had.present { return; }
+        // asked again since it was read: what it owes now settles it later
+        if !had.present || had.owed != row.owed || had.status != "pending" { return; }
         let mut r = had;
         r.status = row.status;
         r.reason = row.reason;
@@ -2473,6 +2481,43 @@ fn matches(c: ChangeRow, q: ChangeQuery) -> Bool {
     if q.has_from && at < std::time::unix(q.from) { return false; }
     if q.has_to && at > std::time::unix(q.to) { return false; }
     return true;
+}
+
+/// The keys of `results` still owed: each names the owed entry it answers
+/// (`owed`, `<id>@<version>#<run>`), and is kept only while the row's
+/// `owed` (entries a space between) still holds that entry. A write for an
+/// annotator asked again since, at another version or in another run, is
+/// stale: it keeps nothing.
+@unbounded
+fn owed_results(results: String, owed: String) -> String {
+    let r = std::str::trim(results);
+    if !std::str::starts_with(r, "{") { return "{}"; }
+    let out = JsonList { };
+    let mut it = std::json::object_first(r);
+    while !it.done {
+        let k = std::json::obj_key_string(it, r);
+        let v = std::str::trim(std::json::obj_value_raw(it, r));
+        it = std::json::object_next(it, r);
+        let entry = std::json::find_string_field(v, "owed");
+        if len(entry) > 0 && std::str::contains(" " + owed + " ", " " + entry + " ") {
+            out.add("\"" + std::json::escape_string(k) + "\": " + v);
+        }
+    }
+    return "{" + out.text() + "}";
+}
+
+/// The answers of the annotators whose keys `results` keeps.
+fn owed_answers(answers: AnswerRows, results: String) -> AnswerRows {
+    let mut out = AnswerRows { };
+    for x in answers.rows {
+        if std::str::starts_with(
+            std::str::trim(std::json::find_field_raw(results, x.annotator)),
+            "{",
+        ) {
+            push(out.rows, x) or discard;
+        }
+    }
+    return out;
 }
 
 /// `base`, a JSON object, with `over`'s members put over its own: a member

@@ -81,7 +81,8 @@ It:
   voice-node-<id>`), adding the account to the `docker` group. Stopping the
   unit first stops the model servers the node started (`voice-node
   stop-seats`, its `ExecStop`), then the node; anything still in the unit
-  after 20 s is killed.
+  after 20 s is killed, and once the node is gone, any container a seat
+  started meanwhile is removed (`ExecStopPost`).
 
 It prints no secret. Running it again changes nothing that is already right;
 a node whose enrollment token is gone is given a new one. Exit codes: 0

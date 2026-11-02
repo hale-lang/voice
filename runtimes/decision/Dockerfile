@@ -72,7 +72,7 @@ RUN set -eu; \
 WORKDIR /src
 COPY lib lib
 COPY decide decide
-RUN hale test decide && hale build decide
+RUN hale test decide && hale build --target-cpu baseline decide
 
 # what each backend's image runs on: the libraries its build loads (OpenMP
 # for the CPU's code, the Vulkan loader and Mesa's drivers, CUDA's or ROCm's

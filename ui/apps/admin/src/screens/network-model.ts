@@ -1,28 +1,24 @@
 import type { Account, Node, Schemas, UsageRecord } from '../api/client';
 
-export type CoreKind = 'project' | 'repository' | 'alias' | 'model' | 'api' | 'node' | 'seat' | 'account' | 'system';
+export type CoreKind = 'project' | 'repository' | 'model' | 'api' | 'node' | 'seat' | 'account' | 'system';
 export type Kind = CoreKind | `context:${string}`;
-export const KINDS: CoreKind[] = ['project', 'repository', 'alias', 'model', 'api', 'node', 'seat', 'account', 'system'];
-export const kindName = (kind: Kind): string => kind.startsWith('context:') ? kind.slice(8) : ({ project: 'Project', repository: 'Repository', alias: 'Alias', model: 'Model', api: 'API instance', node: 'Execution host', seat: 'Seat', account: 'Account', system: 'System key' }[kind as CoreKind]);
+export const KINDS: CoreKind[] = ['project', 'repository', 'model', 'api', 'node', 'seat', 'account', 'system'];
+export const kindName = (kind: Kind): string => kind.startsWith('context:') ? kind.slice(8) : ({ project: 'Project', repository: 'Repository', model: 'Model', api: 'API instance', node: 'Execution host', seat: 'Seat', account: 'Account', system: 'System key' }[kind as CoreKind]);
 export const graphKinds = (graph: Graph): Kind[] => [...new Set(graph.vertices.map(v => v.kind))].sort((a, b) => kindName(a).localeCompare(kindName(b)));
 
 export type RequestContext = { repository?: string; apiInstance?: string };
 export type Fleet = { nodes: Node[]; accounts: Account[]; projects: Schemas['Project'][]; usage: UsageRecord[]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[] };
-export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string };
-export type Edge = { id: string; source: string; target: string; kind: 'offers' | 'hosts' | 'pays' | 'names' | 'resolves' | 'observed'; flow?: boolean };
-export type RequestPath = { vertices: string[]; edges: string[]; flowEdges: string[]; context: RequestContext };
+/** `aliases`: on a model, the names projects give it now (`ModelAlias`), each once: a label on the model, never a vertex of its own. */
+export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string; aliases?: string[] };
+/** `standing`: the fleet's standing topology (a project to the api instances, an api instance to every host), drawn faint whether or not anything flows; never traffic. */
+export type Edge = { id: string; source: string; target: string; kind: 'offers' | 'hosts' | 'pays' | 'standing' | 'observed'; flow?: boolean };
+/** `askedAs`: the alias a request named, when it named one; it flows to the model the alias named like any other. */
+export type RequestPath = { vertices: string[]; edges: string[]; flowEdges: string[]; context: RequestContext; askedAs?: string };
 export type Graph = { vertices: Vertex[]; edges: Edge[]; total: number; requests: Map<string, RequestPath> };
 export type Point = { x: number; y: number };
 export const entityId = (kind: Kind, name: string) => `${kind}:${name}`;
 export const edgeId = (a: string, b: string) => [a, b].sort().join('|');
 const link = (...parts: string[]) => '#/' + parts.map(encodeURIComponent).join('/');
-
-/**
- * An alias is a name a project gives a catalog model (`ModelAlias`). Two
- * projects may give one name to different models, so a vertex is a name and
- * the model it names: `coding` → `coder` is one label wherever it is given.
- */
-export const aliasId = (name: string, model: string) => entityId('alias', `${name}→${model}`);
 
 /**
  * The catalog model a request's alias named; none when it named a model. The
@@ -55,9 +51,12 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   const connect = (source: string, target: string, kind: Edge['kind'], flow = false) => {
     if (vertices.has(source) && vertices.has(target)) {
       const id = edgeId(source, target);
-      // Configuration retains its style; the request membership is tracked separately.
-      if (!edges.has(id)) edges.set(id, { id, source, target, kind, flow });
-      else if (flow) edges.set(id, { ...edges.get(id)!, source, target, flow: true });
+      // Configuration retains its style; the request membership is tracked
+      // separately. A standing link something flows over is traffic now
+      const was = edges.get(id);
+      if (!was) edges.set(id, { id, source, target, kind, flow });
+      else if (flow) edges.set(id, { ...was, source, target, kind: was.kind === 'standing' ? 'observed' : was.kind, flow: true });
+      else if (was.kind === 'standing' && kind === 'observed') edges.set(id, { ...was, kind });
       return id;
     }
     return undefined;
@@ -68,13 +67,6 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   const model = (name: string, meaning: string) => {
     const id = entityId('model', name);
     if (!vertices.has(id)) add({ id, name, kind: 'model', state: 'configured', active: 0, href: link('catalog', name), details: [['Catalog model', name], ['Meaning', meaning]] });
-    return id;
-  };
-  const alias = (name: string, target: string, given: string[]) => {
-    const id = aliasId(name, target);
-    const was = vertices.get(id);
-    const by = [...new Set([...(was?.details.find(([k]) => k === 'Given by')?.[1].split(', ').filter(Boolean) ?? []), ...given])];
-    add({ id, name, kind: 'alias', state: 'configured', active: 0, href: by.length === 1 ? link('projects', by[0]!) : undefined, details: [['Alias', name], ['Names', target], ['Given by', by.join(', ')], ['Meaning', 'A name a project gives a catalog model: a request for it is routed and served as that model.']] });
     return id;
   };
   for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: link('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });
@@ -91,12 +83,16 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       connect(entityId('seat', s.ref), entityId('account', s.account), 'pays');
     }
   }
-  // each project's own aliases, after the seats so a model they serve says so:: the project names the model by it
-  for (const p of fleet.projects) for (const a of p.aliases ?? []) {
-    const id = alias(a.name, a.model, [p.id]);
-    connect(entityId('project', p.id), id, 'names');
-    connect(id, model(a.model, 'Named by an alias; not evidence of a seat that serves it.'), 'resolves');
+  // the names projects give models now, their own and those they inherit:
+  // labels on the model, each name once, and who gives it in its detail
+  const givenBy = new Map<string, string[]>();
+  for (const p of fleet.projects) for (const a of p.resolved_aliases ?? p.aliases ?? []) {
+    const id = model(a.model, 'Named by an alias; not evidence of a seat that serves it.');
+    const v = vertices.get(id)!;
+    if (!(v.aliases ??= []).includes(a.name)) v.aliases.push(a.name);
+    givenBy.set(id, [...(givenBy.get(id) ?? []), `${p.id}: ${a.name}`]);
   }
+  for (const [id, by] of givenBy) vertices.get(id)!.details.push(['Aliases', by.join(', ')]);
   for (const r of fleet.usage) {
     // voice's own request for a project (its system key's: an annotation, a
     // title), drawn apart and dotted: project → its system key → the model,
@@ -131,16 +127,11 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     };
     const join = (a: string, b: string, flow = false) => { const id = connect(a, b, 'observed', flow); if (id) { links.push(id); if (flow) flowLinks.push(id); } };
     const project = member('project', r.project);
-    // a request by alias draws through it to the model it named
+    // a request by alias is the model it named, as it was served: the alias
+    // is what it was asked as, kept on its path, never a vertex
     const resolved = resolvedModel(r, fleet.projects);
-    if (resolved) {
-      const named = alias(r.requested_model, resolved.model, []);
-      members.push(named);
-      const target = member('model', resolved.model, resolved.recorded ? 'The catalog model the alias named when the request was admitted.' : 'The model the alias names now; the record predates voice keeping what it named.');
-      join(project, named);
-      // a resolution, not a hop: the flow reaches the model through its account
-      join(named, target);
-    } else member('model', r.requested_model);
+    if (resolved) member('model', resolved.model, resolved.recorded ? 'The catalog model the alias named when the request was admitted.' : 'The model the alias names now; the record predates voice keeping what it named.');
+    else member('model', r.requested_model);
     if (options.context && context.repository) join(project, member('repository', context.repository, 'Caller-supplied metadata.repository; a label, not verified repository ownership.'));
     // its conversation, the prompt_cache_key it was sent with: whatever client
     if (options.context && r.conversation) {
@@ -167,8 +158,14 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       if (api) join(api, host, true);
       else join(project, host, true);
     }
-    requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context });
+    requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context, ...(resolved ? { askedAs: r.requested_model } : {}) });
   }
+  // the standing topology, faint, with or without traffic: every project
+  // reaches the api instances, every api instance every host; after the
+  // requests, so an instance known only from its records is joined too
+  const apis = [...vertices.values()].filter(v => v.kind === 'api').map(v => v.id);
+  for (const p of fleet.projects) for (const a of apis) connect(entityId('project', p.id), a, 'standing');
+  for (const a of apis) for (const n of fleet.nodes) connect(a, entityId('node', n.id), 'standing');
   const visible = [...vertices.values()].slice(0, 160);
   const ids = new Set(visible.map(v => v.id));
   return { vertices: visible, edges: [...edges.values()].filter(e => ids.has(e.source) && ids.has(e.target)), total: vertices.size, requests };
@@ -235,15 +232,6 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
       };
       group.sort((a,b) => meanY(a)-meanY(b) || a.id.localeCompare(b.id));
     }
-    // the terminal column: each alias stacked just above the model it names
-    if (kind === 'model') {
-      const column: Vertex[] = [];
-      for (const m of group) {
-        column.push(...vertices.filter(a => a.kind === 'alias' && neighbors.get(a.id)!.includes(m.id) && !column.includes(a)), m);
-      }
-      column.push(...vertices.filter(a => a.kind === 'alias' && !column.includes(a)));
-      group.splice(0, group.length, ...column);
-    }
     const x = stages.length === 1 ? width / 2 : start + stage * (modelStart - start) / (stages.length - 1);
     group.forEach((v, index) => {
       const hostId = v.parent ?? neighbors.get(v.id)!.find(id => byId.get(id)?.kind === 'node');
@@ -277,8 +265,7 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
       let fx = dx / distance * repulsion, fy = dy / distance * repulsion;
       // Reserve both the glyph and its label, including labels revealed by selection.
       const overlapX = (a.kind === 'seat' && b.kind === 'seat' ? 112 : 158) - Math.abs(dx);
-      const terminal = (k: Kind) => k === 'model' || k === 'alias';
-      const overlapY = (terminal(a.kind) && terminal(b.kind) ? 30 : a.kind === 'seat' && b.kind === 'seat' ? 46 : 82) - Math.abs(dy);
+      const overlapY = (a.kind === 'model' && b.kind === 'model' ? (a.aliases?.length || b.aliases?.length ? 44 : 30) : a.kind === 'seat' && b.kind === 'seat' ? 46 : 82) - Math.abs(dy);
       if (overlapX > 0 && overlapY > 0) {
         if (overlapX < overlapY) fx += Math.sign(dx) * overlapX * .9;
         else fy += Math.sign(dy) * overlapY * .9;
@@ -289,7 +276,7 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
     for (const e of edges) {
       const a = points.get(e.source)!, b = points.get(e.target)!;
       const aa = anchors.get(e.source)!, ba = anchors.get(e.target)!;
-      const structural = e.kind === 'hosts' || e.kind === 'offers' || e.kind === 'resolves' || e.flow;
+      const structural = e.kind === 'hosts' || e.kind === 'offers' || e.flow;
       const strength = (structural ? .065 : .012) / Math.sqrt(Math.max(neighbors.get(e.source)!.length, neighbors.get(e.target)!.length));
       // Springs retain their natural directed span instead of collapsing long context links.
       const fx = ((b.x - a.x) - (ba.x - aa.x)) * strength - (structural ? Math.max(0, 85 - (b.x-a.x)) * .4 : 0);
@@ -307,7 +294,7 @@ export function layoutGraph(graph: Graph, width: number, height: number, pins: R
       const next = constrain({ x: p.x + Math.max(-12,Math.min(12,f.x)) * cooling, y: p.y + Math.max(-12,Math.min(12,f.y)) * cooling });
       // Neural layers retain their alignment; only explicit pins leave a layer.
       p.x = constrain(anchor).x;
-      p.y = v.kind === 'model' || v.kind === 'alias' || v.kind === 'account' ? constrain(anchor).y : next.y;
+      p.y = v.kind === 'model' || v.kind === 'account' ? constrain(anchor).y : next.y;
     }
   }
   return points;

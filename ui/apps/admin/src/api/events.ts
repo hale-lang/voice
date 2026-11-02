@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
+import { addSteps, type Step } from './steps';
 
 type AdminEvent = Schemas['AdminEvent'];
 const listeners = new Set<(event: AdminEvent) => void>();
@@ -52,6 +53,8 @@ export const AFFECTS: Record<string, string[]> = {
   // a request annotated: its annotation, the searches over them, the
   // conversations' titles, and the annotators' counts
   annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/annotators'],
+  // a step of one: told to the step store (steps.ts), no query read again
+  annotation_step: [],
 };
 
 /** What a (re)connect reads again: every admin read, for what was missed. */
@@ -81,6 +84,7 @@ export function deliver(qc: QueryClient, event: AdminEvent) {
   } else if (event.type === 'usage' && flights.some((f) => f.id === event.data.id)) {
     setFlights(flights.filter((f) => f.id !== event.data.id));
   }
+  if (event.type === 'annotation_step') addSteps([event.data as Step]);
   for (const listener of listeners) listener(event);
   if (event.type === 'reset') { refresh(qc, COVERED); return; }
   const paths = [...(AFFECTS[event.type] ?? [])];

@@ -1,6 +1,8 @@
 import { useState } from 'react';
-import { Panel, Status, Mono, Select, Table, Loading, Unavailable, count, ago } from '@hale/components';
+import { Panel, Status, Mono, Select, Table, Loading, Unavailable, Button, count, ago } from '@hale/components';
 import { useGet, useAnnotations, type Annotation, type Schemas } from './api/client';
+import { useWrite } from './api/mutate';
+import { useSteps, stepLabel, type Step } from './api/steps';
 import { readout } from './readout';
 import { href } from './route';
 import { Fold } from './peek';
@@ -15,6 +17,7 @@ const pct = (p: number) => `${Math.round(p * 100)}%`;
 /** The headline of an annotation: the request's task and the response's outcome, when the built-in annotators gave them. */
 export function AnnotationLine({ a }: { a: Annotation | null }) {
   if (!a) return null;
+  if (a.status === 'pending') return <span className="faint" title={`owed to ${(a.owed ?? []).join(', ')}`}>annotating</span>;
   if (a.status !== 'annotated') return <span className="faint" title={a.reason}>not annotated</span>;
   const pick = (annotator: string, question: string) => a.answers.find((x) => x.annotator === annotator && x.question === question && !x.skipped);
   const task = pick('request-basics', 'task');
@@ -38,16 +41,37 @@ export function AnnotationSection({ id }: { id: string }) {
   // read as the Board and the conversation read it, under the same query:
   // a request with no annotation (404) is `null`, not an error
   const q = useAnnotations([id])[0]!;
+  const steps = useSteps(id);
   if (q.isPending) return null;
   if (q.isError) return <p className="faint">Its annotation could not be read: {q.error.message}</p>;
   const a = q.data;
-  if (a === null || a === undefined) return <p className="faint">Not annotated: annotate is off for its project and key, or it is not read yet.</p>;
+  if (a === null || a === undefined) {
+    return (
+      <section>
+        <p className="faint">Not annotated: annotate is off for its project and key, or no annotator was in force when it was served.</p>
+        <RunAnnotation id={id} label="Run annotation" />
+      </section>
+    );
+  }
+  if (a.status === 'pending') {
+    return (
+      <section>
+        <p>
+          <Status tone="active" label="annotating" /> <span className="muted">owed to {(a.owed ?? []).join(', ')}{a.deadline ? `, until ${ago(a.deadline)}` : ''}</span>
+        </p>
+        <LiveSteps steps={steps} />
+        <Runs runs={a.runs} project={a.project} />
+      </section>
+    );
+  }
   if (a.status !== 'annotated') {
     return (
       <section>
         <p>
-          <Status tone="wait" label="not annotated" /> <span className="muted">{a.reason}</span>
+          <Status tone="wait" label="not annotated" /> <span className="muted">{a.reason}</span> <RunAnnotation id={id} label="re-run" />
         </p>
+        <Results a={a} />
+        <LiveSteps steps={steps} />
         <Runs runs={a.runs} project={a.project} />
       </section>
     );
@@ -68,7 +92,10 @@ export function AnnotationSection({ id }: { id: string }) {
           <span className="faint">titled its conversation </span>“{a.title}”
         </p>
       )}
+      <Results a={a} />
       <Runs runs={a.runs} project={a.project} />
+      <LiveSteps steps={steps} />
+      <p style={{ margin: 'var(--space-1) 0' }}><RunAnnotation id={id} label="Run annotation" /></p>
       {a.pairs.filter((p) => p.applies).map((p) => (
         <div key={p.rule}>
           <Status tone={p.met ? 'ok' : 'fail'} label={p.name} /> <span className="faint">{pct(p.probability)}</span>
@@ -122,6 +149,73 @@ export function Runs({ runs, project }: { runs: Run[]; project: string }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/** Each annotator's own result, when one was not made: which, and why. */
+function Results({ a }: { a: Annotation }) {
+  const failed = (a.results ?? []).filter((r) => r.status !== 'annotated');
+  if (!failed.length) return null;
+  return (
+    <div className="muted">
+      {failed.map((r) => (
+        <div key={r.annotator}>
+          <Mono>{r.annotator}</Mono> <span className="faint">v{r.version} · {r.stage}</span> <span className="c-wait">not annotated{r.reason ? `: ${r.reason}` : ''}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A request's annotation steps as they happen, one line each: queued, a
+ * stage started and done (its model, tokens and time), waiting for a seat
+ * and when it is asked again, skipped, titled, kept or not annotated. Read
+ * when the view opens, then followed on the admin stream.
+ */
+export function LiveSteps({ steps }: { steps: Step[] }) {
+  if (!steps.length) return null;
+  return (
+    <div className={s.runs} aria-label="annotation steps">
+      {steps.map((st) => (
+        <div key={st.seq} className={s.run}>
+          <span className="faint">{new Date(st.at).toLocaleTimeString()}</span>{' '}
+          <span className={st.step === 'waiting' || st.step === 'not_annotated' || (st.step === 'done' && st.reason) ? 'c-wait' : st.step === 'queued' || st.step === 'started' || st.step === 'skipped' ? 'faint' : undefined}>
+            {stepLabel(st)}
+          </span>
+          {st.model && <span className="faint"> · {st.model}</span>}
+          {st.step === 'done' && <span className="faint"> · {count(st.input_tokens)} in · {st.ms} ms</span>}
+          {st.reason && st.step !== 'done' && <span className="faint"> · {st.reason}</span>}
+          {st.reason && st.step === 'done' && <span className="c-wait"> · {st.reason}</span>}
+          {st.title && <span className="faint"> · “{st.title}”</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Runs a request's annotation again (`runAnnotation`): every annotator in
+ * force for it, from its held text or its recording. The api's refusal (no
+ * text, annotate off) is said beside it.
+ */
+export function RunAnnotation({ id, label }: { id: string; label: string }) {
+  const w = useWrite();
+  const [queued, setQueued] = useState(false);
+  return (
+    <span>
+      <Button
+        disabled={w.busy}
+        onClick={async () => {
+          const r = await w.write('post', '/admin/v1/annotations/{request_id}/run', { params: { path: { request_id: id } }, body: {} });
+          setQueued(r !== null);
+        }}
+      >
+        {label}
+      </Button>
+      {queued && !w.error && <span className="faint"> queued</span>}
+      {w.error && <span className="c-wait"> {w.error}</span>}
+    </span>
   );
 }
 

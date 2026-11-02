@@ -475,6 +475,55 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
 quiet_cancel quiet "" "$UPSTREAM_PORT" "$QUIET_PORT"
 quiet_cancel nohead nohead "$((UPSTREAM_PORT + 1))" "$((QUIET_PORT + 1))"
 
+# annotations queued on NATS: four requests at once of a project that
+# annotates, on a decision seat that takes one at a time, each stage a
+# message to the queue group; a stage that finds the seat busy waits and is
+# read again, so every one ends annotated, its steps kept in order. A
+# project that does not annotate writes no row.
+DECIDE_PORT=$((UPSTREAM_PORT + 2))
+python3 scripts/decide-upstream.py "$DECIDE_PORT" "$work/decide-upstream.log" 400 &
+pids+=($!)
+for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$DECIDE_PORT") 2>/dev/null && break; sleep 0.1; done
+post /admin/v1/models '{"id": "jev-2b", "contract": "decision"}' >/dev/null
+dtoken=$(post /admin/v1/nodes '{"id": "decider"}' | field enrollment_token)
+post /admin/v1/nodes/decider/seats '{"id": "decide", "engine": "openai-compatible", "account": "static", "serves": [{"model": "jev-2b"}], "config": {"base_url": "http://127.0.0.1:'"$DECIDE_PORT"'", "model": "jev-2b"}}' >/dev/null
+echo '{"max_in_flight": 1, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/decider-caps.json"
+node/node --id decider --api "$api" --token "$dtoken" --data "$work/decider-data" --capabilities "$work/decider-caps.json" --port "$((QUIET_PORT + 2))" --readings-port "$((QUIET_PORT + 1002))" >"$work/decider.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/decider/seats/decide" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
+routed decider/decide
+post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotate": true, "aliases": [{"name": "decide", "model": "jev-2b"}, {"name": "general", "model": "echo-1"}]}' >/dev/null
+nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
+quiet_id=$(curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "not annotated"}' | field id)
+for n in 1 2 3 4; do
+  curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id" &
+done
+wait_ids() { for n in 1 2 3 4; do while [ ! -s "$work/noted-$n.id" ]; do sleep 0.1; done; done; }
+wait_ids
+for i in $(seq 1 120); do
+  settled=0
+  for n in 1 2 3 4; do
+    st=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-$n.id")" 2>/dev/null | field status 2>/dev/null || true)
+    [ "$st" = annotated ] && settled=$((settled + 1))
+    [ "$st" = not_annotated ] && { echo "a queued annotation was not made: $(curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-$n.id")")"; tail -20 "$work/api.log"; exit 1; }
+  done
+  [ "$settled" = 4 ] && break
+  sleep 0.5
+done
+[ "$settled" = 4 ] || { echo "four queued annotations did not all settle: $settled annotated"; tail -20 "$work/api.log"; exit 1; }
+python3 - "$work/decide-upstream.log" <<'PY' || { echo "the decision seat did not take them one at a time"; cat "$work/decide-upstream.log"; exit 1; }
+import json, sys
+asked = [json.loads(l) for l in open(sys.argv[1])]
+assert len(asked) >= 8, len(asked)
+PY
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-1.id")/steps" | python3 -c '
+import json, sys
+steps = [s["step"] for s in json.load(sys.stdin)["data"]]
+assert steps[0] == "queued" and steps[-1] == "kept" and "done" in steps, steps
+' || { echo "the steps were not kept in order"; exit 1; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H @"$work/admin.h" "$api/admin/v1/annotations/$quiet_id")" = 404 ] || { echo "a request of a project that does not annotate has an annotation"; exit 1; }
+echo "four annotations queued at once on a one-at-a-time decision seat, all annotated, their steps kept; a project that does not annotate wrote none"
+
 # a local pause only restricts: the seat is held, and nothing serves
 curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "max_in_flight": null, "reason": "e2e"}' >/dev/null
 wait_for paused

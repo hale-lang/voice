@@ -170,10 +170,15 @@ type RuleRow {
 
 type RuleRows { rows: bounded[RuleRow; 64]; }
 
-/// A request's annotation (api/annotate.hl): annotated, or not and
+/// A request's annotation (api/annotate.hl): `pending` while an
+/// annotator it is owed has not answered, then annotated, or not and
 /// `reason` why; `clipped` when a text read was cut to fit; `body` the
-/// requests that asked, their model and tokens. Its answers are rows of
-/// their own. The request's text is never kept.
+/// requests that asked (`runs`), their model and tokens, and the title.
+/// `owed` names the annotators asked when it was queued (`<id>@<version>`,
+/// a space between), and `annotations` holds each one's result as it
+/// answers (`{"<id>": {"version", "stage", "status", "reason"}}`), so each
+/// writes only its own. Its answers are rows of their own. The request's
+/// text is held apart (`InputRow`) only until it is settled.
 type AnnotationRow {
     request_id: String = "";
     project: String = "";
@@ -184,6 +189,10 @@ type AnnotationRow {
     reason: String = "";
     clipped: Bool = false;
     body: String = "{}";
+    annotations: String = "{}";
+    owed: String = "";
+    // when a pending one gives up: not annotated, past it
+    deadline: Time = `1970-01-01T00:00:00Z`;
     // its place among annotations, in the order they were kept (the admin
     // event stream's `annotation`)
     seq: Int = 0;
@@ -192,6 +201,18 @@ type AnnotationRow {
 
 /// Annotations, newest first.
 type AnnotationRows { rows: bounded[AnnotationRow; 200]; }
+
+/// A request's text, held while its annotation is pending, for whichever
+/// api instance reads it: the standard request as served and its final
+/// response, each JSON, its model and data class.
+type InputRow {
+    request_id: String = "";
+    model: String = "";
+    data_class: String = "internal";
+    input: String = "";
+    output: String = "";
+    present: Bool = false;
+}
 
 /// One answer a request was given: by which annotator, at which version and
 /// stage; its likeliest `answer` and its `probability`, every answer's
@@ -234,6 +255,9 @@ type AnswerQuery {
     from: Time = `1970-01-01T00:00:00Z`;
     has_to: Bool = false;
     to: Time = `1970-01-01T00:00:00Z`;
+    // annotations of this status alone (`pending`, `annotated`,
+    // `not_annotated`); "" any
+    status: String = "";
     limit: Int = 50;
 }
 
@@ -320,6 +344,40 @@ type TitleRow {
 
 /// Titles, the newest made first.
 type TitleRows { rows: bounded[TitleRow; 500]; }
+
+/// One step of a request's annotation as it happens (api/annotate.hl):
+/// `queued` (it will be read), `started` (a stage's request made, `model`
+/// the alias asked), `done` (a stage's run: its tokens, `ms`, and `reason`
+/// when it failed), `waiting` (no seat free: `reason` says when it is
+/// asked again), `skipped` (a stage with no question to ask), `titled`
+/// (the conversation's title written), and its end, `kept` or
+/// `not_annotated` (`reason` why). `seq` orders every step of every
+/// request, as they were kept.
+type StepRow {
+    seq: Int = 0;
+    request_id: String = "";
+    project: String = "";
+    conversation: String = "";
+    at: Time = `1970-01-01T00:00:00Z`;
+    step: String = "";
+    stage: String = "";
+    model: String = "";
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    ms: Int = 0;
+    reason: String = "";
+    title: String = "";
+    present: Bool = false;
+}
+
+/// Annotation steps, oldest first.
+type StepRows { rows: bounded[StepRow; 200]; }
+
+/// Held texts (the memory store's).
+type InputRows { rows: bounded[InputRow; 64]; }
+
+/// The steps an annotation's lifecycle is told in, a space either side.
+const ANNOTATION_STEPS: String = " queued started done waiting skipped titled kept not_annotated ";
 
 /// A request recorded whole, for a project or key that peeks: its standard
 /// request as served and its final response, each the JSON it was.
@@ -903,6 +961,34 @@ interface Store {
     fn annotations(q: AnswerQuery) -> AnnotationRows fallible(StoreError);
     /// Up to `limit` annotations kept after `seq`, oldest first.
     fn annotations_after(seq: Int, limit: Int) -> AnnotationRows fallible(StoreError);
+    /// One annotator's (or one stage's annotators') results added to a
+    /// request's annotation in one write: `results`, a JSON object of
+    /// `annotations` keys, merged over those it had; `answers` replace the
+    /// ones those annotators gave it before; `run`, the request that gave
+    /// them (an `AnnotationRun`, "" for none), added to its `body.runs`.
+    /// Concurrent writes of other annotators' keys are kept.
+    fn put_annotator_results(
+        request_id: String,
+        results: String,
+        answers: AnswerRows,
+        run: String
+    ) fallible(StoreError);
+    /// A pending annotation settled: its `status`, `reason`, `body` and
+    /// `clipped` written, its place among annotations taken anew (told on
+    /// the event stream), and its held text let go. Its `annotations` and
+    /// answers are left as the annotators wrote them.
+    fn settle_annotation(row: AnnotationRow) fallible(StoreError);
+    /// Hold a request's text while its annotation is pending.
+    fn put_annotation_input(row: InputRow) fallible(StoreError);
+    /// A request's held text; `present` false for none.
+    fn annotation_input(request_id: String) -> InputRow fallible(StoreError);
+    /// Keep one step of a request's annotation, `row.seq` given it here;
+    /// steps older than seven days are let go.
+    fn put_annotation_step(row: StepRow) fallible(StoreError);
+    /// Up to `limit` annotation steps kept after `seq`, oldest first.
+    fn annotation_steps_after(seq: Int, limit: Int) -> StepRows fallible(StoreError);
+    /// One request's annotation steps, oldest first, its last 200.
+    fn annotation_steps(request_id: String) -> StepRows fallible(StoreError);
     /// Keep a conversation's title, replacing the one it had.
     fn put_title(row: TitleRow) fallible(StoreError);
     /// A conversation's title; `present` false for none.
@@ -1048,6 +1134,11 @@ locus MemoryStore {
         answer_log: AnswerLog = AnswerLog { };
         // conversations' titles, the newest made first, the last 500
         title_rows: TitleRows = TitleRows { };
+        // the text of the annotations pending, the last 64
+        input_rows: InputRows = InputRows { };
+        // annotation steps, oldest first, the last 200, and the last `seq`
+        step_rows: StepRows = StepRows { };
+        step_seq: Int = 0;
         // requests being served now, and the last `seq` given one
         flight_rows: FlightRows = FlightRows { };
         flight_seq: Int = 0;
@@ -2029,6 +2120,16 @@ locus MemoryStore {
         }
     }
 
+    /// `answers` kept, each annotator's replacing the ones it gave before.
+    fn replace_answers(answers: AnswerRows) {
+        for a in answers.rows {
+            self.drop_answers(a.request_id, a.annotator);
+        }
+        for a in answers.rows {
+            self.keep_answer(a);
+        }
+    }
+
     /// The answers `request_id` has of `annotator` ("" for every one), gone.
     fn drop_answers(request_id: String, annotator: String) {
         let mut i = 0;
@@ -2087,6 +2188,7 @@ locus MemoryStore {
         if len(q.project) > 0 && r.project != q.project { return false; }
         if len(q.key) > 0 && r.key != q.key { return false; }
         if len(q.conversation) > 0 && r.conversation != q.conversation { return false; }
+        if len(q.status) > 0 && r.status != q.status { return false; }
         let at = std::time::unix(r.created_at);
         if q.has_from && at < std::time::unix(q.from) { return false; }
         if q.has_to && at > std::time::unix(q.to) { return false; }
@@ -2143,6 +2245,110 @@ locus MemoryStore {
             if r.seq <= seq { continue; }
             if count(out.rows) >= limit { break; }
             push(out.rows, r) or discard;
+        }
+        return out;
+    }
+
+    @unbounded
+    fn put_annotator_results(
+        request_id: String,
+        results: String,
+        answers: AnswerRows,
+        run: String
+    ) fallible(StoreError) {
+        let had = self.annotation(request_id) or raise;
+        if !had.present { return; }
+        let mut r = had;
+        r.annotations = json_merged(had.annotations, results);
+        if len(run) > 0 { r.body = with_run(had.body, run); }
+        let mut next = AnnotationRows { };
+        for held in self.annotation_rows.rows {
+            push(next.rows, if held.request_id == request_id { r } else { held }) or discard;
+        }
+        self.annotation_rows = next;
+        self.replace_answers(answers);
+    }
+
+    @unbounded
+    fn settle_annotation(row: AnnotationRow) fallible(StoreError) {
+        let had = self.annotation(row.request_id) or raise;
+        if !had.present { return; }
+        let mut r = had;
+        r.status = row.status;
+        r.reason = row.reason;
+        // the runs as they are now, whatever was added since it was read
+        let runs = std::str::trim(std::json::find_field_raw(had.body, "runs"));
+        r.body = json_merged(
+            row.body,
+            "{\"runs\": " + (if std::str::starts_with(runs, "[") { runs } else { "[]" }) + "}",
+        );
+        r.clipped = row.clipped;
+        self.annotation_seq = self.annotation_seq + 1;
+        r.seq = self.annotation_seq;
+        let mut next = AnnotationRows { };
+        for held in self.annotation_rows.rows {
+            push(next.rows, if held.request_id == row.request_id { r } else { held }) or discard;
+        }
+        self.annotation_rows = next;
+        let mut kept = InputRows { };
+        for x in self.input_rows.rows {
+            if x.request_id != row.request_id { push(kept.rows, x) or discard; }
+        }
+        self.input_rows = kept;
+    }
+
+    @unbounded
+    fn put_annotation_input(row: InputRow) fallible(StoreError) {
+        let mut next = InputRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for x in self.input_rows.rows {
+            if x.request_id == row.request_id { continue; }
+            if count(next.rows) < 64 { push(next.rows, x) or discard; }
+        }
+        self.input_rows = next;
+    }
+
+    fn annotation_input(request_id: String) -> InputRow fallible(StoreError) {
+        for x in self.input_rows.rows {
+            if x.request_id == request_id { return x; }
+        }
+        return InputRow { };
+    }
+
+    @unbounded
+    fn put_annotation_step(row: StepRow) fallible(StoreError) {
+        let mut next = StepRows { };
+        let n = count(self.step_rows.rows);
+        // the oldest let go when full: the last 200 kept
+        let mut i = if n >= 200 { 1 } else { 0 };
+        while i < n {
+            push(next.rows, at(self.step_rows.rows, i) or StepRow { }) or discard;
+            i = i + 1;
+        }
+        self.step_seq = self.step_seq + 1;
+        let mut r = row;
+        r.seq = self.step_seq;
+        r.present = true;
+        push(next.rows, r) or discard;
+        self.step_rows = next;
+    }
+
+    fn annotation_steps_after(seq: Int, limit: Int) -> StepRows fallible(StoreError) {
+        let mut out = StepRows { };
+        for r in self.step_rows.rows {
+            if r.seq <= seq { continue; }
+            if count(out.rows) >= limit { break; }
+            push(out.rows, r) or discard;
+        }
+        return out;
+    }
+
+    fn annotation_steps(request_id: String) -> StepRows fallible(StoreError) {
+        let mut out = StepRows { };
+        for r in self.step_rows.rows {
+            if r.request_id == request_id { push(out.rows, r) or discard; }
         }
         return out;
     }
@@ -2267,4 +2473,52 @@ fn matches(c: ChangeRow, q: ChangeQuery) -> Bool {
     if q.has_from && at < std::time::unix(q.from) { return false; }
     if q.has_to && at > std::time::unix(q.to) { return false; }
     return true;
+}
+
+/// `base`, a JSON object, with `over`'s members put over its own: a member
+/// `over` names replaces the one of that name, the others kept in order.
+@unbounded
+fn json_merged(base: String, over: String) -> String {
+    let b = std::str::trim(base);
+    let o = std::str::trim(over);
+    if !std::str::starts_with(o, "{") || o == "{}" { return if len(b) > 0 { b } else { "{}" }; }
+    if !std::str::starts_with(b, "{") || b == "{}" { return o; }
+    let out = JsonList { };
+    let mut it = std::json::object_first(b);
+    while !it.done {
+        let k = std::json::obj_key_string(it, b);
+        let replaced = std::json::string_field(o, k).kind != "missing";
+        if !replaced {
+            out.add(
+                "\"" + std::json::escape_string(k) + "\": "
+                    + std::str::trim(std::json::obj_value_raw(it, b)),
+            );
+        }
+        it = std::json::object_next(it, b);
+    }
+    let mut ot = std::json::object_first(o);
+    while !ot.done {
+        out.add(
+            "\"" + std::json::escape_string(std::json::obj_key_string(ot, o)) + "\": "
+                + std::str::trim(std::json::obj_value_raw(ot, o)),
+        );
+        ot = std::json::object_next(ot, o);
+    }
+    return "{" + out.text() + "}";
+}
+
+/// An annotation's `body` with `run` (an `AnnotationRun`) added to its
+/// `runs`.
+@unbounded
+fn with_run(body: String, run: String) -> String {
+    let b = if std::json::valid_object(std::str::trim(body)) { std::str::trim(body) } else { "{}" };
+    let runs = std::str::trim(std::json::find_field_raw(b, "runs"));
+    let list = JsonList { };
+    let mut it = std::json::array_first(if std::str::starts_with(runs, "[") { runs } else { "[]" });
+    while !it.done {
+        list.add(std::str::trim(it.element));
+        it = std::json::array_next(it);
+    }
+    list.add(std::str::trim(run));
+    return json_merged(b, "{\"runs\": [" + list.text() + "]}");
 }

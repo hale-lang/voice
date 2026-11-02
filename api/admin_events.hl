@@ -34,7 +34,7 @@ fn node_shape(n: NodeRead) -> String {
 }
 
 /// The `type`s a subscriber may ask for.
-const EVENT_TYPES: String = "node usage change request annotation";
+const EVENT_TYPES: String = "node usage change request annotation annotation_step";
 
 /// A node's place in the stream: its id and what it reported (`node_shape`),
 /// as a number. The nodes' marks are numbers so that a subscriber holds no
@@ -68,6 +68,9 @@ locus EventTick {
         // the last annotation told; -1 not known (a place from before
         // annotations were told), taken at the head without telling
         annotation_mark: Int = 0;
+        // the last annotation step told; -1 not known (a place from before
+        // steps were told), taken at the head without telling
+        step_mark: Int = 0;
         // the last request in flight told (not in the stream's place: one
         // that resumes is told what is in flight then)
         flight_mark: Int = 0;
@@ -85,6 +88,7 @@ locus EventTick {
         publish UsageRecorded;
         publish ChangeMade;
         publish AnnotationKept;
+        publish AnnotationStepTaken;
         publish NodeMoved;
         publish RequestsInFlight;
     }
@@ -110,6 +114,7 @@ locus EventTick {
             let c = self.store.changes(st::ChangeQuery { limit: 1 }) or fail store_down(err);
             self.change_mark = (at(c.rows, 0) or st::ChangeRow { }).seq;
             self.annotation_head() or raise;
+            self.step_head() or raise;
             let mut f = self.store.flights_after(self.flight_mark, 100) or fail store_down(err);
             while count(f.rows) > 0 {
                 self.flight_mark = (at(f.rows, count(f.rows) - 1) or st::FlightRow { }).seq;
@@ -137,6 +142,22 @@ locus EventTick {
                         "annotation_" + to_string(r.seq),
                         r.created_at,
                         annotation_event_json(r, answers),
+                    );
+                }
+            }
+            if self.step_mark < 0 { self.step_head() or raise; }
+            if self.wants("annotation_step") {
+                let rows = self.store.annotation_steps_after(
+                    self.step_mark,
+                    200,
+                ) or fail store_down(err);
+                for r in rows.rows {
+                    self.step_mark = r.seq;
+                    self.tell(
+                        "annotation_step",
+                        "step_" + to_string(r.seq),
+                        r.at,
+                        AnnotationStep::api_encode(step_view(r)),
                     );
                 }
             }
@@ -225,6 +246,17 @@ locus EventTick {
         self.annotation_mark = mark;
     }
 
+    /// The newest annotation step's place, told nothing of what came before.
+    fn step_head() fallible(CtlError) {
+        let mut mark = if self.step_mark < 0 { 0 } else { self.step_mark };
+        let mut rows = self.store.annotation_steps_after(mark, 200) or fail store_down(err);
+        while count(rows.rows) > 0 {
+            mark = (at(rows.rows, count(rows.rows) - 1) or st::StepRow { }).seq;
+            rows = self.store.annotation_steps_after(mark, 200) or fail store_down(err);
+        }
+        self.step_mark = mark;
+    }
+
     /// The requests in flight, told whole to the hub when the set is not
     /// the one last told: at most `FLIGHTS_TOLD`, `whole` false past them.
     fn flights_whole() fallible(CtlError) {
@@ -279,6 +311,8 @@ locus EventTick {
             ChangeMade <- rec;
         } else if t == "annotation" {
             AnnotationKept <- rec;
+        } else if t == "annotation_step" {
+            AnnotationStepTaken <- rec;
         } else if t == "node" {
             NodeMoved <- rec;
         } else if t == "requests" {
@@ -316,6 +350,7 @@ locus AdminEvents {
         usage_mark: Int = 0;
         change_mark: Int = 0;
         annotation_mark: Int = 0;
+        step_mark: Int = 0;
         flight_mark: Int = 0;
         node_marks: NodeMarks = NodeMarks { };
     }
@@ -332,12 +367,14 @@ locus AdminEvents {
             usage_mark: self.usage_mark,
             change_mark: self.change_mark,
             annotation_mark: self.annotation_mark,
+            step_mark: self.step_mark,
             flight_mark: self.flight_mark,
             node_marks: self.node_marks,
         };
         self.usage_mark = t.usage_mark;
         self.change_mark = t.change_mark;
         self.annotation_mark = t.annotation_mark;
+        self.step_mark = t.step_mark;
         self.flight_mark = t.flight_mark;
         self.node_marks = t.node_marks;
         if len(t.failure) > 0 {
@@ -354,7 +391,7 @@ locus AdminEvents {
             nodes = nodes + (if len(nodes) > 0 { "," } else { "" }) + to_string(m);
         }
         return "u" + to_string(self.usage_mark) + ".c" + to_string(self.change_mark) + ".a"
-            + to_string(self.annotation_mark) + ".n" + nodes;
+            + to_string(self.annotation_mark) + ".s" + to_string(self.step_mark) + ".n" + nodes;
     }
 
     /// Take the marks from an event id `place` wrote; false when it is
@@ -370,11 +407,16 @@ locus AdminEvents {
         self.usage_mark = std::str::parse_int(id[1..dc]) or - 1;
         self.change_mark = std::str::parse_int(id[(dc + 2)..ends]) or - 1;
         if self.usage_mark < 0 || self.change_mark < 0 { return false; }
+        // `.s<n>` after it: the step told last; a place from before steps
+        // were told has none, and starts at their head
+        let ds = std::str::index_of(id, ".s");
+        let has_steps = ends == da && ds > da && ds < dn;
         self.annotation_mark = if ends == da {
-            std::str::parse_int(id[(da + 2)..dn]) or - 1
+            std::str::parse_int(id[(da + 2)..(if has_steps { ds } else { dn })]) or - 1
         } else {
                 -1
         };
+        self.step_mark = if has_steps { std::str::parse_int(id[(ds + 2)..dn]) or - 1 } else { -1 };
         let mut rest = id[(dn + 2)..len(id)];
         let mut marks = NodeMarks { };
         while len(rest) > 0 {
@@ -490,6 +532,7 @@ locus AdminFeed {
         usage_mark: Int = 0;
         change_mark: Int = 0;
         annotation_mark: Int = 0;
+        step_mark: Int = 0;
         flight_mark: Int = 0;
         flight_set: String = "";
         node_marks: NodeMarks = NodeMarks { };
@@ -518,6 +561,7 @@ locus AdminFeed {
             usage_mark: self.usage_mark,
             change_mark: self.change_mark,
             annotation_mark: self.annotation_mark,
+            step_mark: self.step_mark,
             flight_mark: self.flight_mark,
             flight_set: self.flight_set,
             node_marks: self.node_marks,
@@ -525,6 +569,7 @@ locus AdminFeed {
         self.usage_mark = t.usage_mark;
         self.change_mark = t.change_mark;
         self.annotation_mark = t.annotation_mark;
+        self.step_mark = t.step_mark;
         self.flight_mark = t.flight_mark;
         self.flight_set = t.flight_set;
         self.node_marks = t.node_marks;

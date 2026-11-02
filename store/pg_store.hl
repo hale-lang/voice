@@ -2278,8 +2278,13 @@ locus PgStore {
         a.add(row.reason);
         a.add(if row.clipped { "true" } else { "false" });
         a.add(if len(row.body) > 0 { row.body } else { "{}" });
+        a.add(if len(row.annotations) > 0 { row.annotations } else { "{}" });
+        a.add(row.owed);
+        a.add(
+            if std::time::unix(row.deadline) > 0 { std::time::iso8601(row.deadline) } else { "" },
+        );
         self.step(
-            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body, seq = nextval(pg_get_serial_sequence('annotation', 'seq'))",
+            "INSERT INTO annotation (request_id, project, key, conversation, created_at, status, reason, clipped, body, annotations, owed, deadline) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7, $8::boolean, $9::jsonb, $10::jsonb, coalesce(string_to_array(nullif($11, ''), ' '), '{}'), nullif($12, '')::timestamptz) ON CONFLICT (request_id) DO UPDATE SET status = excluded.status, reason = excluded.reason, clipped = excluded.clipped, body = excluded.body, annotations = excluded.annotations, owed = excluded.owed, deadline = excluded.deadline, seq = nextval(pg_get_serial_sequence('annotation', 'seq'))",
             a,
         ) or raise;
         // each annotator's answers replace the ones it gave before
@@ -2310,6 +2315,138 @@ locus PgStore {
         }
     }
 
+    fn put_annotator_results(
+        request_id: String,
+        results: String,
+        answers: AnswerRows,
+        run: String
+    ) fallible(StoreError) {
+        self.lock.enter();
+        self.put_annotator_results_locked(request_id, results, answers, run) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_annotator_results_locked(
+        request_id: String,
+        results: String,
+        answers: AnswerRows,
+        run: String
+    ) fallible(StoreError) {
+        self.begin() or raise;
+        // one statement: the keys merged over the ones it had, the run
+        // added to its runs, whatever another annotator wrote kept
+        let a = db::Args { };
+        a.add(request_id);
+        a.add(if len(results) > 0 { results } else { "{}" });
+        a.add(if len(run) > 0 { "[" + run + "]" } else { "[]" });
+        self.step(
+            "UPDATE annotation SET annotations = annotations || $2::jsonb, body = jsonb_set(body, '{runs}', coalesce(body->'runs', '[]'::jsonb) || $3::jsonb) WHERE request_id = $1",
+            a,
+        ) or raise;
+        let mut gone = "\n";
+        for x in answers.rows {
+            if !std::str::contains(gone, "\n" + x.annotator + "\n") {
+                gone = gone + x.annotator + "\n";
+                let d = db::Args { };
+                d.add(x.request_id);
+                d.add(x.annotator);
+                self.step(
+                    "DELETE FROM annotation_answer WHERE request_id = $1 AND annotator = $2",
+                    d,
+                ) or raise;
+            }
+        }
+        for x in answers.rows {
+            self.step(
+                "INSERT INTO annotation_answer (request_id, project, key, conversation, created_at, annotator, version, stage, question, answer, probability, score, probabilities, conditioned, skipped) VALUES ($1, $2, $3, $4, $5::timestamptz, $6, $7::int, $8, $9, $10, $11::float8, $12::float8, $13::jsonb, $14::boolean, $15::boolean)",
+                answer_args(x),
+            ) or raise;
+        }
+        self.held = false;
+        let st = self.conn.commit();
+        if !st.ok {
+            self.conn.rollback();
+            fail StoreError { message: "commit: " + st.err.detail };
+        }
+    }
+
+    fn settle_annotation(row: AnnotationRow) fallible(StoreError) {
+        self.lock.enter();
+        self.settle_annotation_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn settle_annotation_locked(row: AnnotationRow) fallible(StoreError) {
+        self.begin() or raise;
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.status);
+        a.add(row.reason);
+        a.add(if row.clipped { "true" } else { "false" });
+        a.add(if len(row.body) > 0 { row.body } else { "{}" });
+        // the runs as they are now, whatever was added since it was read
+        self.step(
+            "UPDATE annotation SET status = $2, reason = $3, clipped = $4::boolean, body = $5::jsonb || jsonb_build_object('runs', coalesce(body->'runs', '[]'::jsonb)), seq = nextval(pg_get_serial_sequence('annotation', 'seq')) WHERE request_id = $1",
+            a,
+        ) or raise;
+        let d = db::Args { };
+        d.add(row.request_id);
+        self.step("DELETE FROM annotation_input WHERE request_id = $1", d) or raise;
+        self.held = false;
+        let st = self.conn.commit();
+        if !st.ok {
+            self.conn.rollback();
+            fail StoreError { message: "commit: " + st.err.detail };
+        }
+    }
+
+    fn put_annotation_input(row: InputRow) fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.model);
+        a.add(row.data_class);
+        a.add(row.input);
+        a.add(row.output);
+        self.write(
+            "INSERT INTO annotation_input (request_id, model, data_class, input, output) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (request_id) DO UPDATE SET model = excluded.model, data_class = excluded.data_class, input = excluded.input, output = excluded.output",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn annotation_input(request_id: String) -> InputRow fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(request_id);
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (SELECT request_id, model, data_class, input, output FROM annotation_input WHERE request_id = $1) t",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        if len(line) == 0 { return InputRow { }; }
+        return InputRow {
+            request_id: pg_text(line, "request_id"),
+            model: pg_text(line, "model"),
+            data_class: pg_text(line, "data_class"),
+            input: pg_text(line, "input"),
+            output: pg_text(line, "output"),
+            present: true,
+        };
+    }
+
     fn annotation(request_id: String) -> AnnotationRow fallible(StoreError) {
         self.lock.enter();
         let out = self.annotation_locked(request_id) or {
@@ -2322,7 +2459,7 @@ locus PgStore {
 
     fn annotation_locked(request_id: String) -> AnnotationRow fallible(StoreError) {
         let line = self.row(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE a.request_id = $1) t",
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE a.request_id = $1) t",
             single_value(request_id),
         ) or raise;
         if len(line) == 0 { return AnnotationRow { }; }
@@ -2371,7 +2508,7 @@ locus PgStore {
         let cond = answer_where(q, a, 1);
         a.add(to_string(if q.limit > 200 { 200 } else { q.limit }));
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE "
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE "
                 + cond
                 + " ORDER BY a.created_at DESC, a.request_id LIMIT $" + to_string(a.count())
                 + "::int) t",
@@ -2404,7 +2541,7 @@ locus PgStore {
         a.add(to_string(seq));
         a.add(to_string(if limit > 200 { 200 } else { limit }));
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq FROM annotation a WHERE a.seq > $1::bigint ORDER BY a.seq LIMIT $2::int) t",
+            "SELECT row_to_json(t) FROM (SELECT a.request_id, a.project, a.key, a.conversation, a.created_at, a.status, a.reason, a.clipped, a.body, a.seq, a.annotations, array_to_string(a.owed, ' ') AS owed, a.deadline FROM annotation a WHERE a.seq > $1::bigint ORDER BY a.seq LIMIT $2::int) t",
             a,
         ) or raise;
         let mut out = AnnotationRows { };
@@ -2415,6 +2552,107 @@ locus PgStore {
             let line = std::str::trim(std::str::slice(v, start, nl));
             start = nl + 1;
             if len(line) > 0 { push(out.rows, annotation_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn put_annotation_step(row: StepRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_annotation_step_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_annotation_step_locked(row: StepRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.request_id);
+        a.add(row.project);
+        a.add(row.conversation);
+        a.add(std::time::iso8601(row.at));
+        a.add(row.step);
+        a.add(row.stage);
+        a.add(row.model);
+        a.add(to_string(row.input_tokens));
+        a.add(to_string(row.output_tokens));
+        a.add(to_string(row.ms));
+        a.add(row.reason);
+        a.add(row.title);
+        let seq = std::str::trim(
+            self.row(
+                "INSERT INTO annotation_step (request_id, project, conversation, at, step, stage, model, input_tokens, output_tokens, ms, reason, title) VALUES ($1, $2, $3, $4::timestamptz, $5, $6, $7, $8::int, $9::int, $10::int, $11, $12) RETURNING seq",
+                a,
+            ) or raise,
+        );
+        // a step is told as it happens, and kept a week: let the older go,
+        // now and then, as steps are added
+        if (std::str::parse_int(seq) or 0) % 500 == 0 {
+            self.write(
+                "DELETE FROM annotation_step WHERE at < now() - interval '7 days'",
+                db::Args { },
+            ) or raise;
+        }
+    }
+
+    fn annotation_steps_after(seq: Int, limit: Int) -> StepRows fallible(StoreError) {
+        self.lock.enter();
+        let out = self.annotation_steps_locked(
+            "s.seq > $1::bigint ORDER BY s.seq LIMIT $2::int",
+            to_string(seq),
+            if limit > 200 { 200 } else { limit },
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return out;
+    }
+
+    fn annotation_steps(request_id: String) -> StepRows fallible(StoreError) {
+        self.lock.enter();
+        // its last 200, told oldest first
+        let out = self.annotation_steps_locked(
+            "s.request_id = $1 ORDER BY s.seq DESC LIMIT $2::int",
+            request_id,
+            200,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        let mut asc = StepRows { };
+        let mut i = count(out.rows) - 1;
+        while i >= 0 {
+            push(asc.rows, at(out.rows, i) or StepRow { }) or discard;
+            i = i - 1;
+        }
+        return asc;
+    }
+
+    /// The steps `filter` keeps (its `$1` `first`, its `$2` `limit`), in
+    /// its order.
+    fn annotation_steps_locked(
+        filter: String,
+        first: String,
+        limit: Int
+    ) -> StepRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(first);
+        a.add(to_string(limit));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT s.seq, s.request_id, s.project, s.conversation, s.at, s.step, s.stage, s.model, s.input_tokens, s.output_tokens, s.ms, s.reason, s.title FROM annotation_step s WHERE "
+                + filter + ") t",
+            a,
+        ) or raise;
+        let mut out = StepRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, step_row(line)) or discard; }
         }
         return out;
     }
@@ -3193,6 +3431,28 @@ fn annotation_row(j: String) -> AnnotationRow {
         clipped: std::json::find_bool_field(j, "clipped"),
         body: raw_or_empty(j, "body"),
         seq: std::json::find_int_field(j, "seq"),
+        annotations: raw_or_empty(j, "annotations"),
+        owed: pg_text(j, "owed"),
+        deadline: pg_time(pg_text(j, "deadline")),
+        present: true
+    };
+}
+
+fn step_row(j: String) -> StepRow {
+    return StepRow {
+        seq: std::json::find_int_field(j, "seq"),
+        request_id: pg_text(j, "request_id"),
+        project: pg_text(j, "project"),
+        conversation: pg_text(j, "conversation"),
+        at: pg_time(pg_text(j, "at")),
+        step: pg_text(j, "step"),
+        stage: pg_text(j, "stage"),
+        model: pg_text(j, "model"),
+        input_tokens: std::json::find_int_field(j, "input_tokens"),
+        output_tokens: std::json::find_int_field(j, "output_tokens"),
+        ms: std::json::find_int_field(j, "ms"),
+        reason: pg_text(j, "reason"),
+        title: pg_text(j, "title"),
         present: true
     };
 }
@@ -3321,6 +3581,10 @@ fn answer_where(q: AnswerQuery, args: db::Args, first: Int) -> String {
     if len(q.conversation) > 0 {
         args.add(q.conversation);
         cond = cond + " AND a.conversation = $" + to_string(args.count());
+    }
+    if len(q.status) > 0 {
+        args.add(q.status);
+        cond = cond + " AND a.status = $" + to_string(args.count());
     }
     if q.has_from {
         args.add(std::time::iso8601(q.from));

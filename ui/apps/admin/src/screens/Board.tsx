@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, type SyntheticEvent } from 'react';
 import { Panel, Loading, Unavailable, count, ago } from '@hale/components';
 import { useGet, useGetOnce, useAnnotations, type UsageRecord, type UsageSummary, type Schemas } from '../api/client';
 import { readout } from '../readout';
+import { useWrite } from '../api/mutate';
+import { useLastStep, stepLabel, settles } from '../api/steps';
 import { useTitles } from '../titles';
 import s from './Board.module.css';
 
@@ -194,14 +196,34 @@ function chips(a: Annotation): { label: string; title: string }[] {
 /**
  * A turn's tags, as its annotation lands (the event stream's `annotation`
  * refreshes it): its answers as chips, the probability on hover; a pending
- * mark while it is still being read; a failed one's reason on hover.
+ * mark while it is still being read, saying its last step (the stream's
+ * `annotation_step`); a failed one's reason on hover, and a re-run; none,
+ * a run.
  */
 function Tags({ id, waiting }: { id: string; waiting: boolean }) {
   // read as the conversation view reads it, one cache: none yet is null
   const q = useAnnotations([id])[0]!;
   const a = q.data;
-  if (!a) return waiting ? <span className={s.pending} title="its annotation is being read">annotating</span> : null;
-  if (a.status !== 'annotated') return <span className={s.failed} title={a.reason}>not annotated</span>;
+  const step = useLastStep(id);
+  const live = step && !settles(step);
+  if (a?.status === 'pending' || (live && a?.status !== 'annotated')) {
+    return (
+      <span className={s.pending} title={a?.owed?.length ? `owed to ${a.owed.join(', ')}` : 'its annotation is being read'}>
+        {step ? stepLabel(step) : 'annotating'}
+      </span>
+    );
+  }
+  if (!a) {
+    if (waiting) return <span className={s.pending} title="its annotation is being read">annotating</span>;
+    return q.isPending ? null : <Run id={id} label="Run annotation" />;
+  }
+  if (a.status !== 'annotated') {
+    return (
+      <>
+        <span className={s.failed} title={a.reason}>not annotated</span> <Run id={id} label="re-run" />
+      </>
+    );
+  }
   const all = chips(a);
   const shown = all.slice(0, 4);
   const rest = all.slice(4);
@@ -218,6 +240,33 @@ function Tags({ id, waiting }: { id: string; waiting: boolean }) {
         </span>
       )}
     </>
+  );
+}
+
+/**
+ * Runs a turn's annotation again (`runAnnotation`), without opening the
+ * row: the api's refusal on hover.
+ */
+function Run({ id, label }: { id: string; label: string }) {
+  const w = useWrite();
+  // a row is a button, so this is a button by role, not a button in one
+  const run = (e: SyntheticEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!w.busy) void w.write('post', '/admin/v1/annotations/{request_id}/run', { params: { path: { request_id: id } }, body: {} });
+  };
+  return (
+    <span
+      role="button"
+      tabIndex={0}
+      className={s.run}
+      aria-disabled={w.busy}
+      title={w.error ?? 'annotate this request again, every annotator in force'}
+      onClick={run}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') run(e); }}
+    >
+      {w.error ? 'refused' : label}
+    </span>
   );
 }
 

@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, Select, TextInput, Checkbox, micros, count, when, ago } from '@hale/components';
 import { toneOf } from '../tone';
-import { useGet, type UsageRecord } from '../api/client';
+import { api, describe, useGet, type UsageRecord, type Schemas } from '../api/client';
+import { useWrite } from '../api/mutate';
+import { useLastStep, stepLabel, settles } from '../api/steps';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
@@ -15,6 +17,11 @@ import { ConversationName } from '../titles';
 /** Requests a page holds. */
 const PAGE = 50;
 
+/** The most requests one run annotates (`runAnnotations`). */
+const RUN_MAX = 500;
+
+type RunOutcome = Schemas['AnnotationRunOutcome'];
+
 /** The board of conversations, live; summaries; then the records behind them, a page at a time. */
 export function Usage({ route, setInspector }: ScreenProps) {
   // `usage/<request>`, or a conversation, `usage/c/<prompt_cache_key>`
@@ -26,9 +33,13 @@ export function Usage({ route, setInspector }: ScreenProps) {
   const cursor = cursors[cursors.length - 1];
   const [filter, setFilterState] = useState<Filter>(NO_FILTER);
   // a new filter starts again at the newest page
+  // the requests chosen to annotate: kept across pages, let go when the
+  // filter changes
+  const [chosen, setChosen] = useState<Set<string>>(new Set());
   const setFilter = (f: Filter) => {
     setFilterState(f);
     setCursors([]);
+    setChosen(new Set());
   };
   const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...query(filter), ...(cursor ? { cursor } : {}) } } });
   const onPage = records.data?.data.find((r) => r.id === selected);
@@ -56,6 +67,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
       <AnnotationsPanel slice={{ project: filter.project || undefined, key: filter.key.trim() || undefined }} />
       <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
         <Filters value={filter} onChange={setFilter} />
+        <Annotate filter={filter} chosen={chosen} setChosen={setChosen} pageIds={records.data?.data.map((r) => r.id) ?? []} />
         {records.isPending ? (
           <Loading what="usage" />
         ) : records.isError ? (
@@ -67,6 +79,24 @@ export function Usage({ route, setInspector }: ScreenProps) {
             selectedKey={selected}
             onSelect={(r) => go('usage', r.id)}
             columns={[
+              {
+                key: 'pick',
+                header: <PageBox ids={records.data.data.map((r) => r.id)} chosen={chosen} setChosen={setChosen} />,
+                render: (r) => (
+                  <input
+                    type="checkbox"
+                    aria-label={`choose ${r.id}`}
+                    checked={chosen.has(r.id)}
+                    onClick={(e) => e.stopPropagation()}
+                    onChange={(e) => {
+                      const n = new Set(chosen);
+                      if (e.target.checked) n.add(r.id);
+                      else n.delete(r.id);
+                      setChosen(n);
+                    }}
+                  />
+                ),
+              },
               { key: 'when', header: 'When', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
               { key: 'id', header: 'Request', render: (r) => <><Mono>{r.id}</Mono>{r.internal && <Internal record={r} />}</> },
               { key: 'project', header: 'Project / key', render: (r) => <><Mono>{r.project}</Mono> <span className="muted">{r.key}</span>{r.conversation && <div className="faint"><ConversationName conversation={r.conversation} project={r.project} /></div>}</> },
@@ -79,6 +109,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
               { key: 'wall', header: 'Wall', num: true, render: (r) => `${r.timing.wall_ms} ms` },
               { key: 'first', header: 'First output', num: true, render: (r) => (r.timing.first_output_ms != null ? `${r.timing.first_output_ms} ms` : <span className="faint">–</span>) },
               { key: 'rate', header: 'Tok/s', num: true, render: (r) => throughput(r) },
+              { key: 'ann', header: 'Annotation', render: (r) => <StepMark id={r.id} /> },
             ]}
             empty="No requests yet."
           />
@@ -92,6 +123,115 @@ export function Usage({ route, setInspector }: ScreenProps) {
       </Panel>
     </>
   );
+}
+
+/** The page's requests, chosen or let go at once. */
+function PageBox({ ids, chosen, setChosen }: { ids: string[]; chosen: Set<string>; setChosen: (s: Set<string>) => void }) {
+  const all = ids.length > 0 && ids.every((id) => chosen.has(id));
+  return (
+    <input
+      type="checkbox"
+      aria-label="choose this page"
+      checked={all}
+      ref={(el) => { if (el) el.indeterminate = !all && ids.some((id) => chosen.has(id)); }}
+      onChange={(e) => {
+        const n = new Set(chosen);
+        for (const id of ids) {
+          if (e.target.checked) n.add(id);
+          else n.delete(id);
+        }
+        setChosen(n);
+      }}
+    />
+  );
+}
+
+/** A request's annotation as its steps tell it, while this view watches: its last step. */
+function StepMark({ id }: { id: string }) {
+  const step = useLastStep(id);
+  if (!step) return null;
+  return <span className={settles(step) ? (step.step === 'kept' ? undefined : 'c-wait') : 'faint'} title={step.reason || undefined}>{stepLabel(step)}</span>;
+}
+
+/**
+ * The chosen requests annotated now (`runAnnotations`): every annotator in
+ * force for each, or the one picked. The chosen are this page's, or every
+ * request the filter matches (up to `RUN_MAX`, the most one run takes);
+ * each comes back queued, or refused and why, and those refused are said
+ * in one line. Each queued one's steps show on its row as they happen.
+ */
+function Annotate({ filter, chosen, setChosen, pageIds }: { filter: Filter; chosen: Set<string>; setChosen: (s: Set<string>) => void; pageIds: string[] }) {
+  const annotators = useGet('/admin/v1/annotators');
+  const [annotator, setAnnotator] = useState('');
+  const [outcomes, setOutcomes] = useState<RunOutcome[] | null>(null);
+  const [gathering, setGathering] = useState<string | null>(null);
+  const w = useWrite();
+  // how many requests the filter matches, from usage's own totals
+  const total = useGet('/admin/v1/usage/summary', { params: { query: { group_by: ['internal'], ...query(filter) } } });
+  const matching = total.data?.data.reduce((n, g) => n + g.requests, 0);
+  const allPage = pageIds.length > 0 && pageIds.every((id) => chosen.has(id));
+  async function chooseAll() {
+    setGathering('reading the matching requests…');
+    const ids = new Set<string>();
+    let cursor: string | undefined;
+    try {
+      do {
+        const r = await api.GET('/admin/v1/usage', { params: { query: { ...query(filter), limit: 1000, ...(cursor ? { cursor } : {}) } } });
+        if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+        for (const x of r.data.data) if (ids.size < RUN_MAX) ids.add(x.id);
+        cursor = r.data.next_cursor ?? undefined;
+      } while (cursor && ids.size < RUN_MAX);
+      setChosen(ids);
+      setGathering(null);
+    } catch (e) {
+      setGathering(e instanceof Error ? e.message : String(e));
+    }
+  }
+  async function run() {
+    const ids = [...chosen].slice(0, RUN_MAX);
+    const r = await w.write('post', '/admin/v1/annotation-runs', { body: { request_ids: ids, ...(annotator ? { annotator } : {}) } });
+    if (r) setOutcomes(r.data);
+  }
+  const refused = outcomes?.filter((o) => !o.queued) ?? [];
+  const queued = outcomes ? outcomes.length - refused.length : 0;
+  if (!chosen.size && !outcomes) return null;
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)', alignItems: 'center', margin: 'var(--space-2) 0' }} aria-label="annotate the chosen requests">
+      <span><b>{count(chosen.size)}</b> selected</span>
+      {allPage && matching != null && matching > chosen.size && (
+        <Button onClick={() => void chooseAll()} disabled={!!gathering && gathering.endsWith('…')}>
+          select all {count(Math.min(matching, RUN_MAX))} matching{matching > RUN_MAX ? ` (of ${count(matching)}, the most one run takes)` : ''}
+        </Button>
+      )}
+      {gathering && <span className="faint">{gathering}</span>}
+      <Select
+        value={annotator}
+        onChange={setAnnotator}
+        options={[{ value: '', label: 'every annotator in force' }, ...(annotators.data?.data ?? []).filter((a) => a.enabled).map((a) => ({ value: a.id, label: a.id }))]}
+      />
+      <Button tone="primary" onClick={() => void run()} disabled={w.busy || !chosen.size}>Annotate selected</Button>
+      {chosen.size > 0 && <Button onClick={() => { setChosen(new Set()); setOutcomes(null); }}>clear</Button>}
+      {w.error && <span className="c-wait">{w.error}</span>}
+      {outcomes && (
+        <span className="muted" aria-label="annotate outcome">
+          {count(queued)} queued
+          {refused.length > 0 && (
+            <span className="c-wait" title={refused.map((o) => `${o.request_id}: ${o.message}`).join('\n')}>
+              {' '}· {count(refused.length)} refused: {refusedLine(refused)}
+            </span>
+          )}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** The refused, counted by why: "3 no text, 1 unknown". */
+function refusedLine(refused: RunOutcome[]): string {
+  const by = new Map<string, number>();
+  for (const o of refused) by.set(o.reason, (by.get(o.reason) ?? 0) + 1);
+  const words: Record<string, string> = { unknown: 'unknown', no_text: 'no text held or recorded', not_annotating: 'annotate off', no_annotator: 'no annotator in force' };
+  return [...by.entries()].map(([r, n]) => `${n} ${words[r] ?? r}`).join(', ');
 }
 
 /** A record that is not on the page shown: read by its id. */

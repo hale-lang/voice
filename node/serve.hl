@@ -36,6 +36,13 @@ type ServeStop { request_id: String = ""; }
 
 topic ServeCancel { payload: ServeStop; }
 
+/// The session has stopped taking requests as the node drains: no
+/// hand-off follows it. Published after the session's last `ServeJob`,
+/// on the same thread, so a slot sees every hand-off before this.
+type Stopping { at: Int = 0; }
+
+topic SessionStopped { payload: Stopping; }
+
 /// A slot is free again: what it served, and how it went, for the
 /// session's readings and its load.
 type ServeReport {
@@ -63,18 +70,31 @@ locus Server {
         cancelled: Bool = false;
         // monotonic ns of the last look at the bus while serving
         looked: Int = 0;
+        // the session has stopped taking requests: no hand-off follows
+        handoffs_over: Bool = false;
     }
 
     bus {
         subscribe ServeJob as on_job where key == replica;
         subscribe ServeCancel as on_cancel;
+        subscribe SessionStopped as on_session_stopped;
         publish ServeDone;
     }
 
     run() {
-        while true {
+        // a stop (SIGTERM, `systemctl stop`) drains the node: the session
+        // stops taking requests and says so (`SessionStopped`), and a slot
+        // serves what it was handed, waiting or arriving before that, then
+        // returns
+        while !(self.draining && self.handoffs_over && !self.waiting) {
             self.step();
         }
+    }
+
+    /// No hand-off follows: once the node drains, the slot may return when
+    /// it holds nothing.
+    fn on_session_stopped(s: Stopping) {
+        self.handoffs_over = true;
     }
 
     /// One turn: a request handed it is served; else its connection

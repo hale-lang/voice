@@ -151,14 +151,18 @@ jobs:
           handed secret-dna_ci-claude-token--work install --id ci-linux --api http://127.0.0.1:8080 --port 8083
           sudo test -e "$HOME/.voice/vault/claude-token--work"
           sudo test ! -e "$HOME/.voice/vault/claude-token--personal-1"
-          # stopped, nothing of the node's is left in its unit's group, and the
-          # stop does not wait out a timeout: a server it started that holds
-          # SIGTERM (as a seat's first process may) is ended by the unit's
-          # ExecStop, so the stop takes seconds, not systemd's default 90
+          # stopped, the node drains: systemd signals it alone, it tells the
+          # api it is stopping and its drain stops the servers it started (a
+          # server that holds SIGTERM, as a seat's first process may, is
+          # killed after its grace), so the stop takes seconds, not
+          # systemd's default 90, and nothing of the node's is left in its
+          # unit's group; ExecStopPost is the backstop
           unit_file=/etc/systemd/system/voice-node-ci-linux.service
-          grep -q '^ExecStop=.*"stop-seats"' "$unit_file"
+          if grep -q '^ExecStop=' "$unit_file"; then echo "the unit stops its servers before the node drains"; exit 1; fi
           grep -q '^ExecStopPost=.*"stop-seats"' "$unit_file"
+          grep -qx 'KillMode=mixed' "$unit_file"
           grep -qx 'TimeoutStopSec=20' "$unit_file"
+          since=$(date '+%Y-%m-%d %H:%M:%S')
           cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value voice-node-ci-linux)
           sh -c 'trap "" TERM; exec sleep 600' & held=$!
           echo "$held" | sudo tee "$cg/cgroup.procs" >/dev/null
@@ -167,6 +171,10 @@ jobs:
           t0=$(date +%s); sudo systemctl stop voice-node-ci-linux; took=$(( $(date +%s) - t0 ))
           echo "the node's unit stopped in ${took}s"
           test "$took" -lt 10
+          # it drained: its runner stopped the servers, and it left cleanly
+          sudo journalctl -u voice-node-ci-linux --since "$since" --no-pager | tee "$RUNNER_TEMP/stop.log" | tail -20
+          grep -q "stopped the seats' servers" "$RUNNER_TEMP/stop.log"
+          if grep -q "status=1/FAILURE\|code=killed" "$RUNNER_TEMP/stop.log"; then echo "the node did not stop cleanly"; exit 1; fi
           # ended: gone, or a zombie this shell has yet to reap
           case "$(ps -o stat= -p "$held" 2>/dev/null)" in ""|Z*) ;; *) echo "the held server outlived the stop"; exit 1 ;; esac
           test -z "$(cat "$cg/cgroup.procs" 2>/dev/null)"

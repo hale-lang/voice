@@ -124,6 +124,10 @@ fn relative_path(p: String) -> Bool {
             || std::str::contains(p, "/../"));
 }
 
+/// How long one read of a download waits before the fetch looks at a
+/// stop again: the stream stays open across it.
+const PUMP_WAIT_MS: Int = 1000;
+
 locus Fetcher {
     params {
         data: String = "node-data";
@@ -142,7 +146,9 @@ locus Fetcher {
     }
 
     run() {
-        while true {
+        // a stop (SIGTERM, `systemctl stop`) drains the node: each loop
+        // returns, then its locus's `drain()` and `dissolve()` run
+        while !self.draining {
             self.step();
         }
     }
@@ -419,6 +425,9 @@ locus Blobs {
         let mut got = offset;
         let mut next = got + REPORT_BYTES;
         while true {
+            // a stop ends the download; what is written stays in the part,
+            // which the next start resumes from
+            if self.draining { return name + ": stopped, the node is stopping"; }
             let n = self.pump(r, f);
             if n == -1 { return ""; }
             if n < 0 { return name + ": " + self.why; }
@@ -436,11 +445,13 @@ locus Blobs {
         return "";
     }
 
-    /// One piece of the body, read and written: its length, -1 at the end,
-    /// -2 when it could not be read or written (`why` says). A call of its
-    /// own, so a piece is let go once it is written.
+    /// One piece of the body, read and written: its length (0 when none
+    /// came within `PUMP_WAIT_MS`, so the loop can look at a stop), -1 at
+    /// the end, -2 when it could not be read or written (`why` says). A
+    /// call of its own, so a piece is let go once it is written.
     fn pump(r: std::http::BodyReader, f: std::io::file::File) -> Int {
-        let b = r.chunk() or {
+        let b = r.chunk_within(PUMP_WAIT_MS) or {
+            if err.kind == "idle" { return 0; }
             if err.kind == "end" { return -1; }
             self.why = err.kind + ": " + err.detail;
             return -2;

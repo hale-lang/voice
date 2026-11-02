@@ -496,9 +496,15 @@ post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotat
 nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
 quiet_id=$(curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "not annotated"}' | field id)
 for n in 1 2 3 4; do
-  curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id" &
+  curl -fsS --max-time 60 -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id" &
 done
-wait_ids() { for n in 1 2 3 4; do while [ ! -s "$work/noted-$n.id" ]; do sleep 0.1; done; done; }
+# each answered within a minute, or the case fails with what the api said
+wait_ids() {
+  for n in 1 2 3 4; do
+    for i in $(seq 1 1200); do [ -s "$work/noted-$n.id" ] && break; sleep 0.1; done
+    [ -s "$work/noted-$n.id" ] || { echo "request $n of the four was not answered"; tail -40 "$work/api.log"; tail -20 "$work/decider.log"; exit 1; }
+  done
+}
 wait_ids
 for i in $(seq 1 120); do
   settled=0

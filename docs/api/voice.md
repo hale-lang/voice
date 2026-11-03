@@ -1768,9 +1768,15 @@ The operator puts a local model on nodes; the coordinator picks the
 form of its weights (a variant of its recipe) and the runtime that
 serves it: a runtime that reads the variant's format on the nodes'
 platform and accelerator, and a variant that fits them as they
-declared their hardware. It says why for each variant. A variant or
-runtime the operator names is taken only if it fits. Refused when
-none fits, with each variant's reason.
+declared their hardware. Of those that fit, the form the machine
+serves best comes first: MLX on Metal, GGUF on ROCm and Vulkan,
+safetensors on CUDA, except a small model's (its largest variant
+under 8 GiB, about 4B parameters at 16 bits), which on CUDA takes
+its GGUF on llama-server, up in seconds where vLLM warms up for a
+minute or two. Then the most faithful weights there is room for. It
+says why for each variant. A variant or runtime the operator names
+is taken only if it fits. Refused when none fits, with each
+variant's reason.
 
 It creates the seat that serves it: `<leader>/<id>`, on the leader's
 managed engine, spending `account`, serving `model`, its config the

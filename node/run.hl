@@ -250,6 +250,7 @@ locus Runner {
                 models,
                 self.data + "/blobs",
                 gpu_args(std::json::find_string_field(runtime, "accelerator")),
+                server_cache_args(server, self.data, std::json::find_string_field(runtime, "id")),
                 std::json::find_string_field(artifact, "image") + "@"
                     + std::json::find_string_field(artifact, "digest"),
                 server_args(
@@ -589,6 +590,7 @@ fn container_argv(
     models: String,
     blobs: String,
     gpu: String,
+    cache: String,
     image: String,
     args: String
 ) -> String {
@@ -602,7 +604,30 @@ fn container_argv(
     // the hub; and room in shared memory, which vLLM's workers need
         + "-e\nHF_HUB_OFFLINE=1\n-e\nTRANSFORMERS_OFFLINE=1\n--shm-size\n8g\n"
         + gpu
+        + cache
         + image + "\n" + args;
+}
+
+/// The caches a vLLM server fills as it starts, kept between its starts so
+/// a seat started again skips that work: its compiled graphs
+/// (`torch.compile`, under `vllm/`) and FlashInfer's kernel autotune (under
+/// `flashinfer/`), which were most of a restart's time. They are the node's
+/// own, under its data directory (`cache/<runtime>/`), one directory per
+/// runtime, so a server of another version never reads them; vLLM keys its
+/// compile cache by the model and its settings, and FlashInfer its autotune
+/// by version and GPU, so seats of one runtime share them safely. Only those
+/// two are mounted: the rest of the image's `/root/.cache` (a tokenizer's
+/// files, which a model needs offline) stays the image's. A tens-of-megabytes
+/// store, removed with the node's data. "" for any other server.
+fn server_cache_args(server: String, data: String, runtime_id: String) -> String {
+    if server != "vllm" || len(runtime_id) == 0 { return ""; }
+    let root = data + "/cache/" + runtime_id;
+    std::io::fs::mkdir(data + "/cache") or discard;
+    std::io::fs::mkdir(root) or discard;
+    std::io::fs::mkdir(root + "/vllm") or discard;
+    std::io::fs::mkdir(root + "/flashinfer") or discard;
+    return "-v\n" + root + "/vllm:/root/.cache/vllm\n-v\n" + root
+        + "/flashinfer:/root/.cache/flashinfer\n";
 }
 
 /// What `docker run` needs to hand a container its runtime's accelerator,

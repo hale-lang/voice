@@ -53,6 +53,9 @@ type Run {
     asked: Int = 0;
     // what it holds of the memory for models (`footprint`)
     footprint: Int = 0;
+    // what it serves (`serving_identity`): a seat assigned again with
+    // another is replaced, one with the same is left serving
+    identity: String = "";
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -117,20 +120,37 @@ locus Runner {
         std::time::sleep(500ms);
     }
 
+    /// A seat whose weights and runtime the fetcher verified, to run. A
+    /// seat already served is left serving when it is assigned what it
+    /// serves, and replaced when it is assigned another server (its
+    /// runtime, its variant, what its server is started with): the old
+    /// server served while the new one was fetched, and is stopped, all of
+    /// it, before the new one starts, so the two never hold memory at once.
     @unbounded
     fn on_wanted(j: RunJob) {
         // a fetch that finished after its seat was withdrawn starts nothing
         if !self.holds(j.seat) { return; }
-        if std::str::contains("\n" + self.queue, "\n" + j.seat + "\t") { return; }
+        // a start still waiting takes the config asked for last
+        self.queue = queue_without(self.queue, j.seat);
+        let mut next = Runs { };
+        let mut replaced = false;
         for r in self.runs.items {
-            // a seat already served, asked for again when an assignment
-            // changes: the fetcher just said `starting` of it, so it is told
-            // up again (one still starting says so when it answers)
             if r.seat == j.seat {
-                if r.phase == "up" { self.tell_up(r); }
-                return;
+                if wanted_action(r.identity, j.config) == "keep" {
+                    // asked for again when an assignment changes: the
+                    // fetcher just said `starting` of it, so it is told up
+                    // again (one still starting says so when it answers)
+                    if r.phase == "up" { self.tell_up(r); }
+                    return;
+                }
+                self.tell(j.seat, "starting", "its server is replaced: it is assigned another", "");
+                self.stop(r);
+                replaced = true;
+            } else {
+                push(next.items, r) or discard;
             }
         }
+        if replaced { self.runs = next; }
         self.queue = self.queue + j.seat + "\t" + std::json::escape_string(j.config) + "\n";
     }
 
@@ -213,6 +233,7 @@ locus Runner {
         }
         let mut r = Run {
             seat: seat,
+            identity: serving_identity(config),
             server: server,
             port: port,
             footprint: need,
@@ -350,14 +371,9 @@ locus Runner {
         self.runs = next;
     }
 
-    /// Stop a server: its container removed, or its process ended.
+    /// A server stopped (`stop_run`).
     fn stop(r: Run) {
-        if len(r.container) > 0 {
-            run_out("docker\nrm\n-f\n" + r.container);
-        } else {
-            run_out("kill\n" + to_string(r.pid));
-            std::io::fs::unlink(self.data + "/run/" + r.seat + ".pid") or discard;
-        }
+        stop_run(self.data, r);
     }
 
     /// What a node that stopped left running, stopped (`stop_left`).
@@ -408,6 +424,7 @@ locus Runner {
             reason: "",
             endpoint: r.endpoint,
             context: r.context,
+            by_runner: true,
         };
     }
 
@@ -417,6 +434,7 @@ locus Runner {
             status: status,
             reason: reason,
             endpoint: endpoint,
+            by_runner: true,
         };
     }
 }
@@ -671,6 +689,64 @@ fn find_program(dir: String, program: String) -> String {
         if std::io::fs::file_exists(sub + "/" + program) { return sub + "/" + program; }
     }
     return "";
+}
+
+/// What a managed seat's config has its server serve, as one text: its
+/// runtime (the server, the accelerator, the artifact it is pinned to), its
+/// variant (the files and what they are), and what its server is started
+/// with (the model it goes by, the context and cache it takes, the memory
+/// reserved for it). Two configs with the same are served by the same
+/// server; anything else in a config (its placement's id, a field voice
+/// adds later) never restarts one.
+@unbounded
+fn serving_identity(config: String) -> String {
+    let b = std::bytes::BytesBuilder { };
+    for key in ["runtime", "variant", "model", "context_length", "cache_tokens", "reserved_bytes"] {
+        b.append_str(key);
+        b.append_str("=");
+        b.append_str(std::str::trim(std::json::find_field_raw(config, key)));
+        b.append_str("\n");
+    }
+    return std::str::clone(b.text_view());
+}
+
+/// What a running seat does when it is asked for with `config`: "keep" it
+/// serving when it serves the same (`serving_identity`), else "replace" it.
+fn wanted_action(identity: String, config: String) -> String {
+    return if identity == serving_identity(config) { "keep" } else { "replace" };
+}
+
+/// A queue of seats (a line each: the seat, a tab, its config) without
+/// `seat`'s line.
+@unbounded
+fn queue_without(queue: String, seat: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let v = std::str::bytes_view(queue);
+    let mut at_ = 0;
+    while at_ < v.n {
+        let nl = line_end(v, at_);
+        let line = std::str::slice(v, at_, nl);
+        at_ = nl + 1;
+        let tab = std::str::index_of(line, "\t");
+        if tab > 0 && line[0..tab] != seat {
+            out.append_str(line);
+            out.append_str("\n");
+        }
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// A server stopped, all of it: its container removed, or its process
+/// ended (`end_process`) and its pid file gone. It returns once the server
+/// holds nothing, so what replaces it never runs beside it.
+@unbounded
+fn stop_run(data: String, r: Run) {
+    if len(r.container) > 0 {
+        run_out("docker\nrm\n-f\n" + r.container);
+    } else {
+        if r.pid > 0 { end_process(r.pid); }
+        std::io::fs::unlink(data + "/run/" + r.seat + ".pid") or discard;
+    }
 }
 
 /// A process ended: asked to stop (TERM), then, if it is still there after

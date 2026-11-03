@@ -16,11 +16,11 @@ URL and sha256. A runtime names no command.
 | `llama-server-b11913-vulkan` | gguf | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-vulkan-b11913` |
 | `llama-server-b11913-metal` | gguf | Metal, macOS arm64 | llama.cpp's b11913 release for macOS arm64 |
 | `decision-0.3.0-mlx` | mlx, decision models only | Metal, macOS arm64 | voice's own archive, built by [`decision-mlx/build.sh`](decision-mlx/build.sh) |
-| `decision-0.1.1-metal` | gguf, decision models only | Metal, macOS 14+ arm64 | voice's own archive: `voice-decide` and `jev-score-v2`, built by [`decision/build.sh`](decision/build.sh) |
-| `decision-0.1.0-cpu` | gguf, decision models only | CPU, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cpu-0.1.0` |
-| `decision-0.1.0-vulkan` | gguf, decision models only | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:vulkan-0.1.0` |
-| `decision-0.1.0-rocm` | gguf, decision models only | ROCm (AMD), linux x86_64 | `ghcr.io/hale-lang/voice-decision:rocm-0.1.0` |
-| `decision-0.1.0-cuda` | gguf, decision models only | CUDA, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cuda-0.1.0` |
+| `decision-0.1.2-metal` | gguf, decision models only | Metal, macOS 14+ arm64 | voice's own archive: `voice-decide` and `jev-score-v2`, built by [`decision/build.sh`](decision/build.sh) |
+| `decision-0.1.2-cpu` | gguf, decision models only | CPU, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cpu-0.1.2` |
+| `decision-0.1.2-vulkan` | gguf, decision models only | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:vulkan-0.1.2` |
+| `decision-0.1.2-rocm` | gguf, decision models only | ROCm (AMD), linux x86_64 | `ghcr.io/hale-lang/voice-decision:rocm-0.1.2` |
+| `decision-0.1.2-cuda` | gguf, decision models only | CUDA, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cuda-0.1.2` |
 
 The operator is the authority on what may run: they allow more runtimes on
 the admin plane (`POST /admin/v1/runtimes`). These are read by the api at
@@ -54,7 +54,7 @@ a pull request that touches it is held to the pinned sha256, and the release
 asset is published only by running that workflow, from a build that matches the pin, and the node runs it under the macOS sandbox
 like every archive runtime.
 
-## `decision-0.1.0-*`
+## `decision-0.1.2-*`
 
 Voice's decision server built natively: `voice-decide` (the
 [`decide/`](../decide) seed) and the scorer it runs, `jev-score-v2`

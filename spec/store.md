@@ -1002,3 +1002,17 @@ delete from conversation_title where title like '<%';
 insert into annotator_version (annotator, version, body) select 'conversation-title', 2, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where exists (select 1 from annotator where id = 'conversation-title' and builtin and version = 1) on conflict (annotator, version) do nothing;
 update annotator set version = 2, body = '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where id = 'conversation-title' and builtin and version = 1;
 ```
+
+### Migration 27: the decision runtimes, built for any CPU
+
+Voice's native decision runtimes are rebuilt as `decision-0.1.2-*`, their
+`voice-decide` built for hale's portable baseline CPU: the `0.1.0` images
+and the `0.1.1` Metal archive carried a build tuned to the CPU of the
+runner that made it. A placement that names one of those runtimes, as its
+choice or in its fit, names its `0.1.2` replacement, so its nodes fetch
+the new build.
+
+```sql
+update placement set body = jsonb_set(body, '{runtime}', to_jsonb(m.new)) from (values ('decision-0.1.0-cpu', 'decision-0.1.2-cpu'), ('decision-0.1.0-vulkan', 'decision-0.1.2-vulkan'), ('decision-0.1.0-rocm', 'decision-0.1.2-rocm'), ('decision-0.1.0-cuda', 'decision-0.1.2-cuda'), ('decision-0.1.1-metal', 'decision-0.1.2-metal')) as m(old, new) where placement.body->>'runtime' = m.old;
+update placement set body = jsonb_set(body, '{fit}', (select jsonb_agg(case when f->>'runtime' in ('decision-0.1.0-cpu', 'decision-0.1.0-vulkan', 'decision-0.1.0-rocm', 'decision-0.1.0-cuda', 'decision-0.1.1-metal') then jsonb_set(f, '{runtime}', to_jsonb(replace(replace(f->>'runtime', 'decision-0.1.0-', 'decision-0.1.2-'), 'decision-0.1.1-', 'decision-0.1.2-'))) else f end order by n) from jsonb_array_elements(body->'fit') with ordinality as e(f, n))) where jsonb_typeof(body->'fit') = 'array' and exists (select 1 from jsonb_array_elements(body->'fit') f where f->>'runtime' in ('decision-0.1.0-cpu', 'decision-0.1.0-vulkan', 'decision-0.1.0-rocm', 'decision-0.1.0-cuda', 'decision-0.1.1-metal'));
+```

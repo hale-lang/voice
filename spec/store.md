@@ -1009,10 +1009,19 @@ Voice's native decision runtimes are rebuilt as `decision-0.1.2-*`, their
 `voice-decide` built for hale's portable baseline CPU: the `0.1.0` images
 and the `0.1.1` Metal archive carried a build tuned to the CPU of the
 runner that made it. A placement that names one of those runtimes, as its
-choice or in its fit, names its `0.1.2` replacement, so its nodes fetch
-the new build.
+choice or in its fit, names its `0.1.2` replacement; and the runtime its
+seat runs, which the seat's config holds whole and its node is assigned
+from, is that replacement's, its id and its artifact's pin, so the node
+fetches the new build. A seat still holding the MLX build's definition
+from before the decision server had its name (migration 22 renamed the
+placement, not the seat's copy) holds `decision-0.3.0-mlx`'s, its server
+`decision`. Each node holding such a seat has its assignment's version
+moved on, so the api sends it the new one when the node next reports.
 
 ```sql
 update placement set body = jsonb_set(body, '{runtime}', to_jsonb(m.new)) from (values ('decision-0.1.0-cpu', 'decision-0.1.2-cpu'), ('decision-0.1.0-vulkan', 'decision-0.1.2-vulkan'), ('decision-0.1.0-rocm', 'decision-0.1.2-rocm'), ('decision-0.1.0-cuda', 'decision-0.1.2-cuda'), ('decision-0.1.1-metal', 'decision-0.1.2-metal')) as m(old, new) where placement.body->>'runtime' = m.old;
 update placement set body = jsonb_set(body, '{fit}', (select jsonb_agg(case when f->>'runtime' in ('decision-0.1.0-cpu', 'decision-0.1.0-vulkan', 'decision-0.1.0-rocm', 'decision-0.1.0-cuda', 'decision-0.1.1-metal') then jsonb_set(f, '{runtime}', to_jsonb(replace(replace(f->>'runtime', 'decision-0.1.0-', 'decision-0.1.2-'), 'decision-0.1.1-', 'decision-0.1.2-'))) else f end order by n) from jsonb_array_elements(body->'fit') with ordinality as e(f, n))) where jsonb_typeof(body->'fit') = 'array' and exists (select 1 from jsonb_array_elements(body->'fit') f where f->>'runtime' in ('decision-0.1.0-cpu', 'decision-0.1.0-vulkan', 'decision-0.1.0-rocm', 'decision-0.1.0-cuda', 'decision-0.1.1-metal'));
+update node set assignment_version = assignment_version + 1 where id in (select seat.node from seat where seat.config->'runtime'->>'id' in ('decision-0.1.0-cpu', 'decision-0.1.0-vulkan', 'decision-0.1.0-rocm', 'decision-0.1.0-cuda', 'decision-0.1.1-metal', 'jev-style-0.3.0-mlx') or seat.config->'runtime'->>'server' = 'jev-style');
+update seat set config = jsonb_set(jsonb_set(config, '{runtime,id}', to_jsonb(m.new)), '{runtime,artifact}', (config->'runtime'->'artifact') || m.artifact) from (values ('decision-0.1.0-cpu', 'decision-0.1.2-cpu', '{"digest": "sha256:6a8ea5138654184e54a8c51bc21e0efd7be809540f8495da8125e3612b11f84a"}'::jsonb), ('decision-0.1.0-vulkan', 'decision-0.1.2-vulkan', '{"digest": "sha256:744b55d8a7e7fdc4c28f5f50e36fcab7698ac23364f963c0e73e6e08f2312fa4"}'::jsonb), ('decision-0.1.0-rocm', 'decision-0.1.2-rocm', '{"digest": "sha256:c113a7f398be44239b41b4c7ae5a87fac99d5faf1b0603621600d56d63b79c56"}'::jsonb), ('decision-0.1.0-cuda', 'decision-0.1.2-cuda', '{"digest": "sha256:15a9f93feceb564792144e246efc92fef41ebfa17e8a0f3e0a506372c5d2ac2f"}'::jsonb), ('decision-0.1.1-metal', 'decision-0.1.2-metal', '{"url": "https://github.com/hale-lang/voice/releases/download/runtime-decision-0.1.2-metal/decision-0.1.2-metal-darwin-arm64.tar.gz", "sha256": "4a2b5f039a97f9a1f84d8c216936a4597a2e00431710d3c1dc76a7bee6bb28bb", "bytes": 5015544}'::jsonb), ('jev-style-0.3.0-mlx', 'decision-0.3.0-mlx', '{"url": "https://github.com/hale-lang/voice/releases/download/runtime-decision-0.3.0-mlx/decision-0.3.0-mlx-darwin-arm64.tar.gz", "sha256": "c1229baef17c0d4a2ec57c15efaa7c5dc7e6c601a003715b89632f16195c817c", "bytes": 102692887}'::jsonb)) as m(old, new, artifact) where seat.config->'runtime'->>'id' = m.old;
+update seat set config = jsonb_set(config, '{runtime,server}', '"decision"') where seat.config->'runtime'->>'server' = 'jev-style';
 ```

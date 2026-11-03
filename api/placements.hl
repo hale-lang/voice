@@ -796,12 +796,42 @@ fn runtime_on(rts: RuntimeList, id: String) -> String {
     return "";
 }
 
+/// A model this small (its largest variant's weights, in bytes: about 4B
+/// parameters at 16 bits) is served on CUDA from its GGUF, by llama-server,
+/// before its safetensors by vLLM: llama-server is up in seconds, where
+/// vLLM's warm-up (its kernels compiled and tuned, its graphs captured)
+/// takes a minute or two, for a throughput a small model does not need.
+const SMALL_MODEL_BYTES: Int = 8589934592;
+
+/// Whether a recipe's model is small (`SMALL_MODEL_BYTES`): its largest
+/// variant's files together, the weights at their most faithful.
+@bounded_by(variants)
+fn small_model(variants: String) -> Bool {
+    let mut most = 0;
+    let mut it = std::json::array_first(variants);
+    while !it.done {
+        let mut bytes = 0;
+        let mut f = std::json::array_first(std::json::find_field_raw(it.element, "files"));
+        while !f.done {
+            bytes = bytes + std::json::find_int_field(f.element, "bytes");
+            f = std::json::array_next(f);
+        }
+        if bytes > most { most = bytes; }
+        it = std::json::array_next(it);
+    }
+    return most > 0 && most < SMALL_MODEL_BYTES;
+}
+
 /// A format's place in the machine's preference, lower first: the form
-/// made for the accelerator before the one that runs anywhere.
-fn format_rank(format: String, hw: String) -> Int {
+/// made for the accelerator before the one that runs anywhere. On CUDA a
+/// small model (`small`) takes its GGUF first (`SMALL_MODEL_BYTES`).
+fn format_rank(format: String, hw: String, small: Bool) -> Int {
     let accel = accelerator_kinds(hw);
     if std::str::contains(accel, ",metal,") { return if format == "mlx" { 0 } else { 1 }; }
-    if std::str::contains(accel, ",cuda,") { return if format == "safetensors" { 0 } else { 1 }; }
+    if std::str::contains(accel, ",cuda,") {
+        if small { return if format == "gguf" { 0 } else { 1 }; }
+        return if format == "safetensors" { 0 } else { 1 };
+    }
     // an AMD or Intel GPU is served by llama.cpp: its own format first
     if std::str::contains(accel, ",rocm,") || std::str::contains(accel, ",vulkan,") {
         return if format == "gguf" { 0 } else { 1 };
@@ -839,6 +869,7 @@ fn judge_recipe(
     decision: Bool
 ) -> Judged {
     let mut out = Judged { };
+    let small = small_model(variants);
     let mut best_rank = 0;
     let mut best_memory = 0;
     let mut i = 0;
@@ -847,7 +878,7 @@ fn judge_recipe(
         let v = it.element;
         let judged = judge_variant(v, hw, rts, room, held, decision);
         push(out.fit, judged) or discard;
-        let rank = format_rank(std::json::find_string_field(v, "format"), hw)
+        let rank = format_rank(std::json::find_string_field(v, "format"), hw, small)
             + (if judged.has_runtime && runs_on_cpu(rts, judged.runtime) { 10 } else { 0 });
         let memory = std::json::find_int_field(v, "memory_bytes");
         if judged.fits

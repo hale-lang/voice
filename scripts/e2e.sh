@@ -497,12 +497,34 @@ for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/node
 routed decider/decide
 post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotate": true, "aliases": [{"name": "decide", "model": "jev-2b"}, {"name": "general", "model": "echo-1"}]}' >/dev/null
 nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
-quiet_id=$(curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "not annotated"}' | field id)
+# a request of the annotation case: its JSON answer on stdout, or, on any
+# status but 2xx, the status, the answer and the logs that explain it
+ask_json() { # <bearer> <body>
+  local out code
+  out=$(curl -sS --max-time 60 -o "$work/ask.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$2") || true
+  code=$out
+  if [ "${code:0:1}" != 2 ]; then
+    echo "a request of the annotation case was answered $code: $(head -c 600 "$work/ask.out")"
+    echo "--- api"; tail -60 "$work/api.log"; echo "--- node"; tail -30 "$work/node.log"
+    exit 1
+  fi
+  cat "$work/ask.out"
+}
+# the cases before leave the shared static seat reconfigured or still
+# serving a stream its caller left: start from it up, applied and idle
+wait_for up
+for i in $(seq 1 100); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
+ask_json "$key" '{"model": "echo-1", "input": "not annotated"}' >"$work/quiet.json"
+quiet_id=$(field id <"$work/quiet.json")
 # the four asked one after another (the chat seat takes fewer at once, and
 # voice queues no caller): each answered at once, their annotations then
 # queued together on the one-at-a-time decision seat
 for n in 1 2 3 4; do
-  curl -fsS --max-time 60 -X POST "$api/v1/responses" -H "authorization: Bearer $nkey" -H 'content-type: application/json' -d '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' | field id >"$work/noted-$n.id"
+  ask_json "$nkey" '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' >"$work/noted-$n.json"
+  field id <"$work/noted-$n.json" >"$work/noted-$n.id"
 done
 # each answered within a minute, or the case fails with what the api said
 wait_ids() {

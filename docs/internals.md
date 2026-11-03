@@ -776,7 +776,11 @@ only its own in-flight requests.
 
 The node's capabilities file, written by its operator, and its local
 controls. Everything else about what it runs comes from the coordinator, so
-it needs no database.
+it needs no database. Beside them, what the node fetched (`blobs/`, by
+sha256) and what its servers keep between starts: a vLLM seat's compiled
+graphs and FlashInfer's kernel autotune, `cache/<runtime>/`, one directory
+per runtime, tens of megabytes, so a vLLM seat started again skips most of
+its warm-up. All of it goes with the node's data when it is uninstalled.
 
 ### Migrations
 

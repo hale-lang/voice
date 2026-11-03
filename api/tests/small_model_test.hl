@@ -1,0 +1,67 @@
+// On CUDA a small model (its largest variant under SMALL_MODEL_BYTES, about
+// 4B parameters at 16 bits) is placed from its GGUF on llama-server, which
+// is up in seconds, rather than from its safetensors on vLLM, whose warm-up
+// takes minutes; a larger one keeps vLLM, and a small one with no GGUF keeps
+// what it has. Metal is unchanged.
+import ".." as api;
+
+fn runtime(id: String, server: String, format: api::ModelFormat) -> api::Runtime {
+    let mut r = api::Runtime { id: id, server: server, accelerator: api::RuntimeAccelerator::cuda };
+    push(r.formats, format) or discard;
+    push(
+        r.platforms,
+        api::RuntimePlatform { os: api::HostOs::linux, arch: api::HostArch::arm64 },
+    ) or discard;
+    return r;
+}
+
+const GB10: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 128000000000, \"unified\": true}], \"disk_free_bytes\": 1000000000000}";
+
+// qwen3-0.6b's shape: safetensors first, a GGUF beside it
+const SMALL: String = "[{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"memory_bytes\": 3000000000, \"files\": [{\"path\": \"model.safetensors\", \"bytes\": 1503300328}]}, {\"id\": \"gguf-q8_0\", \"format\": \"gguf\", \"memory_bytes\": 2000000000, \"files\": [{\"path\": \"m.gguf\", \"bytes\": 639446688}]}]";
+
+// a larger model: its bf16 weights past the line
+const LARGE: String = "[{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"memory_bytes\": 20000000000, \"files\": [{\"path\": \"model.safetensors\", \"bytes\": 16000000000}]}, {\"id\": \"gguf-q8_0\", \"format\": \"gguf\", \"memory_bytes\": 10000000000, \"files\": [{\"path\": \"m.gguf\", \"bytes\": 8500000000}]}]";
+
+// small, but no GGUF to serve it from
+const SMALL_NO_GGUF: String = "[{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"memory_bytes\": 9000000000, \"files\": [{\"path\": \"model.safetensors\", \"bytes\": 7700000000}]}]";
+
+fn chosen(variants: String, rts: api::RuntimeList) -> String {
+    let j = api::judge_recipe(variants, GB10, rts, 100000000000, 0, false);
+    let best = at(j.fit, j.best) or api::VariantFit { };
+    return best.variant + " on " + best.runtime;
+}
+
+fn main() {
+    let mut both = api::RuntimeList { };
+    push(both.data, runtime("vllm-26.09", "vllm", api::ModelFormat::safetensors)) or discard;
+    push(
+        both.data,
+        runtime("llama-server-b11913-cuda", "llama-server", api::ModelFormat::gguf),
+    ) or discard;
+
+    std::test::assert(api::small_model(SMALL), "a 1.5 GB model is small");
+    std::test::assert(!api::small_model(LARGE), "a 16 GB model is not");
+    std::test::assert_eq_str(
+        chosen(SMALL, both),
+        "gguf-q8_0 on llama-server-b11913-cuda",
+        "a small model on CUDA: its GGUF on llama-server",
+    );
+    std::test::assert_eq_str(
+        chosen(LARGE, both),
+        "safetensors-bf16 on vllm-26.09",
+        "a larger one keeps vLLM",
+    );
+    std::test::assert_eq_str(
+        chosen(SMALL_NO_GGUF, both),
+        "safetensors-bf16 on vllm-26.09",
+        "a small one with no GGUF keeps its safetensors",
+    );
+    let mut vllm_only = api::RuntimeList { };
+    push(vllm_only.data, runtime("vllm-26.09", "vllm", api::ModelFormat::safetensors)) or discard;
+    std::test::assert_eq_str(
+        chosen(SMALL, vllm_only),
+        "safetensors-bf16 on vllm-26.09",
+        "and with no llama-server runtime, vLLM",
+    );
+}

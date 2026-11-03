@@ -1,0 +1,149 @@
+// A managed seat assigned another server under the same id is replaced,
+// and one assigned what it serves is left serving (run.hl
+// `serving_identity`, `Runner.on_wanted`): its runtime's pin, its variant
+// and what its server is started with name what it serves; nothing else in
+// its config restarts it. The old server serves while the new one is
+// fetched (session.hl `merged_fetch`), and is stopped, all of it, before the
+// new one starts (`stop_run`).
+import ".." as node;
+
+const OLD: String = "{\"placement\": \"jev-on-flare\", \"model\": \"jev\", \"cache_tokens\": 4096, \"runtime\": {\"id\": \"decision-0.1.0-cpu\", \"server\": \"decision\", \"artifact\": {\"kind\": \"container\", \"image\": \"ghcr.io/hale-lang/voice-decision\", \"digest\": \"sha256:61b4\"}}, \"variant\": {\"id\": \"gguf-q8_0\", \"files\": [{\"path\": \"m.gguf\", \"sha256\": \"aa\"}]}}";
+
+/// `OLD` with one part changed.
+fn with(from: String, to: String) -> String {
+    let at = std::str::index_of(OLD, from);
+    return OLD[0..at] + to + OLD[(at + len(from))..len(OLD)];
+}
+
+fn main() {
+    let repinned = with("sha256:61b4", "sha256:6a8e");
+    std::test::assert(
+        node::serving_identity(repinned) != node::serving_identity(OLD),
+        "a runtime pinned to another build serves something else",
+    );
+    std::test::assert(
+        node::serving_identity(with("\"cache_tokens\": 4096", "\"cache_tokens\": 8192"))
+            != node::serving_identity(OLD),
+        "so does another cache its server is started with",
+    );
+    std::test::assert(
+        node::serving_identity(with("\"sha256\": \"aa\"", "\"sha256\": \"bb\""))
+            != node::serving_identity(OLD),
+        "and other weights",
+    );
+    std::test::assert_eq_str(
+        node::serving_identity(with("jev-on-flare", "renamed")),
+        node::serving_identity(OLD),
+        "another placement id is the same server",
+    );
+    std::test::assert_eq_str(
+        node::serving_identity(
+            with("\"model\": \"jev\",", "\"model\": \"jev\", \"note\": \"later\","),
+        ),
+        node::serving_identity(OLD),
+        "a field voice adds later is the same server",
+    );
+    std::test::assert_eq_str(
+        node::wanted_action(node::serving_identity(OLD), OLD),
+        "keep",
+        "the same: kept",
+    );
+    std::test::assert_eq_str(
+        node::wanted_action(node::serving_identity(OLD), repinned),
+        "replace",
+        "another: replaced",
+    );
+
+    // a start still waiting takes the config asked for last
+    std::test::assert_eq_str(
+        node::queue_without("a\tone\nb\ttwo\nc\tthree\n", "b"),
+        "a\tone\nc\tthree\n",
+        "a seat's waiting line removed, the others kept in order",
+    );
+
+    // while the new build is fetched the seat stays up and served; the
+    // runner's word takes it starting
+    let up = node::FetchState {
+        seat: "s",
+        status: "up",
+        endpoint: "http://127.0.0.1:47100/v1",
+        context: 4096,
+        by_runner: true,
+    };
+    let fetching = node::merged_fetch(
+        up,
+        node::FetchState { seat: "s", status: "fetching", done: 10, total: 100 },
+    );
+    std::test::assert(
+        fetching.status == "up" && fetching.endpoint == up.endpoint && fetching.done == 10
+            && fetching.total == 100,
+        "up while the next build is fetched, its progress kept: " + fetching.status,
+    );
+    std::test::assert_eq_str(
+        node::merged_fetch(up, node::FetchState { seat: "s", status: "starting" }).status,
+        "up",
+        "up while the fetcher hands the next build to the runner",
+    );
+    let failed = node::merged_fetch(
+        up,
+        node::FetchState { seat: "s", status: "down", reason: "no room" },
+    );
+    std::test::assert(
+        failed.status == "up" && std::str::contains(failed.reason, "no room"),
+        "up when the next build cannot be fetched, and saying why: " + failed.reason,
+    );
+    std::test::assert_eq_str(
+        node::merged_fetch(
+            up,
+            node::FetchState { seat: "s", status: "starting", by_runner: true },
+        ).status,
+        "starting",
+        "the runner's replacing it takes it starting",
+    );
+    std::test::assert_eq_str(
+        node::merged_fetch(
+            node::FetchState { seat: "s", status: "fetching" },
+            node::FetchState { seat: "s", status: "down", reason: "x" },
+        ).status,
+        "down",
+        "a seat not yet up is as the fetcher says",
+    );
+
+    // the runner: a seat serving, asked for again
+    let data = "/tmp/voice-replace-test-" + to_string(std::time::monotonic_ns());
+    std::io::fs::mkdir(data) or discard;
+    std::io::fs::mkdir(data + "/run") or discard;
+    let o = std::process::run(
+        "sh\n-c\n\"$@\" > \"$0\" 2>&1 & echo $!\n" + data + "/server.log\nsleep\n300",
+    )
+    or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+    let pid = std::str::parse_int(std::str::trim(o.stdout)) or 0;
+    std::test::assert(pid > 0 && node::alive(pid), "a server running");
+    std::io::fs::write_file(
+        data + "/run/s.pid",
+        to_string(pid) + "\t" + node::started_at(pid) + "\n",
+    ) or discard;
+    let server = node::Run {
+        seat: "s",
+        phase: "up",
+        pid: pid,
+        identity: node::serving_identity(OLD),
+    };
+    std::test::assert_eq_str(
+        node::wanted_action(server.identity, OLD),
+        "keep",
+        "assigned what it serves, it keeps serving",
+    );
+    std::test::assert(node::alive(pid), "and it is still there");
+    std::test::assert_eq_str(
+        node::wanted_action(server.identity, repinned),
+        "replace",
+        "assigned another build",
+    );
+    node::stop_run(data, server);
+    std::test::assert(
+        !node::alive(pid),
+        "the old server is ended by the time its stop returns, before the new one starts",
+    );
+    std::test::assert(!std::io::fs::file_exists(data + "/run/s.pid"), "its pid file gone");
+}

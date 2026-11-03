@@ -336,10 +336,26 @@ fn main() {
                 "<codex_internal_context source=\"goal\">go</codex_internal_context>",
             )
             && api::harness_context("# AGENTS.md instructions for /work")
+            && api::harness_context("<user_instructions>\nbe terse\n</user_instructions>")
             && !api::harness_context("<b>is this bold</b> or not?")
             && !api::harness_context("fix the build"),
         "a harness's own blocks are its context; a user's markup is not",
     );
+    // a user's ask wholly in markup is theirs, read as their ask
+    std::test::assert(
+        !api::harness_context("<task>Implement a binary search</task>")
+            && !api::harness_context("<p>Explain this paragraph</p>"),
+        "a user's own tags are never a harness's",
+    );
+    let wrapped = api::user_ask(
+        "{\"input\": [{\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"<environment_context>x</environment_context>\"}]}, {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"<task>Implement a binary search</task>\"}]}]}",
+    );
+    std::test::assert_eq_str(
+        wrapped.latest,
+        "<task>Implement a binary search</task>",
+        "the wrapped ask kept",
+    );
+    std::test::assert_eq_str(wrapped.earlier, "", "and the harness's block left out");
     let long = api::kept_start(std::str::repeat("x", 30000), 24576);
     std::test::assert(
         long.cut && std::str::starts_with(long.text, "xxx"),
@@ -553,4 +569,37 @@ fn main() {
         "run",
     );
     std::test::assert(std::str::contains(again, "request"), "a run asks its request: " + again);
+
+    // an explicit run of a final step already of a turn: read as its own
+    // turn, at the annotator's new version, its answers its own, not its
+    // turn's first step's
+    let annotators = api::Annotators { store: e.store };
+    annotators.update(
+        api::AnnotatorUpdate {
+            annotator: "request-basics",
+            has_name: true,
+            name: "Request basics, again",
+        },
+    ) or {
+        std::test::assert(false, "a new version: " + api::ctl_problem(err).message);
+    };
+    let before = e.store.annotation("resp_t5") or st::AnnotationRow { };
+    std::test::assert_eq_str(before.turn, "resp_t1", "resp_t5 is of resp_t1's turn");
+    e.queue_annotation(
+        job("resp_t5", key, cli_input("fix the failing build", 5), FINAL_OUTPUT),
+        "",
+        0,
+        "run",
+    );
+    let rerun = e.store.annotation("resp_t5") or st::AnnotationRow { };
+    std::test::assert_eq_str(rerun.turn, "", "an explicit run is its own turn");
+    let own = annotations.get(api::AnnotationRef { request_id: "resp_t5" }) or api::Annotation { };
+    std::test::assert(!own.has_turn, "no longer read through another's turn");
+    let mut mine = false;
+    let mut theirs = false;
+    for x in own.answers {
+        if x.annotator == "request-basics" && x.version == 2 { mine = true; }
+        if x.annotator == "request-basics" && x.version == 1 { theirs = true; }
+    }
+    std::test::assert(mine && !theirs, "its request answers are its own, at version 2");
 }

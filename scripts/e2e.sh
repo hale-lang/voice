@@ -497,6 +497,13 @@ for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/node
 routed decider/decide
 post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotate": true, "aliases": [{"name": "decide", "model": "jev-2b"}, {"name": "general", "model": "echo-1"}]}' >/dev/null
 nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
+# the cases before leave the shared static seat reconfigured or still
+# serving a stream its caller left: start from it up, applied and idle
+wait_for up
+for i in $(seq 1 100); do
+  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
+  sleep 0.1
+done
 quiet_id=$(curl -fsS -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "echo-1", "input": "not annotated"}' | field id)
 # the four asked one after another (the chat seat takes fewer at once, and
 # voice queues no caller): each answered at once, their annotations then

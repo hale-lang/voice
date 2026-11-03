@@ -1395,6 +1395,39 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/projects/{project}/annotate-readiness:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [annotations]
+      operationId: getAnnotateReadiness
+      summary: Whether a project's annotations can be read now
+      description: |
+        The routes a project's annotations take, as they stand now: its
+        `decide` alias to the decision model its questions are asked of,
+        and its title annotator's alias to the text model that writes
+        titles, each to the seats that serve that model, whether each is
+        up, and whether it spends an account the project's system key may
+        spend. `decide` ready is what turning `annotate` on needs
+        (`409` otherwise); a title route that is not ready is a warning:
+        titles are optional.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: Its routes.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AnnotateReadiness' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/annotation-rules:
     get:
       tags: [annotations]
@@ -1571,6 +1604,12 @@ paths:
         - $ref: '#/components/parameters/AnnotationMinProbability'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
+        - name: status
+          in: query
+          description: Only annotations of this status; `pending` lists the queue, those still being read.
+          schema:
+            type: string
+            enum: [pending, annotated, not_annotated]
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
@@ -1706,6 +1745,122 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/annotations/{request_id}/steps:
+    get:
+      tags: [usage]
+      operationId: listAnnotationSteps
+      summary: List a request's annotation steps
+      description: |
+        Its annotation's steps so far, oldest first, as they happened:
+        `queued`, each stage `started` and `done` (or `skipped`), the
+        conversation `titled`, and its end, `kept` or `not_annotated`. A
+        view shows them while the annotation is still being read, then
+        follows each new one as the admin stream's `annotation_step`. A
+        request not annotated (its project and key do not annotate) has
+        none. Steps are kept a week.
+      security:
+        - operatorToken: []
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The request's annotation steps.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnotationStepList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/annotation-runs:
+    post:
+      tags: [usage]
+      operationId: runAnnotations
+      summary: Annotate requests now
+      description: |
+        Queues each request named, at most 500, for every annotator in force
+        for it, or the one `annotator` names, read from its text: held while
+        it is pending, else its recording (`peek`, seven days). It answers
+        at once with each request's outcome. One already annotated by an
+        annotator asked again is read again by it; the others' answers stay.
+        Each stage is read by whichever api instance takes it, and its steps
+        stream on the admin events (`annotation_step`).
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnotationRunAsk'
+      responses:
+        '202':
+          description: Each request queued, or refused and why.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnotationRunList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/annotations/{request_id}/run:
+    post:
+      tags: [usage]
+      operationId: runAnnotation
+      summary: Annotate one request now
+      description: |
+        `runAnnotations` for the one request the path names: 404 when there
+        is no such request, 409 when it cannot be (no text held or
+        recorded, its project and key do not annotate, no annotator in
+        force).
+      security:
+        - operatorToken: []
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnnotationRunAsk'
+      responses:
+        '202':
+          description: Queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnnotationRunList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/annotation-backfills:
     post:
       tags: [usage]
@@ -1716,9 +1871,9 @@ paths:
         requests whose recording still exists (`peek`, seven days), the
         newest 200 at most that `project`, `key`, `from` and `to` keep.
         Voice keeps no other text, so a request not recorded cannot be. It
-        answers at once with how many it will ask about, then asks, as
-        requests of each one's project's system key; each answer names the
-        version asked.
+        answers at once with how many it queued; each is read as any queued
+        annotation is (`runAnnotations`), as requests of its project's
+        system key, and each answer names the version asked.
         A response annotator reads the request answers already kept.
       security:
         - operatorToken: []
@@ -2864,7 +3019,9 @@ paths:
         tells what any api instance recorded, within about half a second. A
         comment line keeps an idle stream open every 15 seconds. The stream
         never ends on its own. A `request` event tells a request as it is
-        offered; it runs until its `usage` event. The admin UI follows the
+        offered; it runs until its `usage` event. An `annotation_step`
+        tells each step of a request's annotation as it happens, and an
+        `annotation` the annotation once kept. The admin UI follows the
         same events on the hub (`GET /admin/v1/hub`) where the hub carries
         them.
       security:
@@ -2879,7 +3036,7 @@ paths:
             type: array
             items:
               type: string
-              enum: [node, seat, account, usage, change, request, annotation]
+              enum: [node, seat, account, usage, change, request, annotation, annotation_step]
         - name: Last-Event-ID
           in: header
           required: false
@@ -2968,6 +3125,9 @@ paths:
         - `AnnotationKept`: a request's annotation kept; `data` is the
           `annotation` event's (its answers, its runs, the conversation's
           title when this one wrote it).
+        - `AnnotationStepTaken`: a step of a request's annotation, as it
+          happens; `data` is the `annotation_step` event's (an
+          `AnnotationStep`).
         - `NodeMoved`: a node registered, was lost, drained or revoked;
           `data` is the node as `GET /admin/v1/nodes/{node}` answers it.
         - `RequestsInFlight`: the requests seats are serving now, told
@@ -4230,7 +4390,9 @@ components:
             key (`Key.internal`): they spend its accounts, their usage is
             kept apart from its callers' (`UsageRecord.internal`) and held
             to that key's limits alone. `true` is refused (`409`) while
-            `decide` names no decision model. Left out, a child follows its
+            `decide` names no decision model, or no seat serving it is up
+            on an account the project may spend (`getAnnotateReadiness`).
+            Left out, a child follows its
             parent's, read when a request is admitted, and a project of its
             own does not annotate. A request is annotated when its project
             annotates or its key does.
@@ -4311,7 +4473,8 @@ components:
             (off for a project of its own). Each request it sends is annotated
             (`getAnnotation`), as requests of its system key. `true` is
             refused (`409`) while its `decide` alias, as this update leaves
-            it, names no decision model.
+            it, names no decision model, or no seat serving it is up on an
+            account the project may spend (`getAnnotateReadiness`).
         aliases:
           type: array
           maxItems: 32
@@ -5264,7 +5427,15 @@ components:
           type: string
           description: The project's alias for the text model asked, e.g. `general`.
         instruction: { type: string, minLength: 1, maxLength: 1000 }
-        max_output_tokens: { type: integer, minimum: 4, maximum: 64 }
+        max_output_tokens:
+          type: integer
+          minimum: 4
+          maximum: 256
+          description: |
+            The most its model writes. A reasoning model is asked without
+            reasoning (`reasoning.effort` `none`); what it still thinks
+            before its answer is left out, and a run cut short writes no
+            title.
 
     AnnotationCondition:
       type: object
@@ -5430,6 +5601,70 @@ components:
           type: string
           format: date-time
 
+    AnnotationStepKind:
+      type: string
+      enum: [queued, started, done, waiting, skipped, titled, kept, not_annotated]
+      description: |
+        A step of a request's annotation. `queued`: the request is
+        answered (or run) and will be read. `started`: a stage's request
+        made, to the model `model` names (the alias asked). `done`: that
+        stage's run, its tokens and time; `reason` when it failed.
+        `waiting`: no seat was free, or the stage reads the request stage's
+        answers not given yet; `reason` says the attempt and when it is
+        asked again. `skipped`: a stage with no
+        question to ask (every condition unmet). `titled`: the
+        conversation's title written. `kept`: the annotation kept,
+        annotated. `not_annotated`: kept not annotated, `reason` why.
+
+    AnnotationStep:
+      type: object
+      additionalProperties: false
+      required: [seq, request_id, project, conversation, at, step, stage, model, input_tokens, output_tokens, ms, reason, title]
+      description: One step of a request's annotation, told as it happens.
+      properties:
+        seq:
+          type: integer
+          description: Its place among every request's steps, in the order they were kept.
+        request_id:
+          type: string
+          description: The request annotated.
+        project: { type: string }
+        conversation:
+          type: string
+          description: The request's conversation, "" for none.
+        at: { type: string, format: date-time }
+        step: { $ref: '#/components/schemas/AnnotationStepKind' }
+        stage:
+          type: string
+          enum: ['', request, response, title]
+          description: The stage it is a step of, "" for a step of the whole (`queued`, `kept`, `not_annotated`).
+        model:
+          type: string
+          description: The alias asked (`started`) or the model that served (`done`); "" otherwise.
+        input_tokens:
+          type: integer
+          description: "A `done` stage's input tokens; 0 otherwise."
+        output_tokens: { type: integer }
+        ms:
+          type: integer
+          description: "A `done` stage's time, in milliseconds."
+        reason:
+          type: string
+          description: Why a stage failed (`done`) or the request was not annotated; for a `queued` backfill, which annotator asks. "" otherwise.
+        title:
+          type: string
+          description: The title written (`titled`), "" otherwise.
+
+    AnnotationStepList:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/AnnotationStep' }
+
     AnnotationRun:
       type: object
       description: |
@@ -5541,13 +5776,17 @@ components:
         created_at: { type: string, format: date-time }
         status:
           type: string
-          enum: [annotated, not_annotated]
+          enum: [pending, annotated, not_annotated]
+          description: |
+            `pending` while an annotator it was queued for has not answered
+            (it waits for a seat, or is being read); then `annotated` when
+            any answered, else `not_annotated`.
         reason:
           type: string
           description: |
             Why it was not annotated, empty when it was: its project has no
-            decision model it may use, its system key is past its limits, or
-            the model failed.
+            decision model it may use, its system key is past its limits, the
+            model failed, or its deadline passed with no seat free.
         clipped:
           type: boolean
           description: |
@@ -5616,8 +5855,145 @@ components:
               items: { $ref: '#/components/schemas/AnnotationPair' }
             runs:
               type: array
-              description: Each request voice made for it, in order.
+              maxItems: 32
+              description: Each request voice made for it, in order. A stage read twice (a message delivered twice) shows twice.
               items: { $ref: '#/components/schemas/AnnotationRun' }
+            owed:
+              type: array
+              maxItems: 64
+              description: The annotators it was queued for, `<id>@<version>` each.
+              items: { type: string }
+            results:
+              type: array
+              maxItems: 64
+              description: Each owed annotator's result, as it answered; one not answered yet has none.
+              items: { $ref: '#/components/schemas/AnnotatorResult' }
+            deadline:
+              type: string
+              format: date-time
+              description: When a pending one gives up, written not annotated; left out once settled.
+            turn:
+              type: string
+              description: |
+                The request that began its user's turn, when that is
+                another: an agent's steps send one ask over and over, and
+                the turn is read once. Its first request is asked about the
+                ask, its last (the agent's final answer) about the
+                response; this one's `answers` include the turn's request
+                answers. Left out when it began its turn.
+
+    AnnotateRouteSeat:
+      type: object
+      required: [seat, node, account, up, may_spend]
+      properties:
+        seat:
+          type: string
+          description: The seat, `<node>/<seat>`.
+        node: { type: string }
+        account:
+          type: string
+          description: The account it spends.
+        up:
+          type: boolean
+          description: Up on a node that is up, taking requests now.
+        may_spend:
+          type: boolean
+          description: Its account is one the project's system key may spend.
+
+    AnnotateRoute:
+      type: object
+      required: [alias, ready, seats]
+      properties:
+        alias:
+          type: string
+          description: The project's name for the model, e.g. `decide`.
+        model:
+          type: string
+          description: The catalog model the alias names; left out when it names none.
+        decision:
+          type: boolean
+          description: Whether that model is a decision model (`contract` `decision`).
+        seats:
+          type: array
+          maxItems: 32
+          description: The seats that serve the model.
+          items: { $ref: '#/components/schemas/AnnotateRouteSeat' }
+        ready:
+          type: boolean
+          description: A seat serving it is up and spends an account the project may.
+        problem:
+          type: string
+          description: What is missing, when it is not ready.
+
+    AnnotateReadiness:
+      type: object
+      required: [project, decide, title, ready]
+      properties:
+        project: { type: string }
+        decide: { $ref: '#/components/schemas/AnnotateRoute' }
+        title: { $ref: '#/components/schemas/AnnotateRoute' }
+        ready:
+          type: boolean
+          description: Its `decide` route is ready, so annotate may be on.
+
+    AnnotatorResult:
+      type: object
+      additionalProperties: false
+      required: [annotator, version, stage, status, reason]
+      properties:
+        annotator: { type: string }
+        version: { type: integer }
+        stage: { $ref: '#/components/schemas/AnnotatorStage' }
+        status:
+          type: string
+          enum: [annotated, not_annotated, skipped]
+        reason:
+          type: string
+          description: 'Why it was not annotated or skipped, "" otherwise.'
+
+    AnnotationRunAsk:
+      type: object
+      additionalProperties: false
+      properties:
+        request_ids:
+          type: array
+          maxItems: 500
+          description: The requests to annotate now (`runAnnotations`); the path names the one of `runAnnotation`.
+          items: { type: string }
+        annotator:
+          type: string
+          description: The one annotator to ask; left out, every one in force for each request.
+        version:
+          type: integer
+          description: That annotator's version; 0 or left out, its current one.
+
+    AnnotationRunOutcome:
+      type: object
+      additionalProperties: false
+      required: [request_id, queued, reason, message]
+      properties:
+        request_id: { type: string }
+        queued: { type: boolean }
+        reason:
+          type: string
+          enum: ['', unknown, no_text, not_annotating, no_annotator]
+          description: |
+            Why it was not queued, "" when it was: `unknown` (no such
+            request), `no_text` (its text is neither held nor recorded: a
+            request is recorded when its project or key peeks),
+            `not_annotating` (its project and key do not annotate),
+            `no_annotator` (none is in force for it).
+        message: { type: string }
+
+    AnnotationRunList:
+      type: object
+      additionalProperties: false
+      required: [data]
+      properties:
+        data:
+          type: array
+          maxItems: 500
+          items: { $ref: '#/components/schemas/AnnotationRunOutcome' }
 
     AnnotationFacets:
       type: object
@@ -5915,7 +6291,7 @@ components:
           type: array
           items:
             type: string
-            enum: [NodeObserved, InstanceBeat, UsageRecorded, ChangeMade, AnnotationKept, NodeMoved, RequestsInFlight]
+            enum: [NodeObserved, InstanceBeat, UsageRecorded, ChangeMade, AnnotationKept, AnnotationStepTaken, NodeMoved, RequestsInFlight]
           description: The topics this instance's hub carries, which a subscriber may follow.
 
     AdminEvent:
@@ -6001,7 +6377,7 @@ components:
                 conversation: { type: [string, 'null'] }
                 status:
                   type: string
-                  enum: [annotated, not_annotated]
+                  enum: [pending, annotated, not_annotated]
                 reason: { type: string }
                 title: { type: [string, 'null'] }
                 answers:
@@ -6018,6 +6394,18 @@ components:
                 runs:
                   type: array
                   items: { $ref: '#/components/schemas/AnnotationRun' }
+        - type: object
+          required: [id, at, type, data]
+          description: |
+            A step of a request's annotation, told as it happens: queued,
+            each stage started and done (or skipped), the conversation
+            titled, and its end. The `annotation` event that follows its
+            end carries the annotation whole.
+          properties:
+            id: { type: string }
+            at: { type: string, format: date-time }
+            type: { type: string, const: annotation_step }
+            data: { $ref: '#/components/schemas/AnnotationStep' }
         - type: object
           required: [id, at, type, data]
           properties:

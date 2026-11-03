@@ -918,3 +918,87 @@ create index conversation_title_by_made on conversation_title (made_at desc);
 insert into annotator (id, version, body, builtin) values ('conversation-title', 1, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}', true) on conflict (id) do nothing;
 insert into annotator_version (annotator, version, body) values ('conversation-title', 1, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from its first request: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone.", "max_output_tokens": 24}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}') on conflict (annotator, version) do nothing;
 ```
+
+### Migration 25: an annotation queued, read by any instance, its steps told
+
+An annotation is no longer read on the answered request's coroutine: the
+request is answered, and if its project or key annotates and an annotator
+is in force, its annotation is written `pending`, with the annotators it
+is `owed` (`<id>@<version>`) and a `deadline` 15 minutes on, and its text
+held in `annotation_input` until it settles. One message a stage goes on
+core NATS to a queue group, so one api instance reads each. A worker
+writes only its own annotators' results, as keys of `annotations` merged
+in one statement (`annotations || $keys`) beside their answer rows, so
+two annotators of one request never clobber each other and a duplicate
+message rewrites the same keys (and adds a run). When every owed key is
+there, the annotation settles: `annotated`, or `not_annotated` and why,
+its held text let go. A stage that finds no seat free waits and is asked
+again, until its deadline. A request whose project and key do not
+annotate writes none of this.
+
+Its steps are kept as they happen, so every instance's admin feed tells
+them: `queued`, a stage `started`, `done` (its tokens and time, `reason`
+when it failed), `waiting` (no seat free: when it is asked again),
+`skipped` (no question to ask), `titled`, and the end, `kept` or
+`not_annotated`. `seq` orders every step of every request. A step is kept
+a week: the store lets the older go as steps are added.
+
+```sql
+alter table annotation drop constraint annotation_status_check;
+alter table annotation add constraint annotation_status_check check (status in ('pending', 'annotated', 'not_annotated'));
+alter table annotation add column annotations jsonb not null default '{}';
+alter table annotation add column owed text[] not null default '{}';
+alter table annotation add column deadline timestamptz;
+create table annotation_input (
+  request_id text primary key references annotation on delete cascade,
+  model      text not null default '',
+  data_class text not null default 'internal',
+  input      text not null,
+  output     text not null
+);
+create table annotation_step (
+  seq           bigserial primary key,
+  request_id    text not null,
+  project       text not null,
+  conversation  text not null default '',
+  at            timestamptz not null,
+  step          text not null check (step in ('queued', 'started', 'done', 'waiting', 'skipped', 'titled', 'kept', 'not_annotated')),
+  stage         text not null default '',
+  model         text not null default '',
+  input_tokens  int not null default 0,
+  output_tokens int not null default 0,
+  ms            int not null default 0,
+  reason        text not null default '',
+  title         text not null default ''
+);
+create index annotation_step_by_request on annotation_step (request_id, seq);
+create index annotation_step_by_at on annotation_step (at);
+```
+
+### Migration 26: an agent's turn annotated once, and titles that are titles
+
+An agent client (a coding CLI) sends one request a step: the same ask,
+followed by its tool calls and their output. Its annotation is the
+user's turn, not each step: `annotation_turn` keeps, per conversation,
+the hash of its latest user message and the request that began that
+turn, and a request of the same turn is not asked about again. The turn's
+last step, its final answer, is asked about its response, beside the
+answers its first gave (`turn`, that request). Titles a reasoning model
+cut short (`<think>`) are let go, to be written again, and the built-in
+title annotator asks without reasoning and with room for its answer
+(version 2), unless the operator has made it their own.
+
+```sql
+alter table annotation add column turn text not null default '';
+create table annotation_turn (
+  project      text not null,
+  conversation text not null,
+  user_hash    text not null,
+  request_id   text not null,
+  at           timestamptz not null,
+  primary key (project, conversation)
+);
+delete from conversation_title where title like '<%';
+insert into annotator_version (annotator, version, body) select 'conversation-title', 2, '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where exists (select 1 from annotator where id = 'conversation-title' and builtin and version = 1) on conflict (annotator, version) do nothing;
+update annotator set version = 2, body = '{"name": "Conversation title", "stage": "title", "questions": [], "title": {"model": "general", "instruction": "Write a title for this conversation from what the user asks: 3 to 8 words, plain text, no quotes, no punctuation at the end. Answer with the title alone. /no_think", "max_output_tokens": 128}, "scope": {"projects": [], "keys": []}, "reads_request": false, "enabled": true}' where id = 'conversation-title' and builtin and version = 1;
+```

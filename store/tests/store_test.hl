@@ -1217,6 +1217,152 @@ fn crowded(s: st::Store, label: String) {
     );
 }
 
+/// A queued annotation: pending, owed; each annotator's results merged in
+/// beside the others', runs added; settled, its held text let go; and its
+/// steps kept in order.
+fn queued(s: st::Store, label: String) {
+    let at = `2026-10-31T11:00:00Z`;
+    s.put_annotation(
+        st::AnnotationRow {
+            request_id: "resp_q",
+            project: "noted",
+            key: "k_1",
+            created_at: at,
+            status: "pending",
+            body: "{\"runs\": []}",
+            owed: "request-basics@1 response-basics@1",
+            deadline: `2026-10-31T11:15:00Z`,
+        },
+        st::AnswerRows { },
+    ) or {
+        std::test::assert(false, label + ": a pending annotation: " + err.message);
+    };
+    s.put_annotation_input(
+        st::InputRow {
+            request_id: "resp_q",
+            model: "echo-1",
+            input: "{\"input\": \"hi\"}",
+            output: "{}",
+        },
+    ) or discard;
+    let held = s.annotation_input("resp_q") or st::InputRow { };
+    std::test::assert(held.present && held.model == "echo-1", label + ": its text held");
+    let mut ans = st::AnswerRows { };
+    push(ans.rows, answer("resp_q", "request-basics", "task", "code", 0.85, at)) or discard;
+    s.put_annotator_results(
+        "resp_q",
+        "{\"request-basics\": {\"version\": 1, \"owed\": \"request-basics@1\", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        ans,
+        "{\"stage\": \"request\", \"input_tokens\": 40}",
+    ) or {
+        std::test::assert(false, label + ": a result: " + err.message);
+    };
+    s.put_annotator_results(
+        "resp_q",
+        "{\"response-basics\": {\"version\": 1, \"owed\": \"response-basics@1\", \"stage\": \"response\", \"status\": \"not_annotated\", \"reason\": \"failed\"}}",
+        st::AnswerRows { },
+        "{\"stage\": \"response\", \"input_tokens\": 12}",
+    ) or discard;
+    // a stale write (an entry no longer owed): its key and answers dropped,
+    // its run kept
+    let mut stale = st::AnswerRows { };
+    push(stale.rows, answer("resp_q", "request-basics", "task", "chat", 0.6, at)) or discard;
+    s.put_annotator_results(
+        "resp_q",
+        "{\"request-basics\": {\"version\": 0, \"owed\": \"request-basics@0\", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"\"}}",
+        stale,
+        "{\"stage\": \"request\", \"input_tokens\": 7}",
+    ) or discard;
+    let fenced = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(fenced.annotations, "request-basics@1")
+            && !std::str::contains(fenced.annotations, "request-basics@0"),
+        label + ": a stale result does not land: " + fenced.annotations,
+    );
+    std::test::assert(
+        std::str::contains(fenced.body, "\"input_tokens\": 7")
+            || std::str::contains(fenced.body, "\"input_tokens\":7"),
+        label + ": its run kept: " + fenced.body,
+    );
+    let still = s.answers("resp_q") or st::AnswerRows { };
+    let first_answer = at(still.rows, 0) or st::AnswerRow { };
+    std::test::assert(
+        count(still.rows) == 1 && first_answer.answer == "code",
+        label + ": nor its answers",
+    );
+    // settled for an owed list it no longer has: nothing written
+    let mut moved = fenced;
+    moved.owed = "request-basics@2";
+    moved.status = "annotated";
+    s.settle_annotation(moved) or discard;
+    let unmoved = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        unmoved.status == "pending",
+        label + ": a settle for an older owed list writes nothing",
+    );
+    let p = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        p.status == "pending" && std::str::contains(p.annotations, "request-basics")
+            && std::str::contains(p.annotations, "response-basics"),
+        label + ": both annotators' results kept: " + p.annotations,
+    );
+    std::test::assert(
+        std::str::contains(p.owed, "request-basics@1")
+            && std::str::contains(p.owed, "response-basics@1"),
+        label + ": what it is owed: " + p.owed,
+    );
+    std::test::assert(
+        std::str::contains(p.body, "\"input_tokens\": 12")
+            || std::str::contains(p.body, "\"input_tokens\":12"),
+        label + ": each run kept: " + p.body,
+    );
+    let answers = s.answers("resp_q") or st::AnswerRows { };
+    std::test::assert_eq_int(count(answers.rows), 1, label + ": the answers given");
+    let mut done = p;
+    done.status = "annotated";
+    done.body = "{\"model\": \"jev-2b\", \"input_tokens\": 52}";
+    s.settle_annotation(done) or {
+        std::test::assert(false, label + ": settled: " + err.message);
+    };
+    let settled = s.annotation("resp_q") or st::AnnotationRow { };
+    std::test::assert(
+        settled.status == "annotated" && std::str::contains(settled.body, "jev-2b")
+            && std::str::contains(settled.body, "runs") && settled.seq > p.seq,
+        label + ": settled, its runs kept, told anew: " + settled.body,
+    );
+    let gone = s.annotation_input("resp_q") or st::InputRow { present: true };
+    std::test::assert(!gone.present, label + ": its held text let go");
+    s.put_annotation_step(
+        st::StepRow { request_id: "resp_q", project: "noted", at: at, step: "queued" },
+    ) or discard;
+    s.put_annotation_step(
+        st::StepRow {
+            request_id: "resp_q",
+            project: "noted",
+            at: at,
+            step: "done",
+            stage: "request",
+            input_tokens: 40,
+            ms: 12,
+        },
+    ) or discard;
+    s.put_annotation_step(
+        st::StepRow { request_id: "resp_q", project: "noted", at: at, step: "kept" },
+    ) or discard;
+    let steps = s.annotation_steps("resp_q") or st::StepRows { };
+    let first = at(steps.rows, 0) or st::StepRow { };
+    let second = at(steps.rows, 1) or st::StepRow { };
+    std::test::assert(
+        count(steps.rows) == 3
+            && first.step == "queued"
+            && second.step == "done"
+            && second.input_tokens == 40,
+        label + ": its steps, in order",
+    );
+    let after = s.annotation_steps_after(first.seq, 10) or st::StepRows { };
+    std::test::assert_eq_int(count(after.rows), 2, label + ": the steps after one");
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -1280,7 +1426,9 @@ fn main() {
     bounded(st::MemoryStore { }, "memory");
     operator(st::MemoryStore { }, "memory");
     system(st::MemoryStore { }, "memory");
-    annotations(st::MemoryStore { }, "memory");
+    let mem = st::MemoryStore { };
+    annotations(mem, "memory");
+    queued(mem, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1299,7 +1447,7 @@ fn main() {
     bounded(pg, "postgres");
     pg.conn.exec("TRUNCATE operator_token");
     operator(pg, "postgres");
-    pg.conn.exec("TRUNCATE annotation_answer, annotation");
+    pg.conn.exec("TRUNCATE annotation_answer, annotation_input, annotation CASCADE");
     pg.conn.exec(
         "DELETE FROM annotator_version WHERE annotator NOT IN ('request-basics', 'response-basics', 'conversation-title')",
     );
@@ -1307,4 +1455,6 @@ fn main() {
         "DELETE FROM annotator WHERE id NOT IN ('request-basics', 'response-basics', 'conversation-title')",
     );
     annotations(pg, "postgres");
+    pg.conn.exec("TRUNCATE annotation_step RESTART IDENTITY");
+    queued(pg, "postgres");
 }

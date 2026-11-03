@@ -1,0 +1,594 @@
+// The annotate queue: a request whose project or key annotates is queued,
+// `pending` and owed to the annotators in force, each stage read as its
+// message asks (here, in process, at once), each annotator writing its own
+// result; its steps are kept as they happen. A stage that finds no seat
+// free waits and is read again; one that reads the request's answers waits
+// for them; a refusal is final, and past its deadline what is missing is
+// not annotated. A request that does not annotate writes nothing. An
+// operator runs one request, or many, again.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+
+/// The decision model's answers to the built-in annotators' questions, by
+/// question id (`<annotator>.<question>`); any other question is answered
+/// its first option, likely.
+const CANNED: String = """
+    {"request-basics.task": {"type": "choice", "choice": "code", "confidence": 0.8, "probabilities": {"code": 0.85, "debug": 0.05, "writing": 0.02, "research": 0.02, "analysis": 0.02, "planning": 0.02, "chat": 0.01, "other": 0.01}}, "request-basics.domain": {"type": "choice", "choice": "software", "confidence": 0.9, "probabilities": {"software": 0.9, "other": 0.1}}, "request-basics.multi_step": {"type": "noul", "noul": 0.8}, "request-basics.asks_for_code": {"type": "noul", "noul": 0.9}, "request-basics.sensitive": {"type": "noul", "noul": 0.1}, "request-basics.depends_on_context": {"type": "noul", "noul": 0.2}, "request-basics.difficulty": {"type": "score", "score": 1.9, "confidence": 0.5, "legend": {"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, "probabilities": {"0": 0.1, "1": 0.2, "2": 0.4, "3": 0.2, "4": 0.1}}, "request-basics.size": {"type": "score", "score": 1.0, "confidence": 0.5, "legend": {"0": "1", "1": "2", "2": "3", "3": "4", "4": "5"}, "probabilities": {"0": 0.3, "1": 0.5, "2": 0.1, "3": 0.05, "4": 0.05}}, "response-basics.outcome": {"type": "choice", "choice": "answered", "confidence": 0.7, "probabilities": {"answered": 0.75, "partly_answered": 0.15, "refused": 0.02, "asked_back": 0.05, "error": 0.03}}, "response-basics.contains_code": {"type": "noul", "noul": 0.2}, "response-basics.followed_format": {"type": "noul", "noul": 0.95}, "response-basics.completeness": {"type": "score", "score": 2.6, "confidence": 0.6, "legend": {"0": "1", "1": "2", "2": "3", "3": "4"}, "probabilities": {"0": 0.05, "1": 0.1, "2": 0.15, "3": 0.7}}}
+    """;
+
+/// A link to one node, in process: a decision request is answered as a
+/// decision server would, any other by the static engine. It keeps how many
+/// decision requests it was offered, the last one's state, and the question
+/// ids each asked, a line each.
+locus Nodes {
+    params {
+        decisions: Int = 0;
+        last_state: String = "";
+        asked: String = "";
+        // a response-stage decision request fails, as a seat with no
+        // capacity would answer it
+        fail_response: Bool = false;
+        // every decision request refused, as a seat at its most at once
+        busy: Bool = false;
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, reply_to: String, body: String) -> api::Offer {
+        let id = std::json::find_string_field(body, "request_id");
+        let model = std::json::find_string_field(body, "model");
+        let sent = std::str::trim(std::json::find_field_raw(body, "body"));
+        if std::json::find_string_field(body, "endpoint") == "decision" && self.busy {
+            return Scripted { refusal: "seat static is serving 1, its most at once" };
+        }
+        if std::json::find_string_field(body, "endpoint") == "decision" {
+            self.decisions = self.decisions + 1;
+            self.last_state = std::json::find_field_raw(sent, "state");
+            let qs = std::str::trim(std::json::find_field_raw(sent, "questions"));
+            let answers = st::JsonList { };
+            let ids = std::bytes::BytesBuilder { };
+            let mut it = std::json::object_first(qs);
+            while !it.done {
+                let qid = std::json::obj_key_string(it, qs);
+                let q = std::json::obj_value_raw(it, qs);
+                it = std::json::object_next(it, qs);
+                ids.append_str(qid + " ");
+                let canned = std::str::trim(std::json::find_field_raw(CANNED, qid));
+                answers.add(
+                    api::jq(qid) + ": " + (if len(canned) > 0 { canned } else { generic(q) }),
+                );
+            }
+            self.asked = self.asked + std::str::clone(ids.text_view()) + "\n";
+            if self.fail_response
+                && std::str::contains(std::str::clone(ids.text_view()), "response-basics.")
+            {
+                let failed = node::StaticRun {
+                    outcome: "failed",
+                    failure: "no capacity",
+                    model: model,
+                };
+                return Scripted { script: "", result: node::result_message(id, failed, 0, 0) };
+            }
+            let answer = "{\"model\": \"jev-2b\", \"answers\": {" + answers.text()
+                + "}, \"usage\": {\"input_tokens\": 40, \"output_tokens\": 0}}";
+            let run = node::StaticRun {
+                script: node::decision_event(answer) + "\n",
+                outcome: "served",
+                model: model,
+                input_tokens: 40,
+            };
+            return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+        }
+        let run = node::run_static(
+            id,
+            model,
+            "echo",
+            sent,
+            node::static_config("{\"text\": \"hello from voice\", \"chunk_chars\": 8}"),
+        );
+        return Scripted { script: run.script, result: node::result_message(id, run, 0, 0) };
+    }
+}
+
+/// A question answered as a decision server would: its first option likely.
+fn generic(q: String) -> String {
+    let t = std::json::find_string_field(q, "type");
+    if t == "noul" { return "{\"type\": \"noul\", \"noul\": 0.8}"; }
+    let crit = std::str::trim(std::json::find_field_raw(q, "criteria"));
+    if t == "choice" {
+        let mut it = std::json::object_first(crit);
+        let first = std::json::obj_key_string(it, crit);
+        let probs = st::JsonList { };
+        let mut n = 0;
+        while !it.done {
+            probs.add(
+                api::jq(std::json::obj_key_string(it, crit)) + ": "
+                    + (if n == 0 { "0.9" } else { "0.05" }),
+            );
+            n = n + 1;
+            it = std::json::object_next(it, crit);
+        }
+        return "{\"type\": \"choice\", \"choice\": " + api::jq(first)
+            + ", \"confidence\": 0.9, \"probabilities\": {" + probs.text() + "}}";
+    }
+    let legend = st::JsonList { };
+    let probs = st::JsonList { };
+    let mut n = 0;
+    let mut it = std::json::array_first(crit);
+    while !it.done {
+        legend.add(
+            api::jq(to_string(n)) + ": "
+                + api::jq(std::json::find_string_field(it.element, "label")),
+        );
+        probs.add(api::jq(to_string(n)) + ": " + (if n == 0 { "0.6" } else { "0.1" }));
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    return "{\"type\": \"score\", \"score\": 0.5, \"confidence\": 0.5, \"legend\": {"
+        + legend.text()
+        + "}, \"probabilities\": {" + probs.text() + "}}";
+}
+
+/// One offer, scripted: its events, then its result.
+locus Scripted {
+    params {
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+        // the seat's refusal, "" when it takes the request
+        refusal: String = "";
+    }
+    fn ack() -> api::ServeOutcome {
+        if len(self.refusal) > 0 {
+            return api::ServeOutcome { ack: "refused", reason: self.refusal };
+        }
+        return api::ServeOutcome { ack: "accepted" };
+    }
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if len(line) > 0 { return api::LinkMsg { kind: "event", json: line }; }
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn finish() { self.ended = true; }
+}
+
+fn ask(e: api::DataPlane, key: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer " + key,
+            body: body,
+        },
+    );
+}
+
+const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
+
+/// A node with one seat serving the chat model and the decision model, up.
+fn bring_up(e: api::DataPlane) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: "laptop" }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let mut sc = api::SeatCreate {
+        node: "laptop",
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1", has_engine_name: true, engine_name: "echo" })
+    or discard;
+    push(sc.serves, st::SeatModel { model: "jev-2b" }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat: " + api::ctl_problem(err).message);
+    };
+    let reg = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/register",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+                + ", \"local\": " + LOCAL + "}",
+        },
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    let up = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/node/v1/seats",
+            headers: "Authorization: Bearer " + made.enrollment_token,
+            body: "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}",
+        },
+    );
+    std::test::assert_eq_int(up.status, 204, "the seat is up: " + up.body);
+}
+
+/// Its annotation, read as the admin plane reads it.
+fn read(annotations: api::Annotations, id: String) -> api::Annotation {
+    return annotations.get(api::AnnotationRef { request_id: id }) or api::Annotation { };
+}
+
+/// One answer of an annotation.
+fn answer_of(a: api::Annotation, annotator: String, question: String) -> api::AnnotationAnswer {
+    for x in a.answers {
+        if x.annotator == annotator && x.question == question { return x; }
+    }
+    return api::AnnotationAnswer { };
+}
+
+fn pair_of(a: api::Annotation, rule: String) -> api::AnnotationPair {
+    for p in a.pairs {
+        if p.rule == rule { return p; }
+    }
+    return api::AnnotationPair { };
+}
+
+fn refused(r: String, what: String, has: String) {
+    std::test::assert(std::str::contains(r, has), what + ": " + r);
+}
+
+/// A request's steps, as their names, a space between.
+fn steps_of(store: st::Store, id: String) -> String {
+    let rows = store.annotation_steps(id) or st::StepRows { };
+    let b = std::bytes::BytesBuilder { };
+    for r in rows.rows {
+        if b.len() > 0 { b.append_str(" "); }
+        b.append_str(r.step + (if len(r.stage) > 0 { ":" + r.stage } else { "" }));
+    }
+    return std::str::clone(b.text_view());
+}
+
+fn run(e: api::DataPlane, path: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: path,
+            headers: "Authorization: Bearer " + (e.store.operator_token("va-queue-test") or ""),
+            body: body,
+        },
+    );
+}
+
+fn main() {
+    let nodes = Nodes { };
+    let e = api::DataPlane { link: nodes };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let annotations = api::Annotations { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "jev-2b",
+            has_contract: true,
+            contract: api::ModelContract::decision,
+        },
+    ) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work", has_peek: true, peek: true })
+    or discard;
+    projects.create(api::ProjectCreate { id: "quiet", name: "Quiet" }) or discard;
+    let key = (keys.create(api::KeyCreate { project: "work", name: "ci" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    }).secret;
+    let quiet_key = (keys.create(api::KeyCreate { project: "quiet", name: "ci" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    }).secret;
+    bring_up(e);
+    let mut decide = api::ProjectUpdate {
+        project: "work",
+        has_aliases: true,
+        has_annotate: true,
+        annotate: true,
+    };
+    push(decide.aliases, api::ModelAlias { name: "decide", model: "jev-2b" }) or discard;
+    push(decide.aliases, api::ModelAlias { name: "general", model: "echo-1" }) or discard;
+    projects.update(decide) or {
+        std::test::assert(false, "annotate on: " + api::ctl_problem(err).message);
+    };
+
+    // a project that does not annotate: nothing written, nothing asked
+    let q = ask(e, quiet_key, "{\"model\": \"echo-1\", \"input\": \"hello\"}");
+    std::test::assert_eq_int(q.status, 200, "answered: " + q.body);
+    let qid = std::json::find_string_field(q.body, "id");
+    let none = e.store.annotation(qid) or st::AnnotationRow { };
+    std::test::assert(!none.present, "no annotation row for a request that does not annotate");
+    std::test::assert_eq_str(steps_of(e.store, qid), "", "no step, no message");
+    std::test::assert_eq_int(nodes.decisions, 0, "nothing asked");
+
+    // queued, each stage read, each step kept in order
+    let r = ask(
+        e,
+        key,
+        "{\"model\": \"echo-1\", \"prompt_cache_key\": \"conv-q\", \"input\": \"write a sort\"}",
+    );
+    let id = std::json::find_string_field(r.body, "id");
+    let a = read(annotations, id);
+    std::test::assert(a.status == api::AnnotationStatus::annotated, "annotated: " + a.reason);
+    std::test::assert_eq_int(count(a.owed), 3, "owed to the three built-in annotators");
+    std::test::assert_eq_int(count(a.results), 3, "each one's own result");
+    std::test::assert_eq_str(
+        steps_of(e.store, id),
+        "queued started:request done:request started:response done:response started:title done:title titled:title kept",
+        "its steps, in order",
+    );
+    let held = e.store.annotation_input(id) or st::InputRow { };
+    std::test::assert(!held.present, "its text let go once settled");
+
+    // a duplicate message: the same result, nothing asked again
+    let before = nodes.decisions;
+    let again = e.annotator.work(api::AnnotateAsk { request_id: id, stage: "request", attempt: 0 });
+    std::test::assert(!again.wait, "a duplicate does not wait");
+    std::test::assert_eq_int(
+        nodes.decisions,
+        before,
+        "a duplicate of a settled stage asks nothing",
+    );
+    let same = read(annotations, id);
+    std::test::assert(
+        same.status == a.status
+            && count(same.answers) == count(a.answers)
+            && count(same.runs) == count(a.runs),
+        "the same result",
+    );
+
+    // two annotators writing one request: neither clobbers the other
+    let settled_row = e.store.annotation(id) or st::AnnotationRow { };
+    let req_entry = api::owed_entry(settled_row.owed, "request-basics");
+    let resp_entry = api::owed_entry(settled_row.owed, "response-basics");
+    e.store.put_annotator_results(
+        id,
+        "{\"request-basics\": {\"version\": 1, \"owed\": " + api::jq(req_entry)
+            + ", \"stage\": \"request\", \"status\": \"annotated\", \"reason\": \"one\"}}",
+        st::AnswerRows { },
+        "",
+    ) or discard;
+    e.store.put_annotator_results(
+        id,
+        "{\"response-basics\": {\"version\": 1, \"owed\": " + api::jq(resp_entry)
+            + ", \"stage\": \"response\", \"status\": \"annotated\", \"reason\": \"two\"}}",
+        st::AnswerRows { },
+        "",
+    ) or discard;
+    let both = e.store.annotation(id) or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(both.annotations, "\"one\"")
+            && std::str::contains(both.annotations, "\"two\"")
+            && api::has_key(both.annotations, "conversation-title"),
+        "each annotator's key kept: " + both.annotations,
+    );
+
+    // no seat free: pending, its request stage waiting; the stages that
+    // read its answers are not asked until it is read (no polling); a
+    // dependent stage asked anyway waits a short while, no attempt counted
+    nodes.busy = true;
+    let w = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"busy now\"}");
+    let wid = std::json::find_string_field(w.body, "id");
+    let p = read(annotations, wid);
+    std::test::assert(p.status == api::AnnotationStatus::pending, "pending while no seat is free");
+    std::test::assert(p.has_deadline, "with its deadline");
+    let wsteps = steps_of(e.store, wid);
+    std::test::assert(
+        std::str::contains(wsteps, "waiting:request")
+            && !std::str::contains(wsteps, "started:response"),
+        "its request stage waits; its response stage is not asked yet: " + wsteps,
+    );
+    let early = e.annotator.work(
+        api::AnnotateAsk { request_id: wid, stage: "response", attempt: 0 },
+    );
+    std::test::assert(
+        early.wait && early.dependent && early.after_ms == 1000,
+        "a response stage asked early waits for the request stage, briefly, no attempt counted",
+    );
+    let still = e.annotator.work(
+        api::AnnotateAsk { request_id: wid, stage: "request", attempt: 1 },
+    );
+    std::test::assert(still.wait && still.after_ms >= 2000, "still no seat: asked again later");
+    nodes.busy = false;
+    let read_now = e.annotator.work(
+        api::AnnotateAsk { request_id: wid, stage: "request", attempt: 2 },
+    );
+    std::test::assert_eq_str(
+        read_now.then,
+        "response title",
+        "a request stage read hands on its stages",
+    );
+    e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "response", attempt: 0 });
+    e.annotator.work(api::AnnotateAsk { request_id: wid, stage: "title", attempt: 1 });
+    let done = read(annotations, wid);
+    std::test::assert(
+        done.status == api::AnnotationStatus::annotated,
+        "annotated once a seat was free: " + done.reason,
+    );
+
+    // past its deadline: what is missing, not annotated, and why
+    nodes.busy = true;
+    let late = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"too late\"}");
+    let lid = std::json::find_string_field(late.body, "id");
+    let mut row = e.store.annotation(lid) or st::AnnotationRow { };
+    row.deadline = std::time::from_nanos(1000000000);
+    e.store.put_annotation(row, st::AnswerRows { }) or discard;
+    let gave_up = e.annotator.work(
+        api::AnnotateAsk { request_id: lid, stage: "request", attempt: 9 },
+    );
+    nodes.busy = false;
+    std::test::assert(!gave_up.wait, "past its deadline it waits no more");
+    let l = read(annotations, lid);
+    std::test::assert(
+        l.status == api::AnnotationStatus::not_annotated
+            && std::str::contains(l.reason, "deadline"),
+        "not annotated past its deadline: " + l.reason,
+    );
+
+    // a refusal is final: no decision model behind `decide`
+    let mut lost = api::ProjectUpdate { project: "work", has_aliases: true };
+    push(lost.aliases, api::ModelAlias { name: "general", model: "echo-1" }) or discard;
+    projects.update(lost) or discard;
+    let asked = nodes.decisions;
+    let refused_r = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"no model\"}");
+    let rid = std::json::find_string_field(refused_r.body, "id");
+    let rr = read(annotations, rid);
+    std::test::assert(
+        rr.status == api::AnnotationStatus::not_annotated
+            && std::str::contains(rr.reason, "no decision model"),
+        "a refusal, not annotated: " + rr.reason,
+    );
+    let no_retry = e.annotator.work(
+        api::AnnotateAsk { request_id: rid, stage: "request", attempt: 0 },
+    );
+    std::test::assert(!no_retry.wait, "a refusal is not asked again");
+    std::test::assert_eq_int(nodes.decisions, asked, "nothing asked of a seat");
+    projects.update(decide) or discard;
+
+    // fenced: a worker that read request-basics@1 finishes after it was
+    // edited to version 2 and run again: its result does not land (its run
+    // is kept), version 2 stays owed, and is then answered
+    nodes.busy = true;
+    let fr = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"fenced\"}");
+    let fid = std::json::find_string_field(fr.body, "id");
+    let old = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(old.owed, "request-basics@1#"),
+        "owed at version 1: " + old.owed,
+    );
+    let annotators = api::Annotators { store: e.store };
+    annotators.update(
+        api::AnnotatorUpdate {
+            annotator: "request-basics",
+            has_name: true,
+            name: "Request basics, edited",
+        },
+    ) or {
+        std::test::assert(false, "edited: " + api::ctl_problem(err).message);
+    };
+    let rerun = run(
+        e,
+        "/admin/v1/annotations/" + fid + "/run",
+        "{\"annotator\": \"request-basics\"}",
+    );
+    std::test::assert_eq_int(rerun.status, 202, "run at version 2: " + rerun.body);
+    let now_owed = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        std::str::contains(now_owed.owed, "request-basics@2#")
+            && !std::str::contains(now_owed.owed, "request-basics@1#"),
+        "version 2 owed: " + now_owed.owed,
+    );
+    let v1 = e.store.annotator_version("request-basics", 1) or st::AnnotatorRow { };
+    let mut stale_group = st::AnnotatorRows { };
+    push(stale_group.rows, v1) or discard;
+    let before_stale = read(annotations, fid);
+    let runs_before = count(before_stale.runs);
+    e.annotator.results(
+        api::AnnotationJob { request_id: fid, present: true, owed: old.owed },
+        stale_group,
+        "request",
+        "annotated",
+        "",
+        false,
+        st::AnswerRows { },
+        "{\"stage\": \"request\", \"status\": \"annotated\", \"input_tokens\": 40}",
+    );
+    let after_stale = e.store.annotation(fid) or st::AnnotationRow { };
+    std::test::assert(
+        !api::answered_now(after_stale.annotations, after_stale.owed, "request-basics")
+            && after_stale.status == "pending",
+        "the old worker's result does not land: " + after_stale.annotations,
+    );
+    let stale_kept = read(annotations, fid);
+    std::test::assert_eq_int(count(stale_kept.runs), runs_before + 1, "its run still kept");
+    nodes.busy = false;
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "request", attempt: 1 });
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "response", attempt: 1 });
+    e.annotator.work(api::AnnotateAsk { request_id: fid, stage: "title", attempt: 1 });
+    let answered2 = read(annotations, fid);
+    let mut at_v2 = false;
+    for x in answered2.results {
+        if x.annotator == "request-basics" && x.version == 2 && x.status == "annotated" {
+            at_v2 = true;
+        }
+    }
+    std::test::assert(
+        answered2.status == api::AnnotationStatus::annotated && at_v2,
+        "version 2 then answered: " + answered2.reason,
+    );
+
+    // run again: every annotator in force, or one named; from its recording
+    let ran = run(e, "/admin/v1/annotations/" + rid + "/run", "");
+    std::test::assert_eq_int(ran.status, 202, "run: " + ran.body);
+    std::test::assert(
+        read(annotations, rid).status == api::AnnotationStatus::annotated,
+        "annotated when run again, from its recording",
+    );
+    let n0 = nodes.decisions;
+    let one = run(
+        e,
+        "/admin/v1/annotations/" + rid + "/run",
+        "{\"annotator\": \"response-basics\"}",
+    );
+    std::test::assert_eq_int(one.status, 202, "one annotator run: " + one.body);
+    std::test::assert_eq_int(nodes.decisions, n0 + 1, "only that annotator asked again");
+    std::test::assert(
+        std::str::ends_with(std::str::trim(nodes.asked), "response-basics.completeness")
+            || std::str::contains(
+                nodes.asked[(len(nodes.asked) - 200)..len(nodes.asked)],
+                "response-basics.",
+            ),
+        "the last asked were the response annotator's",
+    );
+    std::test::assert(
+        read(annotations, rid).status == api::AnnotationStatus::annotated,
+        "still annotated",
+    );
+    // no text to read: a request of a project that does not peek
+    projects.update(api::ProjectUpdate { project: "work", has_peek: true, peek: false }) or discard;
+    let unrecorded = ask(e, key, "{\"model\": \"echo-1\", \"input\": \"not recorded\"}");
+    let uid = std::json::find_string_field(unrecorded.body, "id");
+    let notext = run(e, "/admin/v1/annotations/" + uid + "/run", "");
+    std::test::assert_eq_int(notext.status, 409, "no text held or recorded: " + notext.body);
+    let unknown = run(e, "/admin/v1/annotations/resp_nope/run", "");
+    std::test::assert_eq_int(unknown.status, 404, "no such request");
+    // many at once: each queued, or refused and why
+    let batch = run(
+        e,
+        "/admin/v1/annotation-runs",
+        "{\"request_ids\": [" + api::jq(rid) + ", \"resp_nope\", " + api::jq(uid) + ", "
+            + api::jq(qid) + "]}",
+    );
+    std::test::assert_eq_int(batch.status, 202, "a batch: " + batch.body);
+    let outcomes = api::AnnotationRunList::api_decode(batch.body) or api::AnnotationRunList { };
+    let first = at(outcomes.data, 0) or api::AnnotationRunOutcome { };
+    let second = at(outcomes.data, 1) or api::AnnotationRunOutcome { };
+    let third = at(outcomes.data, 2) or api::AnnotationRunOutcome { };
+    let fourth = at(outcomes.data, 3) or api::AnnotationRunOutcome { };
+    std::test::assert(
+        first.queued
+            && second.reason == "unknown"
+            && third.reason == "no_text"
+            && fourth.reason == "not_annotating",
+        "each request's outcome: " + batch.body,
+    );
+}

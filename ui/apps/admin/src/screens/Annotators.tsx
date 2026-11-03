@@ -3,8 +3,10 @@ import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Status, Form, Fi
 import { useGet, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
-import { go } from '../route';
+import { go, href } from '../route';
+import { useLastStep, stepLabel } from '../api/steps';
 import { readout } from '../readout';
+import { AnnotateRoutes } from '../readiness';
 
 type Annotator = Schemas['Annotator'];
 type Rule = Schemas['AnnotationRule'];
@@ -67,6 +69,8 @@ export function Annotators({ route, setInspector }: ScreenProps) {
           <Button onClick={() => go('annotators', 'new')} tone="primary">make an annotator</Button>
         </p>
       </Panel>
+      <Queue />
+      <Routes />
       <Panel title="Rules" readout={readout(rules, `${rules.data.data.length} rules`)}>
         <Table<Rule>
           rows={rules.data.data}
@@ -384,5 +388,71 @@ function RuleEditor({ rule: r }: { rule?: Rule }) {
       )}
       {r && <p className="muted">Rules are scored when an annotation is read: a change applies to every annotation, old ones too.</p>}
     </>
+  );
+}
+
+/**
+ * The annotations still being read (`listAnnotations` by `pending`), newest
+ * first: each request's age, and its last step as the stream told it. A
+ * request leaves when its annotation is kept or not made.
+ */
+function Queue() {
+  const q = useGet('/admin/v1/annotations', { params: { query: { status: 'pending', limit: 200 } } });
+  const n = q.data?.data.length ?? 0;
+  return (
+    <Panel title="Queue" readout={readout(q, q.data ? `${n === 200 ? '200+' : n} pending` : null)}>
+      {q.isPending ? (
+        <Loading />
+      ) : q.isError ? (
+        <Unavailable what="The queue" detail={q.error.message} />
+      ) : (
+        <Table
+          rows={q.data.data}
+          rowKey={(r) => r.request_id}
+          columns={[
+            { key: 'when', header: 'Queued', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
+            { key: 'id', header: 'Request', render: (r) => <a href={href('usage', r.request_id)}><Mono>{r.request_id}</Mono></a> },
+            { key: 'p', header: 'Project', render: (r) => <Mono>{r.project}</Mono> },
+            { key: 'step', header: 'Now', render: (r) => <QueueStep id={r.request_id} /> },
+          ]}
+          empty="Nothing waiting: every annotation queued has been kept or not made."
+        />
+      )}
+    </Panel>
+  );
+}
+
+/** A queued request's last step, as the stream told it; none heard yet, queued. */
+function QueueStep({ id }: { id: string }) {
+  const step = useLastStep(id);
+  if (!step) return <span className="faint">queued</span>;
+  return (
+    <span className={step.step === 'waiting' ? 'c-wait' : 'faint'}>
+      {stepLabel(step)}{step.step === 'waiting' && step.reason ? ` · ${step.reason}` : ''}
+    </span>
+  );
+}
+
+/**
+ * Each project's annotation routes, as they stand: where its questions and
+ * its titles would be read now (readiness.tsx).
+ */
+function Routes() {
+  const projects = useGet('/admin/v1/projects');
+  if (projects.isPending) return <Loading what="projects" />;
+  if (projects.isError) return <Unavailable what="Projects" detail={projects.error.message} />;
+  const live = projects.data.data.filter((p) => !p.internal && p.status !== 'archived');
+  return (
+    <Panel title="Routes" readout={readout(projects, `${live.length} projects`)}>
+      <Table
+        rows={live}
+        rowKey={(p) => p.id}
+        columns={[
+          { key: 'p', header: 'Project', render: (p) => <><Mono>{p.id}</Mono>{p.annotates ? <span className="faint"> · annotating</span> : null}</> },
+          { key: 'r', header: 'decide · title', render: (p) => <AnnotateRoutes project={p.id} /> },
+        ]}
+        empty="No projects."
+      />
+    </Panel>
   );
 }

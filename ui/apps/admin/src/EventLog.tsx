@@ -229,6 +229,8 @@ function lineOf(e: AdminEvent): Line | null {
     }
     case 'annotation': {
       const a = e.data;
+      // queued: its steps tell it as they happen (`annotation_step`)
+      if (a.status === 'pending') return null;
       const pick = (q: string) => a.answers.find((x) => x.question === q)?.answer;
       const task = pick('task');
       const outcome = pick('outcome');
@@ -246,6 +248,40 @@ function lineOf(e: AdminEvent): Line | null {
           : `${a.project} · ${said || `${a.answers.length} answers`}${a.title ? ` · “${a.title}”` : ''} · ${a.runs.length} run${a.runs.length === 1 ? '' : 's'}, ${count(tokens)} tok`,
         detail: a.conversation ?? a.request_id,
         open: () => go('usage', a.request_id),
+        replayed,
+      };
+    }
+    case 'annotation_step': {
+      const st = e.data;
+      const short = st.request_id.length > 14 ? `${st.request_id.slice(0, 12)}…` : st.request_id;
+      const tone: Line['tone'] = st.step === 'queued' || st.step === 'started' || st.step === 'skipped'
+        ? 'quiet'
+        : st.step === 'waiting' || st.step === 'not_annotated' || (st.step === 'done' && st.reason)
+          ? 'warn'
+          : st.step === 'kept' ? 'ok' : 'note';
+      const said = st.step === 'started'
+        ? `${st.stage} stage started · ${st.model}`
+        : st.step === 'done'
+          ? `${st.stage} done${st.model ? ` · ${st.model}` : ''} · ${count(st.input_tokens)} tok · ${st.ms} ms${st.reason ? ` · ${st.reason}` : ''}`
+          : st.step === 'waiting'
+            ? `${st.stage} ${st.reason}`
+            : st.step === 'skipped'
+              ? `${st.stage} skipped${st.reason ? ` · ${st.reason}` : ''}`
+              : st.step === 'titled'
+                ? `titled “${st.title}”`
+                : st.step === 'kept'
+                  ? 'annotated'
+                  : st.step === 'not_annotated'
+                    ? `not annotated · ${st.reason}`
+                    : `queued${st.reason ? ` · ${st.reason}` : ''}`;
+      return {
+        key: `step:${e.id}`,
+        at,
+        tag: '◇ annotate',
+        tone,
+        text: `${short} · ${said}`,
+        detail: st.conversation || st.project,
+        open: () => go('usage', st.request_id),
         replayed,
       };
     }

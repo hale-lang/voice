@@ -9,6 +9,7 @@ import { toneOf } from '../tone';
 import { LimitsEditor, limitsForWrite, type Limit } from '../LimitsEditor';
 import { describeLimit } from './Accounts';
 import { Aliases } from './Aliases';
+import { AnnotateRoutes } from '../readiness';
 
 type Key = Schemas['Key'];
 
@@ -201,11 +202,8 @@ function ProjectInspector({ project: p }: { project: Project }) {
                       />
                     )}
                     {p.annotates && <span className="muted"> · kept apart from this project's usage and limits</span>}
-                    {w.error && /decision model/.test(w.error) && (
-                      <div className="c-wait">
-                        pick a model first: give it a <Mono>decide</Mono> alias naming a decision model (aliases, below), then turn annotate on
-                      </div>
-                    )}
+                    {w.error && /decision model/.test(w.error) && <div className="c-fail">{w.error}</div>}
+                    <AnnotateRoutes project={p.id} />
                   </>
                 ),
               },

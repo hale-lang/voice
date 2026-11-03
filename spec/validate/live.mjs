@@ -85,6 +85,9 @@ const bodies = {
   createAnnotationRule: rule('live-2'),
   updateAnnotationRule: { name: 'live, edited' },
   backfillAnnotations: { annotator: 'request-basics', project: 'work' },
+  // a request no ledger holds: the run answers it refused, by why
+  runAnnotations: { request_ids: ['resp_01j8z3q4v7m2k9x0'] },
+  runAnnotation: {},
 };
 
 // the node plane: the node's enrollment token, and the bodies it sends
@@ -116,6 +119,8 @@ const refusals = {
   getPeek: { json: [404, 'not_found', 'NotFound'] },
   // nor, so, any request annotated
   getAnnotation: { json: [404, 'not_found', 'NotFound'] },
+  // nor one to annotate again
+  runAnnotation: { json: [404, 'not_found'] },
 };
 
 // the query an operation needs to be answered at all

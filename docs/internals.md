@@ -444,7 +444,10 @@ publish NATS beyond loopback (`VOICE_NATS_PORT` publishes it on, and advertises,
 A node serves once it exists on the api and is started with its token
 (docs/adding-a-node.md). The `migrate` service brings the schema up to date before the
 api and the brain start, and the api keeps its configuration in Postgres,
-so it survives a restart of the api. The brain writes the route table to
+so it survives a restart of the api. Postgres, NATS, the api and the brain
+are restarted when they stop (`restart: unless-stopped`); `migrate` is
+not, and a restart does not wait on it again, since the schema it brought
+up stands. The brain writes the route table to
 Postgres every second and tells NATS its new version.
 
 ## The brain

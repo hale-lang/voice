@@ -1,15 +1,18 @@
 // A vLLM seat is started as its variant says the weights must be served,
 // on one node and on each rank across two: DeepSeek-V4's fp8 weights from
 // an fp8 KV cache alone (`kv_cache_dtype`), its thinking parsed out of its
-// answer (`reasoning_parser`). A variant that says neither, a value voice
-// does not name, and llama-server start as they always did.
+// answer (`reasoning_parser`), its tool calls read (`tool_call_parser`).
+// A variant that says none, a value voice does not name, and llama-server
+// start as they always did.
 import ".." as node;
 
-const DSV4: String = "{\"id\": \"safetensors-fp8\", \"format\": \"safetensors\", \"quantization\": \"fp8\", \"files\": [{\"path\": \"config.json\", \"bytes\": 1888, \"sha256\": \"6c8f\"}], \"memory_bytes\": 175800000000, \"kv_cache_dtype\": \"fp8\", \"kv_bytes_per_token\": 17200, \"reasoning_parser\": \"deepseek_v4\"}";
+const DSV4: String = "{\"id\": \"safetensors-fp8\", \"format\": \"safetensors\", \"quantization\": \"fp8\", \"files\": [{\"path\": \"config.json\", \"bytes\": 1888, \"sha256\": \"6c8f\"}], \"memory_bytes\": 175800000000, \"kv_cache_dtype\": \"fp8\", \"kv_bytes_per_token\": 17200, \"reasoning_parser\": \"deepseek_v4\", \"tool_call_parser\": \"deepseek_v4\"}";
 
 const PLAIN: String = "{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"quantization\": \"bf16\", \"files\": [{\"path\": \"config.json\", \"bytes\": 1888, \"sha256\": \"6c8f\"}], \"memory_bytes\": 16400000000}";
 
-const FLAGS: String = "\n--kv-cache-dtype\nfp8\n--reasoning-parser\ndeepseek_v4";
+const GPT_OSS: String = "{\"id\": \"safetensors-mxfp4\", \"format\": \"safetensors\", \"quantization\": \"mxfp4\", \"memory_bytes\": 70000000000, \"tool_call_parser\": \"openai\"}";
+
+const FLAGS: String = "\n--kv-cache-dtype\nfp8\n--reasoning-parser\ndeepseek_v4\n--enable-auto-tool-choice\n--tool-call-parser\ndeepseek_v4";
 
 fn vllm(variant: String) -> String {
     return node::server_args(
@@ -34,6 +37,50 @@ fn main() {
         "deepseek_v4",
         "and its reasoning parser",
     );
+    std::test::assert_eq_str(
+        node::tool_call_parser(DSV4),
+        "deepseek_v4",
+        "and the parser its tool calls are read with",
+    );
+    for name in ["openai", "glm47", "qwen3_coder", "granite4", "hermes"] {
+        std::test::assert_eq_str(
+            node::tool_call_parser("{\"tool_call_parser\": \"" + name + "\"}"),
+            name,
+            "a tool-call parser voice names: " + name,
+        );
+    }
+    std::test::assert_eq_str(node::tool_call_parser(PLAIN), "", "a variant that names none: none");
+    for bad in [
+        "{\"tool_call_parser\": \"hermes\\n--trust-remote-code\"}",
+        "{\"tool_call_parser\": \"pythonic\"}",
+        "{\"tool_call_parser\": \"qwen3_xml\"}",
+        "{\"tool_call_parser\": true}",
+        "{\"tool_call_parser\": \"\"}",
+    ] {
+        std::test::assert_eq_str(
+            node::tool_call_parser(bad),
+            "",
+            "no tool-call parser voice does not name is handed to vLLM: " + bad,
+        );
+        std::test::assert(
+            !std::str::contains(vllm(bad), "tool"),
+            "nor any tool flag: " + vllm(bad),
+        );
+    }
+    std::test::assert_eq_str(
+        node::tool_call_parser(GPT_OSS),
+        "openai",
+        "gpt-oss's calls are read with vLLM's openai parser",
+    );
+    std::test::assert(
+        std::str::ends_with(
+            vllm(GPT_OSS),
+            "\n--load-format\nfastsafetensors\n--enable-auto-tool-choice\n--tool-call-parser\nopenai",
+        )
+            && !std::str::contains(vllm(GPT_OSS), "--kv-cache-dtype")
+            && !std::str::contains(vllm(GPT_OSS), "--reasoning-parser"),
+        "a variant that names only a tool-call parser is given only that: " + vllm(GPT_OSS),
+    );
     std::test::assert_eq_str(node::kv_cache_dtype(PLAIN), "", "a variant that does not say: none");
     std::test::assert_eq_str(node::reasoning_parser(PLAIN), "", "nor a parser");
     for bad in [
@@ -52,12 +99,13 @@ fn main() {
         vllm(DSV4),
         "vllm\nserve\n/models\n--host\n0.0.0.0\n--port\n8080\n--served-model-name\ndeepseek-v4-flash\n--gpu-memory-utilization\n0.75\n--max-model-len\nauto\n--load-format\nfastsafetensors"
             + FLAGS,
-        "a seat on one node keeps an fp8 cache and parses the model's thinking",
+        "a seat on one node keeps an fp8 cache, parses the model's thinking and reads its tool calls",
     );
     std::test::assert(
         !std::str::contains(vllm(PLAIN), "--kv-cache-dtype")
-            && !std::str::contains(vllm(PLAIN), "--reasoning-parser"),
-        "a variant that says neither: no flag",
+            && !std::str::contains(vllm(PLAIN), "--reasoning-parser")
+            && !std::str::contains(vllm(PLAIN), "tool"),
+        "a variant that says none: no flag",
     );
     std::test::assert_eq_str(
         node::server_args(
@@ -97,7 +145,8 @@ fn main() {
                 "\n--load-format\nfastsafetensors" + FLAGS
                     + "\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n" + rank + "\n",
             ),
-            "rank " + rank + " keeps an fp8 cache and parses its thinking: " + ranked,
+            "rank " + rank + " keeps an fp8 cache, parses its thinking, reads its tool calls: "
+                + ranked,
         );
         let plain = node::span_container_argv(
             "voice.n.bf16",
@@ -111,8 +160,9 @@ fn main() {
         );
         std::test::assert(
             !std::str::contains(plain, "--kv-cache-dtype")
-                && !std::str::contains(plain, "--reasoning-parser"),
-            "rank " + rank + " of a variant that says neither: no flag",
+                && !std::str::contains(plain, "--reasoning-parser")
+                && !std::str::contains(plain, "tool"),
+            "rank " + rank + " of a variant that says none: no flag",
         );
     }
 }

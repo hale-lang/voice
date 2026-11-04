@@ -25,19 +25,27 @@ serve says so (`VLLM_SERVES` in the script): DeepSeek-V4's fp8 weights are
 served from an fp8 KV cache alone (`kv_cache_dtype`), at what a token costs
 in it (`kv_bytes_per_token`, the variant's own, which the fit takes over the
 recipe's 16-bit figure), with DeepSeek-V4's reasoning parser
-(`reasoning_parser`).
+(`reasoning_parser`). A model that calls tools names the parser vLLM reads
+its calls with (`tool_call_parser`, one vLLM v0.29.0 registers): DeepSeek-V4
+`deepseek_v4`, gpt-oss `openai`, GLM-4.7-Flash `glm47`, the Qwen3-Coders
+`qwen3_coder`, Granite 4.0 `granite4`, and the hand-made `qwen3-0.6b`
+`hermes`. Only a vLLM seat whose variant names one carries `tools`; the
+rest are served text only under vLLM (a GGUF seat carries them, through the
+model's own chat template).
 
 <!-- recipes -->
 | Recipe | License | Variants (download) | Served by |
 |---|---|---|---|
 | `deepseek-r1-0528-qwen3-8b` | mit | `safetensors-bf16` (16.4 GB) | vLLM, on CUDA |
-| `deepseek-v4-flash-0731` | mit | `safetensors-fp8` (166.9 GB) | vLLM, on CUDA |
+| `deepseek-v4-flash-0731` | mit | `gguf-q2_k_s` (98.6 GB), `safetensors-fp8` (166.9 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `glm-4.7-flash` | mit | `gguf-q8_0` (31.8 GB), `safetensors-bf16` (62.5 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `gpt-oss-120b` | apache-2.0 | `gguf-mxfp4` (63.4 GB), `safetensors-mxfp4` (65.3 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `gpt-oss-20b` | apache-2.0 | `gguf-mxfp4` (12.1 GB), `safetensors-mxfp4` (13.8 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `granite-4.0-350m` | apache-2.0 | `gguf-q8_0` (0.4 GB), `safetensors-bf16` (0.7 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `granite-4.0-h-small` | apache-2.0 | `gguf-q4_k_m` (19.5 GB), `gguf-q6_k` (26.5 GB), `gguf-q8_0` (34.3 GB) | llama.cpp, on Metal or CUDA |
 | `granite-4.0-h-tiny` | apache-2.0 | `gguf-q4_k_m` (4.2 GB), `gguf-q6_k` (5.7 GB), `gguf-q8_0` (7.4 GB) | llama.cpp, on Metal or CUDA |
+| `jev-style-0.8b-decision-v3` | apache-2.0 | `mlx-bf16` (1.5 GB), `mlx-8bit` (0.8 GB) | MLX, on Metal |
+| `jev-style-2b-decision-v3` | apache-2.0 | `mlx-bf16` (3.8 GB), `mlx-8bit` (2.0 GB), `gguf-q8_0` (2.0 GB), `gguf-q4_k_m` (1.3 GB), `gguf-f16` (3.8 GB) | MLX, on Metal; llama.cpp, on Metal or CUDA |
 | `mimo-v2.6-distill-qwen-9b` | mit | `gguf-q8_0` (9.5 GB), `safetensors-bf16` (18.8 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `openreasoning-nemotron-32b` | cc-by-4.0 | `safetensors-bf16` (65.5 GB) | vLLM, on CUDA |
 | `phi-4-mini-reasoning` | mit | `safetensors-bf16` (7.7 GB) | vLLM, on CUDA |

@@ -1,0 +1,177 @@
+// What GET /v1/models says a model served by managed seats takes: the
+// context a request can count on is the least any of its up seats' servers
+// took, as their nodes reported it, never more than the model is made for;
+// and it carries `tools` when a seat's variant names the parser vLLM reads
+// its tool calls with (`RecipeVariant.tool_call_parser`).
+import ".." as api;
+import "../../store" as st;
+
+const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
+
+/// A managed seat's config under vLLM, of placement dsv4, its variant
+/// naming `parser` ("" for none).
+fn vllm_config(parser: String) -> String { return vllm_config_of("dsv4", parser); }
+
+/// The same, of placement `model`, which places `model`.
+fn vllm_config_of(model: String, parser: String) -> String {
+    return "{\"placement\": \"" + model + "\", \"model\": \"" + model
+        + "\", \"context_length\": 1048576, \"cache_tokens\": 524288, \"reserved_bytes\": 96600000000, \"variant\": {\"id\": \"safetensors-fp8\", \"format\": \"safetensors\", \"quantization\": \"fp8\", \"memory_bytes\": 175800000000, \"kv_cache_dtype\": \"fp8\""
+        + (if len(parser) > 0 { ", \"tool_call_parser\": \"" + parser + "\"" } else { "" })
+        + "}, \"runtime\": {\"id\": \"vllm-26.09\", \"server\": \"vllm\"}}";
+}
+
+fn plane(e: api::DataPlane, path: String, token: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: path,
+            headers: "Authorization: Bearer " + token,
+            body: body,
+        },
+    );
+}
+
+/// Node `id` with one managed seat serving `model` under `config`,
+/// registered and reporting it up, its server having taken `context`
+/// tokens (0: not said).
+fn bring_up(e: api::DataPlane, id: String, model: String, config: String, context: Int) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: id }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    std::test::assert(made.has_enrollment_token, "a node " + id);
+    let mut sc = api::SeatCreate {
+        node: id,
+        id: "seat",
+        engine: "managed",
+        account: "local",
+        config: std::json::Value::parse(config) or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: model }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat on " + id + ": " + api::ctl_problem(err).message);
+    };
+    let reg = plane(
+        e,
+        "/node/v1/register",
+        made.enrollment_token,
+        "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS + ", \"local\": "
+            + LOCAL + "}",
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    let r = plane(
+        e,
+        "/node/v1/seats",
+        made.enrollment_token,
+        "{\"assignment_version\": " + to_string(version)
+            + ", \"seats\": [{\"id\": \"seat\", \"status\": \"up\", \"in_flight\": 0"
+            + (if context > 0 { ", \"context\": " + to_string(context) } else { "" }) + "}]}",
+    );
+    std::test::assert_eq_int(r.status, 204, id + " reports its seat: " + r.body);
+}
+
+/// `model` as /v1/models/{model} answers it under `key`: its `voice` object.
+fn voice_of(e: api::DataPlane, key: String, model: String) -> String {
+    let r = e.handle(
+        std::http::Request {
+            method: "GET",
+            path: "/v1/models/" + model,
+            headers: "Authorization: Bearer " + key,
+        },
+    );
+    std::test::assert_eq_int(r.status, 200, model + ": " + r.body);
+    return std::json::find_field_raw(r.body, "voice");
+}
+
+fn tools(voice: String) -> Bool {
+    return std::str::trim(
+        std::json::find_field_raw(std::json::find_field_raw(voice, "capabilities"), "tools"),
+    )
+        == "true";
+}
+
+fn main() {
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    accounts.create(api::AccountCreate { id: "local", name: "Local" }) or discard;
+    for m in ["dsv4", "plain"] {
+        catalog.create(api::CatalogModelCreate { id: m, context_length: 1048576 }) or {
+            std::test::assert(false, "a model " + m + ": " + api::ctl_problem(err).message);
+        };
+    }
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let k = keys.create(
+        api::KeyCreate { project: "work", name: "ci" },
+    ) or api::Key { status: api::KeyStatus::revoked };
+    std::test::assert(k.has_secret, "a key");
+    let key = k.secret;
+
+    // the catalog's, while no seat has said
+    std::test::assert_eq_int(
+        std::json::find_int_field(voice_of(e, key, "dsv4"), "context_length"),
+        1048576,
+        "with no seat up, the catalog's context",
+    );
+
+    // one seat, whose vLLM took the model's whole context: the served
+    // figure, which is the model's (the live DeepSeek-V4 placement's)
+    bring_up(e, "spark", "dsv4", vllm_config("deepseek_v4"), 1048576);
+    let one = voice_of(e, key, "dsv4");
+    std::test::assert(
+        std::str::trim(std::json::find_field_raw(one, "available")) == "true",
+        "served: " + one,
+    );
+    std::test::assert_eq_int(
+        std::json::find_int_field(one, "context_length"),
+        1048576,
+        "what its one seat took",
+    );
+    std::test::assert(
+        tools(one),
+        "a vLLM seat whose variant names its tool-call parser carries tools: " + one,
+    );
+
+    // a second seat that took less: what a request can count on is the less
+    bring_up(e, "flare", "dsv4", vllm_config("deepseek_v4"), 262144);
+    std::test::assert_eq_int(
+        std::json::find_int_field(voice_of(e, key, "dsv4"), "context_length"),
+        262144,
+        "the least its up seats took, not the catalog's",
+    );
+
+    // a seat that took more than the model is made for: the model's
+    bring_up(e, "big", "plain", vllm_config_of("plain", ""), 2097152);
+    let plain = voice_of(e, key, "plain");
+    std::test::assert_eq_int(
+        std::json::find_int_field(plain, "context_length"),
+        1048576,
+        "never more than the model is made for",
+    );
+    std::test::assert(
+        !tools(plain),
+        "a vLLM seat whose variant names no tool-call parser carries none: " + plain,
+    );
+
+    // the variant decides it, not the model
+    std::test::assert(
+        api::managed_tools(vllm_config("deepseek_v4")) && api::managed_tools(vllm_config("openai"))
+            && !api::managed_tools(vllm_config(""))
+            && !api::managed_tools(vllm_config("pythonic")),
+        "a vLLM seat carries tools as its variant's parser says, from voice's set",
+    );
+    std::test::assert(
+        api::managed_tools("{\"runtime\": {\"server\": \"llama-server\"}, \"variant\": {}}")
+            && !api::managed_tools(
+                "{\"runtime\": {\"server\": \"decision\"}, \"variant\": {\"tool_call_parser\": \"hermes\"}}",
+            ),
+        "llama-server always, the decision server never",
+    );
+}

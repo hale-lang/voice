@@ -354,8 +354,9 @@ parent and no account until the operator gives it some.
 `/v1/models` answers what the caller could be served: a model is
 `available` when a seat on an account the key may spend serves it, and
 `voice.capabilities.tools` says whether such a seat carries `tools` to the
-model (an openai-compatible seat, or a managed one under llama-server; not
-under vLLM, which voice does not yet start with a tool-call parser).
+model (an openai-compatible seat; a managed one under llama-server, or
+under vLLM when its variant names the parser vLLM reads the model's tool
+calls with, `tool_call_parser`, which the node starts vLLM with).
 
 ## The node
 
@@ -977,8 +978,9 @@ already there.
   order; one that interleaves fails the seat. The api renders them as
   `tool_calls` deltas with `finish_reason: "tool_calls"`, or as the
   Responses API's `function_call` items. Which seats carry tools is derived,
-  not declared: an openai-compatible seat does, a static seat only as its
-  `tool_call` drill, and a claude-cli seat never. A node refuses a `serve`
+  not declared: an openai-compatible seat does, a managed seat under
+  llama-server or under vLLM with its variant's `tool_call_parser`, a
+  static seat only as its `tool_call` drill, and a claude-cli seat never. A node refuses a `serve`
   carrying `tools` for a seat that does not before any event (`refused`,
   which is a seat failure), so the coordinator offers it to the next seat.
   The claude-cli engine (node/claude.hl) runs `claude -p --output-format

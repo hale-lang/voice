@@ -156,6 +156,12 @@ locus Hub {
         Asked <- Ask { file: file, start: from, end: to };
         let first = from == 0 && !std::str::contains(self.seen, file + "\n");
         if from == 0 { self.seen = self.seen + file + "\n"; }
+        if file == "fail.big" && from == 32768 {
+            // refused, once the other lanes are part way through theirs
+            // (and before a window could find this one slow)
+            std::time::sleep(100ms);
+            return std::http::Response { status: 403, body: "no" };
+        }
         let fd = req.conn_fd;
         if file == "stall.big" && first {
             send_range(fd, body, from, to, size, 0, 0, (to - from) / 2);
@@ -169,6 +175,8 @@ locus Hub {
             std::io::tcp::close_fd(fd);
         } else if file == "slow.big" && first {
             send_range(fd, body, from, to, size, 64, 200, 0);
+        } else if file == "fail.big" {
+            send_range(fd, body, from, to, size, 512, 100, 0);
         } else if file == "slow.big" {
             send_range(fd, body, from, to, size, 512, 20, 0);
         } else {
@@ -378,6 +386,21 @@ main locus App {
             "from where it was cut: " + self.asked,
         );
         std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a fetch that ends with lanes part way through their ranges: what
+        // they wrote stays in the sidecar, for the next start to resume
+        let failed = f.blob("s", hub + "fail.big", "fail.big", digest, n, true, 0, n);
+        std::test::assert(std::str::contains(failed, "answered 403"), "a range refused: " + failed);
+        let kept = node::spans_read(
+            std::io::fs::read_file(data + "/blobs/" + digest + ".ranges") or "",
+            n,
+        );
+        std::test::assert(
+            node::spans_total(kept) > 0,
+            "what the lanes wrote of their ranges is kept: " + kept,
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest + ".part") or discard;
+        std::io::fs::unlink(data + "/blobs/" + digest + ".ranges") or discard;
 
         // a fetch cut off: its sidecar holds ranges 1 and 3, the part their
         // bytes and garbage elsewhere; those ranges are not asked for again

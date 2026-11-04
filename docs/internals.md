@@ -368,7 +368,26 @@ the engines. A managed seat (a placement's) is fetched on a thread of its
 own (`fetch.hl`): each of its files from the hub, following the hub's
 redirect to its CDN and resuming a part already on disk, into
 `blobs/<sha256>`, kept only once its size and sha256 match; the seat is
-`fetching` with how far. Then the runner (`run.hl`, its own thread too)
+`fetching` with how far. A file of 256 MiB or more is fetched in 64 MiB
+ranges over the node's eight lanes (`lane.hl`, each a connection on a
+thread of its own), each range written into the part at its offset: a
+CDN's speed varies widely from one connection to the next (on a DGX Spark,
+one connection to a 3.78 GB GGUF held 1.1 MB/s for 15 minutes while a
+fresh one got 14 MB/s, and four ranged ones 43, 20, 13 and 3.6 MB/s), and
+one slow connection held for a whole file is never replaced. Every 10 s
+the fetcher compares the lanes that were busy all of it, and drops one
+that wrote less than a quarter of their median; one that wrote nothing in
+30 s is dropped too. A dropped lane's range, and one that failed, is
+handed again from where it got to, what it wrote kept; a range that fails
+five times in a row with nothing written ends the fetch. What is written
+is kept beside the part, `<sha256>.ranges` (`start end` lines), so a fetch
+cut off resumes with every range it wrote, and a part fetched whole with
+no sidecar counts as the start of the file. A server that answers a range
+with the whole file, or with another range, is fetched from over one
+connection instead, as a smaller file is. The fetcher fetches one file at
+a time, for one seat at a time, so a node holds at most eight connections
+to the hub however many seats it fetches for. The whole file is verified
+against its sha256 either way. Then the runner (`run.hl`, its own thread too)
 lays the weights out under their recipe's names in `models/<seat>`, as
 links into the store, and starts the runtime in voice's sandbox: a
 container under docker, the weights read-only, its port on loopback, the
@@ -781,7 +800,7 @@ only its own in-flight requests.
 The node's capabilities file, written by its operator, and its local
 controls. Everything else about what it runs comes from the coordinator, so
 it needs no database. Beside them, what the node fetched (`blobs/`, by
-sha256) and what its servers keep between starts: a vLLM seat's compiled
+sha256, with a `.part` and its `.ranges` for a file still being fetched) and what its servers keep between starts: a vLLM seat's compiled
 graphs and FlashInfer's kernel autotune, `cache/<runtime>/`, one directory
 per runtime, tens of megabytes, so a vLLM seat started again skips most of
 its warm-up: on a DGX Spark serving gpt-oss-120b, the engine's

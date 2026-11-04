@@ -51,6 +51,63 @@ const HUB_URL: String = "https://huggingface.co";
 /// How often a fetch says how far it is: every this many bytes.
 const REPORT_BYTES: Int = 67108864;
 
+/// A file this large or larger is fetched in ranges, over the lanes: one
+/// connection's speed from a CDN varies widely, and one slow connection
+/// held for a whole file of gigabytes is never replaced.
+const RANGED_BYTES: Int = 268435456;
+
+/// The bytes of one range.
+const RANGE_BYTES: Int = 67108864;
+
+/// How long the lanes are measured over before they are compared.
+const WINDOW_MS: Int = 10000;
+
+/// A lane that wrote nothing in this long is stalled: dropped, its range
+/// handed to another.
+const STALL_MS: Int = 30000;
+
+/// A lane that wrote less than this share of its peers' median over a
+/// window is a straggler: dropped, its range handed to another.
+const SLOWER: Int = 4;
+
+/// A range that failed this many times in a row with nothing written
+/// ends the fetch.
+const TRIES: Int = 5;
+
+/// What `in_ranges` says when the server does not honour `Range`: the
+/// file is fetched whole instead.
+const UNRANGED: String = "(unranged)";
+
+/// A lane as the fetcher holds it: the range it was handed (`ticket` 0
+/// while it has none), for which file (`job`), how far it has written
+/// (`got`, and when it last moved, `since`), and the window's mark it is
+/// measured from (`whole` once it was busy all of a window).
+type LaneSlot {
+    job: Int = 0;
+    ticket: Int = 0;
+    start: Int = 0;
+    end: Int = 0;
+    got: Int = 0;
+    tries: Int = 0;
+    since: Int = 0;
+    mark: Int = 0;
+    whole: Bool = false;
+    // dropped, and waited on only once it may have written
+    dropped: Bool = false;
+    writing: Bool = false;
+}
+
+/// The lanes, by index: a record, so it is stored whole.
+type LaneSlots { items: bounded[LaneSlot; 8]; }
+
+/// A range to hand a lane: `found` when there is one.
+type Piece {
+    start: Int = 0;
+    end: Int = 0;
+    tries: Int = 0;
+    found: Bool = false;
+}
+
 /// Why a managed seat's config cannot be fetched, "" when it can: a
 /// placement, a variant with a source and files, a runtime with an
 /// artifact. The coordinator checked every field when it was allowed.
@@ -328,10 +385,45 @@ locus Blobs {
         file: String = "";
         // why the last chunk could not be read or written
         why: String = "";
+        // what a file fetched in ranges takes: voice's own, smaller only
+        // in its tests
+        ranged: Int = RANGED_BYTES;
+        piece: Int = RANGE_BYTES;
+        lanes: Int = LANES;
+        window_ms: Int = WINDOW_MS;
+        stall_ms: Int = STALL_MS;
+        report_ms: Int = 200;
+        // the lanes, and the tickets handed them
+        slots: LaneSlots = LaneSlots { };
+        tickets: Int = 0;
+        // the file being fetched in ranges: its job, where it comes from,
+        // its part and sidecar, its size
+        job: Int = 0;
+        url: String = "";
+        hub: Bool = false;
+        vault: String = "";
+        part: String = "";
+        side: String = "";
+        size: Int = 0;
+        // its spans written and kept; ranges to hand again ("start end
+        // tries ready" lines), the next byte not yet handed out
+        spans: String = "";
+        retry: String = "";
+        at: Int = 0;
+        // why it cannot be fetched, once that is known; the server does
+        // not honour `Range`
+        failure: String = "";
+        unranged: Bool = false;
+        // when the window ends, and the lanes dropped so far
+        window_end: Int = 0;
+        dropped: Int = 0;
     }
 
     bus {
         publish FetchUpdated;
+        publish RangeWanted;
+        publish RangeDropped;
+        subscribe RangeHeard as on_heard;
     }
 
     /// One file into the store: fetched (resumed when a part of it is
@@ -351,7 +443,19 @@ locus Blobs {
     ) -> String {
         let dest = self.data + "/blobs/" + sha;
         let part = dest + ".part";
-        let fetched = self.download(seat, url, name, part, bytes, hub, done, total);
+        let side = dest + ".ranges";
+        let mut fetched = if bytes >= self.ranged {
+            self.in_ranges(seat, url, name, part, side, bytes, hub, done, total)
+        } else {
+            self.download(seat, url, name, part, side, bytes, hub, done, total)
+        };
+        if fetched == UNRANGED {
+            // the server sends it whole: what the ranges wrote is not a
+            // start of it, so it starts over
+            std::io::fs::unlink(part) or discard;
+            std::io::fs::unlink(side) or discard;
+            fetched = self.download(seat, url, name, part, side, bytes, hub, done, total);
+        }
         if len(fetched) > 0 { return fetched; }
         let size = std::io::fs::file_size(part) or 0;
         if size < bytes {
@@ -360,6 +464,7 @@ locus Blobs {
         }
         if size > bytes {
             std::io::fs::unlink(part) or discard;
+            std::io::fs::unlink(side) or discard;
             return name + " is " + to_string(size) + " bytes, not the " + to_string(bytes)
                 + " pinned: refused";
         }
@@ -369,26 +474,34 @@ locus Blobs {
         let got = std::hex::encode(digest);
         if got != sha {
             std::io::fs::unlink(part) or discard;
+            std::io::fs::unlink(side) or discard;
             return name + "'s sha256 is " + got + ", not the " + sha + " pinned: refused";
         }
         std::io::fs::rename(part, dest) or { return name + " could not be kept: " + err.detail; };
+        std::io::fs::unlink(side) or discard;
         return "";
     }
 
-    /// The body at `url` written to `part`, from where `part` ends; ""
-    /// when it ended, else why not. Its reader and its file are its own,
-    /// so both close when it returns.
+    /// The body at `url` written to `part`, from where `part` ends, over
+    /// one connection; "" when it ended, else why not. Its reader and its
+    /// file are its own, so both close when it returns.
     @unbounded
     fn download(
         seat: String,
         url: String,
         name: String,
         part: String,
+        side: String,
         bytes: Int,
         hub: Bool,
         done: Int,
         total: Int
     ) -> String {
+        if std::io::fs::file_exists(side) {
+            // a part written in ranges is not a start of the file
+            std::io::fs::unlink(part) or discard;
+            std::io::fs::unlink(side) or discard;
+        }
         let mut offset = if std::io::fs::file_exists(part) {
             std::io::fs::file_size(part) or 0
         } else {
@@ -449,6 +562,395 @@ locus Blobs {
         return "";
     }
 
+    /// The file at `url` fetched in ranges over the lanes into `part`, each
+    /// written at its offset, what is written kept in `side`; "" once every
+    /// range is written, `UNRANGED` when the server does not honour
+    /// `Range`, else why not. Spans `side` holds are not fetched again;
+    /// a part with no sidecar, one fetched whole and cut off, holds the
+    /// start of the file.
+    @unbounded
+    fn in_ranges(
+        seat: String,
+        url: String,
+        name: String,
+        part: String,
+        side: String,
+        bytes: Int,
+        hub: Bool,
+        done: Int,
+        total: Int
+    ) -> String {
+        let mut spans = "";
+        if std::io::fs::file_exists(side) {
+            spans = spans_read(std::io::fs::read_file(side) or "!", bytes);
+            if spans == "!" {
+                // a sidecar that is not this file's leaves the part unknown
+                std::io::fs::unlink(part) or discard;
+                std::io::fs::unlink(side) or discard;
+                spans = "";
+            }
+        } else if std::io::fs::file_exists(part) {
+            let size = std::io::fs::file_size(part) or 0;
+            if size > bytes {
+                std::io::fs::unlink(part) or discard;
+            } else {
+                spans = spans_add("", 0, size);
+            }
+        }
+        let made = create_part(part);
+        if len(made) > 0 { return name + ": " + made; }
+        self.job = self.job + 1;
+        self.url = url;
+        self.hub = hub;
+        self.vault = hub_token_vault(self.file);
+        self.part = part;
+        self.side = side;
+        self.size = bytes;
+        self.spans = spans;
+        self.retry = "";
+        self.at = 0;
+        self.failure = "";
+        self.unranged = false;
+        self.fill_slots();
+        // from here the part is written at offsets: the sidecar says what
+        // of it is the file
+        let saved = self.save();
+        if len(saved) > 0 { return name + ": " + saved; }
+        self.window_end = std::time::monotonic_ns() + self.window_ms * 1000000;
+        let mut next = spans_total(spans) + REPORT_BYTES;
+        while true {
+            if self.draining {
+                self.drop_all();
+                self.save();
+                return name + ": stopped, the node is stopping";
+            }
+            let state = self.turn();
+            if state == 1 { return ""; }
+            if state == 2 {
+                self.drop_all();
+                self.save();
+                return name + ": " + self.failure;
+            }
+            if state == 3 {
+                self.drop_all();
+                self.settle();
+                return UNRANGED;
+            }
+            let held = self.held();
+            if held >= next {
+                self.tell(seat, "fetching", "", done + held, total);
+                next = held + REPORT_BYTES;
+            }
+            std::time::sleep(20ms);
+        }
+        return "";
+    }
+
+    /// One turn of a ranged fetch: stalled lanes dropped, the lanes
+    /// judged at the end of a window, free lanes handed ranges. 0 while it
+    /// goes on, 1 once every range is written, 2 when it cannot be
+    /// (`failure` says), 3 when the server does not honour `Range`.
+    fn turn() -> Int {
+        if len(self.failure) > 0 { return 2; }
+        if self.unranged { return 3; }
+        let now = std::time::monotonic_ns();
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let s = at(self.slots.items, i) or LaneSlot { };
+            if self.live(s) && now - s.since > self.stall_ms * 1000000 {
+                self.drop(i);
+            }
+            i = i + 1;
+        }
+        if len(self.failure) > 0 { return 2; }
+        if now >= self.window_end {
+            self.judge();
+            self.save();
+            self.window_end = now + self.window_ms * 1000000;
+        }
+        i = 0;
+        while i < count(self.slots.items) {
+            let s = at(self.slots.items, i) or LaneSlot { };
+            if s.ticket == 0 && !self.hand(i, now) { break; }
+            i = i + 1;
+        }
+        if spans_gap(self.spans, self.at, self.size) < self.size || len(self.retry) > 0 {
+            return 0;
+        }
+        for s in self.slots.items {
+            if s.job == self.job && s.ticket != 0 && (!s.dropped || s.writing) { return 0; }
+        }
+        return 1;
+    }
+
+    /// The window's end: each lane busy all of it compared with the
+    /// others', and one that wrote less than `1/SLOWER` of their median
+    /// dropped; then every busy lane measured afresh.
+    fn judge() {
+        let mut rates: [Int; 8] = [0; 8];
+        let mut n = 0;
+        for s in self.slots.items {
+            if self.live(s) && s.whole && n < 8 {
+                rates[n] = s.got - s.mark;
+                n = n + 1;
+            }
+        }
+        if n >= 2 {
+            // sorted, for the upper median
+            let mut i = 1;
+            while i < n {
+                let v = rates[i];
+                let mut j = i - 1;
+                while j >= 0 && rates[j] > v {
+                    rates[j + 1] = rates[j];
+                    j = j - 1;
+                }
+                rates[j + 1] = v;
+                i = i + 1;
+            }
+            let median = rates[n / 2];
+            i = 0;
+            while i < count(self.slots.items) {
+                let s = at(self.slots.items, i) or LaneSlot { };
+                if self.live(s) && s.whole && (s.got - s.mark) * SLOWER < median {
+                    self.drop(i);
+                }
+                i = i + 1;
+            }
+        }
+        let mut next = LaneSlots { };
+        for s in self.slots.items {
+            let mut m = s;
+            if self.live(m) {
+                m.mark = m.got;
+                m.whole = true;
+            }
+            push(next.items, m) or discard;
+        }
+        self.slots = next;
+    }
+
+    /// Hand lane `i` the next range, a range to hand again first: false
+    /// when none is ready.
+    fn hand(i: Int, now: Int) -> Bool {
+        let p = self.take(now);
+        if !p.found { return false; }
+        self.tickets = self.tickets + 1;
+        self.put(i, LaneSlot {
+            job: self.job,
+            ticket: self.tickets,
+            start: p.start,
+            end: p.end,
+            got: p.start,
+            tries: p.tries,
+            since: now,
+            mark: p.start,
+        });
+        RangeWanted <- RangeWork {
+            lane: i,
+            ticket: self.tickets,
+            url: self.url,
+            hub: self.hub,
+            vault: self.vault,
+            part: self.part,
+            start: p.start,
+            end: p.end,
+            size: self.size,
+            // a bound on the exchange, so no lane is held for ever: 30 s,
+            // and the range at 64 KiB/s; what it wrote stands, and the
+            // rest is handed again
+            timeout_ms: 30000 + (p.end - p.start) / 64,
+            report_ms: self.report_ms,
+        };
+        return true;
+    }
+
+    /// The next range: the first one to hand again that is ready, else the
+    /// next gap's next `piece` bytes.
+    @unbounded
+    fn take(now: Int) -> Piece {
+        let mut kept = "";
+        let mut found = Piece { };
+        let mut rest = self.retry;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let line = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            if !found.found && word(line, 3) <= now {
+                found = Piece {
+                    start: word(line, 0),
+                    end: word(line, 1),
+                    tries: word(line, 2),
+                    found: true,
+                };
+            } else {
+                kept = kept + line + "\n";
+            }
+        }
+        if found.found {
+            self.retry = kept;
+            return found;
+        }
+        let g = spans_gap(self.spans, self.at, self.size);
+        if g >= self.size { return Piece { }; }
+        let gap_end = spans_gap_end(self.spans, g, self.size);
+        let end = if g + self.piece < gap_end { g + self.piece } else { gap_end };
+        self.at = end;
+        return Piece { start: g, end: end, found: true };
+    }
+
+    /// Lane `i` dropped, a straggler or stalled: what it wrote stands, the
+    /// rest of its range is handed again, and the lane is waited on only
+    /// until it says it stopped.
+    fn drop(i: Int) {
+        let mut s = at(self.slots.items, i) or LaneSlot { };
+        RangeDropped <- RangeStop { lane: i, ticket: s.ticket };
+        self.dropped = self.dropped + 1;
+        self.again(s, "stalled: nothing came in " + to_string(self.stall_ms / 1000) + " s");
+        s.dropped = true;
+        self.put(i, s);
+    }
+
+    /// What `s` wrote kept, the rest of its range to hand again; a range
+    /// that failed `TRIES` times in a row with nothing written ends the
+    /// fetch with `why`.
+    @unbounded
+    fn again(s: LaneSlot, why: String) {
+        self.spans = spans_add(self.spans, s.start, s.got);
+        let tries = if s.got > s.start { 0 } else { s.tries + 1 };
+        if tries >= TRIES {
+            if len(self.failure) == 0 {
+                self.failure = "a range failed " + to_string(tries) + " times: " + why;
+            }
+            return;
+        }
+        let wait = if tries > 10 { 10 } else { tries };
+        self.retry = self.retry + to_string(s.got) + " " + to_string(s.end) + " "
+            + to_string(tries) + " "
+            + to_string(std::time::monotonic_ns() + wait * 1000000000) + "\n";
+    }
+
+    /// Every lane still on this file dropped, what each wrote of its range
+    /// kept in the spans first, so the sidecar saved after still holds it.
+    @unbounded
+    fn drop_all() {
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let s = at(self.slots.items, i) or LaneSlot { };
+            if self.live(s) {
+                self.spans = spans_add(self.spans, s.start, s.got);
+                RangeDropped <- RangeStop { lane: i, ticket: s.ticket };
+                let mut d = s;
+                d.dropped = true;
+                self.put(i, d);
+            }
+            i = i + 1;
+        }
+    }
+
+    /// Wait, a stall's time at most, until no lane dropped from this file
+    /// may still write it.
+    fn settle() {
+        let until = std::time::monotonic_ns() + self.stall_ms * 1000000;
+        while std::time::monotonic_ns() < until {
+            std::time::sleep(20ms);
+            let mut writing = false;
+            for s in self.slots.items {
+                if s.job == self.job && s.ticket != 0 && s.writing { writing = true; }
+            }
+            if !writing { return; }
+        }
+    }
+
+    /// What a lane says: how far it wrote, then how its range ended.
+    @unbounded
+    fn on_heard(n: RangeNews) {
+        if n.lane < 0 || n.lane >= count(self.slots.items) { return; }
+        let mut s = at(self.slots.items, n.lane) or LaneSlot { };
+        if s.ticket == 0 || s.ticket != n.ticket { return; }
+        if n.writing { s.writing = true; }
+        if s.dropped || s.job != self.job {
+            // its range was handed again: only its end matters, which
+            // frees the lane
+            self.put(n.lane, if len(n.ended) > 0 { LaneSlot { } } else { s });
+            return;
+        }
+        if n.got > s.got {
+            s.got = n.got;
+            s.since = std::time::monotonic_ns();
+        }
+        if len(n.ended) == 0 {
+            self.put(n.lane, s);
+            return;
+        }
+        if n.ended == RANGE_DONE {
+            self.spans = spans_add(self.spans, s.start, s.end);
+        } else if n.ended == RANGE_WHOLE {
+            self.unranged = true;
+        } else if n.ended == RANGE_UNWRITABLE {
+            if len(self.failure) == 0 { self.failure = n.why; }
+        } else if n.ended == RANGE_STATUS && !retried(n.status) {
+            if len(self.failure) == 0 { self.failure = n.why; }
+        } else {
+            self.again(s, n.why);
+        }
+        self.put(n.lane, LaneSlot { });
+        self.save();
+    }
+
+    /// Whether `s` is a lane on this file's range, not dropped.
+    fn live(s: LaneSlot) -> Bool {
+        return s.ticket != 0 && s.job == self.job && !s.dropped;
+    }
+
+    /// The bytes of this file written: its spans, and what each lane on it
+    /// wrote of its range.
+    fn held() -> Int {
+        let mut n = spans_total(self.spans);
+        for s in self.slots.items {
+            if self.live(s) { n = n + s.got - s.start; }
+        }
+        return n;
+    }
+
+    /// The sidecar written: the spans and what each lane wrote of its
+    /// range, put in place whole.
+    @unbounded
+    fn save() -> String {
+        let mut text = self.spans;
+        for s in self.slots.items {
+            if self.live(s) { text = spans_add(text, s.start, s.got); }
+        }
+        std::io::fs::write_file(self.side + ".new", text) or {
+            return self.side + " could not be written: " + err.detail;
+        };
+        std::io::fs::rename(self.side + ".new", self.side) or {
+            return self.side + " could not be written: " + err.detail;
+        };
+        return "";
+    }
+
+    /// The lanes there are, each held once.
+    fn fill_slots() {
+        if count(self.slots.items) >= self.lanes { return; }
+        let mut next = self.slots;
+        while count(next.items) < self.lanes && count(next.items) < 8 {
+            push(next.items, LaneSlot { }) or discard;
+        }
+        self.slots = next;
+    }
+
+    /// Lane `i` held as `s`.
+    fn put(i: Int, s: LaneSlot) {
+        let mut next = LaneSlots { };
+        let mut j = 0;
+        for x in self.slots.items {
+            push(next.items, if j == i { s } else { x }) or discard;
+            j = j + 1;
+        }
+        self.slots = next;
+    }
+
     /// One piece of the body, read and written: its length (0 when none
     /// came within `PUMP_WAIT_MS`, so the loop can look at a stop), -1 at
     /// the end, -2 when it could not be read or written (`why` says). A
@@ -484,12 +986,48 @@ fn partial(blobs: String, sha: String, bytes: Int) -> Int {
     if held(blobs, sha) { return 0; }
     let part = blobs + "/" + sha + ".part";
     if !std::io::fs::file_exists(part) { return 0; }
+    let side = blobs + "/" + sha + ".ranges";
+    if std::io::fs::file_exists(side) {
+        // written in ranges: what its sidecar says is the file
+        let spans = spans_read(std::io::fs::read_file(side) or "!", bytes);
+        return if spans == "!" { 0 } else { spans_total(spans) };
+    }
     let size = std::io::fs::file_size(part) or 0;
     if size > bytes {
         std::io::fs::unlink(part) or discard;
         return 0;
     }
     return size;
+}
+
+/// `part` there, made empty when it is not: "" when it is, else why not.
+fn create_part(part: String) -> String {
+    if std::io::fs::file_exists(part) { return ""; }
+    let f = std::io::file::open(part, "w") or {
+        return part + " could not be written: " + err.detail;
+    };
+    return "";
+}
+
+/// The `i`th of a line's space-separated numbers, 0 when there is none.
+@bounded_by(line)
+fn word(line: String, i: Int) -> Int {
+    let mut rest = line;
+    let mut k = 0;
+    while k < i {
+        let sp = std::str::index_of(rest, " ");
+        if sp < 0 { return 0; }
+        rest = rest[(sp + 1)..len(rest)];
+        k = k + 1;
+    }
+    let sp = std::str::index_of(rest, " ");
+    return std::str::parse_int(if sp < 0 { rest } else { rest[0..sp] }) or 0;
+}
+
+/// Whether a range the server answered `status` is asked for again: one it
+/// may answer next time (a timeout, too many requests, its own failure).
+fn retried(status: Int) -> Bool {
+    return status == 408 || status == 429 || status >= 500 || status < 400;
 }
 
 /// True when the store holds `blobs/<sha>`: kept only once it verified.

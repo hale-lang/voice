@@ -1,0 +1,427 @@
+// A lane of the fetch: one connection that fetches one byte range of a
+// large file at a time, into the file's part at the range's offset. The
+// node runs `LANES` of them, each its own thread (main.hl), and they are
+// the node's only connections to the hub for a file fetched in ranges:
+// the fetcher (fetch.hl, `Blobs`) fetches one file at a time, for one seat
+// at a time, so however many seats fetch, the node holds at most `LANES`.
+//
+// The fetcher hands a lane a range (`RangeWanted`) and hears from it as
+// it goes (`RangeHeard`): every `report_ms` the bytes it has written, then
+// how it ended. It may drop the lane's range (`RangeDropped`), when the
+// lane is far slower than its peers or stalled; the lane looks at its
+// mailbox every `report_ms` and before it writes its first byte, so a
+// dropped range is never written once the lane has heard of it.
+
+/// The connections a node fetches a file in ranges with: as many lanes as
+/// main.hl runs.
+const LANES: Int = 8;
+
+/// One range for a lane: [start, end) of the file at `url`, into `part`
+/// at `start`; the file is `size` bytes whole. `ticket` names this
+/// hand-off, so what the lane says of an earlier one is told apart.
+type RangeWork {
+    lane: Int = 0;
+    ticket: Int = 0;
+    url: String = "";
+    // the hub's own: its token sent from `vault`, only to its origin
+    hub: Bool = false;
+    vault: String = "";
+    part: String = "";
+    start: Int = 0;
+    end: Int = 0;
+    size: Int = 0;
+    // the exchange's bound, whole: the dial, the head and the body
+    timeout_ms: Int = 0;
+    // how often the lane says how far, and looks at its mailbox
+    report_ms: Int = 200;
+}
+
+topic RangeWanted { payload: RangeWork; keyed_by lane; }
+
+/// The fetcher no longer wants `ticket`: the lane stops it, writing no
+/// more of it.
+type RangeStop { lane: Int = 0; ticket: Int = 0; }
+
+topic RangeDropped { payload: RangeStop; keyed_by lane; }
+
+/// How a range ended, in `RangeNews.ended`: still going ("").
+const RANGE_DONE: String = "done";
+/// cut off (the body ended early, a read failed, the exchange's bound);
+/// what was written up to `got` stands
+const RANGE_CUT: String = "cut";
+/// the server sent the whole file, or not the range asked for: it does not
+/// honour `Range`
+const RANGE_WHOLE: String = "whole";
+/// the server answered `status`, neither 200 nor 206
+const RANGE_STATUS: String = "status";
+/// the part could not be written
+const RANGE_UNWRITABLE: String = "unwritable";
+/// dropped, or the node is stopping
+const RANGE_STOPPED: String = "stopped";
+
+/// What a lane says of a range: `got`, the offset written up to
+/// (`start` until it writes); `writing` once it may write; `ended` once
+/// it has ended, and why.
+type RangeNews {
+    lane: Int = 0;
+    ticket: Int = 0;
+    got: Int = 0;
+    writing: Bool = false;
+    ended: String = "";
+    status: Int = 0;
+    why: String = "";
+}
+
+topic RangeHeard { payload: RangeNews; }
+
+locus Lane {
+    params {
+        // the range handed it, waiting or being fetched
+        work: RangeWork = RangeWork { };
+        waiting: Bool = false;
+        // the last ticket the fetcher dropped
+        dropped: Int = 0;
+        // why the last piece could not be read or written
+        why: String = "";
+        unwritable: Bool = false;
+    }
+
+    bus {
+        subscribe RangeWanted as on_work where key == replica;
+        subscribe RangeDropped as on_drop where key == replica;
+        publish RangeHeard;
+    }
+
+    run() {
+        // a stop drains the node: a range being fetched ends `stopped`,
+        // what it wrote kept, and the loop returns
+        while !self.draining {
+            self.step();
+        }
+    }
+
+    /// One turn: the range handed it, or a sleep, where the next arrives.
+    fn step() {
+        if self.waiting {
+            self.waiting = false;
+            self.fetch(self.work);
+        } else {
+            std::time::sleep(5ms);
+        }
+    }
+
+    fn on_work(w: RangeWork) {
+        self.work = w;
+        self.waiting = true;
+    }
+
+    fn on_drop(d: RangeStop) {
+        self.dropped = d.ticket;
+    }
+
+    /// Whether `w` is to stop: dropped, or the node stopping.
+    fn stopped(w: RangeWork) -> Bool {
+        return self.draining || self.dropped == w.ticket;
+    }
+
+    /// A look at the mailbox, where a drop arrives.
+    fn look() {
+        std::time::sleep(1ms);
+    }
+
+    /// Fetch `w`'s range into its part, saying how far and how it ended.
+    /// Its reader and its file are its own, so both close when it returns.
+    @unbounded
+    fn fetch(w: RangeWork) {
+        let u = std::http::parse_url(w.url) or {
+            self.tell(w, w.start, false, RANGE_STATUS, 0, w.url + " is not a URL");
+            return;
+        };
+        let r = std::http::BodyReader {
+            req: std::http::ClientRequest {
+                url: u,
+                headers: "Range: bytes=" + to_string(w.start) + "-" + to_string(w.end - 1),
+                body: b"",
+                follow_redirects: 5,
+            },
+            bearer: if w.hub && len(w.vault) > 0 {
+                std::secret::Credential { vault: w.vault }
+            } else {
+                std::secret::Credential { }
+            },
+            timeout_ms: w.timeout_ms,
+            // opened a slice at a time, so a drop is heard while the head
+            // is awaited
+            deferred: true,
+        };
+        let mut open = false;
+        while !open {
+            open = r.open_within(w.report_ms) or {
+                self.tell(w, w.start, false, RANGE_CUT, 0, err.kind + ": " + err.detail);
+                return;
+            };
+            self.look();
+            if self.stopped(w) {
+                self.tell(w, w.start, false, RANGE_STOPPED, 0, "");
+                return;
+            }
+        }
+        if r.status == 200 {
+            self.tell(w, w.start, false, RANGE_WHOLE, 200, "");
+            return;
+        }
+        if r.status != 206 {
+            self.tell(
+                w,
+                w.start,
+                false,
+                RANGE_STATUS,
+                r.status,
+                url_host(w.url) + " answered " + to_string(r.status),
+            );
+            return;
+        }
+        let asked = "bytes " + to_string(w.start) + "-" + to_string(w.end - 1) + "/"
+            + to_string(w.size);
+        if head_field(r.headers, "content-range") != asked {
+            // a 206 of some other range is no answer to this one
+            self.tell(w, w.start, false, RANGE_WHOLE, 206, "");
+            return;
+        }
+        // said before it writes, and looked at once more: a range dropped
+        // before this is never written
+        self.tell(w, w.start, true, "", 0, "");
+        self.look();
+        if self.stopped(w) {
+            self.tell(w, w.start, true, RANGE_STOPPED, 0, "");
+            return;
+        }
+        let f = std::io::file::open(w.part, "r+") or {
+            self.tell(
+                w,
+                w.start,
+                true,
+                RANGE_UNWRITABLE,
+                0,
+                w.part + " could not be opened: " + err.detail,
+            );
+            return;
+        };
+        f.seek(w.start) or {
+            self.tell(
+                w,
+                w.start,
+                true,
+                RANGE_UNWRITABLE,
+                0,
+                w.part + " could not be sought: " + err.detail,
+            );
+            return;
+        };
+        let mut got = w.start;
+        let mut told = std::time::monotonic_ns();
+        while true {
+            let n = self.pump(r, f, w.end - got);
+            if n == -1 {
+                if got == w.end {
+                    self.tell(w, got, true, RANGE_DONE, 206, "");
+                } else {
+                    self.tell(w, got, true, RANGE_CUT, 206, "the body ended at " + to_string(got));
+                }
+                return;
+            }
+            if n < 0 {
+                self.tell(
+                    w,
+                    got,
+                    true,
+                    if self.unwritable { RANGE_UNWRITABLE } else { RANGE_CUT },
+                    206,
+                    self.why,
+                );
+                return;
+            }
+            got = got + n;
+            if std::time::monotonic_ns() - told >= w.report_ms * 1000000 {
+                self.tell(w, got, true, "", 0, "");
+                told = std::time::monotonic_ns();
+                self.look();
+                if self.stopped(w) {
+                    self.tell(w, got, true, RANGE_STOPPED, 0, "");
+                    return;
+                }
+            }
+        }
+    }
+
+    /// One piece of the body, read and written, at most `room` bytes of
+    /// it: its length (0 when none came within a slice), -1 at the end,
+    /// -2 when it could not be read or written or brought more than
+    /// `room` (`why` says). A call of its own, so a piece is let go once it
+    /// is written.
+    fn pump(r: std::http::BodyReader, f: std::io::file::File, room: Int) -> Int {
+        let b = r.chunk_within(200) or {
+            if err.kind == "idle" { return 0; }
+            if err.kind == "end" { return -1; }
+            self.unwritable = false;
+            self.why = err.kind + ": " + err.detail;
+            return -2;
+        };
+        if len(b) > room {
+            // past the range is another range's: never written
+            self.unwritable = false;
+            self.why = "more than the range asked for";
+            return -2;
+        }
+        f.write_bytes(b) or {
+            self.unwritable = true;
+            self.why = "could not be written: " + err.detail;
+            return -2;
+        };
+        return len(b);
+    }
+
+    fn tell(w: RangeWork, got: Int, writing: Bool, ended: String, status: Int, why: String) {
+        RangeHeard <- RangeNews {
+            lane: w.lane,
+            ticket: w.ticket,
+            got: got,
+            writing: writing,
+            ended: ended,
+            status: status,
+            why: why,
+        };
+    }
+}
+
+/// A response head's field, by name in any case, trimmed; "" when absent.
+@bounded_by(headers)
+fn head_field(headers: String, name: String) -> String {
+    let want = std::str::lower(name) + ":";
+    let mut rest = headers;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\r\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        if len(line) >= len(want) && std::str::lower(line[0..len(want)]) == want {
+            return std::str::trim(line[len(want)..len(line)]);
+        }
+        rest = if nl < 0 { "" } else { rest[(nl + 2)..len(rest)] };
+    }
+    return "";
+}
+
+// ---- spans ------------------------------------------------------------
+//
+// What of a file fetched in ranges is on disk: spans, "start end" lines
+// ([start, end), in bytes), sorted, apart and merged. Kept beside the
+// part as `<sha256>.ranges`, so a fetch cut off resumes with every range
+// it wrote.
+
+/// `spans` with [s, e) added, merged with every span it meets.
+@bounded_by(spans)
+fn spans_add(spans: String, s: Int, e: Int) -> String {
+    if e <= s { return spans; }
+    let mut out = "";
+    let mut lo = s;
+    let mut hi = e;
+    let mut placed = false;
+    let mut rest = spans;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let a = span_start(line);
+        let b = span_end(line);
+        if b < lo {
+            out = out + line + "\n";
+        } else if a > hi {
+            if !placed {
+                out = out + to_string(lo) + " " + to_string(hi) + "\n";
+                placed = true;
+            }
+            out = out + line + "\n";
+        } else {
+            if a < lo { lo = a; }
+            if b > hi { hi = b; }
+        }
+    }
+    if !placed { out = out + to_string(lo) + " " + to_string(hi) + "\n"; }
+    return out;
+}
+
+/// The bytes `spans` holds.
+@bounded_by(spans)
+fn spans_total(spans: String) -> Int {
+    let mut n = 0;
+    let mut rest = spans;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        n = n + span_end(line) - span_start(line);
+    }
+    return n;
+}
+
+/// The first byte at or after `at` that `spans` does not hold (`bytes`
+/// when none is left before it).
+@bounded_by(spans)
+fn spans_gap(spans: String, at: Int, bytes: Int) -> Int {
+    let mut p = at;
+    let mut rest = spans;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if span_start(line) <= p && span_end(line) > p { p = span_end(line); }
+    }
+    return if p > bytes { bytes } else { p };
+}
+
+/// Where the gap that starts at `at` ends: the next span's start, or
+/// `bytes`.
+@bounded_by(spans)
+fn spans_gap_end(spans: String, at: Int, bytes: Int) -> Int {
+    let mut rest = spans;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if span_start(line) > at { return span_start(line); }
+    }
+    return bytes;
+}
+
+/// A sidecar's spans, made sound: merged, each within [0, bytes); "!" when
+/// a line is not a span of the file, which leaves the part unknown.
+@bounded_by(text)
+fn spans_read(text: String, bytes: Int) -> String {
+    let mut out = "";
+    let mut rest = text;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if len(line) > 0 {
+            let sp = std::str::index_of(line, " ");
+            if sp < 1 { return "!"; }
+            let a = std::str::parse_int(line[0..sp]) or { return "!"; };
+            let b = std::str::parse_int(line[(sp + 1)..len(line)]) or { return "!"; };
+            if a < 0 || b <= a || b > bytes { return "!"; }
+            out = spans_add(out, a, b);
+        }
+    }
+    return out;
+}
+
+fn span_start(line: String) -> Int {
+    let sp = std::str::index_of(line, " ");
+    if sp < 0 { return 0; }
+    return std::str::parse_int(line[0..sp]) or 0;
+}
+
+fn span_end(line: String) -> Int {
+    let sp = std::str::index_of(line, " ");
+    if sp < 0 { return 0; }
+    return std::str::parse_int(line[(sp + 1)..len(line)]) or 0;
+}

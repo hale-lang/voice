@@ -63,24 +63,20 @@ fn checked(store: st::Store, link: api::Link, ok: Bool, bus: Int) {
     let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
     let usable = rts.usable_in_gate() or api::RuntimeList { };
     let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
-    let rows = store.link_checks() or st::LinkCheckRows { };
-    for r0 in rows.rows {
-        if r0.id == c.id {
-            let mut r = r0;
-            let said = api::link_result_json(
-                api::LinkCheckResult {
-                    id: c.id,
-                    ok: ok,
-                    has_bus_bytes_per_second: true,
-                    bus_bytes_per_second: bus,
-                },
-                api::now_seconds(),
-            );
-            r.result_a = said;
-            r.result_b = said;
-            store.put_link_results(r) or discard;
-        }
-    }
+    let said = api::link_result_json(
+        api::LinkCheckResult {
+            id: c.id,
+            ok: ok,
+            has_bus_bytes_per_second: true,
+            bus_bytes_per_second: bus,
+        },
+        api::now_seconds(),
+    );
+    // each rank writes its own, the second never undoing the first's
+    store.put_link_result(c.id, "spark", said) or discard;
+    store.put_link_result(c.id, "flare", said) or discard;
+    let written = store.put_link_result(c.id, "flare", said) or true;
+    std::test::assert(!written, "a rank reports once: its first result stands");
 }
 
 fn main() {
@@ -379,6 +375,31 @@ fn main() {
     std::test::assert(
         std::str::contains(second, "takes part in placement ds across nodes already"),
         "a second placement across the same nodes is refused: " + second,
+    );
+
+    // two placed across the same node at once, by two apis: the one that
+    // reads both after keeping its own withdraws
+    let mut raced = store.placements() or st::PlacementRows { };
+    push(
+        raced.rows,
+        st::PlacementRow {
+            id: "ds-raced",
+            model: "ds2",
+            body: "{\"leader\": \"flare\", \"nodes\": [\"flare\", \"spark\"]}",
+            present: true,
+        },
+    ) or discard;
+    std::test::assert(
+        std::str::starts_with(
+            api::spanning_rival(raced, "ds-raced", "flare", "spark"),
+            "placement ds was placed across flare while this was",
+        ),
+        "a placement across nodes that meets another kept meanwhile withdraws",
+    );
+    std::test::assert_eq_str(
+        api::spanning_rival(raced, "ds-raced", "mac", "spark2"),
+        "",
+        "one on other nodes meets none",
     );
 
     // ---- a decision seat beside it, pair first ----------------------------

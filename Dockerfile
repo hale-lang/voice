@@ -53,7 +53,9 @@ COPY spec/validate/recipes spec/validate/recipes
 COPY spec/validate/runtimes spec/validate/runtimes
 COPY runtimes runtimes
 # what voice ships, which the tests hold placements to (memory_budget_test)
+# and suggest from (pair_placement_test)
 COPY recipes recipes
+COPY catalog catalog
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build --target-cpu baseline api && hale build --target-cpu baseline brain && hale build --target-cpu baseline node
 

@@ -1363,6 +1363,63 @@ fn queued(s: st::Store, label: String) {
     std::test::assert_eq_int(count(after.rows), 2, label + ": the steps after one");
 }
 
+/// A link check between two nodes: kept with both nodes' assignments moved
+/// on, and each rank's result written into its own column once, so two
+/// reporting at once both keep theirs.
+fn links(s: st::Store, label: String) {
+    let at = `2026-11-03T00:00:00Z`;
+    s.insert_node(
+        st::NodeRow { id: "spark", name: "spark", token_digest: "aa01", created_at: at },
+        ch("create", "nodes/spark"),
+    )
+    or discard;
+    s.insert_node(
+        st::NodeRow { id: "flare", name: "flare", token_digest: "aa02", created_at: at },
+        ch("create", "nodes/flare"),
+    )
+    or discard;
+    let before = (s.node("flare") or st::NodeRow { }).assignment_version;
+    s.insert_link_check(
+        st::LinkCheckRow {
+            id: "lc-1",
+            node_a: "spark",
+            node_b: "flare",
+            created_at: at,
+            master_addr: "192.168.100.1",
+            image: "nvcr.io/nvidia/vllm@sha256:5577",
+        },
+    ) or discard;
+    std::test::assert_eq_int(
+        (s.node("flare") or st::NodeRow { }).assignment_version,
+        before + 1,
+        label + ": a check moves its nodes' assignments on",
+    );
+    // rank 1 reports first, then rank 0, each from what it read before
+    std::test::assert(
+        s.put_link_result("lc-1", "flare", "{\"ok\": true}") or false,
+        label + ": rank 1's result",
+    );
+    std::test::assert(
+        s.put_link_result("lc-1", "spark", "{\"ok\": false}") or false,
+        label + ": rank 0's",
+    );
+    std::test::assert(
+        !(s.put_link_result("lc-1", "spark", "{\"ok\": true}") or true),
+        label + ": a rank's first result stands",
+    );
+    std::test::assert(
+        !(s.put_link_result("lc-1", "laptop", "{\"ok\": true}") or true),
+        label + ": a node with no rank writes nothing",
+    );
+    let rows = s.link_checks() or st::LinkCheckRows { };
+    let r = at(rows.rows, 0) or st::LinkCheckRow { };
+    std::test::assert(
+        r.id == "lc-1" && r.master_addr == "192.168.100.1"
+            && std::str::contains(r.result_a, "false") && std::str::contains(r.result_b, "true"),
+        label + ": both ranks' results are kept, each its own: " + r.result_a + " " + r.result_b,
+    );
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -1429,6 +1486,7 @@ fn main() {
     let mem = st::MemoryStore { };
     annotations(mem, "memory");
     queued(mem, "memory");
+    links(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1457,4 +1515,6 @@ fn main() {
     annotations(pg, "postgres");
     pg.conn.exec("TRUNCATE annotation_step RESTART IDENTITY");
     queued(pg, "postgres");
+    pg.conn.exec("TRUNCATE link_check, seat, node RESTART IDENTITY CASCADE");
+    links(pg, "postgres");
 }

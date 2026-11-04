@@ -783,7 +783,13 @@ it needs no database. Beside them, what the node fetched (`blobs/`, by
 sha256) and what its servers keep between starts: a vLLM seat's compiled
 graphs and FlashInfer's kernel autotune, `cache/<runtime>/`, one directory
 per runtime, tens of megabytes, so a vLLM seat started again skips most of
-its warm-up. All of it goes with the node's data when it is uninstalled.
+its warm-up: on a DGX Spark serving gpt-oss-120b, the engine's
+initialization went from 46.15 s to 17.96 s and its compilation from 9.37 s
+to 1.05 s, 28 s a restart. Reading the weights is the rest of a start, and
+the runtime says how (`load_format`): `vllm-26.09` reads them with
+fastsafetensors, 6.82 s for that model's 65 GB where vLLM's default took
+376 s ([`runtimes/README.md`](../runtimes/README.md) has the measurements).
+All of it goes with the node's data when it is uninstalled.
 
 ### Migrations
 

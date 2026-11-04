@@ -29,6 +29,32 @@ this image, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it,
 with no Ray cluster. The field says how voice runs the same build; it added
 no flag to a seat on one node, which runs as it did.
 
+`vllm-26.09` reads a model's weights with fastsafetensors
+(`load_format: fastsafetensors`): the node starts every seat of it with
+`--load-format fastsafetensors`, on one node and on each rank across two,
+each of which loads its shard. It is voice's choice, not a setting: the
+field says what the image ships (NVIDIA's 26.09 image, vLLM 0.29.0, has the
+`fastsafetensors` package), so it sits on the runtime rather than in the
+node, and a vLLM runtime whose image lacks the package leaves it out and
+starts with vLLM's default. vLLM's default maps the files lazily and reads
+them a page at a time as the weights are copied to the GPU, which on a large
+model is most of a start. Measured on a DGX Spark (GB10, 128 GiB unified
+memory, local NVMe, ext4) with gpt-oss-120b (mxfp4, 65 GB) in this image,
+`--gpu-memory-utilization 0.75 --max-model-len 8192`, the page cache
+evicted before each start:
+
+| Loader | Loading weights took | Ready | Peak host memory used | Greedy output |
+|---|---|---|---|---|
+| vLLM's default (lazy mmap) | 375.97 s | 468 s | 102 GiB | `" Paris.\n\nGreat! If you have"` |
+| vLLM's default, started again with the warm caches (`cache/<runtime>/`) | 404.76 s | 494 s; init engine 46.15 → 17.96 s, compilation 9.37 → 1.05 s | 106 GiB | the same |
+| `--safetensors-load-strategy eager` | 36.68 s | 127 s | 102 GiB | the same |
+| `--load-format fastsafetensors` | 6.82 s | 96 s | 103 GiB | the same |
+
+Fastsafetensors loads 55 times faster at that size, with no more memory and
+the same output; on Qwen3-0.6B (1.5 GB) it took 0.36–0.42 s against the
+default's 8.3–8.75 s and eager's 1.63–1.68 s. The warm caches save their 28 s
+of a restart's initialization whatever the loader.
+
 The operator is the authority on what may run: they allow more runtimes on
 the admin plane (`POST /admin/v1/runtimes`). These are read by the api at
 start (`--runtimes`), listed as `shipped`, and cannot be changed or removed

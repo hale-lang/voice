@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Panel, PanelGrid, Table, Status, Loading, Unavailable, Kv, Mono, Button, Select, TextInput, Checkbox, micros, count, when, ago } from '@hale/components';
 import { toneOf } from '../tone';
-import { api, describe, useGet, type UsageRecord, type Schemas } from '../api/client';
+import { useGet, USAGE_PAGE, type UsageRecord, type UsageRecordSummary, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import { useLastStep, stepLabel, settles } from '../api/steps';
 import type { ScreenProps } from '../App';
@@ -14,8 +14,8 @@ import { ConversationView } from './Conversation';
 import { href } from '../route';
 import { ConversationName } from '../titles';
 
-/** Requests a page holds. */
-const PAGE = 50;
+/** Requests a page holds: the most the ledger's page does. */
+const PAGE = USAGE_PAGE;
 
 /** The most requests one run annotates (`runAnnotations`). */
 const RUN_MAX = 500;
@@ -34,19 +34,25 @@ export function Usage({ route, setInspector }: ScreenProps) {
   const [filter, setFilterState] = useState<Filter>(NO_FILTER);
   // a new filter starts again at the newest page
   // the requests chosen to annotate: kept across pages, let go when the
-  // filter changes
-  const [chosen, setChosen] = useState<Set<string>>(new Set());
+  // filter changes; or every one the filter matches, which the run itself
+  // finds (`runAnnotations` `matching`)
+  const [chosen, setChosenIds] = useState<Set<string>>(new Set());
+  const [allMatching, setAllMatching] = useState(false);
+  const setChosen = (ids: Set<string>) => {
+    setChosenIds(ids);
+    setAllMatching(false);
+  };
   const setFilter = (f: Filter) => {
     setFilterState(f);
     setCursors([]);
     setChosen(new Set());
   };
   const records = useGet('/admin/v1/usage', { params: { query: { limit: PAGE, ...query(filter), ...(cursor ? { cursor } : {}) } } });
-  const onPage = records.data?.data.find((r) => r.id === selected);
+  // the page lists each request summarized; the inspector reads it whole
   useEffect(() => {
     if (conversation) setInspector(<ConversationView key={conversation} conversation={conversation} />);
-    else setInspector(selected ? (onPage ? <RecordInspector record={onPage} /> : <RecordById id={selected} />) : null);
-  }, [conversation, selected, onPage, setInspector]);
+    else setInspector(selected ? <RecordById id={selected} /> : null);
+  }, [conversation, selected, setInspector]);
   const next = records.data?.next_cursor ?? null;
   const page = cursors.length + 1;
 
@@ -67,13 +73,13 @@ export function Usage({ route, setInspector }: ScreenProps) {
       <AnnotationsPanel slice={{ project: filter.project || undefined, key: filter.key.trim() || undefined }} />
       <Panel title="Requests" readout={readout(records, records.data ? `page ${page} · ${records.data.data.length}` : null)}>
         <Filters value={filter} onChange={setFilter} />
-        <Annotate filter={filter} chosen={chosen} setChosen={setChosen} pageIds={records.data?.data.map((r) => r.id) ?? []} />
+        <Annotate filter={filter} chosen={chosen} setChosen={setChosen} allMatching={allMatching} setAllMatching={setAllMatching} pageIds={records.data?.data.map((r) => r.id) ?? []} />
         {records.isPending ? (
           <Loading what="usage" />
         ) : records.isError ? (
           <Unavailable what="Usage" detail={records.error.message} />
         ) : (
-          <Table<UsageRecord>
+          <Table<UsageRecordSummary>
             rows={records.data.data}
             rowKey={(r) => r.id}
             selectedKey={selected}
@@ -81,12 +87,12 @@ export function Usage({ route, setInspector }: ScreenProps) {
             columns={[
               {
                 key: 'pick',
-                header: <PageBox ids={records.data.data.map((r) => r.id)} chosen={chosen} setChosen={setChosen} />,
+                header: <PageBox ids={records.data.data.map((r) => r.id)} chosen={chosen} setChosen={setChosen} all={allMatching} />,
                 render: (r) => (
                   <input
                     type="checkbox"
                     aria-label={`choose ${r.id}`}
-                    checked={chosen.has(r.id)}
+                    checked={allMatching || chosen.has(r.id)}
                     onClick={(e) => e.stopPropagation()}
                     onChange={(e) => {
                       const n = new Set(chosen);
@@ -98,7 +104,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
                 ),
               },
               { key: 'when', header: 'When', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
-              { key: 'id', header: 'Request', render: (r) => <><Mono>{r.id}</Mono>{r.internal && <Internal record={r} />}</> },
+              { key: 'id', header: 'Request', render: (r) => <><Mono>{r.id}</Mono>{r.internal && <Internal of={r} />}</> },
               { key: 'project', header: 'Project / key', render: (r) => <><Mono>{r.project}</Mono> <span className="muted">{r.key}</span>{r.conversation && <div className="faint"><ConversationName conversation={r.conversation} project={r.project} /></div>}</> },
               { key: 'model', header: 'Model', render: (r) => r.served?.model ?? r.requested_model },
               { key: 'account', header: 'Account', render: (r) => <Mono>{r.served?.account ?? '–'}</Mono> },
@@ -126,8 +132,8 @@ export function Usage({ route, setInspector }: ScreenProps) {
 }
 
 /** The page's requests, chosen or let go at once. */
-function PageBox({ ids, chosen, setChosen }: { ids: string[]; chosen: Set<string>; setChosen: (s: Set<string>) => void }) {
-  const all = ids.length > 0 && ids.every((id) => chosen.has(id));
+function PageBox({ ids, chosen, setChosen, all: matching }: { ids: string[]; chosen: Set<string>; setChosen: (s: Set<string>) => void; all: boolean }) {
+  const all = matching || (ids.length > 0 && ids.every((id) => chosen.has(id)));
   return (
     <input
       type="checkbox"
@@ -135,7 +141,7 @@ function PageBox({ ids, chosen, setChosen }: { ids: string[]; chosen: Set<string
       checked={all}
       ref={(el) => { if (el) el.indeterminate = !all && ids.some((id) => chosen.has(id)); }}
       onChange={(e) => {
-        const n = new Set(chosen);
+        const n = new Set(matching ? ids : chosen);
         for (const id of ids) {
           if (e.target.checked) n.add(id);
           else n.delete(id);
@@ -155,62 +161,45 @@ function StepMark({ id }: { id: string }) {
 
 /**
  * The chosen requests annotated now (`runAnnotations`): every annotator in
- * force for each, or the one picked. The chosen are this page's, or every
- * request the filter matches (up to `RUN_MAX`, the most one run takes);
- * each comes back queued, or refused and why, and those refused are said
- * in one line. Each queued one's steps show on its row as they happen.
+ * force for each, or the one picked. The chosen are named, this page's and
+ * others', or are every request the filter matches, which the run finds
+ * itself (`matching`: the newest `RUN_MAX`, the most one run takes); each
+ * comes back queued, or refused and why, and those refused are said in one
+ * line. Each queued one's steps show on its row as they happen.
  */
-function Annotate({ filter, chosen, setChosen, pageIds }: { filter: Filter; chosen: Set<string>; setChosen: (s: Set<string>) => void; pageIds: string[] }) {
+function Annotate({ filter, chosen, setChosen, allMatching, setAllMatching, pageIds }: { filter: Filter; chosen: Set<string>; setChosen: (s: Set<string>) => void; allMatching: boolean; setAllMatching: (all: boolean) => void; pageIds: string[] }) {
   const annotators = useGet('/admin/v1/annotators');
   const [annotator, setAnnotator] = useState('');
   const [outcomes, setOutcomes] = useState<RunOutcome[] | null>(null);
-  const [gathering, setGathering] = useState<string | null>(null);
   const w = useWrite();
   // how many requests the filter matches, from usage's own totals
   const total = useGet('/admin/v1/usage/summary', { params: { query: { group_by: ['internal'], ...query(filter) } } });
   const matching = total.data?.data.reduce((n, g) => n + g.requests, 0);
   const allPage = pageIds.length > 0 && pageIds.every((id) => chosen.has(id));
-  async function chooseAll() {
-    setGathering('reading the matching requests…');
-    const ids = new Set<string>();
-    let cursor: string | undefined;
-    try {
-      do {
-        const r = await api.GET('/admin/v1/usage', { params: { query: { ...query(filter), limit: 1000, ...(cursor ? { cursor } : {}) } } });
-        if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
-        for (const x of r.data.data) if (ids.size < RUN_MAX) ids.add(x.id);
-        cursor = r.data.next_cursor ?? undefined;
-      } while (cursor && ids.size < RUN_MAX);
-      setChosen(ids);
-      setGathering(null);
-    } catch (e) {
-      setGathering(e instanceof Error ? e.message : String(e));
-    }
-  }
+  const selected = allMatching ? Math.min(matching ?? 0, RUN_MAX) : chosen.size;
   async function run() {
-    const ids = [...chosen].slice(0, RUN_MAX);
-    const r = await w.write('post', '/admin/v1/annotation-runs', { body: { request_ids: ids, ...(annotator ? { annotator } : {}) } });
+    const which = allMatching ? { matching: match(filter) } : { request_ids: [...chosen].slice(0, RUN_MAX) };
+    const r = await w.write('post', '/admin/v1/annotation-runs', { body: { ...which, ...(annotator ? { annotator } : {}) } });
     if (r) setOutcomes(r.data);
   }
   const refused = outcomes?.filter((o) => !o.queued) ?? [];
   const queued = outcomes ? outcomes.length - refused.length : 0;
-  if (!chosen.size && !outcomes) return null;
+  if (!chosen.size && !allMatching && !outcomes) return null;
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)', alignItems: 'center', margin: 'var(--space-2) 0' }} aria-label="annotate the chosen requests">
-      <span><b>{count(chosen.size)}</b> selected</span>
-      {allPage && matching != null && matching > chosen.size && (
-        <Button onClick={() => void chooseAll()} disabled={!!gathering && gathering.endsWith('…')}>
-          select all {count(Math.min(matching, RUN_MAX))} matching{matching > RUN_MAX ? ` (of ${count(matching)}, the most one run takes)` : ''}
+      <span><b>{count(selected)}</b> selected{allMatching ? ', every one matching' : ''}</span>
+      {!allMatching && allPage && matching != null && matching > chosen.size && (
+        <Button onClick={() => setAllMatching(true)}>
+          select all {count(Math.min(matching, RUN_MAX))} matching{matching > RUN_MAX ? ` (of ${count(matching)}, the newest the most one run takes)` : ''}
         </Button>
       )}
-      {gathering && <span className="faint">{gathering}</span>}
       <Select
         value={annotator}
         onChange={setAnnotator}
         options={[{ value: '', label: 'every annotator in force' }, ...(annotators.data?.data ?? []).filter((a) => a.enabled).map((a) => ({ value: a.id, label: a.id }))]}
       />
-      <Button tone="primary" onClick={() => void run()} disabled={w.busy || !chosen.size}>Annotate selected</Button>
-      {chosen.size > 0 && <Button onClick={() => { setChosen(new Set()); setOutcomes(null); }}>clear</Button>}
+      <Button tone="primary" onClick={() => void run()} disabled={w.busy || !selected}>Annotate selected</Button>
+      {selected > 0 && <Button onClick={() => { setChosen(new Set()); setOutcomes(null); }}>clear</Button>}
       {w.error && <span className="c-wait">{w.error}</span>}
       {outcomes && (
         <span className="muted" aria-label="annotate outcome">
@@ -301,7 +290,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'status', v: <Status tone={toneOf(r.status)} label={r.status} /> },
           { k: 'created', v: when(r.created_at) },
           { k: 'project', v: <Mono>{r.project}</Mono> },
-          { k: 'key', v: <><Mono>{r.key}</Mono>{r.internal && <Internal record={r} />}</> },
+          { k: 'key', v: <><Mono>{r.key}</Mono>{r.internal && <Internal of={internalOf(r)} />}</> },
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
@@ -321,15 +310,23 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
 }
 
 
+/** What an internal request's metadata says of it, as its summary says it. */
+function internalOf(r: UsageRecord): { annotates?: string; side?: string } {
+  const m = (r.metadata ?? {}) as Record<string, unknown>;
+  return {
+    ...(typeof m.annotates === 'string' ? { annotates: m.annotates } : {}),
+    ...(typeof m.side === 'string' ? { side: m.side } : {}),
+  };
+}
+
 /**
  * What a request of a project's system key was: voice's own for the
  * project, an annotation's stage (or a title) for the request it names,
  * kept apart from the project's usage.
  */
-function Internal({ record: r }: { record: UsageRecord }) {
-  const m = (r.metadata ?? {}) as Record<string, unknown>;
-  const of = typeof m.annotates === 'string' ? m.annotates : null;
-  const side = typeof m.side === 'string' ? m.side : null;
+function Internal({ of: r }: { of: { annotates?: string; side?: string } }) {
+  const of = r.annotates ?? null;
+  const side = r.side ?? null;
   return (
     <div className="faint" title="voice's own request for the project, under its system key: not in its usage, its limits or what is told to the organization">
       internal{side ? ` · ${side === 'title' ? 'its title' : `the ${side} stage`}` : ''}
@@ -384,6 +381,22 @@ function metadataPairs(m: string): string | null {
   if (!parts.length || parts.some((p) => !/^[^=\s]+=.*$/.test(p))) return null;
   if (parts.length === 1) return parts[0]!;
   return JSON.stringify(Object.fromEntries(parts.map((p) => [p.slice(0, p.indexOf('=')), p.slice(p.indexOf('=') + 1)])));
+}
+
+/** The filter as `runAnnotations` matches requests by it (`UsageMatch`), as listUsage would list them. */
+function match(f: Filter): Schemas['UsageMatch'] {
+  const parts = f.metadata.split(',').map((p) => p.trim()).filter(Boolean);
+  const pairs = metadataPairs(f.metadata) ? Object.fromEntries(parts.map((p) => [p.slice(0, p.indexOf('=')), p.slice(p.indexOf('=') + 1)])) : null;
+  return {
+    ...(f.project ? { project: f.project } : {}),
+    ...(f.key.trim() ? { key: f.key.trim() } : {}),
+    ...(f.model ? { model: f.model } : {}),
+    ...(f.account ? { account: f.account } : {}),
+    ...(f.conversation.trim() ? { conversation: f.conversation.trim() } : {}),
+    ...(pairs ? { metadata: pairs } : {}),
+    ...(f.from ? { from: f.from } : {}),
+    ...(f.internal ? { include_internal: true } : {}),
+  };
 }
 
 /** The filter as listUsage's query. */
@@ -452,7 +465,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
  * generated, from its first output to its end, as its node measured both,
  * so reading the prompt and a cold start are not counted against it.
  */
-function throughput(r: UsageRecord): string {
+function throughput(r: UsageRecordSummary): string {
   const { first_output_ms: first, engine_ms: end } = r.timing;
   if (first == null || end == null || end <= first || r.output_tokens <= 0) return '–';
   return ((1000 * r.output_tokens) / (end - first)).toFixed(1);

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, TextArea, Button, Confirm, bytes, when } from '@hale/components';
-import { useGet, type Recipe, type Schemas } from '../api/client';
+import { useGet, useRecipes, type Recipe, type RecipeSummary, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
@@ -9,16 +9,21 @@ import { tokens } from '../context';
 
 type Variant = Recipe['variants'][number];
 
-/** The weights the operator allows: what a placement may install, and from where. */
+/**
+ * The weights the operator allows: what a placement may install, and from
+ * where. The list is the recipes summarized; the inspector reads one whole,
+ * its files among it.
+ */
 export function Recipes({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
-  const q = useGet('/admin/v1/recipes');
+  const q = useRecipes();
   const recipe = q.data?.data.find((r) => r.id === selected);
   const creating = selected === 'new';
+  const recipeKey = recipe?.id;
 
   useEffect(() => {
-    setInspector(creating ? <AllowRecipe /> : recipe ? <RecipeInspector recipe={recipe} /> : null);
-  }, [creating, recipe, setInspector]);
+    setInspector(creating ? <AllowRecipe /> : recipeKey ? <RecipeWhole id={recipeKey} /> : null);
+  }, [creating, recipeKey, setInspector]);
 
   if (q.isPending) return <Loading what="recipes" />;
   if (q.isError) return <Unavailable what="Recipes" detail={q.error.message} />;
@@ -28,7 +33,7 @@ export function Recipes({ route, setInspector }: ScreenProps) {
     <>
       <h1>Recipes</h1>
       <Panel title="Recipes" readout={readout(q, `${q.data.data.length} recipes`)}>
-        <Table<Recipe>
+        <Table<RecipeSummary>
           rows={q.data.data}
           rowKey={(r) => r.id}
           selectedKey={selected}
@@ -39,7 +44,7 @@ export function Recipes({ route, setInspector }: ScreenProps) {
             { key: 'license', header: 'License', render: (r) => r.license.name },
             { key: 'ctx', header: 'Context', num: true, render: (r) => (r.context_length ? tokens(r.context_length) : <span className="faint">–</span>) },
             { key: 'variants', header: 'Variants', render: (r) => r.variants.map((v) => `${v.id} (${v.format})`).join(', ') },
-            { key: 'size', header: 'Smallest', num: true, render: (r) => bytes(Math.min(...r.variants.map(size))) },
+            { key: 'size', header: 'Smallest', num: true, render: (r) => bytes(Math.min(...r.variants.map((v) => v.total_bytes))) },
           ]}
           empty="No recipes. Voice ships some; an operator allows others."
         />
@@ -69,6 +74,14 @@ function Files({ files }: { files: Variant['files'] }) {
 /** A variant's download: its files together. */
 function size(v: Variant): number {
   return v.files.reduce((n, f) => n + f.bytes, 0);
+}
+
+/** A recipe whole (`getRecipe`): every variant's files among it. */
+function RecipeWhole({ id }: { id: string }) {
+  const q = useGet('/admin/v1/recipes/{recipe}', { params: { path: { recipe: id } } });
+  if (q.isPending) return <Loading what={`recipe ${id}`} />;
+  if (q.isError) return <Unavailable what={`Recipe ${id}`} detail={q.error.message} />;
+  return <RecipeInspector recipe={q.data} />;
 }
 
 function RecipeInspector({ recipe: r }: { recipe: Recipe }) {

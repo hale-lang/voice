@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Button, Confirm, micros, when } from '@hale/components';
-import { useGet, type CatalogModel } from '../api/client';
+import { useGet, useRecipes, type CatalogModel } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
@@ -61,7 +61,7 @@ function ModelForm({ model }: { model?: CatalogModel }) {
   const [recipe, setRecipe] = useState(model?.recipe ?? '');
   // what it answers; "" is its recipe's (else generative) on create
   const [contract, setContract] = useState<'' | 'generative' | 'decision'>(model?.contract ?? '');
-  const recipes = useGet('/admin/v1/recipes');
+  const recipes = useRecipes();
   const [ctx, setCtx] = useState<number | null>(model?.context_length ?? null);
   const [maxOut, setMaxOut] = useState<number | null>(model?.max_output_tokens ?? null);
   const [priceIn, setPriceIn] = useState<number | null>(model?.price ? model.price.input_per_mtok_micros / 1e6 : null);

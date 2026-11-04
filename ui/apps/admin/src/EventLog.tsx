@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { count } from '@hale/components';
 import { subscribeAdminEvents, subscribeFlights, type Flight } from './api/events';
-import { api, type Schemas, type UsageRecord } from './api/client';
+import { api, type Schemas, type UsageRecord, type UsageRecordSummary } from './api/client';
 import { go } from './route';
 import { DEFAULT, clamp, dragged, keyed, room as roomFor, type Size } from './resize';
 import s from './EventLog.module.css';
@@ -293,14 +293,16 @@ function lineOf(e: AdminEvent): Line | null {
 /** The statuses a request ends as that are not a failure. */
 const FINE = new Set(['served', 'incomplete']);
 
-function landing(r: UsageRecord, at: number, replayed: boolean): Line {
+/** A request's line: from the ledger's page (a summary) or a `usage` event (the record whole). */
+function landing(r: UsageRecord | UsageRecordSummary, at: number, replayed: boolean): Line {
   const t = r.timing;
   const secs = t.wall_ms / 1000;
   const rate = t.first_output_ms != null && t.engine_ms != null && t.engine_ms > t.first_output_ms && r.output_tokens > 0 ? ` · ${((1000 * r.output_tokens) / (t.engine_ms - t.first_output_ms)).toFixed(0)} tok/s` : '';
   const failed = !FINE.has(r.status);
   // voice's own request for the project (its system key's): an annotation's
   // stage or a title, quiet beside the project's own
-  const side = r.internal ? String((r.metadata as Record<string, unknown> | null)?.side ?? 'internal') : '';
+  const said = 'metadata' in r ? (r.metadata as Record<string, unknown> | null)?.side : r.side;
+  const side = r.internal ? String(said ?? 'internal') : '';
   return {
     key: `usage:${r.id}`,
     at,

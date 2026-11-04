@@ -1,6 +1,6 @@
 import { Panel, PanelGrid, Gauge, Table, Status, Loading, Unavailable, Mono, micros, count, until, ago } from '@hale/components';
 import { toneOf } from '../tone';
-import { useGet, type Account, type Node, type SeatView, type UsageRecord } from '../api/client';
+import { useGet, useNodes, type Account, type NodeSummary, type SeatSummary, type UsageRecordSummary } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href } from '../route';
 import { readout } from '../readout';
@@ -57,10 +57,10 @@ function AccountGauges({ account }: { account: Account }) {
   );
 }
 
-type SeatRow = SeatView & { nodeStatus: Node['status'] };
+type SeatRow = SeatSummary & { nodeStatus: NodeSummary['status'] };
 
 function Fleet() {
-  const q = useGet('/admin/v1/nodes');
+  const q = useNodes();
   if (q.isPending) return <Loading what="nodes" />;
   if (q.isError) return <Unavailable what="Nodes" detail={q.error.message} />;
   const rows: SeatRow[] = q.data.data.flatMap((n) => n.seats.map((s) => ({ ...s, nodeStatus: n.status })));
@@ -119,10 +119,10 @@ function Recent() {
   const q = useGet('/admin/v1/usage', { params: { query: { limit: 20 } } });
   if (q.isPending) return <Loading what="usage" />;
   if (q.isError) return <Unavailable what="Usage" detail={q.error.message} />;
-  const fresh = (r: UsageRecord) => Date.now() - Date.parse(r.created_at) < 60_000;
+  const fresh = (r: UsageRecordSummary) => Date.now() - Date.parse(r.created_at) < 60_000;
   return (
     <Panel title="Recent requests" readout={readout(q, `${q.data.data.length}`)}>
-      <Table<UsageRecord>
+      <Table<UsageRecordSummary>
         rows={q.data.data}
         rowKey={(r) => r.id}
         rowClass={(r) => (r.status !== 'served' && fresh(r) ? 'afterglow' : undefined)}

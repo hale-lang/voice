@@ -1,7 +1,9 @@
 // The hub's admin events (admin_events.hl `AdminFeed`, hub.hl): a feed
 // starts at the head, then publishes each row past its marks on its topic,
 // whoever wrote it; the requests in flight go whole, and only when the set
-// changes; a `data` too large for a bus frame goes as `null`, `whole` false.
+// changes; the change log is read past its mark, so a look with nothing
+// new tells nothing, and one far behind catches up a bounded page at a
+// time; a `data` too large for a bus frame goes as `null`, `whole` false.
 import ".." as api;
 import "../../store" as st;
 
@@ -11,6 +13,8 @@ locus Watch {
         usage_data: String = "";
         usage_whole: Bool = true;
         changes: Int = 0;
+        change_ids: String = "";
+        change_data: String = "";
         flights: Int = 0;
         flights_data: String = "";
         nodes: Int = 0;
@@ -45,6 +49,8 @@ locus Watch {
 
     fn on_change(r: api::AdminRecord) {
         self.changes = self.changes + 1;
+        self.change_ids = self.change_ids + r.id + " ";
+        self.change_data = r.data;
     }
 
     fn on_flights(r: api::AdminRecord) {
@@ -226,6 +232,60 @@ main locus App {
         self.feed.tick(false);
         std::time::sleep(50ms);
         std::test::assert_eq_int(self.watch.steps, 2, "a step is told once");
+
+        // the change log, past the feed's mark: what was told is not told
+        // again, and each change after it is, in order, whole
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        let told = self.watch.changes;
+        std::test::assert(told >= 2, "the node's and its seat's changes were told");
+        let catalog = api::Catalog { store: self.feed.store };
+        catalog.create(api::CatalogModelCreate { id: "m1" }) or discard;
+        catalog.create(api::CatalogModelCreate { id: "m2" }) or discard;
+        self.watch.change_ids = "";
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.changes, told + 2, "each new change told once");
+        std::test::assert(
+            std::str::starts_with(self.watch.change_ids, "change_")
+                && std::str::contains(self.watch.change_data, "\"target\": \"models/m2\"")
+                && std::str::contains(self.watch.change_data, "\"after\": {"),
+            "oldest first, the last whole: " + self.watch.change_data,
+        );
+        self.feed.tick(false);
+        std::time::sleep(50ms);
+        std::test::assert_eq_int(self.watch.changes, told + 2, "nothing new: nothing told");
+        // a feed far behind catches up a bounded page at a time
+        let mut i = 1;
+        while i <= 1200 {
+            catalog.update(
+                api::CatalogModelUpdate {
+                    model: "m1",
+                    has_context_length: true,
+                    context_length: i,
+                },
+            ) or discard;
+            i = i + 1;
+        }
+        self.feed.tick(false);
+        std::time::sleep(200ms);
+        let caught = self.watch.changes - told - 2;
+        std::test::assert(
+            caught > 0 && caught <= 1000,
+            "a look tells at most a thousand: " + to_string(caught),
+        );
+        self.feed.tick(false);
+        std::time::sleep(200ms);
+        self.feed.tick(false);
+        std::time::sleep(200ms);
+        std::test::assert(
+            self.watch.changes - told - 2 <= 1200,
+            "none told twice: " + to_string(self.watch.changes - told - 2),
+        );
+        std::test::assert(
+            std::str::contains(self.watch.change_data, "\"context_length\": 1200"),
+            "the last change told last: " + self.watch.change_data,
+        );
 
         // a record too large for one bus frame goes without its data
         let big = "{\"id\": \"resp_big\", \"pad\": \"" + std::str::repeat("x", 70000) + "\"}";

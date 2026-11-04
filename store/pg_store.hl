@@ -1403,8 +1403,11 @@ locus PgStore {
         }
         a.add(to_string(cursor));
         a.add(to_string(limit + 1));
+        // a list of the changes reads no resource they hold
+        let bodies = if q.bodies { "before, after" } else { "NULL AS before, NULL AS after" };
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE ($1 = '' OR target = $1 OR starts_with(target, $1 || '/')) AND ($2::timestamptz IS NULL OR at >= $2::timestamptz) AND ($3::timestamptz IS NULL OR at <= $3::timestamptz) AND ($4::bigint = 0 OR id < $4::bigint) ORDER BY id DESC LIMIT $5::int) t",
+            "SELECT row_to_json(t) FROM (SELECT id, at, action, target, " + bodies
+                + " FROM change WHERE ($1 = '' OR target = $1 OR starts_with(target, $1 || '/')) AND ($2::timestamptz IS NULL OR at >= $2::timestamptz) AND ($3::timestamptz IS NULL OR at <= $3::timestamptz) AND ($4::bigint = 0 OR id < $4::bigint) ORDER BY id DESC LIMIT $5::int) t",
             a,
         ) or raise;
         let mut out = ChangeRows { };
@@ -1419,16 +1422,62 @@ locus PgStore {
                 out.more = true;
                 return out;
             }
-            let id = std::json::find_int_field(line, "id");
-            push(out.rows, ChangeRow {
-                seq: id,
-                id: "chg_" + pad(id, 6),
-                at: pg_time(pg_text(line, "at")),
-                action: pg_text(line, "action"),
-                target: pg_text(line, "target"),
-                before: raw_or_empty(line, "before"),
-                after: raw_or_empty(line, "after")
-            }) or discard;
+            push(out.rows, change_row(line)) or discard;
+        }
+        return out;
+    }
+
+    fn change(id: String) -> ChangeRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.change_locked(id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn change_locked(id: String) -> ChangeRow fallible(StoreError) {
+        let n = change_number(id);
+        if n < 1 { return ChangeRow { }; }
+        let a = db::Args { };
+        a.add(to_string(n));
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE id = $1::bigint) t",
+            a,
+        ) or raise;
+        if len(line) == 0 { return ChangeRow { }; }
+        let c = change_row(line);
+        // the id as the log writes it, not another spelling of its number
+        return if c.id == id { c } else { ChangeRow { } };
+    }
+
+    fn changes_after(seq: Int, limit: Int) -> ChangeRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.changes_after_locked(seq, limit) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn changes_after_locked(seq: Int, limit: Int) -> ChangeRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(to_string(seq));
+        a.add(to_string(if limit < 1 { 1 } else if limit > 1000 { 1000 } else { limit }));
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT id, at, action, target, before, after FROM change WHERE id > $1::bigint ORDER BY id LIMIT $2::int) t",
+            a,
+        ) or raise;
+        let mut out = ChangeRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, change_row(line)) or discard; }
         }
         return out;
     }
@@ -2876,9 +2925,9 @@ locus PgStore {
         return title_row(line);
     }
 
-    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError) {
+    fn titles(q: TitleQuery) -> TitleRows fallible(StoreError) {
         self.lock.enter();
-        let out = self.titles_locked(project, conversation, limit) or {
+        let out = self.titles_locked(q) or {
             self.lock.leave();
             fail err;
         };
@@ -2886,18 +2935,29 @@ locus PgStore {
         return out;
     }
 
-    fn titles_locked(
-        project: String,
-        conversation: String,
-        limit: Int
-    ) -> TitleRows fallible(StoreError) {
+    fn titles_locked(q: TitleQuery) -> TitleRows fallible(StoreError) {
+        let limit = if q.limit < 1 { 100 } else if q.limit > 500 { 500 } else { q.limit };
+        if len(q.after_project) > 0 {
+            let c = db::Args { };
+            c.add(q.after_project);
+            c.add(q.after_conversation);
+            let known = self.row(
+                "SELECT row_to_json(t) FROM (SELECT project FROM conversation_title WHERE project = $1 AND conversation = $2) t",
+                c,
+            ) or raise;
+            if len(known) == 0 { return TitleRows { cursor_known: false }; }
+        }
         let a = db::Args { };
-        a.add(project);
-        a.add(conversation);
-        a.add(to_string(if limit > 500 { 500 } else { limit }));
+        a.add(q.project);
+        a.add(q.conversation);
+        a.add(q.after_project);
+        a.add(q.after_conversation);
+        a.add(to_string(limit + 1));
+        // after the cursor's title in the order they are read: made before
+        // it, or at its time and later by project, then conversation
         let all = self.rows(
             "SELECT row_to_json(t) FROM (" + TITLE_COLUMNS
-                + " WHERE ($1 = '' OR c.project = $1 OR c.project IN (SELECT id FROM project WHERE parent = $1)) AND ($2 = '' OR c.conversation = $2) ORDER BY c.made_at DESC, c.project, c.conversation LIMIT $3::int) t",
+                + " WHERE ($1 = '' OR c.project = $1 OR c.project IN (SELECT id FROM project WHERE parent = $1)) AND ($2 = '' OR c.conversation = $2) AND ($3 = '' OR EXISTS (SELECT 1 FROM conversation_title k WHERE k.project = $3 AND k.conversation = $4 AND (c.made_at < k.made_at OR (c.made_at = k.made_at AND (c.project, c.conversation) > (k.project, k.conversation))))) ORDER BY c.made_at DESC, c.project, c.conversation LIMIT $5::int) t",
             a,
         ) or raise;
         let mut out = TitleRows { };
@@ -2907,7 +2967,12 @@ locus PgStore {
             let nl = line_end(v, start);
             let line = std::str::trim(std::str::slice(v, start, nl));
             start = nl + 1;
-            if len(line) > 0 { push(out.rows, title_row(line)) or discard; }
+            if len(line) == 0 { continue; }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
+            push(out.rows, title_row(line)) or discard;
         }
         return out;
     }
@@ -3331,6 +3396,21 @@ fn pg_text(json: String, name: String) -> String {
 }
 
 /// A member's raw JSON, "" for `null` or absent.
+/// A `change` row as Postgres answers it (`row_to_json`), whole.
+fn change_row(line: String) -> ChangeRow {
+    let id = std::json::find_int_field(line, "id");
+    return ChangeRow {
+        seq: id,
+        id: "chg_" + pad(id, 6),
+        at: pg_time(pg_text(line, "at")),
+        action: pg_text(line, "action"),
+        target: pg_text(line, "target"),
+        before: raw_or_empty(line, "before"),
+        after: raw_or_empty(line, "after"),
+        present: true
+    };
+}
+
 fn raw_or_empty(json: String, name: String) -> String {
     let raw = std::str::trim(std::json::find_field_raw(json, name));
     return if len(raw) == 0 || raw == "null" { "" } else { raw };

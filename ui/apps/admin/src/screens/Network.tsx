@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState, useId } from 'react';
 import { useInstances, INSTANCE_LAPSE_MS } from '../api/hub';
 import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/components';
-import { useGet, type UsageRecord } from '../api/client';
+import { useGet, useNodes, useUsageRecords, USAGE_PAGE } from '../api/client';
 import { subscribeAdminEvents, subscribeFlights, type Flight } from '../api/events';
 import type { ScreenProps } from '../App';
-import { buildGraph, resolvedModel, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
+import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
 import { demoFleet, demoInFlight, demoCompletions, demoContext, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
@@ -13,7 +13,7 @@ const EMPTY: Fleet = { nodes: [], accounts: [], projects: [], usage: [] };
 
 export function Network(_: ScreenProps) {
   const health = useGet('/readyz');
-  const nodes = useGet('/admin/v1/nodes');
+  const nodes = useNodes();
   const accounts = useGet('/admin/v1/accounts');
   const projects = useGet('/admin/v1/projects');
   // voice's own requests for the projects (their system keys'): a layer of
@@ -28,7 +28,12 @@ export function Network(_: ScreenProps) {
     setContext(!context);
     try { localStorage.setItem('voice.network.context', context ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
   };
-  const usage = useGet('/admin/v1/usage', { params: { query: { limit: 100, ...(internal ? { include_internal: true } : {}) } } });
+  const usage = useGet('/admin/v1/usage', { params: { query: { limit: USAGE_PAGE, ...(internal ? { include_internal: true } : {}) } } });
+  // the ledger lists each request without the caller's metadata: with the
+  // context layer on, each is read whole once (a record never changes)
+  const wholes = useUsageRecords(context ? (usage.data?.data ?? []).map((r) => r.id) : []);
+  // the records read so far, as a key: the fleet is built again as they land
+  const wholeKey = wholes.map((w) => w.data?.id ?? '').join(',');
   const [choice, setChoice] = useState<'api' | 'demo' | null>(() => {
     try { const saved = sessionStorage.getItem('voice.network.source'); return saved === 'api' || saved === 'demo' ? saved : null; } catch { return null; }
   });
@@ -49,9 +54,13 @@ export function Network(_: ScreenProps) {
     nodes: nodes.data?.data ?? [],
     accounts: accounts.data?.data ?? [],
     projects: projects.data?.data ?? [],
-    usage: usage.data?.data ?? [],
+    usage: (usage.data?.data ?? []).map((r, i): FleetRequest => {
+      const whole = wholes[i]?.data;
+      return whole && whole.id === r.id ? { ...r, metadata: whole.metadata } : r;
+    }),
     instances: beats.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })),
-  }), [nodes.data, accounts.data, projects.data, usage.data, beats, now]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [nodes.data, accounts.data, projects.data, usage.data, beats, now, wholeKey]);
 
   return <div className={s.screen}>
     <header className={s.header}>
@@ -68,7 +77,7 @@ export function Network(_: ScreenProps) {
   </div>;
 }
 
-type Pulse = { record: UsageRecord; at: number; inFlight?: boolean; color?: string };
+type Pulse = { record: FleetRequest; at: number; inFlight?: boolean; color?: string };
 
 function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean }) {
   const [clock, setClock] = useState(() => ({ tick: 0, now: Date.now() }));
@@ -78,12 +87,12 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
   const [query, setQuery] = useState('');
   const selected = selectedIds.at(-1) ?? null;
   const [hovered, setHovered] = useState<string | null>(null);
-  const [traceSelection, setTrace] = useState<UsageRecord | null>(null);
+  const [traceSelection, setTrace] = useState<FleetRequest | null>(null);
   const [pulses, setPulses] = useState<Pulse[]>([]);
   // requests a seat is serving now (the stream's `request` events), lit
   // until their usage is told, as provisional records
-  const [flying, setFlying] = useState<Map<string, { record: UsageRecord; at: number }>>(new Map());
-  const [arrivals, setArrivals] = useState<UsageRecord[]>([]);
+  const [flying, setFlying] = useState<Map<string, { record: FleetRequest; at: number }>>(new Map());
+  const [arrivals, setArrivals] = useState<FleetRequest[]>([]);
   const [filters, setFilters] = useState<Filters>({});
   const [hidden, setHidden] = useState<Kind[]>([]);
   const seen = useRef(new Set<string>());
@@ -138,7 +147,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
     if (demo) return;
     return subscribeFlights((now) => {
       setFlying((old) => {
-        const next = new Map<string, { record: UsageRecord; at: number }>();
+        const next = new Map<string, { record: FleetRequest; at: number }>();
         for (const f of now) {
           // a retry keeps the request's id on another seat: lit where it is now
           const was = old.get(f.id);
@@ -245,8 +254,8 @@ function Marker({ kind }: { kind: Kind }) {
 }
 
 /** A request in flight as a record the graph can light: what it is, and the seat it is on. */
-function provisional(f: Flight): UsageRecord {
-  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {}, instance: (f as { instance?: string | null }).instance ?? null } as unknown as UsageRecord;
+function provisional(f: Flight): FleetRequest {
+  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {}, instance: (f as { instance?: string | null }).instance ?? null } as unknown as FleetRequest;
 }
 
 function Constellation({ layout, graph, selected, focusedIds, focusedEdges, pulses, paused, onSelect, onHover }: { layout: Graph; graph: Graph; selected: string[]; focusedIds: Set<string>; focusedEdges: Set<string>; pulses: Pulse[]; paused: boolean; onSelect: (id: string) => void; onHover: (id: string | null) => void }) {

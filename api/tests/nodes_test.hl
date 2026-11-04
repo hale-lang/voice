@@ -19,6 +19,14 @@ fn no_seat() -> api::SeatView {
     return api::SeatView { status: api::SeatStatus::offline, enabled: true, concurrency: 0 };
 }
 
+fn no_summary() -> api::SeatSummary {
+    return api::SeatSummary { status: api::SeatStatus::offline, enabled: true, concurrency: 0 };
+}
+
+fn no_listed() -> api::NodeSummary {
+    return api::NodeSummary { status: api::NodeStatus::revoked, has_max_in_flight: true };
+}
+
 fn model(id: String) -> st::SeatModel {
     return st::SeatModel { model: id };
 }
@@ -63,12 +71,13 @@ fn main() {
         !got.has_enrollment_token && got.enrollment_token != token,
         "never the token again",
     );
-    let listed_nodes = nodes.list() or api::NodeList { };
-    let first_node = at(listed_nodes.data, 0) or no_node();
+    let listed_nodes = nodes.list(api::NodeAsk { }) or api::NodeList { };
+    let first_node = at(listed_nodes.data, 0) or no_listed();
     std::test::assert(
         count(listed_nodes.data) == 1
             && first_node.id == "laptop"
-            && !first_node.has_enrollment_token,
+            && !listed_nodes.has_next_cursor
+            && !std::str::contains(api::NodeList::api_encode(listed_nodes), "enrollment_token"),
         "nor in the list",
     );
 
@@ -167,7 +176,7 @@ fn main() {
         api::ChangeAsk { target: "nodes/laptop/seats" },
     ) or api::ChangeList { };
     std::test::assert_eq_str(
-        (at(logged.data, 0) or api::Change { action: api::ChangeAction::delete }).target,
+        (at(logged.data, 0) or api::ChangeSummary { action: api::ChangeAction::delete }).target,
         "nodes/laptop/seats/static",
         "the change names the seat's path",
     );
@@ -209,15 +218,44 @@ fn main() {
 
     let listed = seats.list(api::NodeRef { node: "laptop" }) or api::SeatList { };
     std::test::assert_eq_str(
-        (at(listed.data, 0) or no_seat()).ref,
+        (at(listed.data, 0) or no_summary()).ref,
         "laptop/static",
         "list",
     );
+    // a seat's list and its node carry it summarized: its state, not its config
+    let listed_json = api::SeatList::api_encode(listed);
+    std::test::assert(
+        !std::str::contains(listed_json, "\"config\"")
+            && !std::str::contains(listed_json, "hello from voice")
+            && std::str::contains(listed_json, "\"status\":\"offline\"")
+            && !(at(listed.data, 0) or no_summary()).has_placement,
+        "the seats listed without their configs: " + listed_json,
+    );
     let shown = nodes.get(api::NodeRef { node: "laptop" }) or no_node();
     std::test::assert_eq_str(
-        (at(shown.seats, 0) or no_seat()).ref,
+        (at(shown.seats, 0) or no_summary()).ref,
         "laptop/static",
         "the node shows its seats",
+    );
+    std::test::assert(
+        !std::str::contains(api::Node::api_encode(shown), "hello from voice"),
+        "summarized, its config the seat's own",
+    );
+    let in_list = nodes.list(api::NodeAsk { }) or api::NodeList { };
+    let listed_node = at(in_list.data, 0) or no_listed();
+    std::test::assert(
+        count(listed_node.seats) == 1
+            && (at(listed_node.seats, 0) or no_summary()).ref == "laptop/static"
+            && !std::str::contains(api::NodeList::api_encode(in_list), "hello from voice"),
+        "and so does the list of nodes",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(
+            (seats.get(api::SeatRef { node: "laptop", seat: "static" }) or no_seat()).config.text,
+            "text",
+        ),
+        "hello from voice",
+        "the seat itself answers its config",
     );
 
     let mut patch = api::SeatUpdate {
@@ -271,6 +309,8 @@ fn main() {
     seats.get(api::SeatRef { node: "laptop", seat: "static" }) or { failed = why(err); };
     std::test::assert(std::str::starts_with(failed, "not_found"), "gone: " + failed);
 
+    pages(nodes);
+
     // revoking
     let revoked = nodes.revoke(api::NodeRef { node: "laptop" }) or no_node();
     std::test::assert(revoked.status == api::NodeStatus::revoked, "revoked");
@@ -289,5 +329,49 @@ fn main() {
     std::test::assert(
         std::str::starts_with(failed, "conflict"),
         "its id is never reused: " + failed,
+    );
+}
+
+/// The nodes a page at a time, each page at most `NODE_PAGE_MAX`, and the
+/// next from a page's cursor; a cursor or a limit out of bounds refused.
+fn pages(nodes: api::Nodes) {
+    let mut i = 0;
+    while i < api::NODE_PAGE_MAX {
+        nodes.create(api::NodeCreate { id: "paged-" + to_string(i) }) or discard;
+        i = i + 1;
+    }
+    let first = nodes.list(api::NodeAsk { }) or api::NodeList { };
+    std::test::assert(
+        count(first.data) == api::NODE_PAGE_MAX && first.has_next_cursor,
+        "a page holds at most NODE_PAGE_MAX nodes, and says there are more",
+    );
+    std::test::assert_eq_str(
+        (at(first.data, 0) or no_listed()).id,
+        "laptop",
+        "in the order they were created",
+    );
+    let second = nodes.list(api::NodeAsk { cursor: first.next_cursor }) or api::NodeList { };
+    std::test::assert(
+        count(second.data) == 1 && !second.has_next_cursor
+            && (at(second.data, 0) or no_listed()).id == "paged-"
+            + to_string(api::NODE_PAGE_MAX - 1),
+        "the next page goes on from the cursor, to the last",
+    );
+    let small = nodes.list(api::NodeAsk { limit: 2 }) or api::NodeList { };
+    std::test::assert(
+        count(small.data) == 2 && small.next_cursor == "paged-0",
+        "a smaller page, its cursor its last node",
+    );
+    let mut failed = "";
+    nodes.list(api::NodeAsk { limit: api::NODE_PAGE_MAX + 1 }) or { failed = why(err); };
+    std::test::assert(
+        std::str::starts_with(failed, "invalid limit"),
+        "a page is bounded: " + failed,
+    );
+    failed = "";
+    nodes.list(api::NodeAsk { cursor: "nope" }) or { failed = why(err); };
+    std::test::assert(
+        std::str::starts_with(failed, "invalid cursor"),
+        "a cursor names a node: " + failed,
     );
 }

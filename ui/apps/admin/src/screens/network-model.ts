@@ -1,4 +1,11 @@
-import type { Account, Node, Schemas, UsageRecord } from '../api/client';
+import type { Account, NodeSummary, Schemas, UsageRecordSummary } from '../api/client';
+
+/**
+ * A request as the graph draws it: as the ledger lists it, with the
+ * caller's metadata when it is known (the record read whole, an event's, or
+ * the demo's).
+ */
+export type FleetRequest = UsageRecordSummary & { metadata?: Record<string, string> };
 
 export type CoreKind = 'project' | 'repository' | 'model' | 'api' | 'node' | 'seat' | 'account' | 'system';
 export type Kind = CoreKind | `context:${string}`;
@@ -7,7 +14,7 @@ export const kindName = (kind: Kind): string => kind.startsWith('context:') ? ki
 export const graphKinds = (graph: Graph): Kind[] => [...new Set(graph.vertices.map(v => v.kind))].sort((a, b) => kindName(a).localeCompare(kindName(b)));
 
 export type RequestContext = { repository?: string; apiInstance?: string };
-export type Fleet = { nodes: Node[]; accounts: Account[]; projects: Schemas['Project'][]; usage: UsageRecord[]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[] };
+export type Fleet = { nodes: NodeSummary[]; accounts: Account[]; projects: Schemas['Project'][]; usage: FleetRequest[]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[] };
 /** `aliases`: on a model, the names projects give it now (`ModelAlias`), each once: a label on the model, never a vertex of its own. */
 export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string; aliases?: string[] };
 /** `standing`: the fleet's standing topology (a project to the api instances, an api instance to every host), drawn faint whether or not anything flows; never traffic. */
@@ -26,7 +33,7 @@ const link = (...parts: string[]) => '#/' + parts.map(encodeURIComponent).join('
  * model it was routed as: the alias's model, or the one asked for itself); an
  * older record is read against its project's aliases in force now.
  */
-export function resolvedModel(record: UsageRecord, projects: Schemas['Project'][]): { model: string; recorded: boolean } | undefined {
+export function resolvedModel(record: FleetRequest, projects: Schemas['Project'][]): { model: string; recorded: boolean } | undefined {
   const kept = record.resolved_model;
   if (kept) return kept !== record.requested_model ? { model: kept, recorded: true } : undefined;
   const now = projects.find(p => p.id === record.project)?.resolved_aliases?.find(a => a.name === record.requested_model);
@@ -34,9 +41,9 @@ export function resolvedModel(record: UsageRecord, projects: Schemas['Project'][
 }
 
 /** Repository is an optional caller label. API identity must come from trusted observation, never caller metadata: the record's `instance`, which the api itself writes. */
-export function requestContext(record: UsageRecord, contexts?: Fleet['contexts']): RequestContext {
+export function requestContext(record: FleetRequest, contexts?: Fleet['contexts']): RequestContext {
   const instance = (record as { instance?: string | null }).instance ?? undefined;
-  return { repository: record.metadata.repository?.trim() || undefined, ...(instance ? { apiInstance: instance } : {}), ...contexts?.[record.id] };
+  return { repository: record.metadata?.repository?.trim() || undefined, ...(instance ? { apiInstance: instance } : {}), ...contexts?.[record.id] };
 }
 
 /** What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source. */
@@ -140,7 +147,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       if (v && !v.href) v.href = link('usage', 'c', r.conversation);
       join(project, c);
     }
-    if (options.context) for (const [key, value] of Object.entries(r.metadata)) {
+    if (options.context) for (const [key, value] of Object.entries(r.metadata ?? {})) {
       if (key === 'repository' || typeof value !== 'string' || !value.trim()) continue;
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));
     }
@@ -172,23 +179,23 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
 }
 
 /** No transitive traversal: sharing a model/account cannot splice two requests together. */
-export function requestEdges(record: UsageRecord, graph: Graph): Set<string> {
+export function requestEdges(record: FleetRequest, graph: Graph): Set<string> {
   const existing = new Set(graph.edges.map(e => e.id));
   return new Set((graph.requests.get(record.id)?.edges ?? []).filter(id => existing.has(id)));
 }
-export function requestFlowEdges(record: UsageRecord, graph: Graph): Set<string> {
+export function requestFlowEdges(record: FleetRequest, graph: Graph): Set<string> {
   const existing = new Set(graph.edges.map(e => e.id));
   return new Set((graph.requests.get(record.id)?.flowEdges ?? []).filter(id => existing.has(id)));
 }
 
-export function requestVertices(record: UsageRecord, graph: Graph): Set<string> {
+export function requestVertices(record: FleetRequest, graph: Graph): Set<string> {
   const existing = new Set(graph.vertices.map(v => v.id));
   return new Set((graph.requests.get(record.id)?.vertices ?? []).filter(id => existing.has(id)));
 }
-export function relatedRequests(id: string, records: UsageRecord[], graph: Graph): UsageRecord[] {
+export function relatedRequests(id: string, records: FleetRequest[], graph: Graph): FleetRequest[] {
   return records.filter(r => graph.requests.get(r.id)?.vertices.includes(id));
 }
-export function matchingRequests(ids: string[], records: UsageRecord[], graph: Graph, mode: 'all' | 'any' = 'all'): UsageRecord[] {
+export function matchingRequests(ids: string[], records: FleetRequest[], graph: Graph, mode: 'all' | 'any' = 'all'): FleetRequest[] {
   if (!ids.length) return records;
   return records.filter(r => {
     const members = graph.requests.get(r.id)?.vertices ?? [];

@@ -53,6 +53,13 @@ await setup('/admin/v1/recipes', recipe('live-placed'));
 await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
 await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
 await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], account: 'claude-work', runtime: 'llama-server-b11913-cuda' });
+// a change the setup made, which `getChange` reads whole
+{
+  const r = await fetch(base + '/admin/v1/changes?limit=1', { headers: operator });
+  const page = await r.json();
+  if (r.status !== 200 || !page.data?.[0]?.id) { console.log('FAIL setup changes', r.status, JSON.stringify(page).slice(0, 200)); process.exit(1); }
+  sample.change = page.data[0].id;
+}
 // an annotator and a rule of the operator's (the ones the deletes remove)
 const annotator = (id, stage) => ({ id, name: 'Live', stage, questions: [{ name: 'polite', type: 'noul', instructions: 'Is it polite?' }] });
 await setup('/admin/v1/annotators', annotator('live-sample', 'response'));

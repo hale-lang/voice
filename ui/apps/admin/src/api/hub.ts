@@ -1,6 +1,6 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
-import { useGet, type Node, type Schemas } from './client';
+import { useGet, ALL_PAGES, type NodeSummary, type Schemas } from './client';
 import { AFFECTS, COVERED, deliver, deliverFlights, refresh, type Flight } from './events';
 import { useOperatorToken } from './token';
 
@@ -45,9 +45,9 @@ function adminFrame(qc: QueryClient, topic: string, payload: Record<string, unkn
  * The api's hub (GET /admin/v1/hub), over a WebSocket on a port of the api's
  * own (until it can share the api's, hale-lang/hale#1818): the fleet's
  * heartbeats as they arrive, and, where the api has a database, the admin
- * events of every api instance. Each `NodeObserved` is a node whole, as GET
- * /admin/v1/nodes/{id} answers it, so it is written into the nodes the
- * screens already show, with no read; each `InstanceBeat` is an api
+ * events of every api instance. Each `NodeObserved` is a node summarized, as
+ * GET /admin/v1/nodes lists it, so it is written into the nodes the screens
+ * already show, with no read; each `InstanceBeat` is an api
  * instance alive; each admin topic's event goes where the event stream's
  * would (events.ts `deliver`).
  */
@@ -96,13 +96,23 @@ export function useInstances(): Instance[] {
   return useSyncExternalStore((w) => { watchers.add(w); return () => { watchers.delete(w); }; }, () => snapshot);
 }
 
-/** A node as the hub announced it, written into the nodes list the screens read. */
-function observed(qc: QueryClient, node: Node) {
-  qc.setQueryData<{ data: Node[] }>(['/admin/v1/nodes', null], (old) => {
+/**
+ * A node as the hub announced it (`NodeSummary`, as `listNodes` lists it),
+ * written into the nodes list the screens read; the node's own reads (the
+ * node whole, a seat whole) are read again.
+ */
+function observed(qc: QueryClient, node: NodeSummary) {
+  qc.setQueryData<{ data: NodeSummary[] }>(['/admin/v1/nodes', ALL_PAGES], (old) => {
     if (!old) return old;
     const at = old.data.findIndex((n) => n.id === node.id);
     const data = at < 0 ? [...old.data, node] : old.data.map((n, i) => (i === at ? node : n));
     return { ...old, data };
+  });
+  void qc.invalidateQueries({
+    predicate: (q) => {
+      const [path, init] = q.queryKey as [unknown, { params?: { path?: { node?: string } } } | null | undefined];
+      return (path === '/admin/v1/nodes/{node}' || path === '/admin/v1/nodes/{node}/seats/{seat}') && init?.params?.path?.node === node.id;
+    },
   });
 }
 
@@ -154,7 +164,7 @@ export function useHub(): HubState {
             if (admin && before !== undefined && f.seq > before + 1) refresh(qc, admin === 'change' ? COVERED : AFFECTS[admin] ?? COVERED);
             if (admin && f.payload) adminFrame(qc, f.topic, f.payload);
             else if (f.topic === 'NodeObserved' && typeof f.payload?.body === 'string') {
-              observed(qc, JSON.parse(f.payload.body) as Node);
+              observed(qc, JSON.parse(f.payload.body) as NodeSummary);
               // a seat that moved changes what can be routed and where placements stand
               void qc.invalidateQueries({ queryKey: ['/admin/v1/routes'] });
             } else if (f.topic === 'InstanceBeat' && typeof f.payload?.instance === 'string' && typeof f.payload.at === 'string') {

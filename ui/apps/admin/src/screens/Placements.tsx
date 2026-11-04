@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, Select, Checkbox, Button, Confirm, when, bytes } from '@hale/components';
-import { useGet, type Placement } from '../api/client';
+import { useGet, useNodes, useRecipes, type Placement } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
@@ -16,7 +16,7 @@ import { toneOf } from '../tone';
 export function Placements({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
   const q = useGet('/admin/v1/placements');
-  const nodes = useGet('/admin/v1/nodes');
+  const nodes = useNodes();
   const placement = q.data?.data.find((p) => p.id === selected);
   const creating = selected === 'new';
   const seatAt = (ref: string | undefined) => { const [n] = (ref ?? '').split('/'); return nodes.data?.data.find((x) => x.id === n)?.seats.find((s) => s.ref === ref); };
@@ -114,9 +114,9 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
 function PlacementForm() {
   const w = useWrite();
   const catalog = useGet('/admin/v1/models');
-  const recipes = useGet('/admin/v1/recipes');
+  const recipes = useRecipes();
   const runtimes = useGet('/admin/v1/runtimes');
-  const nodes = useGet('/admin/v1/nodes');
+  const nodes = useNodes();
   const accounts = useGet('/admin/v1/accounts');
   const [id, setId] = useState('');
   const [model, setModel] = useState('');
@@ -152,7 +152,7 @@ function PlacementForm() {
         <Field label="nodes" required help="the first is the leader, which serves; a second, cabled to it with its link checked, takes the other half of a model too large for one">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}>
             {live.map((n) => (
-              <Checkbox key={n.id} checked={on.includes(n.id)} onChange={(c) => setOn(c ? [...on, n.id] : on.filter((x) => x !== n.id))} label={`${n.id}${n.capabilities?.hardware ? '' : ' (no hardware measured)'}`} />
+              <Checkbox key={n.id} checked={on.includes(n.id)} onChange={(c) => setOn(c ? [...on, n.id] : on.filter((x) => x !== n.id))} label={`${n.id}${n.hardware ? '' : ' (no hardware measured)'}`} />
             ))}
           </div>
         </Field>

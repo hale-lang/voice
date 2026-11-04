@@ -46,6 +46,8 @@ const MAP = {
   CatalogList: 'GET /admin/v1/models',
   Recipe: 'Recipe',
   RecipeCreate: 'RecipeCreate',
+  RecipeSummary: 'RecipeSummary',
+  RecipeVariantSummary: 'RecipeVariantSummary',
   RecipeList: 'GET /admin/v1/recipes',
   Runtime: 'Runtime',
   RuntimeCreate: 'RuntimeCreate',
@@ -73,17 +75,21 @@ const MAP = {
   Node: 'NodeWithToken',
   NodeCreate: 'NodeCreate',
   NodeUpdate: 'NodeUpdate',
+  NodeSummary: 'NodeSummary',
   NodeList: 'GET /admin/v1/nodes',
   SeatView: 'SeatView',
+  SeatSummary: 'SeatSummary',
   SeatCreate: 'Seat',
   SeatUpdate: 'SeatUpdate',
   SeatList: 'GET /admin/v1/nodes/{node}/seats',
   'SeatModel': 'SeatModel',
   Change: 'Change',
+  ChangeSummary: 'ChangeSummary',
   ChangeList: 'GET /admin/v1/changes',
   Attempt: 'Attempt',
   Problem: 'AdminProblem',
   UsageRecord: 'UsageRecord',
+  UsageRecordSummary: 'UsageRecordSummary',
   UsageList: 'GET /admin/v1/usage',
   UsageSummary: 'UsageSummary',
   Peek: 'Peek',
@@ -125,7 +131,7 @@ const NOT_COMPARED = {
 };
 
 // Fields of a row's request that are the path's or the query's.
-const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'peer', 'include_archived', 'annotator', 'rule']);
+const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'peer', 'include_archived', 'annotator', 'rule', 'change']);
 // Records that stand for a list: the list rides in `items`. A row's list
 // is a `bounded` field of its own; these are left only inside a record
 // that stands for a value or null (`Restriction.names`).
@@ -135,7 +141,7 @@ const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
-const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeList', 'SeatView', 'SeatList', 'Change', 'ChangeList', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend', 'AnnotatorStats', 'ConversationTitleList', 'AnnotationStep', 'AnnotationStepList', 'AnnotatorResult', 'AnnotateReadiness', 'AnnotateRoute', 'AnnotateRouteSeat']);
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeSummary', 'NodeList', 'SeatView', 'SeatSummary', 'SeatList', 'Change', 'ChangeSummary', 'ChangeList', 'RecipeSummary', 'RecipeVariantSummary', 'RecipeList', 'UsageRecordSummary', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend', 'AnnotatorStats', 'ConversationTitleList', 'AnnotationStep', 'AnnotationStepList', 'AnnotatorResult', 'AnnotateReadiness', 'AnnotateRoute', 'AnnotateRouteSeat']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;

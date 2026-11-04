@@ -132,7 +132,42 @@ type SeatView {
     problems: bounded[String; 8];
 }
 
-type SeatList { data: bounded[SeatView; 16]; }
+/// `SeatSummary`: a seat as a node and its lists carry it, without its
+/// `config` (`getSeat` has it); a placement's seat with the placement, the
+/// variant and the runtime its config names, and the context its model is
+/// made for.
+type SeatSummary {
+    ref: String = "";
+    node: String = "";
+    id: String = "";
+    engine: String = "";
+    account: String = "";
+    serves: bounded[st::SeatModel; 16];
+    data_classes: bounded[String; 32];
+    concurrency: Int = 1;
+    enabled: Bool = true;
+    status: SeatStatus;
+    has_reason: Bool = false;
+    reason: String = "";
+    in_flight: Int = 0;
+    has_progress: Bool = false;
+    progress: FetchProgress = FetchProgress { };
+    has_context: Bool = false;
+    context: Int = 0;
+    problems: bounded[String; 8];
+    // a placement's seat (placements.hl, `managed_config`): what its config names
+    has_placement: Bool = false;
+    placement: String = "";
+    has_variant: Bool = false;
+    variant: String = "";
+    has_runtime: Bool = false;
+    runtime: String = "";
+    has_context_length: Bool = false;
+    context_length: Int = 0;
+}
+
+/// A node's seats, at most 16 (`createSeat`), each a `SeatSummary`.
+type SeatList { data: bounded[SeatSummary; 16]; }
 
 /// `Node`, and `NodeWithToken` when `enrollment_token` is set (only the
 /// answers to its creation and to a rotation). A field whose flag is false
@@ -174,8 +209,56 @@ type NodeRead {
 
 type NodeReadList { data: bounded[NodeRead; 64]; }
 
+/// `NodeSummary`: a node as `listNodes` lists it and the hub and the event
+/// stream tell it: its state, the hardware it measured and its seats, each
+/// a `SeatSummary`; not what it declared (`getNode` has it).
+type NodeSummary {
+    id: String = "";
+    name: String = "";
+    status: NodeStatus;
+    has_version: Bool = false;
+    version: String = "";
+    // `capabilities.hardware`, once it measured it
+    has_hardware: Bool = false;
+    hardware: NodeHardware = NodeHardware { };
+    has_local: Bool = false;
+    local: LocalControls = LocalControls { paused: false };
+    has_max_in_flight: Bool = false;
+    max_in_flight: Int = -1;
+    has_effective_max_in_flight: Bool = false;
+    effective_max_in_flight: Int = -1;
+    in_flight: Int = 0;
+    assignment_version: Int = 0;
+    has_applied_version: Bool = false;
+    applied_version: Int = -1;
+    seats: bounded[SeatSummary; 16];
+    has_connected_at: Bool = false;
+    connected_at: Time = `1970-01-01T00:00:00Z`;
+    has_last_heartbeat_at: Bool = false;
+    last_heartbeat_at: Time = `1970-01-01T00:00:00Z`;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    has_revoked_at: Bool = false;
+    revoked_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// A page of nodes, at most `NODE_PAGE_MAX`, in the order they were
+/// created; `next_cursor` is `null` on the last.
+type NodeList {
+    data: bounded[NodeSummary; 8];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
+
+/// The most nodes a page lists, and the page it lists unasked: a node with
+/// four placed seats is about 2.3 KiB as a summary (a seat's is under 500
+/// bytes), so a page of such nodes is under 20 KiB.
+const NODE_PAGE_MAX: Int = 8;
+
+/// `listNodes`' query: a page's size, and the `next_cursor` it follows.
+type NodeAsk { limit: Int = -1; cursor: String = ""; }
+
 /// `Node`, as the surface describes it: its capabilities a typed record,
-/// its seats `SeatView`s (node_of_read).
+/// its seats `SeatSummary`s (node_of_read); a seat's config is `getSeat`'s.
 type Node {
     id: String = "";
     name: String = "";
@@ -184,6 +267,9 @@ type Node {
     // it last declared them, until it first registers
     has_version: Bool = false;
     version: String = "";
+    // `capabilities.hardware`, as the summary carries it
+    has_hardware: Bool = false;
+    hardware: NodeHardware = NodeHardware { };
     has_capabilities: Bool = false;
     capabilities: NodeCapabilities = NodeCapabilities { max_in_flight: 0 };
     has_local: Bool = false;
@@ -197,7 +283,7 @@ type Node {
     assignment_version: Int = 0;
     has_applied_version: Bool = false;
     applied_version: Int = -1;
-    seats: bounded[SeatView; 16];
+    seats: bounded[SeatSummary; 16];
     links: bounded[NodeLink; 4];
     has_connected_at: Bool = false;
     connected_at: Time = `1970-01-01T00:00:00Z`;
@@ -210,8 +296,6 @@ type Node {
     has_enrollment_token: Bool = false;
     enrollment_token: String = "";
 }
-
-type NodeList { data: bounded[Node; 64]; }
 
 locus Nodes {
     params {
@@ -244,10 +328,10 @@ locus Nodes {
     // router answers the `_read` methods' `NodeRead`, its stored JSON as
     // stored.
 
-    /// `listNodes`.
-    fn list() -> NodeList fallible(CtlError) {
+    /// `listNodes`: a page of nodes, each a `NodeSummary`.
+    fn list(a: NodeAsk) -> NodeList fallible(CtlError) {
         self.gate.enter();
-        let gated = self.list_in_gate() or {
+        let gated = self.list_in_gate(a) or {
             self.gate.leave();
             fail err;
         };
@@ -256,12 +340,34 @@ locus Nodes {
     }
 
     /// `list`, inside the gate.
-    fn list_in_gate() -> NodeList fallible(CtlError) {
-        let l = self.list_read() or raise;
-        let mut out = NodeList { };
-        for n in l.data {
-            push(out.data, node_of_read(n) or raise) or discard;
+    fn list_in_gate(a: NodeAsk) -> NodeList fallible(CtlError) {
+        let mut limit = NODE_PAGE_MAX;
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > NODE_PAGE_MAX {
+                fail bad("`limit` is 1 to " + to_string(NODE_PAGE_MAX), "limit");
+            }
+            limit = a.limit;
         }
+        let rows = self.store.nodes() or fail store_down(err);
+        let mut out = NodeList { };
+        // past the cursor's node, in the order they were created
+        let mut started = len(a.cursor) == 0;
+        for r in rows.rows {
+            if !started {
+                started = r.id == a.cursor;
+                continue;
+            }
+            if count(out.data) >= limit {
+                out.has_next_cursor = true;
+                return out;
+            }
+            push(out.data, node_summary_of(self.view(r) or raise) or raise) or discard;
+            out.next_cursor = r.id;
+        }
+        if !started {
+            fail bad("`cursor` names no node; pass a page's `next_cursor`", "cursor");
+        }
+        out.next_cursor = "";
         return out;
     }
 
@@ -581,12 +687,12 @@ locus Seats {
         return gated;
     }
 
-    /// `list`, inside the gate.
+    /// `list`, inside the gate: each seat without its config.
     fn list_in_gate(r: NodeRef) -> SeatList fallible(CtlError) {
         let l = self.list_read(r) or raise;
         let mut out = SeatList { };
         for v in l.data {
-            push(out.data, seat_view_of(v) or raise) or discard;
+            push(out.data, seat_summary_of(v)) or discard;
         }
         return out;
     }
@@ -886,6 +992,112 @@ fn seat_view_of(r: SeatRead) -> SeatView fallible(CtlError) {
     return v;
 }
 
+/// A `SeatRead` as a node and its lists carry it: without its config, a
+/// placement's seat with what its config names.
+fn seat_summary_of(r: SeatRead) -> SeatSummary {
+    let placement = std::json::string_field(r.config, "placement");
+    let placed = placement.kind == "string";
+    let variant = if placed {
+        std::json::find_string_field(std::json::find_field_raw(r.config, "variant"), "id")
+    } else {
+        ""
+    };
+    let runtime = if placed {
+        std::json::find_string_field(std::json::find_field_raw(r.config, "runtime"), "id")
+    } else {
+        ""
+    };
+    let native = if placed { std::json::find_int_field(r.config, "context_length") } else { 0 };
+    let mut v = SeatSummary {
+        ref: r.ref,
+        node: r.node,
+        id: r.id,
+        engine: r.engine,
+        account: r.account,
+        concurrency: r.concurrency,
+        enabled: r.enabled,
+        status: r.status,
+        has_reason: r.has_reason,
+        reason: r.reason,
+        in_flight: r.in_flight,
+        has_progress: r.has_progress,
+        progress: r.progress,
+        has_context: r.has_context,
+        context: r.context,
+        has_placement: placed,
+        placement: if placed { placement.text } else { "" },
+        has_variant: len(variant) > 0,
+        variant: variant,
+        has_runtime: len(runtime) > 0,
+        runtime: runtime,
+        has_context_length: native > 0,
+        context_length: native,
+    };
+    v.serves = r.serves;
+    v.data_classes = r.data_classes;
+    v.problems = r.problems;
+    return v;
+}
+
+/// The hardware a node's stored capabilities say it measured.
+fn hardware_of(r: NodeRead) -> NodeHardware fallible(CtlError) {
+    let raw = std::str::trim(std::json::find_field_raw(r.capabilities, "hardware"));
+    return NodeHardware::api_decode(raw) or fail CtlError::Unavailable(
+        Problem {
+            code: ErrorCode::internal_error,
+            message: "node " + r.id + "'s hardware is " + to_string(len(raw))
+                + " bytes of stored JSON that are not a node's hardware (`" + err.field + "` is "
+                + err.kind + ")",
+        },
+    );
+}
+
+/// Whether a node's stored capabilities say what hardware it measured.
+fn measured(r: NodeRead) -> Bool {
+    return r.has_capabilities
+        && std::json::string_field(r.capabilities, "hardware").kind == "object";
+}
+
+/// A `NodeRead` as `listNodes` lists it.
+fn node_summary_of(r: NodeRead) -> NodeSummary fallible(CtlError) {
+    let hw = measured(r);
+    let mut n = NodeSummary {
+        id: r.id,
+        name: r.name,
+        status: r.status,
+        has_version: r.has_version,
+        version: r.version,
+        has_hardware: hw,
+        hardware: if hw { hardware_of(r) or raise } else { NodeHardware { } },
+        has_local: r.has_local,
+        local: r.local,
+        has_max_in_flight: r.has_max_in_flight,
+        max_in_flight: r.max_in_flight,
+        has_effective_max_in_flight: r.has_effective_max_in_flight,
+        effective_max_in_flight: r.effective_max_in_flight,
+        in_flight: r.in_flight,
+        assignment_version: r.assignment_version,
+        has_applied_version: r.has_applied_version,
+        applied_version: r.applied_version,
+        has_connected_at: r.has_connected_at,
+        connected_at: r.connected_at,
+        has_last_heartbeat_at: r.has_last_heartbeat_at,
+        last_heartbeat_at: r.last_heartbeat_at,
+        created_at: r.created_at,
+        has_revoked_at: r.has_revoked_at,
+        revoked_at: r.revoked_at,
+    };
+    for s in r.seats {
+        push(n.seats, seat_summary_of(s)) or discard;
+    }
+    return n;
+}
+
+/// A node as the hub and the event stream tell it (`NodeSummary`), as JSON.
+fn node_summary_json(r: NodeRead) -> String fallible(CtlError) {
+    return NodeSummary::api_encode(node_summary_of(r) or raise);
+}
+
 /// A `NodeRead` as the surface's typed `Node`.
 fn node_of_read(r: NodeRead) -> Node fallible(CtlError) {
     let caps = if r.has_capabilities {
@@ -906,6 +1118,8 @@ fn node_of_read(r: NodeRead) -> Node fallible(CtlError) {
         status: r.status,
         has_version: r.has_version,
         version: r.version,
+        has_hardware: r.has_capabilities && caps.has_hardware,
+        hardware: caps.hardware,
         has_capabilities: r.has_capabilities,
         capabilities: caps,
         has_local: r.has_local,
@@ -930,7 +1144,7 @@ fn node_of_read(r: NodeRead) -> Node fallible(CtlError) {
     };
     n.links = r.links.items;
     for s in r.seats {
-        push(n.seats, seat_view_of(s) or raise) or discard;
+        push(n.seats, seat_summary_of(s)) or discard;
     }
     return n;
 }
@@ -1115,16 +1329,58 @@ fn seat_json(s: SeatRead) -> String {
         + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
 }
 
-/// `Node`, or `NodeWithToken` when it carries its token.
+/// A seat as a node and its lists carry it (`SeatSummary`): `seat_json`
+/// without its config, and what a placement's config names.
+fn seat_summary_json(s: SeatRead) -> String {
+    let v = seat_summary_of(s);
+    let problems_list = st::JsonList { };
+    for p in s.problems {
+        problems_list.add(jq(p));
+    }
+    return "{\"id\": " + jq(s.id) + ", \"engine\": " + jq(s.engine) + ", \"account\": "
+        + jq(s.account) + ", \"serves\": " + st::serves_json(s.serves)
+        + ", \"data_classes\": " + st::jnames(s.data_classes) + ", \"concurrency\": "
+        + to_string(s.concurrency) + ", \"enabled\": " + jbool(s.enabled)
+        + ", \"ref\": " + jq(s.ref) + ", \"node\": " + jq(s.node)
+        + ", \"status\": " + jq(seat_status_name(s.status))
+        + ", \"reason\": " + jstring_or_null(s.has_reason, s.reason)
+        + (if s.has_progress {
+            ", \"progress\": {\"done_bytes\": " + to_string(s.progress.done_bytes)
+                + ", \"total_bytes\": "
+                + to_string(s.progress.total_bytes) + "}"
+        } else {
+            ""
+        }) + (if s.has_context { ", \"context\": " + to_string(s.context) } else { "" })
+        + ", \"in_flight\": "
+        + to_string(s.in_flight) + ", \"problems\": [" + problems_list.text() + "]"
+        + (if v.has_placement { ", \"placement\": " + jq(v.placement) } else { "" })
+        + (if v.has_variant { ", \"variant\": " + jq(v.variant) } else { "" })
+        + (if v.has_runtime { ", \"runtime\": " + jq(v.runtime) } else { "" })
+        + (if v.has_context_length {
+            ", \"context_length\": " + to_string(v.context_length)
+        } else {
+            ""
+        }) + "}";
+}
+
+/// `Node`, or `NodeWithToken` when it carries its token: its seats as
+/// summaries, as `getNode` answers it. The event stream takes a node's
+/// place from it (admin_events.hl, `node_shape`).
 fn node_json(n: NodeRead) -> String {
     let seats_list = st::JsonList { };
     for s in n.seats {
-        seats_list.add(seat_json(s));
+        seats_list.add(seat_summary_json(s));
     }
     let seats = seats_list.text();
+    let hardware = if measured(n) {
+        ", \"hardware\": " + std::str::trim(std::json::find_field_raw(n.capabilities, "hardware"))
+    } else {
+        ""
+    };
     let mut out = "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": "
         + jq(node_state_name(n.status))
-        + ", \"version\": " + jstring_or_null(n.has_version, n.version) + ", \"capabilities\": "
+        + ", \"version\": " + jstring_or_null(n.has_version, n.version) + hardware
+        + ", \"capabilities\": "
         + jraw_if(n.has_capabilities, n.capabilities)
         + ", \"local\": " + jraw_if(n.has_local, local_json(n.local)) + ", \"max_in_flight\": "
         + jcount_or_null(n.has_max_in_flight, n.max_in_flight)

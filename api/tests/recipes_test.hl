@@ -69,15 +69,63 @@ fn main() {
         "its files as written",
     );
 
-    let listed = recipes.list() or api::RecipeList { };
+    let listed = recipes.list(api::RecipeAsk { }) or api::RecipeList { };
     std::test::assert_eq_int(count(listed.data), 2, "voice's and the operator's");
-    let first = at(listed.data, 0) or blank();
+    let first = at(listed.data, 0) or api::RecipeSummary { id: "refused" };
     std::test::assert(
         first.id == "fixture-1"
             && first.origin == api::Origin::shipped
             && !first.has_created_at,
         "a shipped one has no time",
     );
+    // listed, a variant's files are counted, not listed; the recipe whole
+    // has them
+    let mine = at(listed.data, 1) or api::RecipeSummary { id: "refused" };
+    let v0 = at(mine.variants, 0) or api::RecipeVariantSummary { };
+    std::test::assert(
+        mine.id == "mine-1" && mine.origin == api::Origin::operator && mine.has_created_at
+            && count(mine.variants) == 1 && v0.id == "q4" && v0.format == api::ModelFormat::gguf
+            && v0.quantization == "q4_k_m" && v0.file_count == 1 && v0.total_bytes == 1
+            && v0.memory_bytes == 2,
+        "a variant summarized: its format, its files counted and summed, its memory",
+    );
+    let page_json = api::RecipeList::api_encode(listed);
+    std::test::assert(
+        !std::str::contains(page_json, "sha256") && !std::str::contains(page_json, "m.gguf")
+            && !std::str::contains(page_json, "\"files\""),
+        "no file is listed: " + page_json,
+    );
+    let whole = recipes.get(api::RecipeRef { recipe: "mine-1" }) or blank();
+    std::test::assert(
+        std::str::contains(whole.variants.text, "m.gguf"),
+        "the recipe by its id lists them",
+    );
+    // a page at a time
+    let one = recipes.list(api::RecipeAsk { limit: 1 }) or api::RecipeList { };
+    std::test::assert(
+        count(one.data) == 1 && one.has_next_cursor && one.next_cursor == "fixture-1",
+        "a page of one names the next",
+    );
+    let rest = recipes.list(
+        api::RecipeAsk { limit: 1, cursor: one.next_cursor },
+    ) or api::RecipeList {
+        has_next_cursor: true,
+    };
+    std::test::assert(
+        count(rest.data) == 1 && !rest.has_next_cursor
+            && (at(rest.data, 0) or api::RecipeSummary { }).id == "mine-1",
+        "the next goes on from it, the operator's after voice's, to the last",
+    );
+    let mut bounded = "";
+    recipes.list(api::RecipeAsk { limit: api::RECIPE_PAGE_MAX + 1 }) or {
+        bounded = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(bounded, "invalid limit", "a page is bounded");
+    bounded = "";
+    recipes.list(api::RecipeAsk { cursor: "nope" }) or {
+        bounded = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(bounded, "invalid cursor", "a cursor names a recipe");
 
     let mut failed = "";
     recipes.create(
@@ -187,7 +235,7 @@ fn main() {
             && std::str::contains(theirs.variants.text, "theirs.gguf"),
         "a shipped id the operator holds is the operator's",
     );
-    let both = after.list() or api::RecipeList { };
+    let both = after.list(api::RecipeAsk { }) or api::RecipeList { };
     std::test::assert_eq_int(count(both.data), 1, "listed once, as the operator's");
     before.remove(api::RecipeRef { recipe: "fixture-1" }) or discard;
     failed = "";
@@ -199,7 +247,7 @@ fn main() {
         "not_found",
         "a withdrawn id is not brought back by a release",
     );
-    let none = after.list() or api::RecipeList { };
+    let none = after.list(api::RecipeAsk { }) or api::RecipeList { };
     std::test::assert_eq_int(count(none.data), 0, "nor listed");
     failed = "";
     api::Catalog { store: held, recipes: after }.create(

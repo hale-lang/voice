@@ -1,0 +1,234 @@
+// Every admin list answers a page that stays well under the 64 KiB frame
+// the runtime carries a row's answer in, with realistic records at the
+// page's bound: the recipes voice ships and a frontier model's of 300
+// files; a page of nodes each with four seats placed with that frontier
+// variant (and the hub's report of one); a page of the ledger, of the
+// change log over such seats, and of conversations' titles. Each is held
+// under 32 KiB, half the frame.
+import ".." as api;
+import "../../store" as st;
+
+/// Half the frame a row's answer crosses the runtime's bus in.
+const HALF_FRAME: Int = 32768;
+
+fn here(path: String) -> String {
+    return if std::io::fs::file_exists(path) { path } else { "../" + path };
+}
+
+/// The line of `lines` (one body a line) that holds `text`.
+fn line_with(lines: String, text: String) -> String {
+    let v = std::str::bytes_view(lines);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        if std::str::contains(line, text) { return line; }
+    }
+    return "";
+}
+
+/// What a node declares, as a node with every engine kind writes it
+/// (node/capabilities.hl), with the hardware it measured.
+const CAPS: String = "{\"max_in_flight\": 16, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"description\": \"Fetches, verifies and runs a model the coordinator placed here, as pinned.\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"placement\", \"variant\", \"runtime\"], \"properties\": {\"placement\": {\"type\": \"string\"}, \"variant\": {\"type\": \"object\"}, \"runtime\": {\"type\": \"object\"}}}}, {\"id\": \"claude\", \"kind\": \"claude-cli\", \"description\": \"Runs the claude CLI under a login the node holds as a secret.\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"token_vault\"], \"properties\": {\"token_vault\": {\"type\": \"string\", \"minLength\": 1}, \"model\": {\"type\": \"string\"}}}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": 137438953472, \"model_memory_bytes\": 120000000000, \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 137438953472, \"unified\": true}], \"disk_free_bytes\": 3500000000000}}";
+
+/// A request as the ledger keeps it, with the caller's metadata.
+fn record(n: Int) -> String {
+    return "{\"id\": \"resp_01k8z3q4v7m2k9x0abcdef" + to_string(1000 + n)
+        + "\", \"created_at\": \"2026-11-03T10:00:00Z\", \"project\": \"tenant-voice-dev\", \"key\": \"k_01k8z3q4v7m2k9x0abcdefgh\", \"requested_model\": \"claude-sonnet-5\", \"resolved_model\": \"claude-sonnet-5\", \"requested_account\": null, \"endpoint\": \"responses\", \"status\": \"served\", \"served\": {\"model\": \"claude-sonnet-5\", \"node\": \"studio-1\", \"seat\": \"studio-1/claude-work\", \"account\": \"claude-work\", \"engine\": \"claude-cli\"}, \"data_class\": \"internal\", \"input_tokens\": 18234, \"cached_input_tokens\": 0, \"cache_write_input_tokens\": 0, \"output_tokens\": 1234, \"reasoning_tokens\": 0, \"price_micros\": 73245, \"currency\": \"USD\", \"timing\": {\"wall_ms\": 12345, \"queue_ms\": 3, \"load_ms\": 0, \"first_output_ms\": 2345, \"engine_ms\": 12001}, \"attempts\": [{\"seat\": \"studio-1/claude-work\", \"account\": \"claude-work\", \"outcome\": \"failed\", \"error\": \"the seat's login expired\", \"wall_ms\": 120}, {\"seat\": \"studio-2/claude-work\", \"account\": \"claude-work\", \"outcome\": \"served\", \"wall_ms\": 12220}], \"conversation\": \"6f9b3a2e-1c4d-4e8f-9a7b-2d3c4e5f6a7b\", \"instance\": \"api-7f3a9c\", \"internal\": false, \"metadata\": {\"attempt\": \"att_01k8z3q4v7m2k9x0abcdefgh\", \"repository\": \"hale-lang/voice\", \"note\": \""
+        + std::str::repeat("x", 400) + "\"}}";
+}
+
+fn main() {
+    // the recipes voice ships, and a frontier model's of 300 files
+    let shipped = api::shipped_recipes(here("recipes")) + "\n"
+        + api::shipped_recipes(here("spec/validate/recipes/ok"));
+    let frontier = line_with(shipped, "\"id\": \"frontier-300\"");
+    std::test::assert(len(frontier) > 40000, "the frontier recipe is read whole");
+    let recipes = api::Recipes { store: st::MemoryStore { }, shipped: shipped };
+    let page = recipes.list(api::RecipeAsk { }) or api::RecipeList { };
+    let recipes_json = api::RecipeList::api_encode(page);
+    std::test::assert(count(page.data) > 20, "the shipped recipes, and the frontier one");
+    std::test::assert(
+        len(recipes_json) < HALF_FRAME,
+        "a page of recipes is under 32 KiB: " + to_string(len(recipes_json)),
+    );
+    let whole = recipes.get(api::RecipeRef { recipe: "frontier-300" }) or api::Recipe { };
+    std::test::assert(
+        len(whole.variants.text) > 40000,
+        "while the frontier recipe whole is its own: " + to_string(len(whole.variants.text)),
+    );
+
+    // a page of nodes, each with four seats placed with the frontier variant
+    let variant = std::json::array_first(std::json::find_field_raw(frontier, "variants")).element;
+    let runtime = line_with(
+        api::shipped_runtimes(here("runtimes")),
+        "\"id\": \"llama-server-b11913-cuda\"",
+    );
+    let config = api::managed_config(
+        "frontier-300-on-spark-0",
+        "frontier-300",
+        131072,
+        65536,
+        1000000,
+        variant,
+        runtime,
+        "",
+    );
+    std::test::assert(len(config) > 40000, "a placed seat's config carries the variant whole");
+    let store = st::MemoryStore { };
+    let nodes = api::Nodes { store: store, link: api::NatsLink { } };
+    let changes = api::Changes { store: store };
+    let mut k = 0;
+    while k < api::NODE_PAGE_MAX {
+        let id = "spark-" + to_string(k);
+        nodes.create(api::NodeCreate { id: id, name: "DGX Spark " + to_string(k) }) or discard;
+        store.put_fleet(
+            st::FleetRow {
+                node: id,
+                version: "0.31.0",
+                capabilities: CAPS,
+                local: "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}",
+                registered_at: `2026-11-01T00:00:00Z`,
+                applied_version: 1,
+            },
+        ) or discard;
+        let mut i = 0;
+        while i < 4 {
+            let seat = "frontier-300-" + to_string(i);
+            let mut row = st::SeatRow {
+                ref: id + "/" + seat,
+                node: id,
+                id: seat,
+                engine: "managed",
+                account: "local",
+                config: config,
+            };
+            push(row.serves.items, st::SeatModel { model: "frontier-300" }) or discard;
+            push(row.data_classes.items, "internal") or discard;
+            store.insert_seat(
+                row,
+                api::change("create", "nodes/" + id + "/seats/" + seat, "", config),
+            ) or discard;
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    let listed = nodes.list(api::NodeAsk { }) or api::NodeList { };
+    let nodes_json = api::NodeList::api_encode(listed);
+    let first = at(listed.data, 0) or api::NodeSummary { status: api::NodeStatus::revoked };
+    let s0 = at(first.seats, 0) or api::SeatSummary { status: api::SeatStatus::offline };
+    std::test::assert(
+        count(listed.data) == api::NODE_PAGE_MAX && count(first.seats) == 4
+            && first.has_hardware && s0.placement == "frontier-300-on-spark-0"
+            && s0.variant == "safetensors-fp8" && s0.runtime == "llama-server-b11913-cuda"
+            && s0.context_length == 131072,
+        "a full page of nodes, each with its four placed seats: " + s0.variant,
+    );
+    std::test::assert(
+        len(nodes_json) < HALF_FRAME,
+        "a page of nodes with four seats each is under 32 KiB: " + to_string(len(nodes_json)),
+    );
+    let one = nodes.get(api::NodeRef { node: "spark-0" }) or api::Node {
+        status: api::NodeStatus::revoked,
+    };
+    std::test::assert(
+        len(api::Node::api_encode(one)) < HALF_FRAME,
+        "and so is a node with its four seats: " + to_string(len(api::Node::api_encode(one))),
+    );
+    let observed = api::node_summary_json(
+        nodes.get_read(api::NodeRef { node: "spark-0" }) or api::NodeRead {
+            status: api::NodeStatus::revoked,
+        },
+    ) or "";
+    std::test::assert(
+        len(observed) > 1000 && len(observed) < HALF_FRAME,
+        "and the hub's report of it: " + to_string(len(observed)),
+    );
+    let seat = api::Seats { store: store, link: api::NatsLink { } }.get(
+        api::SeatRef { node: "spark-0", seat: "frontier-300-0" },
+    ) or api::SeatView { status: api::SeatStatus::offline };
+    std::test::assert(
+        len(seat.config.text) > 40000,
+        "while a seat whole carries its config: " + to_string(len(seat.config.text)),
+    );
+
+    // a page of the change log over those seats, each change holding one
+    let log = changes.list(api::ChangeAsk { }) or api::ChangeList { };
+    let log_json = api::ChangeList::api_encode(log);
+    std::test::assert(count(log.data) == 40, "every seat's change: " + to_string(count(log.data)));
+    std::test::assert(
+        len(log_json) < HALF_FRAME,
+        "a page of changes is under 32 KiB: " + to_string(len(log_json)),
+    );
+
+    // a page of the ledger
+    let ledger = st::MemoryStore { };
+    let mut n = 0;
+    while n < api::USAGE_PAGE_MAX + 5 {
+        ledger.insert_usage(
+            st::UsageRow {
+                id: "resp_01k8z3q4v7m2k9x0abcdef" + to_string(1000 + n),
+                created_at: `2026-11-03T10:00:00Z`,
+                project: "tenant-voice-dev",
+                key: "k_01k8z3q4v7m2k9x0abcdefgh",
+                status: "served",
+                record: record(n),
+            },
+        ) or discard;
+        n = n + 1;
+    }
+    let usage = api::Usage { store: ledger }.list(api::UsageAsk { }) or api::UsageList { };
+    let usage_json = api::UsageList::api_encode(usage);
+    std::test::assert(
+        count(usage.data) == api::USAGE_PAGE_MAX && usage.has_next_cursor,
+        "a full page of the ledger",
+    );
+    std::test::assert(
+        len(usage_json) < HALF_FRAME,
+        "a page of the ledger is under 32 KiB: " + to_string(len(usage_json)),
+    );
+    std::test::assert(
+        !std::str::contains(usage_json, "\"metadata\"")
+            && !std::str::contains(usage_json, "\"attempts\""),
+        "listed without the caller's metadata or the attempts",
+    );
+
+    // a page of conversations' titles
+    let titled = st::MemoryStore { };
+    let mut t = 0;
+    while t < api::TITLE_PAGE_MAX + 5 {
+        titled.put_title(
+            st::TitleRow {
+                project: "tenant-voice-dev",
+                conversation: "6f9b3a2e-1c4d-4e8f-9a7b-" + to_string(100000000000 + t),
+                title: "Fix the sort in the usage table so the newest request is first again",
+                task: "debug",
+                model: "qwen3-0.6b",
+                annotator: "conversation-title",
+                version: 3,
+                made_at: `2026-11-03T10:00:00Z`,
+            },
+        ) or discard;
+        t = t + 1;
+    }
+    let titles = api::Annotations { store: titled }.titles(
+        api::ConversationAsk { },
+    ) or api::ConversationTitleList { };
+    let titles_json = api::ConversationTitleList::api_encode(titles);
+    std::test::assert(
+        count(titles.data) == api::TITLE_PAGE_MAX && titles.has_next_cursor,
+        "a full page of titles",
+    );
+    std::test::assert(
+        len(titles_json) < HALF_FRAME,
+        "a page of titles is under 32 KiB: " + to_string(len(titles_json)),
+    );
+    let rest = api::Annotations { store: titled }.titles(
+        api::ConversationAsk { cursor: titles.next_cursor },
+    ) or api::ConversationTitleList { has_next_cursor: true };
+    std::test::assert(
+        count(rest.data) == 5 && !rest.has_next_cursor,
+        "the next page goes on from the cursor, to the last",
+    );
+}

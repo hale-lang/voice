@@ -17,15 +17,8 @@ type ChangeRead {
     after: String = "";
 }
 
-/// A page of changes; `next_cursor` is `null` on the last.
-type ChangeReadList {
-    data: bounded[ChangeRead; 1000];
-    has_next_cursor: Bool = false;
-    next_cursor: String = "";
-}
-
 /// `Change`, as the surface describes it: `before` and `after` the
-/// resource's JSON, free-form, or `null`.
+/// resource's JSON, free-form, or `null`. `getChange` answers it.
 type Change {
     id: String = "";
     at: Time = `1970-01-01T00:00:00Z`;
@@ -39,11 +32,31 @@ type Change {
     after: std::json::Value = std::json::Value::null();
 }
 
+/// `ChangeSummary`: a change as `listChanges` lists it, without the
+/// resource it holds (`getChange` has it).
+type ChangeSummary {
+    id: String = "";
+    at: Time = `1970-01-01T00:00:00Z`;
+    has_principal: Bool = false;
+    principal: String = "";
+    action: ChangeAction;
+    target: String = "";
+}
+
+/// A page of changes, at most `CHANGE_PAGE_MAX`; `next_cursor` is `null` on
+/// the last.
 type ChangeList {
-    data: bounded[Change; 1000];
+    data: bounded[ChangeSummary; 100];
     has_next_cursor: Bool = false;
     next_cursor: String = "";
 }
+
+/// The most changes a page lists, and the page it lists unasked: a
+/// change's summary is under 300 bytes, so a page is under 32 KiB.
+const CHANGE_PAGE_MAX: Int = 100;
+
+/// Which change: the `{change}` of the path.
+type ChangeRef { change: String; }
 
 /// `listChanges`' query: the times are RFC 3339 text, read when the handler
 /// runs so a bad one is refused by name.
@@ -62,8 +75,7 @@ locus Changes {
         gate: st::Lock = st::Lock { };
     }
 
-    /// `listChanges`: newest first, `before` and `after` as free-form JSON.
-    /// The event stream reads `list_read`, which holds them as stored.
+    /// `listChanges`: newest first, each without the resource it holds.
     fn list(a: ChangeAsk) -> ChangeList fallible(CtlError) {
         self.gate.enter();
         let gated = self.list_in_gate(a) or {
@@ -76,29 +88,25 @@ locus Changes {
 
     /// `list`, inside the gate.
     fn list_in_gate(a: ChangeAsk) -> ChangeList fallible(CtlError) {
-        let q = change_query_of(a) or raise;
-        return change_list_of_read(self.list_read(q) or raise) or raise;
-    }
-
-    fn list_read(q: st::ChangeQuery) -> ChangeReadList fallible(CtlError) {
+        let mut q = change_query_of(a) or raise;
+        q.bodies = false;
         let rows = self.store.changes(q) or fail store_down(err);
         if !rows.cursor_known {
             fail bad("`cursor` names no change; pass a page's `next_cursor`", "cursor");
         }
-        let mut out = ChangeReadList { };
+        let mut out = ChangeList { };
         let mut last = "";
         for c in rows.rows {
+            let r = change_read_of(c);
             push(
                 out.data,
-                ChangeRead {
-                    id: c.id,
-                    at: c.at,
-                    action: action_of(c.action),
-                    target: c.target,
-                    has_before: len(c.before) > 0,
-                    before: c.before,
-                    has_after: len(c.after) > 0,
-                    after: c.after,
+                ChangeSummary {
+                    id: r.id,
+                    at: r.at,
+                    has_principal: r.has_principal,
+                    principal: r.principal,
+                    action: r.action,
+                    target: r.target,
                 },
             ) or discard;
             last = c.id;
@@ -109,6 +117,39 @@ locus Changes {
         }
         return out;
     }
+
+    /// `getChange`: the change whole, `before` and `after` as free-form JSON.
+    fn get(r: ChangeRef) -> Change fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `get`, inside the gate.
+    fn get_in_gate(r: ChangeRef) -> Change fallible(CtlError) {
+        let c = self.store.change(r.change) or fail store_down(err);
+        if !c.present { fail missing("no change " + r.change); }
+        return change_of_read(change_read_of(c)) or raise;
+    }
+}
+
+/// A row of the log as the event stream's `ChangeRead`, its `before` and
+/// `after` as stored.
+fn change_read_of(c: st::ChangeRow) -> ChangeRead {
+    return ChangeRead {
+        id: c.id,
+        at: c.at,
+        action: action_of(c.action),
+        target: c.target,
+        has_before: len(c.before) > 0,
+        before: c.before,
+        has_after: len(c.after) > 0,
+        after: c.after,
+    };
 }
 
 /// A `ChangeRead` as the surface's typed `Change`.
@@ -133,15 +174,6 @@ fn change_of_read(c: ChangeRead) -> Change fallible(CtlError) {
             std::json::Value::null()
         },
     };
-}
-
-/// A `ChangeReadList` as the surface's typed `ChangeList`.
-fn change_list_of_read(l: ChangeReadList) -> ChangeList fallible(CtlError) {
-    let mut out = ChangeList { has_next_cursor: l.has_next_cursor, next_cursor: l.next_cursor };
-    for c in l.data {
-        push(out.data, change_of_read(c) or raise) or discard;
-    }
-    return out;
 }
 
 /// A change made now. `before` and `after` are JSON, "" for `null`.
@@ -200,8 +232,11 @@ fn change_query_of(a: ChangeAsk) -> st::ChangeQuery fallible(CtlError) {
             "to"
         );
     }
+    q.limit = CHANGE_PAGE_MAX;
     if a.limit != -1 {
-        if a.limit < 1 || a.limit > 1000 { fail bad("`limit` is 1 to 1000", "limit"); }
+        if a.limit < 1 || a.limit > CHANGE_PAGE_MAX {
+            fail bad("`limit` is 1 to " + to_string(CHANGE_PAGE_MAX), "limit");
+        }
         q.limit = a.limit;
     }
     return q;

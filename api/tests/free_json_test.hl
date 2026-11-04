@@ -5,6 +5,15 @@ import ".." as api;
 import "../../store" as st;
 
 /// The first 200 bytes of `body`, for a message.
+/// Whether the `i`th change of `page` answers whole (`getChange`).
+fn readable(changes: api::Changes, page: api::ChangeList, i: Int) -> Bool {
+    let c = at(page.data, i) or api::ChangeSummary { action: api::ChangeAction::delete };
+    let got = changes.get(api::ChangeRef { change: c.id }) or {
+        return false;
+    };
+    return got.id == c.id;
+}
+
 fn head(body: String) -> String {
     return if len(body) > 200 { body[0..200] } else { body };
 }
@@ -78,7 +87,13 @@ fn main() {
     ) or api::ChangeList {
         has_next_cursor: true,
     };
-    let created = at(log.data, 0) or api::Change { action: api::ChangeAction::delete };
+    let created = changes.get(
+        api::ChangeRef {
+            change: (
+                at(log.data, 0) or api::ChangeSummary { action: api::ChangeAction::delete }
+            ).id,
+        },
+    ) or api::Change { action: api::ChangeAction::delete };
     std::test::assert_eq_str(
         std::json::find_field_raw(created.after.text, "config"),
         CONFIG,
@@ -132,6 +147,10 @@ fn main() {
         1,
         "the change list answers, with the seat's change",
     );
+    std::test::assert(
+        readable(changes, wide_log, 0),
+        "and the change answers whole",
+    );
     let archived = seats.remove(api::SeatRef { node: "laptop", seat: "bound" }) or nothing();
     std::test::assert_eq_str(
         archived.ref,
@@ -143,7 +162,10 @@ fn main() {
     ) or api::ChangeList {
         has_next_cursor: true,
     };
-    std::test::assert_eq_int(count(after_remove.data), 2, "is readable too");
+    std::test::assert(
+        count(after_remove.data) == 2 && readable(changes, after_remove, 0),
+        "is readable too",
+    );
 
     // one check covers every member of every resource: a model's `owned_by`
     // has no bound of its own, but the model is stored whole in its change, so
@@ -164,7 +186,10 @@ fn main() {
     let edge_log = changes.list(api::ChangeAsk { target: "models/m1" }) or api::ChangeList {
         has_next_cursor: true,
     };
-    std::test::assert_eq_int(count(edge_log.data), 1, "and its change is listed");
+    std::test::assert(
+        count(edge_log.data) == 1 && readable(changes, edge_log, 0),
+        "and its change is listed, and answers whole",
+    );
     let mut over = "";
     catalog.create(api::CatalogModelCreate { id: "m2", owned_by: pad(fits + 1) }) or {
         over = api::ctl_class(err) + " " + api::ctl_problem(err).message;
@@ -221,7 +246,10 @@ fn main() {
     ) or api::ChangeList {
         has_next_cursor: true,
     };
-    std::test::assert_eq_int(count(level_log.data), 1, "and its change is listed");
+    std::test::assert(
+        count(level_log.data) == 1 && readable(changes, level_log, 0),
+        "and its change is listed, and answers whole",
+    );
 
     // a config stored before the 64 KiB a value holds (an old row): never
     // replaced, assigned to its node intact
@@ -276,16 +304,28 @@ fn main() {
             && std::str::contains(refusal, " bytes"),
         "the typed answer refuses it, naming the field and its size: " + refusal,
     );
-    refusal = "";
-    nodes.get(api::NodeRef { node: "mini" }) or {
-        refusal = api::ctl_class(err) + " " + api::ctl_problem(err).message;
+    // its node carries the seat summarized, without its config, so the
+    // node answers
+    let shown = nodes.get(api::NodeRef { node: "mini" }) or api::Node {
+        status: api::NodeStatus::revoked,
     };
     std::test::assert(
-        std::str::contains(refusal, "seat mini/old's config is "),
-        "and in its node: " + refusal,
+        shown.id == "mini" && count(shown.seats) == 1
+            && !std::str::contains(api::Node::api_encode(shown), "\"config\""),
+        "its node answers, the seat without its config",
     );
     refusal = "";
-    changes.list(api::ChangeAsk { target: "nodes/mini/seats/old" }) or {
+    let old_log = changes.list(
+        api::ChangeAsk { target: "nodes/mini/seats/old" },
+    ) or api::ChangeList { };
+    std::test::assert_eq_int(count(old_log.data), 1, "its change is listed");
+    changes.get(
+        api::ChangeRef {
+            change: (
+                at(old_log.data, 0) or api::ChangeSummary { action: api::ChangeAction::delete }
+            ).id,
+        },
+    ) or {
         refusal = api::ctl_class(err) + " " + api::ctl_problem(err).message;
     };
     std::test::assert(

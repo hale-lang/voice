@@ -26,14 +26,19 @@ api.use({
 
 export type Schemas = components['schemas'];
 export type Node = Schemas['Node'];
+export type NodeSummary = Schemas['NodeSummary'];
 export type SeatView = Schemas['SeatView'];
+export type SeatSummary = Schemas['SeatSummary'];
 export type Account = Schemas['Account'];
 export type Project = Schemas['Project'];
 export type UsageRecord = Schemas['UsageRecord'];
+export type UsageRecordSummary = Schemas['UsageRecordSummary'];
 export type UsageSummary = Schemas['UsageSummary'];
 export type Change = Schemas['Change'];
+export type ChangeSummary = Schemas['ChangeSummary'];
 export type CatalogModel = Schemas['CatalogModel'];
 export type Recipe = Schemas['Recipe'];
+export type RecipeSummary = Schemas['RecipeSummary'];
 export type Runtime = Schemas['Runtime'];
 export type Placement = Schemas['Placement'];
 
@@ -124,6 +129,29 @@ export function usePeeks(ids: string[]) {
 }
 
 /**
+ * The usage records of `ids`, each read whole once and kept: a record
+ * never changes once the ledger holds it.
+ */
+export function useUsageRecords(ids: string[]) {
+  return useQueries({
+    queries: ids.map((id) => {
+      const init = { params: { path: { request_id: id } } };
+      return {
+        queryKey: ['/admin/v1/usage/{request_id}', init, 'once'] as const,
+        queryFn: async () => {
+          const r = await api.GET('/admin/v1/usage/{request_id}', init);
+          if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+          return r.data;
+        },
+        staleTime: Infinity,
+        refetchInterval: false as const,
+        retry: false,
+      };
+    }),
+  });
+}
+
+/**
  * The annotations of `ids` (annotate.hl), each read once and kept: a
  * request not annotated (its project and key do not annotate, or it is not
  * read yet) answers 404, which is `null` here, not an error.
@@ -152,10 +180,13 @@ export function useAnnotations(ids: string[]) {
 /** Turns of one conversation read at most, newest first. */
 const TURNS_MAX = 2000;
 
+/** The most a page of the ledger holds (`listUsage`). */
+export const USAGE_PAGE = 40;
+
 /**
- * Every usage record `query` matches, oldest first, following the ledger's
- * pages to at most `TURNS_MAX`. Its key is under `/admin/v1/usage`, so the
- * event stream refreshes it as turns land.
+ * Every usage record `query` matches, summarized, oldest first, following
+ * the ledger's pages to at most `TURNS_MAX`. Its key is under
+ * `/admin/v1/usage`, so the event stream refreshes it as turns land.
  */
 export function useAllUsage(query: { conversation: string }) {
   const refetchInterval = useRefetchInterval();
@@ -163,11 +194,11 @@ export function useAllUsage(query: { conversation: string }) {
     queryKey: ['/admin/v1/usage', { all: query }],
     refetchInterval,
     queryFn: async () => {
-      const out: UsageRecord[] = [];
+      const out: UsageRecordSummary[] = [];
       let cursor: string | undefined;
       let more = false;
       do {
-        const r = await api.GET('/admin/v1/usage', { params: { query: { ...query, limit: 1000, ...(cursor ? { cursor } : {}) } } });
+        const r = await api.GET('/admin/v1/usage', { params: { query: { ...query, limit: USAGE_PAGE, ...(cursor ? { cursor } : {}) } } });
         if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
         out.push(...r.data.data);
         cursor = r.data.next_cursor ?? undefined;
@@ -176,4 +207,67 @@ export function useAllUsage(query: { conversation: string }) {
       return { turns: out.reverse(), truncated: !!cursor };
     },
   });
+}
+
+/** The query key of a whole list, read a page at a time (`useNodes`, `useRecipes`). */
+export const ALL_PAGES = { pages: 'all' } as const;
+
+/** The most pages a whole list is read in. */
+const PAGES_MAX = 64;
+
+type Page<T> = { data: T[]; next_cursor?: string | null };
+
+/**
+ * A list read whole, following its pages' `next_cursor` to the last (at
+ * most `pagesMax`), as one query under its path, so the events that
+ * refresh the path refresh it.
+ */
+function useAllPages<T>(path: string, page: (cursor: string | undefined) => Promise<Page<T>>, pagesMax = PAGES_MAX) {
+  const refetchInterval = useRefetchInterval();
+  return useQuery({
+    queryKey: [path, ALL_PAGES],
+    refetchInterval,
+    queryFn: async () => {
+      const data: T[] = [];
+      let cursor: string | undefined;
+      let pages = 0;
+      do {
+        const p = await page(cursor);
+        data.push(...p.data);
+        cursor = p.next_cursor ?? undefined;
+        pages++;
+      } while (cursor && pages < pagesMax);
+      return { data };
+    },
+  });
+}
+
+/** Every node, summarized (`listNodes`): its seats without their configs. */
+export function useNodes() {
+  return useAllPages<NodeSummary>('/admin/v1/nodes', async (cursor) => {
+    const r = await api.GET('/admin/v1/nodes', { params: { query: cursor ? { cursor } : {} } });
+    if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+    return r.data;
+  });
+}
+
+/** Every recipe, summarized (`listRecipes`): its variants' files counted, not listed. */
+export function useRecipes() {
+  return useAllPages<RecipeSummary>('/admin/v1/recipes', async (cursor) => {
+    const r = await api.GET('/admin/v1/recipes', { params: { query: cursor ? { cursor } : {} } });
+    if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+    return r.data;
+  });
+}
+
+/** The conversations' titles read at most, the newest first: five pages. */
+const TITLE_PAGES = 5;
+
+/** Conversations' titles, the newest written first, a page at a time to `TITLE_PAGES`. */
+export function useConversationTitles() {
+  return useAllPages<Schemas['ConversationTitle']>('/admin/v1/conversations', async (cursor) => {
+    const r = await api.GET('/admin/v1/conversations', { params: { query: cursor ? { cursor } : {} } });
+    if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+    return r.data;
+  }, TITLE_PAGES);
 }

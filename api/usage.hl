@@ -178,12 +178,56 @@ type UsageRecord {
     metadata: std::json::Value = std::json::Value::null();
 }
 
-/// A page of the ledger, newest first; `next_cursor` is `null` on the last.
+/// `UsageRecordSummary`: a request as `listUsage` lists it, without its
+/// attempts or the caller's `metadata` (`getUsage` has them both); an
+/// internal request's own `annotates` and `side`, from its metadata.
+type UsageRecordSummary {
+    id: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    project: String = "";
+    key: String = "";
+    requested_model: String = "";
+    has_resolved_model: Bool = false;
+    resolved_model: String = "";
+    has_requested_account: Bool = false;
+    requested_account: String = "";
+    endpoint: String = "responses";
+    status: String = "served";
+    has_served: Bool = false;
+    served: ServedBy = ServedBy { };
+    data_class: String = "";
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    cache_write_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+    timing: UsageTiming = UsageTiming { };
+    has_conversation: Bool = false;
+    conversation: String = "";
+    has_instance: Bool = false;
+    instance: String = "";
+    internal: Bool = false;
+    // an internal request's: the request it annotated and its stage (or
+    // `title`), as voice wrote them in its metadata
+    has_annotates: Bool = false;
+    annotates: String = "";
+    has_side: Bool = false;
+    side: String = "";
+}
+
+/// A page of the ledger, newest first, at most `USAGE_PAGE_MAX`;
+/// `next_cursor` is `null` on the last.
 type UsageList {
-    data: bounded[UsageRecord; 1000];
+    data: bounded[UsageRecordSummary; 40];
     has_next_cursor: Bool = false;
     next_cursor: String = "";
 }
+
+/// The most requests a page lists, and the page it lists unasked: a
+/// request's summary is about 750 bytes, so a page is about 30 KiB.
+const USAGE_PAGE_MAX: Int = 40;
 
 /// Which request: the `{request_id}` of the path.
 type UsageRef { request_id: String; }
@@ -270,7 +314,7 @@ locus Usage {
         let mut out = UsageList { };
         let mut last = 0;
         for r in rows.rows {
-            push(out.data, record_of(r.record, r.id) or raise) or discard;
+            push(out.data, usage_summary_of(record_of(r.record, r.id) or raise)) or discard;
             last = r.seq;
         }
         if rows.more {
@@ -356,6 +400,53 @@ locus Usage {
     }
 }
 
+/// A record as `listUsage` lists it.
+fn usage_summary_of(r: UsageRecord) -> UsageRecordSummary {
+    let annotates = if r.internal {
+        std::json::string_field(r.metadata.text, "annotates")
+    } else {
+        std::json::string_field("{}", "annotates")
+    };
+    let side = if r.internal {
+        std::json::string_field(r.metadata.text, "side")
+    } else {
+        std::json::string_field("{}", "side")
+    };
+    return UsageRecordSummary {
+        id: r.id,
+        created_at: r.created_at,
+        project: r.project,
+        key: r.key,
+        requested_model: r.requested_model,
+        has_resolved_model: r.has_resolved_model,
+        resolved_model: r.resolved_model,
+        has_requested_account: r.has_requested_account,
+        requested_account: r.requested_account,
+        endpoint: r.endpoint,
+        status: r.status,
+        has_served: r.has_served,
+        served: r.served,
+        data_class: r.data_class,
+        input_tokens: r.input_tokens,
+        cached_input_tokens: r.cached_input_tokens,
+        cache_write_input_tokens: r.cache_write_input_tokens,
+        output_tokens: r.output_tokens,
+        reasoning_tokens: r.reasoning_tokens,
+        price_micros: r.price_micros,
+        currency: r.currency,
+        timing: r.timing,
+        has_conversation: r.has_conversation,
+        conversation: r.conversation,
+        has_instance: r.has_instance,
+        instance: r.instance,
+        internal: r.internal,
+        has_annotates: annotates.kind == "string",
+        annotates: annotates.text,
+        has_side: side.kind == "string",
+        side: side.text,
+    };
+}
+
 /// A ledger row's record as the typed `UsageRecord`.
 fn record_of(text: String, id: String) -> UsageRecord fallible(CtlError) {
     return UsageRecord::api_decode(text) or fail CtlError::Unavailable(
@@ -430,8 +521,11 @@ fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError)
     }
     q.metadata = metadata_pairs(a.metadata) or raise;
     if paged {
+        q.limit = USAGE_PAGE_MAX;
         if a.limit != -1 {
-            if a.limit < 1 || a.limit > 1000 { fail bad("`limit` is 1 to 1000", "limit"); }
+            if a.limit < 1 || a.limit > USAGE_PAGE_MAX {
+                fail bad("`limit` is 1 to " + to_string(USAGE_PAGE_MAX), "limit");
+            }
             q.limit = a.limit;
         }
         if len(a.cursor) > 0 {

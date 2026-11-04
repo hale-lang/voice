@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
-import { useGet, type Node, type SeatView, type Schemas } from '../api/client';
+import { useGet, useNodes, type Node, type NodeSummary, type SeatSummary, type SeatView, type Schemas } from '../api/client';
 import { useHubState } from '../api/hub';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -13,11 +13,15 @@ import { Value } from '../values';
 
 type Seat = Schemas['Seat'];
 
-/** Nodes, and one node's seats with assigned beside reported. */
+/**
+ * Nodes, and one node's seats with assigned beside reported. The list is
+ * the nodes summarized; the inspector reads the node whole (what it
+ * declared), and a seat whole (its config).
+ */
 export function Nodes({ route, setInspector }: ScreenProps) {
   const nodeId = route.parts[1];
   const seatId = route.parts[2];
-  const q = useGet('/admin/v1/nodes');
+  const q = useNodes();
   const node = q.data?.data.find((n) => n.id === nodeId);
   const creating = nodeId === 'new';
   const seat = node?.seats.find((s) => s.id === seatId);
@@ -33,13 +37,15 @@ export function Nodes({ route, setInspector }: ScreenProps) {
     return () => clearInterval(t);
   }, [moving, live, qc]);
 
+  const nodeKey = node?.id;
+  const seatKey = seat?.id;
   useEffect(() => {
     if (creating) setInspector(<CreateNode />);
-    else if (node && newSeat) setInspector(<SeatForm node={node} />);
-    else if (node && seat) setInspector(<SeatInspector node={node} seat={seat} />);
-    else if (node) setInspector(<NodeInspector node={node} />);
+    else if (nodeKey && newSeat) setInspector(<NodeWhole id={nodeKey} show={(n) => <SeatForm node={n} />} />);
+    else if (nodeKey && seatKey) setInspector(<NodeWhole id={nodeKey} show={(n) => <SeatWhole node={n} seat={seatKey} />} />);
+    else if (nodeKey) setInspector(<NodeWhole id={nodeKey} show={(n) => <NodeInspector node={n} />} />);
     else setInspector(null);
-  }, [creating, node, seat, newSeat, setInspector]);
+  }, [creating, nodeKey, seatKey, newSeat, setInspector]);
 
   if (q.isPending) return <Loading what="nodes" />;
   if (q.isError) return <Unavailable what="Nodes" detail={q.error.message} />;
@@ -49,7 +55,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
     <>
       <h1>Nodes</h1>
       <Panel title="Nodes" readout={readout(q, `${q.data.data.length} nodes`)}>
-        <Table<Node>
+        <Table<NodeSummary>
           rows={q.data.data}
           rowKey={(n) => n.id}
           selectedKey={nodeId}
@@ -81,8 +87,24 @@ function Heartbeat({ at }: { at: string | null | undefined }) {
   return <span className={stale ? 'c-wait' : 'muted'} title={stale ? 'no heartbeat for over a minute' : undefined}>{ago(at)} ago</span>;
 }
 
+/** The node whole (`getNode`): what it declared, and its links. */
+function NodeWhole({ id, show }: { id: string; show: (node: Node) => ReactNode }) {
+  const q = useGet('/admin/v1/nodes/{node}', { params: { path: { node: id } } });
+  if (q.isPending) return <Loading what={`node ${id}`} />;
+  if (q.isError) return <Unavailable what={`Node ${id}`} detail={q.error.message} />;
+  return <>{show(q.data)}</>;
+}
+
+/** A seat whole (`getSeat`): its config among it. */
+function SeatWhole({ node, seat }: { node: Node; seat: string }) {
+  const q = useGet('/admin/v1/nodes/{node}/seats/{seat}', { params: { path: { node: node.id, seat } } });
+  if (q.isPending) return <Loading what={`seat ${seat}`} />;
+  if (q.isError) return <Unavailable what={`Seat ${node.id}/${seat}`} detail={q.error.message} />;
+  return <SeatInspector node={node} seat={q.data} />;
+}
+
 /** Intent beside ground truth: the latest assignment and the one applied. */
-function AssignmentCell({ node }: { node: Node }) {
+function AssignmentCell({ node }: { node: NodeSummary }) {
   const version = node.assignment_version ?? 0;
   const behind = node.applied_version != null && node.applied_version < version;
   return (
@@ -93,10 +115,12 @@ function AssignmentCell({ node }: { node: Node }) {
   );
 }
 
-function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh: string }) {
+function Seats({ node, selected, fresh }: { node: NodeSummary; selected?: string; fresh: string }) {
+  // what it offers is declared when it connects
+  const declared = node.connected_at != null;
   return (
     <Panel title={`Seats on ${node.id}`} readout={`${node.seats.length} seats · ${fresh}`}>
-      <Table<SeatView>
+      <Table<SeatSummary>
         rows={node.seats}
         rowKey={(s) => s.id}
         selectedKey={selected}
@@ -115,8 +139,8 @@ function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh
         empty="No seats assigned to this node."
       />
       <p style={{ marginBottom: 0 }}>
-        <Button onClick={() => go('nodes', node.id, 'new')} tone="primary" disabled={!node.capabilities}>
-          {node.capabilities ? 'add seat' : 'add seat (the node has not declared what it offers)'}
+        <Button onClick={() => go('nodes', node.id, 'new')} tone="primary" disabled={!declared}>
+          {declared ? 'add seat' : 'add seat (the node has not declared what it offers)'}
         </Button>
       </p>
     </Panel>
@@ -124,7 +148,7 @@ function Seats({ node, selected, fresh }: { node: Node; selected?: string; fresh
 }
 
 /** A seat's reported state, with how far a fetch has come. */
-function reported(s: SeatView): string {
+function reported(s: SeatSummary | SeatView): string {
   const p = s.progress;
   if (s.status !== 'fetching' || !p || p.total_bytes <= 0) return s.status;
   return `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
@@ -464,9 +488,12 @@ function CapExplained({ node }: { node: Node }) {
   );
 }
 
-/** The context a placed seat's model is made for, from the config its placement gave it. */
-function nativeOf(s: SeatView): number | undefined {
-  const n = (s.config as { context_length?: unknown } | undefined)?.context_length;
+/**
+ * The context a placed seat's model is made for, from the config its
+ * placement gave it: as a summary says it, or read from the config.
+ */
+function nativeOf(s: SeatSummary | SeatView): number | undefined {
+  const n = 'context_length' in s ? s.context_length : ((s as SeatView).config as { context_length?: unknown } | undefined)?.context_length;
   return typeof n === 'number' ? n : undefined;
 }
 

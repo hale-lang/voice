@@ -66,7 +66,6 @@ locus DataPlane {
             },
         };
         nodes: Nodes = Nodes { store: self.store, link: self.link };
-        changes: Changes = Changes { store: self.store };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
         // grafted, the nodes' account on the habitat's broker (lib/broker),
         // handed to a node in its registration's answer; "" standalone
@@ -97,16 +96,21 @@ locus DataPlane {
     }
 
     /// A node's report, recorded, told to the hub (hub.hl) as the node now
-    /// is. A node that cannot be read is told nothing: its report stands.
+    /// is, as `listNodes` lists it: its seats without their configs, so a
+    /// report fits a bus frame whatever its seats are placed with. A node
+    /// that cannot be read is told nothing: its report stands.
     fn observed(ctx: std::api::Context, report: String) {
         let n = self.nodes.get_read(NodeRef { node: ctx.caller.name }) or {
+            return;
+        };
+        let body = node_summary_json(n) or {
             return;
         };
         NodeObserved <- NodeObservation {
             node: n.id,
             report: report,
             at: now_seconds(),
-            body: node_json(n),
+            body: body,
         };
     }
 
@@ -304,7 +308,6 @@ locus DataPlane {
             let events = AdminEvents {
                 store: self.store,
                 nodes: self.nodes,
-                changes: self.changes,
                 types: types,
             };
             return events.follow(
@@ -535,12 +538,30 @@ locus DataPlane {
         };
         let mut ids = AnnotationRunAsk { };
         if len(one) > 0 {
+            if b.has_matching {
+                fail invalid(
+                    "the path names the request; `matching` is not taken here",
+                    "matching"
+                );
+            }
             push(ids.request_ids, one) or discard;
+        } else if b.has_matching {
+            if count(b.request_ids) > 0 {
+                fail invalid(
+                    "name the requests in `request_ids` or match them with `matching`, not both",
+                    "matching"
+                );
+            }
+            let matched = self.matching_ids(b.matching) or raise;
+            ids.request_ids = matched.request_ids;
         } else {
             ids.request_ids = b.request_ids;
         }
-        if count(ids.request_ids) == 0 {
-            fail invalid("name at least one request in `request_ids`", "request_ids");
+        if count(ids.request_ids) == 0 && !b.has_matching {
+            fail invalid(
+                "name at least one request in `request_ids`, or match them with `matching`",
+                "request_ids"
+            );
         }
         if len(b.annotator) > 0 {
             let a = if b.version > 0 {
@@ -582,6 +603,38 @@ locus DataPlane {
             content_type: "application/json",
             body: AnnotationRunList::api_encode(out),
         };
+    }
+
+    /// The newest `RUN_MAX` requests `m` matches, as `listUsage` filters
+    /// them: the ids a run named by its filters annotates.
+    fn matching_ids(m: UsageMatch) -> AnnotationRunAsk fallible(ApiError) {
+        let mut q = usage_query_of(
+            UsageAsk {
+                project: m.project,
+                key: m.key,
+                model: m.model,
+                account: m.account,
+                conversation: m.conversation,
+                metadata: if m.metadata.text == "null" { "" } else { m.metadata.text },
+                from: m.from,
+                to: m.to,
+                include_internal: m.include_internal,
+            },
+            false,
+        ) or {
+            let p = ctl_problem(err);
+            fail invalid(
+                p.message,
+                if len(p.param) > 0 { "matching." + p.param } else { "matching" }
+            );
+        };
+        q.limit = RUN_MAX;
+        let rows = self.store.usage_rows(q) or fail metering_failed(err);
+        let mut out = AnnotationRunAsk { };
+        for r in rows.rows {
+            push(out.request_ids, r.id) or discard;
+        }
+        return out;
     }
 
     /// One request queued for annotation now, or why not.

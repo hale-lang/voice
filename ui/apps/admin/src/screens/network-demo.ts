@@ -1,5 +1,5 @@
-import type { Node, SeatView, UsageRecord } from '../api/client';
-import type { Fleet } from './network-model';
+import type { NodeSummary, SeatSummary } from '../api/client';
+import type { Fleet, FleetRequest } from './network-model';
 
 // Repository is caller metadata on demo requests, not a field on Voice's Project.
 const PROJECTS = [
@@ -28,8 +28,8 @@ export function demoFleet(tick: number, now: number): Fleet {
     ['studio3', [['mlx', 'local', ['llama-70b', 'qwen-coder-32b']]]],
   ] as const;
   const names = { studio1: 'Studio 1 · 256 GB profile', studio2: 'Studio 2 · 512 GB profile', studio3: 'Studio 3 · 128 GB profile', m1: 'M1 Max · 64 GB profile', h1: 'H1 · small local models and CLIs', h2: 'H2 · small local models and CLIs' };
-  const nodes: Node[] = definitions.map(([id, slots], index) => {
-    const seats: SeatView[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
+  const nodes: NodeSummary[] = definitions.map(([id, slots], index) => {
+    const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
     return { id, name: names[id], status: 'up', seats, in_flight: 0, effective_max_in_flight: 6, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };
   });
   const projects = PROJECTS.map(([id]) => ({ id, name: id, status: 'active' as const, owners: [], data_classes: ['internal' as const], created_at: new Date(now - 86400000).toISOString(), aliases: ALIASES[id] ?? [], resolved_aliases: (ALIASES[id] ?? []).map(a => ({ ...a, from: id })) }));
@@ -44,7 +44,7 @@ export function demoFleet(tick: number, now: number): Fleet {
   return fleet;
 }
 
-export function demoRequest(fleet: Fleet, sequence: number, now: number): UsageRecord {
+export function demoRequest(fleet: Fleet, sequence: number, now: number): FleetRequest {
   const seats = fleet.nodes.flatMap(n => n.seats).filter(s => s.status === 'up');
   const seat = seats[(sequence * 7) % seats.length]!;
   const model = seat.serves[Math.floor(sequence / seats.length) % seat.serves.length]!.model;
@@ -73,7 +73,7 @@ export function demoInFlight(fleet: Fleet, tick: number, now: number) {
     return [{ ...job, record: { ...record, id: `demo-live-${job.sequence}`, status: 'served' as const, input_tokens: 0, output_tokens: 0, price_micros: 0 }, color: demoProjectColor(record.project) }];
   });
 }
-export function demoCompletions(fleet: Fleet, tick: number, now: number): UsageRecord[] {
+export function demoCompletions(fleet: Fleet, tick: number, now: number): FleetRequest[] {
   return jobsAt(tick).filter(job => job.elapsed === job.duration).map(job => {
     const record = demoRequest(fleet, job.sequence, now);
     return { ...record, id: `demo-live-${job.sequence}`, timing: { ...record.timing, wall_ms: job.duration * DEMO_TICK_MS } };
@@ -81,7 +81,7 @@ export function demoCompletions(fleet: Fleet, tick: number, now: number): UsageR
 }
 
 /** Only used for the synthetic fleet; never interpreted as backend telemetry. */
-export function demoContext(record: UsageRecord) {
+export function demoContext(record: FleetRequest) {
   const sequence = Number(record.id.replace(/^demo-(?:seed-|live-)?/, ''));
   return { apiInstance: sequence % 2 ? 'api-h1' : 'api-studio3' };
 }

@@ -1,19 +1,21 @@
 import { useEffect } from 'react';
 import { Panel, Table, Loading, Unavailable, Kv, Mono, when, ago } from '@hale/components';
-import { useGet, type Change } from '../api/client';
+import { useGet, type Change, type ChangeSummary } from '../api/client';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 import { Diff } from '../values';
 
-/** The audit log: every applied admin write, before and after. */
+/**
+ * The audit log: every applied admin write, the newest page of them; the
+ * inspector reads one whole, before and after.
+ */
 export function Changes({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
   const q = useGet('/admin/v1/changes', { params: { query: { limit: 100 } } });
-  const change = q.data?.data.find((c) => c.id === selected);
   useEffect(() => {
-    setInspector(change ? <ChangeInspector change={change} /> : null);
-  }, [change, setInspector]);
+    setInspector(selected ? <ChangeWhole id={selected} /> : null);
+  }, [selected, setInspector]);
 
   if (q.isPending) return <Loading what="changes" />;
   if (q.isError) return <Unavailable what="Changes" detail={q.error.message} />;
@@ -21,7 +23,7 @@ export function Changes({ route, setInspector }: ScreenProps) {
     <>
       <h1>Changes</h1>
       <Panel title="Applied" readout={readout(q, `${q.data.data.length} changes`)}>
-        <Table<Change>
+        <Table<ChangeSummary>
           rows={q.data.data}
           rowKey={(c) => c.id}
           selectedKey={selected}
@@ -37,6 +39,14 @@ export function Changes({ route, setInspector }: ScreenProps) {
       </Panel>
     </>
   );
+}
+
+/** A change whole (`getChange`): the resource before and after it. */
+function ChangeWhole({ id }: { id: string }) {
+  const q = useGet('/admin/v1/changes/{change}', { params: { path: { change: id } } });
+  if (q.isPending) return <Loading what={`change ${id}`} />;
+  if (q.isError) return <Unavailable what={`Change ${id}`} detail={q.error.message} />;
+  return <ChangeInspector change={q.data} />;
 }
 
 function ChangeInspector({ change: c }: { change: Change }) {

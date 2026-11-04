@@ -1,13 +1,14 @@
 import { useMemo } from 'react';
-import { useGet } from './api/client';
+import { useConversationTitles } from './api/client';
 
 /**
  * Conversations' titles, as the title annotator wrote them
- * (`listConversationTitles`): read once and refreshed by the event stream's
- * `annotation`, so every screen that names a conversation names it alike.
+ * (`listConversationTitles`, the newest 500, a page at a time): read once
+ * and refreshed by the event stream's `annotation`, so every screen that
+ * names a conversation names it alike.
  */
 export function useTitles(): (conversation: string | null | undefined, project?: string | null) => string | null {
-  const q = useGet('/admin/v1/conversations', { params: { query: { limit: 500 } } });
+  const q = useConversationTitles();
   const map = useMemo(() => {
     const m = new Map<string, string>();
     for (const t of q.data?.data ?? []) {

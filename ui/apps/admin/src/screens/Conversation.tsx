@@ -1,6 +1,6 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Loading, Unavailable, Mono, Button, count, when } from '@hale/components';
-import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecord } from '../api/client';
+import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecordSummary } from '../api/client';
 import { AnnotationLine, AnnotationsPanel, Runs } from '../annotation';
 import { useTitles } from '../titles';
 import { href } from '../route';
@@ -104,7 +104,7 @@ function Tools({ tools }: { tools: Tool[] }) {
   );
 }
 
-type Turn = { record: UsageRecord; recorded: boolean; thread: number; said: Item[]; earlier: Item[]; answered: Item[]; failure: string | null };
+type Turn = { record: UsageRecordSummary; recorded: boolean; thread: number; said: Item[]; earlier: Item[]; answered: Item[]; failure: string | null };
 
 /** A thread's own hue, the same in the context and on each of its turns. */
 function threadHue(k: number): number {
@@ -252,7 +252,7 @@ type Open = { history: string[]; answer: boolean[]; latest: Record<string, unkno
  * recorded turn's: instructions, setup messages, tools. When earlier turns
  * are not shown, a thread's first shown turn folds its history away.
  */
-function thread(turns: UsageRecord[], peeks: ({ input: string; output: string } | null)[], earlierHidden: boolean): Thread {
+function thread(turns: UsageRecordSummary[], peeks: ({ input: string; output: string } | null)[], earlierHidden: boolean): Thread {
   const open: Open[] = [];
   let current = -1;
   const out: Turn[] = [];

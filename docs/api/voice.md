@@ -186,7 +186,7 @@ client can pace itself instead of discovering the wall by failing.
 - [placements](#tag-placements) (4)
 - [accounts](#tag-accounts) (5)
 - [nodes](#tag-nodes) (13)
-- [changes](#tag-changes) (1)
+- [changes](#tag-changes) (2)
 - [events](#tag-events) (1)
 - [routes](#tag-routes) (2)
 - [node](#tag-node) (9)
@@ -906,7 +906,11 @@ Admin plane. Per-request usage and summaries from the ledger.
 
 Authentication: operatorToken
 
-One record per request, newest first, across the projects the principal may see.
+One summary per request, newest first, across the projects the
+principal may see: each without its attempts or the caller's
+`metadata`, which `getUsage` answers with the whole record. A page
+holds at most 40. A `cursor` is a page's `next_cursor`; one that
+names no record, or a `limit` outside 1 to 40, is a `422`.
 
 Parameters:
 
@@ -928,9 +932,11 @@ Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | A page of usage records. | `application/json` object |
+| 200 | A page of usage records, summarized. | `application/json` object |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/admin/v1/usage/summary`
@@ -981,6 +987,8 @@ Responses:
 **Get one usage record** · `getUsage`
 
 Authentication: operatorToken
+
+The record whole, its attempts and the caller's `metadata` among it.
 
 Parameters:
 
@@ -1056,7 +1064,9 @@ Conversations' titles, the newest written first: a project's (its
 children's too), or one conversation's. A title is written by the
 title annotator (`AnnotatorStage` `title`) on a conversation's first
 annotated request, and again when a later one is answered as
-another task.
+another task. A page holds at most 100. A `cursor` is a page's
+`next_cursor`; one that names no title, or a `limit` outside 1 to
+100, is a `422`.
 
 Parameters:
 
@@ -1065,15 +1075,16 @@ Parameters:
 | `project` | query | string |  | Only this project's requests. |
 | `conversation` | query | string |  | Only the turns of this conversation (`UsageRecord.conversation`). |
 | `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | The titles. | `application/json` object |
-| 400 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 200 | A page of titles. | `application/json` object |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/admin/v1/annotations`
@@ -1242,10 +1253,11 @@ Responses:
 
 Authentication: operatorToken
 
-Queues each request named, at most 500, for every annotator in force
-for it, or the one `annotator` names, read from its text: held while
-it is pending, else its recording (`peek`, seven days). It answers
-at once with each request's outcome. One already annotated by an
+Queues each request named, at most 500, or the newest 500 that
+`matching` (`listUsage`'s filters) matches now, for every annotator
+in force for it, or the one `annotator` names, read from its text:
+held while it is pending, else its recording (`peek`, seven days).
+It answers at once with each request's outcome. One already annotated by an
 annotator asked again is read again by it; the others' answers stay.
 Each stage is read by whichever api instance takes it, and its steps
 stream on the admin events (`annotation_step`).
@@ -1259,6 +1271,7 @@ Schema: [AnnotationRunAsk](#schema-annotationrunask)
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `request_ids` | array of string |  | The requests to annotate now (`runAnnotations`); the path names the one of `runAnnotation`. | items ≤ 500 |
+| `matching` | [UsageMatch](#schema-usagematch) |  |  |  |
 | `annotator` | string |  | The one annotator to ask; left out, every one in force for each request. |  |
 | `version` | integer |  | That annotator's version; 0 or left out, its current one. |  |
 
@@ -1299,6 +1312,7 @@ Schema: [AnnotationRunAsk](#schema-annotationrunask)
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `request_ids` | array of string |  | The requests to annotate now (`runAnnotations`); the path names the one of `runAnnotation`. | items ≤ 500 |
+| `matching` | [UsageMatch](#schema-usagematch) |  |  |  |
 | `annotator` | string |  | The one annotator to ask; left out, every one in force for each request. |  |
 | `version` | integer |  | That annotator's version; 0 or left out, its current one. |  |
 
@@ -1523,15 +1537,29 @@ Admin plane. Where local models' weights come from, as the operator allows them.
 
 Authentication: operatorToken
 
-The recipes voice ships (`origin` `shipped`) and the ones the operator added (`operator`). A local model may name only one of these.
+The recipes voice ships (`origin` `shipped`), then the ones the
+operator added (`operator`). A local model may name only one of
+these. Each is summarized, its variants' files counted rather than
+listed; `getRecipe` answers a recipe whole. A page holds at most
+32. A `cursor` is a page's `next_cursor`; one that names no recipe,
+or a `limit` outside 1 to 32, is a `422`.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | The recipes. | `application/json` object |
+| 200 | A page of recipes, summarized. | `application/json` object |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### POST `/admin/v1/recipes`
@@ -1579,6 +1607,8 @@ Responses:
 **Describe a recipe** · `getRecipe`
 
 Authentication: operatorToken
+
+The recipe whole, every variant's files among it.
 
 Parameters:
 
@@ -2018,21 +2048,33 @@ Admin plane. Nodes, their enrollment, what they offer, and their seats.
 
 ### GET `/admin/v1/nodes`
 
-**List nodes, what they offer, and their seats** · `listNodes`
+**List nodes and their seats** · `listNodes`
 
 Authentication: operatorToken
 
-Every node an operator created, whether or not it has connected, with
-the capabilities and local controls it last declared and the state of
-its seats.
+Every node an operator created, whether or not it has connected, in
+the order they were created: its state, the hardware it measured,
+its local controls and its seats' states (`NodeSummary`). What it
+declared is `getNode`'s, and a seat's config `getSeat`'s. A page
+holds at most 8. A `cursor` is a page's `next_cursor`; one that
+names no node, or a `limit` outside 1 to 8, is a `422`.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | Nodes. | `application/json` object |
+| 200 | A page of nodes, summarized. | `application/json` object |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### POST `/admin/v1/nodes`
@@ -2075,6 +2117,8 @@ Responses:
 **Describe a node and its seats** · `getNode`
 
 Authentication: operatorToken
+
+The node with what it declared (`capabilities`) and its links; each seat summarized, its config `getSeat`'s.
 
 Parameters:
 
@@ -2165,6 +2209,8 @@ Responses:
 
 Authentication: operatorToken
 
+Its seats, at most 16, each summarized (`SeatSummary`); `getSeat` answers one with its config.
+
 Parameters:
 
 | Name | In | Type | Required | Description |
@@ -2235,6 +2281,8 @@ Responses:
 **Describe a seat and its state** · `getSeat`
 
 Authentication: operatorToken
+
+The seat whole, its `config` among it.
 
 Parameters:
 
@@ -2435,12 +2483,12 @@ Admin plane. The history of every configuration change.
 
 Authentication: operatorToken
 
-Every applied admin write, newest first: who made it, when, and the
-resource before and after. Secrets, digests and tokens are never
-included. Usage is not configuration and is not listed here. A
-`cursor` is a page's `next_cursor`; one that names no change, a
-`from` or `to` that is not an RFC 3339 time, or a `limit` outside 1
-to 1000 is a `400`.
+Every applied admin write, newest first: who made it, when, what it
+did and to what (`ChangeSummary`); the resource before and after is
+`getChange`'s. Usage is not configuration and is not listed here. A
+page holds at most 100. A `cursor` is a page's `next_cursor`; one
+that names no change, a `from` or `to` that is not an RFC 3339
+time, or a `limit` outside 1 to 100 is a `422`.
 
 Parameters:
 
@@ -2456,11 +2504,36 @@ Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | A page of changes. | `application/json` object |
+| 200 | A page of changes, summarized. | `application/json` object |
 | 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/changes/{change}`
+
+**Describe a configuration change** · `getChange`
+
+Authentication: operatorToken
+
+The change whole: the resource before and after it. Secrets,
+digests and tokens are never included.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `change` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The change. | `application/json` [Change](#schema-change) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-events"></a>
@@ -2558,7 +2631,8 @@ again what that topic covers. So does a client that (re)connects.
 - `NodeObserved`: a node made a report (`register`, `heartbeat`,
   `seats`, `capabilities`, `local`) to this api instance and it was
   recorded. `payload` is `{node, report, at, body}`; `body` is the
-  node as `GET /admin/v1/nodes/{node}` answers it, as a JSON string.
+  node as `GET /admin/v1/nodes` lists it (`NodeSummary`, its seats
+  without their configs), as a JSON string.
 - `InstanceBeat`: this api instance is alive. `payload` is
   `{instance, at}`, every five seconds.
 
@@ -2581,7 +2655,8 @@ and the client reads the resource instead.
   happens; `data` is the `annotation_step` event's (an
   `AnnotationStep`).
 - `NodeMoved`: a node registered, was lost, drained or revoked;
-  `data` is the node as `GET /admin/v1/nodes/{node}` answers it.
+  `data` is the node as `GET /admin/v1/nodes` lists it
+  (`NodeSummary`).
 - `RequestsInFlight`: the requests seats are serving now, told
   whole each time the set changes; `data` is an array of the
   `request` event's `data`, at most 99, `whole` false when there may
@@ -3900,6 +3975,45 @@ Type: object
 | `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 
+<a id="schema-usagerecordsummary"></a>
+
+### UsageRecordSummary
+
+A request as `listUsage` lists it: its `UsageRecord` without its
+`attempts` or the caller's `metadata`, which `getUsage` answers.
+An internal request (`internal`) says what voice wrote in its
+metadata: the request it annotated (`annotates`) and its stage
+(`side`).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `created_at` | string (date-time) | yes |  |  |
+| `project` | string | yes |  |  |
+| `key` | string | yes |  |  |
+| `requested_model` | string | yes |  |  |
+| `resolved_model` | string |  | As `UsageRecord.resolved_model`. |  |
+| `requested_account` | string \| null |  |  |  |
+| `endpoint` | string, one of `responses`, `chat.completions` | yes |  |  |
+| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes |  |  |
+| `served` | [Served](#schema-served) \| null | yes |  |  |
+| `data_class` | [DataClass](#schema-dataclass) |  |  |  |
+| `input_tokens` | integer | yes |  |  |
+| `cached_input_tokens` | integer |  |  |  |
+| `cache_write_input_tokens` | integer |  |  |  |
+| `output_tokens` | integer | yes |  |  |
+| `reasoning_tokens` | integer |  |  |  |
+| `price_micros` | integer | yes |  |  |
+| `currency` | string | yes |  |  |
+| `timing` | [Timing](#schema-timing) | yes |  |  |
+| `instance` | string \| null |  |  |  |
+| `conversation` | string \| null |  |  |  |
+| `internal` | boolean |  |  |  |
+| `annotates` | string |  | For an internal request, the request it annotated (its metadata's `annotates`); left out otherwise. |  |
+| `side` | string |  | For an internal request, its stage, or `title` (its metadata's `side`); left out otherwise. |  |
+
 <a id="schema-usagesummary"></a>
 
 ### UsageSummary
@@ -4004,6 +4118,45 @@ Type: [RecipeCreate](#schema-recipecreate) & object
 | … | all of [RecipeCreate](#schema-recipecreate) |  |  |  |
 | `origin` | string, one of `shipped`, `operator` | yes | `shipped`: in voice's `recipes/`, read-only. `operator`: allowed through `createRecipe`. |  |
 | `created_at` | string (date-time) |  | When the operator allowed it; left out for a shipped recipe. |  |
+
+<a id="schema-recipesummary"></a>
+
+### RecipeSummary
+
+A recipe as `listRecipes` lists it: each variant's files counted
+and summed rather than listed (`getRecipe` has them).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `license` | object | yes |  |  |
+| `license.name` | string | yes |  |  |
+| `license.url` | string | yes |  |  |
+| `context_length` | integer |  |  | ≥ 1 |
+| `kv_bytes_per_token` | integer |  |  | ≥ 1 |
+| `contract` | string, one of `generative`, `decision` | yes |  |  |
+| `origin` | string, one of `shipped`, `operator` | yes |  |  |
+| `created_at` | string (date-time) |  | When the operator allowed it; left out for a shipped recipe. |  |
+| `variants` | array of [RecipeVariantSummary](#schema-recipevariantsummary) | yes |  | items ≤ 8 |
+
+<a id="schema-recipevariantsummary"></a>
+
+### RecipeVariantSummary
+
+A variant as `listRecipes` lists it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `format` | string, one of `safetensors`, `gguf`, `mlx` | yes |  |  |
+| `quantization` | string | yes |  |  |
+| `file_count` | integer | yes | How many files it lists. | ≥ 1 |
+| `total_bytes` | integer | yes | Its files' bytes together, what a node fetches. | ≥ 1 |
+| `memory_bytes` | integer | yes |  | ≥ 1 |
 
 <a id="schema-recipevariant"></a>
 
@@ -4623,13 +4776,38 @@ Type: object
 
 ### AnnotationRunAsk
 
+The requests to annotate, named (`request_ids`) or matched (`matching`), never both.
+
 Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `request_ids` | array of string |  | The requests to annotate now (`runAnnotations`); the path names the one of `runAnnotation`. | items ≤ 500 |
+| `matching` | [UsageMatch](#schema-usagematch) |  |  |  |
 | `annotator` | string |  | The one annotator to ask; left out, every one in force for each request. |  |
 | `version` | integer |  | That annotator's version; 0 or left out, its current one. |  |
+
+<a id="schema-usagematch"></a>
+
+### UsageMatch
+
+The requests `listUsage`'s filters match, as a body carries them
+(`runAnnotations`): a field left out matches any; `metadata` is the
+pairs a request must all have.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `project` | string |  |  |  |
+| `key` | string |  |  |  |
+| `model` | string |  | The model asked for or served. |  |
+| `account` | string |  |  |  |
+| `conversation` | string |  |  |  |
+| `metadata` | object |  |  |  |
+| `from` | string (date-time) |  |  |  |
+| `to` | string (date-time) |  |  |  |
+| `include_internal` | boolean |  | Voice's own requests for its projects (their system keys') too; left out, not. |  |
 
 <a id="schema-annotationrunoutcome"></a>
 
@@ -4804,9 +4982,14 @@ Type: object
 | `name` | string |  |  | length ≤ 128 |
 | `max_in_flight` | integer \| null |  |  | ≥ 1 |
 
-<a id="schema-node"></a>
+<a id="schema-nodesummary"></a>
 
-### Node
+### NodeSummary
+
+A node as `listNodes` lists it, and as the hub (`NodeObserved`,
+`NodeMoved`) and the event stream (`node`) tell it: its state, the
+hardware it measured, its local controls and its seats, each a
+`SeatSummary`.
 
 Type: object
 
@@ -4816,19 +4999,34 @@ Type: object
 | `name` | string |  |  |  |
 | `status` | string, one of `pending`, `up`, `down`, `revoked` | yes | `pending` until it first connects with its token. |  |
 | `version` | string \| null |  | The node software's version, as it reported on connecting. |  |
-| `capabilities` | [schemas-Capabilities](#schema-schemas-capabilities) \| null |  | What the node offers, as it last declared. Null until it first connects. |  |
+| `hardware` | [Hardware](#schema-hardware) |  | What the machine has, as the node measured it (`capabilities.hardware`); left out until it says. |  |
 | `local` | [LocalControls](#schema-localcontrols) \| null |  | Its local controls, as it last reported. Null until it first connects. |  |
 | `max_in_flight` | integer \| null |  | The coordinator's cap for the node, or null for none. |  |
 | `effective_max_in_flight` | integer \| null |  | The smallest of the declared, coordinator and local caps. Null until it first connects. |  |
 | `in_flight` | integer |  |  |  |
 | `assignment_version` | integer |  | The latest assignment for this node. |  |
 | `applied_version` | integer \| null |  | The assignment the node last reported applying. |  |
-| `seats` | array of [SeatView](#schema-seatview) | yes |  |  |
-| `links` | array of [NodeLink](#schema-nodelink) |  | The links the node declared (`capabilities.links`), each with whether its peer declares it back and its latest check. |  |
+| `seats` | array of [SeatSummary](#schema-seatsummary) | yes |  | items ≤ 16 |
 | `connected_at` | string \| null (date-time) |  |  |  |
 | `last_heartbeat_at` | string \| null (date-time) |  |  |  |
 | `created_at` | string (date-time) | yes |  |  |
 | `revoked_at` | string \| null (date-time) |  |  |  |
+
+<a id="schema-node"></a>
+
+### Node
+
+A node as `getNode` answers it: its summary, with what it declared
+and its links. Its seats are summaries too; a seat's config is
+`getSeat`'s.
+
+Type: [NodeSummary](#schema-nodesummary) & object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| … | all of [NodeSummary](#schema-nodesummary) |  |  |  |
+| `capabilities` | [schemas-Capabilities](#schema-schemas-capabilities) \| null |  | What the node offers, as it last declared. Null until it first connects. |  |
+| `links` | array of [NodeLink](#schema-nodelink) |  | The links the node declared (`capabilities.links`), each with whether its peer declares it back and its latest check. |  |
 
 <a id="schema-nodelink"></a>
 
@@ -4896,11 +5094,44 @@ Type: object
 | `enabled` | boolean |  |  |  |
 | `config` | object |  |  |  |
 
+<a id="schema-seatsummary"></a>
+
+### SeatSummary
+
+A seat as a node and its lists carry it: as configured here, with
+its state on its node, without its `config` (`getSeat` has it). A
+placement's seat says what its config names: the placement, the
+variant and the runtime, and the context its model is made for.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | [Slug](#schema-slug) | yes |  |  |
+| `engine` | string | yes |  |  |
+| `account` | string | yes |  |  |
+| `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
+| `data_classes` | array of string |  |  |  |
+| `concurrency` | integer |  |  | ≥ 1 |
+| `enabled` | boolean |  |  |  |
+| `ref` | string | yes | The seat's full name, `<node>/<seat>`. |  |
+| `node` | string | yes |  |  |
+| `status` | string, one of `pending`, `offline`, `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | As `SeatView.status`. |  |
+| `reason` | string \| null |  | The node's reason, for `down`, `paused` and `refused`. |  |
+| `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
+| `context` | integer |  | As `SeatView.context`. | ≥ 1 |
+| `in_flight` | integer | yes |  |  |
+| `problems` | array of string | yes |  |  |
+| `placement` | string |  | A placement's seat's placement (its config's `placement`); left out for any other. |  |
+| `variant` | string |  | The recipe variant a placement's seat runs (its config's `variant.id`). |  |
+| `runtime` | string |  | The runtime a placement's seat runs it under (its config's `runtime.id`). |  |
+| `context_length` | integer |  | The context, in tokens, a placement's seat's model is made for (its config's `context_length`), when its recipe says. | ≥ 1 |
+
 <a id="schema-seatview"></a>
 
 ### SeatView
 
-A seat as configured here, with its state on its node.
+A seat as configured here, with its state on its node, its `config` among it.
 
 Type: [Seat](#schema-seat) & object
 
@@ -4935,9 +5166,11 @@ One event on the admin stream. `data` is the resource as it now is.
 
 Type: object \| object \| object \| object \| object \| object \| object \| object \| object
 
-<a id="schema-change"></a>
+<a id="schema-changesummary"></a>
 
-### Change
+### ChangeSummary
+
+A change as `listChanges` lists it, without the resource it holds (`getChange` has it).
 
 Type: object
 
@@ -4948,6 +5181,18 @@ Type: object
 | `principal` | string \| null |  | Who made it. Null while admin authentication is off, as in the MVP. |  |
 | `action` | string, one of `create`, `update`, `delete`, `archive`, `revoke`, `rotate` | yes |  |  |
 | `target` | string | yes | The resource's path under `/admin/v1`. |  |
+
+<a id="schema-change"></a>
+
+### Change
+
+A change whole (`getChange`, and the event stream's `change`).
+
+Type: [ChangeSummary](#schema-changesummary) & object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| … | all of [ChangeSummary](#schema-changesummary) |  |  |  |
 | `before` | object \| null |  | The resource as it was; null for a create. A node's change holds the node's own fields, not its seats: each seat's changes are recorded under the seat's own target. |  |
 | `after` | object \| null |  | The resource as it became; null for a delete. A node's holds its own fields, as in `before`. |  |
 
@@ -6401,39 +6646,6 @@ Type: object
 
 Type: [ResponseCreatedStreamingEvent](#schema-responsecreatedstreamingevent) \| [ResponseQueuedStreamingEvent](#schema-responsequeuedstreamingevent) \| [ResponseInProgressStreamingEvent](#schema-responseinprogressstreamingevent) \| [ResponseCompletedStreamingEvent](#schema-responsecompletedstreamingevent) \| [ResponseFailedStreamingEvent](#schema-responsefailedstreamingevent) \| [ResponseIncompleteStreamingEvent](#schema-responseincompletestreamingevent) \| [ResponseOutputItemAddedStreamingEvent](#schema-responseoutputitemaddedstreamingevent) \| [ResponseOutputItemDoneStreamingEvent](#schema-responseoutputitemdonestreamingevent) \| [ResponseReasoningSummaryPartAddedStreamingEvent](#schema-responsereasoningsummarypartaddedstreamingevent) \| [ResponseReasoningSummaryPartDoneStreamingEvent](#schema-responsereasoningsummarypartdonestreamingevent) \| [ResponseContentPartAddedStreamingEvent](#schema-responsecontentpartaddedstreamingevent) \| [ResponseContentPartDoneStreamingEvent](#schema-responsecontentpartdonestreamingevent) \| [ResponseOutputTextDeltaStreamingEvent](#schema-responseoutputtextdeltastreamingevent) \| [ResponseOutputTextDoneStreamingEvent](#schema-responseoutputtextdonestreamingevent) \| [ResponseRefusalDeltaStreamingEvent](#schema-responserefusaldeltastreamingevent) \| [ResponseRefusalDoneStreamingEvent](#schema-responserefusaldonestreamingevent) \| [ResponseReasoningDeltaStreamingEvent](#schema-responsereasoningdeltastreamingevent) \| [ResponseReasoningDoneStreamingEvent](#schema-responsereasoningdonestreamingevent) \| [ResponseReasoningSummaryDeltaStreamingEvent](#schema-responsereasoningsummarydeltastreamingevent) \| [ResponseReasoningSummaryDoneStreamingEvent](#schema-responsereasoningsummarydonestreamingevent) \| [ResponseOutputTextAnnotationAddedStreamingEvent](#schema-responseoutputtextannotationaddedstreamingevent) \| [ResponseFunctionCallArgumentsDeltaStreamingEvent](#schema-responsefunctioncallargumentsdeltastreamingevent) \| [ResponseFunctionCallArgumentsDoneStreamingEvent](#schema-responsefunctioncallargumentsdonestreamingevent) \| [ErrorStreamingEvent](#schema-errorstreamingevent)
 
-<a id="schema-slug"></a>
-
-### Slug
-
-Type: string
-
-Notes: pattern `^[a-z0-9][a-z0-9-]{0,62}$`
-
-<a id="schema-engine"></a>
-
-### Engine
-
-One engine the node offers: a kind of engine with the login it runs
-under. Two logins for one CLI are two engines. How the login is held
-is local to the node and is never declared.
-
-Whether a seat carries `tools` is derived from its kind, not
-declared: an `openai-compatible` seat does, a `static` seat only
-with its `tool_call` drill, any other kind never. A `serve` whose
-request lists `tools` for a seat that does not carry them is
-`refused` before any event, a seat failure, so the coordinator
-offers the request to the next seat.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
-| `kind` | string | yes | What runs, e.g. `static`, `claude-cli`, `codex-cli`, `agy`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
-| `description` | string |  |  |  |
-| `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
-| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
-
 <a id="schema-accelerator"></a>
 
 ### Accelerator
@@ -6466,6 +6678,80 @@ Type: object
 | `model_memory_bytes` | integer | yes | What models may use of it: `memory_bytes` less what the machine keeps for its own system (a sixteenth, at least 4 GiB; on a machine whose GPU shares its memory, the one pool both draw on), or less when the node's operator holds some back in the capabilities file, which only lowers it. The seats the node runs hold at most this together: a seat that would take more is not started, and says so. | ≥ 0 |
 | `accelerators` | array of [Accelerator](#schema-accelerator) | yes | At most 16; a machine with more declares its first 16, and its node says so in its log. | items ≤ 16 |
 | `disk_free_bytes` | integer | yes | Free space under the node's data directory, where weights are kept. | ≥ 0 |
+
+<a id="schema-localcontrols"></a>
+
+### LocalControls
+
+What the node's operator set on the machine. Each field only
+restricts: a paused node or seat takes no new requests, and a local
+cap only lowers the effective one.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `paused` | boolean | yes |  |  |
+| `paused_seats` | array of string | yes |  | items ≤ 32 |
+| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
+| `reason` | string \| null |  | Why, for the admin to read. |  |
+
+<a id="schema-slug"></a>
+
+### Slug
+
+Type: string
+
+Notes: pattern `^[a-z0-9][a-z0-9-]{0,62}$`
+
+<a id="schema-seatmodel"></a>
+
+### SeatModel
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `model` | string | yes | A catalog model id. |  |
+| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
+
+<a id="schema-fetchprogress"></a>
+
+### FetchProgress
+
+How far a managed seat's fetch is, in bytes, across its files and its runtime's archive.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `done_bytes` | integer | yes |  | ≥ 0 |
+| `total_bytes` | integer | yes |  | ≥ 0 |
+
+<a id="schema-engine"></a>
+
+### Engine
+
+One engine the node offers: a kind of engine with the login it runs
+under. Two logins for one CLI are two engines. How the login is held
+is local to the node and is never declared.
+
+Whether a seat carries `tools` is derived from its kind, not
+declared: an `openai-compatible` seat does, a `static` seat only
+with its `tool_call` drill, any other kind never. A `serve` whose
+request lists `tools` for a seat that does not carry them is
+`refused` before any event, a seat failure, so the coordinator
+offers the request to the next seat.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
+| `kind` | string | yes | What runs, e.g. `static`, `claude-cli`, `codex-cli`, `agy`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
+| `description` | string |  |  |  |
+| `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
+| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
 
 <a id="schema-linkport"></a>
 
@@ -6510,34 +6796,6 @@ Type: object
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
 | `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 
-<a id="schema-localcontrols"></a>
-
-### LocalControls
-
-What the node's operator set on the machine. Each field only
-restricts: a paused node or seat takes no new requests, and a local
-cap only lowers the effective one.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `paused` | boolean | yes |  |  |
-| `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
-| `reason` | string \| null |  | Why, for the admin to read. |  |
-
-<a id="schema-seatmodel"></a>
-
-### SeatModel
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `model` | string | yes | A catalog model id. |  |
-| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
-
 <a id="schema-seat"></a>
 
 ### Seat
@@ -6557,19 +6815,6 @@ Type: object
 | `concurrency` | integer |  | Requests this seat serves at once. | default `1`; ≥ 1 |
 | `enabled` | boolean |  |  | default `true` |
 | `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
-
-<a id="schema-fetchprogress"></a>
-
-### FetchProgress
-
-How far a managed seat's fetch is, in bytes, across its files and its runtime's archive.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `done_bytes` | integer | yes |  | ≥ 0 |
-| `total_bytes` | integer | yes |  | ≥ 0 |
 
 <a id="schema-seatroute"></a>
 

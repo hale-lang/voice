@@ -9,7 +9,7 @@
 // its ledger row (`usage`, the whole record), a key, project, account,
 // model, node or seat changed is its change row (`change`), and a node
 // registered, lost, drained or revoked is its status moving (`node`, the
-// whole node as `GET /admin/v1/nodes/{id}` answers it), and a request
+// node as `GET /admin/v1/nodes` lists it), and a request
 // annotated is its annotation kept (`annotation`: its answers, its runs,
 // and the conversation's title when it wrote one). A place is the marks
 // of those rows: the last ledger row, change and annotation told, and each
@@ -58,7 +58,6 @@ locus EventTick {
     params {
         store: st::Store;
         nodes: Nodes;
-        changes: Changes;
         types: st::Names = st::Names { };
         out: EventStream;
         // look only to take the marks (the head of the stream), telling nothing
@@ -111,7 +110,9 @@ locus EventTick {
         if self.quiet {
             let u = self.store.usage_rows(st::UsageQuery { limit: 1 }) or fail store_down(err);
             self.usage_mark = (at(u.rows, 0) or st::UsageRow { }).seq;
-            let c = self.store.changes(st::ChangeQuery { limit: 1 }) or fail store_down(err);
+            let c = self.store.changes(
+                st::ChangeQuery { limit: 1, bodies: false },
+            ) or fail store_down(err);
             self.change_mark = (at(c.rows, 0) or st::ChangeRow { }).seq;
             self.annotation_head() or raise;
             self.step_head() or raise;
@@ -178,43 +179,28 @@ locus EventTick {
                 }
             }
             if self.wants("change") {
-                // Pages come newest first: walk back to the page that holds
-                // the place, then tell that page's changes past it, oldest
-                // first. A subscriber further behind than one page gets the
-                // rest on its next answers, so no stored change is skipped.
-                let mut q = st::ChangeQuery { limit: 1000 };
-                let mut page = self.changes.list_read(q) or raise;
-                let mut back = page.has_next_cursor;
-                while back {
-                    let oldest = at(page.data, count(page.data) - 1) or ChangeRead {
-                        action: action_of("create"),
-                    };
-                    if change_seq(oldest) <= self.change_mark {
-                        back = false;
-                    } else {
-                        q.cursor = page.next_cursor;
-                        let older = self.changes.list_read(q) or raise;
-                        let newest = at(older.data, 0) or ChangeRead {
-                            action: action_of("create"),
-                        };
-                        // an older page with nothing past the place: this
-                        // one holds the oldest changes still to tell
-                        if count(older.data) == 0 || change_seq(newest) <= self.change_mark {
-                            back = false;
-                        } else {
-                            page = older;
-                            back = page.has_next_cursor;
-                        }
+                // the changes past the place, oldest first: nothing read
+                // when nothing changed, and at most `CHANGES_A_LOOK`, a
+                // page at a time; one further behind is told the rest on
+                // the looks that follow
+                let mut pages = 0;
+                let mut full = true;
+                while full && pages < CHANGES_A_LOOK / CHANGE_PAGE {
+                    let rows = self.store.changes_after(
+                        self.change_mark,
+                        CHANGE_PAGE,
+                    ) or fail store_down(err);
+                    for c in rows.rows {
+                        self.change_mark = c.seq;
+                        self.tell(
+                            "change",
+                            "change_" + to_string(c.seq),
+                            c.at,
+                            change_json(change_read_of(c)),
+                        );
                     }
-                }
-                let mut i = count(page.data) - 1;
-                while i >= 0 {
-                    let c = at(page.data, i) or ChangeRead { action: action_of("create") };
-                    i = i - 1;
-                    let seq = change_seq(c);
-                    if seq <= self.change_mark { continue; }
-                    self.change_mark = seq;
-                    self.tell("change", "change_" + to_string(seq), c.at, change_json(c));
+                    full = count(rows.rows) == CHANGE_PAGE;
+                    pages = pages + 1;
                 }
             }
         }
@@ -224,11 +210,12 @@ locus EventTick {
             let m = node_mark(n.id, node_state_name(n.status) + "|" + node_shape(n));
             push(fresh.items, m) or discard;
             if !self.quiet && self.wants("node") && !has_mark(self.node_marks, m) {
+                // told as `listNodes` lists it, its seats without their configs
                 self.tell(
                     "node",
                     "node_" + to_string(std::time::monotonic_ns()),
                     now_seconds(),
-                    node_json(n),
+                    node_summary_json(n) or raise,
                 );
             }
         }
@@ -321,6 +308,12 @@ locus EventTick {
     }
 }
 
+/// The changes a look reads at a time, oldest first, past its place.
+const CHANGE_PAGE: Int = 100;
+/// The most changes one look tells: a subscriber further behind is told
+/// the rest on the looks that follow.
+const CHANGES_A_LOOK: Int = 1000;
+
 /// The most requests in flight a hub event tells: one fewer than a read of
 /// them returns (the store's 100), so a full read says there may be more.
 const FLIGHTS_TOLD: Int = 99;
@@ -343,7 +336,6 @@ locus AdminEvents {
     params {
         store: st::Store;
         nodes: Nodes;
-        changes: Changes;
         // the `type`s asked for; none means all
         types: st::Names = st::Names { };
         // the last ledger row, change and annotation told, and each node's place
@@ -360,7 +352,6 @@ locus AdminEvents {
         let t = EventTick {
             store: self.store,
             nodes: self.nodes,
-            changes: self.changes,
             types: self.types,
             out: out,
             quiet: quiet,
@@ -462,11 +453,6 @@ locus AdminEvents {
     }
 }
 
-/// A change's place in the log: the number in its id (`chg_<n>`).
-fn change_seq(c: ChangeRead) -> Int {
-    return std::str::parse_int(c.id[4..len(c.id)]) or 0;
-}
-
 /// The `type` filter of a subscription, refusing a type the stream does
 /// not carry.
 fn read_event_types(path: String) -> st::Names fallible(CtlError) {
@@ -528,7 +514,6 @@ locus AdminFeed {
         // event stream instead
         live: Bool = false;
         nodes: Nodes = Nodes { store: self.store, link: NatsLink { } };
-        changes: Changes = Changes { store: self.store };
         usage_mark: Int = 0;
         change_mark: Int = 0;
         annotation_mark: Int = 0;
@@ -554,7 +539,6 @@ locus AdminFeed {
         let t = EventTick {
             store: self.store,
             nodes: self.nodes,
-            changes: self.changes,
             out: EventStream { },
             quiet: quiet,
             feed: true,

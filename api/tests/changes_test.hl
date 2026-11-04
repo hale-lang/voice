@@ -1,5 +1,6 @@
-// The change log: the Changes row (GET /admin/v1/changes), written by every
-// admin write.
+// The change log: the Changes rows (GET /admin/v1/changes, a page of
+// summaries, and GET /admin/v1/changes/{change}, one whole), written by
+// every admin write.
 import ".." as api;
 import "../../store" as st;
 
@@ -12,8 +13,13 @@ fn nothing() -> api::Change {
     return api::Change { action: api::ChangeAction::delete };
 }
 
-fn nth(page: api::ChangeList, i: Int) -> api::Change {
-    return at(page.data, i) or nothing();
+fn nth(page: api::ChangeList, i: Int) -> api::ChangeSummary {
+    return at(page.data, i) or api::ChangeSummary { action: api::ChangeAction::delete };
+}
+
+/// The `i`th change of a page, whole (`getChange`).
+fn whole(changes: api::Changes, page: api::ChangeList, i: Int) -> api::Change {
+    return changes.get(api::ChangeRef { change: nth(page, i).id }) or nothing();
 }
 
 /// A field of a change's `before` or `after`, which are free-form JSON.
@@ -61,17 +67,43 @@ fn main() {
     std::test::assert_eq_str(failed, "conflict ", "a refused write");
 
     let all = changes.list(api::ChangeAsk { }) or api::ChangeList { };
-    let newest = nth(all, 0);
-    std::test::assert_eq_str(newest.target, "nodes/laptop", "newest first");
-    std::test::assert(newest.action == api::ChangeAction::create, "a create");
+    let listed = nth(all, 0);
+    std::test::assert_eq_str(listed.target, "nodes/laptop", "newest first");
+    std::test::assert(listed.action == api::ChangeAction::create, "a create");
+    std::test::assert(!listed.has_principal, "nobody: admin authentication is off");
+    // the list says what each change did and to what; its resource is the
+    // change's own
+    let page_json = api::ChangeList::api_encode(all);
+    std::test::assert(
+        !std::str::contains(page_json, "\"before\"") && !std::str::contains(page_json, "\"after\""),
+        "a list of changes holds no resource: " + page_json,
+    );
+    let newest = whole(changes, all, 0);
+    std::test::assert(
+        newest.id == listed.id && newest.target == listed.target && newest.at == listed.at
+            && newest.action == listed.action,
+        "a change by its id is the one listed",
+    );
     std::test::assert(
         !newest.has_before && newest.before.text == "null",
         "nothing before a create",
     );
-    std::test::assert(!newest.has_principal, "nobody: admin authentication is off");
+    std::test::assert(
+        newest.has_after && std::json::find_string_field(newest.after.text, "id") == "laptop",
+        "and the node it made after it",
+    );
+    failed = "";
+    changes.get(api::ChangeRef { change: "chg_999999" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "not_found ", "a change the log has not written");
+    failed = "";
+    changes.get(api::ChangeRef { change: "nothing" }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "not_found ", "nor one that is not an id");
     let mut text = "";
-    for c in all.data {
+    let mut i = 0;
+    while i < count(all.data) {
+        let c = whole(changes, all, i);
         text = text + c.before.text + c.after.text;
+        i = i + 1;
     }
     std::test::assert(
         !std::str::contains(text, node.enrollment_token)
@@ -85,11 +117,11 @@ fn main() {
     std::test::assert(len(nth(all, 5).id) > 0, "six changes, the refused write none");
     std::test::assert_eq_int(count(all.data), 6, "and no seventh");
 
-    let renamed = nth(all, 1);
+    let renamed = whole(changes, all, 1);
     std::test::assert(renamed.action == api::ChangeAction::update, "an update");
     std::test::assert_eq_str(text_of(renamed.before, "name"), "Work", "the project as it was");
     std::test::assert_eq_str(text_of(renamed.after, "name"), "The work", "and as it became");
-    let raised = nth(all, 2);
+    let raised = whole(changes, all, 2);
     std::test::assert_eq_str(raised.target, "projects/work/budget", "the budget's own target");
     std::test::assert_eq_int(
         std::json::find_int_field(raised.before.text, "allowance_micros"),
@@ -137,10 +169,10 @@ fn main() {
     std::test::assert(count(future.data) == 0 && !future.has_next_cursor, "from a time");
     failed = "";
     changes.list(api::ChangeAsk { limit: 0 }) or { failed = why(err); };
-    std::test::assert_eq_str(failed, "invalid limit", "a limit is 1 to 1000");
+    std::test::assert_eq_str(failed, "invalid limit", "a limit is 1 to 100");
     failed = "";
-    changes.list(api::ChangeAsk { limit: 1001 }) or { failed = why(err); };
-    std::test::assert_eq_str(failed, "invalid limit", "and at most 1000");
+    changes.list(api::ChangeAsk { limit: 101 }) or { failed = why(err); };
+    std::test::assert_eq_str(failed, "invalid limit", "and at most 100");
     failed = "";
     changes.list(api::ChangeAsk { to: "yesterday" }) or { failed = why(err); };
     std::test::assert_eq_str(failed, "invalid to", "a time is RFC 3339");
@@ -160,13 +192,10 @@ fn main() {
     // a node's change holds the node, not its seats
     nodes.update(api::NodeUpdate { node: "laptop", has_name: true, name: "Laptop" }) or discard;
     let by_node = changes.list(api::ChangeAsk { target: "nodes/laptop" }) or api::ChangeList { };
-    std::test::assert_eq_str(
-        text_of(nth(by_node, 0).after, "name"),
-        "Laptop",
-        "the node as it became",
-    );
+    let node_change = whole(changes, by_node, 0);
+    std::test::assert_eq_str(text_of(node_change.after, "name"), "Laptop", "the node as it became");
     std::test::assert(
-        !std::str::contains(nth(by_node, 0).after.text, "\"seats\""),
+        !std::str::contains(node_change.after.text, "\"seats\""),
         "without its seats",
     );
 }

@@ -516,6 +516,39 @@ fn exercise(s: st::Store, label: String) {
     std::test::assert_eq_int(count(own.rows), 2, label + ": a key's own changes");
     let under = s.changes(st::ChangeQuery { target: "projects/work" }) or st::ChangeRows { };
     std::test::assert_eq_int(count(under.rows), 5, label + ": under a target");
+    // a list of the changes, not what they hold
+    let bare = s.changes(st::ChangeQuery { limit: 1, bodies: false }) or st::ChangeRows { };
+    let b0 = at(bare.rows, 0) or st::ChangeRow { };
+    std::test::assert(
+        b0.id == newest.id && b0.target == newest.target && len(b0.after) == 0
+            && len(b0.before) == 0,
+        label + ": a list without the bodies",
+    );
+    // one change, whole, by its id
+    let one = s.change(newest.id) or st::ChangeRow { };
+    std::test::assert(
+        one.present && one.target == newest.target && one.after == newest.after,
+        label + ": a change by its id, whole",
+    );
+    std::test::assert(
+        !(s.change("chg_999999") or st::ChangeRow { present: true }).present,
+        label + ": no change of an id the log has not written",
+    );
+    std::test::assert(
+        !(s.change("nothing") or st::ChangeRow { present: true }).present,
+        label + ": nor of one that is not an id",
+    );
+    // what a follower has not been told: past its mark, oldest first
+    let oldest = at(all.rows, count(all.rows) - 1) or st::ChangeRow { };
+    let after = s.changes_after(oldest.seq, 2) or st::ChangeRows { };
+    let a0 = at(after.rows, 0) or st::ChangeRow { };
+    let a1 = at(after.rows, 1) or st::ChangeRow { };
+    std::test::assert(
+        count(after.rows) == 2 && a0.seq > oldest.seq && a1.seq > a0.seq && len(a0.after) > 0,
+        label + ": the changes after a mark, oldest first, whole",
+    );
+    let caught = s.changes_after(newest.seq, 100) or st::ChangeRows { };
+    std::test::assert_eq_int(count(caught.rows), 0, label + ": none past the newest");
 }
 
 /// False when the store refused a row for being full; a failure otherwise.
@@ -897,10 +930,48 @@ fn system(s: st::Store, label: String) {
         t.present && t.title == "Fix the sort" && t.task == "debug",
         label + ": its title, replaced",
     );
-    let titles = s.titles("sysk", "", 10) or st::TitleRows { };
+    let titles = s.titles(st::TitleQuery { project: "sysk", limit: 10 }) or st::TitleRows { };
     std::test::assert_eq_int(count(titles.rows), 1, label + ": one a conversation");
-    let other = s.titles("", "c2", 10) or st::TitleRows { };
+    let other = s.titles(st::TitleQuery { conversation: "c2", limit: 10 }) or st::TitleRows { };
     std::test::assert_eq_int(count(other.rows), 0, label + ": by conversation");
+    // a page of titles, and the next from its last
+    s.put_title(
+        st::TitleRow {
+            project: "sysk",
+            conversation: "c2",
+            title: "Name a cat",
+            model: "m",
+            annotator: "conversation-title",
+            version: 1,
+            // made after c1's, whatever the clock's resolution
+            made_at: t("2099-01-01T00:00:00Z"),
+        },
+    ) or discard;
+    let first = s.titles(st::TitleQuery { project: "sysk", limit: 1 }) or st::TitleRows { };
+    let f0 = at(first.rows, 0) or st::TitleRow { };
+    std::test::assert(
+        first.more && count(first.rows) == 1 && f0.conversation == "c2",
+        label + ": a page of titles, the newest first",
+    );
+    let rest = s.titles(
+        st::TitleQuery {
+            project: "sysk",
+            limit: 1,
+            after_project: f0.project,
+            after_conversation: f0.conversation,
+        },
+    ) or st::TitleRows { };
+    let r0 = at(rest.rows, 0) or st::TitleRow { };
+    std::test::assert(
+        rest.cursor_known && !rest.more && count(rest.rows) == 1 && r0.conversation == "c1",
+        label + ": the next page goes on from the last",
+    );
+    std::test::assert(
+        !(s.titles(
+            st::TitleQuery { project: "sysk", after_project: "sysk", after_conversation: "nope" },
+        ) or st::TitleRows { }).cursor_known,
+        label + ": a cursor that names no title",
+    );
 }
 
 /// A request's annotation kept with its answers, an annotator's answers

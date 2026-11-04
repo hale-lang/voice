@@ -1,10 +1,10 @@
-// A full page of the change log is built in memory linear in its size: a
-// page of 1000 changes, each a project as it was and as it became, grows the
-// process's peak by about two megabytes. The transport's codec writes a list
-// of records by `+`, which keeps every prefix it made: a page of 1000
-// changes (about a megabyte of JSON) peaks about 800 MB when it is written,
-// a page of the default 100 about 8 MB. The test holds the default page to
-// linear and says what the full one costs (hale: the codec's list encoder).
+// A page of the change log is built in memory linear in its size, and is
+// small whatever the changes hold: a page lists each change's summary, not
+// the resource it holds (getChange answers that), so the largest page, 100
+// changes of a project of a few hundred bytes each, is a few kilobytes of
+// JSON, and the process's peak grows linearly as it is built and written
+// (hale: the codec's list encoder keeps every prefix it made, so a page of
+// whole changes grew quadratically).
 import ".." as api;
 import "../../store" as st;
 
@@ -42,23 +42,32 @@ fn main() {
 
     let before = peak_kb();
     std::test::assert(before > 0, "the peak is readable from /proc/self/status");
-    let page = changes.list(api::ChangeAsk { limit: 1000 }) or api::ChangeList { };
+    let page = changes.list(api::ChangeAsk { }) or api::ChangeList { };
     let built = peak_kb();
-    std::test::assert_eq_int(count(page.data), 1000, "a page");
     std::test::assert(
-        !page.has_next_cursor && std::str::contains(
-            (at(page.data, 0) or api::Change { action: api::ChangeAction::create }).after.text,
-            long + " 999",
-        ),
-        "all of them, newest first, on one page",
+        count(page.data) == 100 && page.has_next_cursor,
+        "the default page is the largest, 100, and names the next",
     );
-    let first = changes.list(api::ChangeAsk { }) or api::ChangeList { };
-    std::test::assert_eq_int(count(first.data), 100, "the default page is 100");
-    let body = api::ChangeList::api_encode(first);
+    let newest = changes.get(
+        api::ChangeRef {
+            change: (
+                at(page.data, 0) or api::ChangeSummary { action: api::ChangeAction::create }
+            ).id,
+        },
+    ) or api::Change { action: api::ChangeAction::create };
+    std::test::assert(
+        std::str::contains(newest.after.text, long + " 999"),
+        "the newest first, whole by its id",
+    );
+    let body = api::ChangeList::api_encode(page);
     let after = peak_kb();
     std::test::assert(
-        len(body) > 40000,
-        "100 changes of a few hundred bytes each: " + to_string(len(body)),
+        len(body) < 32768,
+        "100 changes listed, without what they hold, are under 32 KiB: " + to_string(len(body)),
+    );
+    std::test::assert(
+        !std::str::contains(body, long),
+        "no resource a change holds is on the page",
     );
     std::test::assert(
         built - before < 32768,

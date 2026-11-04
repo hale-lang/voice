@@ -346,8 +346,23 @@ type TitleRow {
     present: Bool = false;
 }
 
-/// Titles, the newest made first.
-type TitleRows { rows: bounded[TitleRow; 500]; }
+/// Titles, the newest made first; `more` when others match past them.
+/// `cursor_known` is false when the query's cursor names no title, and the
+/// page is then empty.
+type TitleRows { rows: bounded[TitleRow; 500]; more: Bool = false; cursor_known: Bool = true; }
+
+/// Which titles, the newest made first (ties by project, then
+/// conversation): a project's (its children's too) when `project` is not
+/// "", one conversation's when `conversation` is not "", at most `limit`,
+/// after the title of `after_project`'s `after_conversation` when
+/// `after_project` is not "".
+type TitleQuery {
+    project: String = "";
+    conversation: String = "";
+    limit: Int = 100;
+    after_project: String = "";
+    after_conversation: String = "";
+}
 
 /// A conversation's current turn (migration 26): the hash of its latest
 /// user message, and the request that began the turn.
@@ -492,6 +507,8 @@ type ChangeRow {
     target: String = "";
     before: String = "";
     after: String = "";
+    // false for a change the log does not hold (`Store.change`)
+    present: Bool = false;
 }
 
 /// A `node_state` row: what a node declared and reported, written by the
@@ -562,6 +579,9 @@ type ChangeQuery {
     to: Time = `1970-01-01T00:00:00Z`;
     limit: Int = 100;
     cursor: String = "";
+    // false to leave `before` and `after` unread ("" each): a list of the
+    // changes, not the resources they hold
+    bodies: Bool = true;
 }
 
 /// Every catalog row, removed ones included, in the order they were added.
@@ -898,6 +918,11 @@ interface Store {
     /// The change log, as `q` asks; the store numbers each change it
     /// appends.
     fn changes(q: ChangeQuery) -> ChangeRows fallible(StoreError);
+    /// The change `id` (`chg_<n>`), whole; `present` false for none.
+    fn change(id: String) -> ChangeRow fallible(StoreError);
+    /// Up to `limit` changes appended after the one numbered `seq`, oldest
+    /// first, whole: what a follower has not been told.
+    fn changes_after(seq: Int, limit: Int) -> ChangeRows fallible(StoreError);
 
     /// Append a request's usage to the ledger. A row with the id the
     /// ledger has is left as it is.
@@ -1050,10 +1075,8 @@ interface Store {
     fn turn(project: String, conversation: String) -> TurnRow fallible(StoreError);
     /// Keep a conversation's current turn, replacing the one it had.
     fn put_turn(row: TurnRow) fallible(StoreError);
-    /// Titles, the newest made first, at most `limit`: a project's (its
-    /// children's too) when `project` is not "", one conversation's when
-    /// `conversation` is not "".
-    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError);
+    /// Titles, as `q` asks.
+    fn titles(q: TitleQuery) -> TitleRows fallible(StoreError);
     /// How many of the requests `q` keeps gave each answer to `annotator`'s
     /// `question` (not skipped, at `q.min_probability` or more).
     fn answer_counts(
@@ -1852,11 +1875,38 @@ locus MemoryStore {
                     out.more = true;
                     return out;
                 }
-                push(out.rows, c) or discard;
+                let mut kept = c;
+                if !q.bodies {
+                    kept.before = "";
+                    kept.after = "";
+                }
+                push(out.rows, kept) or discard;
             }
             i = i - 1;
         }
         if !started { out.cursor_known = false; }
+        return out;
+    }
+
+    fn change(id: String) -> ChangeRow fallible(StoreError) {
+        let n = change_number(id);
+        if n < 1 || n > self.log.len() { return ChangeRow { }; }
+        let c = self.log.get(n - 1) or ChangeRow { };
+        if c.id != id { return ChangeRow { }; }
+        let mut out = c;
+        out.present = true;
+        return out;
+    }
+
+    fn changes_after(seq: Int, limit: Int) -> ChangeRows fallible(StoreError) {
+        let mut out = ChangeRows { };
+        let mut i = if seq < 0 { 0 } else { seq };
+        while i < self.log.len() && count(out.rows) < limit {
+            let mut c = self.log.get(i) or ChangeRow { };
+            c.present = true;
+            push(out.rows, c) or discard;
+            i = i + 1;
+        }
         return out;
     }
 
@@ -2500,17 +2550,30 @@ locus MemoryStore {
         self.turn_rows = next;
     }
 
-    fn titles(project: String, conversation: String, limit: Int) -> TitleRows fallible(StoreError) {
+    fn titles(q: TitleQuery) -> TitleRows fallible(StoreError) {
         let mut out = TitleRows { };
+        let limit = if q.limit < 1 { 100 } else if q.limit > 500 { 500 } else { q.limit };
+        // held newest put first: past the cursor's title, the ones after it
+        let mut started = len(q.after_project) == 0;
         for r in self.title_rows.rows {
-            if count(out.rows) >= limit { break; }
-            if len(conversation) > 0 && r.conversation != conversation { continue; }
-            if len(project) > 0 && r.project != project {
+            if !started {
+                if r.project == q.after_project && r.conversation == q.after_conversation {
+                    started = true;
+                }
+                continue;
+            }
+            if len(q.conversation) > 0 && r.conversation != q.conversation { continue; }
+            if len(q.project) > 0 && r.project != q.project {
                 let p = self.project_rows.get(r.project) or ProjectRow { };
-                if p.parent != project { continue; }
+                if p.parent != q.project { continue; }
+            }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
             }
             push(out.rows, r) or discard;
         }
+        if !started { out.cursor_known = false; }
         return out;
     }
 
@@ -2589,6 +2652,20 @@ locus MemoryStore {
 }
 
 /// True when `c` is one `q` asks for (all but the cursor and the limit).
+/// The number in a change's id (`chg_<n>`); 0 for an id that is not one.
+fn change_number(id: String) -> Int {
+    if !std::str::starts_with(id, "chg_") || len(id) < 5 { return 0; }
+    let digits = id[4..len(id)];
+    let v = std::str::bytes_view(digits);
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        if b < 48 || b > 57 { return 0; }
+        i = i + 1;
+    }
+    return std::str::parse_int(digits) or 0;
+}
+
 fn matches(c: ChangeRow, q: ChangeQuery) -> Bool {
     if len(q.target) > 0
         && c.target != q.target

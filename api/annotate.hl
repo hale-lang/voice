@@ -397,8 +397,19 @@ type AnnotatorStats {
     last_error_at: Time = `1970-01-01T00:00:00Z`;
 }
 
-/// `GET /admin/v1/conversations`'s filters.
-type ConversationAsk { project: String = ""; conversation: String = ""; limit: Int = -1; }
+/// `GET /admin/v1/conversations`'s filters, a page's size and the
+/// `next_cursor` it follows.
+type ConversationAsk {
+    project: String = "";
+    conversation: String = "";
+    limit: Int = -1;
+    cursor: String = "";
+}
+
+/// The most titles a page lists, and the page it lists unasked: a title is
+/// under 300 bytes as JSON with a title of 80 characters, so a page is
+/// under 32 KiB.
+const TITLE_PAGE_MAX: Int = 100;
 
 /// `ConversationTitle`: a conversation's title, as the title annotator
 /// last wrote it.
@@ -414,7 +425,12 @@ type ConversationTitle {
     made_at: Time = `1970-01-01T00:00:00Z`;
 }
 
-type ConversationTitleList { data: bounded[ConversationTitle; 500]; }
+/// A page of titles; `next_cursor` is `null` on the last.
+type ConversationTitleList {
+    data: bounded[ConversationTitle; 100];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
 
 /// What an annotation's step is: `queued`, a stage `started` or `done`
 /// (or `skipped`), the conversation `titled`, and its end, `kept` or
@@ -1534,22 +1550,43 @@ locus Annotations {
         return annotate_readiness(self.store, p) or fail store_down(err);
     }
 
-    /// `listConversationTitles`: the newest made first, at most `limit`
-    /// (100 by default, 500 at most).
+    /// `listConversationTitles`: the newest made first, a page of at most
+    /// `limit` (`TITLE_PAGE_MAX`, and by default) at a time. A page's
+    /// cursor is its last title's project and conversation,
+    /// `<project>/<conversation>`.
     fn titles(a: ConversationAsk) -> ConversationTitleList fallible(CtlError) {
-        let mut limit = 100;
+        let mut q = st::TitleQuery {
+            project: a.project,
+            conversation: a.conversation,
+            limit: TITLE_PAGE_MAX,
+        };
         if a.limit != -1 {
-            if a.limit < 1 || a.limit > 500 { fail bad("`limit` is 1 to 500", "limit"); }
-            limit = a.limit;
+            if a.limit < 1 || a.limit > TITLE_PAGE_MAX {
+                fail bad("`limit` is 1 to " + to_string(TITLE_PAGE_MAX), "limit");
+            }
+            q.limit = a.limit;
+        }
+        if len(a.cursor) > 0 {
+            let slash = std::str::index_of(a.cursor, "/");
+            if slash < 1 {
+                fail bad("`cursor` names no title; pass a page's `next_cursor`", "cursor");
+            }
+            q.after_project = a.cursor[0..slash];
+            q.after_conversation = a.cursor[(slash + 1)..len(a.cursor)];
         }
         self.gate.enter();
-        let rows = self.store.titles(a.project, a.conversation, limit) or {
+        let rows = self.store.titles(q) or {
             self.gate.leave();
             fail store_down(err);
         };
         self.gate.leave();
+        if !rows.cursor_known {
+            fail bad("`cursor` names no title; pass a page's `next_cursor`", "cursor");
+        }
         let mut out = ConversationTitleList { };
+        let mut last = "";
         for t in rows.rows {
+            last = t.project + "/" + t.conversation;
             push(
                 out.data,
                 ConversationTitle {
@@ -1564,6 +1601,10 @@ locus Annotations {
                     made_at: t.made_at,
                 },
             ) or discard;
+        }
+        if rows.more {
+            out.has_next_cursor = true;
+            out.next_cursor = last;
         }
         return out;
     }
@@ -1905,13 +1946,33 @@ const ANNOTATE_WORKERS: Int = 3;
 /// The most requests one run names.
 const ANNOTATION_RUN_MAX: Int = 500;
 
-/// `runAnnotations`: the requests to annotate now, and the annotator to
+/// `runAnnotations`: the requests to annotate now, named or as the usage
+/// ledger's filters match them (the newest `RUN_MAX`), and the annotator to
 /// ask (at `version`, 0 its current), "" for every one in force.
 type AnnotationRunAsk {
     request_ids: bounded[String; 500];
+    has_matching: Bool = false;
+    matching: UsageMatch = UsageMatch { };
     annotator: String = "";
     version: Int = 0;
 }
+
+/// `UsageMatch`: the requests `listUsage`'s filters match, as a body
+/// carries them; `metadata` an object of the pairs a request must have.
+type UsageMatch {
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    account: String = "";
+    conversation: String = "";
+    metadata: std::json::Value = std::json::Value::null();
+    from: String = "";
+    to: String = "";
+    include_internal: Bool = false;
+}
+
+/// The most requests one run annotates.
+const RUN_MAX: Int = 500;
 
 /// One request of a run: queued, or refused and why (`unknown`, `no_text`
 /// when it has no recorded text, `not_annotating`, `no_annotator`).

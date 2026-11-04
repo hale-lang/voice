@@ -65,8 +65,49 @@ type Recipe {
     created_at: Time = `1970-01-01T00:00:00Z`;
 }
 
-/// Voice's own (at most `SHIPPED_MAX`) and the operator's (the store's 256).
-type RecipeList { data: bounded[Recipe; 320]; }
+/// `RecipeVariantSummary`: a variant as `listRecipes` lists it, its files
+/// counted, not listed.
+type RecipeVariantSummary {
+    id: String = "";
+    format: ModelFormat = ModelFormat::gguf;
+    quantization: String = "";
+    // its files, together
+    file_count: Int = 0;
+    total_bytes: Int = 0;
+    memory_bytes: Int = 0;
+}
+
+/// `RecipeSummary`: a recipe as `listRecipes` lists it, each variant
+/// without its files (`getRecipe` has them).
+type RecipeSummary {
+    id: String = "";
+    license: License = License { };
+    has_context_length: Bool = false;
+    context_length: Int = 0;
+    has_kv_bytes_per_token: Bool = false;
+    kv_bytes_per_token: Int = 0;
+    contract: ModelContract = ModelContract::generative;
+    origin: Origin = Origin::operator;
+    has_created_at: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    variants: bounded[RecipeVariantSummary; 8];
+}
+
+/// A page of recipes, at most `RECIPE_PAGE_MAX`: voice's own, then the
+/// operator's; `next_cursor` is `null` on the last.
+type RecipeList {
+    data: bounded[RecipeSummary; 32];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
+
+/// The most recipes a page lists, and the page it lists unasked: a
+/// recipe's summary is about 500 bytes (the ones voice ships, 20 of them,
+/// are 10 KiB together), so a page is under 20 KiB.
+const RECIPE_PAGE_MAX: Int = 32;
+
+/// `listRecipes`' query: a page's size, and the `next_cursor` it follows.
+type RecipeAsk { limit: Int = -1; cursor: String = ""; }
 
 /// The most recipes voice ships.
 const SHIPPED_MAX: Int = 64;
@@ -93,10 +134,11 @@ locus Recipes {
         shipped: String = "";
     }
 
-    /// `listRecipes`: voice's own, then the operator's not removed.
-    fn list() -> RecipeList fallible(CtlError) {
+    /// `listRecipes`: voice's own, then the operator's not removed, a page
+    /// at a time, each recipe's variants without their files.
+    fn list(a: RecipeAsk) -> RecipeList fallible(CtlError) {
         self.gate.enter();
-        let gated = self.list_in_gate() or {
+        let gated = self.list_in_gate(a) or {
             self.gate.leave();
             fail err;
         };
@@ -104,8 +146,17 @@ locus Recipes {
         return gated;
     }
 
-    fn list_in_gate() -> RecipeList fallible(CtlError) {
+    fn list_in_gate(a: RecipeAsk) -> RecipeList fallible(CtlError) {
+        let mut limit = RECIPE_PAGE_MAX;
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > RECIPE_PAGE_MAX {
+                fail bad("`limit` is 1 to " + to_string(RECIPE_PAGE_MAX), "limit");
+            }
+            limit = a.limit;
+        }
         let mut out = RecipeList { };
+        // past the cursor's recipe, in the order they are listed
+        let mut started = len(a.cursor) == 0;
         let rows = self.store.recipes() or fail store_down(err);
         let v = std::str::bytes_view(self.shipped);
         let mut start = 0;
@@ -113,27 +164,42 @@ locus Recipes {
             let nl = st::line_end(v, start);
             let line = std::str::slice(v, start, nl);
             start = nl + 1;
-            if len(line) > 0 && !held(rows, std::json::find_string_field(line, "id")) {
-                let r = recipe_view(
-                    line,
-                    Origin::shipped,
-                    false,
-                    `1970-01-01T00:00:00Z`,
-                ) or raise;
-                push(out.data, r) or discard;
+            let id = std::json::find_string_field(line, "id");
+            if len(line) == 0 || held(rows, id) { continue; }
+            if !started {
+                started = id == a.cursor;
+                continue;
             }
+            if count(out.data) >= limit {
+                out.has_next_cursor = true;
+                return out;
+            }
+            push(
+                out.data,
+                recipe_summary(line, Origin::shipped, false, `1970-01-01T00:00:00Z`),
+            ) or discard;
+            out.next_cursor = id;
         }
         for row in rows.rows {
-            if !row.removed {
-                let r = recipe_view(
-                    row.body,
-                    Origin::operator,
-                    true,
-                    row.created_at,
-                ) or raise;
-                push(out.data, r) or discard;
+            if row.removed { continue; }
+            if !started {
+                started = row.id == a.cursor;
+                continue;
             }
+            if count(out.data) >= limit {
+                out.has_next_cursor = true;
+                return out;
+            }
+            push(
+                out.data,
+                recipe_summary(row.body, Origin::operator, true, row.created_at),
+            ) or discard;
+            out.next_cursor = row.id;
         }
+        if !started {
+            fail bad("`cursor` names no recipe; pass a page's `next_cursor`", "cursor");
+        }
+        out.next_cursor = "";
         return out;
     }
 
@@ -281,6 +347,58 @@ fn recipe_view(
         has_created_at: dated,
         created_at: at
     };
+}
+
+/// A body as `listRecipes` lists it: each variant's files counted.
+@bounded_by(body)
+fn recipe_summary(body: String, origin: Origin, dated: Bool, at: Time) -> RecipeSummary {
+    let lic = std::json::find_field_raw(body, "license");
+    let mut out = RecipeSummary {
+        id: std::json::find_string_field(body, "id"),
+        license: License {
+            name: std::json::find_string_field(lic, "name"),
+            url: std::json::find_string_field(lic, "url"),
+        },
+        has_context_length: std::json::find_int_field(body, "context_length") > 0,
+        context_length: std::json::find_int_field(body, "context_length"),
+        has_kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token") > 0,
+        kv_bytes_per_token: std::json::find_int_field(body, "kv_bytes_per_token"),
+        contract: model_contract_of(std::json::find_string_field(body, "contract")),
+        origin: origin,
+        has_created_at: dated,
+        created_at: at
+    };
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "variants"));
+    while !it.done {
+        push(out.variants, variant_summary(it.element)) or discard;
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// A variant's body as `listRecipes` lists it: its files counted, not listed.
+@bounded_by(v)
+fn variant_summary(v: String) -> RecipeVariantSummary {
+    let format = text_of(v, "format");
+    let mut out = RecipeVariantSummary {
+        id: text_of(v, "id"),
+        format: if format == "safetensors" {
+            ModelFormat::safetensors
+        } else if format == "mlx" {
+            ModelFormat::mlx
+        } else {
+            ModelFormat::gguf
+        },
+        quantization: text_of(v, "quantization"),
+        memory_bytes: count_of(v, "memory_bytes"),
+    };
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
+    while !it.done {
+        out.file_count = out.file_count + 1;
+        out.total_bytes = out.total_bytes + count_of(it.element, "bytes");
+        it = std::json::array_next(it);
+    }
+    return out;
 }
 
 /// The change log's JSON for `r`: the `Recipe` the api answers.

@@ -1025,3 +1025,28 @@ update node set assignment_version = assignment_version + 1 where id in (select 
 update seat set config = jsonb_set(jsonb_set(config, '{runtime,id}', to_jsonb(m.new)), '{runtime,artifact}', (config->'runtime'->'artifact') || m.artifact) from (values ('decision-0.1.0-cpu', 'decision-0.1.2-cpu', '{"digest": "sha256:6a8ea5138654184e54a8c51bc21e0efd7be809540f8495da8125e3612b11f84a"}'::jsonb), ('decision-0.1.0-vulkan', 'decision-0.1.2-vulkan', '{"digest": "sha256:744b55d8a7e7fdc4c28f5f50e36fcab7698ac23364f963c0e73e6e08f2312fa4"}'::jsonb), ('decision-0.1.0-rocm', 'decision-0.1.2-rocm', '{"digest": "sha256:c113a7f398be44239b41b4c7ae5a87fac99d5faf1b0603621600d56d63b79c56"}'::jsonb), ('decision-0.1.0-cuda', 'decision-0.1.2-cuda', '{"digest": "sha256:15a9f93feceb564792144e246efc92fef41ebfa17e8a0f3e0a506372c5d2ac2f"}'::jsonb), ('decision-0.1.1-metal', 'decision-0.1.2-metal', '{"url": "https://github.com/hale-lang/voice/releases/download/runtime-decision-0.1.2-metal/decision-0.1.2-metal-darwin-arm64.tar.gz", "sha256": "4a2b5f039a97f9a1f84d8c216936a4597a2e00431710d3c1dc76a7bee6bb28bb", "bytes": 5015544}'::jsonb), ('jev-style-0.3.0-mlx', 'decision-0.3.0-mlx', '{"url": "https://github.com/hale-lang/voice/releases/download/runtime-decision-0.3.0-mlx/decision-0.3.0-mlx-darwin-arm64.tar.gz", "sha256": "c1229baef17c0d4a2ec57c15efaa7c5dc7e6c601a003715b89632f16195c817c", "bytes": 102692887}'::jsonb)) as m(old, new, artifact) where seat.config->'runtime'->>'id' = m.old;
 update seat set config = jsonb_set(config, '{runtime,server}', '"decision"') where seat.config->'runtime'->>'server' = 'jev-style';
 ```
+
+### Migration 28: links between nodes, checked
+
+A model may be placed across two nodes cabled to each other, each
+declaring its link to the other in its capabilities (`Capabilities.links`,
+kept with them in `node_state`). Before the two are placed on, their link
+is checked: an NCCL all-reduce between them over it, a rank on each, each
+node assigned its rank and reporting what it measured. A check is the
+node plane's state, like the rest of the fleet as reported: it records no
+change. A pair is placed on only while its latest check passed; a check
+is `running` until both report, or thirty minutes have passed.
+
+```sql
+create table link_check (
+  id          text primary key,
+  node_a      text not null references node,   -- rank 0, whose address the ranks meet at
+  node_b      text not null references node,   -- rank 1
+  created_at  timestamptz not null,
+  master_addr text not null,                   -- node_a's address on the link, where the ranks meet
+  image       text not null,                   -- the image both run it in, by digest
+  result_a    jsonb,                           -- LinkCheckResult, as rank 0 reported it
+  result_b    jsonb                            -- and rank 1
+);
+create index link_check_pair on link_check (node_a, node_b, created_at);
+```

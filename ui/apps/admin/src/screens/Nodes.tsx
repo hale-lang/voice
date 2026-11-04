@@ -131,6 +131,55 @@ function reported(s: SeatView): string {
 }
 
 /** What the machine has, as the node measured it: what placement fits models to. */
+/**
+ * The nodes this one is cabled to, as its capabilities file declares them:
+ * the ports that reach each, whether the peer declares the link back, and
+ * the link's latest check. A model is placed across the two once it passed.
+ */
+function Links({ node }: { node: Node }) {
+  const w = useWrite();
+  const declared = node.capabilities?.links ?? [];
+  if (declared.length === 0) return <span className="faint">none declared: its capabilities file names no node it is cabled to</span>;
+  return (
+    <>
+      <Kv
+        rows={declared.map((l) => {
+          const seen = node.links?.find((x) => x.peer === l.peer);
+          const c = seen?.check;
+          const label = !c ? '' : c.status === 'passed' && c.degraded ? 'passed, degraded' : c.status;
+          const tone = !c ? 'quiet' : c.status === 'failed' ? 'fail' : c.status === 'running' || c.degraded ? 'wait' : 'quiet';
+          return {
+            k: l.peer,
+            v: (
+              <>
+                <a href={href('nodes', l.peer)}>{l.peer}</a>{': '}
+                <Mono>{l.ports.map((p) => `${p.ifname} ${p.address}${p.hca ? ` · ${p.hca}` : ''}`).join(', ')}</Mono>
+                {!seen?.paired && <span className="c-wait"> · {l.peer} declares no link back</span>}
+                {c ? (
+                  <>
+                    {' · '}
+                    <Status tone={tone} label={label} title={c.reason ?? undefined} />
+                    {c.bus_bytes_per_second ? <span className="muted"> · {bytes(c.bus_bytes_per_second)}/s</span> : null}
+                  </>
+                ) : (
+                  <span className="muted"> · never checked</span>
+                )}
+                {seen?.paired && node.status === 'up' && c?.status !== 'running' && (
+                  <>
+                    {' '}
+                    <Button onClick={() => void w.write('post', '/admin/v1/nodes/{node}/links/{peer}/check', { params: { path: { node: node.id, peer: l.peer } } })} disabled={w.busy}>check</Button>
+                  </>
+                )}
+              </>
+            ),
+          };
+        })}
+      />
+      {w.error && <p className="c-fail">{w.error}</p>}
+    </>
+  );
+}
+
 function Hardware({ node }: { node: Node }) {
   const hw = node.capabilities?.hardware;
   if (!hw) return <span className="faint">{node.capabilities ? 'not measured: no model is placed on this node' : 'not declared yet: the node has not registered'}</span>;
@@ -261,6 +310,8 @@ function NodeInspector({ node }: { node: Node }) {
       )}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Hardware</h3>
       <Hardware node={node} />
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Links</h3>
+      <Links node={node} />
       {node.status !== 'revoked' && <Suggested node={node} />}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
       {local ? (
@@ -316,7 +367,7 @@ function Suggested({ node }: { node: Node }) {
   // an account that bills no one is the natural payer of a local seat
   const payer = account || (options.find((a) => (a.billing ?? 'none') === 'none') ?? options[0])?.id || '';
   const placements = useGet('/admin/v1/placements');
-  const place = async (s: Suggestion) => {
+  const place = async (s: Suggestion, peer?: string) => {
     if (!s.recipe || !payer) return;
     const recipe = s.recipe;
     const all = models.data?.data ?? [];
@@ -331,11 +382,11 @@ function Suggested({ node }: { node: Node }) {
     }
     const chosen = model;
     // a placement's id is a slug, never reused, even once removed
-    await w.createFresh('/admin/v1/placements', slug(`${recipe}-on-${node.id}`), new Set((placements.data?.data ?? []).map((p) => p.id)), (id) => ({
+    await w.createFresh('/admin/v1/placements', slug(`${recipe}-on-${node.id}${peer ? `-and-${peer}` : ''}`), new Set((placements.data?.data ?? []).map((p) => p.id)), (id) => ({
       id,
       model: chosen,
       account: payer,
-      nodes: [node.id],
+      nodes: peer ? [node.id, peer] : [node.id],
       ...(s.variant ? { variant: s.variant } : {}),
     }));
   };
@@ -351,25 +402,16 @@ function Suggested({ node }: { node: Node }) {
         <Unavailable what="Suggestions" detail={q.error.message} />
       ) : (
         <>
-          <Kv
-            rows={q.data.data.map((s) => ({
-              k: s.category,
-              v: s.recipe ? (
-                <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
-                  <Mono>{s.recipe}</Mono>
-                  {s.variant && <span className="muted">{s.variant}</span>}
-                  {s.placed ? (
-                    <a href={href('placements', s.placed)}>placed as {s.placed}</a>
-                  ) : (
-                    <Button onClick={() => void place(s)} disabled={w.busy || !payer}>place</Button>
-                  )}
-                  <div className="faint" style={{ flexBasis: '100%', fontSize: 'var(--size-xs)' }}>{s.reason}</div>
-                </div>
-              ) : (
-                <span className="faint">{s.reason}</span>
-              ),
-            }))}
-          />
+          <Kv rows={q.data.data.map((s) => suggestionRow(s, () => void place(s), w.busy || !payer))} />
+          {q.data.pair && (
+            <>
+              <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>
+                Across {node.id} and {q.data.pair.peer}
+                {q.data.pair.tier_gb != null && <span className="faint" style={{ fontWeight: 400 }}> · {q.data.pair.tier_gb} GB together</span>}
+              </h3>
+              <Kv rows={q.data.pair.data.map((s) => suggestionRow(s, () => void place(s, q.data.pair?.peer), w.busy || !payer))} />
+            </>
+          )}
           {options.length > 1 && (
             <div style={{ marginTop: 'var(--space-2)', display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
               <span className="faint">spending</span>
@@ -383,6 +425,27 @@ function Suggested({ node }: { node: Node }) {
       )}
     </>
   );
+}
+
+/** One category's suggestion, with a button to place it. */
+function suggestionRow(s: Suggestion, place: () => void, disabled: boolean) {
+  return {
+    k: s.category,
+    v: s.recipe ? (
+      <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
+        <Mono>{s.recipe}</Mono>
+        {s.variant && <span className="muted">{s.variant}</span>}
+        {s.placed ? (
+          <a href={href('placements', s.placed)}>placed as {s.placed}</a>
+        ) : (
+          <Button onClick={place} disabled={disabled}>place</Button>
+        )}
+        <div className="faint" style={{ flexBasis: '100%', fontSize: 'var(--size-xs)' }}>{s.reason}</div>
+      </div>
+    ) : (
+      <span className="faint">{s.reason}</span>
+    ),
+  };
 }
 
 /** The effective cap and what bounds it: declared, coordinator, local. */

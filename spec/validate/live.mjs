@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -102,6 +102,8 @@ const nodeBodies = {
   reportCapabilities: capabilities,
   reportLocalControls: local,
   reportQuota: { seat: 'static', windows: [] },
+  // no check holds a rank of this node's: what it reports is dropped
+  reportLinkCheck: { id: 'lc-live', ok: true, bus_bytes_per_second: 0 },
   nodeDraining: { reason: 'live check' },
 };
 
@@ -121,6 +123,8 @@ const refusals = {
   getAnnotation: { json: [404, 'not_found', 'NotFound'] },
   // nor one to annotate again
   runAnnotation: { json: [404, 'not_found'] },
+  // no two nodes here are cabled to each other: a node's link to itself is refused
+  checkNodeLink: { json: [422, 'invalid_request', 'Invalid'] },
 };
 
 // the query an operation needs to be answered at all

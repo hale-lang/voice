@@ -1668,6 +1668,100 @@ locus PgStore {
         ) or raise;
     }
 
+    fn link_checks() -> LinkCheckRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.link_checks_locked() or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn link_checks_locked() -> LinkCheckRows fallible(StoreError) {
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT id, node_a, node_b, created_at, master_addr, image, result_a, result_b FROM link_check ORDER BY created_at DESC, id DESC LIMIT 64) t",
+            db::Args { },
+        ) or raise;
+        let mut out = LinkCheckRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 {
+                push(
+                    out.rows,
+                    LinkCheckRow {
+                        id: pg_text(line, "id"),
+                        node_a: pg_text(line, "node_a"),
+                        node_b: pg_text(line, "node_b"),
+                        created_at: pg_time(pg_text(line, "created_at")),
+                        master_addr: pg_text(line, "master_addr"),
+                        image: pg_text(line, "image"),
+                        result_a: raw_or_empty(line, "result_a"),
+                        result_b: raw_or_empty(line, "result_b"),
+                        present: true,
+                    },
+                ) or discard;
+            }
+        }
+        return out;
+    }
+
+    fn insert_link_check(row: LinkCheckRow) fallible(StoreError) {
+        self.lock.enter();
+        self.insert_link_check_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn insert_link_check_locked(row: LinkCheckRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.node_a);
+        a.add(row.node_b);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(row.master_addr);
+        a.add(row.image);
+        // one statement, so the check and the versions it moves are one write
+        self.write(
+            "WITH c AS (INSERT INTO link_check (id, node_a, node_b, created_at, master_addr, image) VALUES ($1, $2, $3, $4::timestamptz, $5, $6) RETURNING node_a, node_b) UPDATE node SET assignment_version = assignment_version + 1 WHERE id IN (SELECT node_a FROM c UNION SELECT node_b FROM c)",
+            a,
+        ) or raise;
+    }
+
+    fn put_link_result(id: String, node: String, result: String) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.put_link_result_locked(id, node, result) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn put_link_result_locked(
+        id: String,
+        node: String,
+        result: String
+    ) -> Bool fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        a.add(node);
+        a.add(result);
+        // its rank's column alone, and only while it is empty: what the
+        // other rank wrote meanwhile is never touched
+        let all = self.rows(
+            "WITH w AS (UPDATE link_check SET result_a = CASE WHEN node_a = $2 AND result_a IS NULL THEN $3::jsonb ELSE result_a END, result_b = CASE WHEN node_b = $2 AND result_b IS NULL THEN $3::jsonb ELSE result_b END WHERE id = $1 AND ((node_a = $2 AND result_a IS NULL) OR (node_b = $2 AND result_b IS NULL)) RETURNING id) SELECT count(*) FROM w",
+            a,
+        ) or raise;
+        return std::str::trim(all) != "0" && len(std::str::trim(all)) > 0;
+    }
+
     fn beat(node: String) -> Beat fallible(StoreError) {
         self.lock.enter();
         let taken = self.beat_locked(node) or {

@@ -67,7 +67,152 @@ fn capabilities_problem(file: String) -> String {
         }
         it = std::json::array_next_span(it, engines);
     }
+    return links_problem(file);
+}
+
+/// Why the capabilities file's `links` (protocol.yaml `Link`) are not
+/// usable, "" when they are or there are none: at most 4 peers, each a
+/// node id with 1 to 4 ports, each port its interface and IPv4 address and
+/// perhaps its RDMA device, and perhaps the GID index they use.
+@unbounded
+fn links_problem(file: String) -> String {
+    let raw = std::str::trim(top_value(file, "links"));
+    if len(raw) == 0 { return ""; }
+    if !std::str::starts_with(raw, "[") { return "links must be a list"; }
+    let mut peers = 0;
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        peers = peers + 1;
+        if peers > 4 { return "links names at most 4 peers"; }
+        let l = it.element;
+        let peer = std::json::find_string_field(l, "peer");
+        if !is_slug(peer) { return "every link names its peer, a node id"; }
+        let gid = std::json::string_field(l, "gid_index");
+        if gid.kind != "missing" {
+            let g = if gid.kind == "number" {
+                std::json::find_int_field(l, "gid_index")
+            } else {
+                    -1
+            };
+            if g < 0 || g > 255 { return "link to " + peer + ": gid_index is 0 to 255"; }
+        }
+        let ports = std::str::trim(std::json::find_field_raw(l, "ports"));
+        if !std::str::starts_with(ports, "[") || std::json::array_first(ports).done {
+            return "link to " + peer + ": ports lists the ports cabled to it";
+        }
+        let mut n = 0;
+        let mut p = std::json::array_first(ports);
+        while !p.done {
+            n = n + 1;
+            if n > 4 { return "link to " + peer + ": at most 4 ports"; }
+            let ifname = std::json::find_string_field(p.element, "ifname");
+            if !port_name(ifname, 15) {
+                return "link to " + peer + ": every port names its ifname";
+            }
+            if !ipv4(std::json::find_string_field(p.element, "address")) {
+                return "link to " + peer + ": port " + ifname
+                    + "'s address is its IPv4 address on the link";
+            }
+            let hca = std::json::string_field(p.element, "hca");
+            if hca.kind != "missing"
+                && !port_name(std::json::find_string_field(p.element, "hca"), 64)
+            {
+                return "link to " + peer + ": port " + ifname + "'s hca names its RDMA device";
+            }
+            p = std::json::array_next(p);
+        }
+        it = std::json::array_next(it);
+    }
     return "";
+}
+
+/// The capabilities file's `links`, as the node declares them: each field
+/// checked (`links_problem`), nothing else; "" for none.
+@unbounded
+fn declared_links(file: String) -> String {
+    let raw = std::str::trim(top_value(file, "links"));
+    if len(raw) == 0 { return ""; }
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
+    let mut first = true;
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let l = it.element;
+        if !first { out.append_str(", "); }
+        first = false;
+        out.append_str(
+            "{\"peer\": " + "\"" + std::json::escape_string(std::json::find_string_field(l, "peer"))
+                + "\"" + ", \"ports\": [",
+        );
+        let mut pf = true;
+        let mut p = std::json::array_first(std::json::find_field_raw(l, "ports"));
+        while !p.done {
+            if !pf { out.append_str(", "); }
+            pf = false;
+            out.append_str(
+                "{\"ifname\": " + "\""
+                    + std::json::escape_string(std::json::find_string_field(p.element, "ifname"))
+                    + "\""
+                    + ", \"address\": " + "\""
+                    + std::json::escape_string(std::json::find_string_field(p.element, "address"))
+                    + "\""
+                    + (
+                        if std::json::string_field(p.element, "hca").kind == "string" {
+                            ", \"hca\": " + "\""
+                                + std::json::escape_string(
+                                    std::json::find_string_field(p.element, "hca"),
+                                )
+                                + "\""
+                        } else {
+                            ""
+                        }
+                    ) + "}",
+            );
+            p = std::json::array_next(p);
+        }
+        out.append_str("]");
+        if std::json::string_field(l, "gid_index").kind == "number" {
+            out.append_str(
+                ", \"gid_index\": " + to_string(std::json::find_int_field(l, "gid_index")),
+            );
+        }
+        out.append_str("}");
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b"";
+    return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// ^[A-Za-z0-9._-]{1,max}$: an interface's or an RDMA device's name.
+fn port_name(s: String, max: Int) -> Bool {
+    let n = len(s);
+    if n == 0 || n > max { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 46
+            || b == 95 || b == 45;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A dotted IPv4 address: four numbers of 0 to 255.
+fn ipv4(s: String) -> Bool {
+    let mut rest = s;
+    let mut parts = 0;
+    while parts < 4 {
+        let dot = std::str::index_of(rest, ".");
+        let part = if dot >= 0 { rest[0..dot] } else { rest };
+        if len(part) == 0 || len(part) > 3 { return false; }
+        let n = std::str::parse_int(part) or - 1;
+        if n < 0 || n > 255 || to_string(n) != part { return false; }
+        parts = parts + 1;
+        if dot < 0 { return parts == 4; }
+        rest = rest[(dot + 1)..len(rest)];
+    }
+    return false;
 }
 
 /// The capabilities as the node declares them: each engine with what its
@@ -103,7 +248,8 @@ fn declared_capabilities(file: String) -> String {
         first = false;
         it = std::json::array_next_span(it, engines);
     }
-    return out + "]}";
+    let links = declared_links(file);
+    return out + "]" + (if len(links) > 0 { ", \"links\": " + links } else { "" }) + "}";
 }
 
 /// ^[a-z0-9][a-z0-9-]{0,62}$

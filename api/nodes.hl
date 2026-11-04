@@ -160,6 +160,8 @@ type NodeRead {
     has_applied_version: Bool = false;
     applied_version: Int = -1;
     seats: bounded[SeatRead; 16];
+    // the links it declared, each with its peer's and its check (links.hl)
+    links: NodeLinks = NodeLinks { };
     has_connected_at: Bool = false;
     connected_at: Time = `1970-01-01T00:00:00Z`;
     has_last_heartbeat_at: Bool = false;
@@ -196,6 +198,7 @@ type Node {
     has_applied_version: Bool = false;
     applied_version: Int = -1;
     seats: bounded[SeatView; 16];
+    links: bounded[NodeLink; 4];
     has_connected_at: Bool = false;
     connected_at: Time = `1970-01-01T00:00:00Z`;
     has_last_heartbeat_at: Bool = false;
@@ -216,6 +219,25 @@ locus Nodes {
         link: Link;
         // serializes the store's use across requests (store/lock.hl): the admin plane takes turns, a row at a time
         gate: st::Lock = st::Lock { };
+        // the runtimes a link's check runs in (runtimes.hl), behind the same gate
+        runtimes: Runtimes = Runtimes { store: self.store, gate: self.gate };
+    }
+
+    /// `checkNodeLink`: both nodes assigned their rank of a check of the
+    /// link between them, `node` rank 0 (links.hl).
+    fn check_link(r: NodeLinkRef) -> LinkCheck fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.check_link_in_gate(r) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn check_link_in_gate(r: NodeLinkRef) -> LinkCheck fallible(CtlError) {
+        let usable = self.runtimes.usable_in_gate() or raise;
+        return check_link_in(self.store, self.link, usable, r.node, r.peer) or raise;
     }
 
     // The surface's rows (surface.hl) answer the typed `Node`; the REST
@@ -529,6 +551,9 @@ locus Nodes {
                 let sv = seat_view(self.store, s, r) or raise;
                 push(v.seats, sv) or discard;
             }
+        }
+        if f.present {
+            v.links = node_links(self.store, r.id, f.capabilities) or fail store_down(err);
         }
         return v;
     }
@@ -903,6 +928,7 @@ fn node_of_read(r: NodeRead) -> Node fallible(CtlError) {
         has_enrollment_token: len(r.enrollment_token) > 0,
         enrollment_token: r.enrollment_token,
     };
+    n.links = r.links.items;
     for s in r.seats {
         push(n.seats, seat_view_of(s) or raise) or discard;
     }
@@ -1107,7 +1133,8 @@ fn node_json(n: NodeRead) -> String {
         + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": "
         + to_string(n.assignment_version)
         + ", \"applied_version\": " + jcount_or_null(n.has_applied_version, n.applied_version)
-        + ", \"seats\": [" + seats + "], \"connected_at\": "
+        + ", \"seats\": [" + seats + "], \"links\": [" + node_links_json(n.links)
+        + "], \"connected_at\": "
         + jtime_or_null(n.has_connected_at, n.connected_at)
         + ", \"last_heartbeat_at\": " + jtime_or_null(n.has_last_heartbeat_at, n.last_heartbeat_at)
         + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": "

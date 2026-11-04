@@ -498,6 +498,32 @@ Type: object
 | `accelerators` | array of [Accelerator](#schema-accelerator) | yes | At most 16; a machine with more declares its first 16, and its node says so in its log. | items ≤ 16 |
 | `disk_free_bytes` | integer | yes | Free space under the node's data directory, where weights are kept. | ≥ 0 |
 
+<a id="schema-linkport"></a>
+
+### LinkPort
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `ifname` | string | yes | Its network interface, by the name the machine gives it. | pattern `^[A-Za-z0-9._-]{1,15}$` |
+| `address` | string | yes | Its IPv4 address on the link, without a prefix length. | pattern `^[0-9]{1,3}(\.[0-9]{1,3}){3}$` |
+| `hca` | string |  | Its RDMA (RoCE) device, when it has one. | pattern `^[A-Za-z0-9._-]{1,64}$` |
+
+<a id="schema-link"></a>
+
+### Link
+
+One peer this node is cabled to, and the ports that reach it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `peer` | [Slug](#schema-slug) | yes | The node at the other end. |  |
+| `ports` | array of [LinkPort](#schema-linkport) | yes | The local ports cabled to the peer, the first the one the two meet on: a model's ranks start from its address. Every port's RDMA device carries the model's traffic (`NCCL_IB_HCA`), and the first port's interface the rest (`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, `UCX_NET_DEVICES`), as NVIDIA's guide to serving vLLM across two DGX Sparks sets them. A DGX Spark's one cabled QSFP port is two ports here, one for each PCIe half of its ConnectX-7. | items ≥ 1; items ≤ 4 |
+| `gid_index` | integer |  | The RoCE GID index the ports' RDMA devices use (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX Spark's ConnectX-7. | ≥ 0; ≤ 255 |
+
 <a id="schema-capabilities"></a>
 
 ### Capabilities
@@ -513,3 +539,4 @@ Type: object
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
+| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |

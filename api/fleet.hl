@@ -27,7 +27,13 @@ type AssignedReads { items: bounded[AssignedRead; 16]; }
 
 /// `Assignment`: the node's whole desired state, as the router and the
 /// nodes' messages carry it.
-type AssignmentRead { version: Int = 0; max_in_flight: Int = 1; seats: bounded[AssignedRead; 16]; }
+type AssignmentRead {
+    version: Int = 0;
+    max_in_flight: Int = 1;
+    seats: bounded[AssignedRead; 16];
+    // the ranks of link checks the node is to run (links.hl)
+    link_checks: LinkJobs = LinkJobs { };
+}
 
 /// `Engine` (protocol.yaml): one engine a node offers. Its `config_schema` is a JSON
 /// Schema, free-form; `models` is `null`, any name, when it is not set.
@@ -66,13 +72,32 @@ type NodeHardware {
     disk_free_bytes: Int = 0;
 }
 
-/// `Capabilities` (protocol.yaml): what the node can run, and the machine
-/// it runs on when the node measured it.
+/// `LinkPort` (protocol.yaml): a local port cabled to a peer.
+type NodeLinkPort {
+    ifname: String;
+    address: String;
+    has_hca: Bool = false;
+    hca: String = "";
+}
+
+/// `Link` (protocol.yaml): a peer the node is cabled to, and its ports.
+type NodeLinkDecl {
+    peer: String;
+    ports: bounded[NodeLinkPort; 4];
+    has_gid_index: Bool = false;
+    gid_index: Int = 0;
+}
+
+/// `Capabilities` (protocol.yaml): what the node can run, the machine it
+/// runs on when the node measured it, and the nodes it is cabled to.
 type NodeCapabilities {
     engines: bounded[NodeEngine; 16];
     max_in_flight: Int;
     has_hardware: Bool = false;
     hardware: NodeHardware = NodeHardware { };
+    // left out when it declares none
+    has_links: Bool = false;
+    links: bounded[NodeLinkDecl; 4];
 }
 
 /// No capabilities: what a node that has not declared any holds.
@@ -303,6 +328,16 @@ locus NodePlane {
         self.store.put_windows(s.account, windows_json(q.windows)) or fail store_failed(err);
     }
 
+    /// `reportLinkCheck`: what the node's rank of a check measured, kept
+    /// once, as it first reported it, with when. A result for a check the
+    /// coordinator no longer holds (one of the newest 64), or one in which
+    /// the node has no rank, is dropped.
+    fn link_check(r: LinkCheckResult, ctx: std::api::Context) fallible(ApiError) {
+        let n = self.registered(ctx) or raise;
+        self.store.put_link_result(r.id, n.id, link_result_json(r, now_seconds()))
+        or fail store_failed(err);
+    }
+
     /// `nodeDraining`: no new requests go to it until it registers again.
     fn going_away(d: Draining, ctx: std::api::Context) fallible(ApiError) {
         let n = self.registered(ctx) or raise;
@@ -377,6 +412,7 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(st
     if cap < 1 { cap = 1; }
     let mut out = AssignmentRead { version: n.assignment_version, max_in_flight: cap };
     if n.revoked { return out; }
+    out.link_checks = link_jobs(store.link_checks() or raise, n.id, now_seconds());
     let seats = store.seats() or raise;
     for s in seats.rows {
         if s.node == n.id {
@@ -760,6 +796,62 @@ fn check_window(w: String) -> Bool fallible(ApiError) {
     return true;
 }
 
+/// `LinkCheckResult`, checked.
+fn read_link_check(body: String) -> LinkCheckResult fallible(ApiError) {
+    object_body(body) or raise;
+    if kind_of(body, "ok") != "bool" { fail invalid("`ok` is a required boolean", "ok"); }
+    let bus = kind_of(body, "bus_bytes_per_second") == "number";
+    let reason = string_or(body, "reason", "") or raise;
+    let mut out = LinkCheckResult { };
+    if kind_of(body, "iommu") == "array" {
+        let mut it = std::json::array_first(std::json::find_field_raw(body, "iommu"));
+        while !it.done {
+            let d = std::str::trim(it.element);
+            push(
+                out.iommu,
+                IommuDomain {
+                    hca: required_string(d, "hca") or raise,
+                    domain: required_string(d, "domain") or raise,
+                },
+            ) or fail invalid("at most 4 RDMA devices' IOMMU domains", "iommu");
+            it = std::json::array_next(it);
+        }
+    }
+    out.id = required_string(body, "id") or raise;
+    out.ok = std::json::find_bool_field(body, "ok");
+    out.has_bus_bytes_per_second = bus;
+    out.bus_bytes_per_second = if bus {
+        required_amount(body, "bus_bytes_per_second") or raise
+    } else {
+        0
+    };
+    out.has_reason = len(reason) > 0;
+    out.reason = if len(reason) > 1024 { reason[0..1024] } else { reason };
+    return out;
+}
+
+/// A rank's result as kept: what it said and when.
+fn link_result_json(r: LinkCheckResult, at: Time) -> String {
+    return "{\"ok\": " + jbool(r.ok)
+        + (
+            if r.has_bus_bytes_per_second {
+                ", \"bus_bytes_per_second\": " + to_string(r.bus_bytes_per_second)
+            } else {
+                ""
+            }
+        ) + (if r.has_reason { ", \"reason\": " + jq(r.reason) } else { "" })
+        + (if count(r.iommu) > 0 { ", \"iommu\": [" + iommu_json(r.iommu) + "]" } else { "" })
+        + ", \"reported_at\": " + jtime(at) + "}";
+}
+
+fn iommu_json(domains: bounded[IommuDomain; 4]) -> String {
+    let out = st::JsonList { };
+    for d in domains {
+        out.add("{\"hca\": " + jq(d.hca) + ", \"domain\": " + jq(d.domain) + "}");
+    }
+    return out.text();
+}
+
 fn read_draining(body: String) -> Draining fallible(ApiError) {
     if len(std::str::trim(body)) == 0 { return Draining { }; }
     object_body(body) or raise;
@@ -781,7 +873,8 @@ fn assignment_json(a: AssignmentRead) -> String {
     }
     let seats = seats_list.text();
     return "{\"version\": " + to_string(a.version) + ", \"max_in_flight\": "
-        + to_string(a.max_in_flight) + ", \"seats\": [" + seats + "]}";
+        + to_string(a.max_in_flight) + ", \"seats\": [" + seats + "], \"link_checks\": ["
+        + link_jobs_json(a.link_checks) + "]}";
 }
 
 fn registered_json(r: RegisteredRead) -> String {

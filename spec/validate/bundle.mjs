@@ -119,12 +119,13 @@ const MAP = {
 // does not cover (a body field on a path record) fails the run.
 const NOT_COMPARED = {
   NodeRef: ['the path parameter `node`; no body', ['node']],
+  NodeLinkRef: ['the path parameters `node` and `peer`; no body', ['node', 'peer']],
   Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, so its schema is never on the wire; the map\'s value is compared as `Health.checks{}`', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 
 // Fields of a row's request that are the path's or the query's.
-const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'include_archived', 'annotator', 'rule']);
+const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'peer', 'include_archived', 'annotator', 'rule']);
 // Records that stand for a list: the list rides in `items`. A row's list
 // is a `bounded` field of its own; these are left only inside a record
 // that stands for a value or null (`Restriction.names`).

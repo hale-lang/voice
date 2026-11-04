@@ -9,8 +9,9 @@ import { toneOf } from '../tone';
 
 /**
  * A model put on nodes: voice picks the variant and runtime that fit the
- * node's hardware, fetches them, and runs the server as a seat on the
- * leader. Each placement's seat is shown as the node reports it.
+ * nodes' hardware, fetches them, and runs the server as a seat on the
+ * leader; across two nodes, a seat on the follower runs the other half.
+ * Each placement's seats are shown as their nodes report them.
  */
 export function Placements({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
@@ -18,7 +19,7 @@ export function Placements({ route, setInspector }: ScreenProps) {
   const nodes = useGet('/admin/v1/nodes');
   const placement = q.data?.data.find((p) => p.id === selected);
   const creating = selected === 'new';
-  const seatOf = (p: Placement) => nodes.data?.data.find((n) => n.id === p.leader)?.seats.find((s) => s.ref === p.seat);
+  const seatAt = (ref: string | undefined) => { const [n] = (ref ?? '').split('/'); return nodes.data?.data.find((x) => x.id === n)?.seats.find((s) => s.ref === ref); };
 
   useEffect(() => {
     setInspector(creating ? <PlacementForm /> : placement ? <PlacementInspector placement={placement} /> : null);
@@ -43,7 +44,7 @@ export function Placements({ route, setInspector }: ScreenProps) {
             { key: 'nodes', header: 'Nodes', render: (p) => p.nodes.join(', ') },
             { key: 'variant', header: 'Variant · runtime', render: (p) => `${p.variant} · ${p.runtime}` },
             { key: 'account', header: 'Account', render: (p) => <Mono>{p.account}</Mono> },
-            { key: 'seat', header: 'Seat', render: (p) => { const s = seatOf(p); return s ? <Status tone={toneOf(s.status)} label={seatState(s)} title={s.reason ?? undefined} /> : <span className="faint">–</span>; } },
+            { key: 'seat', header: 'Seat', render: (p) => <Seats p={p} seatAt={seatAt} /> },
           ]}
           empty="Nothing placed. Place a catalog model that names a recipe on a node."
         />
@@ -51,6 +52,21 @@ export function Placements({ route, setInspector }: ScreenProps) {
           <Button onClick={() => go('placements', 'new')} tone="primary">place a model</Button>
         </p>
       </Panel>
+    </>
+  );
+}
+
+/** A placement's seats: its leader's, and across two nodes its follower's when that is not up. */
+function Seats({ p, seatAt }: { p: Placement; seatAt: (ref: string | undefined) => { status: string; reason?: string | null; progress?: { done_bytes: number; total_bytes: number } | null } | undefined }) {
+  const s = seatAt(p.seat);
+  const f = p.follower_seat ? seatAt(p.follower_seat) : undefined;
+  if (!s) return <span className="faint">–</span>;
+  return (
+    <>
+      <Status tone={toneOf(s.status)} label={seatState(s)} title={s.reason ?? undefined} />
+      {p.follower_seat && (!f || f.status !== 'up') && (
+        <span className="muted"> · follower {f ? <Status tone={toneOf(f.status)} label={seatState(f)} title={f.reason ?? undefined} /> : '–'}</span>
+      )}
     </>
   );
 }
@@ -77,16 +93,17 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
           { k: 'runtime', v: <a href={href('runtimes', p.runtime)}><Mono>{p.runtime}</Mono></a> },
           { k: 'nodes', v: p.nodes.join(', ') },
           { k: 'seat', v: <a href={href('nodes', node ?? '', seat ?? '')}><Mono>{p.seat}</Mono></a> },
+          ...(p.follower_seat ? [{ k: 'follower', v: <><a href={href('nodes', p.follower_seat.split('/')[0] ?? '', seat ?? '')}><Mono>{p.follower_seat}</Mono></a> <span className="muted">· runs the other half, serves nothing itself</span></> }] : []),
           { k: 'account', v: <Mono>{p.account}</Mono> },
           { k: 'cache', v: p.cache_tokens ? `${p.cache_tokens.toLocaleString()} tokens, shared by the conversations it holds` : <span className="faint">32k, placed before voice sized it</span> },
-          { k: 'holds', v: p.reserved_bytes ? `${bytes(p.reserved_bytes)} of ${p.leader}'s memory for models` : '–' },
+          { k: 'holds', v: p.reserved_bytes ? `${bytes(p.reserved_bytes)} of ${p.nodes.length > 1 ? `each of ${p.nodes.join(' and ')}'s` : `${p.leader}'s`} memory for models` : '–' },
           { k: 'placed', v: when(p.created_at) },
         ]}
       />
-      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Fit on {p.leader}</h3>
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Fit on {p.nodes.join(' and ')}</h3>
       <Kv rows={p.fit.map((f) => ({ k: f.variant, v: <span className={f.fits ? undefined : 'muted'}>{f.fits ? `fits, under ${f.runtime}` : f.reason}</span> }))} />
       <p style={{ marginTop: 'var(--space-4)' }}>
-        <Confirm label="remove" confirm="remove: its seat stops serving" onConfirm={async () => { const x = await w.write('delete', '/admin/v1/placements/{placement}', { params: { path: { placement: p.id } } }); if (x) go('placements'); }} />
+        <Confirm label="remove" confirm={p.follower_seat ? 'remove: both its seats stop' : 'remove: its seat stops serving'} onConfirm={async () => { const x = await w.write('delete', '/admin/v1/placements/{placement}', { params: { path: { placement: p.id } } }); if (x) go('placements'); }} />
       </p>
       {w.pending && <p className="c-wait">Proposed, pending review: {w.pending}</p>}
       {w.error && <p className="c-fail">{w.error}</p>}
@@ -132,7 +149,7 @@ function PlacementForm() {
         <Field label="model" required help="a catalog model that names a recipe">
           <Select value={model} onChange={(v) => { setModel(v); setVariant(''); }} options={placeable.map((m) => ({ value: m.id, label: `${m.id} · ${m.recipe}` }))} required empty="" />
         </Field>
-        <Field label="nodes" required help="the first is the leader, which runs the server">
+        <Field label="nodes" required help="the first is the leader, which serves; a second, cabled to it with its link checked, takes the other half of a model too large for one">
           <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-1)' }}>
             {live.map((n) => (
               <Checkbox key={n.id} checked={on.includes(n.id)} onChange={(c) => setOn(c ? [...on, n.id] : on.filter((x) => x !== n.id))} label={`${n.id}${n.capabilities?.hardware ? '' : ' (no hardware measured)'}`} />

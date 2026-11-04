@@ -88,6 +88,13 @@ GGUF_FALLBACK = "ggml-org"
 OVERHEAD = 1.05
 # The sim's share of a tier a model may take (catalog-sim.sh headroom()).
 SHARE = {"osx": 0.70, "linux": 0.90}
+# Quants taken beside the sim's, where none the sim chose ships: the one
+# GGUF of a model that one node of the tier below the model's own holds, so
+# it is placeable on one machine as well as across two (api/placements.hl).
+# ggml-org's DeepSeek-V4-Flash-0731 ships BF16, MXFP4 (155 GB, as large as
+# the fp8 weights), Q2_K (117 GB) and Q2_K_S (99 GB): Q2_K_S alone fits a
+# 128 GB DGX Spark.
+EXTRA_QUANTS = {"deepseek-ai/DeepSeek-V4-Flash-0731": ["Q2_K_S"]}
 # What a safetensors variant lists besides its weights: top-level settings and
 # tokenizer files, in the extensions the recipe contract allows.
 SETTINGS = re.compile(r"^[A-Za-z0-9._-]+\.(json|txt|model|tiktoken|jinja)$")
@@ -165,6 +172,10 @@ def picks():
         p = out[model][row["quant"]]
         p["mem_gb"] = max(p["mem_gb"], float(row["mem GB"]))
         p["uses"].add((os_name, int(row["tier GB"]), row["class"]))
+    for model, quants in EXTRA_QUANTS.items():
+        if model in out:
+            for q in quants:
+                out[model][q]  # taken, used at no tier the sim named
     return out
 
 

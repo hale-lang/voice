@@ -1,0 +1,486 @@
+// Links between nodes (protocol.yaml `Link`): two machines cabled to each
+// other, each declaring its end in its capabilities (its own interfaces and
+// addresses, from its operator's file on the machine), so a model can be
+// placed across the two (placements.hl). Two nodes are a pair when each
+// declares the other. Before a model is placed across a pair, its link is
+// checked: each node is assigned its rank of an NCCL all-reduce over the
+// link (`Assignment.link_checks`) and reports what it measured
+// (`reportLinkCheck`). A check is the fleet's state, never configuration,
+// so it records no change.
+
+/// Where a check's ranks meet on rank 0's address.
+const LINK_CHECK_PORT: Int = 29500;
+
+/// Where a placement's ranks meet across a link: the rendezvous port of
+/// NVIDIA's guide to serving vLLM across two DGX Sparks.
+const SPAN_PORT: Int = 29501;
+
+/// The bus bandwidth under which a link that passed is `degraded`, in
+/// bytes a second: 10 GB/s, a tenth of what a DGX Spark pair's 200 Gb/s
+/// link carries (about 21 to 24 GB/s for an all-reduce, as published).
+const LINK_DEGRADED_BYTES: Int = 10000000000;
+
+/// How long a check waits for its ranks to report, in seconds: time for
+/// a node to pull the image and for its rank to wait on the other's.
+const LINK_CHECK_SECONDS: Int = 1800;
+
+/// `LinkCheck.status`.
+type LinkCheckStatus = enum { running, passed, failed };
+
+fn link_check_status_name(v: LinkCheckStatus) -> String {
+    return match v {
+        LinkCheckStatus::running -> "running",
+        LinkCheckStatus::passed -> "passed",
+        LinkCheckStatus::failed -> "failed"
+    };
+}
+
+/// `LinkCheck` (openapi.yaml): a check of the link between two nodes.
+type LinkCheck {
+    id: String;
+    nodes: bounded[String; 2];
+    status: LinkCheckStatus;
+    has_reason: Bool = false;
+    reason: String = "";
+    has_bus_bytes_per_second: Bool = false;
+    bus_bytes_per_second: Int = 0;
+    // passed, under `LINK_DEGRADED_BYTES`
+    degraded: Bool;
+    started_at: Time;
+    has_finished_at: Bool = false;
+    finished_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// `NodeLink` (openapi.yaml): one link a node declared, as the coordinator
+/// sees it.
+type NodeLink {
+    peer: String;
+    paired: Bool;
+    has_check: Bool = false;
+    check: LinkCheck = no_check();
+}
+
+/// No check: what a link never checked holds.
+fn no_check() -> LinkCheck {
+    return LinkCheck {
+        id: "",
+        status: LinkCheckStatus::running,
+        degraded: false,
+        started_at: `1970-01-01T00:00:00Z`,
+    };
+}
+
+/// `checkNodeLink`'s path.
+type NodeLinkRef { node: String; peer: String; }
+
+type NodeLinks { items: bounded[NodeLink; 4]; }
+
+/// One RDMA device's IOMMU domain, as its machine says it.
+type IommuDomain { hca: String = ""; domain: String = ""; }
+
+/// `LinkCheckResult` (protocol.yaml): what a node's rank measured.
+type LinkCheckResult {
+    id: String = "";
+    ok: Bool = false;
+    has_bus_bytes_per_second: Bool = false;
+    bus_bytes_per_second: Int = 0;
+    has_reason: Bool = false;
+    reason: String = "";
+    iommu: bounded[IommuDomain; 4];
+}
+
+/// A node's rank of a check, as its assignment carries it
+/// (`LinkCheckJob`).
+type LinkJob {
+    id: String = "";
+    peer: String = "";
+    rank: Int = 0;
+    master_addr: String = "";
+    master_port: Int = 0;
+    image: String = "";
+}
+
+type LinkJobs { items: bounded[LinkJob; 4]; }
+
+/// The ports a node's capabilities declare to `peer`, as their JSON list;
+/// "" when it declares no link to it.
+@bounded_by(capabilities)
+fn link_ports(capabilities: String, peer: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "links"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "peer") == peer {
+            let ports = std::str::trim(std::json::find_field_raw(it.element, "ports"));
+            if std::str::starts_with(ports, "[") && !std::json::array_first(ports).done {
+                return ports;
+            }
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// The address of the first of `ports`, the one two nodes meet on.
+fn first_address(ports: String) -> String {
+    let it = std::json::array_first(ports);
+    if it.done { return ""; }
+    return std::json::find_string_field(it.element, "address");
+}
+
+/// The peers a node's capabilities declare links to, one a line.
+@bounded_by(capabilities)
+fn link_peers(capabilities: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 64 };
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "links"));
+    while !it.done {
+        out.append_str(std::json::find_string_field(it.element, "peer") + "\n");
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// The newest check of the link between `a` and `b`, whichever is rank 0;
+/// `present` false when none was run.
+@bounded_by(rows)
+fn latest_check(rows: st::LinkCheckRows, a: String, b: String) -> st::LinkCheckRow {
+    for r in rows.rows {
+        if (r.node_a == a && r.node_b == b) || (r.node_a == b && r.node_b == a) { return r; }
+    }
+    return st::LinkCheckRow { };
+}
+
+/// A check as the api answers it, at `now`: `passed` once both ranks
+/// reported it right, `failed` once either reported it wrong or one has not
+/// reported within `LINK_CHECK_SECONDS`, `running` until then.
+fn link_check_of(r: st::LinkCheckRow, now: Time) -> LinkCheck {
+    let mut out = LinkCheck {
+        id: r.id,
+        status: LinkCheckStatus::running,
+        degraded: false,
+        started_at: r.created_at,
+    };
+    push(out.nodes, r.node_a) or discard;
+    push(out.nodes, r.node_b) or discard;
+    let has_a = len(r.result_a) > 0;
+    let has_b = len(r.result_b) > 0;
+    let ok_a = has_a && std::json::find_bool_field(r.result_a, "ok");
+    let ok_b = has_b && std::json::find_bool_field(r.result_b, "ok");
+    if (has_a && !ok_a) || (has_b && !ok_b) || (has_a && has_b) {
+        out.status = if ok_a && ok_b { LinkCheckStatus::passed } else { LinkCheckStatus::failed };
+        out.has_reason = true;
+        out.reason = rank_said(r.node_a, r.result_a) + "; " + rank_said(r.node_b, r.result_b);
+        let at_a = reported_at(r.result_a);
+        let at_b = reported_at(r.result_b);
+        out.has_finished_at = true;
+        out.finished_at = if std::time::nanos(at_a) > std::time::nanos(at_b) { at_a } else { at_b };
+        if ok_a && std::json::string_field(r.result_a, "bus_bytes_per_second").kind == "number" {
+            out.has_bus_bytes_per_second = true;
+            out.bus_bytes_per_second = std::json::find_int_field(
+                r.result_a,
+                "bus_bytes_per_second",
+            );
+        }
+        // a sum that is right over a slow link passes, and says so: GPUDirect
+        // RDMA is not there on every machine (GB10 has none), so NCCL may
+        // stage through host memory
+        if out.status == LinkCheckStatus::passed
+            && (!out.has_bus_bytes_per_second || out.bus_bytes_per_second < LINK_DEGRADED_BYTES)
+        {
+            out.degraded = true;
+            out.reason = out.reason + "; degraded: "
+                + (
+                    if out.has_bus_bytes_per_second {
+                        gb(out.bus_bytes_per_second) + "/s"
+                    } else {
+                        "no bandwidth"
+                    }
+                ) + " measured, under the " + gb(LINK_DEGRADED_BYTES) + "/s voice expects"
+                + translating(r.node_a, r.result_a) + translating(r.node_b, r.result_b);
+        }
+        return out;
+    }
+    let waited = (std::time::nanos(now) - std::time::nanos(r.created_at)) / 1000000000;
+    if waited > LINK_CHECK_SECONDS {
+        out.status = LinkCheckStatus::failed;
+        out.has_reason = true;
+        out.reason = "node " + (if has_a { r.node_b } else { r.node_a })
+            + " did not report its rank within thirty minutes";
+        out.has_finished_at = true;
+        out.finished_at = std::time::from_nanos(
+            std::time::nanos(r.created_at) + LINK_CHECK_SECONDS * 1000000000,
+        );
+    }
+    return out;
+}
+
+/// Why a slow link may be slow, from what rank `node` said of its RDMA
+/// devices' IOMMU domains (`result`): those behind a translating IOMMU,
+/// which takes every access they make through its page tables, and how a
+/// machine is booted not to; "" when none is.
+@bounded_by(result)
+fn translating(node: String, result: String) -> String {
+    let mut hcas = "";
+    let mut domain = "";
+    let mut it = std::json::array_first(std::json::find_field_raw(result, "iommu"));
+    while !it.done {
+        let d = std::json::find_string_field(it.element, "domain");
+        if len(d) > 0 && d != "identity" {
+            let hca = std::json::find_string_field(it.element, "hca");
+            hcas = if len(hcas) > 0 { hcas + ", " + hca } else { hca };
+            domain = d;
+        }
+        it = std::json::array_next(it);
+    }
+    if len(hcas) == 0 { return ""; }
+    return "; node " + node + "'s RDMA devices (" + hcas + ") are behind a translating IOMMU ("
+        + domain + "): boot it with iommu.passthrough=1";
+}
+
+/// What a rank said, for a check's reason: `<node>: <its reason>`.
+fn rank_said(node: String, result: String) -> String {
+    if len(result) == 0 { return node + ": not reported"; }
+    let said = std::json::find_string_field(result, "reason");
+    let ok = std::json::find_bool_field(result, "ok");
+    return node + ": "
+        + (if len(said) > 0 { said } else if ok { "ran it right" } else { "failed" });
+}
+
+/// When a rank's result was reported, as the api wrote it in.
+fn reported_at(result: String) -> Time {
+    if len(result) == 0 { return `1970-01-01T00:00:00Z`; }
+    return std::time::parse_time(
+        std::json::find_string_field(result, "reported_at"),
+    ) or `1970-01-01T00:00:00Z`;
+}
+
+/// Why the link between `a` and `b` cannot carry a model now, "" when its
+/// latest check passed.
+fn pair_link_problem(rows: st::LinkCheckRows, a: String, b: String, now: Time) -> String {
+    let r = latest_check(rows, a, b);
+    if !r.present {
+        return "the link between " + a + " and " + b
+            + " has not been checked: check it first (POST /admin/v1/nodes/" + a + "/links/" + b
+            + "/check)";
+    }
+    let c = link_check_of(r, now);
+    if c.status == LinkCheckStatus::passed { return ""; }
+    if c.status == LinkCheckStatus::running {
+        return "the link between " + a + " and " + b + " is being checked (" + c.id
+            + "): place it once the check has passed";
+    }
+    return "the link between " + a + " and " + b + " failed its latest check (" + c.id + "): "
+        + c.reason;
+}
+
+/// The ranks of checks node `node` is to run at `now`: those it has a rank
+/// in, still running, that it has not reported.
+@bounded_by(rows)
+fn link_jobs(rows: st::LinkCheckRows, node: String, now: Time) -> LinkJobs {
+    let mut out = LinkJobs { };
+    for r in rows.rows {
+        let rank = if r.node_a == node { 0 } else if r.node_b == node { 1 } else { -1 };
+        if rank < 0 { continue; }
+        if (rank == 0 && len(r.result_a) > 0) || (rank == 1 && len(r.result_b) > 0) { continue; }
+        if link_check_of(r, now).status != LinkCheckStatus::running { continue; }
+        push(
+            out.items,
+            LinkJob {
+                id: r.id,
+                peer: if rank == 0 { r.node_b } else { r.node_a },
+                rank: rank,
+                master_addr: r.master_addr,
+                master_port: LINK_CHECK_PORT,
+                image: r.image,
+            },
+        ) or discard;
+    }
+    return out;
+}
+
+fn link_jobs_json(jobs: LinkJobs) -> String {
+    let out = st::JsonList { };
+    for j in jobs.items {
+        out.add(
+            "{\"id\": " + jq(j.id) + ", \"peer\": " + jq(j.peer) + ", \"rank\": "
+                + to_string(j.rank) + ", \"master_addr\": " + jq(j.master_addr)
+                + ", \"master_port\": " + to_string(j.master_port) + ", \"image\": "
+                + jq(j.image) + "}",
+        );
+    }
+    return out.text();
+}
+
+/// The links node `node` declared (`capabilities`), each with whether its
+/// peer declares one back and its latest check.
+fn node_links(
+    store: st::Store,
+    node: String,
+    capabilities: String
+) -> NodeLinks fallible(st::StoreError) {
+    let mut out = NodeLinks { };
+    let peers = link_peers(capabilities);
+    if len(peers) == 0 { return out; }
+    let rows = store.link_checks() or raise;
+    let now = now_seconds();
+    let mut rest = peers;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let peer = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        let f = store.fleet(peer) or raise;
+        let mut l = NodeLink {
+            peer: peer,
+            paired: f.present && len(link_ports(f.capabilities, node)) > 0,
+        };
+        let r = latest_check(rows, node, peer);
+        if r.present {
+            l.has_check = true;
+            l.check = link_check_of(r, now);
+        }
+        push(out.items, l) or discard;
+    }
+    return out;
+}
+
+fn link_check_json(c: LinkCheck) -> String {
+    let nodes = st::JsonList { };
+    for n in c.nodes {
+        nodes.add(jq(n));
+    }
+    return "{\"id\": " + jq(c.id) + ", \"nodes\": [" + nodes.text() + "], \"status\": "
+        + jq(link_check_status_name(c.status))
+        + (if c.has_reason { ", \"reason\": " + jq(c.reason) } else { "" })
+        + (
+            if c.has_bus_bytes_per_second {
+                ", \"bus_bytes_per_second\": " + to_string(c.bus_bytes_per_second)
+            } else {
+                ""
+            }
+        ) + ", \"degraded\": " + jbool(c.degraded) + ", \"started_at\": " + jtime(c.started_at)
+        + (if c.has_finished_at { ", \"finished_at\": " + jtime(c.finished_at) } else { "" })
+        + "}";
+}
+
+fn node_links_json(links: NodeLinks) -> String {
+    let out = st::JsonList { };
+    for l in links.items {
+        out.add(
+            "{\"peer\": " + jq(l.peer) + ", \"paired\": " + jbool(l.paired)
+                + (if l.has_check { ", \"check\": " + link_check_json(l.check) } else { "" })
+                + "}",
+        );
+    }
+    return out.text();
+}
+
+/// The image a check of a link between nodes of `hw` runs in: the
+/// runtime's among `rts` that spans nodes and runs on their platform and
+/// accelerator, as `<image>@<digest>`; "" for none.
+@bounded_by(rts)
+fn spanning_image(rts: RuntimeList, hw: String) -> String {
+    let os = std::json::find_string_field(hw, "os");
+    let arch = std::json::find_string_field(hw, "arch");
+    let accel = accelerator_kinds(hw);
+    for r in rts.data {
+        if !r.has_multi_node || r.artifact.kind != ArtifactKind::container { continue; }
+        if !std::str::contains(accel, "," + runtime_accelerator_name(r.accelerator) + ",") {
+            continue;
+        }
+        for p in r.platforms {
+            if host_os_name(p.os) == os && host_arch_name(p.arch) == arch {
+                return r.artifact.image + "@" + r.artifact.digest;
+            }
+        }
+    }
+    return "";
+}
+
+/// Why two nodes' hardware cannot be one pair, "" when it can: the same
+/// platform and the same accelerators.
+fn pair_hardware_problem(a: String, hw_a: String, b: String, hw_b: String) -> String {
+    let pa = std::json::find_string_field(hw_a, "os") + "/"
+        + std::json::find_string_field(hw_a, "arch");
+    let pb = std::json::find_string_field(hw_b, "os") + "/"
+        + std::json::find_string_field(hw_b, "arch");
+    if pa != pb {
+        return "node " + a + " is " + pa + " and node " + b + " is " + pb
+            + ": a model spans two nodes of one platform";
+    }
+    if accelerator_kinds(hw_a) != accelerator_kinds(hw_b) {
+        return "node " + a + " has " + accelerators_said(hw_a) + " and node " + b + " has "
+            + accelerators_said(hw_b) + ": a model spans two nodes of the same accelerators";
+    }
+    return "";
+}
+
+/// `checkNodeLink` (nodes.hl `Nodes.check_link`), inside the admin plane's
+/// turn: both nodes assigned their rank of a check of the link between
+/// them, `a` rank 0, in the image of a runtime among `usable` that spans
+/// nodes; one running is answered as it is.
+fn check_link_in(
+    store: st::Store,
+    link: Link,
+    usable: RuntimeList,
+    a: String,
+    b: String
+) -> LinkCheck fallible(CtlError) {
+    let na = store.node(a) or fail store_down(err);
+    if !na.present { fail missing("no node " + a); }
+    let nb = store.node(b) or fail store_down(err);
+    if !nb.present { fail missing("no node " + b); }
+    if a == b { fail bad("a node has no link to itself", "peer"); }
+    let now = now_seconds();
+    can_run_rank(store, na, now) or raise;
+    can_run_rank(store, nb, now) or raise;
+    let fa = store.fleet(a) or fail store_down(err);
+    let fb = store.fleet(b) or fail store_down(err);
+    let ports = link_ports(fa.capabilities, b);
+    if len(ports) == 0 { fail bad("node " + a + " declares no link to " + b, "peer"); }
+    if len(link_ports(fb.capabilities, a)) == 0 {
+        fail bad("node " + b + " declares no link to " + a, "peer");
+    }
+    let hw_a = std::str::trim(std::json::find_field_raw(fa.capabilities, "hardware"));
+    let hw_b = std::str::trim(std::json::find_field_raw(fb.capabilities, "hardware"));
+    if len(hw_a) == 0 || len(hw_b) == 0 {
+        fail bad("a node of the pair has declared no hardware", "node");
+    }
+    let unlike = pair_hardware_problem(a, hw_a, b, hw_b);
+    if len(unlike) > 0 { fail bad(unlike, "peer"); }
+    let image = spanning_image(usable, hw_a);
+    if len(image) == 0 {
+        fail bad(
+            "no runtime that spans nodes runs on " + std::json::find_string_field(hw_a, "os") + "/"
+                + std::json::find_string_field(hw_a, "arch") + " with " + accelerators_said(hw_a)
+                + ", so nothing would run across the link",
+            "node",
+        );
+    }
+    let rows = store.link_checks() or fail store_down(err);
+    let latest = latest_check(rows, a, b);
+    if latest.present && link_check_of(latest, now).status == LinkCheckStatus::running {
+        return link_check_of(latest, now);
+    }
+    let row = st::LinkCheckRow {
+        id: "lc-" + to_string(std::time::nanos(now) / 1000000) + "-" + a + "-" + b,
+        node_a: a,
+        node_b: b,
+        created_at: now,
+        master_addr: first_address(ports),
+        image: image,
+        present: true,
+    };
+    store.insert_link_check(row) or fail store_down(err);
+    tell_assignment(store, link, a) or fail store_down(err);
+    tell_assignment(store, link, b) or fail store_down(err);
+    return link_check_of(row, now);
+}
+
+/// A node that can run its rank now: not revoked, and up.
+fn can_run_rank(store: st::Store, n: st::NodeRow, now: Time) -> Bool fallible(CtlError) {
+    if n.revoked { fail bad("node " + n.id + " is revoked", "node"); }
+    let status = node_status(store, n, now) or fail store_down(err);
+    if status != "up" {
+        fail bad("node " + n.id + " is " + status + ", so it cannot run its rank", "node");
+    }
+    return true;
+}

@@ -1707,6 +1707,7 @@ Schema: [RuntimeCreate](#schema-runtimecreate)
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
 | `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
+| `load_format` | string, one of `fastsafetensors` |  | How its server reads a model's weights, when its image ships a loader faster than the server's default; left out, the server's default. A fact of the image, not a setting: the node starts every seat of the runtime with it, on one node and on each rank across two. `fastsafetensors`: vLLM's `--load-format fastsafetensors`, which the image must ship (the package `fastsafetensors`); it reads the files straight to the GPU rather than through lazily mapped pages, 6.8 s for gpt-oss-120b's 65 GB on a DGX Spark where the default took 376 s, with the same output and memory. Only `vllm`'s. |  |
 
 Responses:
 
@@ -4209,6 +4210,7 @@ Type: object
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
 | `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
+| `load_format` | string, one of `fastsafetensors` |  | How its server reads a model's weights, when its image ships a loader faster than the server's default; left out, the server's default. A fact of the image, not a setting: the node starts every seat of the runtime with it, on one node and on each rank across two. `fastsafetensors`: vLLM's `--load-format fastsafetensors`, which the image must ship (the package `fastsafetensors`); it reads the files straight to the GPU rather than through lazily mapped pages, 6.8 s for gpt-oss-120b's 65 GB on a DGX Spark where the default took 376 s, with the same output and memory. Only `vllm`'s. |  |
 
 <a id="schema-runtime"></a>
 

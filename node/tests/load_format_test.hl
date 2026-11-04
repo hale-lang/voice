@@ -1,0 +1,125 @@
+// A vLLM seat reads its weights with the loader its runtime's image ships
+// (`load_format`), on one node and on each rank across two; a runtime that
+// does not say, and any other server, start as they always did.
+import ".." as node;
+
+const VLLM: String = "{\"id\": \"vllm-26.09\", \"server\": \"vllm\", \"formats\": [\"safetensors\"], \"accelerator\": \"cuda\", \"artifact\": {\"kind\": \"container\", \"image\": \"nvcr.io/nvidia/vllm\", \"digest\": \"sha256:5577\"}, \"multi_node\": \"mp\", \"load_format\": \"fastsafetensors\"}";
+
+fn main() {
+    // ---- what the runtime says ---------------------------------------------------
+    std::test::assert_eq_str(
+        node::load_format(VLLM),
+        "fastsafetensors",
+        "vllm-26.09's image ships fastsafetensors",
+    );
+    std::test::assert_eq_str(
+        node::load_format(
+            "{\"id\": \"vllm-27.01\", \"server\": \"vllm\", \"formats\": [\"safetensors\"]}",
+        ),
+        "",
+        "a vLLM runtime that does not say keeps vLLM's default",
+    );
+    std::test::assert_eq_str(
+        node::load_format("{\"server\": \"llama-server\", \"load_format\": \"fastsafetensors\"}"),
+        "",
+        "llama-server has no such loader",
+    );
+    std::test::assert_eq_str(
+        node::load_format("{\"server\": \"vllm\", \"load_format\": \"x\\n--trust-remote-code\"}"),
+        "",
+        "nor is any other value handed to vLLM",
+    );
+
+    // ---- on one node --------------------------------------------------------------
+    let one = node::server_args(
+        "vllm",
+        "/models",
+        "/models/config.json",
+        8080,
+        "0.0.0.0",
+        "gpt-oss-120b",
+        "0.75",
+        0,
+        node::load_format(VLLM),
+    );
+    std::test::assert_eq_str(
+        one,
+        "vllm\nserve\n/models\n--host\n0.0.0.0\n--port\n8080\n--served-model-name\ngpt-oss-120b\n--gpu-memory-utilization\n0.75\n--max-model-len\nauto\n--load-format\nfastsafetensors",
+        "a seat on one node reads its weights with fastsafetensors",
+    );
+    let argv = node::container_argv(
+        "voice.spark.oss",
+        "spark",
+        9000,
+        "/data/models/oss",
+        "/data/blobs",
+        "--gpus\nall\n",
+        "",
+        "nvcr.io/nvidia/vllm@sha256:5577",
+        one,
+    );
+    std::test::assert(
+        std::str::ends_with(
+            argv,
+            "nvcr.io/nvidia/vllm@sha256:5577\nvllm\nserve\n/models\n--host\n0.0.0.0\n--port\n8080\n--served-model-name\ngpt-oss-120b\n--gpu-memory-utilization\n0.75\n--max-model-len\nauto\n--load-format\nfastsafetensors",
+        ),
+        "as the server's own argument, after its image: " + argv,
+    );
+    std::test::assert(
+        !std::str::contains(
+            node::server_args("vllm", "/models", "/models/c", 8080, "0.0.0.0", "m", "", 0, ""),
+            "--load-format",
+        ),
+        "a runtime that does not say: no flag",
+    );
+    std::test::assert_eq_str(
+        node::server_args(
+            "llama-server",
+            "/m",
+            "/m/x.gguf",
+            9001,
+            "127.0.0.1",
+            "qwen",
+            "",
+            4096,
+            "",
+        ),
+        "-m\n/m/x.gguf\n--host\n127.0.0.1\n--port\n9001\n--alias\nqwen\n-c\n4096",
+        "llama-server starts as it did",
+    );
+
+    // ---- across two nodes: each rank loads its shard ------------------------------
+    let leader = "{\"size\": 2, \"rank\": 0, \"peer\": \"flare\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    let follower = "{\"size\": 2, \"rank\": 1, \"peer\": \"spark\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    for part in [leader, follower] {
+        let rank = std::json::find_int_field(part, "rank");
+        let ranked = node::span_container_argv(
+            "voice.n.oss",
+            "n",
+            "/data/models/oss",
+            "/data/blobs",
+            "",
+            "",
+            "nvcr.io/nvidia/vllm@sha256:5577",
+            node::server_args(
+                "vllm",
+                "/models",
+                "/models/config.json",
+                9000,
+                "127.0.0.1",
+                "gpt-oss-120b",
+                "0.75",
+                0,
+                node::load_format(VLLM),
+            ) + node::span_args(part),
+        );
+        std::test::assert(
+            std::str::contains(
+                ranked,
+                "\n--max-model-len\nauto\n--load-format\nfastsafetensors\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n"
+                    + to_string(rank) + "\n",
+            ),
+            "rank " + to_string(rank) + " reads its shard with fastsafetensors: " + ranked,
+        );
+    }
+}

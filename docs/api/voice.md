@@ -331,7 +331,7 @@ Schema: [ChatCompletionRequest](#schema-chatcompletionrequest)
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
-| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
+| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
 | `tool_choice` | any |  |  |  |
 | `response_format` | object |  |  |  |
 | `metadata` | [Metadata](#schema-metadata) |  |  |  |
@@ -3553,7 +3553,7 @@ Type: object
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
-| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
+| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
 | `tool_choice` | any |  |  |  |
 | `response_format` | object |  |  |  |
 | `metadata` | [Metadata](#schema-metadata) |  |  |  |
@@ -3652,7 +3652,7 @@ Type: object
 | `voice.available` | boolean | yes | True when at least one enabled seat on a connected node serves it, spending an account this key may spend, and its account has headroom. |  |
 | `voice.contract` | string, one of `generative`, `decision` |  | What it answers (`CatalogModel.contract`); a decision model answers only a structured request. |  |
 | `voice.capabilities` | object |  | What a seat that could serve this key carries through to the model. |  |
-| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server, or the static engine's tool-call drill. False under vLLM until voice starts it with a tool-call parser, and for the claude CLI. |  |
+| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server, one under vLLM whose variant names its tool-call parser (`RecipeVariant.tool_call_parser`), or the static engine's tool-call drill. False under vLLM for a variant that names none, and for the claude CLI. |  |
 
 <a id="schema-modellist"></a>
 
@@ -4187,6 +4187,7 @@ Type: object
 | `kv_cache_dtype` | string, one of `fp8` |  | The KV cache its server must keep for these weights, when they are served from no other: a fact of the weights, not a setting. DeepSeek-V4's fp8 weights are, as vLLM serves them (its `fp8_ds_mla` layout). A node starts vLLM with `--kv-cache-dtype` set to it, on one node and on each rank across two. Only a safetensors variant names one; left out, the server's default. |  |
 | `kv_bytes_per_token` | integer |  | What a token of context costs this variant's seat in KV cache, in bytes, as its server counts it: in the cache it keeps for these weights (`kv_cache_dtype`), for a conversation of 131072 tokens, the most a placement gives one, with what each conversation holds besides however long it is. A placement sizes its seat's prompt cache by it; left out, by the recipe's `kv_bytes_per_token`. | ≥ 1; ≤ 16777216 |
 | `reasoning_parser` | string, one of `deepseek_v4` |  | The parser vLLM takes the model's thinking out of its answer with, as vLLM names it, for a model vLLM does not choose one for itself: its thinking then comes as `reasoning_content`, not inline in its answer. A node starts vLLM with `--reasoning-parser` set to it. Only a safetensors variant names one; llama-server parses its own. |  |
+| `tool_call_parser` | string, one of `deepseek_v4`, `openai`, `glm47`, `qwen3_coder`, `granite4`, `hermes` |  | The parser vLLM reads the model's tool calls out of its answer with, as vLLM names it: a fact of the model, how it writes a call. A node starts vLLM with `--enable-auto-tool-choice` and `--tool-call-parser` set to it, on one node and on each rank across two, and the variant's seats carry `tools`; a vLLM seat whose variant names none refuses a request that lists them. Only a safetensors variant names one; llama-server applies the model's own chat template. |  |
 
 <a id="schema-runtimecreate"></a>
 
@@ -6741,9 +6742,11 @@ One engine the node offers: a kind of engine with the login it runs
 under. Two logins for one CLI are two engines. How the login is held
 is local to the node and is never declared.
 
-Whether a seat carries `tools` is derived from its kind, not
-declared: an `openai-compatible` seat does, a `static` seat only
-with its `tool_call` drill, any other kind never. A `serve` whose
+Whether a seat carries `tools` is derived from its kind and its
+config, not declared: an `openai-compatible` seat does; a `managed`
+seat under llama-server does, and one under vLLM when its variant
+names a `tool_call_parser`, which the node starts vLLM with; a
+`static` seat only with its `tool_call` drill; any other never. A `serve` whose
 request lists `tools` for a seat that does not carry them is
 `refused` before any event, a seat failure, so the coordinator
 offers the request to the next seat.

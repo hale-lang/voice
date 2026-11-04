@@ -89,7 +89,9 @@ protocol) and `openai-compatible`
 `base_url`, `model`, an optional `api_key_vault` and a price per million
 tokens, 0 for a local server; see `OpenAICompatibleConfig` in the
 protocol). The `openai-compatible` kind carries tools (a request's
-`tools` go upstream, its tool calls come back); `static` does only as
+`tools` go upstream, its tool calls come back); `managed` does under
+llama-server, and under vLLM when the seat's variant names a
+`tool_call_parser`; `static` does only as
 its `tool_call` drill and `claude-cli` never, and a request with `tools`
 is refused there so the coordinator tries another seat. When the file changes, the node declares its capabilities again,
 and the coordinator re-checks the assignment against them.
@@ -448,9 +450,11 @@ One engine the node offers: a kind of engine with the login it runs
 under. Two logins for one CLI are two engines. How the login is held
 is local to the node and is never declared.
 
-Whether a seat carries `tools` is derived from its kind, not
-declared: an `openai-compatible` seat does, a `static` seat only
-with its `tool_call` drill, any other kind never. A `serve` whose
+Whether a seat carries `tools` is derived from its kind and its
+config, not declared: an `openai-compatible` seat does; a `managed`
+seat under llama-server does, and one under vLLM when its variant
+names a `tool_call_parser`, which the node starts vLLM with; a
+`static` seat only with its `tool_call` drill; any other never. A `serve` whose
 request lists `tools` for a seat that does not carry them is
 `refused` before any event, a seat failure, so the coordinator
 offers the request to the next seat.

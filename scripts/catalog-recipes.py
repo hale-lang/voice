@@ -42,11 +42,13 @@ tokens (default 32768, at most the model's own), from the base model's
 config: full-attention layers hold every token, sliding-window layers their
 window, linear-attention, Mamba and conv layers no per-token cache, and MLA
 its compressed latent. The server must then serve at most CONTEXT tokens.
-A safetensors variant whose architecture vLLM must be told how to serve
-(VLLM_SERVES: DeepSeek-V4) says so: the KV cache it keeps
-(`kv_cache_dtype`), what a token costs a seat in it (`kv_bytes_per_token`,
-which its memory_bytes counts and its placement's fit takes), and the
-parser for the model's thinking (`reasoning_parser`).
+A safetensors variant whose model vLLM must be told how to serve
+(VLLM_SERVES: DeepSeek-V4, and the models that call tools) says so, by
+architecture or by model: the KV cache it keeps (`kv_cache_dtype`), what a
+token costs a seat in it (`kv_bytes_per_token`, which its memory_bytes
+counts and its placement's fit takes), the parser for the model's thinking
+(`reasoning_parser`), and the parser for its tool calls
+(`tool_call_parser`).
 
 Every pick a variant cannot serve (at that tier's budget, on that platform:
 osx needs GGUF) is added to docs/catalog-blocked.tsv, which catalog-sim.sh
@@ -386,7 +388,7 @@ def kv_per_token(cfg):
     return per_token * layers
 
 
-# What the pinned vLLM must be told to serve a model's safetensors weights, by architecture, as each such variant
+# What the pinned vLLM must be told to serve a model's safetensors weights, by architecture or model, as each such variant
 # says it (api/recipes.hl): the KV cache it keeps (`kv_cache_dtype`, --kv-cache-dtype), what a token of context
 # costs a seat in that cache (`kv_bytes_per_token`, the variant's own, which its memory_bytes counts and its
 # placement's fit takes over the recipe's 16-bit figure), and the parser that takes the model's thinking out of its
@@ -401,8 +403,22 @@ def kv_per_token(cfg):
 # which vLLM counts per request at the longest it serves (v1/core/kv_cache_utils.py). For a conversation of
 # 131072 tokens, the most a placement gives one (api/placements.hl CONVERSATION_MAX), that is 17.2 KB a token:
 # vllm-26.09 across two Sparks took 804,884 tokens in 12.88 GiB a rank (17,183 bytes a token) at that length.
+#
+# The tool-call parser (`tool_call_parser`, --enable-auto-tool-choice --tool-call-parser) is the one vLLM v0.29.0
+# registers for the model (vllm/tool_parsers/__init__.py), which its docs (docs/features/tool_calling.md) or the
+# publisher's card name: a seat whose variant names one carries `tools`, and one without refuses them. Keyed by
+# architecture where every model of it calls tools one way, and by the publisher's repo where models of one
+# architecture differ (Qwen3-Coder's XML calls, where other Qwen3 MoE and Next models use hermes). DeepSeek-V4 needs
+# no chat template besides: vLLM picks its own tokenizer mode for the architecture (config/model.py), whose
+# renderer writes the tools into the prompt. A model with no parser here (Phi-4-mini-reasoning, the Phi MoEs,
+# OpenReasoning-Nemotron, the R1 distill, MiMo's Qwen3.5 distill) is served without tools.
 VLLM_SERVES = {"DeepseekV4ForCausalLM": {"kv_cache_dtype": "fp8", "kv_bytes_per_token": 17200,
-                                          "reasoning_parser": "deepseek_v4"}}
+                                          "reasoning_parser": "deepseek_v4", "tool_call_parser": "deepseek_v4"},
+               "GptOssForCausalLM": {"tool_call_parser": "openai"},
+               "Glm4MoeLiteForCausalLM": {"tool_call_parser": "glm47"},
+               "GraniteMoeHybridForCausalLM": {"tool_call_parser": "granite4"},
+               "Qwen/Qwen3-Coder-30B-A3B-Instruct": {"tool_call_parser": "qwen3_coder"},
+               "Qwen/Qwen3-Coder-Next": {"tool_call_parser": "qwen3_coder"}}
 
 
 def need_bytes(files, kv):
@@ -517,8 +533,8 @@ def safetensors_variant(model, sha, info, cfg, quants, registry, types, row, kv)
     qc = cfg.get("quantization_config") or {}
     dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or "bf16")
     precision = qc.get("quant_method") or {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(dtype, dtype)
-    # how vLLM must serve the weights, when the architecture needs telling, and what its cache costs then
-    serves = VLLM_SERVES.get(arch) or {}
+    # how vLLM must serve the weights, when the architecture or the model needs telling, and what its cache costs then
+    serves = {**(VLLM_SERVES.get(arch) or {}), **(VLLM_SERVES.get(model) or {})}
     if serves.get("kv_bytes_per_token"):
         kv = serves["kv_bytes_per_token"] * min(CONTEXT, native_context(cfg) or CONTEXT)
     mem = need_bytes([f for f in files if f["path"].endswith(".safetensors")], kv)

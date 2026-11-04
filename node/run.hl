@@ -317,6 +317,7 @@ locus Runner {
                         std::json::find_string_field(config, "model"), share,
                         served_tokens(config),
                         load_format(runtime),
+                        std::json::find_field_raw(config, "variant"),
                     ) + span_args(cluster),
                 )
             } else {
@@ -343,6 +344,7 @@ locus Runner {
                         std::json::find_string_field(config, "model"), share,
                         served_tokens(config),
                         load_format(runtime),
+                        std::json::find_field_raw(config, "variant"),
                     ),
                 )
             };
@@ -377,6 +379,7 @@ locus Runner {
                     std::json::find_string_field(config, "model"), share,
                     served_tokens(config),
                     load_format(runtime),
+                    std::json::find_field_raw(config, "variant"),
                 );
         }
         // started apart from the node, its output to a file of its own: sh
@@ -603,8 +606,10 @@ fn archive_program(dir: String, server: String) -> String {
 
 /// A server's arguments, one a line: the model it serves (a GGUF's first
 /// file, or the directory of a model of several), where it listens, the
-/// catalog model it goes by, and how it reads the weights (`load`, the
-/// runtime's `load_format`; "" for the server's default).
+/// catalog model it goes by, how it reads the weights (`load`, the
+/// runtime's `load_format`; "" for the server's default), and what its
+/// `variant` says vLLM must serve the weights with (`kv_cache_dtype`,
+/// `reasoning_parser`).
 fn server_args(
     server: String,
     dir: String,
@@ -614,7 +619,8 @@ fn server_args(
     name: String,
     share: String,
     tokens: Int,
-    load: String
+    load: String,
+    variant: String
 ) -> String {
     // the decision server: the placed weights (a release's files in
     // its own layout) and where it listens; the launcher in the runtime's
@@ -640,7 +646,12 @@ fn server_args(
             )
         // the loader its image ships, read straight to the GPU, where
         // vLLM's default maps the files and reads them a page at a time
-            + (if len(load) > 0 { "\n--load-format\n" + load } else { "" });
+            + (if len(load) > 0 { "\n--load-format\n" + load } else { "" })
+        // the cache the weights must be served from, and the parser that
+        // takes the model's thinking out of its answer, when the variant
+        // says
+            + vllm_flag("--kv-cache-dtype", kv_cache_dtype(variant))
+            + vllm_flag("--reasoning-parser", reasoning_parser(variant));
     }
     // llama-server keeps one prompt cache of `tokens` (served_tokens), which
     // its slots share: a conversation that comes back is restored from it
@@ -658,6 +669,30 @@ fn load_format(runtime: String) -> String {
     if std::json::find_string_field(runtime, "server") != "vllm" { return ""; }
     let load = std::json::find_string_field(runtime, "load_format");
     return if load == "fastsafetensors" { load } else { "" };
+}
+
+/// The KV cache dtype a seat's server keeps, as its variant says
+/// (`RecipeVariant.kv_cache_dtype`): `fp8`, which vLLM serves DeepSeek-V4's
+/// fp8 weights from and no other cache; "" otherwise, so a variant that
+/// does not say keeps its server's default, and no other value reaches a
+/// server's arguments. llama-server is never given it (`server_args`).
+fn kv_cache_dtype(variant: String) -> String {
+    let dtype = std::json::find_string_field(variant, "kv_cache_dtype");
+    return if dtype == "fp8" { dtype } else { "" };
+}
+
+/// The parser vLLM takes a model's thinking out of its answer with, as the
+/// seat's variant says (`RecipeVariant.reasoning_parser`): `deepseek_v4`;
+/// "" otherwise, so a variant that does not say keeps vLLM's default, and no
+/// other value reaches a server's arguments. llama-server is never given it.
+fn reasoning_parser(variant: String) -> String {
+    let parser = std::json::find_string_field(variant, "reasoning_parser");
+    return if parser == "deepseek_v4" { parser } else { "" };
+}
+
+/// `\n<flag>\n<value>`, or "" when there is no value.
+fn vllm_flag(flag: String, value: String) -> String {
+    return if len(value) > 0 { "\n" + flag + "\n" + value } else { "" };
 }
 
 /// The prompt cache, in tokens, a llama-server seat keeps, shared by the

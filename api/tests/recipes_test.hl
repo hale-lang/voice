@@ -31,6 +31,7 @@ fn main() {
     );
     variant_bounds();
     context_length();
+    kv_cache();
     // what follows holds one shipped recipe, fixture-1
     let shipped = line_with(every, "\"id\": \"fixture-1\"");
     std::test::assert(
@@ -319,6 +320,119 @@ fn context_length() {
         ),
         "a negative kv_bytes_per_token is refused",
     );
+}
+
+/// A variant says the KV cache its server must keep (`kv_cache_dtype`) and
+/// the parser that takes its thinking out of its answer (`reasoning_parser`),
+/// each from a closed set and for safetensors alone, and what a token costs
+/// its seat's cache (`kv_bytes_per_token`); one that says none has none.
+fn kv_cache() {
+    let head = "[{\"id\": \"safetensors-fp8\", \"format\": \"FORMAT\", \"quantization\": \"fp8\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/m\", \"revision\": \"0123456789abcdef0123456789abcdef01234567\"}, \"files\": [{\"path\": \"m.safetensors\", \"bytes\": 1, \"sha256\": \""
+        + std::str::repeat("a", 64) + "\"}], \"memory_bytes\": 2";
+    let st = std::str::replace(head, "FORMAT", "safetensors");
+    let kept = api::recipe_body(
+        "kv",
+        license(),
+        0,
+        88064,
+        "",
+        st
+            + ", \"reasoning_parser\": \"deepseek_v4\", \"kv_bytes_per_token\": 17200, \"kv_cache_dtype\": \"fp8\"}]",
+    );
+    std::test::assert(
+        std::str::contains(
+            kept,
+            "\"memory_bytes\": 2, \"kv_cache_dtype\": \"fp8\", \"kv_bytes_per_token\": 17200, \"reasoning_parser\": \"deepseek_v4\"}]",
+        )
+            && std::str::contains(kept, "}, \"kv_bytes_per_token\": 88064, \"variants\""),
+        "a variant keeps its cache dtype, its own cost a token beside the recipe's, and its reasoning parser: "
+            + kept,
+    );
+    let plain = api::recipe_body("kv", license(), 0, 0, "", st + "}]");
+    std::test::assert(
+        !std::str::contains(plain, "kv_cache_dtype") && !std::str::contains(plain, "kv_bytes")
+            && !std::str::contains(plain, "reasoning_parser"),
+        "a variant that says none has none: " + plain,
+    );
+    for bad in ["\"qwen3\"", "\"deepseek_v4\\n--trust-remote-code\"", "true", "\"\""] {
+        std::test::assert_eq_str(
+            api::recipe_body(
+                "kv",
+                license(),
+                0,
+                0,
+                "",
+                st + ", \"reasoning_parser\": " + bad + "}]",
+            ),
+            "!variants\tvariants[0].reasoning_parser is deepseek_v4",
+            "a reasoning parser voice does not name is refused: " + bad,
+        );
+    }
+    std::test::assert(
+        std::str::starts_with(
+            api::recipe_body(
+                "kv",
+                license(),
+                0,
+                0,
+                "",
+                std::str::replace(head, "FORMAT", "gguf")
+                    + ", \"reasoning_parser\": \"deepseek_v4\"}]",
+            ),
+            "!variants\tvariants[0].reasoning_parser is a safetensors",
+        ),
+        "a GGUF variant names no reasoning parser: llama-server parses its own",
+    );
+    for bad in [
+        "\"auto\"",
+        "\"fp8_e5m2\"",
+        "\"FP8\"",
+        "\"fp8\\n--trust-remote-code\"",
+        "8",
+        "null",
+        "\"\"",
+    ] {
+        let refused = api::recipe_body(
+            "kv",
+            license(),
+            0,
+            0,
+            "",
+            st + ", \"kv_cache_dtype\": " + bad + "}]",
+        );
+        std::test::assert_eq_str(
+            refused,
+            "!variants\tvariants[0].kv_cache_dtype is fp8",
+            "a cache dtype voice does not name is refused: " + bad,
+        );
+    }
+    let gguf = api::recipe_body(
+        "kv",
+        license(),
+        0,
+        0,
+        "",
+        std::str::replace(head, "FORMAT", "gguf") + ", \"kv_cache_dtype\": \"fp8\"}]",
+    );
+    std::test::assert(
+        std::str::starts_with(gguf, "!variants\tvariants[0].kv_cache_dtype is a safetensors"),
+        "a GGUF variant names none: llama-server is not given one: " + gguf,
+    );
+    for bad in ["0", "-1", "16777217", "1.5", "\"3915\""] {
+        let refused = api::recipe_body(
+            "kv",
+            license(),
+            0,
+            0,
+            "",
+            st + ", \"kv_bytes_per_token\": " + bad + "}]",
+        );
+        std::test::assert_eq_str(
+            refused,
+            "!variants\tvariants[0].kv_bytes_per_token is 1 to 16777216 bytes",
+            "a variant's cost a token out of range is refused: " + bad,
+        );
+    }
 }
 
 /// files, and at most 45 KiB as JSON however few its files.

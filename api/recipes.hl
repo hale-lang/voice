@@ -530,7 +530,10 @@ fn recipe_param(refused: String) -> String {
 @bounded_by(v)
 fn variant_body(v: String, n: Int) -> String {
     let at = "variants[" + to_string(n - 1) + "]";
-    let keys = only_keys(v, ",id,format,quantization,source,files,memory_bytes,");
+    let keys = only_keys(
+        v,
+        ",id,format,quantization,source,files,memory_bytes,kv_cache_dtype,kv_bytes_per_token,reasoning_parser,",
+    );
     if len(keys) > 0 { return "!variants\t" + at + " has no field " + keys; }
     let id = text_of(v, "id");
     if !slug(id, "_.-", true) {
@@ -567,6 +570,35 @@ fn variant_body(v: String, n: Int) -> String {
     }
     let memory = count_of(v, "memory_bytes");
     if memory < 1 { return "!variants\t" + at + ".memory_bytes is at least 1"; }
+    // the KV cache its server must keep, a fact of the weights (vLLM serves
+    // DeepSeek-V4's fp8 weights from an fp8 cache alone), from a closed set:
+    // it reaches a server's arguments (node/run.hl `server_args`)
+    let dtype_given = len(std::json::find_field_raw(v, "kv_cache_dtype")) > 0;
+    let dtype = text_of(v, "kv_cache_dtype");
+    if dtype_given && !kv_cache_dtype_known(dtype) {
+        return "!variants\t" + at + ".kv_cache_dtype is fp8";
+    }
+    if dtype_given && format != "safetensors" {
+        return "!variants\t" + at + ".kv_cache_dtype is a safetensors variant's, which vLLM serves";
+    }
+    // what a token of context costs its seat in that cache, as its server
+    // counts it
+    let kv_given = len(std::json::find_field_raw(v, "kv_bytes_per_token")) > 0;
+    let kv = count_of(v, "kv_bytes_per_token");
+    if kv_given && (kv < 1 || kv > KV_PER_TOKEN_MAX) {
+        return "!variants\t" + at + ".kv_bytes_per_token is 1 to 16777216 bytes";
+    }
+    // the parser vLLM takes the model's thinking out of its answer with, a
+    // fact of the model as vLLM names it, from a closed set as well
+    let parser_given = len(std::json::find_field_raw(v, "reasoning_parser")) > 0;
+    let parser = text_of(v, "reasoning_parser");
+    if parser_given && !reasoning_parser_known(parser) {
+        return "!variants\t" + at + ".reasoning_parser is deepseek_v4";
+    }
+    if parser_given && format != "safetensors" {
+        return "!variants\t" + at
+            + ".reasoning_parser is a safetensors variant's, which vLLM serves";
+    }
     let files = std::json::find_field_raw(v, "files");
     let fout = st::JsonList { };
     let mut k = 0;
@@ -600,7 +632,21 @@ fn variant_body(v: String, n: Int) -> String {
     return "{\"id\": " + jq(id) + ", \"format\": " + jq(format) + ", \"quantization\": " + jq(q)
         + ", \"source\": {\"hub\": \"huggingface\", \"repo\": " + jq(repo) + ", \"revision\": "
         + jq(revision) + "}, \"files\": [" + fout.text() + "], \"memory_bytes\": "
-        + to_string(memory) + "}";
+        + to_string(memory) + (if dtype_given { ", \"kv_cache_dtype\": " + jq(dtype) } else { "" })
+        + kv_field(kv_given, kv)
+        + (if parser_given { ", \"reasoning_parser\": " + jq(parser) } else { "" }) + "}";
+}
+
+/// A reasoning parser a variant may name (`RecipeVariant.reasoning_parser`),
+/// as vLLM names it.
+fn reasoning_parser_known(parser: String) -> Bool {
+    return parser == "deepseek_v4";
+}
+
+/// A KV cache dtype a variant may name (`RecipeVariant.kv_cache_dtype`):
+/// `fp8`, vLLM's own name for it.
+fn kv_cache_dtype_known(dtype: String) -> Bool {
+    return dtype == "fp8";
 }
 
 /// A string member's text; "" when it is absent or not a string.

@@ -1586,7 +1586,7 @@ Schema: [RecipeCreate](#schema-recipecreate)
 | `license.name` | string | yes |  | length ≥ 1; length ≤ 64 |
 | `license.url` | string (uri) | yes |  | length ≤ 512 |
 | `context_length` | integer |  | The longest context, in tokens, the model is made for (its config's `max_position_embeddings`). A catalog model made from the recipe takes it as its `context_length` unless one is given, and a seat is never started with more. What a seat actually serves can be less; each seat reports its own (`SeatState.context`). | ≥ 1; ≤ 16777216 |
-| `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it. | ≥ 1; ≤ 16777216 |
+| `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it, unless its variant gives its own (`RecipeVariant.kv_bytes_per_token`). | ≥ 1; ≤ 16777216 |
 | `contract` | string, one of `generative`, `decision` |  | What a catalog model made from it answers (`CatalogModel.contract`), unless the model says otherwise. Left out, `generative`. |  |
 | `variants` | array of [RecipeVariant](#schema-recipevariant) | yes |  | items ≥ 1; items ≤ 8 |
 
@@ -4104,7 +4104,7 @@ Type: object
 | `license.name` | string | yes |  | length ≥ 1; length ≤ 64 |
 | `license.url` | string (uri) | yes |  | length ≤ 512 |
 | `context_length` | integer |  | The longest context, in tokens, the model is made for (its config's `max_position_embeddings`). A catalog model made from the recipe takes it as its `context_length` unless one is given, and a seat is never started with more. What a seat actually serves can be less; each seat reports its own (`SeatState.context`). | ≥ 1; ≤ 16777216 |
-| `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it. | ≥ 1; ≤ 16777216 |
+| `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it, unless its variant gives its own (`RecipeVariant.kv_bytes_per_token`). | ≥ 1; ≤ 16777216 |
 | `contract` | string, one of `generative`, `decision` |  | What a catalog model made from it answers (`CatalogModel.contract`), unless the model says otherwise. Left out, `generative`. |  |
 | `variants` | array of [RecipeVariant](#schema-recipevariant) | yes |  | items ≥ 1; items ≤ 8 |
 
@@ -4184,6 +4184,9 @@ Type: object
 | `files[].bytes` | integer | yes |  | ≥ 1 |
 | `files[].sha256` | string | yes |  | pattern `^[0-9a-f]{64}$` |
 | `memory_bytes` | integer | yes | What serving the variant needs, weights and the engine's own, before any context. | ≥ 1 |
+| `kv_cache_dtype` | string, one of `fp8` |  | The KV cache its server must keep for these weights, when they are served from no other: a fact of the weights, not a setting. DeepSeek-V4's fp8 weights are, as vLLM serves them (its `fp8_ds_mla` layout). A node starts vLLM with `--kv-cache-dtype` set to it, on one node and on each rank across two. Only a safetensors variant names one; left out, the server's default. |  |
+| `kv_bytes_per_token` | integer |  | What a token of context costs this variant's seat in KV cache, in bytes, as its server counts it: in the cache it keeps for these weights (`kv_cache_dtype`), for a conversation of 131072 tokens, the most a placement gives one, with what each conversation holds besides however long it is. A placement sizes its seat's prompt cache by it; left out, by the recipe's `kv_bytes_per_token`. | ≥ 1; ≤ 16777216 |
+| `reasoning_parser` | string, one of `deepseek_v4` |  | The parser vLLM takes the model's thinking out of its answer with, as vLLM names it, for a model vLLM does not choose one for itself: its thinking then comes as `reasoning_content`, not inline in its answer. A node starts vLLM with `--reasoning-parser` set to it. Only a safetensors variant names one; llama-server parses its own. |  |
 
 <a id="schema-runtimecreate"></a>
 

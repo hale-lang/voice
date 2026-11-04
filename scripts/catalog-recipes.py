@@ -42,6 +42,11 @@ tokens (default 32768, at most the model's own), from the base model's
 config: full-attention layers hold every token, sliding-window layers their
 window, linear-attention, Mamba and conv layers no per-token cache, and MLA
 its compressed latent. The server must then serve at most CONTEXT tokens.
+A safetensors variant whose architecture vLLM must be told how to serve
+(VLLM_SERVES: DeepSeek-V4) says so: the KV cache it keeps
+(`kv_cache_dtype`), what a token costs a seat in it (`kv_bytes_per_token`,
+which its memory_bytes counts and its placement's fit takes), and the
+parser for the model's thinking (`reasoning_parser`).
 
 Every pick a variant cannot serve (at that tier's budget, on that platform:
 osx needs GGUF) is added to docs/catalog-blocked.tsv, which catalog-sim.sh
@@ -381,6 +386,25 @@ def kv_per_token(cfg):
     return per_token * layers
 
 
+# What the pinned vLLM must be told to serve a model's safetensors weights, by architecture, as each such variant
+# says it (api/recipes.hl): the KV cache it keeps (`kv_cache_dtype`, --kv-cache-dtype), what a token of context
+# costs a seat in that cache (`kv_bytes_per_token`, the variant's own, which its memory_bytes counts and its
+# placement's fit takes over the recipe's 16-bit figure), and the parser that takes the model's thinking out of its
+# answer (`reasoning_parser`, --reasoning-parser).
+#
+# DeepSeek-V4 (vLLM v0.29.0, models/deepseek_v4/attention.py): its fp8 weights are served from vLLM's fp8_ds_mla
+# cache alone, vLLM refusing `auto` ("DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache") and on SM12x (a DGX
+# Spark's GB10) any cache but fp8. Each of its 41 compressed layers keeps a 584-byte state (448 B of fp8 NoPE, 128 B
+# of bf16 RoPE, 8 B of scales) per compress_ratio (4 or 128) tokens, each ratio-4 layer's indexer a 132-byte key
+# per state, in 256-token pages padded to 576 bytes: 1,002,240 bytes a block, 3915 a token. Every request holds
+# besides that its sliding windows' and its compressors' blocks, a fixed ~1.7k of those blocks however long it is,
+# which vLLM counts per request at the longest it serves (v1/core/kv_cache_utils.py). For a conversation of
+# 131072 tokens, the most a placement gives one (api/placements.hl CONVERSATION_MAX), that is 17.2 KB a token:
+# vllm-26.09 across two Sparks took 804,884 tokens in 12.88 GiB a rank (17,183 bytes a token) at that length.
+VLLM_SERVES = {"DeepseekV4ForCausalLM": {"kv_cache_dtype": "fp8", "kv_bytes_per_token": 17200,
+                                          "reasoning_parser": "deepseek_v4"}}
+
+
 def need_bytes(files, kv):
     """Weights, buffers and the KV cache; a fifth more than the weights when the cache is not known."""
     size = sum(f["bytes"] for f in files)
@@ -493,13 +517,19 @@ def safetensors_variant(model, sha, info, cfg, quants, registry, types, row, kv)
     qc = cfg.get("quantization_config") or {}
     dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or "bf16")
     precision = qc.get("quant_method") or {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(dtype, dtype)
+    # how vLLM must serve the weights, when the architecture needs telling, and what its cache costs then
+    serves = VLLM_SERVES.get(arch) or {}
+    if serves.get("kv_bytes_per_token"):
+        kv = serves["kv_bytes_per_token"] * min(CONTEXT, native_context(cfg) or CONTEXT)
     mem = need_bytes([f for f in files if f["path"].endswith(".safetensors")], kv)
     fits = [t for t in linux if mem <= budget("linux", t)]
     if not fits:
         return None, f"safetensors: {precision} needs {mem / 1e9:.0f} GB, more than any linux tier it is picked for ({', '.join(map(str, linux))} GB)"
-    return {"id": f"safetensors-{precision}", "format": "safetensors", "quantization": precision,
-            "source": {"hub": "huggingface", "repo": model, "revision": sha},
-            "files": files, "memory_bytes": mem}, ""
+    variant = {"id": f"safetensors-{precision}", "format": "safetensors", "quantization": precision,
+               "source": {"hub": "huggingface", "repo": model, "revision": sha},
+               "files": files, "memory_bytes": mem}
+    variant.update(serves)
+    return variant, ""
 
 
 def served(v, o, t, q):

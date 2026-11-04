@@ -20,7 +20,12 @@ end-to-end check. A recipe's `context_length` is the longest context the
 model is made for, from its config (`max_position_embeddings`). Its
 `memory_bytes` provides for 32768 tokens of context, which is the most a
 llama.cpp seat serves (`node/run.hl`, `SERVED_CONTEXT`); each seat reports
-the context its server took.
+the context its server took. A safetensors variant vLLM must be told how to
+serve says so (`VLLM_SERVES` in the script): DeepSeek-V4's fp8 weights are
+served from an fp8 KV cache alone (`kv_cache_dtype`), at what a token costs
+in it (`kv_bytes_per_token`, the variant's own, which the fit takes over the
+recipe's 16-bit figure), with DeepSeek-V4's reasoning parser
+(`reasoning_parser`).
 
 <!-- recipes -->
 | Recipe | License | Variants (download) | Served by |

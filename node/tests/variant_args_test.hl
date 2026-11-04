@@ -1,0 +1,118 @@
+// A vLLM seat is started as its variant says the weights must be served,
+// on one node and on each rank across two: DeepSeek-V4's fp8 weights from
+// an fp8 KV cache alone (`kv_cache_dtype`), its thinking parsed out of its
+// answer (`reasoning_parser`). A variant that says neither, a value voice
+// does not name, and llama-server start as they always did.
+import ".." as node;
+
+const DSV4: String = "{\"id\": \"safetensors-fp8\", \"format\": \"safetensors\", \"quantization\": \"fp8\", \"files\": [{\"path\": \"config.json\", \"bytes\": 1888, \"sha256\": \"6c8f\"}], \"memory_bytes\": 175800000000, \"kv_cache_dtype\": \"fp8\", \"kv_bytes_per_token\": 17200, \"reasoning_parser\": \"deepseek_v4\"}";
+
+const PLAIN: String = "{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"quantization\": \"bf16\", \"files\": [{\"path\": \"config.json\", \"bytes\": 1888, \"sha256\": \"6c8f\"}], \"memory_bytes\": 16400000000}";
+
+const FLAGS: String = "\n--kv-cache-dtype\nfp8\n--reasoning-parser\ndeepseek_v4";
+
+fn vllm(variant: String) -> String {
+    return node::server_args(
+        "vllm",
+        "/models",
+        "/models/config.json",
+        8080,
+        "0.0.0.0",
+        "deepseek-v4-flash",
+        "0.75",
+        0,
+        "fastsafetensors",
+        variant,
+    );
+}
+
+fn main() {
+    // ---- what the variant says --------------------------------------------------
+    std::test::assert_eq_str(node::kv_cache_dtype(DSV4), "fp8", "DeepSeek-V4's fp8 says fp8");
+    std::test::assert_eq_str(
+        node::reasoning_parser(DSV4),
+        "deepseek_v4",
+        "and its reasoning parser",
+    );
+    std::test::assert_eq_str(node::kv_cache_dtype(PLAIN), "", "a variant that does not say: none");
+    std::test::assert_eq_str(node::reasoning_parser(PLAIN), "", "nor a parser");
+    for bad in [
+        "{\"kv_cache_dtype\": \"fp8\\n--trust-remote-code\", \"reasoning_parser\": \"deepseek_v4\\n--trust-remote-code\"}",
+        "{\"kv_cache_dtype\": \"auto\", \"reasoning_parser\": \"qwen3\"}",
+        "{\"kv_cache_dtype\": 8, \"reasoning_parser\": true}",
+    ] {
+        std::test::assert(
+            len(node::kv_cache_dtype(bad)) == 0 && len(node::reasoning_parser(bad)) == 0,
+            "no value voice does not name is handed to vLLM: " + bad,
+        );
+    }
+
+    // ---- on one node --------------------------------------------------------------
+    std::test::assert_eq_str(
+        vllm(DSV4),
+        "vllm\nserve\n/models\n--host\n0.0.0.0\n--port\n8080\n--served-model-name\ndeepseek-v4-flash\n--gpu-memory-utilization\n0.75\n--max-model-len\nauto\n--load-format\nfastsafetensors"
+            + FLAGS,
+        "a seat on one node keeps an fp8 cache and parses the model's thinking",
+    );
+    std::test::assert(
+        !std::str::contains(vllm(PLAIN), "--kv-cache-dtype")
+            && !std::str::contains(vllm(PLAIN), "--reasoning-parser"),
+        "a variant that says neither: no flag",
+    );
+    std::test::assert_eq_str(
+        node::server_args(
+            "llama-server",
+            "/m",
+            "/m/x.gguf",
+            9001,
+            "127.0.0.1",
+            "qwen",
+            "",
+            4096,
+            "",
+            DSV4,
+        ),
+        "-m\n/m/x.gguf\n--host\n127.0.0.1\n--port\n9001\n--alias\nqwen\n-c\n4096",
+        "llama-server is never given them",
+    );
+
+    // ---- across two nodes: each rank is started the same --------------------------
+    let leader = "{\"size\": 2, \"rank\": 0, \"peer\": \"flare\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    let follower = "{\"size\": 2, \"rank\": 1, \"peer\": \"spark\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    for part in [leader, follower] {
+        let rank = to_string(std::json::find_int_field(part, "rank"));
+        let ranked = node::span_container_argv(
+            "voice.n.dsv4",
+            "n",
+            "/data/models/dsv4",
+            "/data/blobs",
+            "",
+            "",
+            "nvcr.io/nvidia/vllm@sha256:5577",
+            vllm(DSV4) + node::span_args(part),
+        );
+        std::test::assert(
+            std::str::contains(
+                ranked,
+                "\n--load-format\nfastsafetensors" + FLAGS
+                    + "\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n" + rank + "\n",
+            ),
+            "rank " + rank + " keeps an fp8 cache and parses its thinking: " + ranked,
+        );
+        let plain = node::span_container_argv(
+            "voice.n.bf16",
+            "n",
+            "/data/models/bf16",
+            "/data/blobs",
+            "",
+            "",
+            "nvcr.io/nvidia/vllm@sha256:5577",
+            vllm(PLAIN) + node::span_args(part),
+        );
+        std::test::assert(
+            !std::str::contains(plain, "--kv-cache-dtype")
+                && !std::str::contains(plain, "--reasoning-parser"),
+            "rank " + rank + " of a variant that says neither: no flag",
+        );
+    }
+}

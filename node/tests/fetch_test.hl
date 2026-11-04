@@ -2,6 +2,11 @@
 // redirects to a CDN and is kept only once its sha256 matches; one resumed
 // from a part already on disk; one whose bytes are not the pin's, refused
 // and let go; a hub that answers 404; and what a managed config needs.
+// Then a large file, fetched in ranges over the lanes: the ranges make the
+// file; a server that does not honour `Range` sends it whole; a lane that
+// stalls, one far slower than its peers, and a range cut off each have
+// their range handed again, what they wrote kept; and a fetch cut off
+// resumes with the ranges its sidecar holds, fetching none of them again.
 import ".." as node;
 
 const REVISION: String = "0123456789abcdef0123456789abcdef01234567";
@@ -24,10 +29,90 @@ fn managed(path: String, digest: String) -> String {
         + sha("img") + "\"}}}";
 }
 
+/// A large file's bytes: numbers, so a range written at the wrong offset
+/// does not verify.
+@unbounded
+fn counted() -> String {
+    let mut s = "";
+    let mut b = 0;
+    while b < 300 {
+        s = s + block(b);
+        b = b + 1;
+    }
+    return s;
+}
+
+/// The numbers of block `b`: a hundred of them.
+fn block(b: Int) -> String {
+    let mut s = "";
+    let mut i = 0;
+    while i < 100 {
+        s = s + to_string(b * 100 + i) + ",";
+        i = i + 1;
+    }
+    return s;
+}
+
+/// What the hub was asked for: a file's range, [start, end).
+type Ask { file: String = ""; start: Int = 0; end: Int = 0; }
+
+topic Asked { payload: Ask; }
+
+/// A range's head, then its body: all at once, paced (`every` ms between
+/// pieces of `step` bytes), or cut off after `upto` bytes; sent on the
+/// connection the handler took over.
+fn send_range(
+    fd: Int,
+    body: String,
+    from: Int,
+    to: Int,
+    size: Int,
+    step: Int,
+    every: Int,
+    upto: Int
+) {
+    std::io::tcp::set_send_timeout(fd, 5s) or discard;
+    let head = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + to_string(to - from)
+        + "\r\nContent-Range: bytes " + to_string(from) + "-" + to_string(to - 1) + "/"
+        + to_string(size) + "\r\nConnection: close\r\n\r\n";
+    std::io::tcp::send_fd(fd, std::bytes::from_string(head)) or discard;
+    let mut at = from;
+    let last = if upto > 0 && from + upto < to { from + upto } else { to };
+    while at < last {
+        let n = if step > 0 && at + step < last { step } else { last - at };
+        let ok = send_piece(fd, body[at..(at + n)]);
+        if !ok { break; }
+        at = at + n;
+        if every > 0 { std::time::sleep(every * 1ms); }
+    }
+    if upto > 0 && last < to {
+        // a stall: the connection held, nothing more sent
+        std::time::sleep(3s);
+    }
+    std::io::tcp::close_fd(fd);
+}
+
+fn send_piece(fd: Int, b: String) -> Bool {
+    std::io::tcp::send_fd(fd, std::bytes::from_string(b)) or { return false; };
+    return true;
+}
+
 /// The hub: `/resolve/` answers 302 to the CDN, as Hugging Face does; the
-/// CDN takes a `Range` and answers 206 from where it starts.
+/// CDN takes a `Range` and answers 206 with it. The large files' CDN tells
+/// what it was asked for, and serves `plain.big` whole whatever is asked,
+/// `stall.big`'s and `cut.big`'s first range only half (holding the one,
+/// closing the other), `slow.big`'s first range at a trickle and the rest
+/// paced.
 locus Hub {
+    params {
+        seen: String = "";
+        body: String = counted();
+    }
+    bus { publish Asked; }
     fn handle(req: std::http::Request) -> std::http::Response {
+        if std::str::starts_with(req.path, "/cdn/") && std::str::ends_with(req.path, ".big") {
+            return self.big(req);
+        }
         let resolve = "/org/model/resolve/" + REVISION + "/";
         if std::str::starts_with(req.path, resolve) {
             let file = req.path[len(resolve)..len(req.path)];
@@ -54,22 +139,74 @@ locus Hub {
         }
         return std::http::Response { status: 404, body: "" };
     }
+
+    @unbounded
+    fn big(req: std::http::Request) -> std::http::Response {
+        let file = req.path[5..len(req.path)];
+        let body = self.body;
+        let size = len(body);
+        let range = std::http::header(req, "Range");
+        if file == "plain.big" || !std::str::starts_with(range, "bytes=") {
+            Asked <- Ask { file: file, start: 0, end: size };
+            return std::http::Response { status: 200, body: body };
+        }
+        let dash = std::str::index_of(range, "-");
+        let from = std::str::parse_int(range[6..dash]) or 0;
+        let to = (std::str::parse_int(range[(dash + 1)..len(range)]) or(size - 1)) + 1;
+        Asked <- Ask { file: file, start: from, end: to };
+        let first = from == 0 && !std::str::contains(self.seen, file + "\n");
+        if from == 0 { self.seen = self.seen + file + "\n"; }
+        let fd = req.conn_fd;
+        if file == "stall.big" && first {
+            send_range(fd, body, from, to, size, 0, 0, (to - from) / 2);
+        } else if file == "cut.big" && first {
+            // the body cut off: half sent, then the connection closed
+            std::io::tcp::set_send_timeout(fd, 5s) or discard;
+            let head = "HTTP/1.1 206 Partial Content\r\nContent-Length: " + to_string(to - from)
+                + "\r\nContent-Range: bytes " + to_string(from) + "-" + to_string(to - 1) + "/"
+                + to_string(size) + "\r\nConnection: close\r\n\r\n";
+            send_piece(fd, head + body[from..(from + (to - from) / 2)]);
+            std::io::tcp::close_fd(fd);
+        } else if file == "slow.big" && first {
+            send_range(fd, body, from, to, size, 64, 200, 0);
+        } else if file == "slow.big" {
+            send_range(fd, body, from, to, size, 512, 20, 0);
+        } else {
+            send_range(fd, body, from, to, size, 0, 0, 0);
+        }
+        return std::http::Response { status: 0, body: "", takeover_raw: true };
+    }
 }
 
 main locus App {
     params {
         srv: std::http::Server = std::http::Server { port: 0, handler: Hub { } };
+        lanes: node::Lane = node::Lane { };
+        data: String = "/tmp/voice-fetch-test-" + to_string(std::process::pid());
+        // the fetch's own, owned here so what the lanes say reaches it
+        f: node::Blobs = node::Blobs { data: self.data };
+        // what the hub was asked for, a "file start end" line each
+        asked: String = "";
     }
-    placement { srv: cooperative(pool = io) where async_io; }
+    bus { subscribe Asked as on_asked; }
+    placement {
+        srv: cooperative(pool = io) where async_io;
+        lanes: pinned(replicas = 8);
+    }
+    @unbounded
+    fn on_asked(a: Ask) {
+        self.asked = self.asked + a.file + " " + to_string(a.start) + " " + to_string(a.end) + "\n";
+    }
     run() {
         let port = std::io::tcp::__local_port(self.srv.listen_fd);
         let base = "http://127.0.0.1:" + to_string(port);
-        let data = "/tmp/voice-fetch-test-" + to_string(std::process::pid());
+        let data = self.data;
         std::io::fs::mkdir(data) or discard;
         std::io::fs::mkdir(data + "/blobs") or discard;
         let file = "{\"max_in_flight\": 1, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"local\": {\"hub_url\": \""
             + base + "/\"}}]}";
-        let f = node::Blobs { data: data, file: file };
+        self.f.file = file;
+        let f = self.f;
         let hub = base + "/org/model/resolve/" + REVISION + "/";
         std::test::assert_eq_str(
             node::hub_url(file),
@@ -160,8 +297,166 @@ main locus App {
             len(node::managed_problem("{\"placement\": \"p\"}")) > 0,
             "one with nothing to fetch",
         );
+        self.ranges(hub, data);
         std::process::run("rm\n-rf\n" + data) or discard;
     }
+
+    /// A large file, fetched in ranges over the lanes: shrunk so a test
+    /// takes a second, the rules voice's own.
+    @unbounded
+    fn ranges(hub: String, data: String) {
+        let f = self.f;
+        f.ranged = 1000;
+        f.piece = 16384;
+        f.window_ms = 150;
+        f.stall_ms = 600;
+        f.report_ms = 50;
+        let big = counted();
+        let n = len(big);
+        let digest = sha(big);
+        let pieces = (n + 16383) / 16384;
+
+        // the ranges make the file: each asked for once, the whole verified
+        self.asked = "";
+        let got = f.blob("s", hub + "a.big", "a.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(got, "", "a large file is fetched in ranges and verified");
+        std::test::assert_eq_int(asks(self.asked, "a.big"), pieces, "one ask a range");
+        std::test::assert(
+            !std::io::fs::file_exists(data + "/blobs/" + digest + ".ranges"),
+            "its sidecar let go once it is kept",
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a server that does not honour Range: the file sent whole
+        self.asked = "";
+        let plain = f.blob("s", hub + "plain.big", "plain.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(plain, "", "a server without Range sends it whole, verified");
+        std::test::assert(
+            std::io::fs::file_exists(data + "/blobs/" + digest),
+            "and it is kept",
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a lane that stalls half way: dropped, the rest of its range
+        // asked for again from where it stopped
+        self.asked = "";
+        let before = f.dropped;
+        let stalled = f.blob("s", hub + "stall.big", "stall.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(stalled, "", "a stalled lane's range is handed again");
+        std::test::assert(f.dropped > before, "the stalled lane dropped");
+        std::test::assert(
+            std::str::contains(self.asked, "stall.big 8192 16384\n"),
+            "its range asked for again from half way: " + self.asked,
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a lane far slower than its peers: dropped at a window's end
+        self.asked = "";
+        let slow_before = f.dropped;
+        let t0 = std::time::monotonic_ns();
+        let slow = f.blob("s", hub + "slow.big", "slow.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(slow, "", "a straggler's range is handed again");
+        std::test::assert(f.dropped > slow_before, "the straggler dropped");
+        std::test::assert(
+            asks_from(self.asked, "slow.big", 0) == 1
+                && asks_below(self.asked, "slow.big", 16384) == 2,
+            "its range asked for again, from where it got to: " + self.asked,
+        );
+        // the trickle alone takes 16384 / 64 * 0.2 s
+        std::test::assert(
+            std::time::monotonic_ns() - t0 < 20000000000,
+            "and the file is not held to the straggler's pace",
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a range cut off: what came is kept, the rest asked for again
+        self.asked = "";
+        let cut = f.blob("s", hub + "cut.big", "cut.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(cut, "", "a range cut off is asked for again");
+        std::test::assert(
+            std::str::contains(self.asked, "cut.big 8192 16384\n"),
+            "from where it was cut: " + self.asked,
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a fetch cut off: its sidecar holds ranges 1 and 3, the part their
+        // bytes and garbage elsewhere; those ranges are not asked for again
+        let part = data + "/blobs/" + digest + ".part";
+        let w = std::io::file::open(part, "w") or { return; };
+        w.write_bytes(std::bytes::from_string(std::str::repeat("x", 16384) + big[16384..32768]
+                + std::str::repeat("y", 16384) + big[49152..65536])) or discard;
+        std::io::fs::write_file(data + "/blobs/" + digest + ".ranges", "16384 32768\n49152 65536\n")
+        or discard;
+        self.asked = "";
+        let resumed = f.blob("s", hub + "a.big", "a.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(resumed, "", "a fetch cut off resumes, the whole verified");
+        std::test::assert_eq_int(asks(self.asked, "a.big"), pieces - 2, "its ranges kept");
+        std::test::assert(
+            !std::str::contains(self.asked, "a.big 16384 ")
+                && !std::str::contains(self.asked, "a.big 49152 "),
+            "none of them asked for again: " + self.asked,
+        );
+        std::io::fs::unlink(data + "/blobs/" + digest) or discard;
+
+        // a part fetched whole and cut off, with no sidecar: its start kept
+        let p2 = std::io::file::open(part, "w") or { return; };
+        p2.write_bytes(std::bytes::from_string(big[0..20000])) or discard;
+        self.asked = "";
+        let prefix = f.blob("s", hub + "a.big", "a.big", digest, n, true, 0, n);
+        std::test::assert_eq_str(prefix, "", "a part fetched whole resumes in ranges");
+        std::test::assert(
+            std::str::contains(self.asked, "a.big 20000 36384\n")
+                && !std::str::contains(self.asked, "a.big 0 "),
+            "from where it ends: " + self.asked,
+        );
+        std::test::assert_eq_int(
+            node::partial(data + "/blobs", sha("none"), 10),
+            0,
+            "no part, nothing held",
+        );
+    }
+}
+
+/// How many times `file` was asked for.
+@unbounded
+fn asks(asked: String, file: String) -> Int {
+    return asks_below(asked, file, 1000000000);
+}
+
+/// How many times `file` was asked for from `start`.
+@unbounded
+fn asks_from(asked: String, file: String, start: Int) -> Int {
+    return count_lines(asked, file + " " + to_string(start) + " ");
+}
+
+/// How many times `file` was asked for from below `limit`.
+@unbounded
+fn asks_below(asked: String, file: String, limit: Int) -> Int {
+    let mut n = 0;
+    let mut rest = asked;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        if std::str::starts_with(line, file + " ") {
+            let tail = line[(len(file) + 1)..len(line)];
+            let sp = std::str::index_of(tail, " ");
+            if (std::str::parse_int(tail[0..sp]) or 0) < limit { n = n + 1; }
+        }
+    }
+    return n;
+}
+
+@unbounded
+fn count_lines(asked: String, prefix: String) -> Int {
+    let mut n = 0;
+    let mut rest = asked;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        if std::str::starts_with(rest[0..nl], prefix) { n = n + 1; }
+        rest = rest[(nl + 1)..len(rest)];
+    }
+    return n;
 }
 
 fn main() { App { }; }

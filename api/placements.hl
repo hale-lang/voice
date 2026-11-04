@@ -8,9 +8,11 @@
 // engine, its config the chosen variant and runtime, pinned
 // (protocol.yaml `ManagedConfig`); the node fetches and verifies them.
 //
-// One node today, the leader, which holds the seat; the fit is judged on
-// the set, so a model split across nodes changes the judging, not the
-// shape.
+// A placement is on one node, its leader, which holds the seat; or on two
+// cabled to each other (links.hl), the model split by tensor parallelism
+// across their GPUs: the leader's seat serves it, and a seat of the same id
+// on the follower runs the other half (protocol.yaml `ClusterPart`). The fit
+// is judged on each node, which holds its share.
 
 type PlacementRef { placement: String; }
 
@@ -19,7 +21,7 @@ type PlacementCreate {
     id: String;
     model: String;
     account: String = "";
-    nodes: bounded[String; 1];
+    nodes: bounded[String; 2];
     has_variant: Bool = false;
     variant: String = "";
     has_runtime: Bool = false;
@@ -51,13 +53,16 @@ type Placement {
     id: String = "";
     model: String = "";
     account: String = "";
-    nodes: bounded[String; 1];
+    nodes: bounded[String; 2];
     recipe: String = "";
     variant: String = "";
     runtime: String = "";
     chosen_by: PlacementChooser = PlacementChooser::coordinator;
     leader: String = "";
     seat: String = "";
+    // across two nodes, the seat on its follower
+    has_follower_seat: Bool = false;
+    follower_seat: String = "";
     fit: bounded[VariantFit; 8];
     // the prompt cache its seat keeps, in tokens, and what the placement
     // holds of its node's memory for models: its variant and that cache.
@@ -128,7 +133,7 @@ locus Placements {
         let mut held = 0;
         let mut serving = "\n";
         for p in existing.rows {
-            if !p.removed && std::json::find_string_field(p.body, "leader") == node {
+            if !p.removed && places_on(p.body, node) {
                 held = held + (self.held_by(p) or raise);
                 serving = serving + std::json::find_string_field(p.body, "recipe") + "\t" + p.id
                     + "\n";
@@ -150,28 +155,119 @@ locus Placements {
                 s.reason = "node " + node
                     + " has declared no hardware, so nothing can be judged to fit it";
             } else {
-                s = self.suggest_one(cat, os, tier, hw, usable, room, held, serving) or raise;
+                s = self.suggest_one(
+                    cat,
+                    os,
+                    tier,
+                    0,
+                    judging_add(Judging { }, node, hw, held),
+                    usable,
+                    serving,
+                ) or raise;
             }
             push(out.data, s) or discard;
+        }
+        if declared {
+            out = self.suggest_pair(out, node, f.capabilities, hw, held, usable, cats) or raise;
         }
         return out;
     }
 
-    /// Category `cat`'s suggestion for a machine of `os` at `tier`: the
-    /// first of its picks, from that tier down, that is placed there
-    /// already, or that the operator has and that fits what is left.
+    /// `out` with what voice would place across node `node` and the first
+    /// node it is cabled to that could take a model with it (each declares
+    /// the link, of the same platform and accelerators, the link's latest
+    /// check passed), a model per category: the picks of the pair's tier
+    /// (their memory together) above the node's own, judged on the two as
+    /// a placement across them is, by a runtime that spans nodes.
+    fn suggest_pair(
+        out: NodeSuggestions,
+        node: String,
+        capabilities: String,
+        hw: String,
+        held: Int,
+        usable: RuntimeList,
+        cats: String
+    ) -> NodeSuggestions fallible(CtlError) {
+        let mut next = out;
+        let checks = self.store.link_checks() or fail store_down(err);
+        let existing = self.store.placements() or fail store_down(err);
+        let mut spanning = RuntimeList { };
+        for r in usable.data {
+            if r.has_multi_node { push(spanning.data, r) or discard; }
+        }
+        let mut peers = link_peers(capabilities);
+        while len(peers) > 0 {
+            let nl = std::str::index_of(peers, "\n");
+            let peer = peers[0..nl];
+            peers = peers[(nl + 1)..len(peers)];
+            let pn = self.store.node(peer) or fail store_down(err);
+            if !pn.present || pn.revoked { continue; }
+            let pf = self.store.fleet(peer) or fail store_down(err);
+            let phw = std::str::trim(std::json::find_field_raw(pf.capabilities, "hardware"));
+            if len(link_ports(pf.capabilities, node)) == 0 || len(phw) == 0
+                || !std::json::valid_object(phw)
+            {
+                continue;
+            }
+            if len(pair_hardware_problem(node, hw, peer, phw)) > 0 { continue; }
+            if len(pair_link_problem(checks, node, peer, now_seconds())) > 0 { continue; }
+            // what the peer's placements hold, and what is placed across
+            // the two already
+            let mut held_p = 0;
+            let mut serving = "\n";
+            for p in existing.rows {
+                if p.removed { continue; }
+                if places_on(p.body, peer) { held_p = held_p + (self.held_by(p) or raise); }
+                if places_on(p.body, node) && places_on(p.body, peer) {
+                    serving = serving + std::json::find_string_field(p.body, "recipe") + "\t"
+                        + p.id + "\n";
+                }
+            }
+            let own = node_tier(std::json::find_int_field(hw, "memory_bytes"));
+            let tier = node_tier(
+                std::json::find_int_field(hw, "memory_bytes")
+                    + std::json::find_int_field(phw, "memory_bytes"),
+            );
+            let judging = judging_add(judging_add(Judging { }, node, hw, held), peer, phw, held_p);
+            let mut pair = PairSuggestions { peer: peer, has_tier_gb: tier > 0, tier_gb: tier };
+            let mut rest = cats;
+            while len(rest) > 0 {
+                let cnl = std::str::index_of(rest, "\n");
+                let cat = rest[0..cnl];
+                rest = rest[(cnl + 1)..len(rest)];
+                let s = self.suggest_one(
+                    cat,
+                    std::json::find_string_field(hw, "os"),
+                    tier,
+                    own,
+                    judging,
+                    spanning,
+                    serving,
+                ) or raise;
+                push(pair.data, s) or discard;
+            }
+            next.has_pair = true;
+            next.pair = pair;
+            return next;
+        }
+        return next;
+    }
+
+    /// Category `cat`'s suggestion for nodes of `os` at `tier`: the first
+    /// of its picks, from that tier down to the one above `above`, that is
+    /// placed there already, or that the operator has and that fits what
+    /// is left on the nodes of `judging`.
     fn suggest_one(
         cat: String,
         os: String,
         tier: Int,
-        hw: String,
+        above: Int,
+        judging: Judging,
         usable: RuntimeList,
-        room: Int,
-        held: Int,
         serving: String
     ) -> NodeSuggestion fallible(CtlError) {
         let mut s = NodeSuggestion { category: cat };
-        let picks = picks_down(self.picks, os, cat, tier);
+        let picks = picks_above(picks_down(self.picks, os, cat, tier), above);
         if len(picks) == 0 {
             s.reason = "voice suggests no " + cat + " model for a " + os + " machine of "
                 + to_string(tier) + " GB yet";
@@ -206,12 +302,10 @@ locus Placements {
                 }
                 continue;
             }
-            let judged = judge_recipe(
+            let judged = judge_on(
                 recipe.variants.text,
-                hw,
+                judging,
                 usable,
-                room,
-                held,
                 recipe.contract == ModelContract::decision,
             );
             if judged.best < 0 {
@@ -291,7 +385,10 @@ locus Placements {
                 "id"
             );
         }
-        if count(c.nodes) != 1 { fail bad("`nodes` names one node, its leader", "nodes"); }
+        let parts = count(c.nodes);
+        if parts < 1 {
+            fail bad("`nodes` names its leader, and a follower to split the model across", "nodes");
+        }
         let m = self.store.model(c.model) or fail store_down(err);
         if !m.present || m.removed { fail bad("no model " + c.model + " in the catalog", "model"); }
         if len(m.recipe) == 0 {
@@ -302,38 +399,66 @@ locus Placements {
         }
         let recipe = self.recipes.get_in_gate(m.recipe) or raise;
         let leader = at(c.nodes, 0) or "";
-        let n = self.store.node(leader) or fail store_down(err);
-        if !n.present || n.revoked { fail bad("no node " + leader, "nodes"); }
-        let f = self.store.fleet(leader) or fail store_down(err);
-        let managed = managed_engine(f.capabilities);
-        if len(managed) == 0 {
-            fail bad(
-                "node " + leader + " offers no managed engine, so no model can be placed on it",
-                "nodes"
-            );
+        let follower = if parts == 2 { at(c.nodes, 1) or "" } else { "" };
+        if parts == 2 && follower == leader {
+            fail bad("`nodes` names node " + leader + " twice", "nodes");
         }
+        let lead = self.placeable(leader) or raise;
+        let follow = if parts == 2 { self.placeable(follower) or raise } else { Placeable { } };
         if len(c.account) == 0 {
             fail bad("`account` names the account the seat spends", "account");
         }
-        let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
-        if len(hw) == 0 || !std::json::valid_object(hw) {
-            fail bad(
-                "node " + leader + " has declared no hardware, so nothing can be judged to fit it",
-                "nodes"
-            );
-        }
+        let hw = self.hardware_of(leader, lead) or raise;
+        let hw_f = if parts == 2 { self.hardware_of(follower, follow) or raise } else { "" };
+        let where = if parts == 2 {
+            "nodes " + leader + " and " + follower
+        } else {
+            "node " + leader
+        };
         let existing = self.store.placements() or fail store_down(err);
-        // what the node's other placements hold of its memory for models
+        // what each node's other placements hold of its memory for models
         let mut held = 0;
+        let mut held_f = 0;
         for r in existing.rows {
-            if !r.removed && std::json::find_string_field(r.body, "leader") == leader {
-                if r.model == c.model {
-                    fail clash("model " + c.model + " is placed on node " + leader + " by " + r.id);
-                }
-                held = held + (self.held_by(r) or raise);
+            if r.removed { continue; }
+            let on_l = places_on(r.body, leader);
+            let on_f = parts == 2 && places_on(r.body, follower);
+            if !on_l && !on_f { continue; }
+            if r.model == c.model {
+                fail clash(
+                    "model " + c.model + " is placed on node "
+                        + (if on_l { leader } else { follower })
+                        + " by "
+                        + r.id,
+                );
             }
+            // one placement across nodes a node at a time: its ranks meet on
+            // the host's network, at voice's one rendezvous port
+            if parts == 2 && spans(r.body) {
+                fail clash(
+                    "node " + (if on_l { leader } else { follower }) + " takes part in placement "
+                        + r.id
+                        + " across nodes already, and a node takes part in one at a time",
+                );
+            }
+            if on_l { held = held + (self.held_by(r) or raise); }
+            if on_f { held_f = held_f + (self.held_by(r) or raise); }
         }
-        let room = std::json::find_int_field(hw, "model_memory_bytes") - held;
+        if parts == 2 {
+            let unlike = pair_hardware_problem(leader, hw, follower, hw_f);
+            if len(unlike) > 0 { fail bad(unlike, "nodes"); }
+            if len(link_ports(lead.capabilities, follower)) == 0 {
+                fail bad("node " + leader + " declares no link to " + follower, "nodes");
+            }
+            if len(link_ports(follow.capabilities, leader)) == 0 {
+                fail bad("node " + follower + " declares no link to " + leader, "nodes");
+            }
+            let checks = self.store.link_checks() or fail store_down(err);
+            let problem = pair_link_problem(checks, leader, follower, now_seconds());
+            if len(problem) > 0 { fail bad(problem, "nodes"); }
+        }
+        let mut judging = judging_add(Judging { }, leader, hw, held);
+        if parts == 2 { judging = judging_add(judging, follower, hw_f, held_f); }
 
         let mut out = Placement {
             id: c.id,
@@ -344,23 +469,30 @@ locus Placements {
             created_at: now_seconds()
         };
         push(out.nodes, leader) or discard;
+        if parts == 2 { push(out.nodes, follower) or discard; }
         let all = self.runtimes.usable_in_gate() or raise;
         let mut usable = RuntimeList { };
+        let mut named_any = false;
         for r in all.data {
-            if !c.has_runtime || r.id == c.runtime { push(usable.data, r) or discard; }
+            if !c.has_runtime || r.id == c.runtime {
+                named_any = true;
+                // across two nodes, only a runtime whose server spans them
+                if parts == 1 || r.has_multi_node { push(usable.data, r) or discard; }
+            }
         }
-        if c.has_runtime && count(usable.data) == 0 {
+        if c.has_runtime && !named_any {
             fail bad(
                 "no runtime " + c.runtime + ": voice ships none, nor has the operator allowed one",
                 "runtime"
             );
         }
-        let judged = judge_recipe(
+        if c.has_runtime && count(usable.data) == 0 {
+            fail bad("runtime " + c.runtime + " does not span nodes", "runtime");
+        }
+        let judged = judge_on(
             recipe.variants.text,
-            hw,
+            judging,
             usable,
-            room,
-            held,
             // the model's own contract, which may differ from its recipe's
             // default: it is what its requests are served as
             m.contract == "decision",
@@ -380,7 +512,7 @@ locus Placements {
             let chosen = at(out.fit, named) or VariantFit { };
             if !chosen.fits {
                 fail bad(
-                    "variant " + c.variant + " does not fit node " + leader + ": " + chosen.reason,
+                    "variant " + c.variant + " does not fit " + where + ": " + chosen.reason,
                     "variant"
                 );
             }
@@ -390,8 +522,7 @@ locus Placements {
         } else {
             if best < 0 {
                 fail bad(
-                    "no variant of recipe " + m.recipe + " fits node " + leader + ": "
-                        + reasons(out.fit),
+                    "no variant of recipe " + m.recipe + " fits " + where + ": " + reasons(out.fit),
                     "nodes",
                 );
             }
@@ -403,12 +534,13 @@ locus Placements {
 
         // its seat's prompt cache: room for CACHED conversations of the
         // model's context (at most CONVERSATION_MAX), from at most half the
-        // room the variant leaves, never less than the context it was
-        // fitted with
+        // room the variant leaves on the node with the least, never less
+        // than the context it was fitted with. Each node reserves its share
+        // of the variant and the whole cache (`part_need`)
         let variant = variant_body_of(recipe.variants.text, out.variant);
-        let need = std::json::find_int_field(variant, "memory_bytes");
+        let need = part_need(variant, parts);
         let pool = cache_pool(
-            room - footprint(need),
+            least_room(judging) - footprint(need),
             recipe.kv_bytes_per_token,
             recipe.context_length,
             need,
@@ -419,13 +551,123 @@ locus Placements {
         out.reserved_bytes = need
             + (pool - fitted_context(recipe.context_length)) * recipe.kv_bytes_per_token;
 
-        // the seat first: its own checks (the account, the node's room)
-        // refuse before anything is kept
+        // the seats first: their own checks (the account, the node's room)
+        // refuse before anything is kept; across two nodes, the leader's
+        // and then the follower's, each told its part
+        let master = if parts == 2 {
+            first_address(link_ports(lead.capabilities, follower))
+        } else {
+            ""
+        };
         out.seat = leader + "/" + c.id;
+        self.make_seat(
+            c,
+            leader,
+            lead.managed,
+            out,
+            recipe,
+            all,
+            if parts == 2 { cluster_json(0, follower, master) } else { "" },
+        ) or raise;
+        if parts == 2 {
+            out.has_follower_seat = true;
+            out.follower_seat = follower + "/" + c.id;
+            self.make_seat(
+                c,
+                follower,
+                follow.managed,
+                out,
+                recipe,
+                all,
+                cluster_json(1, leader, master),
+            ) or {
+                self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
+                fail err;
+            };
+        }
+        let body = placement_json(out);
+        let added = self.store.insert_placement(
+            st::PlacementRow { id: c.id, model: c.model, body: body, created_at: out.created_at },
+            checked_change("create", "placements/" + c.id, "", body) or raise,
+        ) or {
+            self.unmake_seats(out);
+            fail store_down(err);
+        };
+        if !added {
+            self.unmake_seats(out);
+            fail clash("placement " + c.id + " exists; a placement id is never reused");
+        }
+        // another api may have placed on a node since its placements were
+        // read: what they hold now, this one counted, is read again, and
+        // this one withdrawn if together they overfill one. Of two placed at
+        // once, the one that reads last sees both.
+        let now = self.store.placements() or fail store_down(err);
+        for n in out.nodes {
+            let mut total = 0;
+            for r in now.rows {
+                if !r.removed && places_on(r.body, n) {
+                    total = total + (self.held_by(r) or raise);
+                }
+            }
+            let memory = std::json::find_int_field(
+                if n == leader { hw } else { hw_f },
+                "model_memory_bytes",
+            );
+            if total > memory {
+                self.remove_in_gate(c.id) or discard;
+                fail clash(
+                    "node " + n + " filled while this was placed: its placements would hold "
+                        + gb(total) + " of " + gb(memory) + " for models; place it again",
+                );
+            }
+        }
+        return out;
+    }
+
+    /// Node `id`, as a placement may be put on it: there, not revoked, and
+    /// offering a managed engine.
+    fn placeable(id: String) -> Placeable fallible(CtlError) {
+        let n = self.store.node(id) or fail store_down(err);
+        if !n.present || n.revoked { fail bad("no node " + id, "nodes"); }
+        let f = self.store.fleet(id) or fail store_down(err);
+        let managed = managed_engine(f.capabilities);
+        if len(managed) == 0 {
+            fail bad(
+                "node " + id + " offers no managed engine, so no model can be placed on it",
+                "nodes"
+            );
+        }
+        return Placeable { capabilities: f.capabilities, managed: managed };
+    }
+
+    /// The hardware node `id` declared (`p`'s capabilities), as JSON.
+    fn hardware_of(id: String, p: Placeable) -> String fallible(CtlError) {
+        let hw = std::str::trim(std::json::find_field_raw(p.capabilities, "hardware"));
+        if len(hw) == 0 || !std::json::valid_object(hw) {
+            fail bad(
+                "node " + id + " has declared no hardware, so nothing can be judged to fit it",
+                "nodes"
+            );
+        }
+        return hw;
+    }
+
+    /// Placement `out`'s seat on `node`, on its managed engine `engine`, its
+    /// config its variant and runtime pinned and, across two nodes, its part
+    /// (`cluster`, "" for none).
+    fn make_seat(
+        c: PlacementCreate,
+        node: String,
+        engine: String,
+        out: Placement,
+        recipe: Recipe,
+        all: RuntimeList,
+        cluster: String
+    ) -> Bool fallible(CtlError) {
         let mut seat = SeatCreate {
-            node: leader,
+            node: node,
             id: c.id,
-            engine: managed,
+            engine: engine,
             account: c.account,
             config: std::json::Value::parse(
                 managed_config(
@@ -436,43 +678,22 @@ locus Placements {
                     out.reserved_bytes,
                     variant_body_of(recipe.variants.text, out.variant),
                     runtime_body_of(all, out.runtime),
+                    cluster,
                 ),
             ) or fail bad("the placement's seat config is too large to keep", "model"),
         };
         push(seat.serves, st::SeatModel { model: c.model }) or discard;
         self.seats.create_read(seat) or raise;
-        let body = placement_json(out);
-        let added = self.store.insert_placement(
-            st::PlacementRow { id: c.id, model: c.model, body: body, created_at: out.created_at },
-            checked_change("create", "placements/" + c.id, "", body) or raise,
-        ) or {
-            self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
-            fail store_down(err);
-        };
-        if !added {
-            self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
-            fail clash("placement " + c.id + " exists; a placement id is never reused");
+        return true;
+    }
+
+    /// The seats placement `p` made, removed.
+    fn unmake_seats(p: Placement) {
+        self.seats.remove_read(SeatRef { node: p.leader, seat: p.id }) or discard;
+        if p.has_follower_seat {
+            let follower = at(p.nodes, 1) or "";
+            self.seats.remove_read(SeatRef { node: follower, seat: p.id }) or discard;
         }
-        // another api may have placed on the node since its placements were
-        // read: what they hold now, this one counted, is read again, and
-        // this one withdrawn if together they overfill it. Of two placed at
-        // once, the one that reads last sees both.
-        let now = self.store.placements() or fail store_down(err);
-        let mut total = 0;
-        for r in now.rows {
-            if !r.removed && std::json::find_string_field(r.body, "leader") == leader {
-                total = total + (self.held_by(r) or raise);
-            }
-        }
-        let memory = std::json::find_int_field(hw, "model_memory_bytes");
-        if total > memory {
-            self.remove_in_gate(c.id) or discard;
-            fail clash(
-                "node " + leader + " filled while this was placed: its placements would hold "
-                    + gb(total) + " of " + gb(memory) + " for models; place it again",
-            );
-        }
-        return out;
     }
 
     /// `getPlacement`.
@@ -510,6 +731,10 @@ locus Placements {
         if v.seat == v.leader + "/" + v.id {
             self.seats.remove_read(SeatRef { node: v.leader, seat: v.id }) or discard;
         }
+        let follower = at(v.nodes, 1) or "";
+        if v.has_follower_seat && v.follower_seat == follower + "/" + v.id {
+            self.seats.remove_read(SeatRef { node: follower, seat: v.id }) or discard;
+        }
         self.store.remove_placement(
             st::PlacementRow { id: id, removed: true, removed_at: now_seconds() },
             checked_change("delete", "placements/" + id, placement_json(v), "") or raise,
@@ -535,6 +760,8 @@ fn placement_of(r: st::PlacementRow) -> Placement fallible(CtlError) {
         },
         leader: std::json::find_string_field(b, "leader"),
         seat: std::json::find_string_field(b, "seat"),
+        has_follower_seat: len(std::json::find_string_field(b, "follower_seat")) > 0,
+        follower_seat: std::json::find_string_field(b, "follower_seat"),
         has_cache_tokens: std::json::find_int_field(b, "cache_tokens") > 0,
         cache_tokens: std::json::find_int_field(b, "cache_tokens"),
         has_reserved_bytes: std::json::find_int_field(b, "reserved_bytes") > 0,
@@ -589,7 +816,9 @@ fn placement_json(p: Placement) -> String {
         + ", \"recipe\": " + jq(p.recipe) + ", \"variant\": " + jq(p.variant) + ", \"runtime\": "
         + jq(p.runtime) + ", \"chosen_by\": "
         + jq(placement_chooser_name(p.chosen_by)) + ", \"leader\": " + jq(p.leader) + ", \"seat\": "
-        + jq(p.seat) + ", \"fit\": ["
+        + jq(p.seat)
+        + (if p.has_follower_seat { ", \"follower_seat\": " + jq(p.follower_seat) } else { "" })
+        + ", \"fit\": ["
         + fits.text() + "]"
         + (if p.has_cache_tokens { ", \"cache_tokens\": " + to_string(p.cache_tokens) } else { "" })
         + (
@@ -715,7 +944,8 @@ fn managed_config(
     cache_tokens: Int,
     reserved_bytes: Int,
     variant: String,
-    runtime: String
+    runtime: String,
+    cluster: String
 ) -> String {
     // the most context the model is made for, which a server is not
     // started past (node/run.hl); left out when the recipe does not say
@@ -733,8 +963,48 @@ fn managed_config(
         + to_string(reserved_bytes)
         + ", \"variant\": "
         + variant
-        + ", \"runtime\": " + runtime + "}";
+        + ", \"runtime\": " + runtime
+    // across two nodes, its part (protocol.yaml `ClusterPart`)
+        + (if len(cluster) > 0 { ", \"cluster\": " + cluster } else { "" }) + "}";
 }
+
+/// A seat's part of a placement across two nodes (`ClusterPart`): its rank,
+/// the other node, and where the ranks meet, the leader's address on the
+/// link at voice's rendezvous port (links.hl `SPAN_PORT`).
+fn cluster_json(rank: Int, peer: String, master: String) -> String {
+    return "{\"size\": 2, \"rank\": " + to_string(rank) + ", \"peer\": " + jq(peer)
+        + ", \"master_addr\": " + jq(master) + ", \"master_port\": " + to_string(SPAN_PORT)
+        + "}";
+}
+
+/// The node a placement is on, of those it names: its leader, and across
+/// two nodes its follower too (`body` its row's body).
+@bounded_by(body)
+fn places_on(body: String, node: String) -> Bool {
+    if std::json::find_string_field(body, "leader") == node { return true; }
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "nodes"));
+    while !it.done {
+        if std::str::trim(it.element) == jq(node) { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// True when a placement (`body` its row's body) spans two nodes.
+@bounded_by(body)
+fn spans(body: String) -> Bool {
+    let mut n = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "nodes"));
+    while !it.done {
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    return n > 1;
+}
+
+/// A node a placement may be put on: its capabilities as declared, and its
+/// managed engine.
+type Placeable { capabilities: String = ""; managed: String = ""; }
 
 // ---- the fit ----------------------------------------------------------
 
@@ -853,12 +1123,67 @@ fn accelerator_kinds(hw: String) -> String {
     return std::str::from_bytes(b);
 }
 
+/// The nodes a variant is judged against: one, or a pair it is split
+/// across, each with its name (for a reason), its hardware, the memory it
+/// has left for models and what its other placements hold of it.
+type Judging {
+    names: bounded[String; 2];
+    hw: bounded[String; 2];
+    room: bounded[Int; 2];
+    held: bounded[Int; 2];
+}
+
+/// `j` with node `name` added: its hardware `hw`, and `held` of its memory
+/// for models held by its other placements.
+fn judging_add(j: Judging, name: String, hw: String, held: Int) -> Judging {
+    let mut out = j;
+    push(out.names, name) or discard;
+    push(out.hw, hw) or discard;
+    push(out.room, std::json::find_int_field(hw, "model_memory_bytes") - held) or discard;
+    push(out.held, held) or discard;
+    return out;
+}
+
+/// The least room for models any of `j`'s nodes has left.
+fn least_room(j: Judging) -> Int {
+    let mut least = -1;
+    let mut first = true;
+    for r in j.room {
+        if first || r < least { least = r; }
+        first = false;
+    }
+    return least;
+}
+
+/// What each of `parts` nodes holds of a variant `v` split across them by
+/// tensor parallelism: its share of the weights and their buffers (5%, as
+/// scripts/catalog-recipes.py counts them in `memory_bytes`), and the whole
+/// cache for the context the variant is fitted to, which vLLM keeps whole
+/// on every rank of a latent-attention model and voice counts whole for
+/// any. On one node, the variant's `memory_bytes`.
+@bounded_by(v)
+fn part_need(v: String, parts: Int) -> Int {
+    let need = std::json::find_int_field(v, "memory_bytes");
+    if parts <= 1 { return need; }
+    let mut weights = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
+    while !it.done {
+        weights = weights + std::json::find_int_field(it.element, "bytes");
+        it = std::json::array_next(it);
+    }
+    let buffered = weights * 105 / 100;
+    if buffered >= need { return (need + parts - 1) / parts; }
+    return need - buffered + (buffered + parts - 1) / parts;
+}
+
 /// Every variant of a recipe judged against a machine (`judge_variant`),
 /// and the one a placement takes when none is named: of those that fit, the
 /// format the machine serves best (`format_rank`), off the CPU, then the
 /// biggest, the most faithful weights it has room for; -1 when none fits.
 type Judged { fit: bounded[VariantFit; 8]; best: Int = -1; }
 
+/// A recipe judged against one machine of hardware `hw`, `room` left of its
+/// memory for models and `held` of it held by its other placements.
 @bounded_by(variants)
 fn judge_recipe(
     variants: String,
@@ -868,7 +1193,16 @@ fn judge_recipe(
     held: Int,
     decision: Bool
 ) -> Judged {
+    let mut j = judging_add(Judging { }, "", hw, held);
+    set(j.room, 0, room) or discard;
+    return judge_on(variants, j, rts, decision);
+}
+
+/// A recipe judged against the nodes of `j`.
+@bounded_by(variants)
+fn judge_on(variants: String, j: Judging, rts: RuntimeList, decision: Bool) -> Judged {
     let mut out = Judged { };
+    let hw = at(j.hw, 0) or "{}";
     let small = small_model(variants);
     let mut best_rank = 0;
     let mut best_memory = 0;
@@ -876,7 +1210,7 @@ fn judge_recipe(
     let mut it = std::json::array_first(variants);
     while !it.done {
         let v = it.element;
-        let judged = judge_variant(v, hw, rts, room, held, decision);
+        let judged = judge_variant(v, j, rts, decision);
         push(out.fit, judged) or discard;
         let rank = format_rank(std::json::find_string_field(v, "format"), hw, small)
             + (if judged.has_runtime && runs_on_cpu(rts, judged.runtime) { 10 } else { 0 });
@@ -894,20 +1228,17 @@ fn judge_recipe(
     return out;
 }
 
-/// One variant judged against a machine's hardware and the runtimes that
-/// may serve it: a runtime reads its format there, it fits what models may
-/// use of the memory, and its files fit the disk. A decision recipe's
+/// One variant judged against the nodes of `j` and the runtimes that may
+/// serve it: a runtime reads its format there, each node's share of it
+/// (`part_need`) fits what models may use of its memory, and its files fit
+/// each node's disk (every rank reads the files whole). A decision recipe's
 /// (`decision`) is served only by a decision server (`decision`), and a
-/// generative one never.
+/// generative one never. Across two nodes, `rts` holds only runtimes that
+/// span nodes, and each node is named in the reason.
 @bounded_by(v)
-fn judge_variant(
-    v: String,
-    hw: String,
-    rts: RuntimeList,
-    room: Int,
-    held: Int,
-    decision: Bool
-) -> VariantFit {
+fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> VariantFit {
+    let parts = count(j.hw);
+    let hw = at(j.hw, 0) or "{}";
     let id = std::json::find_string_field(v, "id");
     let format = std::json::find_string_field(v, "format");
     let rt = runtime_for(format, hw, rts, decision);
@@ -918,6 +1249,8 @@ fn judge_variant(
             reason: (
                 if decision {
                     "no decision runtime (a decision model's server)"
+                } else if parts > 1 {
+                    "no runtime that spans nodes"
                 } else {
                     "no runtime"
                 }
@@ -927,12 +1260,38 @@ fn judge_variant(
                 + std::json::find_string_field(hw, "arch") + " with " + accelerators_said(hw),
         };
     }
-    let runs = rt + " runs " + format + " on " + runtime_on(rts, rt);
-    // what its seat takes, its server's own beside the weights
-    let need = footprint(std::json::find_int_field(v, "memory_bytes"));
-    let memory = gb(need) + " of " + gb(if room > 0 { room } else { 0 }) + " free for models"
-        + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
-    if need > room {
+    let runs = rt + " runs " + format + " on " + runtime_on(rts, rt)
+        + (if parts > 1 { " across " + to_string(parts) + " nodes" } else { "" });
+    // what its seat takes on each node, its server's own beside its share
+    let need = footprint(part_need(v, parts));
+    let mut size = 0;
+    let mut f = std::json::array_first(std::json::find_field_raw(v, "files"));
+    while !f.done {
+        size = size + std::json::find_int_field(f.element, "bytes");
+        f = std::json::array_next(f);
+    }
+    let mut memory = "";
+    let mut disk = "";
+    let mut short = false;
+    let mut full = false;
+    let mut i = 0;
+    while i < parts {
+        let node_hw = at(j.hw, i) or "{}";
+        let room = at(j.room, i) or 0;
+        let held = at(j.held, i) or 0;
+        let name = if parts > 1 { (at(j.names, i) or "") + ": " } else { "" };
+        let said = name + gb(need) + " of " + gb(if room > 0 { room } else { 0 })
+            + " free for models"
+            + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
+        memory = if i == 0 { said } else { memory + "; " + said };
+        if need > room { short = true; }
+        let free = std::json::find_int_field(node_hw, "disk_free_bytes");
+        let on_disk = name + gb(size) + " of " + gb(free) + " free";
+        disk = if i == 0 { on_disk } else { disk + "; " + on_disk };
+        if size > free { full = true; }
+        i = i + 1;
+    }
+    if short {
         return VariantFit {
             variant: id,
             has_runtime: true,
@@ -941,15 +1300,7 @@ fn judge_variant(
             reason: runs + "; needs " + memory,
         };
     }
-    let mut size = 0;
-    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
-    while !it.done {
-        size = size + std::json::find_int_field(it.element, "bytes");
-        it = std::json::array_next(it);
-    }
-    let free = std::json::find_int_field(hw, "disk_free_bytes");
-    let disk = gb(size) + " of " + gb(free) + " free";
-    if size > free {
+    if full {
         return VariantFit {
             variant: id,
             has_runtime: true,

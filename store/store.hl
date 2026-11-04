@@ -509,6 +509,26 @@ type FleetRow {
     present: Bool = false;
 }
 
+/// A `link_check` row: a check of the link between two nodes, rank 0
+/// (`node_a`) and rank 1 (`node_b`), and what each reported of it, its
+/// `LinkCheckResult` JSON, "" until it does (api/links.hl).
+type LinkCheckRow {
+    id: String = "";
+    node_a: String = "";
+    node_b: String = "";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    // where the ranks meet (node_a's address on the link) and the image
+    // both run it in, by digest
+    master_addr: String = "";
+    image: String = "";
+    result_a: String = "";
+    result_b: String = "";
+    present: Bool = false;
+}
+
+/// The newest link checks, newest first.
+type LinkCheckRows { rows: bounded[LinkCheckRow; 64]; }
+
 /// A node's last sign of life: its heartbeat (or registration) and the
 /// requests it had in flight then.
 type Beat { at: Time = `1970-01-01T00:00:00Z`; in_flight: Int = 0; present: Bool = false; }
@@ -926,6 +946,13 @@ interface Store {
     fn seat_states(node: String) -> SeatStateRows fallible(StoreError);
     /// Replace one seat's state; a store writes it only when it changed.
     fn put_seat_state(row: SeatStateRow) fallible(StoreError);
+    /// The newest link checks, newest first, at most 64.
+    fn link_checks() -> LinkCheckRows fallible(StoreError);
+    /// Add a check; both its nodes' `assignment_version`s move on with it,
+    /// so each is sent its rank.
+    fn insert_link_check(row: LinkCheckRow) fallible(StoreError);
+    /// Replace the results of the check with `row.id`.
+    fn put_link_results(row: LinkCheckRow) fallible(StoreError);
     /// An account's provider windows, the JSON array an engine last
     /// reported, "" for none.
     /// Record a request whole; those past `PEEK_DAYS` go.
@@ -1146,6 +1173,8 @@ locus MemoryStore {
         beat_ns: bounded[Int; 64];
         beat_load: bounded[Int; 64];
         seat_state_rows: SeatStateTable = SeatStateTable { };
+        // link checks, newest first, the last 64
+        link_check_rows: LinkCheckRows = LinkCheckRows { };
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
@@ -1839,6 +1868,36 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.fleet_rows.set(r);
+    }
+
+    fn link_checks() -> LinkCheckRows fallible(StoreError) {
+        return self.link_check_rows;
+    }
+
+    fn insert_link_check(row: LinkCheckRow) fallible(StoreError) {
+        let mut next = LinkCheckRows { };
+        let mut r = row;
+        r.present = true;
+        push(next.rows, r) or discard;
+        for held in self.link_check_rows.rows {
+            if count(next.rows) < 64 && held.id != row.id { push(next.rows, held) or discard; }
+        }
+        self.link_check_rows = next;
+        self.bump(row.node_a);
+        self.bump(row.node_b);
+    }
+
+    fn put_link_results(row: LinkCheckRow) fallible(StoreError) {
+        let mut next = LinkCheckRows { };
+        for held in self.link_check_rows.rows {
+            let mut h = held;
+            if h.id == row.id {
+                h.result_a = row.result_a;
+                h.result_b = row.result_b;
+            }
+            push(next.rows, h) or discard;
+        }
+        self.link_check_rows = next;
     }
 
     fn beat(node: String) -> Beat fallible(StoreError) {

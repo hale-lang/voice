@@ -19,6 +19,13 @@
 // pick. A server that ends takes its seat `down`, with what it said last;
 // a seat that leaves the assignment has its server stopped. A server left
 // running by a node that stopped is stopped when the node starts again.
+//
+// A seat's part of a placement across two nodes (its config's `cluster`,
+// span.hl) runs vLLM's multi-node executor in the runtime's container on
+// the host's network, its API on loopback alone. The leader's is `up` once
+// its API answers, which it does only when both ranks have loaded; the
+// follower's, headless, answers nothing, and is `up` while its server runs,
+// joined or waiting for the leader to be there.
 
 /// A managed seat to run, once its fetch verified.
 type RunJob { seat: String = ""; config: String = ""; }
@@ -56,6 +63,8 @@ type Run {
     // what it serves (`serving_identity`): a seat assigned again with
     // another is replaced, one with the same is left serving
     identity: String = "";
+    // a part of a placement across two nodes
+    spans: Bool = false;
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -84,6 +93,9 @@ locus Runner {
         // the seats it runs hold at most this together, none when it is 0;
         // -1 for unknown
         model_memory: Int = -1;
+        // the node's declared capabilities, whose links a part across two
+        // nodes runs over (span.hl)
+        capabilities: String = "";
     }
 
     bus {
@@ -226,6 +238,18 @@ locus Runner {
             return;
         }
         let share = gpu_share(need, self.gpu_memory);
+        // its part across two nodes, over this node's link to the other
+        let cluster = std::str::trim(std::json::find_field_raw(config, "cluster"));
+        let spans = len(cluster) > 0;
+        let mut env = "";
+        if spans {
+            let refused_part = self.part_refusal(server, artifact, cluster);
+            if len(refused_part) > 0 {
+                self.tell(seat, "down", refused_part, "");
+                return;
+            }
+            env = link_env(self.capabilities, std::json::find_string_field(cluster, "peer"));
+        }
         let port = free_port(PORT_FROM + count(self.runs.items));
         if port < 0 {
             self.tell(seat, "down", "no free port on loopback for its server", "");
@@ -239,7 +263,13 @@ locus Runner {
             footprint: need,
             health: "http://127.0.0.1:" + to_string(port) + health_path(server),
             endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
+            spans: spans,
         };
+        // a follower serves no API: nothing to ask, nowhere to serve
+        if spans && std::json::find_int_field(cluster, "rank") > 0 {
+            r.health = "";
+            r.endpoint = "";
+        }
         let mut argv = "";
         if std::json::find_string_field(artifact, "kind") == "container" {
             // named so no two nodes' seats meet (ids hold no dots), and
@@ -264,26 +294,56 @@ locus Runner {
                 return;
             }
             run_out("docker\nrm\n-f\n" + r.container);
-            argv = container_argv(
-                r.container,
-                self.id,
-                port,
-                models,
-                self.data + "/blobs",
-                gpu_args(std::json::find_string_field(runtime, "accelerator")),
-                server_cache_args(server, self.data, std::json::find_string_field(runtime, "id")),
-                std::json::find_string_field(artifact, "image") + "@"
-                    + std::json::find_string_field(artifact, "digest"),
-                server_args(
-                    server,
-                    "/models",
-                    "/models/" + first,
-                    8080,
-                    "0.0.0.0",
-                    std::json::find_string_field(config, "model"), share,
-                    served_tokens(config),
-                ),
-            );
+            argv = if spans {
+                span_container_argv(
+                    r.container,
+                    self.id,
+                    models,
+                    self.data + "/blobs",
+                    env,
+                    server_cache_args(
+                        server,
+                        self.data,
+                        std::json::find_string_field(runtime, "id"),
+                    ),
+                    std::json::find_string_field(artifact, "image") + "@"
+                        + std::json::find_string_field(artifact, "digest"),
+                    server_args(
+                        server,
+                        "/models",
+                        "/models/" + first,
+                        port,
+                        "127.0.0.1",
+                        std::json::find_string_field(config, "model"), share,
+                        served_tokens(config),
+                    ) + span_args(cluster),
+                )
+            } else {
+                container_argv(
+                    r.container,
+                    self.id,
+                    port,
+                    models,
+                    self.data + "/blobs",
+                    gpu_args(std::json::find_string_field(runtime, "accelerator")),
+                    server_cache_args(
+                        server,
+                        self.data,
+                        std::json::find_string_field(runtime, "id"),
+                    ),
+                    std::json::find_string_field(artifact, "image") + "@"
+                        + std::json::find_string_field(artifact, "digest"),
+                    server_args(
+                        server,
+                        "/models",
+                        "/models/" + first,
+                        8080,
+                        "0.0.0.0",
+                        std::json::find_string_field(config, "model"), share,
+                        served_tokens(config),
+                    ),
+                )
+            };
         } else {
             if os_of(run_out("uname\n-s")) != "darwin" {
                 self.tell(
@@ -353,7 +413,11 @@ locus Runner {
                 let wrote = last_of(std::io::fs::read_file(r.log) or "", 1500);
                 self.tell(r.seat, "down", "its server ended: " + last_line(wrote), "");
             } else {
-                if r.phase == "starting" && healthy(r.health) {
+                if r.phase == "starting" && len(r.health) == 0 {
+                    // a follower's part: up while its server runs
+                    r.phase = "up";
+                    self.tell_up(r);
+                } else if r.phase == "starting" && healthy(r.health) {
                     r.phase = "up";
                     r.context = served_context(r.server, r.port);
                     r.asked = 1;
@@ -369,6 +433,28 @@ locus Runner {
             }
         }
         self.runs = next;
+    }
+
+    /// Why a seat's part across two nodes (`cluster`) is not started here,
+    /// "" when it is: it runs vLLM's container, over a link this node
+    /// declares to the other, beside no other part across nodes (its ranks
+    /// meet on the host's network, at one port).
+    fn part_refusal(server: String, artifact: String, cluster: String) -> String {
+        if server != "vllm" || std::json::find_string_field(artifact, "kind") != "container" {
+            return "a model across two nodes runs vLLM's container, and its runtime is not one";
+        }
+        let peer = std::json::find_string_field(cluster, "peer");
+        if len(link_env(self.capabilities, peer)) == 0 {
+            return "this node declares no link to " + peer
+                + ", which its part across the two runs over";
+        }
+        for r in self.runs.items {
+            if r.spans {
+                return "this node runs " + r.seat
+                    + " across two nodes already, and takes part in one at a time";
+            }
+        }
+        return "";
     }
 
     /// A server stopped (`stop_run`).
@@ -695,13 +781,21 @@ fn find_program(dir: String, program: String) -> String {
 /// runtime (the server, the accelerator, the artifact it is pinned to), its
 /// variant (the files and what they are), and what its server is started
 /// with (the model it goes by, the context and cache it takes, the memory
-/// reserved for it). Two configs with the same are served by the same
+/// reserved for it, its part across two nodes). Two configs with the same are served by the same
 /// server; anything else in a config (its placement's id, a field voice
 /// adds later) never restarts one.
 @unbounded
 fn serving_identity(config: String) -> String {
     let b = std::bytes::BytesBuilder { };
-    for key in ["runtime", "variant", "model", "context_length", "cache_tokens", "reserved_bytes"] {
+    for key in [
+        "runtime",
+        "variant",
+        "model",
+        "context_length",
+        "cache_tokens",
+        "reserved_bytes",
+        "cluster",
+    ] {
         b.append_str(key);
         b.append_str("=");
         b.append_str(std::str::trim(std::json::find_field_raw(config, key)));

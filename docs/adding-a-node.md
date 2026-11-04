@@ -73,6 +73,8 @@ It:
   take there (`HALE_DNA_HOST_RESERVED_BYTES`), or less 8 GiB from a hale
   that does not say; outside one, less 8 GiB for the coordinator when
   `--api` is on this machine (localhost);
+  the links its operator declared in the file (`links`, below) are kept as
+  they are;
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a
@@ -110,6 +112,41 @@ installing.
 The node finds NATS where the api tells it when it registers (the api's
 `--node-nats`), so the machine needs a route to that address as well as to
 the api.
+
+### Cabled to another node
+
+Two machines cabled to each other (two DGX Sparks over their ConnectX-7
+QSFP ports) can serve a model too large for either, split across the two.
+Each declares its end of the link in its capabilities file, beside its
+engines: the other node's id, and the local ports cabled to it, each its
+interface, its IPv4 address on the link and its RDMA device; and the RoCE
+GID index, when NCCL's own choice is not the one the addresses are on. The
+addresses are the machine's own, set up by whoever runs its network (voice
+configures no host networking). A DGX Spark's one cabled port is two ports
+here, one per half of its ConnectX-7:
+
+```json
+"links": [{"peer": "flare", "gid_index": 3, "ports": [
+  {"ifname": "enp1s0f0np0", "address": "192.168.100.1", "hca": "rocep1s0f0"},
+  {"ifname": "enP2p1s0f0np0", "address": "192.168.101.1", "hca": "roceP2p1s0f0"}]}]
+```
+
+Once both nodes declare the link and are up, check it: each runs a rank of
+an NCCL all-reduce over it, in the image a model across the two would run
+in, and says what it measured.
+
+```sh
+curl -X POST $api/admin/v1/nodes/spark/links/flare/check -H @admin.h   # running
+curl -sS $api/admin/v1/nodes/spark -H @admin.h                          # links[].check: passed
+```
+
+A check whose sum is right passes; one under 10 GB/s passes `degraded`, with
+the figure. Then a placement naming both nodes, the leader first, splits the
+model across them (`"nodes": ["spark", "flare"]`): vLLM's own multi-node
+executor, tensor parallel across the two GPUs, as NVIDIA's guide to serving
+vLLM across two DGX Sparks runs it. The leader's seat serves it; the
+follower's, of the same id, runs the other half and serves nothing itself;
+the model is served while both are `up`.
 
 ## Put a model on it
 

@@ -1,0 +1,176 @@
+// A node's link to another, as its operator declares it in its
+// capabilities file, and what a part of a model across the two runs: the
+// NCCL settings from the declaration alone (both RDMA devices of a DGX
+// Spark's cabled port, the first port's interface for sockets, its GID
+// index), vLLM's multi-node arguments for each rank, the container on the
+// host's network with the RDMA devices, and a link check's output read.
+// The addresses are the lab's, as fixtures.
+import ".." as node;
+
+const SPARK: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}], \"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"192.168.101.1\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}]}";
+
+fn main() {
+    // ---- the declaration -------------------------------------------------
+    std::test::assert_eq_str(node::capabilities_problem(SPARK), "", "spark's file is usable");
+    let declared = node::declared_capabilities(SPARK);
+    std::test::assert(
+        std::str::contains(
+            declared,
+            "\"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"192.168.101.1\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}]",
+        ),
+        "the node declares its links as its file says them: " + declared,
+    );
+    std::test::assert(
+        !std::str::contains(
+            node::declared_capabilities("{\"max_in_flight\": 1, \"engines\": []}"),
+            "links",
+        ),
+        "a node with none declares none",
+    );
+    for bad in [
+        "\"links\": {}|links must be a list",
+        "\"links\": [{\"peer\": \"Flare\", \"ports\": []}]|every link names its peer, a node id",
+        "\"links\": [{\"peer\": \"flare\", \"ports\": []}]|link to flare: ports lists the ports cabled to it",
+        "\"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1/30\"}]}]|link to flare: port enp1s0f0np0's address is its IPv4 address on the link",
+        "\"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\"}], \"gid_index\": 300}]|link to flare: gid_index is 0 to 255",
+        "\"links\": [{\"peer\": \"flare\", \"ports\": [{\"address\": \"192.168.100.1\"}]}]|link to flare: every port names its ifname",
+    ] {
+        let bar = std::str::index_of(bad, "|");
+        std::test::assert_eq_str(
+            node::capabilities_problem(
+                "{\"max_in_flight\": 1, \"engines\": [], " + bad[0..bar] + "}",
+            ),
+            bad[(bar + 1)..len(bad)],
+            "refused at start: " + bad[0..bar],
+        );
+    }
+
+    // ---- NCCL's settings, from the declaration alone -------------------------
+    let env = node::link_env(declared, "flare");
+    std::test::assert_eq_str(
+        env,
+        "-e\nNCCL_SOCKET_IFNAME=enp1s0f0np0\n-e\nGLOO_SOCKET_IFNAME=enp1s0f0np0\n-e\nTP_SOCKET_IFNAME=enp1s0f0np0\n-e\nUCX_NET_DEVICES=enp1s0f0np0\n-e\nMN_IF_NAME=enp1s0f0np0\n-e\nOMPI_MCA_btl_tcp_if_include=enp1s0f0np0\n-e\nVLLM_HOST_IP=192.168.100.1\n-e\nNCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0\n-e\nNCCL_IB_DISABLE=0\n-e\nNCCL_IB_GID_INDEX=3\n-e\nNCCL_IGNORE_CPU_AFFINITY=1\n",
+        "both halves' RDMA devices carry the model, the first port's interface the rest",
+    );
+    std::test::assert_eq_str(
+        node::link_env(declared, "spark2"),
+        "",
+        "no link to another node: nothing",
+    );
+
+    // ---- each rank's vLLM -------------------------------------------------------
+    let leader = "{\"size\": 2, \"rank\": 0, \"peer\": \"flare\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    let follower = "{\"size\": 2, \"rank\": 1, \"peer\": \"spark\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+    std::test::assert_eq_str(
+        node::span_args(leader),
+        "\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n0\n--master-addr\n192.168.100.1\n--master-port\n29501",
+        "the leader: rank 0, serving the API",
+    );
+    std::test::assert_eq_str(
+        node::span_args(follower),
+        "\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n1\n--master-addr\n192.168.100.1\n--master-port\n29501\n--headless",
+        "the follower: rank 1, headless",
+    );
+    let argv = node::span_container_argv(
+        "voice.flare.ds",
+        "flare",
+        "/data/models/ds",
+        "/data/blobs",
+        env,
+        "",
+        "nvcr.io/nvidia/vllm@sha256:5577",
+        "vllm\nserve\n/models" + node::span_args(follower),
+    );
+    std::test::assert(
+        std::str::starts_with(
+            argv,
+            "docker\nrun\n--rm\n--init\n--name\nvoice.flare.ds\n--label\nnet.hale-lang.voice.node=flare\n--network\nhost\n--ipc\nhost\n--gpus\nall\n--device\n/dev/infiniband\n--ulimit\nmemlock=-1\n--ulimit\nstack=67108864\n-e\nNCCL_SOCKET_IFNAME=enp1s0f0np0\n",
+        ),
+        "on the host's network, with the GPUs and the RDMA devices: " + argv,
+    );
+    std::test::assert(
+        std::str::contains(argv, "-v\n/data/models/ds:/models:ro\n")
+            && std::str::contains(argv, "-e\nHF_HUB_OFFLINE=1\n")
+            && std::str::ends_with(
+                argv,
+                "nvcr.io/nvidia/vllm@sha256:5577\nvllm\nserve\n/models\n--tensor-parallel-size\n2\n--nnodes\n2\n--node-rank\n1\n--master-addr\n192.168.100.1\n--master-port\n29501\n--headless",
+            )
+            && !std::str::contains(argv, "\n-p\n"),
+        "its weights read-only, offline, publishing no port: " + argv,
+    );
+
+    // ---- a link check's output --------------------------------------------------
+    let good = node::link_result(
+        "lc-1",
+        "spark:1:1 NCCL INFO Channel 00/0 : 0[0] -> 1[0] [send] via NET/IB/0\nVOICE_LINK_CHECK {\"ok\": true, \"bus_bytes_per_second\": 2600000000}\n",
+        "",
+    );
+    std::test::assert_eq_str(
+        good,
+        "{\"id\": \"lc-1\", \"ok\": true, \"bus_bytes_per_second\": 2600000000, \"reason\": \"the all-reduce's sum was right, 2.4 GiB/s, over RDMA (NCCL NET/IB)\"}",
+        "a check that ran right, with its transport",
+    );
+    let sockets = node::link_result(
+        "lc-2",
+        "x via NET/Socket/0\nVOICE_LINK_CHECK {\"ok\": true, \"bus_bytes_per_second\": 900000000}\n",
+        "",
+    );
+    std::test::assert(
+        std::str::contains(
+            sockets,
+            "over sockets (NCCL NET/Socket): the RDMA devices were not used",
+        ),
+        "one that fell back to sockets says so: " + sockets,
+    );
+    let wrong = node::link_result(
+        "lc-3",
+        "VOICE_LINK_CHECK {\"ok\": false, \"error\": \"DistNetworkError: timed out\"}",
+        "",
+    );
+    std::test::assert_eq_str(
+        wrong,
+        "{\"id\": \"lc-3\", \"ok\": false, \"reason\": \"DistNetworkError: timed out\"}",
+        "one that failed, with why",
+    );
+    let lost = node::link_result(
+        "lc-4",
+        "docker: Error response from daemon: no such device\n",
+        "",
+    );
+    std::test::assert_eq_str(
+        lost,
+        "{\"id\": \"lc-4\", \"ok\": false, \"reason\": \"the check did not finish: docker: Error response from daemon: no such device\"}",
+        "one that never ran, with what it said last",
+    );
+
+    // ---- the RDMA devices' IOMMU domains, as sysfs says them ----------------
+    let root = "/tmp/voice-span-" + to_string(std::time::monotonic_ns());
+    for hca in ["rocep1s0f0:DMA-FQ", "roceP2p1s0f0:identity"] {
+        let c = std::str::index_of(hca, ":");
+        let dir = root + "/sys/class/infiniband/" + hca[0..c] + "/device/iommu_group";
+        std::process::run("mkdir\n-p\n" + dir) or discard;
+        std::io::fs::write_file(dir + "/type", hca[(c + 1)..len(hca)] + "\n") or discard;
+    }
+    let domains = node::iommu_domains(declared, "flare", root);
+    std::test::assert_eq_str(
+        domains,
+        "{\"hca\": \"rocep1s0f0\", \"domain\": \"DMA-FQ\"}, {\"hca\": \"roceP2p1s0f0\", \"domain\": \"identity\"}",
+        "each RDMA device's IOMMU domain",
+    );
+    std::test::assert_eq_str(
+        node::iommu_domains(declared, "flare", root + "/none"),
+        "",
+        "a machine with no IOMMU group says none",
+    );
+    std::test::assert(
+        std::str::ends_with(
+            node::link_result(
+                "lc-5",
+                "VOICE_LINK_CHECK {\"ok\": true, \"bus_bytes_per_second\": 2600000000}",
+                domains,
+            ),
+            ", \"iommu\": [" + domains + "]}",
+        ),
+        "and says them with its result",
+    );
+}

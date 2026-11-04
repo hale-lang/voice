@@ -118,7 +118,9 @@ The operator decides which weights and which servers may run:
   container digest or archive sha256;
 - a **placement** puts a catalog model on a node: voice picks the variant
   and runtime that fit the node's hardware, the node fetches and checks every
-  file, and the seat comes up.
+  file, and the seat comes up. A model too large for one machine is placed
+  across two cabled to each other, once their link passed its check
+  ([`docs/adding-a-node.md`](./docs/adding-a-node.md)).
 
 Voice ships a default catalog of recipes per memory tier and platform
 ([`recipes/README.md`](./recipes/README.md),

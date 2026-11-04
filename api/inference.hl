@@ -1826,10 +1826,20 @@ fn tool_calls_json(response: String) -> String {
 
 /// True when the seat could take a request now: its account is not
 /// archived, and its node is up, not draining, has applied its assignment,
-/// reports the seat `up` and holds it by no local control.
+/// reports the seat `up` and holds it by no local control. A placement's
+/// part across two nodes (its config's `cluster`) takes requests as its
+/// leader's seat, rank 0, while the follower's on the other node is up too
+/// (`part_up`); the follower's serves nothing itself.
 fn seat_ready(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError) {
     let a = store.account(s.account) or raise;
     if !a.present || a.archived { return false; }
+    let cluster = std::json::find_field_raw(s.config, "cluster");
+    if len(std::str::trim(cluster)) > 0 {
+        if std::json::find_int_field(cluster, "rank") != 0 { return false; }
+        if !(part_up(store, std::json::find_string_field(cluster, "peer"), s.id) or raise) {
+            return false;
+        }
+    }
     let n = store.node(s.node) or raise;
     if !n.present { return false; }
     let status = node_status(store, n, now_seconds()) or raise;
@@ -1847,6 +1857,22 @@ fn seat_ready(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError)
     let states = store.seat_states(n.id) or raise;
     for st in states.rows {
         if st.seat == s.id { return st.status == "up"; }
+    }
+    return false;
+}
+
+/// True when seat `id` on node `node`, a follower's part, is up: reported
+/// `up` for its node's current assignment, its node up and not draining.
+fn part_up(store: st::Store, node: String, id: String) -> Bool fallible(st::StoreError) {
+    let n = store.node(node) or raise;
+    if !n.present || n.revoked { return false; }
+    let status = node_status(store, n, now_seconds()) or raise;
+    if status != "up" { return false; }
+    let f = store.fleet(node) or raise;
+    if f.draining || f.applied_version < n.assignment_version { return false; }
+    let states = store.seat_states(node) or raise;
+    for st in states.rows {
+        if st.seat == id { return st.status == "up"; }
     }
     return false;
 }

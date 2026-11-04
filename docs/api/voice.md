@@ -185,11 +185,11 @@ client can pace itself instead of discovering the wall by failing.
 - [runtimes](#tag-runtimes) (4)
 - [placements](#tag-placements) (4)
 - [accounts](#tag-accounts) (5)
-- [nodes](#tag-nodes) (12)
+- [nodes](#tag-nodes) (13)
 - [changes](#tag-changes) (1)
 - [events](#tag-events) (1)
 - [routes](#tag-routes) (2)
-- [node](#tag-node) (8)
+- [node](#tag-node) (9)
 - [health](#tag-health) (2)
 - [annotations](#tag-annotations) (12)
 - [Schemas](#schemas)
@@ -1676,6 +1676,7 @@ Schema: [RuntimeCreate](#schema-runtimecreate)
 | `platforms[].os` | string, one of `linux`, `darwin` | yes |  |  |
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
+| `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
 
 Responses:
 
@@ -1796,7 +1797,7 @@ Schema: [PlacementCreate](#schema-placementcreate)
 | `id` | string | yes | Chosen at creation, stable forever, never reused; the id of the seat it creates on its leader. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `account` | string | yes | The account the seat spends, as any seat names one; a local account that bills nothing, for a model on the operator's own machines. |  |
 | `model` | string | yes | A local catalog model that names a recipe. |  |
-| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. One node today; a model too large for one is placed across several when engines can split it. | items ≥ 1; items ≤ 1 |
+| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each declares a link to the other (protocol.yaml `Link`), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
 | `variant` | string |  | The operator's choice of form, taken only if it fits; left out, the coordinator picks. |  |
 | `runtime` | string |  | The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks. |  |
 
@@ -2359,6 +2360,40 @@ Responses:
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+### POST `/admin/v1/nodes/{node}/links/{peer}/check`
+
+**Check the link between two nodes** · `checkNodeLink`
+
+Authentication: operatorToken
+
+Assigns both nodes their rank of an NCCL all-reduce over the link
+(protocol.yaml `LinkCheckJob`), in the image of the runtime that
+would serve a model across it (the one voice ships or the operator
+allows that spans nodes, for the nodes' platform), and answers the
+check, `running`. Its result is the link's `check` on both nodes
+once both report. Both nodes must be up, declare the link to each
+other, and have the same platform; a check of the pair already
+running is answered as it is.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `node` | path | [NodeIdValue](#schema-nodeidvalue) | yes |  |
+| `peer` | path | string | yes | The node at the other end of the link. |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 202 | The check, started or running. | `application/json` [LinkCheck](#schema-linkcheck) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 ### POST `/admin/v1/nodes/{node}/token`
 
 **Issue a node a new enrollment token** · `rotateNodeToken`
@@ -2699,6 +2734,7 @@ Schema: [schemas-Capabilities](#schema-schemas-capabilities)
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
+| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 
 Responses:
 
@@ -2765,6 +2801,42 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The node is revoked: its token is known but no longer admits it. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/node/v1/link-checks`
+
+**What the node's rank of a link check measured** · `reportLinkCheck`
+
+Authentication: enrollmentToken
+
+Kept once, as the node first reported it. A result for a check the
+coordinator no longer holds (it keeps the newest 64), or one in
+which the node has no rank, is dropped.
+
+Request body
+
+`application/json`
+
+Schema: [LinkCheckResult](#schema-linkcheckresult)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `ok` | boolean | yes | True when the all-reduce ran and its result was right. |  |
+| `bus_bytes_per_second` | integer |  | The all-reduce's bus bandwidth, as nccl-tests counts it, for the largest size it ran. | ≥ 0 |
+| `reason` | string |  | Why it failed, or what it ran. |  |
+| `iommu` | array of object |  | The IOMMU domain each of the link's RDMA devices is in, as the machine says it (`/sys/bus/pci/devices/<bdf>/iommu_group/type`), left out for a device in none. An all-reduce under 10 GB/s with a device behind a translating IOMMU is told so: a diagnosis only, as voice never changes how a machine boots. | items ≤ 4 |
+| `iommu[].hca` | string | yes |  |  |
+| `iommu[].domain` | string | yes | `identity` is passthrough; `DMA` and `DMA-FQ` translate every access the device makes. |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 204 | Received. |  |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The node is revoked: its token is known but no longer admits it. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### POST `/node/v1/draining`
@@ -3983,6 +4055,7 @@ Type: object
 | `platforms[].os` | string, one of `linux`, `darwin` | yes |  |  |
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
 | `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
+| `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
 
 <a id="schema-runtime"></a>
 
@@ -4007,7 +4080,7 @@ Type: object
 | `id` | string | yes | Chosen at creation, stable forever, never reused; the id of the seat it creates on its leader. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `account` | string | yes | The account the seat spends, as any seat names one; a local account that bills nothing, for a model on the operator's own machines. |  |
 | `model` | string | yes | A local catalog model that names a recipe. |  |
-| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. One node today; a model too large for one is placed across several when engines can split it. | items ≥ 1; items ≤ 1 |
+| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each declares a link to the other (protocol.yaml `Link`), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
 | `variant` | string |  | The operator's choice of form, taken only if it fits; left out, the coordinator picks. |  |
 | `runtime` | string |  | The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks. |  |
 
@@ -4025,6 +4098,10 @@ Type: object
 | `os` | string |  | The node's platform, as its hardware says it; left out when it has declared none. |  |
 | `tier_gb` | integer |  | The catalog tier the node is suggested from, in GB; left out below the smallest, or with no hardware declared. |  |
 | `data` | array of [NodeSuggestion](#schema-nodesuggestion) | yes |  |  |
+| `pair` | object |  | Across this node and the first node it is cabled to that could take a model with it (each declares the link, the two have the same platform and accelerators, and the link's latest check passed), what voice would place across the two, a model per category: the picks of the pair's tier (their memory together) above this node's own, judged on both nodes as a placement across them is, by a runtime that spans nodes (`nodes` names this node first). Left out when there is no such node. |  |
+| `pair.peer` | string | yes |  |  |
+| `pair.tier_gb` | integer |  | The pair's tier, in GB. |  |
+| `pair.data` | array of [NodeSuggestion](#schema-nodesuggestion) | yes |  |  |
 
 <a id="schema-nodesuggestion"></a>
 
@@ -4059,9 +4136,10 @@ Type: [PlacementCreate](#schema-placementcreate) & object
 | `chosen_by` | string, one of `coordinator`, `operator` | yes |  |  |
 | `leader` | string | yes | The node that holds the seat, the first of `nodes`. |  |
 | `seat` | string | yes | The seat it created, `<leader>/<id>`. |  |
+| `follower_seat` | string |  | Across two nodes, the seat it created on its follower, `<follower>/<id>`, which serves nothing itself; left out on one node. |  |
 | `fit` | array of [VariantFit](#schema-variantfit) | yes | Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made. |  |
 | `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. | ≥ 1 |
-| `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
+| `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed; across two nodes, what is reserved on each. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 
 <a id="schema-peeksummary"></a>
@@ -4746,10 +4824,48 @@ Type: object
 | `assignment_version` | integer |  | The latest assignment for this node. |  |
 | `applied_version` | integer \| null |  | The assignment the node last reported applying. |  |
 | `seats` | array of [SeatView](#schema-seatview) | yes |  |  |
+| `links` | array of [NodeLink](#schema-nodelink) |  | The links the node declared (`capabilities.links`), each with whether its peer declares it back and its latest check. |  |
 | `connected_at` | string \| null (date-time) |  |  |  |
 | `last_heartbeat_at` | string \| null (date-time) |  |  |  |
 | `created_at` | string (date-time) | yes |  |  |
 | `revoked_at` | string \| null (date-time) |  |  |  |
+
+<a id="schema-nodelink"></a>
+
+### NodeLink
+
+One link a node declared, as the coordinator sees it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `peer` | string | yes |  |  |
+| `paired` | boolean | yes | True when the peer declares a link back to this node. |  |
+| `check` | [LinkCheck](#schema-linkcheck) |  | The latest check of the link between the two, whichever started it; left out when none was run. |  |
+
+<a id="schema-linkcheck"></a>
+
+### LinkCheck
+
+A check of the link between two nodes: an NCCL all-reduce between
+them over it, one rank on each, in the image of the runtime that
+would serve a model across it. `running` until both report, or for
+thirty minutes; `passed` when both ran it right, `failed` otherwise.
+The pair is placed on only while its latest check has passed.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `nodes` | array of string | yes | The two nodes, rank 0 (whose address the ranks meet at) first. | items ≥ 2; items ≤ 2 |
+| `status` | string, one of `running`, `passed`, `failed` | yes |  |  |
+| `reason` | string |  | What each rank said, or which did not report. |  |
+| `bus_bytes_per_second` | integer |  | The bus bandwidth rank 0 measured, once it passed. | ≥ 0 |
+| `degraded` | boolean | yes | True when it passed under 10 GB/s of bus bandwidth: the sum was right, so a model may be placed across the link, but the link carries a tenth or less of what it should (NCCL staging through host memory, a port down). `reason` says the figure. |  |
+| `started_at` | string (date-time) | yes |  |  |
+| `finished_at` | string (date-time) |  |  |  |
 
 <a id="schema-nodewithtoken"></a>
 
@@ -6351,6 +6467,32 @@ Type: object
 | `accelerators` | array of [Accelerator](#schema-accelerator) | yes | At most 16; a machine with more declares its first 16, and its node says so in its log. | items ≤ 16 |
 | `disk_free_bytes` | integer | yes | Free space under the node's data directory, where weights are kept. | ≥ 0 |
 
+<a id="schema-linkport"></a>
+
+### LinkPort
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `ifname` | string | yes | Its network interface, by the name the machine gives it. | pattern `^[A-Za-z0-9._-]{1,15}$` |
+| `address` | string | yes | Its IPv4 address on the link, without a prefix length. | pattern `^[0-9]{1,3}(\.[0-9]{1,3}){3}$` |
+| `hca` | string |  | Its RDMA (RoCE) device, when it has one. | pattern `^[A-Za-z0-9._-]{1,64}$` |
+
+<a id="schema-link"></a>
+
+### Link
+
+One peer this node is cabled to, and the ports that reach it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `peer` | [Slug](#schema-slug) | yes | The node at the other end. |  |
+| `ports` | array of [LinkPort](#schema-linkport) | yes | The local ports cabled to the peer, the first the one the two meet on: a model's ranks start from its address. Every port's RDMA device carries the model's traffic (`NCCL_IB_HCA`), and the first port's interface the rest (`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, `UCX_NET_DEVICES`), as NVIDIA's guide to serving vLLM across two DGX Sparks sets them. A DGX Spark's one cabled QSFP port is two ports here, one for each PCIe half of its ConnectX-7. | items ≥ 1; items ≤ 4 |
+| `gid_index` | integer |  | The RoCE GID index the ports' RDMA devices use (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX Spark's ConnectX-7. | ≥ 0; ≤ 255 |
+
 <a id="schema-schemas-capabilities"></a>
 
 ### schemas-Capabilities
@@ -6366,6 +6508,7 @@ Type: object
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
+| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 
 <a id="schema-localcontrols"></a>
 
@@ -6487,6 +6630,27 @@ Type: object
 | `capabilities` | [schemas-Capabilities](#schema-schemas-capabilities) | yes |  |  |
 | `local` | [LocalControls](#schema-localcontrols) | yes |  |  |
 
+<a id="schema-linkcheckjob"></a>
+
+### LinkCheckJob
+
+One rank of a link's check: an NCCL all-reduce between the two nodes
+over their link, in the image named, with the NCCL settings the
+node's own declaration of the link gives (`Link.ports`), its RDMA
+devices passed to the container. Verify only: nothing is kept but
+what it measured.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `peer` | [Slug](#schema-slug) | yes |  |  |
+| `rank` | integer | yes |  | ≥ 0; ≤ 1 |
+| `master_addr` | string | yes | Rank 0's address on the link. |  |
+| `master_port` | integer | yes |  | ≥ 1; ≤ 65535 |
+| `image` | string | yes | The image it runs in, by digest (`<image>@sha256:...`), the runtime a model across the link would run in. |  |
+
 <a id="schema-assignment"></a>
 
 ### Assignment
@@ -6500,6 +6664,7 @@ Type: object
 | `version` | integer | yes | Increases with every change. The node applies the newest it has. |  |
 | `max_in_flight` | integer | yes | The coordinator's cap for this node, at most the node's declared `max_in_flight`. | ≥ 1 |
 | `seats` | array of [Seat](#schema-seat) | yes | A seat the node is running and this list leaves out is stopped once its in-flight requests finish. | items ≤ 16 |
+| `link_checks` | array of [LinkCheckJob](#schema-linkcheckjob) |  | The link checks the node is to run, one rank of each. A node runs each once and reports it; a check it has reported, or one thirty minutes old, is left out. | items ≤ 4 |
 
 <a id="schema-registered"></a>
 
@@ -6570,6 +6735,24 @@ Type: object
 |---|---|---|---|---|
 | `seat` | string | yes |  |  |
 | `windows` | array of [QuotaWindow](#schema-quotawindow) | yes |  | items ≤ 16 |
+
+<a id="schema-linkcheckresult"></a>
+
+### LinkCheckResult
+
+What a node's rank of a link check measured.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `ok` | boolean | yes | True when the all-reduce ran and its result was right. |  |
+| `bus_bytes_per_second` | integer |  | The all-reduce's bus bandwidth, as nccl-tests counts it, for the largest size it ran. | ≥ 0 |
+| `reason` | string |  | Why it failed, or what it ran. |  |
+| `iommu` | array of object |  | The IOMMU domain each of the link's RDMA devices is in, as the machine says it (`/sys/bus/pci/devices/<bdf>/iommu_group/type`), left out for a device in none. An all-reduce under 10 GB/s with a device behind a translating IOMMU is told so: a diagnosis only, as voice never changes how a machine boots. | items ≤ 4 |
+| `iommu[].hca` | string | yes |  |  |
+| `iommu[].domain` | string | yes | `identity` is passthrough; `DMA` and `DMA-FQ` translate every access the device makes. |  |
 
 <a id="schema-draining"></a>
 

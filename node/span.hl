@@ -1,0 +1,339 @@
+// A model across two nodes (protocol.yaml `ClusterPart`), and the checks
+// of the links that carry one (`LinkCheckJob`).
+//
+// Two nodes cabled to each other each declare their end of the link in
+// their capabilities file (`links`: the peer, the local ports, the GID
+// index), since those are the machine's own. What NCCL and vLLM are told
+// comes from that alone, as NVIDIA's guide to serving vLLM across two DGX
+// Sparks sets it: every port's RDMA device carries the model's traffic
+// (`NCCL_IB_HCA`), the first port's interface the rest. A seat's part of a
+// placement across the two runs vLLM's own multi-node executor (`--nnodes
+// 2`, the leader rank 0 serving the API, the follower rank 1 headless) in
+// the runtime's container, on the host's network so the ranks reach each
+// other over the link, with the machine's RDMA devices.
+
+/// A node's declared link to `peer`: its ports (as JSON) and GID index
+/// (-1 for none), from its declared capabilities.
+type LinkEnd { ports: String = ""; gid_index: Int = -1; }
+
+@bounded_by(capabilities)
+fn link_end(capabilities: String, peer: String) -> LinkEnd {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "links"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "peer") == peer {
+            return LinkEnd {
+                ports: std::str::trim(std::json::find_field_raw(it.element, "ports")),
+                gid_index: if std::json::string_field(it.element, "gid_index").kind == "number" {
+                    std::json::find_int_field(it.element, "gid_index")
+                } else {
+                        -1
+                },
+            };
+        }
+        it = std::json::array_next(it);
+    }
+    return LinkEnd { };
+}
+
+/// What `docker run` sets in a container's environment to carry NCCL, its
+/// bootstrap and vLLM's control traffic over the link to `peer`, one
+/// argument a line: the first port's interface for sockets, every port's
+/// RDMA device for the model's traffic, RDMA on; "" when this node
+/// declares no link to `peer`.
+@bounded_by(capabilities)
+fn link_env(capabilities: String, peer: String) -> String {
+    let end = link_end(capabilities, peer);
+    let first = std::json::array_first(end.ports);
+    if first.done { return ""; }
+    let ifname = std::json::find_string_field(first.element, "ifname");
+    let mut hcas = "";
+    let mut it = first;
+    while !it.done {
+        let hca = std::json::find_string_field(it.element, "hca");
+        if len(hca) > 0 { hcas = if len(hcas) > 0 { hcas + "," + hca } else { hca }; }
+        it = std::json::array_next(it);
+    }
+    let mut out = "";
+    for name in [
+        "NCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
+        "TP_SOCKET_IFNAME",
+        "UCX_NET_DEVICES",
+        "MN_IF_NAME",
+        "OMPI_MCA_btl_tcp_if_include",
+    ] {
+        out = out + "-e\n" + name + "=" + ifname + "\n";
+    }
+    out = out + "-e\nVLLM_HOST_IP=" + std::json::find_string_field(first.element, "address") + "\n";
+    if len(hcas) > 0 { out = out + "-e\nNCCL_IB_HCA=" + hcas + "\n-e\nNCCL_IB_DISABLE=0\n"; }
+    if end.gid_index >= 0 {
+        out = out + "-e\nNCCL_IB_GID_INDEX=" + to_string(end.gid_index) + "\n";
+    }
+    return out + "-e\nNCCL_IGNORE_CPU_AFFINITY=1\n";
+}
+
+/// `docker run` for a seat's part across two nodes, or a link's check: on
+/// the host's network and IPC, so the ranks reach each other over the link
+/// and its RDMA devices are there; the GPUs; the RDMA devices
+/// (`/dev/infiniband`) and the locked memory they register, which NCCL's
+/// RDMA transport needs or it falls back to sockets; the link's
+/// environment (`env`), then what else the caller mounts and sets
+/// (`more`), one argument a line.
+fn span_docker(name: String, owner: String, env: String, more: String, image: String) -> String {
+    return "docker\nrun\n--rm\n--init\n--name\n" + name + "\n--label\n" + OWNER_LABEL + "=" + owner
+        + "\n--network\nhost\n--ipc\nhost\n--gpus\nall\n--device\n/dev/infiniband\n--ulimit\nmemlock=-1\n--ulimit\nstack=67108864\n"
+        + env + more + image + "\n";
+}
+
+/// A seat's part across two nodes, as `docker run` takes it: the weights
+/// and the store they link into mounted read-only, offline, its caches
+/// (`cache`), and vLLM (`args`). Its API listens on loopback alone, at the
+/// port the node picked.
+fn span_container_argv(
+    name: String,
+    owner: String,
+    models: String,
+    blobs: String,
+    env: String,
+    cache: String,
+    image: String,
+    args: String
+) -> String {
+    return span_docker(
+        name,
+        owner,
+        env,
+        "-v\n" + models + ":/models:ro\n-v\n" + blobs + ":" + blobs
+            + ":ro\n-e\nHF_HUB_OFFLINE=1\n-e\nTRANSFORMERS_OFFLINE=1\n" + cache,
+        image,
+    ) + args;
+}
+
+/// vLLM's arguments for a seat's part (`cluster`, its `ClusterPart`), after
+/// its own: the model split by tensor parallelism across the two GPUs,
+/// vLLM's multi-node executor told the nodes, this one's rank and where
+/// they meet; the follower headless, serving no API.
+fn span_args(cluster: String) -> String {
+    let rank = std::json::find_int_field(cluster, "rank");
+    return "\n--tensor-parallel-size\n" + to_string(std::json::find_int_field(cluster, "size"))
+        + "\n--nnodes\n" + to_string(std::json::find_int_field(cluster, "size")) + "\n--node-rank\n"
+        + to_string(rank)
+        + "\n--master-addr\n" + std::json::find_string_field(cluster, "master_addr")
+        + "\n--master-port\n" + to_string(std::json::find_int_field(cluster, "master_port"))
+        + (if rank > 0 { "\n--headless" } else { "" });
+}
+
+// ---- link checks ------------------------------------------------------
+
+/// The ranks of link checks the assignment holds (`Assignment.link_checks`),
+/// as their JSON list.
+type LinkCheckJobs { jobs: String = "[]"; }
+
+topic LinkChecksAssigned { payload: LinkCheckJobs; }
+
+/// A rank of a check, run: its `LinkCheckResult` JSON.
+type LinkChecked { id: String = ""; result: String = ""; }
+
+topic LinkCheckDone { payload: LinkChecked; }
+
+/// What a rank of a check runs, in the image named: an NCCL all-reduce of
+/// 256 MiB between the two ranks, its sum checked, then timed over twenty,
+/// its bus bandwidth as nccl-tests counts it (size / time x 2(n-1)/n). It
+/// says what it found on its last line. `torch.distributed` is in every
+/// vLLM image, and needs no MPI or SSH between the nodes, which
+/// nccl-tests would.
+const LINK_CHECK_SCRIPT: String = "import datetime, json, os, time\nimport torch\nimport torch.distributed as dist\n\nrank = int(os.environ['VOICE_RANK'])\nout = {'ok': False}\ntry:\n    dist.init_process_group('nccl', init_method='tcp://%s:%s' % (os.environ['VOICE_MASTER_ADDR'], os.environ['VOICE_MASTER_PORT']), rank=rank, world_size=2, timeout=datetime.timedelta(seconds=600))\n    torch.cuda.set_device(0)\n    n = 64 * 1024 * 1024\n    x = torch.full((n,), float(rank + 1), dtype=torch.float32, device='cuda')\n    dist.all_reduce(x)\n    torch.cuda.synchronize()\n    out['ok'] = bool(torch.all(x == 3.0).item())\n    y = torch.ones(n, dtype=torch.float32, device='cuda')\n    for _ in range(3):\n        dist.all_reduce(y)\n    torch.cuda.synchronize()\n    iters = 20\n    t = time.perf_counter()\n    for _ in range(iters):\n        dist.all_reduce(y)\n    torch.cuda.synchronize()\n    took = (time.perf_counter() - t) / iters\n    out['bus_bytes_per_second'] = int(n * 4 / took * 2 * (2 - 1) / 2)\n    dist.destroy_process_group()\nexcept Exception as e:\n    out['ok'] = False\n    out['error'] = '%s: %s' % (type(e).__name__, str(e)[:300])\nprint('VOICE_LINK_CHECK ' + json.dumps(out), flush=True)\n";
+
+/// The IOMMU domain of each RDMA device of the link to `peer`
+/// (`link_end`), as `LinkCheckResult.iommu`'s members: what sysfs says of
+/// its PCI device's group, under `root` ("" for the machine's own; a
+/// test's); a device in no group is left out.
+@bounded_by(capabilities)
+fn iommu_domains(capabilities: String, peer: String, root: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 128 };
+    let mut first = true;
+    let mut it = std::json::array_first(link_end(capabilities, peer).ports);
+    while !it.done {
+        let hca = std::json::find_string_field(it.element, "hca");
+        if len(hca) > 0 {
+            let domain = std::str::trim(
+                std::io::fs::read_file(
+                    root + "/sys/class/infiniband/" + hca + "/device/iommu_group/type",
+                ) or "",
+            );
+            if len(domain) > 0 {
+                if !first { out.append_str(", "); }
+                first = false;
+                out.append_str("{\"hca\": " + q(hca) + ", \"domain\": " + q(domain) + "}");
+            }
+        }
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// What a check's output (its container's, NCCL's own lines among it)
+/// says: its result as `LinkCheckResult` JSON for check `id`, with the
+/// transport NCCL took and the link's RDMA devices' IOMMU domains
+/// (`iommu`, `iommu_domains`).
+@bounded_by(output)
+fn link_result(id: String, output: String, iommu: String) -> String {
+    let at = std::str::index_of(output, "VOICE_LINK_CHECK ");
+    let transport = if std::str::contains(output, "via NET/IB") {
+        "over RDMA (NCCL NET/IB)"
+    } else if std::str::contains(output, "via NET/Socket") {
+        "over sockets (NCCL NET/Socket): the RDMA devices were not used"
+    } else {
+        ""
+    };
+    if at < 0 {
+        let said = last_line(last_of(output, 1500));
+        return "{\"id\": " + q(id) + ", \"ok\": false, \"reason\": "
+            + q("the check did not finish" + (if len(said) > 0 { ": " + said } else { "" }))
+            + (if len(iommu) > 0 { ", \"iommu\": [" + iommu + "]" } else { "" }) + "}";
+    }
+    let rest = output[(at + 17)..len(output)];
+    let nl = std::str::index_of(rest, "\n");
+    let found = std::str::trim(if nl >= 0 { rest[0..nl] } else { rest });
+    let ok = std::json::find_bool_field(found, "ok");
+    let bus = std::json::string_field(found, "bus_bytes_per_second").kind == "number";
+    let error = std::json::find_string_field(found, "error");
+    let reason = if !ok {
+        if len(error) > 0 { error } else { "the all-reduce's sum was wrong" }
+    } else {
+        "the all-reduce's sum was right"
+            + (
+                if bus {
+                    ", " + gib(std::json::find_int_field(found, "bus_bytes_per_second")) + "/s"
+                } else {
+                    ""
+                }
+            )
+    } + (if len(transport) > 0 { ", " + transport } else { "" });
+    return "{\"id\": " + q(id) + ", \"ok\": " + (if ok { "true" } else { "false" })
+        + (
+            if bus {
+                ", \"bus_bytes_per_second\": "
+                    + to_string(std::json::find_int_field(found, "bus_bytes_per_second"))
+            } else {
+                ""
+            }
+        ) + ", \"reason\": " + q(reason)
+        + (if len(iommu) > 0 { ", \"iommu\": [" + iommu + "]" } else { "" }) + "}";
+}
+
+/// The checks of the links the coordinator assigns this node, its rank of
+/// each run once, one at a time, on a thread of their own: a rank waits for
+/// the other for up to ten minutes, and an image may be pulled first (the
+/// coordinator waits thirty for both).
+locus Checker {
+    params {
+        id: String = "";
+        data: String = "node-data";
+        // the node's declared capabilities, whose links say the ports
+        capabilities: String = "";
+        // ranks to run, one a line, each its job's JSON escaped
+        queue: String = "";
+        // the checks run or queued, one a line
+        seen: String = "\n";
+    }
+
+    bus {
+        subscribe LinkChecksAssigned as on_assigned;
+        publish LinkCheckDone;
+    }
+
+    run() {
+        while !self.draining {
+            self.step();
+        }
+    }
+
+    @unbounded
+    fn step() {
+        if len(self.queue) > 0 {
+            let nl = std::str::index_of(self.queue, "\n");
+            let line = self.queue[0..nl];
+            self.queue = self.queue[(nl + 1)..len(self.queue)];
+            self.check(std::json::unescape_string(line));
+        }
+        std::time::sleep(500ms);
+    }
+
+    /// The assignment's checks: each not run or queued yet, queued.
+    @unbounded
+    fn on_assigned(j: LinkCheckJobs) {
+        let mut it = std::json::array_first(j.jobs);
+        while !it.done {
+            let job = std::str::trim(it.element);
+            let id = std::json::find_string_field(job, "id");
+            if len(id) > 0 && !std::str::contains(self.seen, "\n" + id + "\n") {
+                self.seen = self.seen + id + "\n";
+                self.queue = self.queue + std::json::escape_string(job) + "\n";
+            }
+            it = std::json::array_next(it);
+        }
+    }
+
+    /// One rank of a check, run in its image with the link's environment,
+    /// and what it found told.
+    @unbounded
+    fn check(job: String) {
+        let id = std::json::find_string_field(job, "id");
+        let peer = std::json::find_string_field(job, "peer");
+        let image = std::json::find_string_field(job, "image");
+        let env = link_env(self.capabilities, peer);
+        if len(env) == 0 {
+            self.tell(
+                id,
+                "{\"id\": " + q(id) + ", \"ok\": false, \"reason\": "
+                    + q("this node declares no link to " + peer) + "}",
+            );
+            return;
+        }
+        log_info(
+            "checking the link",
+            fields2(std::log::kv("peer", peer), std::log::kv("check", id)),
+        );
+        // the image by digest, pulled once: what a model across the link
+        // would run in
+        if len(run_out("docker\nimage\ninspect\n-f\n{{.Id}}\n" + image)) == 0 {
+            run_out("docker\npull\n" + image);
+        }
+        std::io::fs::mkdir(self.data + "/run") or discard;
+        let script = self.data + "/run/link-check.py";
+        std::io::fs::write_file(script, LINK_CHECK_SCRIPT) or discard;
+        let name = "voice." + self.id + ".link-check";
+        run_out("docker\nrm\n-f\n" + name);
+        let argv = span_docker(
+            name,
+            self.id,
+            env,
+            "-e\nNCCL_DEBUG=INFO\n-e\nNCCL_DEBUG_SUBSYS=INIT,NET\n-e\nVOICE_RANK="
+                + to_string(std::json::find_int_field(job, "rank")) + "\n-e\nVOICE_MASTER_ADDR="
+                + std::json::find_string_field(job, "master_addr") + "\n-e\nVOICE_MASTER_PORT="
+                + to_string(std::json::find_int_field(job, "master_port")) + "\n-v\n" + script
+                + ":/voice/link-check.py:ro\n--entrypoint\npython3\n",
+            image,
+        ) + "/voice/link-check.py";
+        let o = std::process::run(argv) or std::process::ProcessOutput {
+            code: 1,
+            signal: 0,
+            stdout: "",
+            stderr: "docker could not be run",
+        };
+        self.tell(
+            id,
+            link_result(id, o.stdout + "\n" + o.stderr, iommu_domains(self.capabilities, peer, "")),
+        );
+    }
+
+    fn tell(id: String, result: String) {
+        log_info(
+            "checked the link",
+            fields2(std::log::kv("check", id), std::log::kv("result", result)),
+        );
+        LinkCheckDone <- LinkChecked { id: id, result: result };
+    }
+}

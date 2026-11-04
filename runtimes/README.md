@@ -22,6 +22,13 @@ URL and sha256. A runtime names no command.
 | `decision-0.1.2-rocm` | gguf, decision models only | ROCm (AMD), linux x86_64 | `ghcr.io/hale-lang/voice-decision:rocm-0.1.2` |
 | `decision-0.1.2-cuda` | gguf, decision models only | CUDA, linux arm64 and x86_64 | `ghcr.io/hale-lang/voice-decision:cuda-0.1.2` |
 
+`vllm-26.09` spans two nodes (`multi_node: mp`): a model too large for one
+machine is placed across two cabled to each other, and each runs a rank of
+vLLM's own multi-node executor (`--nnodes 2`, the follower `--headless`) in
+this image, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it,
+with no Ray cluster. The field says how voice runs the same build; it added
+no flag to a seat on one node, which runs as it did.
+
 The operator is the authority on what may run: they allow more runtimes on
 the admin plane (`POST /admin/v1/runtimes`). These are read by the api at
 start (`--runtimes`), listed as `shipped`, and cannot be changed or removed

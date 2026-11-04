@@ -110,6 +110,23 @@ info:
       `quota_exhausted` failure also marks the account exhausted until the
       reset in the result's quota windows.
 
+    ## A model across two nodes
+
+    A placement may span two nodes cabled to each other (openapi.yaml
+    `Placement`). Its seat is on the first, its leader, which serves it; a
+    seat of the same id on the second, its follower, runs the other half of
+    the model and serves nothing itself. Each seat's config says its part
+    (`ManagedConfig.cluster`), and both nodes fetch and verify the variant's
+    files. The coordinator offers requests only to the leader's seat, and
+    only while both seats are `up`: either one down, stopped, drained or
+    replaced takes the model out of service until both run again.
+
+    A model is placed across a link only once the link was checked. The
+    coordinator assigns each of the two nodes a `link_check`
+    (`Assignment.link_checks`); each runs one rank of an NCCL all-reduce
+    over the link, in the image of the runtime that would serve a model
+    across it, and reports what it measured (`POST /node/v1/link-checks`).
+
     ## Subjects
 
     `voice.node.<node>.assign`, `voice.node.<node>.serve`,
@@ -253,6 +270,70 @@ components:
           description: The most requests the node will serve at once, across all its seats.
         hardware:
           $ref: '#/components/schemas/Hardware'
+        links:
+          type: array
+          maxItems: 4
+          description: |
+            The direct links to other nodes its operator declared on the
+            machine, in the node's capabilities file beside its engines
+            (each machine's own interfaces and addresses): for each peer,
+            the local ports cabled to it. A model is placed across two
+            nodes only when each declares the other and their link passed
+            its check (openapi.yaml `checkNodeLink`).
+          items: { $ref: '#/components/schemas/Link' }
+
+    Link:
+      type: object
+      description: One peer this node is cabled to, and the ports that reach it.
+      required: [peer, ports]
+      properties:
+        peer:
+          $ref: '#/components/schemas/Slug'
+          description: The node at the other end.
+        ports:
+          type: array
+          minItems: 1
+          maxItems: 4
+          description: |
+            The local ports cabled to the peer, the first the one the two
+            meet on: a model's ranks start from its address. Every port's
+            RDMA device carries the model's traffic (`NCCL_IB_HCA`), and
+            the first port's interface the rest (`NCCL_SOCKET_IFNAME`,
+            `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, `UCX_NET_DEVICES`),
+            as NVIDIA's guide to serving vLLM across two DGX Sparks sets
+            them. A DGX Spark's one cabled QSFP port is two ports here, one
+            for each PCIe half of its ConnectX-7.
+          items: { $ref: '#/components/schemas/LinkPort' }
+        gid_index:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: |
+            The RoCE GID index the ports' RDMA devices use
+            (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one
+            the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX
+            Spark's ConnectX-7.
+          examples: [3]
+
+    LinkPort:
+      type: object
+      required: [ifname, address]
+      properties:
+        ifname:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,15}$'
+          description: Its network interface, by the name the machine gives it.
+          examples: [enp1s0f0np0]
+        address:
+          type: string
+          pattern: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+          description: Its IPv4 address on the link, without a prefix length.
+          examples: [192.168.100.1]
+        hca:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,64}$'
+          description: Its RDMA (RoCE) device, when it has one.
+          examples: [rocep1s0f0]
 
     Hardware:
       type: object
@@ -382,6 +463,40 @@ components:
           $ref: './openapi.yaml#/components/schemas/RecipeVariant'
         runtime:
           $ref: './openapi.yaml#/components/schemas/RuntimeCreate'
+        cluster:
+          $ref: '#/components/schemas/ClusterPart'
+
+    ClusterPart:
+      type: object
+      description: |
+        A seat's part of a placement across two nodes: its rank, the node it
+        pairs with, and where the ranks meet. The node runs the runtime's
+        server across the two as the runtime says (`multi_node`): for vLLM
+        (`mp`), its own multi-node executor, `--nnodes 2`, the leader rank
+        0 serving the API and the follower rank 1 headless, the model split
+        by tensor parallelism across the two GPUs, as NVIDIA's two-Spark
+        guide runs it. Both run on the host's network, so the ranks reach
+        each other over the link, and the leader's API listens on loopback
+        alone. A node takes part in one such placement at a time.
+      required: [size, rank, peer, master_addr, master_port]
+      properties:
+        size: { type: integer, const: 2 }
+        rank:
+          type: integer
+          minimum: 0
+          maximum: 1
+          description: 0 for the leader, which serves; 1 for the follower.
+        peer:
+          $ref: '#/components/schemas/Slug'
+          description: The other node; this node's link to it (`Capabilities.links`) carries the model.
+        master_addr:
+          type: string
+          description: The leader's address on its link to the follower, the first of its ports.
+        master_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+          description: Where on it the ranks meet.
 
     StaticConfig:
       type: object
@@ -594,6 +709,72 @@ components:
           maxItems: 16
           description: A seat the node is running and this list leaves out is stopped once its in-flight requests finish.
           items: { $ref: '#/components/schemas/Seat' }
+        link_checks:
+          type: array
+          maxItems: 4
+          description: |
+            The link checks the node is to run, one rank of each. A node
+            runs each once and reports it; a check it has reported, or one
+            thirty minutes old, is left out.
+          items: { $ref: '#/components/schemas/LinkCheckJob' }
+
+    LinkCheckJob:
+      type: object
+      description: |
+        One rank of a link's check: an NCCL all-reduce between the two nodes
+        over their link, in the image named, with the NCCL settings the
+        node's own declaration of the link gives (`Link.ports`), its RDMA
+        devices passed to the container. Verify only: nothing is kept but
+        what it measured.
+      required: [id, peer, rank, master_addr, master_port, image]
+      properties:
+        id: { type: string }
+        peer:
+          $ref: '#/components/schemas/Slug'
+        rank: { type: integer, minimum: 0, maximum: 1 }
+        master_addr:
+          type: string
+          description: Rank 0's address on the link.
+        master_port: { type: integer, minimum: 1, maximum: 65535 }
+        image:
+          type: string
+          description: The image it runs in, by digest (`<image>@sha256:...`), the runtime a model across the link would run in.
+          examples: ['nvcr.io/nvidia/vllm@sha256:5577473378...']
+
+    LinkCheckResult:
+      type: object
+      description: What a node's rank of a link check measured.
+      required: [id, ok]
+      properties:
+        id: { type: string }
+        ok:
+          type: boolean
+          description: True when the all-reduce ran and its result was right.
+        bus_bytes_per_second:
+          type: integer
+          minimum: 0
+          description: The all-reduce's bus bandwidth, as nccl-tests counts it, for the largest size it ran.
+        reason:
+          type: string
+          description: Why it failed, or what it ran.
+        iommu:
+          type: array
+          maxItems: 4
+          description: |
+            The IOMMU domain each of the link's RDMA devices is in, as the
+            machine says it (`/sys/bus/pci/devices/<bdf>/iommu_group/type`),
+            left out for a device in none. An all-reduce under 10 GB/s with
+            a device behind a translating IOMMU is told so: a diagnosis
+            only, as voice never changes how a machine boots.
+          items:
+            type: object
+            required: [hca, domain]
+            properties:
+              hca: { type: string, examples: [rocep1s0f0] }
+              domain:
+                type: string
+                description: '`identity` is passthrough; `DMA` and `DMA-FQ` translate every access the device makes.'
+                examples: [identity, DMA-FQ]
 
     SeatState:
       type: object

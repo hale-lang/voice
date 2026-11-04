@@ -6,7 +6,11 @@
 // A seat routes when it is enabled, reported `up` for its node's current
 // assignment, held by no local control, on a node that is up (a heartbeat
 // younger than three intervals) and not draining, for an account that is
-// active and not exhausted. An account is exhausted while one of its
+// active and not exhausted. A seat that is a placement's part across two
+// nodes (its config's `cluster`) routes only as its leader's (rank 0), and
+// only while its follower's seat on the other node would route but for
+// serving nothing itself: up, its node up and not draining, its assignment
+// applied. The follower's never routes. An account is exhausted while one of its
 // provider windows is at 100%; it is listed with the earliest reset. Rank
 // is account headroom first (the fullest window), then seat load, with a
 // little jitter so instances spread. Limits are not counted yet (nothing
@@ -34,7 +38,7 @@ type SeatLine {
 /// What a seat needs to be judged: the seat, its node, its account, the
 /// node's report and the seat's state, its account's fullest window and
 /// the earliest reset of a full one, and its heartbeat's age in seconds.
-const SEAT_READ: String = "SELECT row_to_json(t) FROM (SELECT s.node || '/' || s.id AS seat, s.node, s.id, s.account, s.serves, s.data_classes, s.concurrency, s.enabled, n.max_in_flight AS node_cap, n.assignment_version, ns.capabilities, ns.local, ns.in_flight AS node_in_flight, ns.applied_version, ns.draining, extract(epoch FROM now() - ns.last_heartbeat_at)::int AS beat_age, st.status AS seat_status, st.in_flight AS seat_in_flight, a.status AS account_status, (SELECT max(used_percent) FROM quota_window q WHERE q.account = s.account) AS used, (SELECT min(resets_at) FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted_until, EXISTS (SELECT 1 FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted FROM seat s JOIN node n ON n.id = s.node JOIN account a ON a.id = s.account LEFT JOIN node_state ns ON ns.node = s.node LEFT JOIN seat_state st ON st.node = s.node AND st.seat = s.id WHERE n.status <> 'revoked' ORDER BY s.node, s.id) t";
+const SEAT_READ: String = "SELECT row_to_json(t) FROM (SELECT s.node || '/' || s.id AS seat, s.node, s.id, s.account, s.serves, s.data_classes, s.concurrency, s.enabled, n.max_in_flight AS node_cap, n.assignment_version, ns.capabilities, ns.local, ns.in_flight AS node_in_flight, ns.applied_version, ns.draining, extract(epoch FROM now() - ns.last_heartbeat_at)::int AS beat_age, st.status AS seat_status, st.in_flight AS seat_in_flight, a.status AS account_status, (s.config->'cluster'->>'rank')::int AS cluster_rank, (SELECT fst.status = 'up' AND NOT coalesce(fns.draining, false) AND extract(epoch FROM now() - fns.last_heartbeat_at)::int <= 15 AND coalesce(fns.applied_version, -1) >= fnode.assignment_version FROM seat_state fst JOIN node fnode ON fnode.id = fst.node LEFT JOIN node_state fns ON fns.node = fst.node WHERE fst.node = s.config->'cluster'->>'peer' AND fst.seat = s.id AND fnode.status <> 'revoked') AS follower_up, (SELECT max(used_percent) FROM quota_window q WHERE q.account = s.account) AS used, (SELECT min(resets_at) FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted_until, EXISTS (SELECT 1 FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted FROM seat s JOIN node n ON n.id = s.node JOIN account a ON a.id = s.account LEFT JOIN node_state ns ON ns.node = s.node LEFT JOIN seat_state st ON st.node = s.node AND st.seat = s.id WHERE n.status <> 'revoked' ORDER BY s.node, s.id) t";
 
 const MODEL_READ: String = "SELECT id FROM catalog_model WHERE removed_at IS NULL ORDER BY created_at, id";
 
@@ -70,7 +74,7 @@ fn judge(row: String, jitter: Float) -> SeatLine {
     let active = st::pg_text(row, "account_status") == "active";
     out.exhausted = active && std::json::find_bool_field(row, "exhausted");
     out.exhausted_until = st::pg_text(row, "exhausted_until");
-    out.routes = node_up && seat_up && active && !out.exhausted;
+    out.routes = node_up && seat_up && active && !out.exhausted && part_routes(row);
 
     let concurrency = int_or(row, "concurrency", 1);
     let in_flight = int_or(row, "seat_in_flight", 0);
@@ -97,6 +101,15 @@ fn judge(row: String, jitter: Float) -> SeatLine {
         + (Float(in_flight) / Float(if concurrency > 0 { concurrency } else { 1 })) * 0.01
         + jitter * 0.001;
     return out;
+}
+
+/// Whether a seat routes as its part of a placement across two nodes: a
+/// seat that is none routes; a leader (rank 0) while its follower is up
+/// (`follower_up`); a follower never, as it serves nothing itself.
+fn part_routes(row: String) -> Bool {
+    if std::json::string_field(row, "cluster_rank").kind != "number" { return true; }
+    if std::json::find_int_field(row, "cluster_rank") != 0 { return false; }
+    return std::json::find_bool_field(row, "follower_up");
 }
 
 /// True when the JSON list of seat ids names `id`.

@@ -2968,6 +2968,49 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/nodes/{node}/links/{peer}/check:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+      - name: peer
+        in: path
+        required: true
+        description: The node at the other end of the link.
+        schema: { type: string }
+    post:
+      tags: [nodes]
+      operationId: checkNodeLink
+      summary: Check the link between two nodes
+      description: |
+        Assigns both nodes their rank of an NCCL all-reduce over the link
+        (protocol.yaml `LinkCheckJob`), in the image of the runtime that
+        would serve a model across it (the one voice ships or the operator
+        allows that spans nodes, for the nodes' platform), and answers the
+        check, `running`. Its result is the link's `check` on both nodes
+        once both report. Both nodes must be up, declare the link to each
+        other, and have the same platform; a check of the pair already
+        running is answered as it is.
+      security:
+        - operatorToken: []
+      responses:
+        '202':
+          description: The check, started or running.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LinkCheck'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/nodes/{node}/token:
     parameters:
       - $ref: '#/components/parameters/NodeId'
@@ -3342,6 +3385,35 @@ paths:
           $ref: '#/components/responses/NodeRevoked'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /node/v1/link-checks:
+    post:
+      tags: [node]
+      operationId: reportLinkCheck
+      summary: What the node's rank of a link check measured
+      description: |
+        Kept once, as the node first reported it. A result for a check the
+        coordinator no longer holds (it keeps the newest 64), or one in
+        which the node has no rank, is dropped.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/LinkCheckResult'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NodeRevoked'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -5243,6 +5315,15 @@ components:
               then: { required: [image, digest] }
             - if: { properties: { kind: { const: archive } } }
               then: { required: [url, sha256, bytes] }
+        multi_node:
+          type: string
+          enum: [mp]
+          description: |
+            How its server spans two nodes, when it can; left out, a model
+            it serves is placed on one node. `mp`: vLLM's own multi-node
+            executor (`--nnodes`, `--node-rank`, `--master-addr`, the
+            follower `--headless`), with no Ray cluster, as NVIDIA's guide to
+            serving vLLM across two DGX Sparks runs it.
 
     Runtime:
       allOf:
@@ -5279,11 +5360,21 @@ components:
         nodes:
           type: array
           minItems: 1
-          maxItems: 1
+          maxItems: 2
           description: |
             The nodes it runs on, the first of them its leader, which holds
-            the seat that serves it. One node today; a model too large for
-            one is placed across several when engines can split it.
+            the seat that serves it. Two, for a model split across them:
+            the second, its follower, holds a seat of the same id that runs
+            the other half and serves nothing itself. Two nodes are placed
+            on only when they have the same platform and accelerator, each
+            declares a link to the other (protocol.yaml `Link`), their link
+            passed its latest check (`checkNodeLink`), neither takes part in
+            another placement across nodes, and the runtime spans nodes
+            (`RuntimeCreate.multi_node`). The variant is judged on each:
+            each holds half its weights, its whole cache for the context
+            it is fitted to (vLLM keeps a latent-attention model's cache
+            whole on every rank, so voice counts it whole on each), and
+            its server's own.
           items: { $ref: '#/components/schemas/NodeIdValue' }
         variant:
           type: string
@@ -5308,6 +5399,27 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/NodeSuggestion'
+        pair:
+          description: |
+            Across this node and the first node it is cabled to that could
+            take a model with it (each declares the link, the two have the
+            same platform and accelerators, and the link's latest check
+            passed), what voice would place across the two, a model per
+            category: the picks of the pair's tier (their memory together)
+            above this node's own, judged on both nodes as a placement across
+            them is, by a runtime that spans nodes (`nodes` names this node
+            first). Left out when there is no such node.
+          type: object
+          required: [peer, data]
+          properties:
+            peer: { type: string }
+            tier_gb:
+              type: integer
+              description: The pair's tier, in GB.
+            data:
+              type: array
+              items:
+                $ref: '#/components/schemas/NodeSuggestion'
 
     NodeSuggestion:
       type: object
@@ -5360,6 +5472,9 @@ components:
             seat:
               type: string
               description: The seat it created, `<leader>/<id>`.
+            follower_seat:
+              type: string
+              description: Across two nodes, the seat it created on its follower, `<follower>/<id>`, which serves nothing itself; left out on one node.
             fit:
               type: array
               description: Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made.
@@ -5379,7 +5494,8 @@ components:
               minimum: 1
               description: |
                 What is reserved for it of its node's memory for models: its
-                variant's need and its cache, all of it from when it is placed.
+                variant's need and its cache, all of it from when it is placed;
+                across two nodes, what is reserved on each.
                 Its seat holds that and its server's own, 2 GiB (the process,
                 its GPU context and compute buffers; vLLM is given that sum as
                 its share of the GPU). A later placement on the node fits in
@@ -6212,10 +6328,65 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SeatView'
+        links:
+          type: array
+          description: The links the node declared (`capabilities.links`), each with whether its peer declares it back and its latest check.
+          items:
+            $ref: '#/components/schemas/NodeLink'
         connected_at: { type: [string, 'null'], format: date-time }
         last_heartbeat_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
         revoked_at: { type: [string, 'null'], format: date-time }
+
+    NodeLink:
+      type: object
+      description: One link a node declared, as the coordinator sees it.
+      required: [peer, paired]
+      properties:
+        peer: { type: string }
+        paired:
+          type: boolean
+          description: True when the peer declares a link back to this node.
+        check:
+          description: The latest check of the link between the two, whichever started it; left out when none was run.
+          $ref: '#/components/schemas/LinkCheck'
+
+    LinkCheck:
+      type: object
+      description: |
+        A check of the link between two nodes: an NCCL all-reduce between
+        them over it, one rank on each, in the image of the runtime that
+        would serve a model across it. `running` until both report, or for
+        thirty minutes; `passed` when both ran it right, `failed` otherwise.
+        The pair is placed on only while its latest check has passed.
+      required: [id, nodes, status, degraded, started_at]
+      properties:
+        id: { type: string }
+        nodes:
+          type: array
+          minItems: 2
+          maxItems: 2
+          description: The two nodes, rank 0 (whose address the ranks meet at) first.
+          items: { type: string }
+        status:
+          type: string
+          enum: [running, passed, failed]
+        reason:
+          type: string
+          description: What each rank said, or which did not report.
+        bus_bytes_per_second:
+          type: integer
+          minimum: 0
+          description: The bus bandwidth rank 0 measured, once it passed.
+        degraded:
+          type: boolean
+          description: |
+            True when it passed under 10 GB/s of bus bandwidth: the sum was
+            right, so a model may be placed across the link, but the link
+            carries a tenth or less of what it should (NCCL staging through
+            host memory, a port down). `reason` says the figure.
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
 
     NodeWithToken:
       allOf:

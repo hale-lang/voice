@@ -320,6 +320,8 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** nothing in the api reads `self.draining`. The teller's loop (api/teller.hl) runs until the process ends, so a signal ends it at once, as before, and events not yet told go with it.
 
+**Fixed upstream.** hale's serve loops end on a drain (its drain watcher stops every listener); what held the api was its own pinned loops never reading `self.draining`. Since hale v0.32.5 (#1851) a locus's `dissolve()` counts for the drain, so the api, the brain and their loops (teller, governance, pulse, the brain's tick) read `while !self.draining`: SIGTERM ends the api in under a second, exit 0, its hooks run.
+
 ## A binding's literal that reads the locus's params passes the check and fails the build
 
 **hale 0.25.1.** In `bindings { T: nats::NatsPublisher { url: self.nerves_url, ... } codec(...); }` `hale check` accepts `self.nerves_url`; `hale build` then fails: "codegen error: unsupported in codegen v0: self.org read outside a locus method".

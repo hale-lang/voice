@@ -930,7 +930,8 @@ standard pack's first clause asks (GH #1591, "Logs are structured"), and
 the attach manifest declares it ([`dna/applications/voice.toml`](../dna/applications/voice.toml)).
 Voice prints nothing outside the sink, and CI refuses a bare `print`,
 `println`, `eprint` or `eprintln` anywhere else outside the tests
-directories. One line is not voice's: the
+directories, but in the commands whose output is their product: `api
+admin-token`, `api arrange plan` and the node's install. One line is not voice's: the
 Hale runtime's `perror` when a client hangs up while the api writes
 (`lotus_tcp_send_str: write: Broken pipe` on stderr), which FRICTION.md
 lists for hale.

@@ -455,3 +455,5 @@ Still there on hale 0.32.6: with the copy reverted, `hale test api/tests/nodes_t
 **hale 0.32.6.** `std::time::sleep` snapshots the drain state when it starts, so a sleep that begins after the drain has begun is not cut short and runs its full length. A loop that checks `!self.draining` and then sleeps for its interval holds a stop that arrives between the two for the whole interval.
 
 **Working shape:** governance and pulse sleep through `nap()`, a second at a time while `!self.draining` (voice#160). The fix is hale-lang/hale#1865, expected in hale 0.32.7.
+
+**Resolved in hale 0.32.7 (hale-lang/hale#1865).** A timed wait that begins during a drain returns at once in a run() that watches it. `nap()` is gone; governance, pulse and the brain sleep plainly again, and SIGTERM ends the api and the brain in about 0.25 s, exit 0.

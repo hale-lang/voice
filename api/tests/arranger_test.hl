@@ -346,4 +346,55 @@ fn main() {
             && std::str::contains(u.reason, "no runtime"),
         "DeepSeek alone on spark3 does not fit: " + u.reason,
     );
+
+    // ---- a pin naming a catalog model is filled by that model -------------
+    // `tiny` (qwen3-0.6b) is placed on spark3; `wanted` is another catalog
+    // model of the same recipe, which requests are routed to by its id
+    api::Catalog { store: store, recipes: recipes }.create(
+        api::CatalogModelCreate { id: "wanted", has_recipe: true, recipe: "qwen3-0.6b" },
+    ) or discard;
+    let mut exact = api::ArrangementWants { };
+    let mut ep = pin("wanted", 0);
+    push(ep.nodes, "spark3") or discard;
+    push(exact.pins, ep) or discard;
+    let named = placements.plan_arrangement(exact) or api::ArrangementPlan { };
+    let na = at(named.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        count(named.add) == 1 && na.model == "wanted" && count(named.keep) == 0,
+        "not the other model of its recipe: " + api::plan_text(named),
+    );
+    // a role is filled by any model of its candidate recipe: the one placed
+    let mut by_role = api::ArrangementWants { };
+    push(by_role.roles, role("small", 0)) or discard;
+    let kept_tiny = placements.plan_arrangement(by_role) or api::ArrangementPlan { };
+    let ka = at(kept_tiny.aliases, 0) or api::PlanAlias { };
+    std::test::assert(
+        count(kept_tiny.keep) == 1 && ka.model == "tiny",
+        "kept, its alias at the model placed: " + api::plan_text(kept_tiny),
+    );
+
+    // ---- what the slots before it put on a disk is counted ---------------
+    // a Spark with a gigabyte of disk: qwen3-0.6b's GGUF (639 MB) fits, and
+    // then granite-4.0-350m's (378 MB) does not
+    let small_disk = std::str::replace(
+        spark(""),
+        "\"disk_free_bytes\": 3500000000000",
+        "\"disk_free_bytes\": 1000000000",
+    );
+    add_node(store, "sliver", small_disk);
+    let mut two = api::ArrangementWants { };
+    let mut a1 = pin("qwen3-0.6b", 0);
+    push(a1.nodes, "sliver") or discard;
+    let mut a2 = pin("granite-4.0-350m", 0);
+    push(a2.nodes, "sliver") or discard;
+    push(two.pins, a1) or discard;
+    push(two.pins, a2) or discard;
+    let tight = placements.plan_arrangement(two) or api::ArrangementPlan { };
+    let tu = at(tight.unmet, 0) or api::PlanUnmet { };
+    std::test::assert(
+        count(tight.add) == 1 && count(tight.unmet) == 1
+            && std::str::contains(tu.want, "granite-4.0-350m")
+            && std::str::contains(tu.reason, "needs"),
+        "the second does not fit the disk the first took: " + api::plan_text(tight),
+    );
 }

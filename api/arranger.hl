@@ -149,6 +149,8 @@ type ArrangePlaced {
     variant: String = "";
     nodes: NodeSet = NodeSet { };
     held: Int = 0;
+    // its model is served as a decision model
+    decision: Bool = false;
 }
 
 type ArrangePlacedList { items: bounded[ArrangePlaced; 64]; }
@@ -194,6 +196,9 @@ type ArrangeSlot {
     candidates: bounded[Int; 32];
     named: NodeSet = NodeSet { };
     parts: Int = 0;
+    // a pin naming a catalog model: only that model fills it, not another
+    // of the same recipe
+    exact: Bool = false;
     // why the want cannot be filled at all, "" when it may be
     problem: String = "";
 }
@@ -213,6 +218,9 @@ type ArrangeChoice {
     placed: Int = -1;
     shared: Int = -1;
     nodes: NodeSet = NodeSet { };
+    // the catalog model it serves: a kept placement's own, which may be
+    // another of the same recipe than the one a role names first
+    served: String = "";
     variant: String = "";
     runtime: String = "";
     // what it holds of each of its nodes' memory for models
@@ -439,6 +447,8 @@ fn slots_of(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> Ar
             s.problem = "voice has no model or recipe " + p.model;
         } else {
             push(s.candidates, m) or discard;
+            let named = at(f.models.items, m) or ArrangeModel { };
+            s.exact = named.in_catalog && named.model == p.model;
         }
         push(out.items, s) or discard;
     }
@@ -761,10 +771,11 @@ fn options(
                             model: m,
                             shared: t,
                             nodes: c.nodes,
+                            served: c.served,
                             variant: c.variant,
                             runtime: c.runtime,
                             on_disk: true,
-                            reason: "shares " + ts.label + "'s " + model.model,
+                            reason: "shares " + ts.label + "'s " + c.served,
                         },
                     ) or discard;
                 }
@@ -775,9 +786,7 @@ fn options(
         // the search keeps (held from the start, in `base`)
         let mut pi = 0;
         for p in f.placed.items {
-            if p.recipe == model.recipe.id && fits_slot(s, p.nodes) && !kept_in(path, si, pi)
-                && in_indices(kept, pi)
-            {
+            if serves_slot(s, model, p) && !kept_in(path, si, pi) && in_indices(kept, pi) {
                 {
                     push(
                         found.items,
@@ -787,6 +796,7 @@ fn options(
                             model: m,
                             placed: pi,
                             nodes: p.nodes,
+                            served: p.model,
                             variant: p.variant,
                             held: p.held,
                             on_disk: true,
@@ -807,8 +817,16 @@ fn options(
             if len(no) == 0 { no = beside_placed(placed, model.model, nodes); }
             if len(no) == 0 {
                 let mut j = Judging { };
+                let mut ni = 0;
                 for n in nodes.items {
                     j = judging_add(j, n, node_of(f, n).hw, held_on(placed, n));
+                    // less what the slots before it put on its disk
+                    set(
+                        j.disk,
+                        ni,
+                        (at(j.disk, ni) or 0) - disk_planned(f, path, si, n),
+                    ) or discard;
+                    ni = ni + 1;
                 }
                 let fit = fit_recipe(model.recipe, j, f.usable, model.decision);
                 if fit.judged.best >= 0 {
@@ -820,6 +838,7 @@ fn options(
                             rank: rank,
                             model: m,
                             nodes: nodes,
+                            served: model.model,
                             variant: fit.variant,
                             runtime: fit.runtime,
                             held: footprint(fit.reserved_bytes),
@@ -876,6 +895,40 @@ fn kept_in(path: ArrangePath, si: Int, pi: Int) -> Bool {
         i = i + 1;
     }
     return false;
+}
+
+/// True when placement `p` serves slot `s` as candidate `model` would: of
+/// its recipe and served as it is (a decision model or not), on nodes the
+/// slot may go on; for a pin naming a catalog model, that model itself,
+/// since requests are routed by model.
+fn serves_slot(s: ArrangeSlot, model: ArrangeModel, p: ArrangePlaced) -> Bool {
+    if p.recipe != model.recipe.id || p.decision != model.decision { return false; }
+    if s.exact && p.model != model.model { return false; }
+    return fits_slot(s, p.nodes);
+}
+
+/// What the slots of `path` before `upto` put on node `n`'s disk: each
+/// add's files there (`disk_need`, its rank's), but for a variant the node
+/// holds whole already. A removal leaves its files on the disk.
+fn disk_planned(f: ArrangeFleet, path: ArrangePath, upto: Int, n: String) -> Int {
+    let mut used = 0;
+    let mut i = 0;
+    while i < upto {
+        let c = at(path.items, i) or ArrangeChoice { };
+        if c.kind == ChoiceKind::add {
+            let m = at(f.models.items, c.model) or ArrangeModel { };
+            let mut rank = 0;
+            for x in c.nodes.items {
+                if x == n && !holds_variant(f, n, m.recipe.id, c.variant) {
+                    used = used
+                        + disk_need(variant_body_of(m.recipe.variants.text, c.variant), rank);
+                }
+                rank = rank + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return used;
 }
 
 /// True when slot `s` may be on `nodes`: its named nodes, as a set, or as
@@ -993,7 +1046,7 @@ fn keepable(f: ArrangeFleet, slots: ArrangeSlots) -> Indices {
         for s in slots.items {
             for m in s.candidates {
                 let model = at(f.models.items, m) or ArrangeModel { };
-                if model.recipe.id == p.recipe && fits_slot(s, p.nodes) { serves = true; }
+                if serves_slot(s, model, p) { serves = true; }
             }
         }
         if serves && count(out.items) < KEEPABLE_MAX { push(out.items, pi) or discard; }
@@ -1021,8 +1074,11 @@ fn search(f: ArrangeFleet, slots: ArrangeSlots) -> Searched {
     for c in can.items {
         sets = sets * 2;
     }
-    let mut mask = sets - 1;
-    while mask >= 0 && best.tried < SEARCH_MAX {
+    // the empty set first, whose first path down is always complete, so
+    // the search never comes back without a plan; then the largest first
+    let mut k = 0;
+    while k < sets && (k == 0 || best.tried < SEARCH_MAX) {
+        let mask = if k == 0 { 0 } else { sets - k };
         // the set `mask` names, its bits `can`'s placements
         let mut kept = Indices { };
         let mut bits = mask;
@@ -1036,7 +1092,7 @@ fn search(f: ArrangeFleet, slots: ArrangeSlots) -> Searched {
         } else {
             best.tried = next.tried;
         }
-        mask = mask - 1;
+        k = k + 1;
     }
     return best;
 }
@@ -1144,6 +1200,20 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
     let found = search(f, slots);
     let path = found.path;
     let mut out = ArrangementPlan { };
+    // no path found (which the search's order rules out): every want is
+    // said unmet, and nothing is kept, removed or added on no search
+    if count(slots.items) > 0 && !found.found {
+        for s in slots.items {
+            push(
+                out.unmet,
+                PlanUnmet {
+                    want: s.label,
+                    reason: "voice found no complete plan within its search: plan fewer wants at once",
+                },
+            ) or discard;
+        }
+        return out;
+    }
     // the placements now: kept when a slot keeps one, else removed
     let mut pi = 0;
     for p in f.placed.items {
@@ -1252,10 +1322,9 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
         }
         // the alias the role points, at its first unit's model
         if len(s.alias) > 0 && c.kind != ChoiceKind::unmet && !aliased(out, s.role) {
-            let m = at(f.models.items, c.model) or ArrangeModel { };
             push(
                 out.aliases,
-                PlanAlias { role: s.role, alias: s.alias, model: m.model },
+                PlanAlias { role: s.role, alias: s.alias, model: c.served },
             ) or discard;
         }
         if c.kind == ChoiceKind::unmet {

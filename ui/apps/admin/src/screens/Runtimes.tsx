@@ -66,9 +66,22 @@ function RuntimeInspector({ runtime: r }: { runtime: Runtime }) {
           { k: 'accelerator', v: r.accelerator },
           { k: 'platforms', v: platforms(r) },
           { k: 'formats', v: r.formats.join(', ') },
+          ...(r.compute_capabilities ? [{ k: 'GPUs', v: `compute capability ${r.compute_capabilities.join(' or ')} only` }] : []),
+          ...(r.multi_node
+            ? [{ k: 'across nodes', v: r.multi_node === 'lanes' ? 'two nodes only, its ranks paired as TensorFold runs them' : "one node or two, by vLLM's own multi-node executor" }]
+            : []),
           { k: 'artifact', v: a.kind === 'container' ? 'a container image, run under docker' : 'an archive, run in a sandbox' },
           ...(a.kind === 'container'
-            ? [{ k: 'image', v: <Mono>{`${a.image}@${a.digest}`}</Mono> }]
+            ? [
+                { k: 'image', v: <Mono>{`${a.image}@${a.digest}`}</Mono> },
+                ...(a.archive
+                  ? [
+                      { k: 'engine', v: <Mono>{a.archive.url}</Mono> },
+                      { k: 'engine sha256', v: <Mono>{a.archive.sha256}</Mono> },
+                      { k: 'engine size', v: bytes(a.archive.bytes) },
+                    ]
+                  : []),
+              ]
             : [
                 { k: 'url', v: <Mono>{a.url}</Mono> },
                 { k: 'sha256', v: <Mono>{a.sha256}</Mono> },

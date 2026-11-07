@@ -4223,8 +4223,9 @@ components:
           description: |
             Function tools, passed to the seat as they are. Only a seat that
             carries tools serves a request that lists them (an
-            `openai-compatible` seat; a managed seat under llama-server, or
-            under vLLM when its variant names a `tool_call_parser`; a
+            `openai-compatible` seat; a managed seat under llama-server or
+            TensorFold, or under vLLM when its variant names a
+            `tool_call_parser`; a
             `static` seat only as its drill); the others refuse it and the
             request moves to the next seat. The
             answer's calls come back as `tool_calls` (deltas when streamed)
@@ -4375,7 +4376,8 @@ components:
                   description: |
                     A request's `tools` reach the model and come back as tool
                     calls: an openai-compatible seat, a managed seat under
-                    llama-server, one under vLLM whose variant names its
+                    llama-server or TensorFold (which reads DeepSeek's DSML
+                    calls itself), one under vLLM whose variant names its
                     tool-call parser (`RecipeVariant.tool_call_parser`), or
                     the static engine's tool-call drill. False under vLLM
                     for a variant that names none, and for the claude CLI.
@@ -5346,16 +5348,16 @@ components:
         id: { type: string }
         format:
           type: string
-          enum: [safetensors, gguf, mlx]
+          enum: [safetensors, gguf, mlx, exl3]
         quantization: { type: string }
         file_count:
           type: integer
           minimum: 1
-          description: How many files it lists.
+          description: How many files it pins, its file sets' among them (a set pinned by a manifest counts the manifest).
         total_bytes:
           type: integer
           minimum: 1
-          description: Its files' bytes together, what a node fetches.
+          description: Its files' bytes together, its file sets' among them, what a node fetches.
         memory_bytes: { type: integer, minimum: 1 }
 
     RecipeVariant:
@@ -5375,8 +5377,11 @@ components:
           examples: [gguf-q4_k_m, mlx-4bit]
         format:
           type: string
-          enum: [safetensors, gguf, mlx]
-          description: Formats that hold only tensors; none runs code when loaded.
+          enum: [safetensors, gguf, mlx, exl3]
+          description: |
+            Formats that hold only tensors; none runs code when loaded.
+            `exl3`: ExLlamaV3's quantized tensors in safetensors files, which
+            TensorFold serves (`RuntimeCreate.server: tensorfold`).
         quantization:
           type: string
           minLength: 1
@@ -5471,6 +5476,128 @@ components:
             whose variant names none refuses a request that lists them. Only
             a safetensors variant names one; llama-server applies the
             model's own chat template.
+        file_sets:
+          type: array
+          minItems: 1
+          maxItems: 4
+          description: |
+            What its server reads beside the weights, from other
+            repositories, each pinned as the weights are: a set is fetched
+            from its own source at its own revision, and a file is used only
+            when its digest matches. Each set is named for where its server
+            reads it, once. Only an `exl3` variant names sets.
+
+            A set lists its files (`files`), or names one file of its source
+            that lists them (`manifest`), pinned by its sha256, with the
+            bytes of every file it lists together (`bytes`): the node fetches
+            the manifest, then each file it lists at the path it gives
+            beside the manifest, held to the sha256 and size it gives, and
+            refuses a manifest whose files are not `bytes` together. A
+            manifest says a file a line, its sha256 first, its size second
+            and its path last, apart by spaces; a line that starts with `#`
+            says nothing. A kit of hundreds of kernel files is pinned so in
+            a variant small enough for a seat's config.
+          items:
+            type: object
+            required: [name, source]
+            additionalProperties: false
+            properties:
+              name:
+                type: string
+                enum: [engram, kit]
+                description: |
+                  `engram`: a DeepSeek-V4.1 checkpoint's Engram tables, which
+                  TensorFold reads at /engram. `kit`: TensorFold's kernel kit
+                  for the model, which it reads at /kit.
+              source:
+                type: object
+                required: [hub, repo, revision]
+                additionalProperties: false
+                properties:
+                  hub: { type: string, enum: [huggingface] }
+                  repo:
+                    type: string
+                    maxLength: 128
+                    pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
+                  revision:
+                    type: string
+                    pattern: '^[0-9a-f]{40}$'
+              files:
+                type: array
+                minItems: 1
+                maxItems: 300
+                items:
+                  type: object
+                  required: [path, bytes, sha256]
+                  additionalProperties: false
+                  properties:
+                    path:
+                      type: string
+                      maxLength: 256
+                      pattern: '^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/-]+\.(safetensors|gguf|json|txt|model|tiktoken|jinja)$'
+                    bytes: { type: integer, minimum: 1 }
+                    sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+              manifest:
+                type: object
+                required: [path, bytes, sha256]
+                additionalProperties: false
+                properties:
+                  path:
+                    type: string
+                    maxLength: 256
+                    pattern: '^(?!/)(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/-]+$'
+                  bytes: { type: integer, minimum: 1 }
+                  sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+              bytes:
+                type: integer
+                minimum: 1
+                description: Every file the set's manifest lists, together; a set that lists its files leaves it out.
+            oneOf:
+              - required: [files]
+                not: { anyOf: [{ required: [manifest] }, { required: [bytes] }] }
+              - required: [manifest, bytes]
+                not: { required: [files] }
+        prepare:
+          type: string
+          enum: [dsv41-tp2]
+          description: |
+            What its node readies from its files before its server first
+            starts, once, and keeps (`prepared`). `dsv41-tp2`: TensorFold's
+            inputs for DeepSeek-V4.1 across two nodes, made in the runtime's
+            image with the engine's tools (no GPU, no network): the model
+            folder's two added files (the recipe's `serving_1017.py`), then
+            the node's rank's weight file and Engram's token map
+            (`node_inputs.sh`). A seat is `starting` meanwhile, its `reason`
+            the step and how far. Only an `exl3` variant names one, with
+            `prepared`.
+        prepared:
+          type: array
+          minItems: 1
+          maxItems: 16
+          description: |
+            Each file its prepare step makes, pinned: the node checks every
+            one it made against its size and sha256 before its server
+            starts, and refuses the seat if one differs. Under `model/`,
+            beside the weights; under `cache/`, its server's other inputs. A
+            file only one rank's node makes names that rank. Kept under the
+            node's data directory, keyed by everything they are made from and
+            must be: the prepare step, the image and the engine, every file of
+            the variant and its sets by name and digest, these pins and the
+            rank. A seat placed again with the same reads them at once, while
+            every file is there at its size; one gone, they are made again.
+          items:
+            type: object
+            required: [path, bytes, sha256]
+            additionalProperties: false
+            properties:
+              path:
+                type: string
+                maxLength: 256
+                pattern: '^(model|cache)/(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._/-]+$'
+                examples: [model/serving-1017.safetensors, cache/rank-cache/rank0of2-993f2e3eefa9d95965c2.bin]
+              bytes: { type: integer, minimum: 1 }
+              sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+              rank: { type: integer, minimum: 0, maximum: 1 }
 
     # ---- runtimes --------------------------------------------------------
 
@@ -5497,9 +5624,13 @@ components:
             url: { type: string, format: uri, maxLength: 512 }
         server:
           type: string
-          enum: [vllm, llama-server, decision]
+          enum: [vllm, llama-server, decision, tensorfold]
           description: |
             The server program, which the node knows how to start and stop.
+            `tensorfold`: TensorFold's native engine with its DeepSeek-V4.1
+            family, which serves `exl3` weights on `cuda` across two nodes
+            (`multi_node: lanes`), from an image and the engine's archive
+            (`artifact.archive`).
             `decision`: voice's decision server, `voice-decide`, which
             answers a decision model's requests (`CatalogModel.contract:
             decision`, asked as `/v1/systemone`): its MLX build, an archive
@@ -5514,7 +5645,7 @@ components:
           description: The weight formats it reads.
           items:
             type: string
-            enum: [safetensors, gguf, mlx]
+            enum: [safetensors, gguf, mlx, exl3]
         accelerator:
           type: string
           enum: [cuda, rocm, vulkan, metal, cpu]
@@ -5541,7 +5672,10 @@ components:
             Where it comes from. `container`: an image, pulled by its
             digest, never a tag; for several platforms, a manifest list's
             digest. `archive`: a tarball, fetched from `url` and used only
-            when its sha256 matches.
+            when its sha256 matches. A `tensorfold` container runs an engine
+            built apart from its image (`archive`): a tarball fetched and
+            checked as an archive runtime is, unpacked once and mounted
+            read-only.
           required: [kind]
           additionalProperties: false
           properties:
@@ -5562,6 +5696,20 @@ components:
               type: string
               pattern: '^[0-9a-f]{64}$'
             bytes: { type: integer, minimum: 1 }
+            archive:
+              type: object
+              description: A container's engine, built apart from its image (a `tensorfold` runtime's alone).
+              required: [url, sha256, bytes]
+              additionalProperties: false
+              properties:
+                url:
+                  type: string
+                  maxLength: 512
+                  pattern: '^https://'
+                sha256:
+                  type: string
+                  pattern: '^[0-9a-f]{64}$'
+                bytes: { type: integer, minimum: 1 }
           allOf:
             - if: { properties: { kind: { const: container } } }
               then: { required: [image, digest] }
@@ -5569,13 +5717,35 @@ components:
               then: { required: [url, sha256, bytes] }
         multi_node:
           type: string
-          enum: [mp]
+          enum: [mp, lanes]
           description: |
             How its server spans two nodes, when it can; left out, a model
             it serves is placed on one node. `mp`: vLLM's own multi-node
             executor (`--nnodes`, `--node-rank`, `--master-addr`, the
             follower `--headless`), with no Ray cluster, as NVIDIA's guide to
-            serving vLLM across two DGX Sparks runs it.
+            serving vLLM across two DGX Sparks runs it. `lanes`:
+            TensorFold's two ranks, the leader serving (`tensorfold-native
+            serve`) and the follower running its lanes (`tf-dsv41-lanes`),
+            meeting at the leader's address on the link; a `lanes` runtime
+            runs only across two nodes, and a placement on one never chooses
+            it.
+        compute_capabilities:
+          type: array
+          minItems: 1
+          maxItems: 8
+          description: |
+            The NVIDIA GPUs its kernels are built for, by compute capability,
+            when it runs on no other: a binary built for one does not load on
+            another major one. A placement chooses it only for nodes each of
+            whose GPU declares one of them (`Accelerator.compute_capability`),
+            and a node whose GPU does not refuses to start it. Left out, a
+            runtime runs on any GPU of its accelerator. Only a `cuda`
+            runtime's; a `tensorfold` runtime names them (its archive is
+            built for the DGX Spark's GB10, `12.1`).
+          items:
+            type: string
+            pattern: '^[0-9]+\.[0-9]+$'
+            examples: ['12.1']
         load_format:
           type: string
           enum: [fastsafetensors]

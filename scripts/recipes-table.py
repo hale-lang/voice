@@ -8,14 +8,23 @@ import re
 
 root = pathlib.Path(__file__).resolve().parent.parent
 readme = root / "recipes" / "README.md"
-SERVED = {"gguf": "llama.cpp, on Metal or CUDA", "safetensors": "vLLM, on CUDA", "mlx": "MLX, on Metal"}
+SERVED = {"gguf": "llama.cpp, on Metal or CUDA", "safetensors": "vLLM, on CUDA", "mlx": "MLX, on Metal",
+          "exl3": "TensorFold, on CUDA across two nodes"}
+
+
+def download(v):
+    """What a node fetches for a variant: its files, and its file sets' (a manifest and what it lists)."""
+    n = sum(f["bytes"] for f in v["files"])
+    for s in v.get("file_sets", []):
+        n += s["manifest"]["bytes"] + s["bytes"] if "manifest" in s else sum(f["bytes"] for f in s["files"])
+    return n
 
 rows = ["| Recipe | License | Variants (download) | Served by |", "|---|---|---|---|"]
 for path in sorted((root / "recipes").glob("*.json")):
     r = json.loads(path.read_text())
     variants, served = [], []
     for v in r["variants"]:
-        gb = sum(f["bytes"] for f in v["files"]) / 1e9
+        gb = download(v) / 1e9
         variants.append(f"`{v['id']}` ({gb:.1f} GB)")
         if SERVED.get(v["format"]) and SERVED[v["format"]] not in served:
             served.append(SERVED[v["format"]])

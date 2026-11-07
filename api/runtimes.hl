@@ -13,13 +13,16 @@
 type RuntimeRef { runtime: String; }
 
 /// A weight format (`RuntimeCreate.formats`, `RecipeVariant.format`).
-type ModelFormat = enum { safetensors, gguf, mlx };
+/// `exl3`: ExLlamaV3's quantized tensors, in safetensors files, which
+/// TensorFold serves.
+type ModelFormat = enum { safetensors, gguf, mlx, exl3 };
 
 fn model_format_name(v: ModelFormat) -> String {
     return match v {
         ModelFormat::safetensors -> "safetensors",
         ModelFormat::gguf -> "gguf",
-        ModelFormat::mlx -> "mlx"
+        ModelFormat::mlx -> "mlx",
+        ModelFormat::exl3 -> "exl3"
     };
 }
 
@@ -42,7 +45,12 @@ type RuntimePlatform { os: HostOs = HostOs::linux; arch: HostArch = HostArch::x8
 /// Where a runtime comes from (`RuntimeCreate.artifact.kind`).
 type ArtifactKind = enum { container, archive };
 
-/// `RuntimeCreate.artifact`: an image by digest, or a tarball by sha256.
+/// `RuntimeCreate.artifact.archive`: the engine a container runs, built
+/// apart from its image, as a tarball by sha256.
+type EngineArchive { url: String; sha256: String; bytes: Int; }
+
+/// `RuntimeCreate.artifact`: an image by digest, or a tarball by sha256;
+/// an image may run an engine archive beside it (`archive`).
 type RuntimeArtifact {
     kind: ArtifactKind = ArtifactKind::container;
     has_image: Bool = false;
@@ -55,11 +63,22 @@ type RuntimeArtifact {
     sha256: String = "";
     has_bytes: Bool = false;
     bytes: Int = 0;
+    has_archive: Bool = false;
+    archive: EngineArchive = EngineArchive { url: "", sha256: "", bytes: 0 };
 }
 
 /// How a runtime's server spans two nodes (`RuntimeCreate.multi_node`):
-/// `mp`, vLLM's own multi-node executor, with no Ray cluster.
-type MultiNode = enum { mp };
+/// `mp`, vLLM's own multi-node executor, with no Ray cluster; `lanes`,
+/// TensorFold's two ranks, the leader serving and the follower its lanes,
+/// which run only across two nodes.
+type MultiNode = enum { mp, lanes };
+
+fn multi_node_name(v: MultiNode) -> String {
+    return match v {
+        MultiNode::mp -> "mp",
+        MultiNode::lanes -> "lanes"
+    };
+}
 
 /// How a runtime's server reads a model's weights, when its image ships a
 /// loader faster than the server's default (`RuntimeCreate.load_format`):
@@ -86,6 +105,8 @@ type RuntimeCreate {
     multi_node: MultiNode = MultiNode::mp;
     has_load_format: Bool = false;
     load_format: LoadFormat = LoadFormat::fastsafetensors;
+    has_compute_capabilities: Bool = false;
+    compute_capabilities: bounded[String; 8];
 }
 
 /// `Runtime`. A shipped runtime has no `created_at`.
@@ -101,6 +122,8 @@ type Runtime {
     multi_node: MultiNode = MultiNode::mp;
     has_load_format: Bool = false;
     load_format: LoadFormat = LoadFormat::fastsafetensors;
+    has_compute_capabilities: Bool = false;
+    compute_capabilities: bounded[String; 8];
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
     created_at: Time = `1970-01-01T00:00:00Z`;
@@ -112,8 +135,9 @@ type RuntimeList { data: bounded[Runtime; 128]; }
 /// The server programs a node knows how to start and stop.
 /// `decision`: voice's decision server, `voice-decide`, which answers a
 /// decision model's requests (`/v1/systemone`): MLX on Metal, or GGUF
-/// anywhere.
-const SERVERS: String = ",vllm,llama-server,decision,";
+/// anywhere. `tensorfold`: TensorFold's native engine, its DeepSeek-V4.1
+/// family, which serves EXL3 weights across two nodes.
+const SERVERS: String = ",vllm,llama-server,decision,tensorfold,";
 
 locus Runtimes {
     params {
@@ -296,6 +320,10 @@ fn runtime_view(body: String, origin: Origin, dated: Bool, at: Time) -> Runtime 
     for p in c.platforms {
         push(out.platforms, p) or discard;
     }
+    out.has_compute_capabilities = c.has_compute_capabilities;
+    for cc in c.compute_capabilities {
+        push(out.compute_capabilities, cc) or discard;
+    }
     return out;
 }
 
@@ -305,7 +333,7 @@ fn runtime_body(c: RuntimeCreate) -> String {
     let head = id_and_license(c.id, c.license);
     if len(head) > 0 { return head; }
     if !std::str::contains(SERVERS, "," + c.server + ",") {
-        return "!server\t`server` is one a node knows how to start: vllm, llama-server or decision";
+        return "!server\t`server` is one a node knows how to start: vllm, llama-server, decision or tensorfold";
     }
     if count(c.formats) == 0 { return "!formats\ta runtime reads at least one format"; }
     if count(c.platforms) == 0 { return "!platforms\ta runtime runs on at least one platform"; }
@@ -341,7 +369,17 @@ fn runtime_body(c: RuntimeCreate) -> String {
             return "!artifact\t`artifact.digest` is sha256: and 64 hex digits, never a tag";
         }
         if a.has_url || a.has_sha256 || a.has_bytes {
-            return "!artifact\ta container is its image and digest, nothing more";
+            return "!artifact\ta container is its image and digest, and its engine's archive";
+        }
+        if a.has_archive {
+            let e = a.archive;
+            if !std::str::starts_with(e.url, "https://") || len(e.url) > 512 {
+                return "!artifact\t`artifact.archive.url` is an https URL, at most 512 characters";
+            }
+            if !hex(e.sha256, 64) {
+                return "!artifact\t`artifact.archive.sha256` is 64 hex digits";
+            }
+            if e.bytes < 1 { return "!artifact\t`artifact.archive.bytes` is at least 1"; }
         }
     } else {
         if !a.has_url || !std::str::starts_with(a.url, "https://") || len(a.url) > 512 {
@@ -351,19 +389,67 @@ fn runtime_body(c: RuntimeCreate) -> String {
             return "!artifact\t`artifact.sha256` is 64 hex digits";
         }
         if !a.has_bytes || a.bytes < 1 { return "!artifact\t`artifact.bytes` is at least 1"; }
-        if a.has_image || a.has_digest {
+        if a.has_image || a.has_digest || a.has_archive {
             return "!artifact\tan archive is its url, sha256 and size, nothing more";
         }
     }
     // across two nodes: vLLM's own executor, from an image both run
-    if c.has_multi_node && (c.server != "vllm" || a.kind != ArtifactKind::container) {
-        return "!multi_node\ta runtime that spans nodes is vllm's, as a container";
+    if c.has_multi_node && c.multi_node == MultiNode::mp
+        && (c.server != "vllm" || a.kind != ArtifactKind::container)
+    {
+        return "!multi_node\t`mp` is vllm's, as a container";
+    }
+    // TensorFold: its engine, built apart (`archive`), run in a CUDA image
+    // across two nodes, its ranks as it pairs them (`lanes`), reading EXL3
+    // alone. It is the only server that runs an engine archive in its image
+    if c.server == "tensorfold" {
+        if a.kind != ArtifactKind::container || !a.has_archive {
+            return "!artifact\ta tensorfold runtime is an image and its engine's archive";
+        }
+        if !c.has_multi_node || c.multi_node != MultiNode::lanes {
+            return "!multi_node\ta tensorfold runtime runs across two nodes: `lanes`";
+        }
+        if runtime_accelerator_name(c.accelerator) != "cuda" {
+            return "!accelerator\ta tensorfold runtime runs on cuda";
+        }
+        for f in c.formats {
+            if f != ModelFormat::exl3 { return "!formats\ta tensorfold runtime reads exl3 alone"; }
+        }
+    } else {
+        if a.has_archive {
+            return "!artifact\tonly a tensorfold runtime runs an engine's archive in its image";
+        }
+        if c.has_multi_node && c.multi_node == MultiNode::lanes {
+            return "!multi_node\t`lanes` is tensorfold's";
+        }
+        for f in c.formats {
+            if f == ModelFormat::exl3 { return "!formats\texl3 is read by tensorfold alone"; }
+        }
     }
     // a loader the image ships, which only vLLM is told of
     if c.has_load_format && c.server != "vllm" {
         return "!load_format\ta runtime's load_format is vllm's";
     }
-    let r = Runtime {
+    // the NVIDIA GPUs its kernels are built for, when it runs on no other
+    // (a binary built for one compute capability does not load on another
+    // major one): a node whose GPU says another is not placed on
+    if c.has_compute_capabilities {
+        if runtime_accelerator_name(c.accelerator) != "cuda" {
+            return "!compute_capabilities\ta runtime's compute capabilities are a cuda runtime's";
+        }
+        if count(c.compute_capabilities) == 0 {
+            return "!compute_capabilities\t`compute_capabilities` names at least one";
+        }
+        for cc in c.compute_capabilities {
+            if !compute_capability_text(cc) {
+                return "!compute_capabilities\ta compute capability is NVIDIA's, as 12.1";
+            }
+        }
+    }
+    if c.server == "tensorfold" && !c.has_compute_capabilities {
+        return "!compute_capabilities\ta tensorfold runtime names the compute capabilities its kernels are built for";
+    }
+    let mut r = Runtime {
         id: c.id,
         license: c.license,
         server: c.server,
@@ -373,7 +459,11 @@ fn runtime_body(c: RuntimeCreate) -> String {
         multi_node: c.multi_node,
         has_load_format: c.has_load_format,
         load_format: c.load_format,
+        has_compute_capabilities: c.has_compute_capabilities,
     };
+    for cc in c.compute_capabilities {
+        push(r.compute_capabilities, cc) or discard;
+    }
     return runtime_create_json(r, c.formats, c.platforms);
 }
 
@@ -417,7 +507,16 @@ fn runtime_create_json(
     let a = r.artifact;
     let artifact = if a.kind == ArtifactKind::container {
         "{\"kind\": \"container\", \"image\": " + jq(a.image) + ", \"digest\": " + jq(a.digest)
-            + "}"
+            + (
+                if a.has_archive {
+                    ", \"archive\": {\"url\": " + jq(a.archive.url) + ", \"sha256\": "
+                        + jq(a.archive.sha256)
+                        + ", \"bytes\": "
+                        + to_string(a.archive.bytes) + "}"
+                } else {
+                    ""
+                }
+            ) + "}"
     } else {
         "{\"kind\": \"archive\", \"url\": " + jq(a.url) + ", \"sha256\": " + jq(a.sha256)
             + ", \"bytes\": "
@@ -429,14 +528,46 @@ fn runtime_create_json(
         + "], \"accelerator\": " + jq(runtime_accelerator_name(r.accelerator))
         + ", \"platforms\": ["
         + ps.text() + "], \"artifact\": " + artifact
-        + (if r.has_multi_node { ", \"multi_node\": \"mp\"" } else { "" })
+        + (
+            if r.has_multi_node {
+                ", \"multi_node\": " + jq(multi_node_name(r.multi_node))
+            } else {
+                ""
+            }
+        )
         + (
             if r.has_load_format {
                 ", \"load_format\": " + jq(load_format_name(r.load_format))
             } else {
                 ""
             }
-        ) + "}";
+        ) + compute_capabilities_field(r) + "}";
+}
+
+/// `, "compute_capabilities": [...]` when the runtime names them, "" when not.
+@bounded_by(r)
+fn compute_capabilities_field(r: Runtime) -> String {
+    if !r.has_compute_capabilities { return ""; }
+    let out = st::JsonList { };
+    for cc in r.compute_capabilities {
+        out.add(jq(cc));
+    }
+    return ", \"compute_capabilities\": [" + out.text() + "]";
+}
+
+/// A compute capability as NVIDIA writes it: digits, a dot, digits.
+@bounded_by(s)
+fn compute_capability_text(s: String) -> Bool {
+    let dot = std::str::index_of(s, ".");
+    if dot < 1 || dot == len(s) - 1 || len(s) > 7 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        if i != dot && (b < 48 || b > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// The change log's JSON for `r`: the `Runtime` the api answers.

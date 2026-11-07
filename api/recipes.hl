@@ -376,7 +376,8 @@ fn recipe_summary(body: String, origin: Origin, dated: Bool, at: Time) -> Recipe
     return out;
 }
 
-/// A variant's body as `listRecipes` lists it: its files counted, not listed.
+/// A variant's body as `listRecipes` lists it: its files counted, not
+/// listed, its file sets' among them.
 @bounded_by(v)
 fn variant_summary(v: String) -> RecipeVariantSummary {
     let format = text_of(v, "format");
@@ -386,6 +387,8 @@ fn variant_summary(v: String) -> RecipeVariantSummary {
             ModelFormat::safetensors
         } else if format == "mlx" {
             ModelFormat::mlx
+        } else if format == "exl3" {
+            ModelFormat::exl3
         } else {
             ModelFormat::gguf
         },
@@ -397,6 +400,24 @@ fn variant_summary(v: String) -> RecipeVariantSummary {
         out.file_count = out.file_count + 1;
         out.total_bytes = out.total_bytes + count_of(it.element, "bytes");
         it = std::json::array_next(it);
+    }
+    // its file sets': each listed file, or a manifest and what it lists
+    let mut sets = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
+    while !sets.done {
+        let m = std::json::find_field_raw(sets.element, "manifest");
+        if len(m) > 0 {
+            out.file_count = out.file_count + 1;
+            out.total_bytes = out.total_bytes + count_of(m, "bytes")
+                + count_of(sets.element, "bytes");
+        } else {
+            let mut f = std::json::array_first(std::json::find_field_raw(sets.element, "files"));
+            while !f.done {
+                out.file_count = out.file_count + 1;
+                out.total_bytes = out.total_bytes + count_of(f.element, "bytes");
+                f = std::json::array_next(f);
+            }
+        }
+        sets = std::json::array_next(sets);
     }
     return out;
 }
@@ -532,7 +553,7 @@ fn variant_body(v: String, n: Int) -> String {
     let at = "variants[" + to_string(n - 1) + "]";
     let keys = only_keys(
         v,
-        ",id,format,quantization,source,files,memory_bytes,kv_cache_dtype,kv_bytes_per_token,reasoning_parser,tool_call_parser,",
+        ",id,format,quantization,source,files,memory_bytes,kv_cache_dtype,kv_bytes_per_token,reasoning_parser,tool_call_parser,file_sets,prepare,prepared,",
     );
     if len(keys) > 0 { return "!variants\t" + at + " has no field " + keys; }
     let id = text_of(v, "id");
@@ -541,33 +562,15 @@ fn variant_body(v: String, n: Int) -> String {
             + ".id is lowercase letters, digits, dots, dashes and underscores, at most 63";
     }
     let format = text_of(v, "format");
-    if format != "safetensors" && format != "gguf" && format != "mlx" {
-        return "!variants\t" + at + ".format is safetensors, gguf or mlx";
+    if format != "safetensors" && format != "gguf" && format != "mlx" && format != "exl3" {
+        return "!variants\t" + at + ".format is safetensors, gguf, mlx or exl3";
     }
     let q = text_of(v, "quantization");
     if len(q) < 1 || len(q) > 64 {
         return "!variants\t" + at + ".quantization is 1 to 64 characters";
     }
-    let src = std::json::find_field_raw(v, "source");
-    let skeys = only_keys(src, ",hub,repo,revision,");
-    if len(skeys) > 0 { return "!variants\t" + at + ".source has no field " + skeys; }
-    if text_of(src, "hub") != "huggingface" {
-        return "!variants\t" + at + ".source.hub is huggingface";
-    }
-    let repo = text_of(src, "repo");
-    let slash = std::str::index_of(repo, "/");
-    if len(repo) > 128
-        || slash < 1
-        || !slug(repo[0..slash], "._-", false)
-        || !slug(repo[(slash + 1)..len(repo)], "._-", false)
-    {
-        return "!variants\t" + at + ".source.repo is owner/name";
-    }
-    let revision = text_of(src, "revision");
-    if !hex(revision, 40) {
-        return "!variants\t" + at
-            + ".source.revision is a commit (40 hex digits), never a branch or a tag";
-    }
+    let source = source_body(std::json::find_field_raw(v, "source"), at + ".source");
+    if std::str::starts_with(source, "!") { return source; }
     let memory = count_of(v, "memory_bytes");
     if memory < 1 { return "!variants\t" + at + ".memory_bytes is at least 1"; }
     // the KV cache its server must keep, a fact of the weights (vLLM serves
@@ -611,7 +614,77 @@ fn variant_body(v: String, n: Int) -> String {
         return "!variants\t" + at
             + ".tool_call_parser is a safetensors variant's, which vLLM serves";
     }
-    let files = std::json::find_field_raw(v, "files");
+    let files = files_body(std::json::find_field_raw(v, "files"), at + ".files", true);
+    if std::str::starts_with(files, "!") { return files; }
+    // what an EXL3 variant's server needs beside its weights, each pinned:
+    // more files from other repositories (`file_sets`), and the inputs its
+    // node readies from them before it starts (`prepare`, `prepared`)
+    let sets_given = len(std::json::find_field_raw(v, "file_sets")) > 0;
+    let prepare_given = len(std::json::find_field_raw(v, "prepare")) > 0;
+    let prepared_given = len(std::json::find_field_raw(v, "prepared")) > 0;
+    if (sets_given || prepare_given || prepared_given) && format != "exl3" {
+        return "!variants\t" + at
+            + "'s file_sets, prepare and prepared are an exl3 variant's, which tensorfold serves";
+    }
+    let sets = if sets_given {
+        file_sets_body(std::json::find_field_raw(v, "file_sets"), at + ".file_sets")
+    } else {
+        ""
+    };
+    if std::str::starts_with(sets, "!") { return sets; }
+    let prepare = text_of(v, "prepare");
+    if prepare_given && prepare != "dsv41-tp2" {
+        return "!variants\t" + at + ".prepare is dsv41-tp2";
+    }
+    if prepare_given != prepared_given {
+        return "!variants\t" + at + " names its prepare step and what it makes (prepared) together";
+    }
+    let prepared = if prepared_given {
+        prepared_body(std::json::find_field_raw(v, "prepared"), at + ".prepared")
+    } else {
+        ""
+    };
+    if std::str::starts_with(prepared, "!") { return prepared; }
+    return "{\"id\": " + jq(id) + ", \"format\": " + jq(format) + ", \"quantization\": " + jq(q)
+        + ", \"source\": " + source + ", \"files\": [" + files + "], \"memory_bytes\": "
+        + to_string(memory) + (if dtype_given { ", \"kv_cache_dtype\": " + jq(dtype) } else { "" })
+        + kv_field(kv_given, kv)
+        + (if parser_given { ", \"reasoning_parser\": " + jq(parser) } else { "" })
+        + (if tools_given { ", \"tool_call_parser\": " + jq(tools) } else { "" })
+        + (if sets_given { ", \"file_sets\": [" + sets + "]" } else { "" })
+        + (if prepare_given { ", \"prepare\": " + jq(prepare) } else { "" })
+        + (if prepared_given { ", \"prepared\": [" + prepared + "]" } else { "" }) + "}";
+}
+
+/// A variant's or a file set's `source`, checked, as the body keeps it; or
+/// `!variants\t<problem>`, `at` naming it.
+fn source_body(src: String, at: String) -> String {
+    let skeys = only_keys(src, ",hub,repo,revision,");
+    if len(skeys) > 0 { return "!variants\t" + at + " has no field " + skeys; }
+    if text_of(src, "hub") != "huggingface" { return "!variants\t" + at + ".hub is huggingface"; }
+    let repo = text_of(src, "repo");
+    let slash = std::str::index_of(repo, "/");
+    if len(repo) > 128
+        || slash < 1
+        || !slug(repo[0..slash], "._-", false)
+        || !slug(repo[(slash + 1)..len(repo)], "._-", false)
+    {
+        return "!variants\t" + at + ".repo is owner/name";
+    }
+    let revision = text_of(src, "revision");
+    if !hex(revision, 40) {
+        return "!variants\t" + at
+            + ".revision is a commit (40 hex digits), never a branch or a tag";
+    }
+    return "{\"hub\": \"huggingface\", \"repo\": " + jq(repo) + ", \"revision\": " + jq(revision)
+        + "}";
+}
+
+/// A list of pinned files (`path`, `bytes`, `sha256`), checked, as the
+/// members the body keeps; or `!variants\t<problem>`. Each holds tensors, a
+/// tokenizer or settings when `weights` (`safe_path`); else any relative path.
+@bounded_by(files)
+fn files_body(files: String, at: String, weights: Bool) -> String {
     let fout = st::JsonList { };
     let mut k = 0;
     let mut it = std::json::array_first(files);
@@ -621,14 +694,17 @@ fn variant_body(v: String, n: Int) -> String {
             return "!variants\t" + at + " lists at most " + to_string(VARIANT_FILES_MAX) + " files";
         }
         let f = it.element;
-        let fat = at + ".files[" + to_string(k - 1) + "]";
+        let fat = at + "[" + to_string(k - 1) + "]";
         let fkeys = only_keys(f, ",path,bytes,sha256,");
         if len(fkeys) > 0 { return "!variants\t" + fat + " has no field " + fkeys; }
         let path = text_of(f, "path");
-        if !safe_path(path) {
+        if weights && !safe_path(path) {
             return "!variants\t" + fat
                 + ".path is a relative path to tensors, a tokenizer or settings "
                 + "(.safetensors, .gguf, .json, .txt, .model, .tiktoken, .jinja), never a pickle or code";
+        }
+        if !weights && !plain_path(path) {
+            return "!variants\t" + fat + ".path is a relative path of letters, digits and ._/-";
         }
         let bytes = count_of(f, "bytes");
         if bytes < 1 { return "!variants\t" + fat + ".bytes is at least 1"; }
@@ -641,13 +717,144 @@ fn variant_body(v: String, n: Int) -> String {
         it = std::json::array_next(it);
     }
     if k == 0 { return "!variants\t" + at + " lists at least one file"; }
-    return "{\"id\": " + jq(id) + ", \"format\": " + jq(format) + ", \"quantization\": " + jq(q)
-        + ", \"source\": {\"hub\": \"huggingface\", \"repo\": " + jq(repo) + ", \"revision\": "
-        + jq(revision) + "}, \"files\": [" + fout.text() + "], \"memory_bytes\": "
-        + to_string(memory) + (if dtype_given { ", \"kv_cache_dtype\": " + jq(dtype) } else { "" })
-        + kv_field(kv_given, kv)
-        + (if parser_given { ", \"reasoning_parser\": " + jq(parser) } else { "" })
-        + (if tools_given { ", \"tool_call_parser\": " + jq(tools) } else { "" }) + "}";
+    return fout.text();
+}
+
+/// The names a file set may have, each where its server reads it
+/// (`RecipeVariant.file_sets`): `engram`, a DeepSeek-V4.1 checkpoint's
+/// Engram tables; `kit`, TensorFold's kernel kit for the model.
+fn file_set_known(name: String) -> Bool {
+    return name == "engram" || name == "kit";
+}
+
+/// A variant's `file_sets`, checked, as the members the body keeps; or
+/// `!variants\t<problem>`. Each set is named once, from its own source,
+/// pinned by its files or by one manifest file that pins them (its sha256,
+/// and the bytes of every file it lists, together).
+@bounded_by(sets)
+fn file_sets_body(sets: String, at: String) -> String {
+    if std::json::string_field("{\"v\": " + sets + "}", "v").kind != "array" {
+        return "!variants\t" + at + " is a list";
+    }
+    let out = st::JsonList { };
+    let mut seen = "\n";
+    let mut k = 0;
+    let mut it = std::json::array_first(sets);
+    while !it.done {
+        k = k + 1;
+        if k > 4 { return "!variants\t" + at + " has at most 4 sets"; }
+        let s = it.element;
+        let sat = at + "[" + to_string(k - 1) + "]";
+        let keys = only_keys(s, ",name,source,files,manifest,bytes,");
+        if len(keys) > 0 { return "!variants\t" + sat + " has no field " + keys; }
+        let name = text_of(s, "name");
+        if !file_set_known(name) { return "!variants\t" + sat + ".name is engram or kit"; }
+        if std::str::contains(seen, "\n" + name + "\n") {
+            return "!variants\t" + at + " names " + name + " twice";
+        }
+        seen = seen + name + "\n";
+        let source = source_body(std::json::find_field_raw(s, "source"), sat + ".source");
+        if std::str::starts_with(source, "!") { return source; }
+        let has_files = len(std::json::find_field_raw(s, "files")) > 0;
+        let has_manifest = len(std::json::find_field_raw(s, "manifest")) > 0;
+        if has_files == has_manifest {
+            return "!variants\t" + sat + " is pinned by its files or by a manifest, one of the two";
+        }
+        if has_files {
+            let files = files_body(std::json::find_field_raw(s, "files"), sat + ".files", true);
+            if std::str::starts_with(files, "!") { return files; }
+            if len(std::json::find_field_raw(s, "bytes")) > 0 {
+                return "!variants\t" + sat + ".bytes is a manifest's; its files say their own";
+            }
+            out.add(
+                "{\"name\": " + jq(name) + ", \"source\": " + source + ", \"files\": [" + files
+                    + "]}",
+            );
+        } else {
+            let m = std::json::find_field_raw(s, "manifest");
+            let one = files_body("[" + m + "]", sat + ".manifest", false);
+            if std::str::starts_with(one, "!") {
+                return std::str::replace(one, ".manifest[0]", ".manifest");
+            }
+            let bytes = count_of(s, "bytes");
+            if bytes < 1 {
+                return "!variants\t" + sat + ".bytes, every file its manifest lists, is at least 1";
+            }
+            out.add(
+                "{\"name\": " + jq(name) + ", \"source\": " + source + ", \"manifest\": " + one
+                    + ", \"bytes\": "
+                    + to_string(bytes) + "}",
+            );
+        }
+        it = std::json::array_next(it);
+    }
+    if k == 0 { return "!variants\t" + at + " lists at least one set"; }
+    return out.text();
+}
+
+/// A variant's `prepared`, checked, as the members the body keeps; or
+/// `!variants\t<problem>`: each file its node's prepare step makes, under
+/// `model/` (beside the weights) or `cache/` (its server's own inputs),
+/// pinned by its size and sha256; a file one rank alone makes says which
+/// (`rank`).
+@bounded_by(prepared)
+fn prepared_body(prepared: String, at: String) -> String {
+    let out = st::JsonList { };
+    let mut k = 0;
+    let mut it = std::json::array_first(prepared);
+    while !it.done {
+        k = k + 1;
+        if k > 16 { return "!variants\t" + at + " lists at most 16 files"; }
+        let f = it.element;
+        let fat = at + "[" + to_string(k - 1) + "]";
+        let keys = only_keys(f, ",path,bytes,sha256,rank,");
+        if len(keys) > 0 { return "!variants\t" + fat + " has no field " + keys; }
+        let path = text_of(f, "path");
+        if !plain_path(path)
+            || !(std::str::starts_with(path, "model/") || std::str::starts_with(path, "cache/"))
+        {
+            return "!variants\t" + fat + ".path is under model/ or cache/";
+        }
+        let bytes = count_of(f, "bytes");
+        if bytes < 1 { return "!variants\t" + fat + ".bytes is at least 1"; }
+        let sha = text_of(f, "sha256");
+        if !hex(sha, 64) { return "!variants\t" + fat + ".sha256 is 64 hex digits"; }
+        let ranked = len(std::json::find_field_raw(f, "rank")) > 0;
+        let rank_raw = std::str::trim(std::json::find_field_raw(f, "rank"));
+        if ranked && rank_raw != "0" && rank_raw != "1" {
+            return "!variants\t" + fat + ".rank is 0 or 1";
+        }
+        out.add(
+            "{\"path\": " + jq(path) + ", \"bytes\": " + to_string(bytes) + ", \"sha256\": "
+                + jq(sha)
+                + (if ranked { ", \"rank\": " + rank_raw } else { "" }) + "}",
+        );
+        it = std::json::array_next(it);
+    }
+    if k == 0 { return "!variants\t" + at + " lists at least one file"; }
+    return out.text();
+}
+
+/// A relative path that does not climb, of letters, digits and `._/-`.
+@bounded_by(p)
+fn plain_path(p: String) -> Bool {
+    let n = len(p);
+    if n == 0 || n > 256 || std::str::starts_with(p, "/") { return false; }
+    if p == ".." || std::str::starts_with(p, "../") || std::str::ends_with(p, "/..")
+        || std::str::contains(p, "/../")
+    {
+        return false;
+    }
+    let v = std::str::bytes_view(p);
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
+            || b == 46 || b == 95 || b == 47 || b == 45;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// The tool-call parsers a variant may name (`RecipeVariant.tool_call_parser`),
@@ -744,24 +951,8 @@ fn hex(s: String, n: Int) -> Bool {
 
 /// A relative path that does not climb, of letters, digits and `._/-`,
 /// ending in a kind of file that holds no code.
-@bounded_by(p)
 fn safe_path(p: String) -> Bool {
-    let n = len(p);
-    if n == 0 || n > 256 || std::str::starts_with(p, "/") { return false; }
-    if p == ".." || std::str::starts_with(p, "../") || std::str::ends_with(p, "/..")
-        || std::str::contains(p, "/../")
-    {
-        return false;
-    }
-    let v = std::str::bytes_view(p);
-    let mut i = 0;
-    while i < n {
-        let b = std::str::byte_at(v, i);
-        let ok = (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57)
-            || b == 46 || b == 95 || b == 47 || b == 45;
-        if !ok { return false; }
-        i = i + 1;
-    }
+    if !plain_path(p) { return false; }
     return std::str::ends_with(p, ".safetensors") || std::str::ends_with(p, ".gguf")
         || std::str::ends_with(p, ".json") || std::str::ends_with(p, ".txt")
         || std::str::ends_with(p, ".model") || std::str::ends_with(p, ".tiktoken")

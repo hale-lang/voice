@@ -90,7 +90,7 @@ protocol) and `openai-compatible`
 tokens, 0 for a local server; see `OpenAICompatibleConfig` in the
 protocol). The `openai-compatible` kind carries tools (a request's
 `tools` go upstream, its tool calls come back); `managed` does under
-llama-server, and under vLLM when the seat's variant names a
+llama-server or TensorFold, and under vLLM when the seat's variant names a
 `tool_call_parser`; `static` does only as
 its `tool_call` drill and `claude-cli` never, and a request with `tools`
 is refused there so the coordinator tries another seat. When the file changes, the node declares its capabilities again,
@@ -336,7 +336,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes |  |  |
-| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
+| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), or its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
 | `reason` | string \| null |  |  |  |
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
@@ -481,6 +481,7 @@ Type: object
 | `name` | string | yes |  |  |
 | `memory_bytes` | integer | yes | Its own memory; with `unified`, the machine's, which it shares. | ≥ 0 |
 | `unified` | boolean | yes | True when it shares the machine's memory (Apple silicon, NVIDIA GB10) rather than having its own. |  |
+| `compute_capability` | string |  | An NVIDIA GPU's compute capability, as `nvidia-smi` says it: what a runtime's kernels must be built for (`RuntimeCreate.compute_capabilities`). Left out when the driver does not say, and for other kinds. | pattern `^[0-9]+\.[0-9]+$` |
 
 <a id="schema-hardware"></a>
 

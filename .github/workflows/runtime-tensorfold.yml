@@ -1,0 +1,138 @@
+# The TensorFold runtime's engine (runtimes/tensorfold): DeepSeek-V4.1's
+# dsv41 family on TensorFold's native Zig engine, built from source here,
+# never on someone's machine, with voice's patches (runtimes/tensorfold/
+# patches) and the grammar library built from xgrammar's source. It builds
+# for the DGX Spark (aarch64, sm_121) in the CUDA image the runtime runs in,
+# by digest, on an arm64 runner: compiling needs no GPU, and `zig build
+# test` runs the engine's host-side tests.
+#
+# Run by hand (Actions, "runtime: tensorfold", Run workflow), it builds the
+# same, then publishes TENSORFOLD_VERSION once, as the release
+# runtime-tensorfold-<version> holding the archive. A release that exists
+# is refused: what a runtime pins never changes. No image is published: the
+# runtime runs NVIDIA's image by its digest, and the archive holds the
+# engine's own programs, which link nothing but the C library. The run's
+# summary is what runtimes/tensorfold-<version>.json must pin.
+
+name: "runtime: tensorfold"
+
+on:
+  pull_request:
+    paths:
+      - runtimes/tensorfold/**
+      - .github/workflows/runtime-tensorfold.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-tensorfold-${{ github.event_name }}-${{ github.ref }}
+
+env:
+  TENSORFOLD_VERSION: 0.7.5
+  # the image the runtime runs in, whose nvcc and glibc the engine is built with
+  IMAGE: nvcr.io/nvidia/pytorch@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
+  # the engine: the recipe's ENGINE_COMMIT (v0.7.5), branch deepseek-v41-zig-tp2
+  ENGINE_REPO: https://github.com/bertholomus/TensorFold
+  ENGINE_COMMIT: e100ee8b1d806a9f516d7a01cbcbf06ae98d77e1
+  ZIG_URL: https://ziglang.org/download/0.17.0/zig-aarch64-linux-0.17.0.tar.xz
+  ZIG_SHA256: 9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
+  # the grammar library's source, the release the engine's shim is written against
+  XGRAMMAR_TAG: v0.2.8
+  XGRAMMAR_COMMIT: 97787376faee5ed8466cfad57c99855e4ce2f6aa
+  # the recipe's two files the node runs to ready a model, and its license, by sha256
+  RECIPE: https://raw.githubusercontent.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10/2f252f4a6c254242c374a40f38d7e5cb979db862
+  SERVING_SHA256: 56ce1ab76b3873615ef157a169d4b0180c3056244c7fdc726be99ac7db046b69
+  TEMPLATE_SHA256: b581d19d13f5c678d72ae197781c016c8331174cf69118017f20dadbb7e2e6a4
+  RECIPE_LICENSE_SHA256: cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30
+
+jobs:
+  build:
+    name: build (linux arm64, sm_121)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      # the CUDA image is tens of gigabytes unpacked
+      - name: Room for the image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: The sources, each checked against its pin
+        run: |
+          set -eu
+          src="$RUNNER_TEMP/src"; mkdir -p "$src/recipe"
+          git init -q "$src/TensorFold"
+          git -C "$src/TensorFold" fetch -q --depth 1 "$ENGINE_REPO" "$ENGINE_COMMIT"
+          git -C "$src/TensorFold" checkout -q FETCH_HEAD
+          [ "$(git -C "$src/TensorFold" rev-parse HEAD)" = "$ENGINE_COMMIT" ]
+          for p in runtimes/tensorfold/patches/*.patch; do git -C "$src/TensorFold" apply --verbose "$PWD/$p"; done
+          git clone -q --depth 1 --branch "$XGRAMMAR_TAG" --recurse-submodules --shallow-submodules https://github.com/mlc-ai/xgrammar "$src/xgrammar"
+          [ "$(git -C "$src/xgrammar" rev-parse HEAD)" = "$XGRAMMAR_COMMIT" ]
+          curl -fsSL -o "$src/zig.tar.xz" "$ZIG_URL"
+          echo "$ZIG_SHA256  $src/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$src/zig" && tar -xJf "$src/zig.tar.xz" -C "$src/zig" --strip-components=1
+          curl -fsSL -o "$src/recipe/serving_1017.py" "$RECIPE/tools/serving_1017.py"
+          curl -fsSL -o "$src/recipe/chat_template.jinja" "$RECIPE/chat/chat_template.jinja"
+          echo "$SERVING_SHA256  $src/recipe/serving_1017.py" | sha256sum -c -
+          curl -fsSL -o "$src/recipe/LICENSE" "$RECIPE/LICENSE"
+          echo "$TEMPLATE_SHA256  $src/recipe/chat_template.jinja" | sha256sum -c -
+          echo "$RECIPE_LICENSE_SHA256  $src/recipe/LICENSE" | sha256sum -c -
+          cp runtimes/tensorfold/build.sh "$src/"
+
+      - name: Build and test, in the runtime's image
+        run: |
+          docker pull "$IMAGE"
+          src="$RUNNER_TEMP/src"
+          docker run --rm -v "$src:/w" -e TENSORFOLD_VERSION \
+            -e PATH=/w/zig:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            -e ZIG_GLOBAL_CACHE_DIR=/w/zig-cache -w /w "$IMAGE" \
+            bash -c 'git config --global --add safe.directory "*" && bash /w/build.sh /w/TensorFold /w/xgrammar /w/recipe /w/out'
+          sudo chown -R "$(id -u):$(id -g)" "$src/out"
+          a="$src/out/tensorfold-$TENSORFOLD_VERSION-linux-arm64.tar.gz"
+          tar -tzf "$a" | sort
+          {
+            echo "## tensorfold $TENSORFOLD_VERSION: what the runtime pins"
+            echo
+            echo "| archive | sha256 | bytes |"
+            echo "|---|---|---|"
+            echo "| $(basename "$a") | $(sha256sum "$a" | cut -d' ' -f1) | $(stat -c %s "$a") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tensorfold-archive
+          path: ${{ runner.temp }}/src/out/tensorfold-${{ env.TENSORFOLD_VERSION }}-linux-arm64.tar.gz
+          retention-days: 7
+
+  # by hand: the archive as a release, once
+  publish:
+    name: publish
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: tensorfold-archive
+          path: archive
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="runtime-tensorfold-$TENSORFOLD_VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $tag exists; another build is another version"; exit 1
+          fi
+          a=$(ls archive/*.tar.gz)
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" \
+            --title "Runtime: tensorfold-$TENSORFOLD_VERSION (linux arm64, sm_121)" \
+            --notes "TensorFold's native engine with its DeepSeek-V4.1 family (bertholomus/TensorFold $ENGINE_COMMIT, the deepseek-v41-tensorfold-tp2-2xgb10 recipe's v0.7.5), with voice's patches (runtimes/tensorfold/patches), libtfgrammar from xgrammar $XGRAMMAR_TAG, and the recipe's serving_1017.py and chat template; built by runtimes/tensorfold/build.sh in $IMAGE. Licenses in LICENSES/." \
+            "$a"
+          echo "| tensorfold-$TENSORFOLD_VERSION | $(basename "$a") | sha256 $(sha256sum "$a" | cut -d' ' -f1), $(stat -c %s "$a") bytes |" >> "$GITHUB_STEP_SUMMARY"

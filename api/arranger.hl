@@ -1579,3 +1579,107 @@ fn applied_text(a: ArrangementApplied) -> String {
         + a.advice
         + "\n";
 }
+
+// ---- arrangements kept ----------------------------------------------------------
+//
+// Wants the operator keeps under an id (`PUT /admin/v1/arrangements/{id}`),
+// to be planned again on demand (`POST .../plan`): after a node joins, say.
+// Never on their own, and never as part of anything else: a plan is always
+// the operator's to ask for, and to apply. Each plan of a kept arrangement
+// records the fleet it was made against (`fleet_basis`), so a later read can
+// say the fleet has changed since.
+
+/// `ArrangementPut`: wants kept as arrangement `arrangement`.
+type ArrangementPut {
+    arrangement: String;
+    name: String = "";
+    wants: ArrangementWants = ArrangementWants { };
+}
+
+type ArrangementRef { arrangement: String; }
+
+/// `Arrangement`: wants kept, when they were last planned, and whether the
+/// fleet has changed since.
+type Arrangement {
+    id: String = "";
+    name: String = "";
+    wants: ArrangementWants = ArrangementWants { };
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    updated_at: Time = `1970-01-01T00:00:00Z`;
+    has_planned_at: Bool = false;
+    planned_at: Time = `1970-01-01T00:00:00Z`;
+    fleet_changed: Bool = false;
+}
+
+type ArrangementList { data: bounded[Arrangement; 64]; }
+
+/// The fleet as a plan depends on it, as a digest: each node that can take
+/// a model and its memory for models, each placement, and each pair whose
+/// link can carry a model now. Two digests differ when a node joins or
+/// leaves, a placement comes or goes, or a link is checked.
+fn fleet_basis(
+    nodes: ArrangeNodes,
+    placed: ArrangePlacedList,
+    checks: st::LinkCheckRows,
+    now: Time
+) -> String {
+    let mut text = "";
+    for n in nodes.items {
+        text = text + "node " + n.id + " "
+            + (
+                if len(n.problem) > 0 {
+                    "-"
+                } else {
+                    to_string(std::json::find_int_field(n.hw, "model_memory_bytes"))
+                }
+            )
+            + "\n";
+    }
+    for p in placed.items {
+        text = text + "placed " + p.id + "\n";
+    }
+    let mut i = 0;
+    while i < count(nodes.items) {
+        let a = at(nodes.items, i) or ArrangeNode { };
+        let mut j = i + 1;
+        while j < count(nodes.items) {
+            let b = at(nodes.items, j) or ArrangeNode { };
+            if len(link_ports(a.capabilities, b.id)) > 0
+                && len(
+                    pair_problem(
+                        a.id,
+                        a.capabilities,
+                        a.hw,
+                        b.id,
+                        b.capabilities,
+                        b.hw,
+                        checks,
+                        now,
+                    ),
+                )
+                == 0
+            {
+                text = text + "pair " + a.id + " " + b.id + "\n";
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(text)));
+}
+
+/// Row `r` as the surface's `Arrangement`, the fleet changed since it was
+/// last planned when `basis` (the fleet now, "" when not asked) is not the
+/// one it was planned against.
+fn arrangement_of(r: st::ArrangementRow, basis: String) -> Arrangement {
+    return Arrangement {
+        id: r.id,
+        name: r.name,
+        wants: ArrangementWants::api_decode(r.body) or ArrangementWants { },
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        has_planned_at: r.planned,
+        planned_at: r.planned_at,
+        fleet_changed: r.planned && len(basis) > 0 && basis != r.planned_basis,
+    };
+}

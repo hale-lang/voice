@@ -1083,3 +1083,26 @@ the parser), and the seat carries `tools` from then on.
 update node set assignment_version = assignment_version + 1 where id in (select seat.node from seat, (values ('deepseek-ai/DeepSeek-V4-Flash-0731', '7872f01b1d1fe23eabc4c98b48bffcef5a386062', 'deepseek_v4'), ('zai-org/GLM-4.7-Flash', '7dd20894a642a0aa287e9827cb1a1f7f91386b67', 'glm47'), ('openai/gpt-oss-120b', 'b5c939de8f754692c1647ca79fbf85e8c1e70f8a', 'openai'), ('openai/gpt-oss-20b', '6cee5e81ee83917806bbde320786a8fb61efebee', 'openai'), ('ibm-granite/granite-4.0-350m', 'bd8a1497065c0d6ba1ef19af6b0d2b14bacf71c2', 'granite4'), ('Qwen/Qwen3-0.6B', 'c1899de289a04d12100db370d81485cdf75e47ca', 'hermes'), ('Qwen/Qwen3-Coder-30B-A3B-Instruct', 'b2cff646eb4bb1d68355c01b18ae02e7cf42d120', 'qwen3_coder'), ('Qwen/Qwen3-Coder-Next', 'a7fbcb5c0e12d62a448eaa0e260346bf5dcc0feb', 'qwen3_coder')) as m(repo, revision, parser) where seat.config->'variant'->>'format' = 'safetensors' and seat.config->'variant'->'source'->>'repo' = m.repo and seat.config->'variant'->'source'->>'revision' = m.revision and seat.config->'variant'->'tool_call_parser' is null);
 update seat set config = jsonb_set(config, '{variant,tool_call_parser}', to_jsonb(m.parser)) from (values ('deepseek-ai/DeepSeek-V4-Flash-0731', '7872f01b1d1fe23eabc4c98b48bffcef5a386062', 'deepseek_v4'), ('zai-org/GLM-4.7-Flash', '7dd20894a642a0aa287e9827cb1a1f7f91386b67', 'glm47'), ('openai/gpt-oss-120b', 'b5c939de8f754692c1647ca79fbf85e8c1e70f8a', 'openai'), ('openai/gpt-oss-20b', '6cee5e81ee83917806bbde320786a8fb61efebee', 'openai'), ('ibm-granite/granite-4.0-350m', 'bd8a1497065c0d6ba1ef19af6b0d2b14bacf71c2', 'granite4'), ('Qwen/Qwen3-0.6B', 'c1899de289a04d12100db370d81485cdf75e47ca', 'hermes'), ('Qwen/Qwen3-Coder-30B-A3B-Instruct', 'b2cff646eb4bb1d68355c01b18ae02e7cf42d120', 'qwen3_coder'), ('Qwen/Qwen3-Coder-Next', 'a7fbcb5c0e12d62a448eaa0e260346bf5dcc0feb', 'qwen3_coder')) as m(repo, revision, parser) where seat.config->'variant'->>'format' = 'safetensors' and seat.config->'variant'->'source'->>'repo' = m.repo and seat.config->'variant'->'source'->>'revision' = m.revision and seat.config->'variant'->'tool_call_parser' is null;
 ```
+
+### Migration 30: arrangements
+
+What the operator wants the whole fleet for (`ArrangementWants`: pins and
+roles), kept under an id (`putArrangement`) to be planned again on demand
+(`planSavedArrangement`), never on its own. Each plan records when it was
+made and the fleet it was made against, a digest of the nodes that can take
+a model, their memory for models, what is placed and the links checked; a
+later read compares the fleet now, so the admin UI can say the fleet has
+changed since. Saving the wants again clears that record. A removed
+arrangement's row goes; its id may be used again.
+
+```sql
+create table arrangement (
+  id            text primary key,
+  name          text not null,
+  body          jsonb not null,               -- ArrangementWants, as the api checked it
+  created_at    timestamptz not null,
+  updated_at    timestamptz not null,
+  planned_at    timestamptz,                  -- when it was last planned
+  planned_basis text not null default ''      -- the fleet it was planned against, a digest
+);
+```

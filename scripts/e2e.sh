@@ -234,6 +234,14 @@ assert "echo-1" in m and m["echo-1"]["available"] is False and m["echo-1"]["capa
 PY
 curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["parent"] == "e2e-habitat" and p["inherits"] is True and p["accounts"] == [] and p["key_count"] == 2, p' || { echo "the tenant is not the habitat's inheriting child"; exit 1; }
 curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-habitat" | python3 -c 'import json,sys; p=json.load(sys.stdin); assert p["accounts"] == [] and not p.get("parent"), p' || { echo "the habitat's project is not as it should be"; exit 1; }
+# an arrangement kept in the store, planned again on demand, and forgotten
+curl -fsS -X PUT -H @"$work/admin.h" "$api/admin/v1/arrangements/e2e" -H 'content-type: application/json' -d '{"name": "E2E", "wants": {"roles": [{"role": "small", "count": 2}]}}' >/dev/null || { echo "an arrangement was not kept"; exit 1; }
+curl -fsS -X PUT -H @"$work/admin.h" "$api/admin/v1/arrangements/e2e" -H 'content-type: application/json' -d '{"name": "E2E again", "wants": {"roles": [{"role": "small"}]}}' >/dev/null || { echo "an arrangement was not kept again"; exit 1; }
+curl -fsS -X POST -H @"$work/admin.h" "$api/admin/v1/arrangements/e2e/plan" -H 'content-type: application/json' -d '{}' | python3 -c 'import json,sys; p=json.load(sys.stdin); assert "add" in p and "unmet" in p and len(p["add"]) + len(p["unmet"]) == 1, p' || { echo "a kept arrangement was not planned"; exit 1; }
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/arrangements" | python3 -c 'import json,sys; a=json.load(sys.stdin)["data"]; assert len(a) == 1 and a[0]["name"] == "E2E again" and a[0]["wants"]["roles"][0]["role"] == "small" and a[0]["planned_at"] and a[0]["fleet_changed"] is False, a' || { echo "the kept arrangement does not read back"; exit 1; }
+curl -fsS -X DELETE -H @"$work/admin.h" "$api/admin/v1/arrangements/e2e" >/dev/null
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H @"$work/admin.h" "$api/admin/v1/arrangements/e2e")" = 404 ] || { echo "a forgotten arrangement is still read"; exit 1; }
+echo "an arrangement is kept, planned on demand and forgotten"
 code=$(tenant /v1/chat/completions "$tenant_key" -H 'content-type: application/json' -d '{"model": "echo-1", "messages": [{"role": "user", "content": "hi"}]}')
 [ "$code" != 200 ] || { echo "a tenant with no account was served"; exit 1; }
 # the operator gives the habitat's project the account, once: the tenant is

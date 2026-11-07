@@ -131,7 +131,10 @@ The operator decides which weights and which servers may run:
   (`applyArrangement`, `voice-api arrange apply`, the screen's **apply**):
   voice plans again and refuses a plan the fleet has moved on from, then
   removes, adds and points aliases in that order, stopping at a step that
-  fails and saying what was done.
+  fails and saying what was done. An arrangement may be kept under an id and
+  planned again on demand, after a node joins, say (`voice-api arrange plan
+  --arrangement ID`, the screen's **re-plan**); the screen says when the
+  fleet has changed since it was last planned, and plans nothing on its own.
 
 Voice ships a default catalog of recipes per memory tier and platform
 ([`recipes/README.md`](./recipes/README.md),

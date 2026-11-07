@@ -49,6 +49,26 @@ type RecipeRow {
     present: Bool = false;
 }
 
+/// An `arrangement` row: what the operator wants the whole fleet for, kept
+/// under an id to be planned again on demand (api/arranger.hl). `body` is
+/// its `ArrangementWants`. `planned_at` and `planned_basis`: when it was
+/// last planned, and the fleet as it was then (a digest), so a later read
+/// can say the fleet has changed since.
+type ArrangementRow {
+    id: String = "";
+    name: String = "";
+    body: String = "{}";
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    updated_at: Time = `1970-01-01T00:00:00Z`;
+    planned: Bool = false;
+    planned_at: Time = `1970-01-01T00:00:00Z`;
+    planned_basis: String = "";
+    present: Bool = false;
+}
+
+/// Every arrangement row, in the order they were added.
+type ArrangementRows { rows: bounded[ArrangementRow; 64]; }
+
 /// A `runtime` row: one the operator allowed (voice's own are files, not
 /// rows). `body` is its `RuntimeCreate` as the api checked and wrote it. A
 /// removed row keeps its id, which is never reused.
@@ -854,6 +874,18 @@ interface Store {
     /// Mark the row with `row.id` removed, at `row.removed_at`.
     fn remove_recipe(row: RecipeRow, change: ChangeRow) fallible(StoreError);
 
+    /// The arrangement row for `id`; `present` is false when there is none.
+    fn arrangement(id: String) -> ArrangementRow fallible(StoreError);
+    fn arrangements() -> ArrangementRows fallible(StoreError);
+    /// Add the row, or replace the name and wants of the one with `row.id`
+    /// (its plan's record cleared); true when it was added.
+    fn put_arrangement(row: ArrangementRow, change: ChangeRow) -> Bool fallible(StoreError);
+    /// Remove the row with `id`.
+    fn delete_arrangement(id: String, change: ChangeRow) fallible(StoreError);
+    /// Arrangement `id` was planned at `at`, against the fleet `basis`: a
+    /// record of the plan, no change of configuration.
+    fn plan_arrangement_at(id: String, at: Time, basis: String) fallible(StoreError);
+
     /// The runtime row for `id`; `present` is false when there is none.
     fn runtime(id: String) -> RuntimeRow fallible(StoreError);
     fn runtimes() -> RuntimeRows fallible(StoreError);
@@ -1201,6 +1233,7 @@ locus MemoryStore {
         seat_state_rows: SeatStateTable = SeatStateTable { };
         // link checks, newest first, the last 64
         link_check_rows: LinkCheckRows = LinkCheckRows { };
+        arrangement_rows: ArrangementRows = ArrangementRows { };
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
@@ -1921,6 +1954,79 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.fleet_rows.set(r);
+    }
+
+    // ---- arrangements
+
+    fn arrangement(id: String) -> ArrangementRow fallible(StoreError) {
+        for r in self.arrangement_rows.rows {
+            if r.id == id { return r; }
+        }
+        return ArrangementRow { };
+    }
+
+    fn arrangements() -> ArrangementRows fallible(StoreError) {
+        return self.arrangement_rows;
+    }
+
+    @unbounded
+    fn put_arrangement(row: ArrangementRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        let mut next = ArrangementRows { };
+        let mut found = false;
+        for held in self.arrangement_rows.rows {
+            if held.id == row.id {
+                found = true;
+                push(
+                    next.rows,
+                    ArrangementRow {
+                        id: held.id,
+                        name: row.name,
+                        body: row.body,
+                        created_at: held.created_at,
+                        updated_at: row.updated_at,
+                        present: true,
+                    },
+                ) or discard;
+            } else {
+                push(next.rows, held) or discard;
+            }
+        }
+        if !found {
+            if count(self.arrangement_rows.rows) >= 64 {
+                fail StoreError { kind: "full", message: "voice holds at most 64 arrangements" };
+            }
+            let mut r = row;
+            r.present = true;
+            r.planned = false;
+            push(next.rows, r) or discard;
+        }
+        self.arrangement_rows = next;
+        self.append(change);
+        return !found;
+    }
+
+    @unbounded
+    fn delete_arrangement(id: String, change: ChangeRow) fallible(StoreError) {
+        let mut next = ArrangementRows { };
+        for held in self.arrangement_rows.rows {
+            if held.id != id { push(next.rows, held) or discard; }
+        }
+        self.arrangement_rows = next;
+        self.append(change);
+    }
+
+    fn plan_arrangement_at(id: String, at: Time, basis: String) fallible(StoreError) {
+        let mut next = ArrangementRows { };
+        for held in self.arrangement_rows.rows {
+            let mut h = held;
+            if h.id == id {
+                h.planned = true;
+                h.planned_at = at;
+                h.planned_basis = basis;
+            }
+            push(next.rows, h) or discard;
+        }
+        self.arrangement_rows = next;
     }
 
     fn link_checks() -> LinkCheckRows fallible(StoreError) {

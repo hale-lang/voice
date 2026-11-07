@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Mono, Field, Select, NumberInput, Checkbox, Button, bytes, type Tone } from '@hale/components';
-import { api, describe, useGet, useNodes, useRecipes, type Schemas } from '../api/client';
+import { Seats } from './Placements';
+import { Panel, Table, Status, Loading, Unavailable, Mono, Field, Select, NumberInput, Checkbox, Button, Confirm, bytes, type Tone } from '@hale/components';
+import { api, describe, useGet, useNodes, useRecipes, type Schemas, type Placement } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href } from '../route';
 
@@ -8,6 +9,7 @@ type Wants = Schemas['ArrangementWants'];
 type Pin = Schemas['ArrangementPin'];
 type RoleWant = Schemas['ArrangementRoleWant'];
 type Plan = Schemas['ArrangementPlan'];
+type Applied = Schemas['ArrangementApplied'];
 
 /** One line of the plan's diff, as the table shows it. */
 type Step = { key: string; kind: 'keep' | 'remove' | 'add' | 'alias'; what: React.ReactNode; nodes: string; detail: React.ReactNode };
@@ -17,7 +19,8 @@ const TONE: Record<Step['kind'], Tone> = { keep: 'quiet', remove: 'fail', add: '
 /**
  * The fleet as the operator wants it: models pinned to nodes and roles to
  * fill, and the plan voice proposes for it, a diff against what is placed
- * now, with why and what it costs. The plan is read, not carried out.
+ * now, with why and what it costs; and, on the operator's click, the plan
+ * carried out, each step's state and each added placement's seats shown.
  */
 export function Arrange(_: ScreenProps) {
   const roles = useGet('/admin/v1/arrangement-roles');
@@ -29,6 +32,11 @@ export function Arrange(_: ScreenProps) {
   const [plan, setPlan] = useState<Plan | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [account, setAccount] = useState('');
+  const [project, setProject] = useState('');
+  const [applied, setApplied] = useState<Applied | null>(null);
+  const accounts = useGet('/admin/v1/accounts');
+  const projects = useGet('/admin/v1/projects');
 
   if (roles.isPending) return <Loading what="roles" />;
   if (roles.isError) return <Unavailable what="Arrange" detail={roles.error.message} />;
@@ -51,7 +59,29 @@ export function Arrange(_: ScreenProps) {
         setPlan(null);
       } else {
         setPlan(r.data);
+        setApplied(null);
       }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** The plan shown, carried out: only ever on the operator's click. */
+  async function apply() {
+    if (!plan) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.POST('/admin/v1/arrangement-applies', { body: { wants: { pins, roles: wanted }, plan, account, project: project || undefined } });
+      if (r.error !== undefined || !r.data) {
+        setError(describe(r.error, r.response.status));
+        return;
+      }
+      setApplied(r.data);
+      // drifted: the fleet has moved on, and the fresh plan is the one to look at
+      if (r.data.outcome === 'drifted' && r.data.plan) setPlan(r.data.plan);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -135,12 +165,31 @@ export function Arrange(_: ScreenProps) {
       </Panel>
 
       <p style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
-        <Button tone="primary" onClick={ask} disabled={busy || pins.some((p) => !p.model)}>{busy ? 'planning…' : 'plan'}</Button>
-        <Button disabled>apply (phase 2)</Button>
+        <Button tone="primary" onClick={ask} disabled={busy || pins.some((p) => !p.model)}>{busy ? 'working…' : 'plan'}</Button>
         <span className="faint">a plan changes nothing</span>
       </p>
       {error && <p className="c-fail">{error}</p>}
+      {applied && <AppliedView applied={applied} />}
       {plan && <PlanView plan={plan} />}
+      {plan && (plan.add.length > 0 || plan.remove.length > 0 || plan.aliases.length > 0) && (
+        <Panel title="Apply" readout="the plan as shown, carried out">
+          <p className="muted" style={{ marginTop: 0 }}>Voice plans again first, and changes nothing if the fleet has moved on. Then removals, adds, aliases, in that order; a step that fails stops the rest, and nothing done is undone.</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 'var(--space-3)' }}>
+            <Field label="account" required help="what the seats it adds spend">
+              <Select value={account} onChange={setAccount} options={(accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => ({ value: a.id, label: `${a.id} · ${a.billing}` }))} required empty="" />
+            </Field>
+            <Field label="project" required={plan.aliases.length > 0} help="whose aliases the roles point">
+              <Select value={project} onChange={setProject} options={(projects.data?.data ?? []).map((p) => ({ value: p.id, label: p.id }))} empty={plan.aliases.length ? '' : 'none'} />
+            </Field>
+          </div>
+          <Confirm
+            label="apply"
+            confirm={`apply: ${plan.remove.length} removed, ${plan.add.length} added, ${plan.aliases.length} aliases`}
+            disabled={busy || (plan.add.length > 0 && !account) || (plan.aliases.length > 0 && !project)}
+            onConfirm={apply}
+          />
+        </Panel>
+      )}
     </>
   );
 }
@@ -207,5 +256,40 @@ function PlanView({ plan }: { plan: Plan }) {
         </Panel>
       )}
     </>
+  );
+}
+
+const STEP_TONE: Record<string, Tone> = { done: 'ok', failed: 'fail', not_run: 'quiet' };
+
+/** What applying came to: each step's state, the added placements' seats as their nodes report them, and what to do. */
+function AppliedView({ applied }: { applied: Applied }) {
+  const placements = useGet('/admin/v1/placements');
+  const nodes = useNodes();
+  const seatAt = (ref: string | undefined) => { const [n] = (ref ?? '').split('/'); return nodes.data?.data.find((x) => x.id === n)?.seats.find((s) => s.ref === ref); };
+  const placed = (id: string): Placement | undefined => placements.data?.data.find((p) => p.id === id);
+  const tone: Tone = applied.outcome === 'applied' ? 'ok' : applied.outcome === 'failed' ? 'fail' : 'wait';
+  return (
+    <Panel title={<>Applied <Status tone={tone} label={applied.outcome} /></>} readout={`${applied.steps.filter((s) => s.state === 'done').length} of ${applied.steps.length} steps done`}>
+      <p className={applied.outcome === 'applied' ? 'muted' : applied.outcome === 'failed' ? 'c-fail' : 'c-wait'} style={{ marginTop: 0 }}>{applied.advice}</p>
+      {applied.steps.length > 0 && (
+        <Table<Schemas['ApplyStep'] & { i: number }>
+          rows={applied.steps.map((s, i) => ({ ...s, i }))}
+          rowKey={(s) => String(s.i)}
+          columns={[
+            { key: 'state', header: '', render: (s) => <Status tone={STEP_TONE[s.state] ?? 'quiet'} label={s.state.replace('_', ' ')} /> },
+            { key: 'action', header: 'Step', render: (s) => <>{s.action} <Mono>{s.target}</Mono></> },
+            { key: 'detail', header: 'What', render: (s) => <>{s.detail}{s.reason && <div className="c-fail">{s.reason}</div>}</> },
+            {
+              key: 'seat',
+              header: 'Seats',
+              render: (s) => {
+                const p = s.action === 'add' && s.state === 'done' ? placed(s.target) : undefined;
+                return p ? <a href={href('placements', p.id)}><Seats p={p} seatAt={seatAt} /></a> : <span className="faint">–</span>;
+              },
+            },
+          ]}
+        />
+      )}
+    </Panel>
   );
 }

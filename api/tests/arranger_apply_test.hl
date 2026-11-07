@@ -1,0 +1,229 @@
+// Applying an arrangement's plan (arranger.hl, "carrying a plan out"): the
+// three Sparks of arranger_test.hl, the plan carried out as placements in a
+// safe order, removals first; a plan the fleet has moved on from refused
+// with the fresh one; a step that fails stopping the rest, what was done
+// left done and said.
+import ".." as api;
+import "../../store" as st;
+import "../../node" as node;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+/// A DGX Spark's two ports on its one cabled QSFP port, to `peer`.
+fn link_to(peer: String, a: String, b: String) -> String {
+    return "{\"peer\": \"" + peer + "\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \""
+        + a + "\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"" + b
+        + "\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}";
+}
+
+/// A DGX Spark's capabilities: a managed engine, its GB10 (compute
+/// capability 12.1, as TensorFold's kernels are built for), and its links.
+fn spark(links: String) -> String {
+    let memory = 130661072896;
+    return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": "
+        + to_string(memory) + ", \"model_memory_bytes\": "
+        + to_string(node::model_memory("{}", memory))
+        + ", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": "
+        + to_string(memory)
+        + ", \"unified\": true, \"compute_capability\": \"12.1\"}], \"disk_free_bytes\": 3500000000000}"
+        + (if len(links) > 0 { ", \"links\": [" + links + "]" } else { "" }) + "}";
+}
+
+fn add_node(store: st::Store, id: String, capabilities: String) {
+    store.insert_node(
+        st::NodeRow { id: id, name: id, max_in_flight: 4, created_at: api::now_seconds() },
+        api::change("create", "nodes/" + id, "", "{}"),
+    ) or discard;
+    store.put_fleet(st::FleetRow { node: id, capabilities: capabilities, present: true })
+    or discard;
+    store.put_beat(id, api::now_seconds(), 0) or discard;
+}
+
+/// The link between spark and flare, checked and passed.
+fn checked(store: st::Store, link: api::Link) {
+    let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
+    let usable = rts.usable_in_gate() or api::RuntimeList { };
+    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let said = api::link_result_json(
+        api::LinkCheckResult {
+            id: c.id,
+            ok: true,
+            has_bus_bytes_per_second: true,
+            bus_bytes_per_second: 20000000000,
+        },
+        api::now_seconds(),
+    );
+    store.put_link_result(c.id, "spark", said) or discard;
+    store.put_link_result(c.id, "flare", said) or discard;
+}
+
+fn pin(model: String, n: Int) -> api::ArrangementPin {
+    return api::ArrangementPin { model: model, count: n };
+}
+
+fn role(id: String, priority: Int) -> api::ArrangementRoleWant {
+    return api::ArrangementRoleWant { role: id, priority: priority };
+}
+
+fn nodes_of(n: bounded[String; 2]) -> String {
+    let out = st::JsonList { };
+    for x in n {
+        out.add(x);
+    }
+    return std::str::replace(out.text(), ", ", "+");
+}
+
+fn added_on(p: api::ArrangementPlan, recipe: String) -> String {
+    for a in p.add {
+        if a.recipe == recipe { return nodes_of(a.nodes); }
+    }
+    return "";
+}
+
+fn step_states(a: api::ArrangementApplied) -> String {
+    let mut out = "";
+    for s in a.steps {
+        out = out + api::apply_action_name(s.action) + " " + s.target + ": "
+            + api::apply_step_state_name(s.state)
+            + (if len(s.reason) > 0 { " (" + s.reason + ")" } else { "" }) + "\n";
+    }
+    return out;
+}
+
+fn main() {
+    let read = api::roles_of(std::io::fs::read_file(shipped("catalog") + "/roles.json") or "");
+    let store = st::MemoryStore { };
+    let link = api::NatsLink { };
+    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(shipped("recipes")) };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let seats = api::Seats { store: store, link: link };
+    let catalog = api::Catalog { store: store, recipes: recipes };
+    let projects = api::Projects { store: store };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: seats,
+        roles: read.roles,
+        catalog: catalog,
+        projects: projects,
+    };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    add_node(store, "spark", spark(link_to("flare", "192.168.100.1", "192.168.101.1")));
+    add_node(store, "flare", spark(link_to("spark", "192.168.100.2", "192.168.101.2")));
+    add_node(store, "spark3", spark(""));
+    checked(store, link);
+    catalog.create(
+        api::CatalogModelCreate { id: "granite", has_recipe: true, recipe: "granite-4.0-h-tiny" },
+    ) or discard;
+    let mut g = api::PlacementCreate { id: "granite-now", model: "granite", account: "local" };
+    push(g.nodes, "spark") or discard;
+    placements.create(g) or {
+        std::test::assert(false, "placed: " + api::ctl_message(err));
+        return;
+    };
+
+    let mut w = api::ArrangementWants { };
+    push(w.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
+    push(w.roles, role("coder", 1)) or discard;
+    push(w.roles, role("decider", 2)) or discard;
+    push(w.roles, role("small", 3)) or discard;
+
+    // ---- refused before anything is done --------------------------------
+    let plan = placements.plan_arrangement(w) or api::ArrangementPlan { };
+    placements.apply_arrangement(
+        api::ArrangementApply { wants: w, plan: plan, account: "local" },
+    ) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "`project`"),
+            "aliases need a project: " + api::ctl_message(err),
+        );
+        api::ArrangementApplied { }
+    };
+    std::test::assert(
+        (store.placement("granite-now") or st::PlacementRow { }).removed == false,
+        "and nothing was done",
+    );
+
+    // ---- a step that fails stops the rest --------------------------------
+    let broke = placements.apply_arrangement(
+        api::ArrangementApply { wants: w, plan: plan, account: "nobody", project: "work" },
+    ) or {
+        std::test::assert(false, "applied: " + api::ctl_message(err));
+        return;
+    };
+    let said = step_states(broke);
+    std::test::assert(broke.outcome == api::ApplyOutcome::failed, "it failed: " + said);
+    std::test::assert(
+        std::str::starts_with(said, "remove granite-now: done\n"),
+        "the removal first, done: " + said,
+    );
+    std::test::assert(
+        std::str::contains(said, "add deepseek-v4-1-flash-1017-flare: failed (")
+            && std::str::contains(said, "add qwen3-coder-next-spark3: not_run")
+            && std::str::contains(said, "alias coding: not_run"),
+        "the first add failed, the rest not run: " + said,
+    );
+    std::test::assert(
+        std::str::contains(broke.advice, "Nothing was undone"),
+        "and what to do is said: " + broke.advice,
+    );
+    std::test::assert(
+        (store.placement("granite-now") or st::PlacementRow { }).removed,
+        "what was done stays done",
+    );
+
+    // ---- a plan the fleet has moved on from is refused with the fresh one
+    let stale = placements.apply_arrangement(
+        api::ArrangementApply { wants: w, plan: plan, account: "local", project: "work" },
+    ) or api::ArrangementApplied { };
+    std::test::assert(
+        stale.outcome == api::ApplyOutcome::drifted && stale.has_plan && count(stale.steps) == 0
+            && count(stale.plan.remove) == 0,
+        "drifted, the fresh plan answered: " + step_states(stale),
+    );
+
+    // ---- carried out ------------------------------------------------------
+    let done = placements.apply_arrangement(
+        api::ArrangementApply { wants: w, plan: stale.plan, account: "local", project: "work" },
+    ) or {
+        std::test::assert(false, "applied: " + api::ctl_message(err));
+        return;
+    };
+    std::test::assert(
+        done.outcome == api::ApplyOutcome::applied,
+        "applied: " + step_states(done) + done.advice,
+    );
+    let ds = store.placement("deepseek-v4-1-flash-1017-flare") or st::PlacementRow { };
+    std::test::assert(ds.present && !ds.removed, "DeepSeek is placed across the pair");
+    std::test::assert(
+        std::str::contains(ds.body, "tensorfold-0.7.5"),
+        "on TensorFold, as the plan said",
+    );
+    let coder = store.placement("qwen3-coder-next-spark3") or st::PlacementRow { };
+    std::test::assert(coder.present, "the coder on spark3");
+    let m = store.model("qwen3-coder-next") or st::ModelRow { };
+    std::test::assert(m.present && m.recipe == "qwen3-coder-next", "its catalog model, added");
+    let work = store.project("work") or st::ProjectRow { };
+    let aliases = api::aliases_of(work.aliases);
+    let mut coding = "";
+    for x in aliases.items {
+        if x.name == "coding" { coding = x.model; }
+    }
+    std::test::assert_eq_str(coding, "qwen3-coder-next", "the coder's alias, pointed");
+
+    // ---- planned again, it keeps everything --------------------------------
+    let again = placements.plan_arrangement(w) or api::ArrangementPlan { };
+    std::test::assert(
+        count(again.add) == 0 && count(again.remove) == 0 && count(again.keep) == 4,
+        "the fleet is as wanted: " + api::plan_text(again),
+    );
+}

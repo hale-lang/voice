@@ -1,96 +1,121 @@
-// `api arrange plan`: a plan for the fleet, asked of the live api with the
-// operator token and printed (arranger.hl `plan_text`). It writes to
-// stdout: the plan is its product. Nothing is carried out.
+// `api arrange plan` and `api arrange apply`: a plan for the fleet, asked
+// of the live api with the operator token and printed (arranger.hl
+// `plan_text`); and, asked for, carried out (`applied_text`). It writes to
+// stdout: the plan and what applying it came to are its product.
 
-/// How long the api is given to plan.
+/// How long the api is given to plan, and to carry a plan out.
 const ARRANGE_WITHIN_S: Int = 60;
+const APPLY_WITHIN_S: Int = 600;
 
 /// `api arrange plan --wants FILE [--api URL] [--token-file FILE]
 /// [--database URL] [--state DIR]`: post the wants in FILE (an
 /// `ArrangementWants`) to the api at URL (`http://127.0.0.1:8080` by
-/// default) and print the plan. The operator token is FILE's
-/// (`--token-file`), or else read as `api admin-token` reads it.
+/// default) and print the plan. `api arrange apply ... --account ACCOUNT
+/// [--project PROJECT]` plans the same way, prints the plan and carries it
+/// out, the seats it adds spending ACCOUNT and its aliases set on PROJECT,
+/// and prints each step. The operator token is FILE's (`--token-file`), or
+/// else read as `api admin-token` reads it.
 fn arrange() -> Int {
     let cli = ArrangeCli { };
-    return cli.plan();
+    return cli.go();
 }
 
 /// `api arrange`'s work, in a locus of its own so what one run makes is
 /// the run's.
 locus ArrangeCli {
-    fn plan() -> Int {
+    fn go() -> Int {
         let a = arrange_args();
         if len(a.problem) > 0 {
             log_error(a.problem, "");
             return 2;
         }
-        let wants = a.wants;
         let base = if std::str::ends_with(a.api, "/") { a.api[0..(len(a.api) - 1)] } else { a.api };
-        let token_file = a.token_file;
-        let database = a.database;
-        let state = a.state;
-        let body = std::io::fs::read_file(wants) or {
-            log_error("arrange plan: no file " + wants, "");
+        let wants = std::io::fs::read_file(a.wants) or {
+            log_error("arrange: no file " + a.wants, "");
             return 1;
         };
         let mut token = "";
-        if len(token_file) > 0 {
-            token = std::str::trim(std::io::fs::read_file(token_file) or "");
+        if len(a.token_file) > 0 {
+            token = std::str::trim(std::io::fs::read_file(a.token_file) or "");
         } else if len(granted_operator_entry()) > 0 {
             log_error(
-                "arrange plan: the habitat holds the operator token: give it with --token-file",
+                "arrange: the habitat holds the operator token: give it with --token-file",
                 "",
             );
             return 1;
         } else {
-            token = operator_token_for(st::database_or_habitat(database), state) or {
-                log_error("arrange plan: " + err.message, "");
+            token = operator_token_for(st::database_or_habitat(a.database), a.state) or {
+                log_error("arrange: " + err.message, "");
                 return 1;
             };
         }
+        let headers = "Content-Type: application/json\r\nAuthorization: Bearer " + token;
         let got = exchange(
             base + "/admin/v1/arrangement-plans",
             ARRANGE_WITHIN_S * 1s,
             "POST",
-            "Content-Type: application/json\r\nAuthorization: Bearer " + token,
-            body,
+            headers,
+            wants,
         );
-        if got.status == 0 {
-            log_error("arrange plan: the api did not answer: " + got.why, "");
-            return 1;
-        }
-        if got.status != 200 {
-            let invalid = std::json::find_field_raw(got.body, "Invalid");
-            let said = std::json::find_string_field(invalid, "message");
-            log_error(
-                "arrange plan: the api refused it (" + to_string(got.status) + "): "
-                    + (if len(said) > 0 { said } else { got.body }),
-                "",
-            );
+        let refused = answer_problem(got);
+        if len(refused) > 0 {
+            log_error("arrange: " + refused, "");
             return 1;
         }
         let plan = ArrangementPlan::api_decode(got.body) or {
-            log_error("arrange plan: the api's answer is not a plan", "");
+            log_error("arrange: the api's answer is not a plan", "");
             return 1;
         };
         print(plan_text(plan));
-        return 0;
+        if !a.apply { return 0; }
+        let applying = exchange(
+            base + "/admin/v1/arrangement-applies",
+            APPLY_WITHIN_S * 1s,
+            "POST",
+            headers,
+            "{\"wants\": " + wants + ", \"plan\": " + got.body + ", \"account\": " + jq(a.account)
+                + (if len(a.project) > 0 { ", \"project\": " + jq(a.project) } else { "" }) + "}",
+        );
+        let not_applied = answer_problem(applying);
+        if len(not_applied) > 0 {
+            log_error("arrange apply: " + not_applied, "");
+            return 1;
+        }
+        let applied = ArrangementApplied::api_decode(applying.body) or {
+            log_error("arrange apply: the api's answer is not what applying came to", "");
+            return 1;
+        };
+        print("\n" + applied_text(applied));
+        return if applied.outcome == ApplyOutcome::applied { 0 } else { 1 };
     }
 }
 
-/// `api arrange`'s arguments as read: its flags' values, or why they are
-/// refused.
+/// Why `got` is no answer the api gave to a request it took, "" when it is.
+fn answer_problem(got: Answer) -> String {
+    if got.status == 0 { return "the api did not answer: " + got.why; }
+    if got.status == 200 { return ""; }
+    let invalid = std::json::find_field_raw(got.body, "Invalid");
+    let said = std::json::find_string_field(invalid, "message");
+    return "the api refused it (" + to_string(got.status) + "): "
+        + (if len(said) > 0 { said } else { got.body });
+}
+
+/// `api arrange`'s arguments as read: plan or apply, its flags' values, or
+/// why they are refused.
 type ArrangeArgs {
+    apply: Bool = false;
     wants: String = "";
     api: String = "http://127.0.0.1:8080";
     token_file: String = "";
     database: String = "";
     state: String = "";
+    account: String = "";
+    project: String = "";
     problem: String = "";
 }
 
-/// The program's arguments (`api arrange plan ...`), as `arrange` reads
-/// them.
+/// The program's arguments (`api arrange plan|apply ...`), as `arrange`
+/// reads them.
 fn arrange_args() -> ArrangeArgs {
     let mut out = ArrangeArgs {
         database: if std::env::var_exists("VOICE_DATABASE_URL") {
@@ -99,10 +124,12 @@ fn arrange_args() -> ArrangeArgs {
             ""
         },
     };
-    if std::env::args_count() < 3 || std::env::arg(2) != "plan" {
-        out.problem = "usage: api arrange plan --wants FILE [--api URL] [--token-file FILE]";
+    let usage = "usage: api arrange plan --wants FILE [--api URL] [--token-file FILE]; api arrange apply --wants FILE --account ACCOUNT [--project PROJECT] [--api URL] [--token-file FILE]";
+    if std::env::args_count() < 3 || (std::env::arg(2) != "plan" && std::env::arg(2) != "apply") {
+        out.problem = usage;
         return out;
     }
+    out.apply = std::env::arg(2) == "apply";
     let mut i = 3;
     while i < std::env::args_count() {
         let flag = std::env::arg(i);
@@ -117,14 +144,20 @@ fn arrange_args() -> ArrangeArgs {
             out.database = value;
         } else if flag == "--state" {
             out.state = value;
+        } else if flag == "--account" && out.apply {
+            out.account = value;
+        } else if flag == "--project" && out.apply {
+            out.project = value;
         } else {
-            out.problem = "arrange plan: no flag " + flag;
+            out.problem = "arrange: no flag " + flag + "; " + usage;
             return out;
         }
         i = i + 2;
     }
     if len(out.wants) == 0 {
-        out.problem = "arrange plan: --wants names the file of what the fleet is for";
+        out.problem = "arrange: --wants names the file of what the fleet is for";
+    } else if out.apply && len(out.account) == 0 {
+        out.problem = "arrange apply: --account names the account the seats it adds spend";
     }
     return out;
 }

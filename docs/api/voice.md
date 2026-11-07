@@ -184,7 +184,7 @@ client can pace itself instead of discovering the wall by failing.
 - [recipes](#tag-recipes) (4)
 - [runtimes](#tag-runtimes) (4)
 - [placements](#tag-placements) (4)
-- [arrangements](#tag-arrangements) (2)
+- [arrangements](#tag-arrangements) (3)
 - [accounts](#tag-accounts) (5)
 - [nodes](#tag-nodes) (13)
 - [changes](#tag-changes) (2)
@@ -1967,6 +1967,57 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | The plan. | `application/json` [ArrangementPlan](#schema-arrangementplan) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/arrangement-applies`
+
+**Carry out a plan** · `applyArrangement`
+
+Authentication: operatorToken
+
+The operator applies a plan `planArrangement` answered; voice
+never applies one on its own. The api plans the same wants again
+first: when the fleet would now get another plan (what it keeps,
+removes, adds where and in which form, or the aliases it points),
+nothing is done and the answer is `drifted`, with the fresh plan to
+look at and apply instead.
+
+Otherwise the plan is carried out as ordinary placements, in a safe
+order: every removal first, freeing the memory the adds are judged
+against (a pair that takes its nodes whole needs them empty); then
+each add in the plan's order, a catalog model of the recipe first
+where the catalog has none (`in_catalog` false), each placed as
+`createPlacement` places it, spending `account`; then each alias,
+set on `project`'s aliases. Each step writes its own change, so the
+admin event stream tells each as it is done; each added
+placement's seats then come up as their nodes fetch what they name.
+
+A step that fails stops the rest. The answer says which steps were
+done, which failed and why, and which were not run, and what to do:
+nothing done is undone.
+
+Request body
+
+`application/json`
+
+Schema: [ArrangementApply](#schema-arrangementapply)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `wants` | [ArrangementWants](#schema-arrangementwants) | yes |  |  |
+| `plan` | [ArrangementPlan](#schema-arrangementplan) | yes |  |  |
+| `account` | string | yes | The account the seats it adds spend. |  |
+| `project` | string |  | The project whose aliases it points; needed when the plan points any. |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | What applying it came to. | `application/json` [ArrangementApplied](#schema-arrangementapplied) |
 | 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -4516,6 +4567,50 @@ Type: object
 |---|---|---|---|---|
 | `want` | string | yes |  |  |
 | `reason` | string | yes |  |  |
+
+<a id="schema-arrangementapply"></a>
+
+### ArrangementApply
+
+A plan to carry out, and the wants it was made for.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `wants` | [ArrangementWants](#schema-arrangementwants) | yes |  |  |
+| `plan` | [ArrangementPlan](#schema-arrangementplan) | yes |  |  |
+| `account` | string | yes | The account the seats it adds spend. |  |
+| `project` | string |  | The project whose aliases it points; needed when the plan points any. |  |
+
+<a id="schema-arrangementapplied"></a>
+
+### ArrangementApplied
+
+What applying a plan came to.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `outcome` | string, one of `applied`, `failed`, `drifted` | yes | Every step done; stopped at a step that failed; or nothing done, the plan no longer the fleet's. |  |
+| `steps` | array of [ApplyStep](#schema-applystep) | yes | In the order they are taken. Empty when the plan had drifted. |  |
+| `advice` | string | yes | What to do next. |  |
+| `plan` | [ArrangementPlan](#schema-arrangementplan) |  | When the plan had drifted, the plan for the fleet now. |  |
+
+<a id="schema-applystep"></a>
+
+### ApplyStep
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `action` | string, one of `remove`, `catalog`, `add`, `alias` | yes |  |  |
+| `target` | string | yes | The placement removed or added, the catalog model added, or the alias pointed. |  |
+| `detail` | string | yes |  |  |
+| `state` | string, one of `done`, `failed`, `not_run` | yes |  |  |
+| `reason` | string | yes | Why it failed; empty otherwise. |  |
 
 <a id="schema-nodesuggestions"></a>
 

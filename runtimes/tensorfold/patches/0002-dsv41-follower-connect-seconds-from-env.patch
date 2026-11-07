@@ -1,0 +1,67 @@
+TensorFold dsv41: a follower's wait for rank 0 is TF_TP_CONNECT_SECONDS
+
+A follower (tf-dsv41-lanes) retries its connect to rank 0's rendezvous for
+300 s, then stops. The recipe's launch starts both ranks together; voice
+starts each rank when its own node has fetched and readied its inputs, which
+on a first start may be tens of minutes apart. The wait now comes from
+TF_TP_CONNECT_SECONDS: 300 when it is unset, as before; a whole number from 1
+to 1,000,000 otherwise, anything else stopping the start. The node gives a
+follower a day (node/tensorfold.hl `TF_CONNECT_SECONDS`), and stops it when
+its seat leaves the assignment.
+
+diff --git a/zig/src/families/dsv41/link.zig b/zig/src/families/dsv41/link.zig
+index eb85c6d9..a5c978c5 100644
+--- a/zig/src/families/dsv41/link.zig
++++ b/zig/src/families/dsv41/link.zig
+@@ -211,6 +211,22 @@ pub const Watch = struct {
+ };
+ 
+ /// "192.0.2.7" as four bytes.
++/// How long a follower retries its connect to rank 0 while rank 0 starts: TF_TP_CONNECT_SECONDS, 300 when unset.
++/// A launcher that starts the ranks on their own schedules (one node may still be readying its inputs when the other
++/// is done) sets it longer; a value that is not a whole number from 1 to 1,000,000 stops the start.
++pub fn connectSeconds() error{BadConnectSeconds}!u32 {
++    const raw = std.c.getenv("TF_TP_CONNECT_SECONDS");
++    return parseConnectSeconds(if (raw) |v| std.mem.span(v) else null);
++}
++
++pub fn parseConnectSeconds(value: ?[]const u8) error{BadConnectSeconds}!u32 {
++    const raw = value orelse return 300;
++    if (raw.len == 0 or raw.len > 7 or raw[0] == '0') return error.BadConnectSeconds;
++    for (raw) |ch| if (ch < '0' or ch > '9') return error.BadConnectSeconds;
++    const n = std.fmt.parseInt(u32, raw, 10) catch return error.BadConnectSeconds;
++    return if (n > 1_000_000) error.BadConnectSeconds else n;
++}
++
+ pub fn parseIp(text: []const u8) ![4]u8 {
+     var out: [4]u8 = undefined;
+     var it = std.mem.splitScalar(u8, text, '.');
+@@ -340,3 +356,15 @@ test "a watch's grace lets this process end first" {
+     w.stop(); // this process ends its links itself in time
+     try std.testing.expectEqual(@as(u32, 0), awaitGone(100));
+ }
++
++test "TF_TP_CONNECT_SECONDS: unset is 300, a number is that many seconds, anything else is refused" {
++    try std.testing.expectEqual(@as(u32, 300), try parseConnectSeconds(null));
++    try std.testing.expectEqual(@as(u32, 1), try parseConnectSeconds("1"));
++    try std.testing.expectEqual(@as(u32, 86400), try parseConnectSeconds("86400"));
++    try std.testing.expectEqual(@as(u32, 1_000_000), try parseConnectSeconds("1000000"));
++    try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds(""));
++    try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds("0"));
++    try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds("1000001"));
++    try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds("-5"));
++    try std.testing.expectError(error.BadConnectSeconds, parseConnectSeconds("60s"));
++}
+diff --git a/zig/src/families/dsv41/prompt2d.zig b/zig/src/families/dsv41/prompt2d.zig
+index 6ecef491..7663b702 100644
+--- a/zig/src/families/dsv41/prompt2d.zig
++++ b/zig/src/families/dsv41/prompt2d.zig
+@@ -52,7 +52,7 @@ pub const Fan = struct {
+         if (rank == 0) {
+             for (1..world) |g| f.links[g - 1] = try Link.listen(ip, port + @as(u16, @intCast(g - 1)));
+         } else {
+-            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), 300);
++            f.links[0] = try Link.connect(io, ip, port + @as(u16, @intCast(rank - 1)), try @import("link.zig").connectSeconds());
+         }
+         return f;
+     }

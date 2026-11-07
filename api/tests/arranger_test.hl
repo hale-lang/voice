@@ -62,6 +62,38 @@ fn checked(store: st::Store, link: api::Link) {
     store.put_link_result(c.id, "flare", said) or discard;
 }
 
+/// What a node reports its store holds: every file variant `v` pins (its
+/// own, its file sets', a set's manifest), as downloads.hl reads them.
+fn holding(node: String, v: String) -> st::InventoryRow {
+    let mut out = st::InventoryRow { node: node, reported_at: api::now_seconds() };
+    out.blobs = blobs_of(std::json::find_field_raw(v, "files"));
+    let mut set = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
+    while !set.done {
+        out.blobs = out.blobs + blobs_of(std::json::find_field_raw(set.element, "files"));
+        let manifest = std::str::trim(std::json::find_field_raw(set.element, "manifest"));
+        if len(manifest) > 0 { out.blobs = out.blobs + blobs_of("[" + manifest + "]"); }
+        set = std::json::array_next(set);
+    }
+    return out;
+}
+
+fn blobs_of(files: String) -> String {
+    let mut out = "";
+    let mut f = std::json::array_first(files);
+    while !f.done {
+        out = out + std::json::find_string_field(f.element, "sha256") + " "
+            + to_string(std::json::find_int_field(f.element, "bytes")) + "\n";
+        f = std::json::array_next(f);
+    }
+    return out;
+}
+
+/// Variant `id` of shipped recipe `recipe`, as JSON.
+fn shipped_variant(recipe: String, id: String) -> String {
+    let file = std::io::fs::read_file(shipped("recipes") + "/" + recipe + ".json") or "";
+    return api::variant_body_of(std::str::trim(std::json::find_field_raw(file, "variants")), id);
+}
+
 fn pin(model: String, n: Int) -> api::ArrangementPin {
     return api::ArrangementPin { model: model, count: n };
 }
@@ -248,16 +280,36 @@ fn main() {
     let p0 = at(plain.add, 0) or api::PlanAdd { };
     std::test::assert_eq_str(nodes_of(p0.nodes), "flare", "with nothing held, the first node");
     std::test::assert(p0.download_bytes > 0, "which fetches it");
-    push(
-        f.holdings.items,
-        api::NodeHolding { node: "spark3", recipe: p0.recipe, variant: p0.variant },
-    ) or discard;
-    let held = api::plan_fleet(f, small, read.roles);
+    // spark3 reports its store holds that variant whole
+    store.put_inventory(holding("spark3", shipped_variant(p0.recipe, p0.variant))) or discard;
+    let mut g2 = placements.arrangement_fleet_in_gate(small) or api::ArrangeFleet { };
+    g2.placed = api::ArrangePlacedList { };
+    let held = api::plan_fleet(g2, small, read.roles);
     let p1 = at(held.add, 0) or api::PlanAdd { };
     std::test::assert(
         nodes_of(p1.nodes) == "spark3" && p1.download_bytes == 0
             && std::str::contains(p1.reason, "already on disk"),
         "the node that holds it: " + api::plan_text(held),
+    );
+
+    // ---- across a pair, held whole on each to be on disk ----------------
+    let mut ds_only = api::ArrangementWants { };
+    push(ds_only.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
+    let exl3 = shipped_variant("deepseek-v4.1-flash-1017", "exl3-2.5bpw");
+    store.put_inventory(holding("flare", exl3)) or discard;
+    let half = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
+    let h0 = at(half.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        h0.download_bytes == api::fetched_bytes(exl3)
+            && !std::str::contains(h0.reason, "already on disk"),
+        "held on flare alone: spark fetches its part: " + api::plan_text(half),
+    );
+    store.put_inventory(holding("spark", exl3)) or discard;
+    let both = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
+    let h1 = at(both.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        h1.download_bytes == 0 && std::str::contains(h1.reason, "already on disk"),
+        "held whole on both: " + api::plan_text(both),
     );
 
     // ---- refusals ----------------------------------------------------------
@@ -293,5 +345,56 @@ fn main() {
         count(alone.unmet) == 1 && std::str::contains(u.reason, "spark3")
             && std::str::contains(u.reason, "no runtime"),
         "DeepSeek alone on spark3 does not fit: " + u.reason,
+    );
+
+    // ---- a pin naming a catalog model is filled by that model -------------
+    // `tiny` (qwen3-0.6b) is placed on spark3; `wanted` is another catalog
+    // model of the same recipe, which requests are routed to by its id
+    api::Catalog { store: store, recipes: recipes }.create(
+        api::CatalogModelCreate { id: "wanted", has_recipe: true, recipe: "qwen3-0.6b" },
+    ) or discard;
+    let mut exact = api::ArrangementWants { };
+    let mut ep = pin("wanted", 0);
+    push(ep.nodes, "spark3") or discard;
+    push(exact.pins, ep) or discard;
+    let named = placements.plan_arrangement(exact) or api::ArrangementPlan { };
+    let na = at(named.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        count(named.add) == 1 && na.model == "wanted" && count(named.keep) == 0,
+        "not the other model of its recipe: " + api::plan_text(named),
+    );
+    // a role is filled by any model of its candidate recipe: the one placed
+    let mut by_role = api::ArrangementWants { };
+    push(by_role.roles, role("small", 0)) or discard;
+    let kept_tiny = placements.plan_arrangement(by_role) or api::ArrangementPlan { };
+    let ka = at(kept_tiny.aliases, 0) or api::PlanAlias { };
+    std::test::assert(
+        count(kept_tiny.keep) == 1 && ka.model == "tiny",
+        "kept, its alias at the model placed: " + api::plan_text(kept_tiny),
+    );
+
+    // ---- what the slots before it put on a disk is counted ---------------
+    // a Spark with a gigabyte of disk: qwen3-0.6b's GGUF (639 MB) fits, and
+    // then granite-4.0-350m's (378 MB) does not
+    let small_disk = std::str::replace(
+        spark(""),
+        "\"disk_free_bytes\": 3500000000000",
+        "\"disk_free_bytes\": 1000000000",
+    );
+    add_node(store, "sliver", small_disk);
+    let mut two = api::ArrangementWants { };
+    let mut a1 = pin("qwen3-0.6b", 0);
+    push(a1.nodes, "sliver") or discard;
+    let mut a2 = pin("granite-4.0-350m", 0);
+    push(a2.nodes, "sliver") or discard;
+    push(two.pins, a1) or discard;
+    push(two.pins, a2) or discard;
+    let tight = placements.plan_arrangement(two) or api::ArrangementPlan { };
+    let tu = at(tight.unmet, 0) or api::PlanUnmet { };
+    std::test::assert(
+        count(tight.add) == 1 && count(tight.unmet) == 1
+            && std::str::contains(tu.want, "granite-4.0-350m")
+            && std::str::contains(tu.reason, "needs"),
+        "the second does not fit the disk the first took: " + api::plan_text(tight),
     );
 }

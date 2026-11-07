@@ -186,11 +186,11 @@ client can pace itself instead of discovering the wall by failing.
 - [placements](#tag-placements) (4)
 - [arrangements](#tag-arrangements) (8)
 - [accounts](#tag-accounts) (5)
-- [nodes](#tag-nodes) (13)
+- [nodes](#tag-nodes) (14)
 - [changes](#tag-changes) (2)
 - [events](#tag-events) (1)
 - [routes](#tag-routes) (2)
-- [node](#tag-node) (9)
+- [node](#tag-node) (10)
 - [health](#tag-health) (2)
 - [annotations](#tag-annotations) (12)
 - [Schemas](#schemas)
@@ -2679,6 +2679,42 @@ Responses:
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+### GET `/admin/v1/nodes/{node}/downloads`
+
+**The models a node has on disk** · `listNodeDownloads`
+
+Authentication: operatorToken
+
+What the node holds of the models voice knows, from what it last
+reported its store holds (`reportInventory`): each variant of a
+recipe voice ships or the operator allows that has a file on the
+node, whole or in part, and whether a placement uses it there now;
+then the files no such variant lists. A variant's files are those
+it pins: its own and its file sets' (a set pinned by a manifest
+counts the manifest; the files the manifest lists are not named in
+the recipe, so they are counted with the files no variant lists).
+What its prepare step makes is kept apart from the store, and is not
+counted. A node keeps a variant's
+files when its placement is removed, so placing a variant it holds
+whole again is a reload, not a download. A model placed across two
+nodes is held whole on each.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `node` | path | [NodeIdValue](#schema-nodeidvalue) | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | What the node holds, by variant. | `application/json` [NodeDownloads](#schema-nodedownloads) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 ### POST `/admin/v1/nodes/{node}/links/{peer}/check`
 
 **Check the link between two nodes** · `checkNodeLink`
@@ -2900,7 +2936,7 @@ a topic's `seq` is events it missed, and a client that sees one reads
 again what that topic covers. So does a client that (re)connects.
 
 - `NodeObserved`: a node made a report (`register`, `heartbeat`,
-  `seats`, `capabilities`, `local`) to this api instance and it was
+  `seats`, `capabilities`, `local`, `inventory`) to this api instance and it was
   recorded. `payload` is `{node, report, at, body}`; `body` is the
   node as `GET /admin/v1/nodes` lists it (`NodeSummary`, its seats
   without their configs), as a JSON string.
@@ -3081,6 +3117,36 @@ Schema: [schemas-Capabilities](#schema-schemas-capabilities)
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
 | `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 204 | Received. |  |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The node is revoked: its token is known but no longer admits it. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PUT `/node/v1/inventory`
+
+**What the node's store holds** · `reportInventory`
+
+Authentication: enrollmentToken
+
+The files the node holds whole, replacing what it reported before.
+Sent once it registers and whenever what it holds changes. Refused
+when a file is listed twice or out of order.
+
+Request body
+
+`application/json`
+
+Schema: [Inventory](#schema-inventory)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `blobs` | array of [InventoryBlob](#schema-inventoryblob) | yes | Sorted by `sha256`, each file once. | items ≤ 4096 |
 
 Responses:
 
@@ -4814,7 +4880,60 @@ Type: object
 | `runtime` | string |  | The runtime that would serve it. |  |
 | `tier_gb` | integer |  | The tier whose pick it is, which is the node's own or one below it. |  |
 | `placed` | string |  | The placement already serving the recipe on this node, when there is one. |  |
+| `downloaded` | boolean |  | True when the variant's files are all on the node already (on both, across a pair: each holds the whole variant), so placing it is a reload, not a download (`listNodeDownloads`). |  |
 | `reason` | string | yes | Why it fits (as a placement's fit says), that it is placed, or why there is no suggestion. |  |
+
+<a id="schema-nodedownloads"></a>
+
+### NodeDownloads
+
+What a node holds of the models voice knows, by recipe variant.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `node` | string | yes |  |  |
+| `reported_at` | string \| null (date-time) |  | When the node last reported what it holds; null until it does, and then it holds nothing here. |  |
+| `files` | integer | yes | The files its store holds whole. | ≥ 0 |
+| `bytes` | integer | yes | Their size together. | ≥ 0 |
+| `data` | array of [NodeDownload](#schema-nodedownload) | yes | Each variant with a file on the node: those it holds whole first, then those it holds in part, each in the order `listRecipes` lists their recipes. At most 64. | items ≤ 64 |
+| `other_files` | integer | yes | The files it holds that no variant lists, e.g. a runtime's archive or a withdrawn recipe's weights. | ≥ 0 |
+| `other_bytes` | integer | yes | Their size together. | ≥ 0 |
+
+<a id="schema-nodedownload"></a>
+
+### NodeDownload
+
+One recipe variant, as much of it as the node holds.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `recipe` | string | yes |  |  |
+| `variant` | string | yes |  |  |
+| `bytes` | integer | yes | The variant's files together. | ≥ 0 |
+| `complete` | boolean | yes | True when the node holds every one of its files. |  |
+| `files_held` | integer | yes |  | ≥ 0 |
+| `files_total` | integer | yes |  | ≥ 1 |
+| `bytes_held` | integer | yes | What it holds of them. | ≥ 0 |
+| `placed` | string \| null |  | The placement that uses it on this node now, when one does. |  |
+
+<a id="schema-nodedownloaded"></a>
+
+### NodeDownloaded
+
+What a node's store holds, in short (`listNodeDownloads` has it by
+recipe variant): how many files it holds whole and their size
+together, as it last reported.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `files` | integer | yes | The files its store holds whole. | ≥ 0 |
+| `bytes` | integer | yes | Their size together. | ≥ 0 |
 
 <a id="schema-placement"></a>
 
@@ -5549,6 +5668,7 @@ Type: object
 | `assignment_version` | integer |  | The latest assignment for this node. |  |
 | `applied_version` | integer \| null |  | The assignment the node last reported applying. |  |
 | `seats` | array of [SeatSummary](#schema-seatsummary) | yes |  | items ≤ 16 |
+| `downloaded` | [NodeDownloaded](#schema-nodedownloaded) \| null |  | The models it has on disk, in short; null until it reports what its store holds. |  |
 | `connected_at` | string \| null (date-time) |  |  |  |
 | `last_heartbeat_at` | string \| null (date-time) |  |  |  |
 | `created_at` | string (date-time) | yes |  |  |
@@ -7514,6 +7634,34 @@ Type: object
 |---|---|---|---|---|
 | `assignment_version` | integer | yes | The assignment these states answer. |  |
 | `seats` | array of [SeatState](#schema-seatstate) | yes |  | items ≤ 16 |
+
+<a id="schema-inventoryblob"></a>
+
+### InventoryBlob
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `sha256` | string | yes |  | pattern `^[0-9a-f]{64}$` |
+| `bytes` | integer | yes |  | ≥ 0 |
+
+<a id="schema-inventory"></a>
+
+### Inventory
+
+The files the node's store holds whole (its data directory's
+`blobs/<sha256>`, each kept only once it verified): what it has on
+disk of the models it was placed, and the runtimes' archives. A
+file being fetched is not one of them until it verified. At most
+4096, about 300 KiB; a node that holds more reports the first 4096
+by sha256, and says so in its log.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `blobs` | array of [InventoryBlob](#schema-inventoryblob) | yes | Sorted by `sha256`, each file once. | items ≤ 4096 |
 
 <a id="schema-quotareport"></a>
 

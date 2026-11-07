@@ -1084,7 +1084,27 @@ update node set assignment_version = assignment_version + 1 where id in (select 
 update seat set config = jsonb_set(config, '{variant,tool_call_parser}', to_jsonb(m.parser)) from (values ('deepseek-ai/DeepSeek-V4-Flash-0731', '7872f01b1d1fe23eabc4c98b48bffcef5a386062', 'deepseek_v4'), ('zai-org/GLM-4.7-Flash', '7dd20894a642a0aa287e9827cb1a1f7f91386b67', 'glm47'), ('openai/gpt-oss-120b', 'b5c939de8f754692c1647ca79fbf85e8c1e70f8a', 'openai'), ('openai/gpt-oss-20b', '6cee5e81ee83917806bbde320786a8fb61efebee', 'openai'), ('ibm-granite/granite-4.0-350m', 'bd8a1497065c0d6ba1ef19af6b0d2b14bacf71c2', 'granite4'), ('Qwen/Qwen3-0.6B', 'c1899de289a04d12100db370d81485cdf75e47ca', 'hermes'), ('Qwen/Qwen3-Coder-30B-A3B-Instruct', 'b2cff646eb4bb1d68355c01b18ae02e7cf42d120', 'qwen3_coder'), ('Qwen/Qwen3-Coder-Next', 'a7fbcb5c0e12d62a448eaa0e260346bf5dcc0feb', 'qwen3_coder')) as m(repo, revision, parser) where seat.config->'variant'->>'format' = 'safetensors' and seat.config->'variant'->'source'->>'repo' = m.repo and seat.config->'variant'->'source'->>'revision' = m.revision and seat.config->'variant'->'tool_call_parser' is null;
 ```
 
-### Migration 30: arrangements
+### Migration 30: what a node holds
+
+A node reports the files its store holds whole (`Inventory`), once it
+registers and whenever that changes: the fleet as reported, so it records
+no change. The api reads it against the recipes to tell which models a node
+has on disk (`listNodeDownloads`). It is kept as the node last sent it, one
+file a line, `<sha256> <bytes>`, in the order of their sha256; at most 4096
+lines, about 300 KiB. How many and their size together are kept beside it,
+for a node's summary, which is read with every report it makes.
+
+```sql
+create table node_inventory (
+  node        text primary key references node,
+  blobs       text not null,          -- "<sha256> <bytes>" a file, a line, by sha256
+  files       integer not null,       -- how many lines
+  bytes       bigint not null,        -- their sizes together
+  reported_at timestamptz not null
+);
+```
+
+### Migration 31: arrangements
 
 What the operator wants the whole fleet for (`ArrangementWants`: pins and
 roles), kept under an id (`putArrangement`) to be planned again on demand

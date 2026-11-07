@@ -1,0 +1,65 @@
+// What the node's store holds (protocol.yaml `Inventory`): the files kept
+// whole in the data directory's content-addressed store, `blobs/<sha256>`
+// (fetch.hl), each by its sha256 and size. A file being fetched (its
+// `.part`, its `.ranges` sidecar) is not one of them until it verified.
+// The plane reports it once the node registers and again whenever the
+// fetcher keeps a file (`BlobKept`), never with a heartbeat; the
+// coordinator reads it against the recipes to tell which models the node
+// has on disk (api/downloads.hl). A file a placement no longer uses stays
+// in the store, so placing it again is a reload, not a download.
+
+/// The fetcher kept a file in the store: its sha256.
+type KeptBlob { sha: String = ""; }
+
+topic BlobKept { payload: KeptBlob; }
+
+/// The most files the node reports: about 300 KiB. A node that holds more
+/// reports the first of them by sha256, and says so in its log.
+const INVENTORY_MAX: Int = 4096;
+
+/// A store's lines, `<sha256> <bytes>`, to sort.
+@form(vec)
+locus InventoryLines { capacity { heap items of String; } }
+
+/// What the store at `blobs` holds whole: `Inventory` JSON, the files by
+/// sha256, at most `max`. A missing store holds nothing.
+@unbounded
+fn inventory_body(blobs: String, max: Int) -> String {
+    let lines = InventoryLines { };
+    let n = std::io::fs::list_dir_count(blobs) or 0;
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(blobs, i) or "";
+        i = i + 1;
+        // a file kept whole is named for its sha256 alone
+        if !hex(name, 64) { continue; }
+        let size = std::io::fs::file_size(blobs + "/" + name) or - 1;
+        if size < 0 { continue; }
+        lines.push(name + " " + to_string(size));
+    }
+    lines.sort();
+    let total = lines.len();
+    if total > max {
+        log_warn(
+            "the store holds more files than the node reports: the first by sha256 are",
+            fields2(
+                std::log::kv("held", to_string(total)),
+                std::log::kv("reported", to_string(max)),
+            ),
+        );
+    }
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    out.append_str("{\"blobs\": [");
+    let mut k = 0;
+    while k < total && k < max {
+        let line = lines.get(k) or "";
+        if k > 0 { out.append_str(", "); }
+        out.append_str(
+            "{\"sha256\": \"" + line[0..64] + "\", \"bytes\": " + line[65..len(line)] + "}",
+        );
+        k = k + 1;
+    }
+    out.append_str("]}");
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}

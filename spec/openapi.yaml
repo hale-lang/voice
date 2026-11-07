@@ -3028,6 +3028,45 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/nodes/{node}/downloads:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      tags: [nodes]
+      operationId: listNodeDownloads
+      summary: The models a node has on disk
+      description: |
+        What the node holds of the models voice knows, from what it last
+        reported its store holds (`reportInventory`): each variant of a
+        recipe voice ships or the operator allows that has a file on the
+        node, whole or in part, and whether a placement uses it there now;
+        then the files no such variant lists. A variant's files are those
+        it pins: its own and its file sets' (a set pinned by a manifest
+        counts the manifest; the files the manifest lists are not named in
+        the recipe, so they are counted with the files no variant lists).
+        What its prepare step makes is kept apart from the store, and is not
+        counted. A node keeps a variant's
+        files when its placement is removed, so placing a variant it holds
+        whole again is a reload, not a download. A model placed across two
+        nodes is held whole on each.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: What the node holds, by variant.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeDownloads'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/AdminNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/arrangement-roles:
     get:
       tags: [arrangements]
@@ -3503,7 +3542,7 @@ paths:
         again what that topic covers. So does a client that (re)connects.
 
         - `NodeObserved`: a node made a report (`register`, `heartbeat`,
-          `seats`, `capabilities`, `local`) to this api instance and it was
+          `seats`, `capabilities`, `local`, `inventory`) to this api instance and it was
           recorded. `payload` is `{node, report, at, body}`; `body` is the
           node as `GET /admin/v1/nodes` lists it (`NodeSummary`, its seats
           without their configs), as a JSON string.
@@ -3676,6 +3715,35 @@ paths:
           application/json:
             schema:
               $ref: './protocol.yaml#/components/schemas/Capabilities'
+      responses:
+        '204':
+          description: Received.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NodeRevoked'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /node/v1/inventory:
+    put:
+      tags: [node]
+      operationId: reportInventory
+      summary: What the node's store holds
+      description: |
+        The files the node holds whole, replacing what it reported before.
+        Sent once it registers and whenever what it holds changes. Refused
+        when a file is listed twice or out of order.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './protocol.yaml#/components/schemas/Inventory'
       responses:
         '204':
           description: Received.
@@ -6462,9 +6530,92 @@ components:
         placed:
           type: string
           description: The placement already serving the recipe on this node, when there is one.
+        downloaded:
+          type: boolean
+          description: |
+            True when the variant's files are all on the node already (on
+            both, across a pair: each holds the whole variant), so placing
+            it is a reload, not a download (`listNodeDownloads`).
         reason:
           type: string
           description: Why it fits (as a placement's fit says), that it is placed, or why there is no suggestion.
+
+    NodeDownloads:
+      type: object
+      description: What a node holds of the models voice knows, by recipe variant.
+      required: [node, files, bytes, data, other_files, other_bytes]
+      properties:
+        node: { type: string }
+        reported_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the node last reported what it holds; null until it does, and then it holds nothing here.
+        files:
+          type: integer
+          minimum: 0
+          description: The files its store holds whole.
+        bytes:
+          type: integer
+          minimum: 0
+          description: Their size together.
+        data:
+          type: array
+          maxItems: 64
+          description: |
+            Each variant with a file on the node: those it holds whole
+            first, then those it holds in part, each in the order
+            `listRecipes` lists their recipes. At most 64.
+          items:
+            $ref: '#/components/schemas/NodeDownload'
+        other_files:
+          type: integer
+          minimum: 0
+          description: The files it holds that no variant lists, e.g. a runtime's archive or a withdrawn recipe's weights.
+        other_bytes:
+          type: integer
+          minimum: 0
+          description: Their size together.
+
+    NodeDownload:
+      type: object
+      description: One recipe variant, as much of it as the node holds.
+      required: [recipe, variant, bytes, complete, files_held, files_total, bytes_held]
+      properties:
+        recipe: { type: string }
+        variant: { type: string }
+        bytes:
+          type: integer
+          minimum: 0
+          description: The variant's files together.
+        complete:
+          type: boolean
+          description: True when the node holds every one of its files.
+        files_held: { type: integer, minimum: 0 }
+        files_total: { type: integer, minimum: 1 }
+        bytes_held:
+          type: integer
+          minimum: 0
+          description: What it holds of them.
+        placed:
+          type: [string, 'null']
+          description: The placement that uses it on this node now, when one does.
+
+    NodeDownloaded:
+      type: object
+      description: |
+        What a node's store holds, in short (`listNodeDownloads` has it by
+        recipe variant): how many files it holds whole and their size
+        together, as it last reported.
+      required: [files, bytes]
+      properties:
+        files:
+          type: integer
+          minimum: 0
+          description: The files its store holds whole.
+        bytes:
+          type: integer
+          minimum: 0
+          description: Their size together.
 
     Placement:
       allOf:
@@ -7378,6 +7529,11 @@ components:
           maxItems: 16
           items:
             $ref: '#/components/schemas/SeatSummary'
+        downloaded:
+          description: The models it has on disk, in short; null until it reports what its store holds.
+          oneOf:
+            - $ref: '#/components/schemas/NodeDownloaded'
+            - type: 'null'
         connected_at: { type: [string, 'null'], format: date-time }
         last_heartbeat_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }

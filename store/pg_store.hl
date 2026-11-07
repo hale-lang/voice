@@ -1719,7 +1719,7 @@ locus PgStore {
 
     fn inventory(node: String) -> InventoryRow fallible(StoreError) {
         self.lock.enter();
-        let taken = self.inventory_locked(node) or {
+        let taken = self.inventory_locked(node, true) or {
             self.lock.leave();
             fail err;
         };
@@ -1727,17 +1727,34 @@ locus PgStore {
         return taken;
     }
 
-    fn inventory_locked(node: String) -> InventoryRow fallible(StoreError) {
+    fn inventory_summary(node: String) -> InventoryRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.inventory_locked(node, false) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    /// The node's row, with its `blobs` when `whole`.
+    fn inventory_locked(node: String, whole: Bool) -> InventoryRow fallible(StoreError) {
         let a = db::Args { };
         a.add(node);
         let j = self.row(
-            "SELECT row_to_json(t) FROM (SELECT node, blobs, reported_at FROM node_inventory WHERE node = $1) t",
+            if whole {
+                "SELECT row_to_json(t) FROM (SELECT node, blobs, files, bytes, reported_at FROM node_inventory WHERE node = $1) t"
+            } else {
+                "SELECT row_to_json(t) FROM (SELECT node, files, bytes, reported_at FROM node_inventory WHERE node = $1) t"
+            },
             a,
         ) or raise;
         if len(j) == 0 { return InventoryRow { }; }
         return InventoryRow {
             node: pg_text(j, "node"),
-            blobs: pg_text(j, "blobs"),
+            blobs: if whole { pg_text(j, "blobs") } else { "" },
+            files: std::json::find_int_field(j, "files"),
+            bytes: std::json::find_int_field(j, "bytes"),
             reported_at: pg_time(pg_text(j, "reported_at")),
             present: true
         };
@@ -1756,9 +1773,11 @@ locus PgStore {
         let a = db::Args { };
         a.add(row.node);
         a.add(row.blobs);
+        a.add(to_string(row.files));
+        a.add(to_string(row.bytes));
         a.add(std::time::iso8601(row.reported_at));
         self.write(
-            "INSERT INTO node_inventory (node, blobs, reported_at) VALUES ($1, $2, $3::timestamptz) ON CONFLICT (node) DO UPDATE SET blobs = excluded.blobs, reported_at = excluded.reported_at",
+            "INSERT INTO node_inventory (node, blobs, files, bytes, reported_at) VALUES ($1, $2, $3::integer, $4::bigint, $5::timestamptz) ON CONFLICT (node) DO UPDATE SET blobs = excluded.blobs, files = excluded.files, bytes = excluded.bytes, reported_at = excluded.reported_at",
             a,
         ) or raise;
     }

@@ -67,6 +67,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
             { key: 'seats', header: 'Seats', num: true, render: (n) => n.seats.length },
             { key: 'cap', header: 'In flight / cap', num: true, render: (n) => `${n.in_flight ?? 0} / ${n.effective_max_in_flight ?? '–'}` },
             { key: 'assign', header: 'Assignment', num: true, render: (n) => <AssignmentCell node={n} /> },
+            { key: 'disk', header: 'On disk', num: true, render: (n) => <OnDiskCell node={n} /> },
             { key: 'hb', header: 'Heartbeat', render: (n) => <Heartbeat at={n.last_heartbeat_at} /> },
           ]}
           empty="No nodes. Create one to get its enrollment token."
@@ -113,6 +114,13 @@ function AssignmentCell({ node }: { node: NodeSummary }) {
       {node.applied_version == null ? <span className="faint"> (not applied)</span> : behind ? ` (applied v${node.applied_version})` : ''}
     </span>
   );
+}
+
+/** What the node's store holds, in short: its size, with how many files. */
+function OnDiskCell({ node }: { node: NodeSummary }) {
+  const d = node.downloaded;
+  if (!d) return <span className="faint" title="the node has not reported what its store holds">–</span>;
+  return <span title={`${d.files} files held whole`}>{bytes(d.bytes)}</span>;
 }
 
 function Seats({ node, selected, fresh }: { node: NodeSummary; selected?: string; fresh: string }) {
@@ -336,6 +344,7 @@ function NodeInspector({ node }: { node: Node }) {
       <Hardware node={node} />
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Links</h3>
       <Links node={node} />
+      <OnThisMachine node={node} />
       {node.status !== 'revoked' && <Suggested node={node} />}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
       {local ? (
@@ -364,6 +373,61 @@ function NodeInspector({ node }: { node: Node }) {
         <a href={href('nodes')}>all nodes</a>
       </p>
     </>
+  );
+}
+
+type Download = Schemas['NodeDownload'];
+
+/**
+ * The models on the machine's disk (`listNodeDownloads`): each recipe
+ * variant it holds whole, its size and the placement that uses it here
+ * now; one it holds in part, with how much; and what no variant lists.
+ * A placement removed leaves its files, so placing a variant held whole
+ * again is a reload, not a download.
+ */
+function OnThisMachine({ node }: { node: Node }) {
+  const q = useGet('/admin/v1/nodes/{node}/downloads', { params: { path: { node: node.id } } });
+  const d = q.data;
+  return (
+    <>
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>
+        On this machine
+        {d?.reported_at && <span className="faint" style={{ fontWeight: 400 }}> · {bytes(d.bytes)} in {d.files} files · reported {ago(d.reported_at)} ago</span>}
+      </h3>
+      {q.isPending ? (
+        <Loading what="downloads" />
+      ) : q.isError ? (
+        <Unavailable what="Downloads" detail={q.error.message} />
+      ) : !q.data.reported_at ? (
+        <span className="faint">not reported yet: the node has not said what its store holds</span>
+      ) : (
+        <Kv
+          rows={[
+            ...q.data.data.map((v) => ({ k: v.recipe, v: <DownloadRow v={v} /> })),
+            ...(q.data.data.length === 0 ? [{ k: 'models', v: <span className="faint">none: no variant of a recipe voice knows has a file here</span> }] : []),
+            ...(q.data.other_files > 0
+              ? [{ k: 'other', v: <>{bytes(q.data.other_bytes)} <span className="muted">· {q.data.other_files} files no recipe lists: a runtime, or a withdrawn recipe's weights</span></> }]
+              : []),
+          ]}
+        />
+      )}
+    </>
+  );
+}
+
+/** One variant on disk: whole with its size, or how far along. */
+function DownloadRow({ v }: { v: Download }) {
+  const pct = v.bytes > 0 ? Math.floor((100 * v.bytes_held) / v.bytes) : 0;
+  return (
+    <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
+      <span className="muted">{v.variant}</span>
+      {v.complete ? (
+        <Status tone="ok" label={`downloaded · ${bytes(v.bytes)}`} />
+      ) : (
+        <Status tone="wait" label={`partial ${pct}% · ${v.files_held} of ${v.files_total} files · ${bytes(v.bytes_held)} of ${bytes(v.bytes)}`} />
+      )}
+      {v.placed ? <a href={href('placements', v.placed)}>placed as {v.placed}</a> : <span className="faint">not placed here</span>}
+    </div>
   );
 }
 
@@ -451,6 +515,11 @@ function Suggested({ node }: { node: Node }) {
   );
 }
 
+/** Why a suggestion says downloaded: placing it is a reload. */
+function downloadedNote(s: Suggestion): string {
+  return `${s.recipe} ${s.variant ?? ''} is on disk already: placing it loads it, with nothing to download`;
+}
+
 /** One category's suggestion, with a button to place it. */
 function suggestionRow(s: Suggestion, place: () => void, disabled: boolean) {
   return {
@@ -459,6 +528,7 @@ function suggestionRow(s: Suggestion, place: () => void, disabled: boolean) {
       <div style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
         <Mono>{s.recipe}</Mono>
         {s.variant && <span className="muted">{s.variant}</span>}
+        {s.downloaded && <Status tone="ok" label="downloaded" title={downloadedNote(s)} />}
         {s.placed ? (
           <a href={href('placements', s.placed)}>placed as {s.placed}</a>
         ) : (

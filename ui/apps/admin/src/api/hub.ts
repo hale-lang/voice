@@ -102,18 +102,36 @@ export function useInstances(): Instance[] {
  * node whole, a seat whole) are read again.
  */
 function observed(qc: QueryClient, node: NodeSummary) {
+  let before: NodeSummary | undefined;
   qc.setQueryData<{ data: NodeSummary[] }>(['/admin/v1/nodes', ALL_PAGES], (old) => {
     if (!old) return old;
     const at = old.data.findIndex((n) => n.id === node.id);
+    before = at < 0 ? undefined : old.data[at];
     const data = at < 0 ? [...old.data, node] : old.data.map((n, i) => (i === at ? node : n));
     return { ...old, data };
   });
+  // what its store holds, read again only when that or its seats changed:
+  // its own downloads, and every node's suggestions, since a pair's is
+  // read on both nodes' stores
+  const stored = !before || storeOf(before) !== storeOf(node) || seatsOf(before) !== seatsOf(node);
   void qc.invalidateQueries({
     predicate: (q) => {
       const [path, init] = q.queryKey as [unknown, { params?: { path?: { node?: string } } } | null | undefined];
-      return (path === '/admin/v1/nodes/{node}' || path === '/admin/v1/nodes/{node}/seats/{seat}') && init?.params?.path?.node === node.id;
+      if (stored && path === '/admin/v1/nodes/{node}/suggestions') return true;
+      const mine = init?.params?.path?.node === node.id;
+      return mine && (path === '/admin/v1/nodes/{node}' || path === '/admin/v1/nodes/{node}/seats/{seat}' || (stored && path === '/admin/v1/nodes/{node}/downloads'));
     },
   });
+}
+
+/** A node's store, in short, to tell a change. */
+function storeOf(n: NodeSummary): string {
+  return n.downloaded ? `${n.downloaded.files}/${n.downloaded.bytes}` : '';
+}
+
+/** A node's seats, by id, to tell one placed or removed. */
+function seatsOf(n: NodeSummary): string {
+  return n.seats.map((s) => s.id).join(',');
 }
 
 /**

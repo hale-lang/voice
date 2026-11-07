@@ -1091,12 +1091,15 @@ registers and whenever that changes: the fleet as reported, so it records
 no change. The api reads it against the recipes to tell which models a node
 has on disk (`listNodeDownloads`). It is kept as the node last sent it, one
 file a line, `<sha256> <bytes>`, in the order of their sha256; at most 4096
-lines, about 300 KiB.
+lines, about 300 KiB. How many and their size together are kept beside it,
+for a node's summary, which is read with every report it makes.
 
 ```sql
 create table node_inventory (
   node        text primary key references node,
   blobs       text not null,          -- "<sha256> <bytes>" a file, a line, by sha256
+  files       integer not null,       -- how many lines
+  bytes       bigint not null,        -- their sizes together
   reported_at timestamptz not null
 );
 ```

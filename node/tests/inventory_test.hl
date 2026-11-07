@@ -1,0 +1,70 @@
+// What the node reports its store holds (protocol.yaml `Inventory`): the
+// files kept whole, by sha256 and size, sorted; never a part being fetched,
+// its ranges' sidecar or a file not named for its sha256; at most the
+// bound, the first by sha256.
+import ".." as node;
+
+fn put(path: String, body: String) {
+    std::io::fs::write_file(path, body) or discard;
+}
+
+fn entry(sha: String, bytes: Int) -> String {
+    return "{\"sha256\": \"" + sha + "\", \"bytes\": " + to_string(bytes) + "}";
+}
+
+@unbounded
+fn main() {
+    let data = "/tmp/voice-inventory-test-" + to_string(std::process::pid());
+    let blobs = data + "/blobs";
+    std::test::assert_eq_str(
+        node::inventory_body(blobs, 4096),
+        "{\"blobs\": []}",
+        "a store not made yet holds nothing",
+    );
+    std::io::fs::mkdir(data) or discard;
+    std::io::fs::mkdir(blobs) or discard;
+    std::test::assert_eq_str(
+        node::inventory_body(blobs, 4096),
+        "{\"blobs\": []}",
+        "nor does an empty one",
+    );
+    // three kept, written out of their order
+    let a = std::str::repeat("0a", 32);
+    let b = std::str::repeat("5", 64);
+    let c = std::str::repeat("f0", 32);
+    put(blobs + "/" + c, "c");
+    put(blobs + "/" + a, "aaaa");
+    put(blobs + "/" + b, "");
+    // a fetch under way, its sidecar, and what is not the store's
+    let d = std::str::repeat("3", 64);
+    put(blobs + "/" + d + ".part", "dd");
+    put(blobs + "/" + d + ".ranges", "0 2\n");
+    put(blobs + "/" + std::str::repeat("A", 64), "e");
+    put(blobs + "/" + std::str::repeat("1", 63), "e");
+    put(blobs + "/notes.txt", "x");
+    std::test::assert_eq_str(
+        node::inventory_body(blobs, 4096),
+        "{\"blobs\": [" + entry(a, 4) + ", " + entry(b, 0) + ", " + entry(c, 1) + "]}",
+        "the files kept whole, by sha256, each with its size; no part, sidecar or other file",
+    );
+    std::test::assert_eq_str(
+        node::inventory_body(blobs, 2),
+        "{\"blobs\": [" + entry(a, 4) + ", " + entry(b, 0) + "]}",
+        "past the bound, the first by sha256",
+    );
+    // a part that verified is renamed into the store: told from then on
+    std::io::fs::rename(blobs + "/" + d + ".part", blobs + "/" + d) or discard;
+    std::io::fs::unlink(blobs + "/" + d + ".ranges") or discard;
+    std::test::assert_eq_str(
+        node::inventory_body(blobs, 4096),
+        "{\"blobs\": [" + entry(a, 4) + ", " + entry(d, 2) + ", " + entry(b, 0) + ", "
+            + entry(c, 1) + "]}",
+        "a file is held once it verified",
+    );
+    let n = std::io::fs::list_dir_count(blobs) or 0;
+    let mut k = n;
+    while k > 0 {
+        k = k - 1;
+        std::io::fs::unlink(blobs + "/" + (std::io::fs::list_dir_at(blobs, k) or "")) or discard;
+    }
+}

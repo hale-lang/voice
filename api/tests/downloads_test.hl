@@ -1,0 +1,187 @@
+// What a node has on disk, from what it reported its store holds, read
+// against the recipes: a variant held whole, and the placement that uses
+// it there now; one held in part, with how much; and the files no variant
+// lists. The report itself is checked: each file by its sha256, in order,
+// once.
+import ".." as api;
+import "../../store" as st;
+
+fn h(c: String) -> String {
+    return std::str::repeat(c, 64);
+}
+
+fn file(path: String, bytes: Int, sha: String) -> String {
+    return "{\"path\": \"" + path + "\", \"bytes\": " + to_string(bytes) + ", \"sha256\": \"" + sha
+        + "\"}";
+}
+
+/// Two recipes: `chat`'s two variants share a tokenizer; `coder`'s one is
+/// a single file.
+fn recipes() -> String {
+    return "[{\"id\": \"chat\", \"variants\": [{\"id\": \"gguf-q4\", \"files\": ["
+        + file("chat-q4.gguf", 4000, h("1")) + "]}, {\"id\": \"safetensors-bf16\", \"files\": ["
+        + file("tokenizer.json", 10, h("2")) + ", " + file("model-1.safetensors", 5000, h("3"))
+        + ", " + file("model-2.safetensors", 5000, h("4"))
+        + "]}, {\"id\": \"safetensors-fp8\", \"files\": [" + file("tokenizer.json", 10, h("2"))
+        + ", " + file("model.safetensors", 5000, h("5"))
+        + "]}]}, {\"id\": \"coder\", \"variants\": [{\"id\": \"gguf-q8\", \"files\": ["
+        + file("coder.gguf", 9000, h("6")) + "]}]}]";
+}
+
+fn placed(id: String, recipe: String, variant: String, leader: String) -> st::PlacementRow {
+    return st::PlacementRow {
+        id: id,
+        body: "{\"id\": \"" + id + "\", \"recipe\": \"" + recipe + "\", \"variant\": \"" + variant
+            + "\", \"nodes\": [\"" + leader + "\"], \"leader\": \"" + leader + "\"}",
+        present: true,
+    };
+}
+
+fn refused(body: String) -> String {
+    api::read_inventory(body) or { return err.message; };
+    return "";
+}
+
+fn main() {
+    // ---- the report ------------------------------------------------------
+    let ok = api::read_inventory(
+        "{\"blobs\": [{\"sha256\": \"" + h("1") + "\", \"bytes\": 4000}, {\"sha256\": \"" + h("a")
+            + "\", \"bytes\": 0}]}",
+    ) or api::InventoryText { };
+    std::test::assert_eq_str(
+        ok.blobs,
+        h("1") + " 4000\n" + h("a") + " 0\n",
+        "kept a file a line, in the order reported",
+    );
+    std::test::assert(ok.files == 2 && ok.bytes == 4000, "with how many and their size");
+    let empty = api::read_inventory("{\"blobs\": []}") or api::InventoryText { files: -1 };
+    std::test::assert(empty.files == 0 && len(empty.blobs) == 0, "an empty store is a report");
+    let two = "{\"sha256\": \"" + h("2") + "\", \"bytes\": 1}";
+    let one = "{\"sha256\": \"" + h("1") + "\", \"bytes\": 1}";
+    std::test::assert(
+        std::str::contains(refused("{\"blobs\": [" + two + ", " + one + "]}"), "out of order"),
+        "files out of order are refused",
+    );
+    std::test::assert(
+        std::str::contains(refused("{\"blobs\": [" + one + ", " + one + "]}"), "listed twice"),
+        "a file listed twice is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            refused("{\"blobs\": [{\"sha256\": \"" + h("A") + "\", \"bytes\": 1}]}"),
+            "64 lowercase hex digits",
+        ),
+        "a sha256 in capitals is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            refused("{\"blobs\": [{\"sha256\": \"" + h("1") + "\", \"bytes\": -1}]}"),
+            "0 or more",
+        ),
+        "a negative size is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            refused("{\"blobs\": [{\"sha256\": \"" + h("1") + "\", \"bytes\": 1.5}]}"),
+            "whole number",
+        ),
+        "a fraction of a byte is refused",
+    );
+    std::test::assert(len(refused("{\"files\": []}")) > 0, "a report without blobs is refused");
+
+    // ---- what it holds ---------------------------------------------------
+    // chat's bf16 whole, its fp8 in part (the tokenizer the two share),
+    // nothing of its q4 or of coder, and two files no variant lists
+    let inv = st::InventoryRow {
+        node: "spark",
+        blobs: h("2") + " 10\n" + h("3") + " 5000\n" + h("4") + " 5000\n" + h("b") + " 700\n"
+            + h("c")
+            + " 300\n",
+        files: 5,
+        bytes: 11010,
+        reported_at: `2026-11-07T00:00:00Z`,
+        present: true,
+    };
+    let mut rows = st::PlacementRows { };
+    push(rows.rows, placed("chat-on-spark", "chat", "safetensors-bf16", "spark")) or discard;
+    let mut gone = placed("old", "chat", "safetensors-fp8", "spark");
+    gone.removed = true;
+    push(rows.rows, gone) or discard;
+    let d = api::node_downloads("spark", inv, recipes(), rows);
+    std::test::assert(
+        d.node == "spark" && d.has_reported_at && d.files == 5 && d.bytes == 11010,
+        "the node's store, as it reported it",
+    );
+    std::test::assert_eq_int(count(d.data), 2, "two variants with a file on the node");
+    let whole = at(d.data, 0) or api::NodeDownload { };
+    std::test::assert(
+        whole.recipe == "chat" && whole.variant == "safetensors-bf16" && whole.complete
+            && whole.files_held == 3 && whole.files_total == 3 && whole.bytes == 10010
+            && whole.bytes_held == 10010,
+        "the variant held whole first",
+    );
+    std::test::assert(
+        whole.has_placed && whole.placed == "chat-on-spark",
+        "with the placement that uses it there now",
+    );
+    let part = at(d.data, 1) or api::NodeDownload { };
+    std::test::assert(
+        part.variant == "safetensors-fp8" && !part.complete && part.files_held == 1
+            && part.files_total == 2 && part.bytes_held == 10 && part.bytes == 5010,
+        "then the one held in part, with how much",
+    );
+    std::test::assert(!part.has_placed, "a placement removed uses it no more");
+    std::test::assert(
+        d.other_files == 2 && d.other_bytes == 1000,
+        "the files no variant lists, apart",
+    );
+
+    // placed on another node, it is not placed here
+    let mut elsewhere = st::PlacementRows { };
+    push(elsewhere.rows, placed("chat-on-flare", "chat", "safetensors-bf16", "flare"))
+    or discard;
+    let e = api::node_downloads("spark", inv, recipes(), elsewhere);
+    std::test::assert(
+        !(at(e.data, 0) or api::NodeDownload { }).has_placed,
+        "a placement on another node is not this node's",
+    );
+
+    // a node that never reported holds nothing known
+    let none = api::node_downloads("flare", st::InventoryRow { }, recipes(), rows);
+    std::test::assert(
+        !none.has_reported_at && count(none.data) == 0 && none.files == 0,
+        "nothing until the node reports",
+    );
+
+    // a recipe withdrawn: its files are the node's, and no variant's
+    let only_coder = "[{\"id\": \"coder\", \"variants\": [{\"id\": \"gguf-q8\", \"files\": ["
+        + file("coder.gguf", 9000, h("6")) + "]}]}]";
+    let w = api::node_downloads("spark", inv, only_coder, rows);
+    std::test::assert(
+        count(w.data) == 0 && w.other_files == 5 && w.other_bytes == 11010,
+        "what no recipe lists any more is other",
+    );
+
+    // the summary reads the totals alone
+    let s = api::node_downloaded_of(inv);
+    std::test::assert(s.files == 5 && s.bytes == 11010, "a node's summary: files and bytes");
+
+    // a variant held whole, for a suggestion
+    let held = api::HeldBlobs { };
+    api::hold_blobs(held, inv.blobs);
+    std::test::assert(
+        api::variant_whole(
+            "{\"files\": [" + file("a", 10, h("2")) + ", " + file("b", 5000, h("3")) + "]}",
+            held,
+        ),
+        "every file held: whole",
+    );
+    std::test::assert(
+        !api::variant_whole(
+            "{\"files\": [" + file("a", 10, h("2")) + ", " + file("b", 5000, h("5")) + "]}",
+            held,
+        ),
+        "one missing: not",
+    );
+    std::test::assert(!api::variant_whole("{}", held), "a variant that lists none is never whole");
+}

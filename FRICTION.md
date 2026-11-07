@@ -179,7 +179,7 @@ costs about a millisecond, against a request that waits for its seat.
 
 ## `draining` and `drain` cannot name a method
 
-**Status (2026-11-06):** `drain` FIXED in hale v0.24.0 (#1531): `drain`, `release`, `run`, `restart`, `publish` and the other framework words are contextual keywords and can name a method. `draining` is still every locus's drain flag, so it still cannot.
+**Status (2026-11-06):** STILL REAL on hale v0.32.7 (verified with `hale check`): a locus method cannot be named `drain`, `release` or `run` (those names are the lifecycle hooks) or `draining` (the drain flag every locus carries). What #1531 (hale v0.24.0) did change: `restart`, `publish`, `capacity` and the other framework words are contextual keywords and can name a method, a record field or a local; `restart` still cannot name a free fn (the recovery statement). The rename here stays.
 
 **hale 0.24.0.** The node plane's last report is `POST /node/v1/draining`,
 and its handler is naturally `NodePlane::draining`. `draining` is the drain

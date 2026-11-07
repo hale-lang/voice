@@ -1717,6 +1717,71 @@ locus PgStore {
         ) or raise;
     }
 
+    fn inventory(node: String) -> InventoryRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.inventory_locked(node, true) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn inventory_summary(node: String) -> InventoryRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.inventory_locked(node, false) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    /// The node's row, with its `blobs` when `whole`.
+    fn inventory_locked(node: String, whole: Bool) -> InventoryRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(node);
+        let j = self.row(
+            if whole {
+                "SELECT row_to_json(t) FROM (SELECT node, blobs, files, bytes, reported_at FROM node_inventory WHERE node = $1) t"
+            } else {
+                "SELECT row_to_json(t) FROM (SELECT node, files, bytes, reported_at FROM node_inventory WHERE node = $1) t"
+            },
+            a,
+        ) or raise;
+        if len(j) == 0 { return InventoryRow { }; }
+        return InventoryRow {
+            node: pg_text(j, "node"),
+            blobs: if whole { pg_text(j, "blobs") } else { "" },
+            files: std::json::find_int_field(j, "files"),
+            bytes: std::json::find_int_field(j, "bytes"),
+            reported_at: pg_time(pg_text(j, "reported_at")),
+            present: true
+        };
+    }
+
+    fn put_inventory(row: InventoryRow) fallible(StoreError) {
+        self.lock.enter();
+        self.put_inventory_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn put_inventory_locked(row: InventoryRow) fallible(StoreError) {
+        let a = db::Args { };
+        a.add(row.node);
+        a.add(row.blobs);
+        a.add(to_string(row.files));
+        a.add(to_string(row.bytes));
+        a.add(std::time::iso8601(row.reported_at));
+        self.write(
+            "INSERT INTO node_inventory (node, blobs, files, bytes, reported_at) VALUES ($1, $2, $3::integer, $4::bigint, $5::timestamptz) ON CONFLICT (node) DO UPDATE SET blobs = excluded.blobs, files = excluded.files, bytes = excluded.bytes, reported_at = excluded.reported_at",
+            a,
+        ) or raise;
+    }
+
     fn link_checks() -> LinkCheckRows fallible(StoreError) {
         self.lock.enter();
         let taken = self.link_checks_locked() or {

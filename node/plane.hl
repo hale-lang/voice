@@ -5,7 +5,8 @@
 /// controls, and hands what comes back to the session (`PlaneJoined`). It
 /// reports every seat state the session applies, heartbeats every interval
 /// with the version it applied, tells the coordinator when the local
-/// controls change, and reads the assignment whenever the session is on
+/// controls change and what the store holds once registered and when the
+/// fetcher keeps a file (inventory.hl), and reads the assignment whenever the session is on
 /// NATS again, since an `assign` sent while it was not is lost. When the
 /// coordinator stops taking its token (a rotation or a revocation), it
 /// registers again.
@@ -98,6 +99,12 @@ locus Plane {
         in_flight: Int = 0;
         // link checks' results to tell, one a line, each escaped (span.hl)
         checked: String = "";
+        // what the store holds, as the coordinator was last told
+        // (inventory.hl): told once registered, and again when it changes;
+        // one not told is told again with the next heartbeat
+        inventory: String = "";
+        inventory_due: Bool = false;
+        inventory_retry: Bool = false;
         // work the session asked for
         report_due: Bool = false;
         read_due: Bool = false;
@@ -111,6 +118,7 @@ locus Plane {
         subscribe NatsConnected as on_nats;
         subscribe LoadChanged as on_load;
         subscribe LinkCheckDone as on_checked;
+        subscribe BlobKept as on_kept;
         publish PlaneJoined;
         publish AssignmentRead;
         publish LocalApplied;
@@ -160,6 +168,10 @@ locus Plane {
             self.report_due = false;
             self.report_seats();
         }
+        if self.inventory_due {
+            self.inventory_due = false;
+            self.report_inventory();
+        }
         self.check_local();
         if len(self.checked) > 0 { self.report_checked(); }
         if std::time::monotonic_ns() >= self.next_beat { self.heartbeat(); }
@@ -188,6 +200,30 @@ locus Plane {
         if resp.status == 0 || resp.status >= 500 { return; }
         if resp.status == 401 || resp.status == 403 { self.registered = false; }
         self.checked = self.checked[(nl + 1)..len(self.checked)];
+    }
+
+    /// The fetcher kept a file: what the store holds is told next turn.
+    fn on_kept(k: KeptBlob) {
+        self.inventory_due = true;
+    }
+
+    /// `PUT /node/v1/inventory`: what the store holds, when the coordinator
+    /// was not told it yet; told again with the next heartbeat when the
+    /// api could not be reached or failed.
+    @unbounded
+    fn report_inventory() {
+        let body = inventory_body(self.data + "/blobs", INVENTORY_MAX);
+        if body == self.inventory { return; }
+        let resp = self.call("PUT", "/node/v1/inventory", body);
+        if resp.status == 401 || resp.status == 403 {
+            self.registered = false;
+            return;
+        }
+        if resp.status < 200 || resp.status >= 300 {
+            self.inventory_retry = true;
+            return;
+        }
+        self.inventory = body;
     }
 
     /// A request began or ended: the next heartbeat says so.
@@ -229,6 +265,9 @@ locus Plane {
         if self.interval_ms < 1000 { self.interval_ms = 5000; }
         self.local = local;
         self.registered = true;
+        // a coordinator registered with is told what the store holds
+        self.inventory = "";
+        self.inventory_due = true;
         self.next_beat = std::time::monotonic_ns() + self.interval_ms * 1000000;
         PlaneReport <- PlaneState { state: "registered", detail: "" };
         PlaneJoined <- joined_of(answer, local);
@@ -272,6 +311,10 @@ locus Plane {
     /// token is registered with again.
     fn heartbeat() {
         self.next_beat = std::time::monotonic_ns() + self.interval_ms * 1000000;
+        if self.inventory_retry {
+            self.inventory_retry = false;
+            self.inventory_due = true;
+        }
         let version = if self.applied >= 0 {
             ", \"assignment_version\": " + to_string(self.applied)
         } else {

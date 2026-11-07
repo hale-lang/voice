@@ -101,6 +101,43 @@ locus Placements {
         projects: Projects = Projects { store: self.store, gate: self.gate };
     }
 
+    /// `listNodeDownloads`: what node `r` has on disk of the models voice
+    /// knows, by variant (downloads.hl).
+    fn downloads(r: NodeRef) -> NodeDownloads fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.downloads_in_gate(r.node) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn downloads_in_gate(node: String) -> NodeDownloads fallible(CtlError) {
+        let n = self.store.node(node) or fail store_down(err);
+        if !n.present { fail missing("no node " + node); }
+        let inv = self.store.inventory(node) or fail store_down(err);
+        let rows = self.store.placements() or fail store_down(err);
+        let recipes = self.recipes.bodies_in_gate() or raise;
+        return node_downloads(node, inv, recipes, rows);
+    }
+
+    /// `s` with `downloaded` set when every node of `held` holds its
+    /// variant whole.
+    fn on_disk(
+        s: NodeSuggestion,
+        held: HeldBlobs,
+        peer: HeldBlobs,
+        pair: Bool
+    ) -> NodeSuggestion fallible(CtlError) {
+        if !s.has_recipe || !s.has_variant { return s; }
+        let recipe = self.recipes.get_in_gate(s.recipe) or { return s; };
+        let v = variant_body_of(recipe.variants.text, s.variant);
+        let mut out = s;
+        out.downloaded = variant_whole(v, held) && (!pair || variant_whole(v, peer));
+        return out;
+    }
+
     /// `suggestNodeModels`: for each category voice ships, the model it
     /// would place on node `r` (suggestions.hl).
     fn suggest(r: NodeRef) -> NodeSuggestions fallible(CtlError) {
@@ -118,6 +155,9 @@ locus Placements {
         if !n.present || n.revoked { fail missing("no node " + node); }
         let mut out = NodeSuggestions { node: node };
         let cats = pick_categories(self.picks);
+        // what its store holds, so a suggestion it holds whole says so
+        let blobs = HeldBlobs { };
+        hold_blobs(blobs, (self.store.inventory(node) or fail store_down(err)).blobs);
         let f = self.store.fleet(node) or fail store_down(err);
         let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
         let declared = len(hw) > 0 && std::json::valid_object(hw);
@@ -158,25 +198,40 @@ locus Placements {
             let nl = std::str::index_of(rest, "\n");
             let cat = rest[0..nl];
             rest = rest[(nl + 1)..len(rest)];
-            let mut s = NodeSuggestion { category: cat };
             if !declared {
-                s.reason = "node " + node
-                    + " has declared no hardware, so nothing can be judged to fit it";
-            } else {
-                s = self.suggest_one(
-                    cat,
-                    os,
-                    tier,
-                    0,
-                    judging_add(Judging { }, node, hw, held),
-                    usable,
-                    serving,
-                ) or raise;
+                push(
+                    out.data,
+                    NodeSuggestion {
+                        category: cat,
+                        reason: "node " + node
+                            + " has declared no hardware, so nothing can be judged to fit it",
+                    },
+                ) or discard;
+                continue;
             }
+            let judged = self.suggest_one(
+                cat,
+                os,
+                tier,
+                0,
+                judging_add(Judging { }, node, hw, held),
+                usable,
+                serving,
+            ) or raise;
+            let s = self.on_disk(judged, blobs, blobs, false) or raise;
             push(out.data, s) or discard;
         }
         if declared {
-            out = self.suggest_pair(out, node, f.capabilities, hw, held, usable, cats) or raise;
+            out = self.suggest_pair(
+                out,
+                node,
+                f.capabilities,
+                hw,
+                held,
+                usable,
+                cats,
+                blobs,
+            ) or raise;
         }
         return out;
     }
@@ -186,7 +241,10 @@ locus Placements {
     /// the link, of the same platform and accelerators, the link's latest
     /// check passed), a model per category: the picks of the pair's tier
     /// (their memory together) above the node's own, judged on the two as
-    /// a placement across them is, by a runtime that spans nodes.
+    /// a placement across them is, by a runtime that spans nodes. Each
+    /// peer tried has its store read; the first that could take a model
+    /// ends the loop.
+    @unbounded
     fn suggest_pair(
         out: NodeSuggestions,
         node: String,
@@ -194,7 +252,8 @@ locus Placements {
         hw: String,
         held: Int,
         usable: RuntimeList,
-        cats: String
+        cats: String,
+        blobs: HeldBlobs
     ) -> NodeSuggestions fallible(CtlError) {
         let mut next = out;
         let checks = self.store.link_checks() or fail store_down(err);
@@ -247,6 +306,10 @@ locus Placements {
                     + std::json::find_int_field(phw, "memory_bytes"),
             );
             let judging = judging_add(judging_add(Judging { }, node, hw, held), peer, phw, held_p);
+            // what the peer's store holds: a model across the two is held
+            // whole on each
+            let peer_blobs = HeldBlobs { };
+            hold_blobs(peer_blobs, (self.store.inventory(peer) or fail store_down(err)).blobs);
             let mut pair = PairSuggestions { peer: peer, has_tier_gb: tier > 0, tier_gb: tier };
             let mut rest = cats;
             while len(rest) > 0 {
@@ -262,7 +325,7 @@ locus Placements {
                     spanning,
                     serving,
                 ) or raise;
-                push(pair.data, s) or discard;
+                push(pair.data, self.on_disk(s, blobs, peer_blobs, true) or raise) or discard;
             }
             next.has_pair = true;
             next.pair = pair;
@@ -921,7 +984,6 @@ locus Placements {
             now: now_seconds(),
             usable: self.runtimes.usable_in_gate() or raise,
             checks: self.store.link_checks() or fail store_down(err),
-            holdings: node_holdings(),
         };
         let nodes = self.store.nodes() or fail store_down(err);
         let mut ids = "\n";
@@ -948,10 +1010,15 @@ locus Placements {
                 },
             ) or discard;
         }
+        let catalog = self.store.models() or fail store_down(err);
         let rows = self.store.placements() or fail store_down(err);
         for r in rows.rows {
             if !r.removed {
                 let p = placement_of(r) or raise;
+                let mut decision = false;
+                for m in catalog.rows {
+                    if m.id == p.model { decision = m.contract == "decision"; }
+                }
                 push(
                     f.placed.items,
                     ArrangePlaced {
@@ -961,13 +1028,13 @@ locus Placements {
                         variant: p.variant,
                         nodes: node_set(p.nodes),
                         held: self.held_by(r) or raise,
+                        decision: decision,
                     },
                 ) or discard;
             }
         }
         // the models a want may be filled with: each pin's, and each wanted
         // role's candidates, the strongest first
-        let catalog = self.store.models() or fail store_down(err);
         let mut wanted = "";
         for p in w.pins {
             wanted = wanted + p.model + "\n";
@@ -987,7 +1054,46 @@ locus Placements {
                 if len(m.model) > 0 { push(f.models.items, m) or discard; }
             }
         }
+        f.holdings = self.holdings_in_gate(f) or raise;
         return f;
+    }
+
+    /// What each node of `f` holds whole of the variants of `f`'s models,
+    /// from what it last reported its store holds (downloads.hl
+    /// `variant_whole`): a variant held whole is not fetched again.
+    fn holdings_in_gate(f: ArrangeFleet) -> NodeHoldings fallible(CtlError) {
+        let mut out = NodeHoldings { };
+        for n in f.nodes.items {
+            let held = self.holdings_on(n.id, f.models) or raise;
+            for h in held.items {
+                push(out.items, h) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// What node `node` holds whole of the variants of `models`.
+    fn holdings_on(node: String, models: ArrangeModels) -> NodeHoldings fallible(CtlError) {
+        let mut out = NodeHoldings { };
+        let blobs = HeldBlobs { };
+        hold_blobs(blobs, (self.store.inventory(node) or fail store_down(err)).blobs);
+        for m in models.items {
+            let mut it = std::json::array_first(m.recipe.variants.text);
+            while !it.done {
+                if variant_whole(it.element, blobs) {
+                    push(
+                        out.items,
+                        NodeHolding {
+                            node: node,
+                            recipe: m.recipe.id,
+                            variant: std::json::find_string_field(it.element, "id"),
+                        },
+                    ) or discard;
+                }
+                it = std::json::array_next(it);
+            }
+        }
+        return out;
     }
 
     /// Model `id`: the catalog's model of that id, or else recipe `id`, as
@@ -1608,6 +1714,9 @@ type Judging {
     hw: bounded[String; 2];
     room: bounded[Int; 2];
     held: bounded[Int; 2];
+    // the disk each has free: what it declared, less what a plan has
+    // already put there (arranger.hl)
+    disk: bounded[Int; 2];
 }
 
 /// `j` with node `name` added: its hardware `hw`, and `held` of its memory
@@ -1618,6 +1727,7 @@ fn judging_add(j: Judging, name: String, hw: String, held: Int) -> Judging {
     push(out.hw, hw) or discard;
     push(out.room, std::json::find_int_field(hw, "model_memory_bytes") - held) or discard;
     push(out.held, held) or discard;
+    push(out.disk, std::json::find_int_field(hw, "disk_free_bytes")) or discard;
     return out;
 }
 
@@ -1779,7 +1889,7 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
             + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
         memory = if i == 0 { said } else { memory + "; " + said };
         if need > room { short = true; }
-        let free = std::json::find_int_field(node_hw, "disk_free_bytes");
+        let free = at(j.disk, i) or 0;
         let size = disk_need(v, i);
         let on_disk = name + gb(size) + " of " + gb(free) + " free";
         disk = if i == 0 { on_disk } else { disk + "; " + on_disk };
@@ -1821,11 +1931,27 @@ fn accelerators_said(hw: String) -> String {
 }
 
 /// What variant `v` keeps on the disk of the node that runs its rank
-/// `rank`: every file it fetches (its own, its file sets', a set pinned by a
-/// manifest at the bytes it says), and what that node's prepare step makes
-/// (`prepared`: each file every rank makes, and its own rank's).
+/// `rank`: every file it fetches (`fetched_bytes`), and what that node's
+/// prepare step makes (`prepared`: each file every rank makes, and its own
+/// rank's).
 @bounded_by(v)
 fn disk_need(v: String, rank: Int) -> Int {
+    let mut size = fetched_bytes(v);
+    let mut p = std::json::array_first(std::json::find_field_raw(v, "prepared"));
+    while !p.done {
+        let ranked = len(std::json::find_field_raw(p.element, "rank")) > 0;
+        if !ranked || std::json::find_int_field(p.element, "rank") == rank {
+            size = size + std::json::find_int_field(p.element, "bytes");
+        }
+        p = std::json::array_next(p);
+    }
+    return size;
+}
+
+/// What a node fetches of variant `v`: its own files, and its file sets'
+/// (a set pinned by a manifest at the bytes it says).
+@bounded_by(v)
+fn fetched_bytes(v: String) -> Int {
     let mut size = files_bytes(std::json::find_field_raw(v, "files"));
     let mut it = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
     while !it.done {
@@ -1840,14 +1966,6 @@ fn disk_need(v: String, rank: Int) -> Int {
                 }
             );
         it = std::json::array_next(it);
-    }
-    let mut p = std::json::array_first(std::json::find_field_raw(v, "prepared"));
-    while !p.done {
-        let ranked = len(std::json::find_field_raw(p.element, "rank")) > 0;
-        if !ranked || std::json::find_int_field(p.element, "rank") == rank {
-            size = size + std::json::find_int_field(p.element, "bytes");
-        }
-        p = std::json::array_next(p);
     }
     return size;
 }

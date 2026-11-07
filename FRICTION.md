@@ -43,6 +43,8 @@ one-locus-many-endpoints shape: `std::http::build_context(req)` and an
 `if std::http::is_route(...)` ladder in its own `handle`, let-bound where the
 `Server` is created (`api/endpoints.hl`). Shared state lives in its `params`.
 
+**Resolved in hale 0.22.0** (hale-lang/hale#1048): `hale check` and `hale build` refuse a handler literal built in a function that returns the router, fills a router it was handed, or fills `self`'s router, so the shape above no longer builds instead of dangling. hale's migration, each handler a field of the locus that owns the router and the router filled in `birth()`, is a second safe shape; voice keeps its one handler locus.
+
 ## Triple-quoted and raw strings are in the grammar's comment, not the lexer
 
 **hale 0.21.0.** `spec/grammar.ebnf` notes `STRING_LIT` as
@@ -53,6 +55,8 @@ exists.
 **Working shape:** JSON bodies live in files and are read at request time
 (`api/canned/`), not embedded in source.
 
+**Resolved in hale 0.27.0** (hale-lang/hale#1677) for multi-line text: a block string opens with `"""` at the end of a line and closes with `"""` on a line of its own, nothing escaped. The one-line `"""{"a": 1}"""` is now refused by the lexer. Raw `r"..."` strings still do not lex on hale 0.32.6.
+
 ## `std::http` has no reason phrase for most statuses
 
 **hale 0.21.0.** `__status_phrase` covers 101, 200, 301, 400, 404, 413 and
@@ -62,6 +66,8 @@ trace.
 
 **Working shape:** none needed. Worth adding 201, 202, 204, 401, 403, 409,
 429, 502, 503 and 504 upstream.
+
+**Resolved in hale 0.24.0** (hale-lang/hale#1540): `__status_phrase` holds every RFC 9110 status.
 
 ## `is_route` writes its captures into the context, not into a copy of it
 
@@ -107,6 +113,8 @@ a `push` loop. A whole record copies its bounded fields with it.
 **Working shape:** wrap the list in a record (`type Names { items:
 bounded[String; 32]; }`) and assign the record.
 
+**Resolved in hale 0.25.0** (hale-lang/hale#1601): `row.models = req.models` copies the count and the elements. `Names` stays, since a function still cannot return a bounded list by value (below).
+
 ## `hale verify` calls a hashmap row write in a long-lived locus unbounded
 
 **hale 0.24.0.** `MemoryStore` keeps rows in `@form(hashmap)` loci for the
@@ -134,6 +142,8 @@ not an offset.
 the date first (the month 1 to 12, the day within the month, leap years
 counted) and takes an offset off by hand, with exactly two digits for its
 hours and its minutes.
+
+**Resolved in hale 0.25.0** (hale-lang/hale#1601) for the impossible day: `parse_time("2099-02-30T00:00:00Z")` is refused. An offset is still refused on hale 0.32.6 (`2099-03-02T00:00:00+02:00`), so `rfc3339` stays.
 
 ## A NATS client held for the api's life grows with every served request
 
@@ -280,11 +290,15 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** an enum field the contract requires has no declaration default (`Limit.scope`, `Key.status`, `Attempt.outcome`, ...), so the description lists it as required, as the codec reads it. An enum the contract leaves optional is a presence pair (`has_billing` with `billing`), and its handler reads `has_billing` rather than the field's zero, which the codec makes the first variant.
 
+**Resolved in hale 0.26.0** (hale-lang/hale#1651): a field with any default, an enum's among them, is optional and decodes to its default. The rows keep the shapes above, which say the contract's required and optional enums either way.
+
 ## A record literal in a field default is not checked for a field with no default
 
 **hale 0.25.1.** `type Row { budget: BudgetSet = BudgetSet { }; }`, where `BudgetSet` has a field with no default (here an enum, `period: Period;`), passes `hale check`; the build then fails: "codegen error: unsupported in codegen v0: type `st::BudgetSet` literal missing field `period`". The same literal in a function body is refused by the checker ("missing field `period`").
 
 **Working shape:** a field default names every field without a default (`BudgetSet { period: Period::month }`).
+
+**Resolved in hale 0.26.0** (hale-lang/hale#1651): `hale check` refuses the literal at the default ("type `BudgetSet`: missing field `period`").
 
 ## The codec has no free-form JSON value, no scalar-valued map and no third state for a PATCH's null
 
@@ -314,13 +328,15 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** none in voice; docs/internals.md's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 
+**Resolved in hale 0.26.0** (hale-lang/hale#1592, its second slice in hale-lang/hale#1661): the runtime's diagnostics are records in the format `std::log`'s sinks write, one line on stderr, so the hang-up now reads `time=... level=error logger=lotus.tcp msg="write failed" op="lotus_tcp_send_str: write" errno=32 error="Broken pipe"`, beside voice's own warnings and errors. docs/internals.md's Logs section still names it as the one exception.
+
 ## A program that reads `self.draining` waits out the whole drain grace, its HTTP server never ending on it
 
 **hale 0.25.1.** The drain on SIGINT or SIGTERM is installed only in a program that reads `self.draining`. Once anything does (a pinned queue's `while !self.draining` loop, or pond's `NatsConn`), a signal waits for the main locus's `run()` to return, and the api's `run()` is `std::http::Server`, which does not end on the drain. So every stop waits out the grace: "the drain begun by signal 15 did not finish within 5000 ms ... live loci that read draining: `Teller` x1". The api took 5 s to stop instead of a few milliseconds.
 
 **Working shape:** nothing in the api reads `self.draining`. The teller's loop (api/teller.hl) runs until the process ends, so a signal ends it at once, as before, and events not yet told go with it.
 
-**Fixed upstream.** hale's serve loops end on a drain (its drain watcher stops every listener); what held the api was its own pinned loops never reading `self.draining`. Since hale v0.32.5 (#1851) a locus's `dissolve()` counts for the drain, so the api, the brain and their loops (teller, governance, pulse, the brain's tick) read `while !self.draining`: SIGTERM ends the api in under a second, exit 0, its hooks run.
+**Resolved in hale 0.26.0** (hale-lang/hale#1659): a drain stops the process's listeners. hale's serve loops end on a drain (its drain watcher stops every listener); what held the api was its own pinned loops never reading `self.draining`. Since hale v0.32.5 (#1851) a locus's `dissolve()` counts for the drain, so the api, the brain and their loops (teller, governance, pulse, the brain's tick) read `while !self.draining`: SIGTERM ends the api in under a second, exit 0, its hooks run.
 
 ## A binding's literal that reads the locus's params passes the check and fails the build
 
@@ -328,11 +344,15 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** no binding. The teller (api/teller.hl) is a pinned locus whose params the main locus's own literal sets from its params, which a params initializer may read.
 
+**Resolved in hale 0.26.0** (hale-lang/hale#1657): `hale check` refuses a read of `self` in an adapter binding's literal, at the read, since the prelude builds the adapter before the main locus exists. A binding still cannot take the locus's params, so the working shape stays.
+
 ## `std::http::Client` bounds its dial, not its answer
 
 **hale 0.25.1, and main at ec6fc8f.** `timeout_ms` bounds the TCP connect (and the TLS handshake); the request's write and the read of the answer have no bound, and `max_retries` (3 by default) repeats the whole exchange. A peer that takes the connection and never answers (a head stopped mid-run, a proxy that holds it) keeps the caller for as long as it holds, so a call a locus makes on a schedule has no deadline it can state.
 
 **Working shape:** api/deadline.hl, an HTTP/1.1 exchange over `std::io::tcp` or `std::io::tls` under one deadline: `connect_within`, then `set_send_timeout` and `set_recv_timeout` set to what is left of it before each write and read, the answer read to its `Content-Length`, its last chunk or the close. A total deadline on `std::http::Client` (say `deadline_ms`) would retire it.
+
+**Resolved in hale 0.26.0** (hale-lang/hale#1657): `timeout_ms` is one deadline for the whole call, the dial, every write and read, and the retries and their backoff, and a response the deadline cuts short is never handed back. api/deadline.hl is still voice's; a `Client` with `max_retries: 0` (deadline.hl never tries twice) would retire it.
 
 ## A pinned locus's log line waits for the main thread's next request
 
@@ -340,11 +360,15 @@ each gap classed in `api/gaps.json`.
 
 **Working shape:** none in the api. The DNA fixture (api/tests/admin_limits.sh) asks the api's `/healthz` while it waits for a reader's line.
 
+**Resolved in hale 0.26.0** (hale-lang/hale#1659): an accept on the main thread also waits on main's bus queue, so a line another thread publishes to a sink on main is written while the server is idle. The fixture still asks `/healthz` while it waits (`more_unread`), which is no longer needed.
+
 ## `std::http`'s client reads a response whole, so an https upstream is relayed after it ends
 
 **hale 0.27.0.** `std::http::request` returns a `ClientResponse` with the body read to its end. The openai-compatible engine (node/compat.hl) asks a chat-completions upstream for a stream, but over https the whole stream is read first and its events are published afterward: the caller sees no first token until the model has finished, and a tool call's argument fragments arrive all at once. Filed as [hale-lang/hale#1698](https://github.com/hale-lang/hale/issues/1698), modelled on the server side's chunked/SSE writer (#1596): a client that hands back the body as it arrives.
 
 **Working shape:** an http upstream is spoken to over `std::io::tcp` and relayed chunk by chunk (`Upstream.open` and `next_data`); an https upstream goes through `std::http::request` and is played from the finished body (`compat_play`), the same events in the same order, only late.
+
+**Resolved in hale 0.29.0** (hale-lang/hale#1698, in hale-lang/hale#1719): `std::http::BodyReader` and `SseReader` hand a body on as it arrives, over http and https, and the engine reads its upstream through `SseReader`. A keyed upstream is still read whole (`whole` in node/compat.hl, whose KNOWN GAP names #1719): since hale 0.30.0 a streamed reader presents a vault-held bearer itself (`bearer: std::secret::Credential`, hale-lang/hale#1762), which would let that path stream too.
 
 ## A payload's record stored into a bounded field with `set` or `push` dangles
 
@@ -384,3 +408,50 @@ arena"). Reported to the compiler session with the voice reproduction
 **Working shape:** write into a fresh copy and return that
 (`let mut out = after; out.enrollment_token = token; return out;`).
 
+Still there on hale 0.32.6: with the copy reverted, `hale test api/tests/nodes_test.hl` fails "a new token".
+
+## `hale build` tuned a binary to the CPU that built it
+
+**hale 0.32.0.** `hale build` targeted the build machine's CPU, so a binary built on a CI runner could use instructions another machine of the same architecture lacks. voice-decide, built in CI for the decision runtimes, died with SIGILL on other CPUs.
+
+**Working shape:** every program voice ships is built with `hale build --target-cpu baseline` (the Dockerfiles, `image.yml`, `runtime-decision.yml`), and CI refuses a shipped build without it (voice#143).
+
+**Resolved in hale 0.32.1** (hale-lang/hale#1839): `hale build` targets the portable baseline by default, and `--target-cpu native` asks for the build machine's. Voice still passes `--target-cpu baseline` everywhere and CI still guards it; the flag is now the default, so both could go.
+
+## A `drain()` hook never ran on SIGTERM unless something read `draining`
+
+**hale 0.32.0.** The drain on a signal was installed only in a program that reads `self.draining`, so a locus that declared a `drain()` hook and read nothing died by the signal with its hook unrun (hale-lang/hale#1838).
+
+**Resolved in hale 0.32.5** (hale-lang/hale#1851): a locus that declares `drain()` or `dissolve()` counts as able to answer a drain, as a reader of `self.draining` does, so a signal starts the drain and the hook runs.
+
+## `hale verify` reported a hot-path copy whose presence moved with an unrelated constant
+
+**hale 0.32.1.** `hale verify` failed on a "hot-path copy ... in a loop" at api/projects.hl, at a store written once, in a method with no loop. Whether it appeared depended on the length of the `MIGRATIONS` string in api/main.hl, which the code at that line has nothing to do with. The JSON codecs the compiler generates were parsed at offset 0, so their spans coincided with real files' code, and a copy recorded inside a generated decoder's loop was read back at the file's statement with the same offsets.
+
+**Working shape:** none; voice did not reshape code around it, and voice#150 waited for the fix.
+
+**Resolved in hale 0.32.2** (hale-lang/hale#1842): generated codecs are parsed in a position space of their own past every file, and a diagnostic inside one names the generated code.
+
+## A codec- or hub-bound publish leaked into the bus payload arena until the api died
+
+**hale 0.32.1.** voice-api died with SIGSEGV after about 6.5 h in the lab. Every publish on a topic bound through a codec or to a `ws::Hub` (here `NodeObserved`, once per node heartbeat) left its encoded payload in `g_bus_payload_arena`, which nothing reclaims. At its 64 MiB cap the arena returned NULL, and a caller dereferenced it.
+
+**Resolved in hale 0.32.3** (hale-lang/hale#1845): a codec's encode runs in an arena freed when the publish's serializer returns. Reaching the cap now aborts with a report naming the arena, its cap and the frames that asked. Separately, voice#154 cut `NodeObserved` from about 37 KB to about 2.3 KB.
+
+## A drain hook anywhere held every stop behind an endless `run()`
+
+**hale 0.32.5.** After hale-lang/hale#1851, a `drain()` or `dissolve()` hook anywhere in a program installs the drain, which then waits for every `run()` to return. Voice's loops were `while true` (Teller, Governance, Pulse, the brain's tick), so none returned, and every stop waited out the 5 s grace and died by the signal: exit 143, measured at 5.20 s.
+
+**Working shape:** each of those loops is `while !self.draining` (voice#160). The api stops in about 0.4 s, exit 0, with its hooks run. hale-lang/hale#1858 (an RFC) proposes a runtime-driven drain, `run()` loops stopped between iterations.
+
+## The secrets drift check asked for `node` among the readers of a host command's secret
+
+**hale 0.32.5.** `hale check`'s `[dna.secrets]` drift check named a reading program by its directory, so a secret read in node/install.hl, the program `[dna.host.node]` runs, demanded `node` among the secret's `readers` even when they rightly named the host command.
+
+**Resolved in hale 0.32.6** (hale-lang/hale#1856): a host command's program reads as `host.<command>`.
+
+## A sleep begun after the drain has begun runs its full length
+
+**hale 0.32.6.** `std::time::sleep` snapshots the drain state when it starts, so a sleep that begins after the drain has begun is not cut short and runs its full length. A loop that checks `!self.draining` and then sleeps for its interval holds a stop that arrives between the two for the whole interval.
+
+**Working shape:** governance and pulse sleep through `nap()`, a second at a time while `!self.draining` (voice#160). The fix is hale-lang/hale#1865, expected in hale 0.32.7.

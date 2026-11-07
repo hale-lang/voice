@@ -166,6 +166,18 @@ printf '%s\n' "$readings" | grep -qx 'voice_node_seat_up{seat="static",engine="s
 printf '%s\n' "$readings" | grep -q '^hale_process_' || { echo "the node's readings carry none of the runtime's own"; exit 1; }
 echo "laptop's readings say static is up"
 
+# the node told what its store holds once it registered: nothing yet, a
+# static seat fetches no file; its summary and its downloads say so
+held=""
+for i in $(seq 1 50); do
+  held=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop/downloads")
+  printf '%s' "$held" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["reported_at"] and d["files"] == 0 and d["data"] == [] and d["other_files"] == 0 else 1)' && break
+  sleep 0.2
+done
+printf '%s' "$held" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["reported_at"] else 1)' || { echo "laptop never reported what its store holds: $held"; exit 1; }
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/laptop" | python3 -c 'import json,sys; n=json.load(sys.stdin); sys.exit(0 if n["downloaded"] == {"files": 0, "bytes": 0} else 1)' || { echo "laptop's summary does not say its store is empty"; exit 1; }
+echo "laptop reported its store: empty"
+
 
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key")
 (cd spec/validate && node served.mjs ../../build/openapi.bundled.json "$api" "$key" stream)

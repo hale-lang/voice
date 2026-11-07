@@ -58,6 +58,9 @@ export const AFFECTS: Record<string, string[]> = {
   annotation_step: [],
 };
 
+/** The node reads derived from the recipe set (`listNodeDownloads`, `suggestNodeModels`). */
+export const RECIPE_READS = ['/admin/v1/nodes/{node}/downloads', '/admin/v1/nodes/{node}/suggestions'];
+
 /** What a (re)connect reads again: every admin read, for what was missed. */
 export const COVERED = ['/admin/v1'];
 
@@ -93,6 +96,9 @@ export function deliver(qc: QueryClient, event: AdminEvent) {
     // `projects/work/budget` changes what `/admin/v1/projects` shows
     const top = event.data.target.split('/')[0];
     if (top) paths.push(`/admin/v1/${top}`);
+    // what a node has on disk, and what it is suggested, are read against
+    // every recipe: one allowed or withdrawn changes them
+    if (top === 'recipes') paths.push(...RECIPE_READS);
   }
   refresh(qc, paths);
 }

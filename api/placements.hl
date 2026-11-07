@@ -91,6 +91,9 @@ locus Placements {
         // voice's default picks (suggestions.hl): catalog/picks.json, read
         // at start, "" when none was found
         picks: String = "";
+        // voice's role data (catalog/roles.json, arranger.hl `roles_of`),
+        // read at start; none when it was refused or not found
+        roles: ArrangementRoles = ArrangementRoles { };
     }
 
     /// `listNodeDownloads`: what node `r` has on disk of the models voice
@@ -263,13 +266,23 @@ locus Placements {
             if !pn.present || pn.revoked { continue; }
             let pf = self.store.fleet(peer) or fail store_down(err);
             let phw = std::str::trim(std::json::find_field_raw(pf.capabilities, "hardware"));
-            if len(link_ports(pf.capabilities, node)) == 0 || len(phw) == 0
-                || !std::json::valid_object(phw)
+            if len(phw) == 0 || !std::json::valid_object(phw) { continue; }
+            if len(
+                pair_problem(
+                    node,
+                    capabilities,
+                    hw,
+                    peer,
+                    pf.capabilities,
+                    phw,
+                    checks,
+                    now_seconds(),
+                ),
+            )
+                > 0
             {
                 continue;
             }
-            if len(pair_hardware_problem(node, hw, peer, phw)) > 0 { continue; }
-            if len(pair_link_problem(checks, node, peer, now_seconds())) > 0 { continue; }
             // what the peer's placements hold, and what is placed across
             // the two already
             let mut held_p = 0;
@@ -487,37 +500,30 @@ locus Placements {
             let on_l = places_on(r.body, leader);
             let on_f = parts == 2 && places_on(r.body, follower);
             if !on_l && !on_f { continue; }
-            if r.model == c.model {
-                fail clash(
-                    "model " + c.model + " is placed on node "
-                        + (if on_l { leader } else { follower })
-                        + " by "
-                        + r.id,
-                );
-            }
-            // one placement across nodes a node at a time: its ranks meet on
-            // the host's network, at voice's one rendezvous port
-            if parts == 2 && spans(r.body) {
-                fail clash(
-                    "node " + (if on_l { leader } else { follower }) + " takes part in placement "
-                        + r.id
-                        + " across nodes already, and a node takes part in one at a time",
-                );
-            }
+            let beside = beside_problem(
+                c.model,
+                parts,
+                r.id,
+                r.model,
+                spans(r.body),
+                if on_l { leader } else { follower },
+            );
+            if len(beside) > 0 { fail clash(beside); }
             if on_l { held = held + (self.held_by(r) or raise); }
             if on_f { held_f = held_f + (self.held_by(r) or raise); }
         }
         if parts == 2 {
-            let unlike = pair_hardware_problem(leader, hw, follower, hw_f);
-            if len(unlike) > 0 { fail bad(unlike, "nodes"); }
-            if len(link_ports(lead.capabilities, follower)) == 0 {
-                fail bad("node " + leader + " declares no link to " + follower, "nodes");
-            }
-            if len(link_ports(follow.capabilities, leader)) == 0 {
-                fail bad("node " + follower + " declares no link to " + leader, "nodes");
-            }
             let checks = self.store.link_checks() or fail store_down(err);
-            let problem = pair_link_problem(checks, leader, follower, now_seconds());
+            let problem = pair_problem(
+                leader,
+                lead.capabilities,
+                hw,
+                follower,
+                follow.capabilities,
+                hw_f,
+                checks,
+                now_seconds(),
+            );
             if len(problem) > 0 { fail bad(problem, "nodes"); }
         }
         let mut judging = judging_add(Judging { }, leader, hw, held);
@@ -560,16 +566,16 @@ locus Placements {
                 "runtime"
             );
         }
-        let judged = judge_on(
-            recipe.variants.text,
+        let mut fitted = fit_recipe(
+            recipe,
             judging,
             usable,
             // the model's own contract, which may differ from its recipe's
             // default: it is what its requests are served as
             m.contract == "decision",
         );
-        out.fit = judged.fit;
-        let best = judged.best;
+        out.fit = fitted.judged.fit;
+        let best = fitted.judged.best;
         let mut named = -1;
         let mut i = 0;
         for f in out.fit {
@@ -590,6 +596,7 @@ locus Placements {
             out.variant = c.variant;
             out.runtime = chosen.runtime;
             out.chosen_by = PlacementChooser::operator;
+            fitted = reserve(fitted, recipe, c.variant, chosen.runtime, judging);
         } else {
             if best < 0 {
                 fail bad(
@@ -603,24 +610,10 @@ locus Placements {
             if c.has_runtime { out.chosen_by = PlacementChooser::operator; }
         }
 
-        // its seat's prompt cache: room for CACHED conversations of the
-        // model's context (at most CONVERSATION_MAX), from at most half the
-        // room the variant leaves on the node with the least, never less
-        // than the context it was fitted with. Each node reserves its share
-        // of the variant and the whole cache (`part_need`)
-        let variant = variant_body_of(recipe.variants.text, out.variant);
-        let need = part_need(variant, parts);
-        let per_token = kv_per_token(variant, recipe.kv_bytes_per_token);
-        let pool = cache_pool(
-            least_room(judging) - footprint(need),
-            per_token,
-            recipe.context_length,
-            need,
-        );
         out.has_cache_tokens = true;
-        out.cache_tokens = pool;
+        out.cache_tokens = fitted.cache_tokens;
         out.has_reserved_bytes = true;
-        out.reserved_bytes = need + (pool - fitted_context(recipe.context_length)) * per_token;
+        out.reserved_bytes = fitted.reserved_bytes;
 
         // the seats first: their own checks (the account, the node's room)
         // refuse before anything is kept; across two nodes, the leader's
@@ -819,6 +812,194 @@ locus Placements {
         ) or fail store_down(err);
         return v;
     }
+
+    // ---- arrangements (arranger.hl): the methods are the placements', as
+    // what a plan proposes is placements
+
+    /// `listArrangementRoles`: voice's role data.
+    fn arrangement_roles() -> ArrangementRoles fallible(CtlError) {
+        return self.roles;
+    }
+
+    /// `planArrangement`: the plan for wants `w`, written nowhere.
+    fn plan_arrangement(w: ArrangementWants) -> ArrangementPlan fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.plan_in_gate(w) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn plan_in_gate(w: ArrangementWants) -> ArrangementPlan fallible(CtlError) {
+        let f = self.arrangement_fleet_in_gate(w) or raise;
+        let problem = check_wants(f, w, self.roles);
+        if len(problem) > 0 { fail bad(problem, "wants"); }
+        return plan_fleet(f, w, self.roles);
+    }
+
+    /// The fleet as the store holds it now: its nodes in the order of
+    /// their ids, so a plan does not depend on when each enrolled; what is
+    /// placed; and the models wants `w` may be filled with.
+    fn arrangement_fleet_in_gate(w: ArrangementWants) -> ArrangeFleet fallible(CtlError) {
+        let mut f = ArrangeFleet {
+            now: now_seconds(),
+            usable: self.runtimes.usable_in_gate() or raise,
+            checks: self.store.link_checks() or fail store_down(err),
+        };
+        let nodes = self.store.nodes() or fail store_down(err);
+        let mut ids = "\n";
+        for n in nodes.rows {
+            if !n.revoked { ids = ids + n.id + "\n"; }
+        }
+        while len(ids) > 1 {
+            let mut next = "";
+            for n in nodes.rows {
+                if std::str::contains(ids, "\n" + n.id + "\n") && (len(next) == 0 || n.id < next) {
+                    next = n.id;
+                }
+            }
+            ids = std::str::replace(ids, "\n" + next + "\n", "\n");
+            let fl = self.store.fleet(next) or fail store_down(err);
+            let hw = std::str::trim(std::json::find_field_raw(fl.capabilities, "hardware"));
+            push(
+                f.nodes.items,
+                ArrangeNode {
+                    id: next,
+                    capabilities: fl.capabilities,
+                    hw: if len(hw) > 0 { hw } else { "{}" },
+                    problem: placeable_problem(next, fl.capabilities),
+                },
+            ) or discard;
+        }
+        let catalog = self.store.models() or fail store_down(err);
+        let rows = self.store.placements() or fail store_down(err);
+        for r in rows.rows {
+            if !r.removed {
+                let p = placement_of(r) or raise;
+                let mut decision = false;
+                for m in catalog.rows {
+                    if m.id == p.model { decision = m.contract == "decision"; }
+                }
+                push(
+                    f.placed.items,
+                    ArrangePlaced {
+                        id: p.id,
+                        model: p.model,
+                        recipe: p.recipe,
+                        variant: p.variant,
+                        nodes: node_set(p.nodes),
+                        held: self.held_by(r) or raise,
+                        decision: decision,
+                    },
+                ) or discard;
+            }
+        }
+        // the models a want may be filled with: each pin's, and each wanted
+        // role's candidates, the strongest first
+        let mut wanted = "";
+        for p in w.pins {
+            wanted = wanted + p.model + "\n";
+        }
+        for r in w.roles {
+            let role = role_named(self.roles, r.role);
+            for c in role.candidates {
+                wanted = wanted + c + "\n";
+            }
+        }
+        while len(wanted) > 0 {
+            let nl = std::str::index_of(wanted, "\n");
+            let id = wanted[0..nl];
+            wanted = wanted[(nl + 1)..len(wanted)];
+            // a catalog model named is loaded as itself, though a model of
+            // its recipe is loaded already; a recipe, once
+            let mut named = false;
+            for row in catalog.rows {
+                if !row.removed && row.id == id && len(row.recipe) > 0 { named = true; }
+            }
+            let loaded = if named { model_exact(f, id) } else { model_index(f, id) };
+            if loaded < 0 {
+                let m = self.arrangement_model(catalog, id) or raise;
+                if len(m.model) > 0 { push(f.models.items, m) or discard; }
+            }
+        }
+        f.holdings = self.holdings_in_gate(f) or raise;
+        return f;
+    }
+
+    /// What each node of `f` holds whole of the variants of `f`'s models,
+    /// from what it last reported its store holds (downloads.hl
+    /// `variant_whole`): a variant held whole is not fetched again.
+    fn holdings_in_gate(f: ArrangeFleet) -> NodeHoldings fallible(CtlError) {
+        let mut out = NodeHoldings { };
+        for n in f.nodes.items {
+            let held = self.holdings_on(n.id, f.models) or raise;
+            for h in held.items {
+                push(out.items, h) or discard;
+            }
+        }
+        return out;
+    }
+
+    /// What node `node` holds whole of the variants of `models`.
+    fn holdings_on(node: String, models: ArrangeModels) -> NodeHoldings fallible(CtlError) {
+        let mut out = NodeHoldings { };
+        let blobs = HeldBlobs { };
+        hold_blobs(blobs, (self.store.inventory(node) or fail store_down(err)).blobs);
+        for m in models.items {
+            let mut it = std::json::array_first(m.recipe.variants.text);
+            while !it.done {
+                if variant_whole(it.element, blobs) {
+                    push(
+                        out.items,
+                        NodeHolding {
+                            node: node,
+                            recipe: m.recipe.id,
+                            variant: std::json::find_string_field(it.element, "id"),
+                        },
+                    ) or discard;
+                }
+                it = std::json::array_next(it);
+            }
+        }
+        return out;
+    }
+
+    /// Model `id`: the catalog's model of that id, or else recipe `id`, as
+    /// the catalog's first model that names it or as itself when none does;
+    /// `model` "" when voice has neither.
+    fn arrangement_model(catalog: st::ModelRows, id: String) -> ArrangeModel fallible(CtlError) {
+        for row in catalog.rows {
+            if !row.removed && row.id == id && len(row.recipe) > 0 {
+                let recipe = self.recipes.get_in_gate(row.recipe) or Recipe { };
+                if len(recipe.id) == 0 { return ArrangeModel { }; }
+                return ArrangeModel {
+                    model: row.id,
+                    in_catalog: true,
+                    decision: row.contract == "decision",
+                    recipe: recipe,
+                };
+            }
+        }
+        let recipe = self.recipes.get_in_gate(id) or Recipe { };
+        if len(recipe.id) == 0 { return ArrangeModel { }; }
+        for row in catalog.rows {
+            if !row.removed && row.recipe == id {
+                return ArrangeModel {
+                    model: row.id,
+                    in_catalog: true,
+                    decision: row.contract == "decision",
+                    recipe: recipe,
+                };
+            }
+        }
+        return ArrangeModel {
+            model: id,
+            decision: recipe.contract == ModelContract::decision,
+            recipe: recipe,
+        };
+    }
 }
 
 /// A row as the surface's `Placement`. The body is what `create` decided.
@@ -907,6 +1088,118 @@ fn placement_json(p: Placement) -> String {
             }
         )
         + ", \"created_at\": " + jtime(p.created_at) + "}";
+}
+
+// ---- the fit rules a placement and the arranger share --------------------
+
+/// Why placement `other` (of `other_model`, across two nodes when
+/// `other_spans`, on node `on`) keeps a placement of `model` on `parts`
+/// nodes off `on`, "" when it does not: a node serves a model once, and
+/// takes part in one placement across nodes at a time (its ranks meet on
+/// the host's network, at voice's one rendezvous port).
+fn beside_problem(
+    model: String,
+    parts: Int,
+    other: String,
+    other_model: String,
+    other_spans: Bool,
+    on: String
+) -> String {
+    if other_model == model {
+        return "model " + model + " is placed on node " + on + " by " + other;
+    }
+    if parts == 2 && other_spans {
+        return "node " + on + " takes part in placement " + other
+            + " across nodes already, and a node takes part in one at a time";
+    }
+    return "";
+}
+
+/// Why `leader` and `follower` (each its capabilities and hardware) cannot
+/// take a model across them, "" when they can: one platform and the same
+/// accelerators, each declaring its link to the other, and the link's
+/// latest check (`checks`, at `now`) passed.
+fn pair_problem(
+    leader: String,
+    caps_l: String,
+    hw_l: String,
+    follower: String,
+    caps_f: String,
+    hw_f: String,
+    checks: st::LinkCheckRows,
+    now: Time
+) -> String {
+    let unlike = pair_hardware_problem(leader, hw_l, follower, hw_f);
+    if len(unlike) > 0 { return unlike; }
+    if len(link_ports(caps_l, follower)) == 0 {
+        return "node " + leader + " declares no link to " + follower;
+    }
+    if len(link_ports(caps_f, leader)) == 0 {
+        return "node " + follower + " declares no link to " + leader;
+    }
+    return pair_link_problem(checks, leader, follower, now);
+}
+
+/// Why no model can be placed on node `id` (its `capabilities`), "" when
+/// one can: it offers a managed engine and has declared its hardware.
+@bounded_by(capabilities)
+fn placeable_problem(id: String, capabilities: String) -> String {
+    if len(managed_engine(capabilities)) == 0 {
+        return "node " + id + " offers no managed engine, so no model can be placed on it";
+    }
+    let hw = std::str::trim(std::json::find_field_raw(capabilities, "hardware"));
+    if len(hw) == 0 || !std::json::valid_object(hw) {
+        return "node " + id + " has declared no hardware, so nothing can be judged to fit it";
+    }
+    return "";
+}
+
+/// A recipe's fit on the nodes of `j`: every variant judged (`judge_on`),
+/// the one voice picks, the runtime that serves it, and what it holds of
+/// each node (`reserve`). No variant picked when none fits
+/// (`judged.best` -1).
+type PlacementFit {
+    judged: Judged = Judged { };
+    variant: String = "";
+    runtime: String = "";
+    cache_tokens: Int = 0;
+    reserved_bytes: Int = 0;
+}
+
+/// Recipe `recipe` judged on the nodes of `j` for the runtimes of `usable`,
+/// its requests served as a decision model's when `decision`; with the
+/// variant voice picks reserved there.
+fn fit_recipe(recipe: Recipe, j: Judging, usable: RuntimeList, decision: Bool) -> PlacementFit {
+    let judged = judge_on(recipe.variants.text, j, usable, decision);
+    let out = PlacementFit { judged: judged };
+    if judged.best < 0 { return out; }
+    let chosen = at(judged.fit, judged.best) or VariantFit { };
+    return reserve(out, recipe, chosen.variant, chosen.runtime, j);
+}
+
+/// `f` with variant `variant` of `recipe`, served by `runtime`, reserved
+/// on the nodes of `j`: its seat's prompt cache, room for CACHED
+/// conversations of the model's context (at most CONVERSATION_MAX), from
+/// at most half the room the variant leaves on the node with the least,
+/// never less than the context it was fitted with; and what each node
+/// reserves, its share of the variant and the whole cache (`part_need`).
+fn reserve(
+    f: PlacementFit,
+    recipe: Recipe,
+    variant: String,
+    runtime: String,
+    j: Judging
+) -> PlacementFit {
+    let mut out = f;
+    let v = variant_body_of(recipe.variants.text, variant);
+    let need = part_need(v, count(j.hw));
+    let per_token = kv_per_token(v, recipe.kv_bytes_per_token);
+    let pool = cache_pool(least_room(j) - footprint(need), per_token, recipe.context_length, need);
+    out.variant = variant;
+    out.runtime = runtime;
+    out.cache_tokens = pool;
+    out.reserved_bytes = need + (pool - fitted_context(recipe.context_length)) * per_token;
+    return out;
 }
 
 // ---- what a seat takes ------------------------------------------------
@@ -1291,6 +1584,9 @@ type Judging {
     hw: bounded[String; 2];
     room: bounded[Int; 2];
     held: bounded[Int; 2];
+    // the disk each has free: what it declared, less what a plan has
+    // already put there (arranger.hl)
+    disk: bounded[Int; 2];
 }
 
 /// `j` with node `name` added: its hardware `hw`, and `held` of its memory
@@ -1301,6 +1597,7 @@ fn judging_add(j: Judging, name: String, hw: String, held: Int) -> Judging {
     push(out.hw, hw) or discard;
     push(out.room, std::json::find_int_field(hw, "model_memory_bytes") - held) or discard;
     push(out.held, held) or discard;
+    push(out.disk, std::json::find_int_field(hw, "disk_free_bytes")) or discard;
     return out;
 }
 
@@ -1462,7 +1759,7 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
             + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
         memory = if i == 0 { said } else { memory + "; " + said };
         if need > room { short = true; }
-        let free = std::json::find_int_field(node_hw, "disk_free_bytes");
+        let free = at(j.disk, i) or 0;
         let size = disk_need(v, i);
         let on_disk = name + gb(size) + " of " + gb(free) + " free";
         disk = if i == 0 { on_disk } else { disk + "; " + on_disk };
@@ -1504,11 +1801,27 @@ fn accelerators_said(hw: String) -> String {
 }
 
 /// What variant `v` keeps on the disk of the node that runs its rank
-/// `rank`: every file it fetches (its own, its file sets', a set pinned by a
-/// manifest at the bytes it says), and what that node's prepare step makes
-/// (`prepared`: each file every rank makes, and its own rank's).
+/// `rank`: every file it fetches (`fetched_bytes`), and what that node's
+/// prepare step makes (`prepared`: each file every rank makes, and its own
+/// rank's).
 @bounded_by(v)
 fn disk_need(v: String, rank: Int) -> Int {
+    let mut size = fetched_bytes(v);
+    let mut p = std::json::array_first(std::json::find_field_raw(v, "prepared"));
+    while !p.done {
+        let ranked = len(std::json::find_field_raw(p.element, "rank")) > 0;
+        if !ranked || std::json::find_int_field(p.element, "rank") == rank {
+            size = size + std::json::find_int_field(p.element, "bytes");
+        }
+        p = std::json::array_next(p);
+    }
+    return size;
+}
+
+/// What a node fetches of variant `v`: its own files, and its file sets'
+/// (a set pinned by a manifest at the bytes it says).
+@bounded_by(v)
+fn fetched_bytes(v: String) -> Int {
     let mut size = files_bytes(std::json::find_field_raw(v, "files"));
     let mut it = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
     while !it.done {
@@ -1523,14 +1836,6 @@ fn disk_need(v: String, rank: Int) -> Int {
                 }
             );
         it = std::json::array_next(it);
-    }
-    let mut p = std::json::array_first(std::json::find_field_raw(v, "prepared"));
-    while !p.done {
-        let ranked = len(std::json::find_field_raw(p.element, "rank")) > 0;
-        if !ranked || std::json::find_int_field(p.element, "rank") == rank {
-            size = size + std::json::find_int_field(p.element, "bytes");
-        }
-        p = std::json::array_next(p);
     }
     return size;
 }

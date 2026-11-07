@@ -197,6 +197,8 @@ tags:
     description: Admin plane. What serves a local model on a node, pinned, as the operator allows it.
   - name: placements
     description: Admin plane. Which nodes a local model is to run on, and in which form.
+  - name: arrangements
+    description: Admin plane. The whole fleet as the operator wants it, and the plan that would make it so.
   - name: accounts
     description: Admin plane. Accounts that pay for serving, and their limits.
   - name: nodes
@@ -3065,6 +3067,96 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/arrangement-roles:
+    get:
+      tags: [arrangements]
+      operationId: listArrangementRoles
+      summary: The roles an arrangement may ask voice to fill
+      description: |
+        Voice's role data (`catalog/roles.json`): each role's name, how
+        it is shown, the alias it points at the model that fills it, and
+        the recipes that can fill it, the strongest first. Empty when the
+        api found no role data, or refused it.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The roles.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ArrangementRole'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/arrangement-plans:
+    post:
+      tags: [arrangements]
+      operationId: planArrangement
+      summary: Plan the fleet for what the operator wants
+      description: |
+        The operator states what the whole fleet is for (pins and roles),
+        and voice proposes a plan: a diff against what is placed now. It
+        changes nothing; the plan is read, not carried out.
+
+        Each want is a slot, filled in order: the pins as given, then the
+        roles by priority (1 first, none last), a role's `count` a slot
+        each. A slot takes the strongest of its candidates (a pin's model;
+        a role's recipes, in the role data's order) that fits what the
+        slots before it left: judged as `createPlacement` judges a
+        placement (the variant and runtime it would choose, each node's
+        memory for models after what is placed beside it, the disk, a pair
+        of one platform cabled to each other with its link's latest check
+        passed, one placement across nodes a node at a time), so a model
+        that takes a node's memory whole, as DeepSeek-V4.1-Flash-1017
+        across two Sparks on TensorFold does, leaves nothing beside it.
+        A role may share a model a slot before it places. Of the equally
+        strong ways to fill a slot, every one is tried, since where one
+        goes decides what fits after it; the plan is the one that fills
+        the slots best, in order, then fetches the least (a variant a node
+        holds already is not fetched again), then moves the least (a
+        placement that serves a want is kept). Ties go to the first, in the
+        order of the nodes' ids, so the same fleet and wants make the same
+        plan.
+
+        The arrangement is the whole fleet's: a placement that serves no
+        want is removed. A want that cannot be filled is listed, with why.
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ArrangementWants'
+      responses:
+        '200':
+          description: The plan.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArrangementPlan'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/nodes/{node}/links/{peer}/check:
     parameters:
       - $ref: '#/components/parameters/NodeId'
@@ -5886,6 +5978,206 @@ components:
         runtime:
           type: string
           description: The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks.
+
+    ArrangementRole:
+      type: object
+      description: A role an arrangement may ask voice to fill, from voice's role data.
+      required: [id, title, annotation, alias, candidates]
+      properties:
+        id:
+          type: string
+          examples: [coder]
+        title:
+          type: string
+          examples: [Coder]
+        annotation:
+          type: string
+          description: What the role is for, as the admin UI says it.
+        alias:
+          type: string
+          description: The alias the role points at the model that fills it.
+          examples: [coding]
+        candidates:
+          type: array
+          description: The recipes that can fill the role, the strongest first.
+          items: { type: string }
+
+    ArrangementWants:
+      type: object
+      description: What the operator wants the whole fleet for.
+      properties:
+        pins:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/ArrangementPin'
+        roles:
+          type: array
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/ArrangementRoleWant'
+
+    ArrangementPin:
+      type: object
+      description: |
+        A model on a node, or across two cabled to each other: the nodes
+        named, or any. Two take the model split across them, and their
+        link's latest check must have passed.
+      required: [model]
+      properties:
+        model:
+          type: string
+          description: A catalog model, or a recipe.
+          examples: [deepseek-v4.1-flash-1017]
+        count:
+          type: integer
+          minimum: 0
+          maximum: 2
+          description: How many nodes, when none are named; 0 or left out is one, or as many as `nodes` names.
+        nodes:
+          type: array
+          maxItems: 2
+          description: The nodes, the first its leader; left out for any.
+          items: { type: string }
+
+    ArrangementRoleWant:
+      type: object
+      description: A role to fill.
+      required: [role]
+      properties:
+        role:
+          type: string
+          description: A role of the role data (`listArrangementRoles`).
+          examples: [coder]
+        priority:
+          type: integer
+          minimum: 0
+          description: Filled in this order, 1 first; 0 or left out after those with one, in the order given.
+        count:
+          type: integer
+          minimum: 0
+          maximum: 8
+          description: How many placements fill it; 0 or left out is one.
+
+    ArrangementPlan:
+      type: object
+      description: A plan for the fleet, as a diff against what is placed now. Nothing in it is carried out.
+      required: [keep, remove, add, aliases, downloads, down, unmet]
+      properties:
+        keep:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanKeep'
+        remove:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanRemove'
+        add:
+          type: array
+          description: In the order the plan fills its wants.
+          items:
+            $ref: '#/components/schemas/PlanAdd'
+        aliases:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanAlias'
+        downloads:
+          type: array
+          description: What each node the plan adds to fetches.
+          items:
+            $ref: '#/components/schemas/PlanDownload'
+        down:
+          type: array
+          description: The models no placement serves once the plan is carried out.
+          items: { type: string }
+        unmet:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanUnmet'
+
+    PlanKeep:
+      type: object
+      description: A placement left as it is.
+      required: [placement, model, recipe, nodes, serves, reason]
+      properties:
+        placement: { type: string }
+        model: { type: string }
+        recipe: { type: string }
+        nodes:
+          type: array
+          items: { type: string }
+        serves:
+          type: array
+          description: The wants it serves.
+          items: { type: string }
+        reason: { type: string }
+
+    PlanRemove:
+      type: object
+      description: A placement withdrawn, and why.
+      required: [placement, model, recipe, nodes, reason]
+      properties:
+        placement: { type: string }
+        model: { type: string }
+        recipe: { type: string }
+        nodes:
+          type: array
+          items: { type: string }
+        reason: { type: string }
+
+    PlanAdd:
+      type: object
+      description: A model placed, in the form `createPlacement` would choose for it.
+      required: [placement, model, in_catalog, recipe, nodes, variant, runtime, download_bytes, serves, reason]
+      properties:
+        placement:
+          type: string
+          description: The id it would be placed as.
+        model:
+          type: string
+          description: The catalog model it is placed as; the recipe's id when no catalog model names the recipe yet (`in_catalog` false).
+        in_catalog: { type: boolean }
+        recipe: { type: string }
+        nodes:
+          type: array
+          description: Its nodes, the first its leader.
+          items: { type: string }
+        variant: { type: string }
+        runtime: { type: string }
+        download_bytes:
+          type: integer
+          description: What its nodes fetch for it, together; 0 when they hold it already.
+        serves:
+          type: array
+          description: The wants it serves.
+          items: { type: string }
+        reason:
+          type: string
+          description: Why it goes there, as the fit says it, what it fetches, and the link it needs.
+
+    PlanAlias:
+      type: object
+      description: The alias a role points, at the model that fills it.
+      required: [role, alias, model]
+      properties:
+        role: { type: string }
+        alias: { type: string }
+        model: { type: string }
+
+    PlanDownload:
+      type: object
+      required: [node, bytes]
+      properties:
+        node: { type: string }
+        bytes: { type: integer }
+
+    PlanUnmet:
+      type: object
+      description: A want the plan leaves unfilled.
+      required: [want, reason]
+      properties:
+        want: { type: string }
+        reason: { type: string }
 
     NodeSuggestions:
       type: object

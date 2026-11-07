@@ -120,7 +120,14 @@ The operator decides which weights and which servers may run:
   and runtime that fit the node's hardware, the node fetches and checks every
   file, and the seat comes up. A model too large for one machine is placed
   across two cabled to each other, once their link passed its check
-  ([`docs/adding-a-node.md`](./docs/adding-a-node.md)).
+  ([`docs/adding-a-node.md`](./docs/adding-a-node.md));
+- an **arrangement** states what the whole fleet is for: models pinned to
+  nodes, and roles to fill (coder, decider, small…, from
+  [`catalog/roles.json`](./catalog/roles.json)). Voice proposes a plan, a
+  diff against what is placed now (keep, remove, add, alias), judged by the
+  same fit a placement is, with what each node fetches and what goes down
+  (`planArrangement`, `voice-api arrange plan --wants FILE`, the **Arrange**
+  screen). A plan changes nothing.
 
 Voice ships a default catalog of recipes per memory tier and platform
 ([`recipes/README.md`](./recipes/README.md),
@@ -138,7 +145,7 @@ Served by the api at `/`, under the operator token:
 - **Usage**: a live board of conversations, the ledger with filters, and a
   request's recording (for a project or key that **peeks**: kept seven days)
   read as a conversation, its context beside the back and forth;
-- **Nodes**, **Accounts**, **Catalog**, **Placements**, **Recipes**,
+- **Nodes**, **Accounts**, **Catalog**, **Placements**, **Arrange**, **Recipes**,
   **Runtimes**, **Projects** (subprojects, keys, limits, budgets, peek),
   **Changes** (every admin change, field by field), **API** (the contract);
 - an event log docked at the foot of every screen: requests taking off and

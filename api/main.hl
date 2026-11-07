@@ -277,8 +277,9 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 }
 
 /// `api [--host H] [--port N] [--nats URL] [--node-nats URL]
-/// [--ui DIR] [--recipes DIR] [--runtimes DIR] [--picks FILE] [--database URL] [--state DIR] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
-/// [--migrations DIR]`, or `api admin-token [--database URL] [--state DIR]`
+/// [--ui DIR] [--recipes DIR] [--runtimes DIR] [--picks FILE] [--roles FILE] [--database URL] [--state DIR] [--seat-first-s N] [--seat-idle-s N]`, or `api migrate --database URL
+/// [--migrations DIR]`, or `api arrange plan --wants FILE` (arrange_cli.hl),
+/// or `api admin-token [--database URL] [--state DIR]`
 /// (admin_token.hl), which prints the admin plane's operator token
 /// (operator.hl): kept in the database, or, standalone, in the state
 /// directory (`--state`, by default `$XDG_STATE_HOME/voice-api`). The migrations directory defaults to
@@ -287,7 +288,8 @@ fn migration_failed(e: migs::MigrationError, d: st::Dsn) -> Int {
 /// (`recipes`, the repository's, by default), `--runtimes` the
 /// runtimes' (`runtimes`), and `--picks` the default catalog's picks, which
 /// recipe voice suggests per category for a node (`catalog/picks.json`,
-/// suggestions.hl).
+/// suggestions.hl), and `--roles` the roles an arrangement may ask voice
+/// to fill (`catalog/roles.json`, arranger.hl).
 /// `--node-nats` is where the nodes find NATS, when that
 /// differs from where the api does. `--database` (or `VOICE_DATABASE_URL`)
 /// is `postgres://user:password@host:port/database`; without either, a
@@ -381,6 +383,24 @@ fn shipped_picks(file: String) -> String {
     return text;
 }
 
+/// Voice's role data (arranger.hl), read once at start: none when the
+/// file is missing or refused, which is said.
+fn shipped_roles(file: String) -> ArrangementRoles {
+    let text = std::io::fs::read_file(file) or {
+        log_warn("no role data, so an arrangement can fill no role", std::log::kv("file", file));
+        return ArrangementRoles { };
+    };
+    let read = roles_of(text);
+    if len(read.problem) > 0 {
+        log_error(
+            "the role data is refused",
+            std::log::kv("file", file) + std::log::kv("problem", read.problem),
+        );
+        return ArrangementRoles { };
+    }
+    return read.roles;
+}
+
 /// A shipped recipe file's body, held to the rules (recipes.hl).
 fn shipped_recipe_body(file: String) -> String {
     let lic = std::json::find_field_raw(file, "license");
@@ -420,6 +440,10 @@ fn shipped_runtime_body(file: String) -> String {
 fn main() {
     // the one sink: every logger's lines are written here (log.hl)
     let sink = logfmt::RecordSink { };
+    // `api arrange plan ...` (arrange_cli.hl), its arguments its own
+    if std::env::args_count() > 1 && std::env::arg(1) == "arrange" {
+        std::process::exit(arrange());
+    }
     let migrating = std::env::args_count() > 1 && std::env::arg(1) == "migrate";
     let token_asked = std::env::args_count() > 1 && std::env::arg(1) == "admin-token";
     let mut database = if std::env::var_exists("VOICE_DATABASE_URL") {
@@ -436,6 +460,7 @@ fn main() {
     let mut recipes = "recipes";
     let mut runtimes = "runtimes";
     let mut picks_file = "catalog/picks.json";
+    let mut roles_file = "catalog/roles.json";
     let mut state = "";
     let mut first_s = 120;
     let mut idle_s = 30;
@@ -509,6 +534,8 @@ fn main() {
             runtimes = value;
         } else if flag == "--picks" {
             picks_file = value;
+        } else if flag == "--roles" {
+            roles_file = value;
         } else if flag == "--state" {
             state = value;
         } else if flag == "--seat-first-s" {
@@ -672,6 +699,7 @@ fn main() {
     let shipped = shipped_recipes(recipes);
     let shipped_rt = shipped_runtimes(runtimes);
     let picks = shipped_picks(picks_file);
+    let roles = shipped_roles(roles_file);
     if len(database) > 0 {
         Api {
             front: Front {
@@ -682,6 +710,7 @@ fn main() {
                 shipped: shipped,
                 shipped_runtimes: shipped_rt,
                 picks: picks,
+                roles: roles,
                 hub_port: hub_port,
                 hub_admin: true,
                 store: st::PgStore { url: database },
@@ -750,6 +779,7 @@ fn main() {
                 shipped: shipped,
                 shipped_runtimes: shipped_rt,
                 picks: picks,
+                roles: roles,
                 hub_port: hub_port,
                 store: st::MemoryStore { operator: operator },
                 link: link,

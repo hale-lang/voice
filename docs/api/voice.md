@@ -184,6 +184,7 @@ client can pace itself instead of discovering the wall by failing.
 - [recipes](#tag-recipes) (4)
 - [runtimes](#tag-runtimes) (4)
 - [placements](#tag-placements) (4)
+- [arrangements](#tag-arrangements) (2)
 - [accounts](#tag-accounts) (5)
 - [nodes](#tag-nodes) (14)
 - [changes](#tag-changes) (2)
@@ -1889,6 +1890,87 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+<a id="tag-arrangements"></a>
+
+## arrangements
+
+Admin plane. The whole fleet as the operator wants it, and the plan that would make it so.
+
+### GET `/admin/v1/arrangement-roles`
+
+**The roles an arrangement may ask voice to fill** · `listArrangementRoles`
+
+Authentication: operatorToken
+
+Voice's role data (`catalog/roles.json`): each role's name, how
+it is shown, the alias it points at the model that fills it, and
+the recipes that can fill it, the strongest first. Empty when the
+api found no role data, or refused it.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The roles. | `application/json` object |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/arrangement-plans`
+
+**Plan the fleet for what the operator wants** · `planArrangement`
+
+Authentication: operatorToken
+
+The operator states what the whole fleet is for (pins and roles),
+and voice proposes a plan: a diff against what is placed now. It
+changes nothing; the plan is read, not carried out.
+
+Each want is a slot, filled in order: the pins as given, then the
+roles by priority (1 first, none last), a role's `count` a slot
+each. A slot takes the strongest of its candidates (a pin's model;
+a role's recipes, in the role data's order) that fits what the
+slots before it left: judged as `createPlacement` judges a
+placement (the variant and runtime it would choose, each node's
+memory for models after what is placed beside it, the disk, a pair
+of one platform cabled to each other with its link's latest check
+passed, one placement across nodes a node at a time), so a model
+that takes a node's memory whole, as DeepSeek-V4.1-Flash-1017
+across two Sparks on TensorFold does, leaves nothing beside it.
+A role may share a model a slot before it places. Of the equally
+strong ways to fill a slot, every one is tried, since where one
+goes decides what fits after it; the plan is the one that fills
+the slots best, in order, then fetches the least (a variant a node
+holds already is not fetched again), then moves the least (a
+placement that serves a want is kept). Ties go to the first, in the
+order of the nodes' ids, so the same fleet and wants make the same
+plan.
+
+The arrangement is the whole fleet's: a placement that serves no
+want is removed. A want that cannot be filled is listed, with why.
+
+Request body
+
+`application/json`
+
+Schema: [ArrangementWants](#schema-arrangementwants)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `pins` | array of [ArrangementPin](#schema-arrangementpin) |  |  | items ≤ 8 |
+| `roles` | array of [ArrangementRoleWant](#schema-arrangementrolewant) |  |  | items ≤ 16 |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The plan. | `application/json` [ArrangementPlan](#schema-arrangementplan) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-accounts"></a>
@@ -4331,6 +4413,175 @@ Type: object
 | `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each declares a link to the other (protocol.yaml `Link`), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
 | `variant` | string |  | The operator's choice of form, taken only if it fits; left out, the coordinator picks. |  |
 | `runtime` | string |  | The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks. |  |
+
+<a id="schema-arrangementrole"></a>
+
+### ArrangementRole
+
+A role an arrangement may ask voice to fill, from voice's role data.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `title` | string | yes |  |  |
+| `annotation` | string | yes | What the role is for, as the admin UI says it. |  |
+| `alias` | string | yes | The alias the role points at the model that fills it. |  |
+| `candidates` | array of string | yes | The recipes that can fill the role, the strongest first. |  |
+
+<a id="schema-arrangementwants"></a>
+
+### ArrangementWants
+
+What the operator wants the whole fleet for.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `pins` | array of [ArrangementPin](#schema-arrangementpin) |  |  | items ≤ 8 |
+| `roles` | array of [ArrangementRoleWant](#schema-arrangementrolewant) |  |  | items ≤ 16 |
+
+<a id="schema-arrangementpin"></a>
+
+### ArrangementPin
+
+A model on a node, or across two cabled to each other: the nodes
+named, or any. Two take the model split across them, and their
+link's latest check must have passed.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `model` | string | yes | A catalog model, or a recipe. |  |
+| `count` | integer |  | How many nodes, when none are named; 0 or left out is one, or as many as `nodes` names. | ≥ 0; ≤ 2 |
+| `nodes` | array of string |  | The nodes, the first its leader; left out for any. | items ≤ 2 |
+
+<a id="schema-arrangementrolewant"></a>
+
+### ArrangementRoleWant
+
+A role to fill.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `role` | string | yes | A role of the role data (`listArrangementRoles`). |  |
+| `priority` | integer |  | Filled in this order, 1 first; 0 or left out after those with one, in the order given. | ≥ 0 |
+| `count` | integer |  | How many placements fill it; 0 or left out is one. | ≥ 0; ≤ 8 |
+
+<a id="schema-arrangementplan"></a>
+
+### ArrangementPlan
+
+A plan for the fleet, as a diff against what is placed now. Nothing in it is carried out.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `keep` | array of [PlanKeep](#schema-plankeep) | yes |  |  |
+| `remove` | array of [PlanRemove](#schema-planremove) | yes |  |  |
+| `add` | array of [PlanAdd](#schema-planadd) | yes | In the order the plan fills its wants. |  |
+| `aliases` | array of [PlanAlias](#schema-planalias) | yes |  |  |
+| `downloads` | array of [PlanDownload](#schema-plandownload) | yes | What each node the plan adds to fetches. |  |
+| `down` | array of string | yes | The models no placement serves once the plan is carried out. |  |
+| `unmet` | array of [PlanUnmet](#schema-planunmet) | yes |  |  |
+
+<a id="schema-plankeep"></a>
+
+### PlanKeep
+
+A placement left as it is.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `placement` | string | yes |  |  |
+| `model` | string | yes |  |  |
+| `recipe` | string | yes |  |  |
+| `nodes` | array of string | yes |  |  |
+| `serves` | array of string | yes | The wants it serves. |  |
+| `reason` | string | yes |  |  |
+
+<a id="schema-planremove"></a>
+
+### PlanRemove
+
+A placement withdrawn, and why.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `placement` | string | yes |  |  |
+| `model` | string | yes |  |  |
+| `recipe` | string | yes |  |  |
+| `nodes` | array of string | yes |  |  |
+| `reason` | string | yes |  |  |
+
+<a id="schema-planadd"></a>
+
+### PlanAdd
+
+A model placed, in the form `createPlacement` would choose for it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `placement` | string | yes | The id it would be placed as. |  |
+| `model` | string | yes | The catalog model it is placed as; the recipe's id when no catalog model names the recipe yet (`in_catalog` false). |  |
+| `in_catalog` | boolean | yes |  |  |
+| `recipe` | string | yes |  |  |
+| `nodes` | array of string | yes | Its nodes, the first its leader. |  |
+| `variant` | string | yes |  |  |
+| `runtime` | string | yes |  |  |
+| `download_bytes` | integer | yes | What its nodes fetch for it, together; 0 when they hold it already. |  |
+| `serves` | array of string | yes | The wants it serves. |  |
+| `reason` | string | yes | Why it goes there, as the fit says it, what it fetches, and the link it needs. |  |
+
+<a id="schema-planalias"></a>
+
+### PlanAlias
+
+The alias a role points, at the model that fills it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `role` | string | yes |  |  |
+| `alias` | string | yes |  |  |
+| `model` | string | yes |  |  |
+
+<a id="schema-plandownload"></a>
+
+### PlanDownload
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `node` | string | yes |  |  |
+| `bytes` | integer | yes |  |  |
+
+<a id="schema-planunmet"></a>
+
+### PlanUnmet
+
+A want the plan leaves unfilled.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `want` | string | yes |  |  |
+| `reason` | string | yes |  |  |
 
 <a id="schema-nodesuggestions"></a>
 

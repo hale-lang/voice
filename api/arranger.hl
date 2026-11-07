@@ -1,0 +1,1464 @@
+// The arranger: the operator states what the whole fleet is for, and voice
+// proposes a plan, a diff against what is placed now
+// (`POST /admin/v1/arrangement-plans`). Nothing is applied: the plan is
+// read, never acted on, here.
+//
+// What the operator wants (`ArrangementWants`): pins, a model on a node or
+// across two nodes cabled to each other, named or any; and roles to fill, a
+// role a model of voice's role data can fill (catalog/roles.json, read at
+// start with `--roles`), each with a priority and a count. The role data is
+// data: which recipes can fill a role, the strongest first, and the alias
+// the role points. Nothing here knows one role from another.
+//
+// The plan is searched over the fleet (`plan_fleet`), each want a slot in
+// order: the pins as given, then the roles by priority. A slot is filled
+// with the strongest candidate that fits what the slots before it left, by
+// the fit a placement is judged by (placements.hl: `fit_recipe`,
+// `beside_problem`, `pair_problem`, `placeable_problem`), so what the plan
+// adds is what placing it would choose. Of the equally strong ways to fill
+// a slot, every one is tried, depth first, since where one goes decides
+// what fits after it; the plan kept is the one that fills the wants best,
+// slot by slot, then downloads the least (a variant a node's store holds
+// whole is not fetched again, downloads.hl), then moves the least (a placement
+// that serves a want is kept), the first found on a tie. Every list is in
+// a fixed order, so the same fleet and wants make the same plan.
+//
+// The arrangement is the whole fleet's: a placement that serves no want
+// is removed, and says so.
+
+/// A role an arrangement may ask voice to fill (`ArrangementRole`): its
+/// name, how the UI shows it, the alias it points, and the recipes that can
+/// fill it, the strongest first.
+type ArrangementRole {
+    id: String = "";
+    title: String = "";
+    annotation: String = "";
+    alias: String = "";
+    candidates: bounded[String; 32];
+}
+
+type ArrangementRoles { data: bounded[ArrangementRole; 16]; }
+
+/// Role data as read (`roles_of`): the roles, or why the file is refused.
+type RolesRead { roles: ArrangementRoles = ArrangementRoles { }; problem: String = ""; }
+
+/// The most roles the role data holds, and candidates a role names.
+const ROLES_MAX: Int = 16;
+const CANDIDATES_MAX: Int = 32;
+
+/// `ArrangementPin`: a model on `count` nodes, the ones named or any; two
+/// are a pair cabled to each other, the model split across them.
+type ArrangementPin {
+    model: String;
+    count: Int = 0;
+    nodes: bounded[String; 2];
+}
+
+/// `ArrangementRoleWant`: a role to fill, `count` times; `priority` 1 is
+/// filled first, and a role with none after those with one.
+type ArrangementRoleWant {
+    role: String;
+    priority: Int = 0;
+    count: Int = 1;
+}
+
+/// `ArrangementWants`.
+type ArrangementWants {
+    pins: bounded[ArrangementPin; 8];
+    roles: bounded[ArrangementRoleWant; 16];
+}
+
+/// `PlanKeep`: a placement left as it is, and the wants it serves.
+type PlanKeep {
+    placement: String = "";
+    model: String = "";
+    recipe: String = "";
+    nodes: bounded[String; 2];
+    serves: bounded[String; 8];
+    reason: String = "";
+}
+
+/// `PlanRemove`: a placement withdrawn, and why.
+type PlanRemove {
+    placement: String = "";
+    model: String = "";
+    recipe: String = "";
+    nodes: bounded[String; 2];
+    reason: String = "";
+}
+
+/// `PlanAdd`: a model placed, in the form placing it would choose: the id
+/// it would be placed as, its variant and runtime, what its nodes fetch.
+/// `in_catalog` false when no catalog model names the recipe yet: `model`
+/// is then the recipe's id, the model it would be added as.
+type PlanAdd {
+    placement: String = "";
+    model: String = "";
+    in_catalog: Bool = false;
+    recipe: String = "";
+    nodes: bounded[String; 2];
+    variant: String = "";
+    runtime: String = "";
+    download_bytes: Int = 0;
+    serves: bounded[String; 8];
+    reason: String = "";
+}
+
+/// `PlanAlias`: the alias a role points, at the model filling it.
+type PlanAlias { role: String = ""; alias: String = ""; model: String = ""; }
+
+/// `PlanDownload`: what a node fetches for the plan.
+type PlanDownload { node: String = ""; bytes: Int = 0; }
+
+/// `PlanUnmet`: a want the plan leaves unfilled, and why.
+type PlanUnmet { want: String = ""; reason: String = ""; }
+
+/// `ArrangementPlan`.
+type ArrangementPlan {
+    keep: bounded[PlanKeep; 64];
+    remove: bounded[PlanRemove; 64];
+    add: bounded[PlanAdd; 32];
+    aliases: bounded[PlanAlias; 16];
+    downloads: bounded[PlanDownload; 16];
+    down: bounded[String; 64];
+    unmet: bounded[PlanUnmet; 32];
+}
+
+// ---- the fleet, as the plan reads it ------------------------------------
+
+/// One node, or two a model is split across, the first its leader.
+type NodeSet { items: bounded[String; 2]; }
+
+/// A node: its capabilities and hardware as declared, and why no model can
+/// be placed on it ("" when one can).
+type ArrangeNode {
+    id: String = "";
+    capabilities: String = "";
+    hw: String = "{}";
+    problem: String = "";
+}
+
+type ArrangeNodes { items: bounded[ArrangeNode; 16]; }
+
+/// A placement now, or one a plan adds: what it holds of each of its
+/// nodes' memory for models (`Placements.held_by`, `reserve`).
+type ArrangePlaced {
+    id: String = "";
+    model: String = "";
+    recipe: String = "";
+    variant: String = "";
+    nodes: NodeSet = NodeSet { };
+    held: Int = 0;
+    // its model is served as a decision model
+    decision: Bool = false;
+}
+
+type ArrangePlacedList { items: bounded[ArrangePlaced; 64]; }
+
+/// A model a want may be filled with: its recipe, the catalog model it is
+/// placed as (the recipe's id when the catalog has none), and whether it is
+/// served as a decision model.
+type ArrangeModel {
+    model: String = "";
+    in_catalog: Bool = false;
+    decision: Bool = false;
+    recipe: Recipe = Recipe { };
+}
+
+type ArrangeModels { items: bounded[ArrangeModel; 64]; }
+
+/// A variant a node holds whole, as its store last reported
+/// (downloads.hl): placed there, it is not fetched again.
+type NodeHolding { node: String = ""; recipe: String = ""; variant: String = ""; }
+
+type NodeHoldings { items: bounded[NodeHolding; 256]; }
+
+/// What the plan is searched over.
+type ArrangeFleet {
+    nodes: ArrangeNodes = ArrangeNodes { };
+    placed: ArrangePlacedList = ArrangePlacedList { };
+    models: ArrangeModels = ArrangeModels { };
+    usable: RuntimeList = RuntimeList { };
+    checks: st::LinkCheckRows = st::LinkCheckRows { };
+    now: Time = `1970-01-01T00:00:00Z`;
+    holdings: NodeHoldings = NodeHoldings { };
+}
+
+/// A want as the search fills it: its label, the models that can fill it
+/// (`fleet.models` indices, the strongest first), and the nodes it may go
+/// on: `named`, or any `parts` (0: one node or two).
+type ArrangeSlot {
+    label: String = "";
+    pin: Bool = false;
+    role: String = "";
+    title: String = "";
+    alias: String = "";
+    candidates: bounded[Int; 32];
+    named: NodeSet = NodeSet { };
+    parts: Int = 0;
+    // a pin naming a catalog model: only that model fills it, not another
+    // of the same recipe
+    exact: Bool = false;
+    // why the want cannot be filled at all, "" when it may be
+    problem: String = "";
+}
+
+type ArrangeSlots { items: bounded[ArrangeSlot; 32]; }
+
+/// How a slot is filled.
+type ChoiceKind = enum { unmet, keep, add, share };
+
+/// One way to fill a slot: keep a placement, add one, or share another
+/// slot's; its candidate's rank, what it holds and fetches.
+type ArrangeChoice {
+    kind: ChoiceKind = ChoiceKind::unmet;
+    rank: Int = 1000;
+    model: Int = -1;
+    // keep: the placement's index in `fleet.placed`; share: the slot shared
+    placed: Int = -1;
+    shared: Int = -1;
+    nodes: NodeSet = NodeSet { };
+    // the catalog model it serves: a kept placement's own, which may be
+    // another of the same recipe than the one a role names first
+    served: String = "";
+    variant: String = "";
+    runtime: String = "";
+    // what it holds of each of its nodes' memory for models
+    held: Int = 0;
+    download: Int = 0;
+    on_disk: Bool = false;
+    reason: String = "";
+}
+
+type ArrangeOptions { items: bounded[ArrangeChoice; 48]; why: String = ""; }
+
+type ArrangePath { items: bounded[ArrangeChoice; 32]; }
+
+type OptionsStack { items: bounded[ArrangeOptions; 32]; }
+
+type Indices { items: bounded[Int; 32]; }
+
+type Whys { items: bounded[String; 32]; }
+
+type Downloads { items: bounded[PlanDownload; 16]; }
+
+/// The most ways a plan's search works out to fill a slot, all slots
+/// together.
+const SEARCH_MAX: Int = 4000;
+
+/// The rank of a slot left unfilled.
+const UNMET_RANK: Int = 1000;
+
+// ---- the role data ------------------------------------------------------
+
+/// The strings of a JSON list `raw`, one a line; `ok` false when one is not
+/// a string.
+type Strings { text: String = ""; ok: Bool = true; n: Int = 0; }
+
+@bounded_by(raw)
+fn json_strings(raw: String) -> Strings {
+    let mut out = Strings { };
+    if !std::str::starts_with(std::str::trim(raw), "[") {
+        out.ok = false;
+        return out;
+    }
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let f = std::json::string_field("{\"s\": " + it.element + "}", "s");
+        if f.kind != "string" {
+            out.ok = false;
+        } else {
+            out.text = out.text + f.text + "\n";
+            out.n = out.n + 1;
+        }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// Role data `text` (catalog/roles.json) as read: each role a slug of an id,
+/// given once, a title, a slug of an alias and at least one candidate, each
+/// a slug of a recipe's id, given once; refused whole when one is not.
+@bounded_by(text)
+fn roles_of(text: String) -> RolesRead {
+    let t = std::str::trim(text);
+    if !std::json::valid_object(t) { return RolesRead { problem: "not a JSON object" }; }
+    let raw = std::str::trim(std::json::find_field_raw(t, "roles"));
+    if !std::str::starts_with(raw, "[") { return RolesRead { problem: "`roles` is not a list" }; }
+    let mut out = ArrangementRoles { };
+    let mut it = std::json::array_first(raw);
+    let mut i = 0;
+    while !it.done {
+        let r = std::str::trim(it.element);
+        let at_i = "role " + to_string(i + 1);
+        if !std::json::valid_object(r) { return RolesRead { problem: at_i + " is not an object" }; }
+        let id = std::json::find_string_field(r, "id");
+        if !is_slug(id) {
+            return RolesRead {
+                problem: at_i
+                    + ": `id` is lowercase letters, digits and dashes, starting with a letter or digit",
+            };
+        }
+        for o in out.data {
+            if o.id == id { return RolesRead { problem: "role " + id + " is given twice" }; }
+        }
+        let title = std::json::find_string_field(r, "title");
+        if len(std::str::trim(title)) == 0 {
+            return RolesRead { problem: "role " + id + " has no `title`" };
+        }
+        let alias = std::json::find_string_field(r, "alias");
+        if !is_slug(alias) {
+            return RolesRead {
+                problem: "role " + id
+                    + ": `alias` is lowercase letters, digits and dashes, starting with a letter or digit",
+            };
+        }
+        let cs = json_strings(std::json::find_field_raw(r, "candidates"));
+        if !cs.ok || cs.n == 0 {
+            return RolesRead {
+                problem: "role " + id
+                    + ": `candidates` lists the recipes that can fill it, at least one",
+            };
+        }
+        if cs.n > CANDIDATES_MAX {
+            return RolesRead {
+                problem: "role " + id + " names more than " + to_string(CANDIDATES_MAX)
+                    + " candidates",
+            };
+        }
+        let mut role = ArrangementRole {
+            id: id,
+            title: title,
+            annotation: std::json::find_string_field(r, "annotation"),
+            alias: alias,
+        };
+        let mut rest = cs.text;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let c = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            if !slug(c, ".-", true) {
+                return RolesRead {
+                    problem: "role " + id + ": candidate " + c + " is not a recipe's id",
+                };
+            }
+            for x in role.candidates {
+                if x == c {
+                    return RolesRead { problem: "role " + id + " names candidate " + c + " twice" };
+                }
+            }
+            push(role.candidates, c) or discard;
+        }
+        if count(out.data) >= ROLES_MAX {
+            return RolesRead { problem: "more than " + to_string(ROLES_MAX) + " roles" };
+        }
+        push(out.data, role) or discard;
+        i = i + 1;
+        it = std::json::array_next(it);
+    }
+    return RolesRead { roles: out };
+}
+
+/// The role `id` of `roles`, `id` "" when there is none.
+fn role_named(roles: ArrangementRoles, id: String) -> ArrangementRole {
+    for r in roles.data {
+        if r.id == id { return r; }
+    }
+    return ArrangementRole { };
+}
+
+/// The roles' ids, as a refusal lists them.
+fn role_ids(roles: ArrangementRoles) -> String {
+    let out = st::JsonList { };
+    for r in roles.data {
+        out.add(r.id);
+    }
+    return out.text();
+}
+
+// ---- the slots ----------------------------------------------------------
+
+/// The index of model `id` in `f.models`: the catalog model of that id,
+/// or else the first model of recipe `id`; -1 for none.
+fn model_index(f: ArrangeFleet, id: String) -> Int {
+    let exact = model_exact(f, id);
+    if exact >= 0 { return exact; }
+    let mut i = 0;
+    for m in f.models.items {
+        if m.recipe.id == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The index of catalog model `id` itself in `f.models`, -1 for none: a
+/// model of the same recipe is not it, since requests are routed by model.
+fn model_exact(f: ArrangeFleet, id: String) -> Int {
+    let mut i = 0;
+    for m in f.models.items {
+        if m.model == id { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// Node `id` of `f`, `id` "" for none.
+fn node_of(f: ArrangeFleet, id: String) -> ArrangeNode {
+    for n in f.nodes.items {
+        if n.id == id { return n; }
+    }
+    return ArrangeNode { };
+}
+
+/// `nodes` as a `NodeSet`.
+fn node_set(nodes: bounded[String; 2]) -> NodeSet {
+    let mut out = NodeSet { };
+    for n in nodes {
+        push(out.items, n) or discard;
+    }
+    return out;
+}
+
+/// Nodes as a reason names them.
+fn nodes_said(nodes: NodeSet) -> String {
+    if count(nodes.items) == 2 {
+        return (at(nodes.items, 0) or "") + " and " + (at(nodes.items, 1) or "");
+    }
+    return at(nodes.items, 0) or "";
+}
+
+/// The wants as slots, in the order they are filled: the pins as given,
+/// then each role's units by priority (1 first, none last), in the order
+/// given on a tie. The wants are checked first (`check_wants`).
+fn slots_of(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> ArrangeSlots {
+    let mut out = ArrangeSlots { };
+    for p in w.pins {
+        let named = node_set(p.nodes);
+        let parts = if count(p.nodes) > 0 {
+            count(p.nodes)
+        } else if p.count > 0 {
+            p.count
+        } else {
+            1
+        };
+        let mut s = ArrangeSlot {
+            label: "pin " + p.model + " on " + (
+                if count(p.nodes) > 0 {
+                    nodes_said(named)
+                } else if parts == 2 {
+                    "two linked nodes"
+                } else {
+                    "a node"
+                }
+            ),
+            pin: true,
+            named: named,
+            parts: parts,
+        };
+        let m = model_index(f, p.model);
+        if m < 0 {
+            s.problem = "voice has no model or recipe " + p.model;
+        } else {
+            push(s.candidates, m) or discard;
+            let named = at(f.models.items, m) or ArrangeModel { };
+            s.exact = named.in_catalog && named.model == p.model;
+        }
+        push(out.items, s) or discard;
+    }
+    // the roles by priority: 1 first, none last, the order given on a tie
+    let mut taken = 0;
+    let wanted = count(w.roles);
+    let mut done = "\n";
+    while taken < wanted {
+        let mut best = -1;
+        let mut best_p = 0;
+        let mut i = 0;
+        for r in w.roles {
+            let p = if r.priority > 0 { r.priority } else { 1000000 };
+            if !std::str::contains(done, "\n" + to_string(i) + "\n") && (best < 0 || p < best_p) {
+                best = i;
+                best_p = p;
+            }
+            i = i + 1;
+        }
+        done = done + to_string(best) + "\n";
+        taken = taken + 1;
+        let r = at(w.roles, best) or ArrangementRoleWant { role: "" };
+        let role = role_named(roles, r.role);
+        let units = if r.count > 0 { r.count } else { 1 };
+        let mut u = 0;
+        while u < units {
+            let mut s = ArrangeSlot {
+                label: if u == 0 { r.role } else { r.role + " " + to_string(u + 1) },
+                role: r.role,
+                title: role.title,
+                alias: role.alias,
+            };
+            for c in role.candidates {
+                let m = model_index(f, c);
+                if m >= 0 { push(s.candidates, m) or discard; }
+            }
+            if count(s.candidates) == 0 {
+                s.problem = "voice has none of the recipes that can fill " + r.role + " ("
+                    + role_candidates(role) + ")";
+            }
+            push(out.items, s) or discard;
+            u = u + 1;
+        }
+    }
+    return out;
+}
+
+/// A role's candidates, as a reason lists them.
+fn role_candidates(r: ArrangementRole) -> String {
+    let out = st::JsonList { };
+    for c in r.candidates {
+        out.add(c);
+    }
+    return out.text();
+}
+
+/// Why wants `w` cannot be planned on `f` with `roles`, "" when they can:
+/// each pin names a model, on one node or two, named nodes known and given
+/// once; each role is one the role data has, wanted once, 1 to 8 of it; at
+/// most 32 wants in all.
+fn check_wants(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> String {
+    let mut slots = 0;
+    for p in w.pins {
+        if len(p.model) == 0 { return "a pin names its `model`"; }
+        if p.count < 0 || p.count > 2 {
+            return "pin " + p.model
+                + ": `count` is 1, a node, or 2, two nodes cabled to each other";
+        }
+        if count(p.nodes) > 0 && p.count > 0 && p.count != count(p.nodes) {
+            return "pin " + p.model + " names " + to_string(count(p.nodes))
+                + " nodes and a `count` of " + to_string(p.count);
+        }
+        if count(p.nodes) == 2 && (at(p.nodes, 0) or "") == (at(p.nodes, 1) or "") {
+            return "pin " + p.model + " names node " + (at(p.nodes, 0) or "") + " twice";
+        }
+        for n in p.nodes {
+            if len(node_of(f, n).id) == 0 { return "pin " + p.model + ": no node " + n; }
+        }
+        slots = slots + 1;
+    }
+    let mut seen = "\n";
+    for r in w.roles {
+        let role = role_named(roles, r.role);
+        if len(role.id) == 0 {
+            return "no role " + r.role + ": the roles are " + role_ids(roles);
+        }
+        if std::str::contains(seen, "\n" + r.role + "\n") {
+            return "role " + r.role + " is wanted twice: give it a `count`";
+        }
+        seen = seen + r.role + "\n";
+        if r.count < 0 || r.count > 8 { return "role " + r.role + ": `count` is 1 to 8"; }
+        if r.priority < 0 { return "role " + r.role + ": `priority` is 1 or more, 1 first"; }
+        slots = slots + (if r.count > 0 { r.count } else { 1 });
+    }
+    if slots > 32 { return "an arrangement wants at most 32 placements"; }
+    return "";
+}
+
+// ---- the search ---------------------------------------------------------
+
+/// The placements now of `kept` (indices in `fleet.placed`).
+fn kept_list(f: ArrangeFleet, kept: Indices) -> ArrangePlacedList {
+    let mut out = ArrangePlacedList { };
+    for i in kept.items {
+        push(out.items, at(f.placed.items, i) or ArrangePlaced { }) or discard;
+    }
+    return out;
+}
+
+/// What is placed once `path` (its slots before `upto`) is: the placements
+/// kept (`base`) and those it adds, each holding its nodes' memory.
+fn placed_by(
+    f: ArrangeFleet,
+    base: ArrangePlacedList,
+    path: ArrangePath,
+    upto: Int
+) -> ArrangePlacedList {
+    let mut out = base;
+    let mut i = 0;
+    while i < upto {
+        let c = at(path.items, i) or ArrangeChoice { };
+        if c.kind == ChoiceKind::add {
+            let m = at(f.models.items, c.model) or ArrangeModel { };
+            push(
+                out.items,
+                ArrangePlaced {
+                    id: "the plan's " + m.model,
+                    model: m.model,
+                    recipe: m.recipe.id,
+                    variant: c.variant,
+                    nodes: c.nodes,
+                    held: c.held,
+                },
+            ) or discard;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// True when `nodes` holds node `n`.
+fn in_set(nodes: NodeSet, n: String) -> Bool {
+    for x in nodes.items {
+        if x == n { return true; }
+    }
+    return false;
+}
+
+/// What `placed` holds of node `n`'s memory for models.
+fn held_on(placed: ArrangePlacedList, n: String) -> Int {
+    let mut held = 0;
+    for p in placed.items {
+        if in_set(p.nodes, n) { held = held + p.held; }
+    }
+    return held;
+}
+
+/// Why model `model` cannot go on `nodes` beside `placed`, "" when it can
+/// (`beside_problem`).
+fn beside_placed(placed: ArrangePlacedList, model: String, nodes: NodeSet) -> String {
+    for p in placed.items {
+        for n in nodes.items {
+            if in_set(p.nodes, n) {
+                let why = beside_problem(
+                    model,
+                    count(nodes.items),
+                    p.id,
+                    p.model,
+                    count(p.nodes.items) > 1,
+                    n,
+                );
+                if len(why) > 0 { return why; }
+            }
+        }
+    }
+    return "";
+}
+
+/// True when node `n` holds variant `variant` of `recipe` whole already,
+/// as its store last reported (`fleet.holdings`).
+fn holds_variant(f: ArrangeFleet, n: String, recipe: String, variant: String) -> Bool {
+    for h in f.holdings.items {
+        if h.node == n && h.recipe == recipe && h.variant == variant { return true; }
+    }
+    return false;
+}
+
+/// What variant `variant` of `m` fetches to `nodes` (to node `only` of
+/// them, when not ""): each node's (`fetched_bytes`), but for a node that
+/// holds it whole already. What a prepare step makes is made there, not
+/// fetched.
+fn fetch_of(
+    f: ArrangeFleet,
+    m: ArrangeModel,
+    variant: String,
+    nodes: NodeSet,
+    only: String
+) -> Int {
+    let v = variant_body_of(m.recipe.variants.text, variant);
+    let mut fetch = 0;
+    for n in nodes.items {
+        if (len(only) == 0 || n == only) && !holds_variant(f, n, m.recipe.id, variant) {
+            fetch = fetch + fetched_bytes(v);
+        }
+    }
+    return fetch;
+}
+
+/// The node sets slot `s` may go on, each a line of `a` or `a\tb`: its
+/// named nodes; else every node, and every pair, in the fleet's order.
+fn node_sets(f: ArrangeFleet, s: ArrangeSlot) -> String {
+    if count(s.named.items) == 2 {
+        return (at(s.named.items, 0) or "") + "\t" + (at(s.named.items, 1) or "") + "\n";
+    }
+    if count(s.named.items) == 1 { return (at(s.named.items, 0) or "") + "\n"; }
+    let mut out = "";
+    if s.parts != 2 {
+        for n in f.nodes.items {
+            out = out + n.id + "\n";
+        }
+    }
+    if s.parts != 1 {
+        let mut i = 0;
+        while i < count(f.nodes.items) {
+            let a = at(f.nodes.items, i) or ArrangeNode { };
+            let mut j = i + 1;
+            while j < count(f.nodes.items) {
+                let b = at(f.nodes.items, j) or ArrangeNode { };
+                out = out + a.id + "\t" + b.id + "\n";
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    return out;
+}
+
+/// A node set's line as nodes.
+fn set_nodes(line: String) -> NodeSet {
+    let mut out = NodeSet { };
+    let tab = std::str::index_of(line, "\t");
+    if tab < 0 {
+        push(out.items, line) or discard;
+    } else {
+        push(out.items, line[0..tab]) or discard;
+        push(out.items, line[(tab + 1)..len(line)]) or discard;
+    }
+    return out;
+}
+
+/// Why no model can go on `nodes` together, "" when one may: each can take
+/// a model, and across two, the pair can (`pair_problem`).
+fn set_problem(f: ArrangeFleet, nodes: NodeSet) -> String {
+    for n in nodes.items {
+        let x = node_of(f, n);
+        if len(x.problem) > 0 { return x.problem; }
+    }
+    if count(nodes.items) < 2 { return ""; }
+    let a = node_of(f, at(nodes.items, 0) or "");
+    let b = node_of(f, at(nodes.items, 1) or "");
+    return pair_problem(a.id, a.capabilities, a.hw, b.id, b.capabilities, b.hw, f.checks, f.now);
+}
+
+/// The reason of the variant voice picks; or, when none fits, of the first
+/// that has a runtime there (what keeps it off), else of the first.
+fn fit_said(fit: PlacementFit) -> String {
+    if fit.judged.best >= 0 {
+        let chosen = at(fit.judged.fit, fit.judged.best) or VariantFit { };
+        return chosen.reason;
+    }
+    for v in fit.judged.fit {
+        if v.has_runtime { return v.variant + ": " + v.reason; }
+    }
+    let first = at(fit.judged.fit, 0) or VariantFit { };
+    return first.variant + ": " + first.reason;
+}
+
+/// The ways to fill slot `si` after the slots before it took `path`: of its
+/// candidates, the strongest that has one, every way that one has (shared
+/// with another slot, a placement kept, or added on a node set it fits),
+/// those that move and fetch least first; or, when none has, the slot left
+/// unmet and why.
+fn options(
+    f: ArrangeFleet,
+    slots: ArrangeSlots,
+    si: Int,
+    path: ArrangePath,
+    kept: Indices,
+    base: ArrangePlacedList
+) -> ArrangeOptions {
+    let s = at(slots.items, si) or ArrangeSlot { };
+    let mut out = ArrangeOptions { };
+    if len(s.problem) > 0 {
+        push(out.items, ArrangeChoice { reason: s.problem }) or discard;
+        out.why = s.problem;
+        return out;
+    }
+    let placed = placed_by(f, base, path, si);
+    let sets = node_sets(f, s);
+    let mut why = "";
+    let mut rank = 0;
+    for m in s.candidates {
+        let model = at(f.models.items, m) or ArrangeModel { };
+        let mut found = ArrangeOptions { };
+        // a role may share a model another slot places, one no unit of the
+        // same role holds
+        if !s.pin {
+            let mut t = 0;
+            while t < si {
+                let c = at(path.items, t) or ArrangeChoice { };
+                let ts = at(slots.items, t) or ArrangeSlot { };
+                if (c.kind == ChoiceKind::keep || c.kind == ChoiceKind::add) && c.model == m
+                    && !held_by_role(slots, path, si, t, s.role)
+                {
+                    push(
+                        found.items,
+                        ArrangeChoice {
+                            kind: ChoiceKind::share,
+                            rank: rank,
+                            model: m,
+                            shared: t,
+                            nodes: c.nodes,
+                            served: c.served,
+                            variant: c.variant,
+                            runtime: c.runtime,
+                            on_disk: true,
+                            reason: "shares " + ts.label + "'s " + c.served,
+                        },
+                    ) or discard;
+                }
+                t = t + 1;
+            }
+        }
+        // a placement now that serves it, on nodes it may go on, of those
+        // the search keeps (held from the start, in `base`)
+        let mut pi = 0;
+        for p in f.placed.items {
+            if serves_slot(s, model, p) && !kept_in(path, si, pi) && in_indices(kept, pi) {
+                {
+                    push(
+                        found.items,
+                        ArrangeChoice {
+                            kind: ChoiceKind::keep,
+                            rank: rank,
+                            model: m,
+                            placed: pi,
+                            nodes: p.nodes,
+                            served: p.model,
+                            variant: p.variant,
+                            held: p.held,
+                            on_disk: true,
+                            reason: "placed as " + p.id,
+                        },
+                    ) or discard;
+                }
+            }
+            pi = pi + 1;
+        }
+        // added, on each node set it fits
+        let mut rest = sets;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let nodes = set_nodes(rest[0..nl]);
+            rest = rest[(nl + 1)..len(rest)];
+            let mut no = set_problem(f, nodes);
+            if len(no) == 0 { no = beside_placed(placed, model.model, nodes); }
+            if len(no) == 0 {
+                let mut j = Judging { };
+                let mut ni = 0;
+                for n in nodes.items {
+                    j = judging_add(j, n, node_of(f, n).hw, held_on(placed, n));
+                    // less what the slots before it put on its disk
+                    set(
+                        j.disk,
+                        ni,
+                        (at(j.disk, ni) or 0) - disk_planned(f, path, si, n),
+                    ) or discard;
+                    ni = ni + 1;
+                }
+                let fit = fit_recipe(model.recipe, j, f.usable, model.decision);
+                if fit.judged.best >= 0 {
+                    let fetch = fetch_of(f, model, fit.variant, nodes, "");
+                    push(
+                        found.items,
+                        ArrangeChoice {
+                            kind: ChoiceKind::add,
+                            rank: rank,
+                            model: m,
+                            nodes: nodes,
+                            served: model.model,
+                            variant: fit.variant,
+                            runtime: fit.runtime,
+                            held: footprint(fit.reserved_bytes),
+                            download: fetch,
+                            on_disk: fetch == 0,
+                            reason: fit_said(fit),
+                        },
+                    ) or discard;
+                } else {
+                    no = fit_said(fit);
+                }
+            }
+            if len(no) > 0 && rank == 0 {
+                why = why + (if len(why) > 0 { "; " } else { "" }) + nodes_said(nodes) + ": " + no;
+            }
+        }
+        if count(found.items) > 0 { return cheapest_first(found); }
+        rank = rank + 1;
+    }
+    let first = at(f.models.items, at(s.candidates, 0) or - 1) or ArrangeModel { };
+    if len(why) == 0 { why = "the fleet has no node to put it on"; }
+    let said = if s.pin {
+        first.model + " fits no nodes it may go on: " + why
+    } else {
+        "no node has room for a " + s.role + " after the wants before it (" + first.model
+            + ", the strongest: " + why + ")"
+    };
+    push(out.items, ArrangeChoice { rank: UNMET_RANK, reason: said }) or discard;
+    out.why = said;
+    return out;
+}
+
+/// True when slot `t`'s placement is a slot of role `role`'s, or shared by
+/// one before slot `si`.
+fn held_by_role(slots: ArrangeSlots, path: ArrangePath, si: Int, t: Int, role: String) -> Bool {
+    let ts = at(slots.items, t) or ArrangeSlot { };
+    if ts.role == role { return true; }
+    let mut i = 0;
+    while i < si {
+        let c = at(path.items, i) or ArrangeChoice { };
+        let s = at(slots.items, i) or ArrangeSlot { };
+        if c.kind == ChoiceKind::share && c.shared == t && s.role == role { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// True when a slot before `si` kept placement `pi`.
+fn kept_in(path: ArrangePath, si: Int, pi: Int) -> Bool {
+    let mut i = 0;
+    while i < si {
+        let c = at(path.items, i) or ArrangeChoice { };
+        if c.kind == ChoiceKind::keep && c.placed == pi { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// True when placement `p` serves slot `s` as candidate `model` would: of
+/// its recipe and served as it is (a decision model or not), on nodes the
+/// slot may go on; for a pin naming a catalog model, that model itself,
+/// since requests are routed by model.
+fn serves_slot(s: ArrangeSlot, model: ArrangeModel, p: ArrangePlaced) -> Bool {
+    if p.recipe != model.recipe.id || p.decision != model.decision { return false; }
+    if s.exact && p.model != model.model { return false; }
+    return fits_slot(s, p.nodes);
+}
+
+/// What the slots of `path` before `upto` put on node `n`'s disk: each
+/// add's files there (`disk_need`, its rank's), but for a variant the node
+/// holds whole already. A removal leaves its files on the disk.
+fn disk_planned(f: ArrangeFleet, path: ArrangePath, upto: Int, n: String) -> Int {
+    let mut used = 0;
+    let mut i = 0;
+    while i < upto {
+        let c = at(path.items, i) or ArrangeChoice { };
+        if c.kind == ChoiceKind::add {
+            let m = at(f.models.items, c.model) or ArrangeModel { };
+            let mut rank = 0;
+            for x in c.nodes.items {
+                if x == n && !holds_variant(f, n, m.recipe.id, c.variant) {
+                    used = used
+                        + disk_need(variant_body_of(m.recipe.variants.text, c.variant), rank);
+                }
+                rank = rank + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return used;
+}
+
+/// True when slot `s` may be on `nodes`: its named nodes, as a set, or as
+/// many as it takes.
+fn fits_slot(s: ArrangeSlot, nodes: NodeSet) -> Bool {
+    if count(s.named.items) > 0 {
+        if count(s.named.items) != count(nodes.items) { return false; }
+        for n in s.named.items {
+            if !in_set(nodes, n) { return false; }
+        }
+        return true;
+    }
+    return s.parts == 0 || s.parts == count(nodes.items);
+}
+
+/// The order a choice is tried in, of equally strong ones: shared, kept,
+/// added.
+fn kind_order(c: ArrangeChoice) -> Int {
+    if c.kind == ChoiceKind::share { return 0; }
+    if c.kind == ChoiceKind::keep { return 1; }
+    return 2;
+}
+
+/// `o`'s choices, those that move and fetch least first, else in their
+/// order.
+fn cheapest_first(o: ArrangeOptions) -> ArrangeOptions {
+    let mut rest = o;
+    let mut out = ArrangeOptions { why: o.why };
+    while count(rest.items) > 0 {
+        let mut best = 0;
+        let mut i = 1;
+        while i < count(rest.items) {
+            let x = at(rest.items, i) or ArrangeChoice { };
+            let b = at(rest.items, best) or ArrangeChoice { };
+            if kind_order(x) < kind_order(b)
+                || (kind_order(x) == kind_order(b) && x.download < b.download)
+            {
+                best = i;
+            }
+            i = i + 1;
+        }
+        push(out.items, at(rest.items, best) or ArrangeChoice { }) or discard;
+        let mut left = ArrangeOptions { };
+        i = 0;
+        while i < count(rest.items) {
+            if i != best { push(left.items, at(rest.items, i) or ArrangeChoice { }) or discard; }
+            i = i + 1;
+        }
+        rest = left;
+    }
+    return out;
+}
+
+/// What a complete path costs: what it fetches, and its moves, the
+/// placements it adds and those it removes.
+type PathCost { download: Int = 0; moves: Int = 0; }
+
+fn path_cost(f: ArrangeFleet, path: ArrangePath) -> PathCost {
+    let mut out = PathCost { };
+    let mut kept = 0;
+    for c in path.items {
+        out.download = out.download + c.download;
+        if c.kind == ChoiceKind::add { out.moves = out.moves + 1; }
+        if c.kind == ChoiceKind::keep { kept = kept + 1; }
+    }
+    out.moves = out.moves + count(f.placed.items) - kept;
+    return out;
+}
+
+/// -1 when `a` fills the slots before `upto` better than `b` (at the first
+/// slot they differ in, with a stronger candidate), 1 when worse, 0 when as
+/// well.
+fn ranks_compare(a: ArrangePath, b: ArrangePath, upto: Int) -> Int {
+    let mut i = 0;
+    while i < upto {
+        let x = at(a.items, i) or ArrangeChoice { };
+        let y = at(b.items, i) or ArrangeChoice { };
+        if x.rank < y.rank { return -1; }
+        if x.rank > y.rank { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// The search's result: the best path, and why each slot of it is filled
+/// as it is or left unmet; `tried`, the slots' ways worked out.
+type Searched {
+    path: ArrangePath = ArrangePath { };
+    whys: Whys = Whys { };
+    found: Bool = false;
+    cost: PathCost = PathCost { };
+    tried: Int = 0;
+}
+
+/// The most placements now a search weighs keeping, every set of them
+/// tried: of more that could serve a want, those past the first are not.
+const KEEPABLE_MAX: Int = 6;
+
+/// True when `xs` holds `i`.
+fn in_indices(xs: Indices, i: Int) -> Bool {
+    for x in xs.items {
+        if x == i { return true; }
+    }
+    return false;
+}
+
+/// The placements now (indices in `f.placed`) that could serve a slot of
+/// `slots`: one of its candidates, on nodes it may go on; at most
+/// `KEEPABLE_MAX`, in their order.
+fn keepable(f: ArrangeFleet, slots: ArrangeSlots) -> Indices {
+    let mut out = Indices { };
+    let mut pi = 0;
+    for p in f.placed.items {
+        let mut serves = false;
+        for s in slots.items {
+            for m in s.candidates {
+                let model = at(f.models.items, m) or ArrangeModel { };
+                if serves_slot(s, model, p) { serves = true; }
+            }
+        }
+        if serves && count(out.items) < KEEPABLE_MAX { push(out.items, pi) or discard; }
+        pi = pi + 1;
+    }
+    return out;
+}
+
+/// The best way to fill `slots` on `f`. Every set of the placements now
+/// that could serve a want (`keepable`) is tried as kept, the largest
+/// first, held from the start as they would be, since what is kept stays
+/// while the rest is placed around it; a path that keeps one of the set
+/// for no slot is not taken, another set covering it without. For each,
+/// depth first: at each slot every way its strongest fitting candidate has
+/// (`options`). A path is kept over the best so far when it fills the
+/// slots better, in order, or as well and fetches less, or as much and
+/// moves less; a branch that already fills a slot worse than the best is
+/// not followed. At most `SEARCH_MAX` slots' ways are worked out; the best
+/// found by then is the plan.
+fn search(f: ArrangeFleet, slots: ArrangeSlots) -> Searched {
+    let mut best = Searched { };
+    if count(slots.items) == 0 { return best; }
+    let can = keepable(f, slots);
+    let mut sets = 1;
+    for c in can.items {
+        sets = sets * 2;
+    }
+    // the empty set first, whose first path down is always complete, so
+    // the search never comes back without a plan; then the largest first
+    let mut k = 0;
+    while k < sets && (k == 0 || best.tried < SEARCH_MAX) {
+        let mask = if k == 0 { 0 } else { sets - k };
+        // the set `mask` names, its bits `can`'s placements
+        let mut kept = Indices { };
+        let mut bits = mask;
+        for c in can.items {
+            if bits % 2 == 1 { push(kept.items, c) or discard; }
+            bits = bits / 2;
+        }
+        let next = search_kept(f, slots, kept, best);
+        if next.found {
+            best = next;
+        } else {
+            best.tried = next.tried;
+        }
+        k = k + 1;
+    }
+    return best;
+}
+
+/// The best path that keeps the placements of `kept`, held from the start,
+/// searched depth first (`search`), if it is better than `bar`, the best
+/// so far; `found` false when none is. `tried` counts on from `bar`'s.
+fn search_kept(f: ArrangeFleet, slots: ArrangeSlots, kept: Indices, bar: Searched) -> Searched {
+    let n = count(slots.items);
+    let base = kept_list(f, kept);
+    let mut out = Searched { tried: bar.tried };
+    let mut best_path = ArrangePath { };
+    let mut best_whys = Whys { };
+    let mut path = ArrangePath { };
+    let mut stack = OptionsStack { };
+    let mut idx = Indices { };
+    let mut whys = Whys { };
+    let mut i = 0;
+    while i < n {
+        push(path.items, ArrangeChoice { }) or discard;
+        push(stack.items, ArrangeOptions { }) or discard;
+        push(idx.items, 0) or discard;
+        push(whys.items, "") or discard;
+        i = i + 1;
+    }
+    out.tried = out.tried + 1;
+    set(stack.items, 0, options(f, slots, 0, path, kept, base)) or discard;
+    let mut d = 0;
+    while d >= 0 {
+        let o = at(stack.items, d) or ArrangeOptions { };
+        let x = at(idx.items, d) or 0;
+        if x >= count(o.items) {
+            d = d - 1;
+            if d >= 0 { set(idx.items, d, (at(idx.items, d) or 0) + 1) or discard; }
+            continue;
+        }
+        set(path.items, d, at(o.items, x) or ArrangeChoice { }) or discard;
+        set(whys.items, d, o.why) or discard;
+        let worse = (out.found && ranks_compare(path, best_path, d + 1) > 0)
+            || (bar.found && ranks_compare(path, bar.path, d + 1) > 0);
+        if worse {
+            set(idx.items, d, x + 1) or discard;
+            continue;
+        }
+        if d + 1 == n {
+            if keeps_all(path, kept) && (!out.found || better_than(f, path, best_path, out.cost))
+                && better(f, path, bar)
+            {
+                out.found = true;
+                out.cost = path_cost(f, path);
+                best_path = path;
+                best_whys = whys;
+            }
+            set(idx.items, d, x + 1) or discard;
+            continue;
+        }
+        if out.tried >= SEARCH_MAX { break; }
+        out.tried = out.tried + 1;
+        set(stack.items, d + 1, options(f, slots, d + 1, path, kept, base)) or discard;
+        set(idx.items, d + 1, 0) or discard;
+        d = d + 1;
+    }
+    out.path = best_path;
+    out.whys = best_whys;
+    return out;
+}
+
+/// True when complete path `path` is better than `best`'s: it fills the
+/// slots better, in order, or as well and fetches less, or as much and
+/// moves less; any path, when there is no best yet.
+fn better(f: ArrangeFleet, path: ArrangePath, best: Searched) -> Bool {
+    if !best.found { return true; }
+    return better_than(f, path, best.path, best.cost);
+}
+
+/// True when complete path `path` is better than `best`, which costs
+/// `cost` (`better`).
+fn better_than(f: ArrangeFleet, path: ArrangePath, best: ArrangePath, cost: PathCost) -> Bool {
+    let r = ranks_compare(path, best, count(path.items));
+    if r != 0 { return r < 0; }
+    let mine = path_cost(f, path);
+    if mine.download != cost.download { return mine.download < cost.download; }
+    return mine.moves < cost.moves;
+}
+
+/// True when `path` keeps every placement of `kept`.
+fn keeps_all(path: ArrangePath, kept: Indices) -> Bool {
+    for i in kept.items {
+        let mut used = false;
+        for c in path.items {
+            if c.kind == ChoiceKind::keep && c.placed == i { used = true; }
+        }
+        if !used { return false; }
+    }
+    return true;
+}
+
+// ---- the plan -------------------------------------------------------------
+
+/// The plan for wants `w` on fleet `f`, with the role data `roles`: the
+/// search's best path as a diff against what is placed now. `w` is checked
+/// first (`check_wants`).
+fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> ArrangementPlan {
+    let slots = slots_of(f, w, roles);
+    let found = search(f, slots);
+    let path = found.path;
+    let mut out = ArrangementPlan { };
+    // no path found (which the search's order rules out): every want is
+    // said unmet, and nothing is kept, removed or added on no search
+    if count(slots.items) > 0 && !found.found {
+        for s in slots.items {
+            push(
+                out.unmet,
+                PlanUnmet {
+                    want: s.label,
+                    reason: "voice found no complete plan within its search: plan fewer wants at once",
+                },
+            ) or discard;
+        }
+        return out;
+    }
+    // the placements now: kept when a slot keeps one, else removed
+    let mut pi = 0;
+    for p in f.placed.items {
+        let mut serves = Whys { };
+        let mut si = 0;
+        for c in path.items {
+            let s = at(slots.items, si) or ArrangeSlot { };
+            if c.kind == ChoiceKind::keep && c.placed == pi {
+                push(serves.items, s.label) or discard;
+            }
+            if c.kind == ChoiceKind::share {
+                let t = at(path.items, c.shared) or ArrangeChoice { };
+                if t.kind == ChoiceKind::keep && t.placed == pi {
+                    push(serves.items, s.label) or discard;
+                }
+            }
+            si = si + 1;
+        }
+        if count(serves.items) > 0 {
+            let mut keep = PlanKeep {
+                placement: p.id,
+                model: p.model,
+                recipe: p.recipe,
+                reason: "serves " + listed(serves) + " as it is placed: nothing moves",
+            };
+            for n in p.nodes.items {
+                push(keep.nodes, n) or discard;
+            }
+            for x in serves.items {
+                push(keep.serves, x) or discard;
+            }
+            push(out.keep, keep) or discard;
+        } else {
+            let mut taken = "";
+            for n in p.nodes.items {
+                let mut ai = 0;
+                for c in path.items {
+                    let s = at(slots.items, ai) or ArrangeSlot { };
+                    if c.kind == ChoiceKind::add && len(taken) == 0 && in_set(c.nodes, n) {
+                        taken = "; its room on " + n + " goes to " + s.label;
+                    }
+                    ai = ai + 1;
+                }
+            }
+            let mut r = PlanRemove {
+                placement: p.id,
+                model: p.model,
+                recipe: p.recipe,
+                reason: "serves none of the arrangement's wants" + taken,
+            };
+            for n in p.nodes.items {
+                push(r.nodes, n) or discard;
+            }
+            push(out.remove, r) or discard;
+        }
+        pi = pi + 1;
+    }
+    // what is added, in the order its slots are filled, and what each
+    // node fetches for it
+    let mut downloads = Downloads { };
+    let mut si = 0;
+    for c in path.items {
+        let s = at(slots.items, si) or ArrangeSlot { };
+        if c.kind == ChoiceKind::add {
+            let m = at(f.models.items, c.model) or ArrangeModel { };
+            let mut a = PlanAdd {
+                placement: placement_id(m.model, c.nodes),
+                model: m.model,
+                in_catalog: m.in_catalog,
+                recipe: m.recipe.id,
+                variant: c.variant,
+                runtime: c.runtime,
+                download_bytes: c.download,
+                reason: "fits: " + c.reason + "; "
+                    + (
+                        if c.on_disk {
+                            "already on disk"
+                        } else {
+                            "fetches " + gb(c.download)
+                        }
+                    )
+                    + (
+                        if count(c.nodes.items) == 2 {
+                            "; needs the " + (at(c.nodes.items, 0) or "") + "–"
+                                + (at(c.nodes.items, 1) or "")
+                                + " link, which is checked"
+                        } else {
+                            ""
+                        }
+                    ),
+            };
+            for n in c.nodes.items {
+                push(a.nodes, n) or discard;
+                downloads = downloads_add(downloads, n, fetch_of(f, m, c.variant, c.nodes, n));
+            }
+            push(a.serves, s.label) or discard;
+            let mut ti = 0;
+            for t in path.items {
+                let ts = at(slots.items, ti) or ArrangeSlot { };
+                if t.kind == ChoiceKind::share && t.shared == si {
+                    push(a.serves, ts.label) or discard;
+                }
+                ti = ti + 1;
+            }
+            push(out.add, a) or discard;
+        }
+        // the alias the role points, at its first unit's model
+        if len(s.alias) > 0 && c.kind != ChoiceKind::unmet && !aliased(out, s.role) {
+            push(
+                out.aliases,
+                PlanAlias { role: s.role, alias: s.alias, model: c.served },
+            ) or discard;
+        }
+        if c.kind == ChoiceKind::unmet {
+            let why = at(found.whys.items, si) or "";
+            push(
+                out.unmet,
+                PlanUnmet { want: s.label, reason: if len(why) > 0 { why } else { c.reason } },
+            ) or discard;
+        }
+        si = si + 1;
+    }
+    for d in downloads.items {
+        push(out.downloads, d) or discard;
+    }
+    // the models no placement serves once the plan is carried out
+    let mut kept = Indices { };
+    for c in path.items {
+        if c.kind == ChoiceKind::keep { push(kept.items, c.placed) or discard; }
+    }
+    let after = placed_by(f, kept_list(f, kept), path, count(path.items));
+    for r in out.remove {
+        let mut still = false;
+        for p in after.items {
+            if p.model == r.model { still = true; }
+        }
+        for d in out.down {
+            if d == r.model { still = true; }
+        }
+        if !still { push(out.down, r.model) or discard; }
+    }
+    return out;
+}
+
+/// Labels, as a reason lists them.
+fn listed(w: Whys) -> String {
+    let out = st::JsonList { };
+    for s in w.items {
+        out.add(s);
+    }
+    return out.text();
+}
+
+/// True when plan `p` points role `role`'s alias already.
+fn aliased(p: ArrangementPlan, role: String) -> Bool {
+    for a in p.aliases {
+        if a.role == role { return true; }
+    }
+    return false;
+}
+
+/// `d` with `bytes` more fetched to node `n`.
+fn downloads_add(d: Downloads, n: String, bytes: Int) -> Downloads {
+    let mut out = Downloads { };
+    let mut found = false;
+    for x in d.items {
+        if x.node == n {
+            push(out.items, PlanDownload { node: n, bytes: x.bytes + bytes }) or discard;
+            found = true;
+        } else {
+            push(out.items, x) or discard;
+        }
+    }
+    if !found { push(out.items, PlanDownload { node: n, bytes: bytes }) or discard; }
+    return out;
+}
+
+/// The id a placement the plan adds would take: its model and its leader,
+/// a slug of at most 63.
+fn placement_id(model: String, nodes: NodeSet) -> String {
+    let id = std::str::replace(model, ".", "-") + "-" + (at(nodes.items, 0) or "");
+    return if len(id) > 63 { id[0..63] } else { id };
+}
+
+// ---- the plan, as a person reads it -----------------------------------------
+
+/// Plan `p` as `api arrange plan` prints it: a line a step, its keeps,
+/// removals and adds, the aliases pointed, what each node fetches, the
+/// models that go down and the wants left unmet.
+fn plan_text(p: ArrangementPlan) -> String {
+    let mut out = "";
+    for k in p.keep {
+        out = out + "keep    " + k.placement + "  " + k.model + " on " + names_said(k.nodes) + "\n"
+            + "        " + k.reason + "\n";
+    }
+    for r in p.remove {
+        out = out + "remove  " + r.placement + "  " + r.model + " on " + names_said(r.nodes) + "\n"
+            + "        " + r.reason + "\n";
+    }
+    for a in p.add {
+        out = out + "add     " + a.placement + "  " + a.model + " on " + names_said(a.nodes) + ", "
+            + a.variant + " under " + a.runtime + " (for " + serves_text(a.serves) + ")\n"
+            + "        " + a.reason + "\n";
+    }
+    for a in p.aliases {
+        out = out + "alias   " + a.alias + " -> " + a.model + "  (" + a.role + ")\n";
+    }
+    for d in p.downloads {
+        out = out + "fetch   " + d.node + ": " + gb(d.bytes) + "\n";
+    }
+    for d in p.down {
+        out = out + "down    " + d + "\n";
+    }
+    for u in p.unmet {
+        out = out + "unmet   " + u.want + "\n" + "        " + u.reason + "\n";
+    }
+    if len(out) == 0 { return "nothing wanted, nothing placed: the plan is empty\n"; }
+    return out;
+}
+
+fn names_said(nodes: bounded[String; 2]) -> String {
+    let out = st::JsonList { };
+    for n in nodes {
+        out.add(n);
+    }
+    return std::str::replace(out.text(), ", ", " and ");
+}
+
+fn serves_text(serves: bounded[String; 8]) -> String {
+    let out = st::JsonList { };
+    for s in serves {
+        out.add(s);
+    }
+    return out.text();
+}

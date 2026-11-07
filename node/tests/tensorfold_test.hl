@@ -50,7 +50,8 @@ fn config(v: String, archive: String, cluster: String, placement: String) -> Str
         + ", \"runtime\": {\"id\": \"tensorfold-0.7.5\", \"server\": \"tensorfold\", \"accelerator\": \"cuda\", \"artifact\": {\"kind\": \"container\", \"image\": \"nvcr.io/nvidia/pytorch\", \"digest\": \"sha256:"
         + sha("4") + "\", \"archive\": {\"url\": \"https://example.com/tf.tar.gz\", \"sha256\": \""
         + archive
-        + "\", \"bytes\": 9}}, \"multi_node\": \"lanes\"}, \"cluster\": " + cluster + "}";
+        + "\", \"bytes\": 9}}, \"multi_node\": \"lanes\", \"compute_capabilities\": [\"12.1\"]}, \"cluster\": "
+        + cluster + "}";
 }
 
 fn main() {
@@ -299,12 +300,45 @@ fn main() {
         config(v, sha("8"), LEADER, "ds"),
         config(v, sha("5"), FOLLOWER, "ds"),
         config(std::str::replace(v, sha("d"), sha("e")), sha("5"), LEADER, "ds"),
+        // what the step must make, pinned otherwise
+        config(std::str::replace(v, sha("f"), sha("9")), sha("5"), LEADER, "ds"),
+        config(std::str::replace(v, "\"bytes\": 5,", "\"bytes\": 6,"), sha("5"), LEADER, "ds"),
+        // the image it is made in
+        std::str::replace(
+            config(v, sha("5"), LEADER, "ds"),
+            "sha256:" + sha("4"),
+            "sha256:" + sha("3"),
+        ),
+        // a file under another name
+        config(
+            std::str::replace(v, "\"path\": \"config.json\"", "\"path\": \"settings.json\""),
+            sha("5"),
+            LEADER,
+            "ds",
+        ),
     ] {
         std::test::assert(
             node::prepared_dir(data, other) != here,
-            "other weights, sets, engine or rank: other inputs",
+            "other weights, sets, image, engine, pins or rank: other inputs",
         );
     }
+    // kept inputs are read as they are only while every file is there, whole
+    let kept = data + "/kept";
+    run("mkdir\n-p\n" + kept + "/model\n" + kept + "/cache/rank-cache");
+    std::io::fs::write_file(kept + "/model/serving-1017.safetensors", "12345") or discard;
+    std::test::assert_eq_str(
+        node::prepared_missing(kept, v, 0),
+        "cache/rank-cache/rank0of2-aaaa.bin",
+        "its weight file is gone",
+    );
+    std::io::fs::write_file(kept + "/cache/rank-cache/rank0of2-aaaa.bin", "123456") or discard;
+    std::test::assert_eq_str(
+        node::prepared_missing(kept, v, 0),
+        "cache/rank-cache/rank0of2-aaaa.bin",
+        "or cut short",
+    );
+    std::io::fs::write_file(kept + "/cache/rank-cache/rank0of2-aaaa.bin", "1234567") or discard;
+    std::test::assert_eq_str(node::prepared_missing(kept, v, 0), "", "every file, at its size");
     std::test::assert_eq_str(
         node::prepared_files(v, 1),
         "model/serving-1017.safetensors\t" + sha("e") + "\t5\ncache/rank-cache/rank1of2-bbbb.bin\t"
@@ -362,6 +396,28 @@ fn main() {
     );
 
     // ---- what it carries --------------------------------------------------------
+    // ---- the GPU its kernels are built for ---------------------------------------
+    let gb10 = "{\"hardware\": {\"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"compute_capability\": \"12.1\"}]}}";
+    let gh200 = "{\"hardware\": {\"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GH200\", \"compute_capability\": \"9.0\"}]}}";
+    let unsaid = "{\"hardware\": {\"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\"}]}}";
+    let runtime = std::json::find_field_raw(cfg, "runtime");
+    std::test::assert_eq_str(node::compute_refusal(runtime, gb10), "", "started on a GB10");
+    std::test::assert_eq_str(
+        node::compute_refusal(runtime, gh200),
+        "its runtime's kernels are built for compute capability 12.1, and this node's GPU is 9.0",
+        "refused on a Hopper",
+    );
+    std::test::assert_eq_str(
+        node::compute_refusal(runtime, unsaid),
+        "its runtime's kernels are built for compute capability 12.1, and this node's GPU does not say its own",
+        "and where the GPU does not say",
+    );
+    std::test::assert_eq_str(
+        node::compute_refusal("{\"server\": \"vllm\"}", unsaid),
+        "",
+        "a runtime that names none runs on any",
+    );
+
     std::test::assert(
         node::seat_carries_tools("managed", cfg),
         "TensorFold reads DeepSeek's DSML calls itself",

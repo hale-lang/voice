@@ -44,8 +44,8 @@ and the kernel kit (`kit`), pinned by the sha256 of its `MANIFEST`, whose
 Before a node first starts its rank, it readies the inputs that rank reads
 (`prepare: dsv41-tp2`): the model folder's two added files, then its rank's
 weight file (93 GB) and Engram's token map. Each is pinned under `prepared`,
-as this release's own inputs measured them, and kept for the next seat with
-the same weights, sets, engine and rank. Its `memory_bytes` gives each node
+as this release's own inputs measured them, and kept for the next seat that
+would make the same. Its `memory_bytes` gives each node
 a share of 120 GB, about all a 128 GB Spark gives models (122.5 GB), which
 is what the engine holds there at the served window (the recipe measured
 10.3 GiB left free on rank 0's node during a 1M-token prompt). So a node

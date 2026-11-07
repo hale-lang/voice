@@ -16,9 +16,10 @@
 // network: the model folder's two added files (the recipe's
 // serving_1017.py), then the rank's weight file of about 93 GB and Engram's
 // token map (the engine's node_inputs.sh). Each is checked against the
-// variant's pins (`prepared`) and kept under `prepared/<key>`, the key the
-// weights, the sets, the engine and the rank, so a seat placed again with
-// the same reads them at once.
+// variant's pins (`prepared`) and kept under `prepared/<key>`, the key all
+// they are made from and must be (`prepared_identity`: the step, the image,
+// the engine, every file by name and digest, the pins, the rank), so a seat
+// placed again with the same reads them at once while each file is there.
 //
 // Rank 1 (`tf-dsv41-lanes`) connects to rank 0's rendezvous on the link,
 // which rank 0 (`tensorfold-native serve`) listens for on its link address
@@ -64,34 +65,82 @@ fn rank_of(config: String) -> Int {
     return if len(cluster) > 0 { std::json::find_int_field(cluster, "rank") } else { 0 };
 }
 
-/// What a seat's readied inputs are made from, as one text: the prepare
-/// step, the engine that makes and reads them (its archive's sha256), every
-/// file of the variant and of its sets (their sha256s, a manifest's for a
-/// set it pins), and the rank. Two seats with the same read the same inputs.
+/// What a seat's readied inputs are made from and must be, as one text:
+/// the prepare step, the image it runs in (by digest) and the engine that
+/// makes and reads them (its archive's sha256), every file of the variant
+/// and of its sets (each by its name and sha256, a manifest's for a set it
+/// pins), every file the step must make as the variant pins it (`prepared`:
+/// path, size, sha256, rank), and the rank. Two seats with the same read
+/// the same inputs; any of it changed, inputs of their own.
 @unbounded
 fn prepared_identity(config: String) -> String {
     let variant = std::json::find_field_raw(config, "variant");
+    let artifact = std::json::find_field_raw(
+        std::json::find_field_raw(config, "runtime"),
+        "artifact",
+    );
     let b = std::bytes::BytesBuilder { };
-    b.append_str(std::json::find_string_field(variant, "prepare") + "\n");
+    b.append_str("prepare " + std::json::find_string_field(variant, "prepare") + "\n");
     b.append_str(
-        std::json::find_string_field(
-            std::json::find_field_raw(
-                std::json::find_field_raw(std::json::find_field_raw(config, "runtime"), "artifact"),
-                "archive",
-            ),
-            "sha256",
-        ) + "\n",
+        "image " + std::json::find_string_field(artifact, "image") + "@"
+            + std::json::find_string_field(artifact, "digest")
+            + "\n",
+    );
+    b.append_str(
+        "engine "
+            + std::json::find_string_field(std::json::find_field_raw(artifact, "archive"), "sha256")
+            + "\n",
     );
     let pins = variant_pins("", variant);
     let v = std::str::bytes_view(pins);
     let mut from = 0;
     while from < v.n {
         let nl = line_end(v, from);
-        b.append_str(tab_field(std::str::slice(v, from, nl), 2) + "\n");
+        let line = std::str::slice(v, from, nl);
+        b.append_str("file " + tab_field(line, 1) + " " + tab_field(line, 2) + "\n");
         from = nl + 1;
+    }
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "prepared"));
+    while !it.done {
+        let ranked = len(std::json::find_field_raw(it.element, "rank")) > 0;
+        b.append_str(
+            "makes " + std::json::find_string_field(it.element, "path") + " "
+                + to_string(std::json::find_int_field(it.element, "bytes"))
+                + " "
+                + std::json::find_string_field(it.element, "sha256") + " "
+                + (
+                    if ranked {
+                        to_string(std::json::find_int_field(it.element, "rank"))
+                    } else {
+                        "-"
+                    }
+                )
+                + "\n",
+        );
+        it = std::json::array_next(it);
     }
     b.append_str("rank " + to_string(rank_of(config)) + " of 2\n");
     return std::str::clone(b.text_view());
+}
+
+/// Why the inputs kept in `dir` cannot be read as rank `rank`'s, "" when
+/// they can: every file the variant pins for it there, at its size. A
+/// folder is kept only once each file in it matched its sha256, so its
+/// sizes say it is whole.
+@unbounded
+fn prepared_missing(dir: String, variant: String, rank: Int) -> String {
+    let files = prepared_files(variant, rank);
+    let v = std::str::bytes_view(files);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        let path = tab_field(line, 0);
+        let size = std::io::fs::file_size(dir + "/" + path) or - 1;
+        if size != (std::str::parse_int(tab_field(line, 2)) or 0) { return path; }
+    }
+    return "";
 }
 
 /// Where a seat's readied inputs are kept: `prepared/<key>`, the key the

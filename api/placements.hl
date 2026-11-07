@@ -1087,7 +1087,8 @@ fn runtime_for(format: String, hw: String, rts: RuntimeList, decision: Bool) -> 
         for p in r.platforms {
             if host_os_name(p.os) == os && host_arch_name(p.arch) == arch { here = true; }
         }
-        if reads && here {
+        // its kernels built for the machine's GPU, when it says which
+        if reads && here && (!r.has_compute_capabilities || computes_on(r, hw)) {
             let on = runtime_accelerator_name(r.accelerator);
             let rank = accelerator_rank(on);
             if (on == "cpu" || std::str::contains(accel, "," + on + ",")) && rank < best_rank {
@@ -1097,6 +1098,52 @@ fn runtime_for(format: String, hw: String, rts: RuntimeList, decision: Bool) -> 
         }
     }
     return best;
+}
+
+/// True when one of the machine's GPUs (its `hw`) declares a compute
+/// capability runtime `r` is built for (`RuntimeCreate.compute_capabilities`).
+@bounded_by(hw)
+fn computes_on(r: Runtime, hw: String) -> Bool {
+    let mut it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    while !it.done {
+        let cap = std::json::find_string_field(it.element, "compute_capability");
+        for cc in r.compute_capabilities {
+            if len(cap) > 0 && cc == cap { return true; }
+        }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// Which of the nodes of `j` has no GPU runtime `rt` (among `rts`) is
+/// built for (`RuntimeCreate.compute_capabilities`), as a reason says it;
+/// "" when every one has.
+@bounded_by(rts)
+fn other_gpu(rts: RuntimeList, rt: String, j: Judging) -> String {
+    for r in rts.data {
+        if r.id == rt && r.has_compute_capabilities {
+            let mut i = 0;
+            while i < count(j.hw) {
+                if !computes_on(r, at(j.hw, i) or "{}") {
+                    let built = st::JsonList { };
+                    for cc in r.compute_capabilities {
+                        built.add(cc);
+                    }
+                    return "its kernels are built for compute capability "
+                        + std::str::replace(built.text(), ", ", " or ")
+                        + (
+                            if count(j.hw) > 1 {
+                                ", and node " + (at(j.names, i) or "") + "'s GPU is not"
+                            } else {
+                                ", and the node's GPU is not"
+                            }
+                        );
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return "";
 }
 
 /// True when the runtime `id` runs on processors, not an accelerator.
@@ -1324,6 +1371,17 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
     }
     let runs = rt + " runs " + format + " on " + runtime_on(rts, rt)
         + (if parts > 1 { " across " + to_string(parts) + " nodes" } else { "" });
+    // across two nodes, the follower's GPU as well as the leader's
+    let gpu_short = other_gpu(rts, rt, j);
+    if len(gpu_short) > 0 {
+        return VariantFit {
+            variant: id,
+            has_runtime: true,
+            runtime: rt,
+            fits: false,
+            reason: runs + "; " + gpu_short,
+        };
+    }
     // what its seat takes on each node, its server's own beside its share
     let need = footprint(part_need(v, parts));
     let mut memory = "";

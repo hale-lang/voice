@@ -33,7 +33,12 @@ fn measured_hardware(data: String, file: String) -> String {
                 std::log::kv("gpus", to_string(gpus)),
             );
         }
-        let nvidia = nvidia_accelerators(smi, memory);
+        // each GPU's compute capability, asked apart: a driver that does not
+        // know the field fails only this, and its GPUs are declared without
+        let nvidia = with_compute_capabilities(
+            nvidia_accelerators(smi, memory),
+            run_out("nvidia-smi\n--query-gpu=compute_cap\n--format=csv,noheader"),
+        );
         // a machine with no NVIDIA GPU may have AMD's or Intel's: ROCm for an
         // AMD card when its compute device is there, Vulkan for either
         if gpus > 0 {
@@ -194,6 +199,56 @@ fn nvidia_accelerators(smi: String, memory: Int) -> String {
     }
     let b = out.snapshot() or b"";
     return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// NVIDIA accelerators (`nvidia_accelerators`) with each GPU's compute
+/// capability, `nvidia-smi --query-gpu=compute_cap`'s line for it in the
+/// same order (`12.1` for a GB10): what a runtime's kernels must be built
+/// for (`RuntimeCreate.compute_capabilities`). A line that is not one, or
+/// none, leaves its GPU without.
+@bounded_by(accelerators)
+fn with_compute_capabilities(accelerators: String, caps: String) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
+    let v = std::str::bytes_view(caps);
+    let mut from = 0;
+    let mut first = true;
+    let mut it = std::json::array_first(accelerators);
+    while !it.done {
+        let mut cap = "";
+        if from < v.n {
+            let nl = line_end(v, from);
+            cap = std::str::trim(std::str::slice(v, from, nl));
+            from = nl + 1;
+        }
+        let gpu = std::str::trim(it.element);
+        if !first { out.append_str(", "); }
+        first = false;
+        out.append_str(
+            if compute_capability_text(cap) {
+                gpu[0..(len(gpu) - 1)] + ", \"compute_capability\": \"" + cap + "\"}"
+            } else {
+                gpu
+            },
+        );
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b"";
+    return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// A compute capability as NVIDIA writes it: digits, a dot, digits.
+@bounded_by(s)
+fn compute_capability_text(s: String) -> Bool {
+    let dot = std::str::index_of(s, ".");
+    if dot < 1 || dot == len(s) - 1 || len(s) > 7 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        if i != dot && (b < 48 || b > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// The machine's GPUs as the kernel's DRM devices say them, one a line:

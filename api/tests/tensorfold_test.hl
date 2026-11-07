@@ -33,7 +33,9 @@ fn tensorfold() -> api::RuntimeCreate {
         },
         has_multi_node: true,
         multi_node: api::MultiNode::lanes,
+        has_compute_capabilities: true,
     };
+    push(c.compute_capabilities, "12.1") or discard;
     push(c.formats, api::ModelFormat::exl3) or discard;
     push(
         c.platforms,
@@ -50,7 +52,11 @@ fn view(c: api::RuntimeCreate) -> api::Runtime {
         artifact: c.artifact,
         has_multi_node: c.has_multi_node,
         multi_node: c.multi_node,
+        has_compute_capabilities: c.has_compute_capabilities,
     };
+    for cc in c.compute_capabilities {
+        push(r.compute_capabilities, cc) or discard;
+    }
     for f in c.formats {
         push(r.formats, f) or discard;
     }
@@ -60,7 +66,14 @@ fn view(c: api::RuntimeCreate) -> api::Runtime {
     return r;
 }
 
-const GB10: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 130661072896, \"unified\": true}], \"model_memory_bytes\": 122494755840, \"disk_free_bytes\": 1000000000000}";
+const GB10: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 130661072896, \"unified\": true, \"compute_capability\": \"12.1\"}], \"model_memory_bytes\": 122494755840, \"disk_free_bytes\": 1000000000000}";
+
+/// An arm64 Hopper (GH200) with room enough: its GPU is another major
+/// compute capability, which the archive's sm_121 kernels do not load on.
+const GH200: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GH200 480GB\", \"memory_bytes\": 102000000000, \"unified\": false, \"compute_capability\": \"9.0\"}], \"model_memory_bytes\": 140000000000, \"disk_free_bytes\": 1000000000000}";
+
+/// A GB10 whose driver did not say its compute capability.
+const UNSAID: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 130661072896, \"unified\": true}], \"model_memory_bytes\": 122494755840, \"disk_free_bytes\": 1000000000000}";
 
 fn src(repo: String) -> String {
     return "{\"hub\": \"huggingface\", \"repo\": \"" + repo + "\", \"revision\": \"" + H[0..40]
@@ -139,6 +152,27 @@ fn main() {
     llama_exl3.server = "llama-server";
     llama_exl3.artifact.has_archive = false;
     llama_exl3.has_multi_node = false;
+    let mut no_caps = tensorfold();
+    no_caps.has_compute_capabilities = false;
+    let mut bad_cap = tensorfold();
+    push(bad_cap.compute_capabilities, "sm_121") or discard;
+    std::test::assert_eq_str(
+        api::runtime_body(no_caps),
+        "!compute_capabilities\ta tensorfold runtime names the compute capabilities its kernels are built for",
+        "it says the GPUs its kernels are built for",
+    );
+    std::test::assert_eq_str(
+        api::runtime_body(bad_cap),
+        "!compute_capabilities\ta compute capability is NVIDIA's, as 12.1",
+        "as NVIDIA writes them",
+    );
+    std::test::assert(
+        std::str::contains(
+            api::runtime_body(tensorfold()),
+            ", \"compute_capabilities\": [\"12.1\"]}",
+        ),
+        "kept with them",
+    );
     let mut bad_url = tensorfold();
     bad_url.artifact.archive.url = "http://example.com/tf.tar.gz";
     std::test::assert_eq_str(
@@ -319,6 +353,44 @@ fn main() {
         !api::serves_on(view(tensorfold()), 1) && api::serves_on(view(tensorfold()), 2),
         "a lanes runtime serves two nodes alone",
     );
+    // ---- only on the GPU its kernels are built for --------------------------------
+    let hopper = api::judging_add(
+        api::judging_add(api::Judging { }, "gh1", GH200, 0),
+        "gh2",
+        GH200,
+        0,
+    );
+    let on_hopper = api::judge_on("[" + v + "]", hopper, rts, false);
+    let not_hopper = at(on_hopper.fit, 0) or api::VariantFit { };
+    std::test::assert(
+        on_hopper.best < 0
+            && std::str::starts_with(not_hopper.reason, "no runtime that spans nodes reads exl3"),
+        "not across two Hoppers with room for it: " + not_hopper.reason,
+    );
+    let mixed = api::judging_add(
+        api::judging_add(api::Judging { }, "spark", GB10, 0),
+        "gh",
+        GH200,
+        0,
+    );
+    let on_mixed = api::judge_on("[" + v + "]", mixed, rts, false);
+    let not_mixed = at(on_mixed.fit, 0) or api::VariantFit { };
+    std::test::assert(
+        on_mixed.best < 0
+            && std::str::contains(
+                not_mixed.reason,
+                "its kernels are built for compute capability 12.1, and node gh's GPU is not",
+            ),
+        "nor with a follower of another GPU: " + not_mixed.reason,
+    );
+    let unsaid = api::judging_add(
+        api::judging_add(api::Judging { }, "spark", UNSAID, 0),
+        "flare",
+        UNSAID,
+        0,
+    );
+    let on_unsaid = api::judge_on("[" + v + "]", unsaid, rts, false);
+    std::test::assert(on_unsaid.best < 0, "nor on GPUs that do not say theirs");
     std::test::assert(
         api::managed_tools("{\"runtime\": {\"server\": \"tensorfold\"}, \"variant\": {}}"),
         "a TensorFold seat carries tools",

@@ -481,6 +481,7 @@ Type: object
 | `name` | string | yes |  |  |
 | `memory_bytes` | integer | yes | Its own memory; with `unified`, the machine's, which it shares. | ≥ 0 |
 | `unified` | boolean | yes | True when it shares the machine's memory (Apple silicon, NVIDIA GB10) rather than having its own. |  |
+| `compute_capability` | string |  | An NVIDIA GPU's compute capability, as `nvidia-smi` says it: what a runtime's kernels must be built for (`RuntimeCreate.compute_capabilities`). Left out when the driver does not say, and for other kinds. | pattern `^[0-9]+\.[0-9]+$` |
 
 <a id="schema-hardware"></a>
 

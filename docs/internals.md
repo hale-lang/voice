@@ -409,9 +409,10 @@ its rank reads beside them, in the runtime's image with no GPU and no
 network: the model folder's two added files, then its rank's weight file
 (about 93 GB) and Engram's token map. The seat is `starting` meanwhile,
 its reason the step and how far. Each file is checked against the
-variant's pins (`prepared`) and kept under `prepared/<key>`, the key the
-weights, the sets, the engine and the rank, so a seat placed again starts
-at once. Each rank runs in the image on the host's network with the GPUs,
+variant's pins (`prepared`) and kept under `prepared/<key>`, the key all
+they are made from and must be (the step, the image, the engine, every file
+by name and digest, the pins and the rank), so a seat placed again starts
+at once while each kept file is there at its size. Each rank runs in the image on the host's network with the GPUs,
 the RDMA devices and locked memory, the engine at `/engine`, the weights
 at `/model`, the sets at `/engram` and `/kit` and the readied inputs at
 `/cache`, all read-only, with the recipe's served shape and switches. Its
@@ -829,8 +830,8 @@ it needs no database. Beside them, what the node fetched (`blobs/`, by
 sha256, with a `.part` and its `.ranges` for a file still being fetched), the
 archives it unpacked (`runtimes/<sha256>`), a TensorFold seat's file sets
 laid out (`sets/<seat>/`) and the inputs its rank readied
-(`prepared/<key>/`, about 93 GB, kept for the next seat with the same
-weights, sets, engine and rank), and what its servers keep between starts: a vLLM seat's compiled
+(`prepared/<key>/`, about 93 GB, kept for the next seat that would make
+the same), and what its servers keep between starts: a vLLM seat's compiled
 graphs and FlashInfer's kernel autotune, `cache/<runtime>/`, one directory
 per runtime, tens of megabytes, so a vLLM seat started again skips most of
 its warm-up: on a DGX Spark serving gpt-oss-120b, the engine's

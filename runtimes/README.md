@@ -77,6 +77,11 @@ served as that recipe serves it. It is `server: tensorfold`,
 from a variant that brings the Engram tables and the kernel kit as file sets
 and names its prepare step (`recipes/deepseek-v4.1-flash-1017.json`).
 
+Its kernels are built for the GB10 alone (`sm_121`, with no PTX to fall
+back on), so it names that GPU's compute capability
+(`compute_capabilities: ["12.1"]`): a placement chooses it only for nodes
+whose GPU declares it, and a node whose GPU does not refuses to start it.
+
 Its artifact is two pins: NVIDIA's PyTorch 26.07 image by digest, which the
 recipe builds and runs in, and the engine built from source apart from it
 (`artifact.archive`), which the node fetches, checks and mounts read-only at

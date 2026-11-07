@@ -105,6 +105,8 @@ type RuntimeCreate {
     multi_node: MultiNode = MultiNode::mp;
     has_load_format: Bool = false;
     load_format: LoadFormat = LoadFormat::fastsafetensors;
+    has_compute_capabilities: Bool = false;
+    compute_capabilities: bounded[String; 8];
 }
 
 /// `Runtime`. A shipped runtime has no `created_at`.
@@ -120,6 +122,8 @@ type Runtime {
     multi_node: MultiNode = MultiNode::mp;
     has_load_format: Bool = false;
     load_format: LoadFormat = LoadFormat::fastsafetensors;
+    has_compute_capabilities: Bool = false;
+    compute_capabilities: bounded[String; 8];
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
     created_at: Time = `1970-01-01T00:00:00Z`;
@@ -316,6 +320,10 @@ fn runtime_view(body: String, origin: Origin, dated: Bool, at: Time) -> Runtime 
     for p in c.platforms {
         push(out.platforms, p) or discard;
     }
+    out.has_compute_capabilities = c.has_compute_capabilities;
+    for cc in c.compute_capabilities {
+        push(out.compute_capabilities, cc) or discard;
+    }
     return out;
 }
 
@@ -422,7 +430,26 @@ fn runtime_body(c: RuntimeCreate) -> String {
     if c.has_load_format && c.server != "vllm" {
         return "!load_format\ta runtime's load_format is vllm's";
     }
-    let r = Runtime {
+    // the NVIDIA GPUs its kernels are built for, when it runs on no other
+    // (a binary built for one compute capability does not load on another
+    // major one): a node whose GPU says another is not placed on
+    if c.has_compute_capabilities {
+        if runtime_accelerator_name(c.accelerator) != "cuda" {
+            return "!compute_capabilities\ta runtime's compute capabilities are a cuda runtime's";
+        }
+        if count(c.compute_capabilities) == 0 {
+            return "!compute_capabilities\t`compute_capabilities` names at least one";
+        }
+        for cc in c.compute_capabilities {
+            if !compute_capability_text(cc) {
+                return "!compute_capabilities\ta compute capability is NVIDIA's, as 12.1";
+            }
+        }
+    }
+    if c.server == "tensorfold" && !c.has_compute_capabilities {
+        return "!compute_capabilities\ta tensorfold runtime names the compute capabilities its kernels are built for";
+    }
+    let mut r = Runtime {
         id: c.id,
         license: c.license,
         server: c.server,
@@ -432,7 +459,11 @@ fn runtime_body(c: RuntimeCreate) -> String {
         multi_node: c.multi_node,
         has_load_format: c.has_load_format,
         load_format: c.load_format,
+        has_compute_capabilities: c.has_compute_capabilities,
     };
+    for cc in c.compute_capabilities {
+        push(r.compute_capabilities, cc) or discard;
+    }
     return runtime_create_json(r, c.formats, c.platforms);
 }
 
@@ -510,7 +541,33 @@ fn runtime_create_json(
             } else {
                 ""
             }
-        ) + "}";
+        ) + compute_capabilities_field(r) + "}";
+}
+
+/// `, "compute_capabilities": [...]` when the runtime names them, "" when not.
+@bounded_by(r)
+fn compute_capabilities_field(r: Runtime) -> String {
+    if !r.has_compute_capabilities { return ""; }
+    let out = st::JsonList { };
+    for cc in r.compute_capabilities {
+        out.add(jq(cc));
+    }
+    return ", \"compute_capabilities\": [" + out.text() + "]";
+}
+
+/// A compute capability as NVIDIA writes it: digits, a dot, digits.
+@bounded_by(s)
+fn compute_capability_text(s: String) -> Bool {
+    let dot = std::str::index_of(s, ".");
+    if dot < 1 || dot == len(s) - 1 || len(s) > 7 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        if i != dot && (b < 48 || b > 57) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// The change log's JSON for `r`: the `Runtime` the api answers.

@@ -1,0 +1,297 @@
+// The arranger (arranger.hl): a plan for the whole fleet from what the
+// operator wants, a diff against what is placed now, judged by the fit a
+// placement is (placements.hl), from voice's own recipes, runtimes and role
+// data. Three DGX Sparks: spark and flare cabled to each other, their link
+// checked, and spark3. DeepSeek-V4.1-Flash-1017 pinned across a pair takes
+// both of its nodes whole on TensorFold; the roles go on spark3; a model
+// placed already is kept, one a node holds is preferred, and what does not
+// fit is said.
+import ".." as api;
+import "../../store" as st;
+import "../../node" as node;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+/// A DGX Spark's two ports on its one cabled QSFP port, to `peer`.
+fn link_to(peer: String, a: String, b: String) -> String {
+    return "{\"peer\": \"" + peer + "\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \""
+        + a + "\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"" + b
+        + "\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}";
+}
+
+/// A DGX Spark's capabilities: a managed engine, its GB10 (compute
+/// capability 12.1, as TensorFold's kernels are built for), and its links.
+fn spark(links: String) -> String {
+    let memory = 130661072896;
+    return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": "
+        + to_string(memory) + ", \"model_memory_bytes\": "
+        + to_string(node::model_memory("{}", memory))
+        + ", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": "
+        + to_string(memory)
+        + ", \"unified\": true, \"compute_capability\": \"12.1\"}], \"disk_free_bytes\": 3500000000000}"
+        + (if len(links) > 0 { ", \"links\": [" + links + "]" } else { "" }) + "}";
+}
+
+fn add_node(store: st::Store, id: String, capabilities: String) {
+    store.insert_node(
+        st::NodeRow { id: id, name: id, max_in_flight: 4, created_at: api::now_seconds() },
+        api::change("create", "nodes/" + id, "", "{}"),
+    ) or discard;
+    store.put_fleet(st::FleetRow { node: id, capabilities: capabilities, present: true })
+    or discard;
+    store.put_beat(id, api::now_seconds(), 0) or discard;
+}
+
+/// The link between spark and flare, checked and passed.
+fn checked(store: st::Store, link: api::Link) {
+    let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
+    let usable = rts.usable_in_gate() or api::RuntimeList { };
+    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let said = api::link_result_json(
+        api::LinkCheckResult {
+            id: c.id,
+            ok: true,
+            has_bus_bytes_per_second: true,
+            bus_bytes_per_second: 20000000000,
+        },
+        api::now_seconds(),
+    );
+    store.put_link_result(c.id, "spark", said) or discard;
+    store.put_link_result(c.id, "flare", said) or discard;
+}
+
+fn pin(model: String, n: Int) -> api::ArrangementPin {
+    return api::ArrangementPin { model: model, count: n };
+}
+
+fn role(id: String, priority: Int) -> api::ArrangementRoleWant {
+    return api::ArrangementRoleWant { role: id, priority: priority };
+}
+
+fn nodes_of(n: bounded[String; 2]) -> String {
+    let out = st::JsonList { };
+    for x in n {
+        out.add(x);
+    }
+    return std::str::replace(out.text(), ", ", "+");
+}
+
+fn added_on(p: api::ArrangementPlan, recipe: String) -> String {
+    for a in p.add {
+        if a.recipe == recipe { return nodes_of(a.nodes); }
+    }
+    return "";
+}
+
+fn main() {
+    // ---- the role data ---------------------------------------------------
+    let shipped_roles = std::io::fs::read_file(shipped("catalog") + "/roles.json") or "";
+    let read = api::roles_of(shipped_roles);
+    std::test::assert(len(read.problem) == 0, "voice's role data reads: " + read.problem);
+    let coder = api::role_named(read.roles, "coder");
+    std::test::assert(
+        coder.alias == "coding" && count(coder.candidates) > 1,
+        "a role names its alias and candidates",
+    );
+    std::test::assert_eq_str(api::role_named(read.roles, "decider").alias, "decide", "decider");
+    let refusals = [
+        "[]",
+        "{\"roles\": {}}",
+        "{\"roles\": [{\"id\": \"Coder\", \"title\": \"C\", \"alias\": \"c\", \"candidates\": [\"a\"]}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \" \", \"alias\": \"c\", \"candidates\": [\"a\"]}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \"C\", \"alias\": \"no alias\", \"candidates\": [\"a\"]}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \"C\", \"alias\": \"c\", \"candidates\": []}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \"C\", \"alias\": \"c\", \"candidates\": [3]}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \"C\", \"alias\": \"c\", \"candidates\": [\"a\", \"a\"]}]}",
+        "{\"roles\": [{\"id\": \"c\", \"title\": \"C\", \"alias\": \"c\", \"candidates\": [\"a\"]}, {\"id\": \"c\", \"title\": \"D\", \"alias\": \"d\", \"candidates\": [\"b\"]}]}",
+    ];
+    for r in refusals {
+        let x = api::roles_of(r);
+        std::test::assert(len(x.problem) > 0, "refused: " + r);
+    }
+
+    // ---- the fleet -------------------------------------------------------
+    let store = st::MemoryStore { };
+    let link = api::NatsLink { };
+    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(shipped("recipes")) };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let seats = api::Seats { store: store, link: link };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: seats,
+        roles: read.roles,
+    };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+    add_node(store, "spark", spark(link_to("flare", "192.168.100.1", "192.168.101.1")));
+    add_node(store, "flare", spark(link_to("spark", "192.168.100.2", "192.168.101.2")));
+    add_node(store, "spark3", spark(""));
+    checked(store, link);
+
+    // ---- the worked example: DeepSeek on a pair, three roles on spark3 ---
+    let mut w = api::ArrangementWants { };
+    push(w.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
+    push(w.roles, role("coder", 1)) or discard;
+    push(w.roles, role("decider", 2)) or discard;
+    push(w.roles, role("small", 3)) or discard;
+    let plan = placements.plan_arrangement(w) or {
+        std::test::assert(false, "planned: " + api::ctl_message(err));
+        return;
+    };
+    std::test::assert_eq_str(
+        added_on(plan, "deepseek-v4.1-flash-1017"),
+        "flare+spark",
+        "the pin takes the checked pair",
+    );
+    let ds = at(plan.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        ds.runtime == "tensorfold-0.7.5" && std::str::contains(ds.reason, "link"),
+        "on TensorFold, needing the link: " + ds.reason,
+    );
+    std::test::assert_eq_str(added_on(plan, "qwen3-coder-next"), "spark3", "the coder on spark3");
+    std::test::assert_eq_str(
+        added_on(plan, "jev-style-2b-decision-v3"),
+        "spark3",
+        "the decider on spark3, the pair being whole: " + api::plan_text(plan),
+    );
+    std::test::assert(count(plan.aliases) >= 2, "each filled role points its alias");
+    let first = at(plan.aliases, 0) or api::PlanAlias { };
+    std::test::assert(first.alias == "coding", "coder points coding: " + first.alias);
+    for d in plan.downloads {
+        std::test::assert(d.bytes > 0, "every node fetches: " + d.node);
+    }
+
+    // ---- deterministic ---------------------------------------------------
+    let again = placements.plan_arrangement(w) or api::ArrangementPlan { };
+    std::test::assert_eq_str(
+        api::plan_text(again),
+        api::plan_text(plan),
+        "the same fleet and wants, the same plan",
+    );
+
+    // ---- a pair pin keeps its nodes to itself ---------------------------
+    for a in plan.add {
+        if a.recipe != "deepseek-v4.1-flash-1017" {
+            std::test::assert(
+                nodes_of(a.nodes) == "spark3",
+                "nothing beside DeepSeek on the pair: " + a.recipe + " on " + nodes_of(a.nodes),
+            );
+        }
+    }
+
+    // ---- unmet, with why -------------------------------------------------
+    let mut more = w;
+    push(more.roles, role("reasoner", 4)) or discard;
+    let crowded = placements.plan_arrangement(more) or api::ArrangementPlan { };
+    let mut why = "";
+    for u in crowded.unmet {
+        if u.want == "reasoner" { why = u.reason; }
+    }
+    std::test::assert(
+        std::str::contains(why, "no node has room for a reasoner"),
+        "a reasoner does not fit after the pin and the roles before it: " + api::plan_text(crowded),
+    );
+
+    // ---- the fewest moves: what is placed and wanted is kept -------------
+    api::Catalog { store: store, recipes: recipes }.create(
+        api::CatalogModelCreate { id: "tiny", has_recipe: true, recipe: "qwen3-0.6b" },
+    ) or discard;
+    api::Catalog { store: store, recipes: recipes }.create(
+        api::CatalogModelCreate { id: "granite", has_recipe: true, recipe: "granite-4.0-h-tiny" },
+    ) or discard;
+    let mut c = api::PlacementCreate { id: "tiny-now", model: "tiny", account: "local" };
+    push(c.nodes, "spark3") or discard;
+    placements.create(c) or {
+        std::test::assert(false, "placed: " + api::ctl_message(err));
+        return;
+    };
+    let mut g = api::PlacementCreate { id: "granite-now", model: "granite", account: "local" };
+    push(g.nodes, "spark") or discard;
+    placements.create(g) or {
+        std::test::assert(false, "placed: " + api::ctl_message(err));
+        return;
+    };
+    let kept = placements.plan_arrangement(w) or api::ArrangementPlan { };
+    let k = at(kept.keep, 0) or api::PlanKeep { };
+    std::test::assert(
+        count(kept.keep) == 1 && k.placement == "tiny-now" && (at(k.serves, 0) or "") == "small",
+        "the small model placed already is kept: " + api::plan_text(kept),
+    );
+    std::test::assert_eq_str(added_on(kept, "qwen3-0.6b"), "", "and not added again");
+    let r = at(kept.remove, 0) or api::PlanRemove { };
+    std::test::assert(
+        count(kept.remove) == 1 && r.placement == "granite-now"
+            && std::str::contains(r.reason, "serves none")
+            && std::str::contains(r.reason, "goes to pin"),
+        "a placement no want needs is removed, its room given: " + api::plan_text(kept),
+    );
+    std::test::assert(
+        count(kept.down) == 1 && (at(kept.down, 0) or "") == "granite",
+        "and its model goes down",
+    );
+
+    // ---- what a node holds already is preferred --------------------------
+    let mut small = api::ArrangementWants { };
+    push(small.roles, role("coder", 0)) or discard;
+    let mut f = placements.arrangement_fleet_in_gate(small) or api::ArrangeFleet { };
+    // nothing placed, so the first node that fits, in the order of ids
+    f.placed = api::ArrangePlacedList { };
+    let plain = api::plan_fleet(f, small, read.roles);
+    let p0 = at(plain.add, 0) or api::PlanAdd { };
+    std::test::assert_eq_str(nodes_of(p0.nodes), "flare", "with nothing held, the first node");
+    std::test::assert(p0.download_bytes > 0, "which fetches it");
+    push(
+        f.holdings.items,
+        api::NodeHolding { node: "spark3", recipe: p0.recipe, variant: p0.variant },
+    ) or discard;
+    let held = api::plan_fleet(f, small, read.roles);
+    let p1 = at(held.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        nodes_of(p1.nodes) == "spark3" && p1.download_bytes == 0
+            && std::str::contains(p1.reason, "already on disk"),
+        "the node that holds it: " + api::plan_text(held),
+    );
+
+    // ---- refusals ----------------------------------------------------------
+    let mut bad = api::ArrangementWants { };
+    push(bad.roles, role("juggler", 0)) or discard;
+    let refused = placements.plan_arrangement(bad) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "no role juggler"),
+            "an unknown role is refused: " + api::ctl_message(err),
+        );
+        api::ArrangementPlan { }
+    };
+    std::test::assert_eq_int(count(refused.add), 0, "and nothing is planned");
+    let mut nowhere = api::ArrangementWants { };
+    let mut np = pin("deepseek-v4.1-flash-1017", 0);
+    push(np.nodes, "moon") or discard;
+    push(nowhere.pins, np) or discard;
+    placements.plan_arrangement(nowhere) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "no node moon"),
+            "an unknown node is refused: " + api::ctl_message(err),
+        );
+        api::ArrangementPlan { }
+    };
+    // a pin on nodes it does not fit is unmet, with the fit's reason
+    let mut lone = api::ArrangementWants { };
+    let mut lp = pin("deepseek-v4.1-flash-1017", 0);
+    push(lp.nodes, "spark3") or discard;
+    push(lone.pins, lp) or discard;
+    let alone = placements.plan_arrangement(lone) or api::ArrangementPlan { };
+    let u = at(alone.unmet, 0) or api::PlanUnmet { };
+    std::test::assert(
+        count(alone.unmet) == 1 && std::str::contains(u.reason, "spark3")
+            && std::str::contains(u.reason, "no runtime"),
+        "DeepSeek alone on spark3 does not fit: " + u.reason,
+    );
+}

@@ -74,6 +74,7 @@ const bodies = {
   createRecipe: recipe('live-2'),
   createRuntime: runtime('live-2'),
   createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'], account: 'claude-work' },
+  planArrangement: { pins: [{ model: 'live-local', nodes: ['laptop'] }], roles: [{ role: 'small', priority: 1 }] },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },

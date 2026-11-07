@@ -525,3 +525,9 @@ Still there on hale 0.32.6: with the copy reverted, `hale test api/tests/nodes_t
 **Working shape:** governance and pulse sleep through `nap()`, a second at a time while `!self.draining` (voice#160). The fix is hale-lang/hale#1865, expected in hale 0.32.7.
 
 **Resolved in hale 0.32.7 (hale-lang/hale#1865).** A timed wait that begins during a drain returns at once in a run() that watches it. `nap()` is gone; governance, pulse and the brain sleep plainly again, and SIGTERM ends the api and the brain in about 0.25 s, exit 0.
+
+## A seventeenth receiver in `api::serve` fails the build with "path call `api::serve` in expression position"
+
+**hale 0.32.7.** The `Voice` surface's rows had sixteen receivers (Probes, Catalog, Recipes, …). Adding a row on a seventeenth locus (`Arranger::plan`, a field of `Front` like the others) passes `hale verify` and then fails every build and test of the api with `codegen error: unsupported in codegen v0: path call `api::serve` in expression position`. The receiver's own code does not matter: a locus with one method returning a constant fails the same way, and the same rows on an existing receiver build.
+
+**Working shape:** the arranger's two rows are methods of `Placements` (`arrangement_roles`, `plan_arrangement`), what a plan proposes being placements; the planning itself stays in api/arranger.hl as free functions.

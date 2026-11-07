@@ -4,7 +4,13 @@ What building voice in Hale ran into: the cause and the shape that works.
 Read it before the next task; append when something fights back. Versions
 are the `hale` the entry was found with.
 
+Re-read 2026-11-06 against hale v0.32.7 (main `7764d0e18`): every entry
+has a status line under its heading, so the working shapes below can be
+read as history where the cause is gone.
+
 ## A stateful handler literal given to `Router.add` in a builder fn dangles
+
+**Status (2026-11-06):** FIXED upstream: hale-lang/hale#1048 closed 2026-09-28 (a handler literal built outside the router's frame is owned by the router), and since v0.24.0 (#1569) a fn returning a locus must build every instance it returns. The one-locus-many-endpoints shape stays fine.
 
 **hale 0.21.0**, found at hale `3d9ea6ef`, still there at `bb0a2c55`.
 Filed as [hale-lang/hale#1048](https://github.com/hale-lang/hale/issues/1048).
@@ -45,6 +51,8 @@ one-locus-many-endpoints shape: `std::http::build_context(req)` and an
 
 ## Triple-quoted and raw strings are in the grammar's comment, not the lexer
 
+**Status (2026-11-06):** FIXED for block strings: hale v0.27.0 (#1677) added `""" … """`, unescaped and uninterpolated, for exactly this (a JSON body, a SQL query). There is still no `r"…"` raw literal, and the grammar no longer advertises one.
+
 **hale 0.21.0.** `spec/grammar.ebnf` notes `STRING_LIT` as
 `"..." with escapes; r"..." raw; """..."""`, but `"""{"a": 1}"""` lexes as
 an empty string followed by another literal. Only `"..."` with `\"` escapes
@@ -55,6 +63,8 @@ exists.
 
 ## `std::http` has no reason phrase for most statuses
 
+**Status (2026-11-06):** FIXED upstream: `__status_phrase` (crates/hale-stdlib/hl/http.hl) now carries the full IANA table, 100 through 511.
+
 **hale 0.21.0.** `__status_phrase` covers 101, 200, 301, 400, 404, 413 and
 500. Everything else goes out as `Status`, e.g. `HTTP/1.1 201 Status`.
 Clients ignore reason phrases, so nothing breaks, but it reads wrong in a
@@ -64,6 +74,8 @@ trace.
 429, 502, 503 and 504 upstream.
 
 ## `is_route` writes its captures into the context, not into a copy of it
+
+**Status (2026-11-06):** by design, unchanged: `is_route` fills `c.params` on a match, and a copy taken before the ladder is a copy (v0.24.0's "a value you read is yours"). Read `c.params` after the match.
 
 **hale 0.24.0.** `std::http::is_route(c, method, pattern)` puts the
 pattern's `:name` captures in `c.params` when it matches. A router that
@@ -76,6 +88,8 @@ route, and nothing says so: the handler runs with an empty id and answers
 matched (`std::http::path_param(c.params, "model")`, `api/endpoints.hl`).
 
 ## A surface's JSON codec has no `null`, enum or map, and code cannot call it
+
+**Status (2026-11-06):** closed by hale v0.25.0 (set types, `null` through presence pairs, enums and lists in rows) and v0.26.0 (`indexed_by k -> v` maps #1656, the presence triple #1664, `std::json::Value`); `T::api_encode` / `T::api_decode` are callable from code since v0.25.1. See the three later entries that record each closure.
 
 **hale 0.24.0.** The contract has lists that may be `null` (a project's
 `models`: `null` is the whole catalog), a price that may be `null`, enums
@@ -99,6 +113,8 @@ hand-written readers and writers (`api/wire.hl`), checked against
 
 ## A `bounded` field is never assigned whole
 
+**Status (2026-11-06):** FIXED in hale v0.25.0: a caller assigns a `bounded` field whole (`row.owners = names_of(x).items`), as the later entry on returning a bounded list records.
+
 **hale 0.24.0.** `row.models = req.models;` between two records'
 `bounded[String; 32]` fields is refused: the intrinsics are the only way
 to change a bounded field, so copying one list into another record means
@@ -108,6 +124,8 @@ a `push` loop. A whole record copies its bounded fields with it.
 bounded[String; 32]; }`) and assign the record.
 
 ## `hale verify` calls a hashmap row write in a long-lived locus unbounded
+
+**Status (2026-11-06):** unchanged by design: the survey cannot see that a replaced row's text is reclaimed, and `@unbounded` / `@bounded_by(<input>)` (v0.24.0, #1494, #1500) is the acknowledgement it asks for. The measurement stands.
 
 **hale 0.24.0.** `MemoryStore` keeps rows in `@form(hashmap)` loci for the
 life of the process. `hale verify` warns that every `set` there grows the
@@ -125,6 +143,8 @@ is used, at most once a minute per key (`KeyBearer`, `Store.touch_key`).
 
 ## `std::time::parse_time` rolls an impossible day into the next month
 
+**Status (2026-11-06):** FIXED for the rollover (hale 2026-10-17: `parse_time("2099-02-30T00:00:00Z")` is a `ParseError`; spec/stdlib.md says a day past its month is refused). An offset form (`+02:00`) is refused by design rather than ignored, so `rfc3339` in `api/wire.hl` stays for offsets.
+
 **hale 0.24.0.** `std::time::parse_time("2099-02-30T00:00:00Z")` answers
 2 March 2099 instead of refusing it, so a reader that relies on it takes
 a date that does not exist. It also reads only the `Z` form of RFC 3339,
@@ -136,6 +156,8 @@ counted) and takes an offset off by hand, with exactly two digits for its
 hours and its minutes.
 
 ## A NATS client held for the api's life grows with every served request
+
+**Status (2026-11-06):** not re-measured. Two upstream leaks in the same area were closed since: a served program's per-call growth on a connection (v0.26.0, #1626) and every codec-bound or hub-bound topic leaking its encoded payload (v0.32.3, #1845, found by voice). The per-use connection stays until the framer is measured flat.
 
 **hale 0.24.0, pond `realtime/nats` at `697852f`.** The api first held one
 `NatsClient` for its life and served every request over it: subscribe to
@@ -157,6 +179,8 @@ costs about a millisecond, against a request that waits for its seat.
 
 ## `draining` and `drain` cannot name a method
 
+**Status (2026-11-06):** `drain` FIXED in hale v0.24.0 (#1531): `drain`, `release`, `run`, `restart`, `publish` and the other framework words are contextual keywords and can name a method. `draining` is still every locus's drain flag, so it still cannot.
+
 **hale 0.24.0.** The node plane's last report is `POST /node/v1/draining`,
 and its handler is naturally `NodePlane::draining`. `draining` is the drain
 flag every locus carries (`self.draining`) and `drain` is a lifecycle hook,
@@ -165,6 +189,8 @@ so both are refused as method names, and so as rpc members.
 **Working shape:** `NodePlane::going_away`.
 
 ## `count` and `at` on a call's result pass the check and fail the build
+
+**Status (2026-11-06):** STILL REAL on hale v0.32.7 (re-run 2026-11-06): `count((s.keys() or Rows { }).rows)` and `count(s.plain().rows)` check and then fail the build with the same "did you mean" message; `at(s.plain().rows, 0) or -1` fails as "`or` over call to unknown fn `at`". Bind the result first. Reported upstream with the 2026-11-06 friction retest.
 
 **hale 0.24.0.** `count((s.keys("work") or KeyRows { }).rows)` typechecks,
 and then the build refuses it: "unsupported in codegen v0: call to `count`:
@@ -176,6 +202,8 @@ the message points at an unrelated fn.
 KeyRows { }; count(ks.rows)`).
 
 ## pond's pq: tab-separated rows, and a line on stdout
+
+**Status (2026-11-06):** closed on voice's side (JSON rows; `std::log` for the notice since voice#28); pond's `pq` upstream still returns `Rows.csv`.
 
 **pond `pq` as hale 0.24.0 carries it.** A query's rows come back as one
 string, rows by newline and columns by tab, with no escaping, so a column
@@ -194,6 +222,8 @@ sink, prints nothing.
 
 ## A text built or read a line at a time is quadratic in memory
 
+**Status (2026-11-06):** unchanged by design; spec/stdlib.md § Linear byte scanning states the cost model, and `BytesBuilder` / `bytes_view` are the linear shapes. A loop body in a method now frees what each iteration makes (v0.30.1, #1765), which bounds the second shape's peak but not the first's copies.
+
 **hale 0.24.0.** Two shapes that read naturally both copy the whole text
 per line, and every copy stays in the arena until the handler returns:
 growing a result with `out = out + row`, and walking lines with
@@ -210,6 +240,8 @@ in `store/types.hl`). The same page now grows the peak by 8 MB, and
 
 ## A shared seed's names are reached only through its alias
 
+**Status (2026-11-06):** unchanged by design (one alias per import, names reached through it).
+
 **hale 0.24.0.** An import binds one alias (`import "../store" as st;`),
 and every name of the seed is reached through it (`st::ModelRow`); there is
 no importing a name unqualified, and an alias binds in the seed that
@@ -224,6 +256,8 @@ names. The surface's descriptions name the store's shapes `st::Names` and
 so on, which is the open point on stable names for imported types.
 
 ## `hale verify` took `std::env::arg` for a seed's `one_arg`
+
+**Status (2026-11-06):** very likely FIXED by hale v0.32.2 (#1842): the generated JSON codecs were parsed as if they began at the bundle's first byte, so their positions overlapped real files' code and a store in one file was reported against another, depending on an unrelated constant's length. Not re-run with the original seed.
 
 **hale 0.24.0.** With the store seed declaring `fn one_arg(v: String) ->
 db::Args`, `hale verify api` and `hale verify brain` flagged each
@@ -243,6 +277,8 @@ method name, as `draining` and `drain` are.
 
 ## `hale api export`'s OpenAPI form does not lint
 
+**Status (2026-11-06):** unchanged for `servers`: the export still writes no `servers` entry (an upstream ask, small). Imported types are named plainly since v0.25.0.
+
 **hale 0.24.0; narrowed in 0.25.0.** The exported `Voice.openapi.json`
 failed `redocly lint` with ten errors: nine component names (a type from an
 imported seed was named by its alias, `st::Names`, and `::` is not allowed
@@ -258,11 +294,15 @@ each gap classed in `api/gaps.json`.
 
 ## A bounded list can't be returned by value from a fn
 
+**Status (2026-11-06):** settled as a rule: `hale check` now refuses the declaration itself ("bounded[T; N] cannot be returned by value — it lives inline in its containing type; return a record holding it"), so the build no longer fails late. The record shape stays.
+
 **hale 0.25.0.** `fn names() -> bounded[String; 4] { let mut r = Row { }; push(r.names, "a") or discard; return r.names; }` (with `type Row { names: bounded[String; 4]; }`) typechecks, then fails the build: "codegen error: unsupported in codegen v0: bounded[T; N] cannot be returned by value — it lives inline in its containing type".
 
 **Working shape:** a function returns a record that holds the list (`Names { items }`), and since 0.25.0 a caller assigns the field whole (`row.owners = names_of(x).items`).
 
 ## `std::http::Server` does not read a chunked request body
+
+**Status (2026-11-06):** STILL REAL on hale v0.32.7: `io_tcp_serve.hl` still reads `Content-Length` bodies only ("Transfer-Encoding: chunked is not parsed"); the streamed readers on the client side (v0.29.0, v0.30.0) do read chunked. The `400 invalid_request` stands.
 
 **hale 0.25.0.** A request sent with `Transfer-Encoding: chunked` and no `Content-Length` reaches the handler with an empty body: the Server reads `Content-Length` bodies only, a deferral hale named with its streamed responses (hale-lang/hale#1596). The body cap and its `413` hold only for bodies with a `Content-Length`, which the usual SDKs send.
 
@@ -270,11 +310,15 @@ each gap classed in `api/gaps.json`.
 
 ## `std::http::Server` reassembles a request body in memory quadratic in its size
 
+**Status (2026-11-06):** FIXED in hale v0.25.1 (#1628), as recorded below.
+
 **hale 0.25.0.** The connection loop (`__http_handle_one_conn`, io_tcp_serve.hl) grows the request with `raw = raw + chunk` per 8 KiB `recv`, and every prefix stays until the connection is served. A handler that only answers `len(req.body)` peaks at 74 MB for a 1 MiB body, 274 MB for 2 MiB, 1.07 GB for 4 MiB and 4.2 GB for 8 MiB; an 11 MiB body took the api to 7.7 GB, before its handler ran (so before any key is checked). It stayed hidden under the 1 MiB default cap; `max_request_bytes` at the contract's 12 MiB makes a 12 MiB body cost about 9.5 GB.
 
 **Resolved in hale 0.25.1** (hale-lang/hale#1628): the Server reads a body in linear memory, about 75 MB of peak for 12 MiB. The api's cap is back at the contract's 12 MiB; a request just under it peaks the api at about 160 MB, streamed about 210 MB, and e2e holds them under 200 and 256 MB. Until then the cap was 2 MiB (about 274 MB worst case), still answered `413 request_too_large` in the contract's envelope.
 
 ## An enum field's literal default is described as optional, but the codec requires the field
+
+**Status (2026-11-06):** FIXED upstream (re-run 2026-11-06 on v0.32.7): the export leaves `scope` out of `required` and `L::api_decode` fills an absent `scope` with its declared default; spec/api.md § Codecs now says an absent enum field is its default when it declares one, and `missing_field` otherwise. The presence pairs can go back to plain defaults.
 
 **hale 0.25.1.** With `type Scope = enum { project, key };` and `type L { scope: Scope = Scope::key; }`, `hale api export` leaves `scope` out of `L`'s `required`, but `L::api_decode("{}")` refuses the payload with `missing_field`. That matches the spec: an enum field has no default the codec reads (spec/api.md, Codecs). The description and the codec disagree, and a client built from the description would leave the field out.
 
@@ -282,11 +326,15 @@ each gap classed in `api/gaps.json`.
 
 ## A record literal in a field default is not checked for a field with no default
 
+**Status (2026-11-06):** FIXED in hale v0.26.0: `hale check` refuses a record literal in a field, parameter or method default that leaves out a field with no default of its own, at the literal (re-run 2026-11-06: "type `B`: missing field `period`" in check and build alike).
+
 **hale 0.25.1.** `type Row { budget: BudgetSet = BudgetSet { }; }`, where `BudgetSet` has a field with no default (here an enum, `period: Period;`), passes `hale check`; the build then fails: "codegen error: unsupported in codegen v0: type `st::BudgetSet` literal missing field `period`". The same literal in a function body is refused by the checker ("missing field `period`").
 
 **Working shape:** a field default names every field without a default (`BudgetSet { period: Period::month }`).
 
 ## The codec has no free-form JSON value, no scalar-valued map and no third state for a PATCH's null
+
+**Status (2026-11-06):** closed in hale v0.26.0, as recorded below.
 
 **hale 0.25.1.** The contract has three shapes no Hale type says:
 
@@ -298,11 +346,15 @@ each gap classed in `api/gaps.json`.
 
 ## A bounded list is never required
 
+**Status (2026-11-06):** by design, unchanged (spec/api.md § Codecs: a `bounded` field left out is empty, so none is ever under `required`). The reader-side refusal stands.
+
 **hale 0.25.1.** A `bounded` field may be left out of a payload and is empty (spec/api.md, Codecs), so the export lists none under `required`. The contract requires several lists (a project's `owners` and `data_classes`, a node's `seats`, local controls' `paused_seats`); each is a `required` gap the row cannot close.
 
 **Working shape:** the REST reader refuses a body without a required list; the gap stays listed.
 
 ## A Float does not survive `to_string`, nor the api codec
+
+**Status (2026-11-06):** FIXED in hale v0.26.0 (#1666), as recorded below.
 
 **hale 0.25.1.** `to_string(Float)` keeps six significant digits: `99.999995` is written `100` and `33.333333333333336` is written `33.3333`, so `parse_float(to_string(x)) == x` fails for most values. `T::api_encode` writes a Float field the same way (`{"used_percent":100}` for 99.999995), so a Float that crosses the api codec comes back as a different number.
 
@@ -310,11 +362,15 @@ each gap classed in `api/gaps.json`.
 
 ## The runtime writes to stderr outside any logger
 
+**Status (2026-11-06):** STILL REAL, reworded: the `perror` is gone, but a failed write in `lotus_tcp_send_str` (EPIPE included) still writes one ERROR record to fd 2 through the runtime's own `lotus_diag_errno`, outside `std::log` and with no level filter. Reported upstream with the 2026-11-06 friction retest.
+
 **hale 0.25.1.** When a client hangs up while the api writes its answer, the runtime prints `lotus_tcp_send_str: write: Broken pipe` (a `perror` in the C runtime) on stderr. It is a write by Hale's runtime, outside `std::log` and outside the program, so a program that routes every line through its logger still has this one, unstructured.
 
 **Working shape:** none in voice; docs/internals.md's Logs section names it as the one exception. hale's #1592 (structured stdout and runtime events) is where it belongs.
 
 ## A program that reads `self.draining` waits out the whole drain grace, its HTTP server never ending on it
+
+**Status (2026-11-06):** FIXED upstream, as recorded below (v0.26.0 stops every listener on a drain; v0.32.5 #1851 counts a `drain()` / `dissolve()` hook; v0.32.7 ends a sleep begun during the drain at once).
 
 **hale 0.25.1.** The drain on SIGINT or SIGTERM is installed only in a program that reads `self.draining`. Once anything does (a pinned queue's `while !self.draining` loop, or pond's `NatsConn`), a signal waits for the main locus's `run()` to return, and the api's `run()` is `std::http::Server`, which does not end on the drain. So every stop waits out the grace: "the drain begun by signal 15 did not finish within 5000 ms ... live loci that read draining: `Teller` x1". The api took 5 s to stop instead of a few milliseconds.
 
@@ -324,11 +380,15 @@ each gap classed in `api/gaps.json`.
 
 ## A binding's literal that reads the locus's params passes the check and fails the build
 
+**Status (2026-11-06):** settled as a rule: `hale check` now refuses it with the reason (re-run 2026-11-06: "the `…` literal is built by the program's prelude, before `App`, as an expression of a free fn is: `self` used outside a locus body"). The pinned-locus shape stays the way to read a param.
+
 **hale 0.25.1.** In `bindings { T: nats::NatsPublisher { url: self.nerves_url, ... } codec(...); }` `hale check` accepts `self.nerves_url`; `hale build` then fails: "codegen error: unsupported in codegen v0: self.org read outside a locus method".
 
 **Working shape:** no binding. The teller (api/teller.hl) is a pinned locus whose params the main locus's own literal sets from its params, which a params initializer may read.
 
 ## `std::http::Client` bounds its dial, not its answer
+
+**Status (2026-11-06):** FIXED in hale v0.26.0 (#1657): `timeout_ms` bounds the call whole, the dial, the writes and the reads (crates/hale-stdlib/hl/http_client.hl). `api/deadline.hl` can retire.
 
 **hale 0.25.1, and main at ec6fc8f.** `timeout_ms` bounds the TCP connect (and the TLS handshake); the request's write and the read of the answer have no bound, and `max_retries` (3 by default) repeats the whole exchange. A peer that takes the connection and never answers (a head stopped mid-run, a proxy that holds it) keeps the caller for as long as it holds, so a call a locus makes on a schedule has no deadline it can state.
 
@@ -336,17 +396,23 @@ each gap classed in `api/gaps.json`.
 
 ## A pinned locus's log line waits for the main thread's next request
 
+**Status (2026-11-06):** FIXED in hale v0.26.0: an accept on the main thread delivers what other threads publish to subscribers on main while it waits, so a pinned locus's `std::log` line reaches a sink on main as it is written.
+
 **hale 0.25.1, and main at ec6fc8f.** A `std::log::Logger` line written on a pinned locus's thread reaches `StdoutSink` only when the main thread next drains its bus queue, and a main thread serving `std::http::Server` drains it between requests. With no request coming in, the teller's and the limits reader's warnings (a head that stopped answering) are not written at all until one does. A probe (a pinned locus logging once a second beside a Server) wrote nothing for five seconds, then all five lines on the first request.
 
 **Working shape:** none in the api. The DNA fixture (api/tests/admin_limits.sh) asks the api's `/healthz` while it waits for a reader's line.
 
 ## `std::http`'s client reads a response whole, so an https upstream is relayed after it ends
 
+**Status (2026-11-06):** FIXED in hale v0.29.0 (#1719, #1729, #1736; hale-lang/hale#1698 closed 2026-10-22): `std::http` reads a body as it arrives, as chunks or as server-sent events, with bounded waits; v0.30.0 reads chunked bodies in linear time. `compat_play` can go.
+
 **hale 0.27.0.** `std::http::request` returns a `ClientResponse` with the body read to its end. The openai-compatible engine (node/compat.hl) asks a chat-completions upstream for a stream, but over https the whole stream is read first and its events are published afterward: the caller sees no first token until the model has finished, and a tool call's argument fragments arrive all at once. Filed as [hale-lang/hale#1698](https://github.com/hale-lang/hale/issues/1698), modelled on the server side's chunked/SSE writer (#1596): a client that hands back the body as it arrives.
 
 **Working shape:** an http upstream is spoken to over `std::io::tcp` and relayed chunk by chunk (`Upstream.open` and `next_data`); an https upstream goes through `std::http::request` and is played from the finished body (`compat_play`), the same events in the same order, only late.
 
 ## A payload's record stored into a bounded field with `set` or `push` dangles
+
+**Status (2026-11-06):** not reproduced on hale v0.32.7 (2026-11-06): a subscriber that `push`es or `set`s each delivered record into a `bounded[Rec; 16]` field reads every stored String back intact after later deliveries, on a cooperative and on a pinned subscriber, under `LOTUS_NO_CHUNK_POOL=1` and in an ASan build. Whatever the 0.29.0 trigger was is narrower than this shape, or was closed by the arena work since (#1765, #1767, #1832). Keep the whole-record assignment until the original is re-run.
 
 **hale 0.29.0, and the stdlib/http-credential-redirects branch.** spec/semantics.md
 says a payload's String or row is copied into a resident's own storage as it is
@@ -364,6 +430,8 @@ holds (node/session.hl, `on_fetch`, `overlay`). To be filed upstream with a
 reproduction.
 
 ## A write to a local record is lost once the record was handed by value to a call
+
+**Status (2026-11-06):** FIXED in hale v0.32.0 (hale-lang/hale#1832, found in voice#133): a fallible locus member's write through a record parameter landed in its own per-call scratch and the caller read freed memory; it lands in the caller's arena now, as an infallible member's did since #1767. The fresh-copy shape can stay or go.
 
 **hale 0.30.1** (not 0.30.0). In `Nodes.rotate_token_held` (api/nodes.hl),
 `let mut after = self.view(row) or raise;` was passed by value to

@@ -1,0 +1,75 @@
+TensorFold dsv41: the RDMA ring opens the GID index TF_RDMA_GID_INDEX names
+
+The two-node line (deepseek-v41-zig-tp2) opens GID index 5 of each RDMA
+device and reads no setting for it (the recipe's RUNNING.md, section 2). A
+link whose RoCE v2 address sits at another index (index 3 on the lab's DGX
+Sparks, where index 5 does not exist) cannot run it. Both ring openings in
+model.zig now take the index from TF_RDMA_GID_INDEX: 5 when it is unset, as
+before; a whole number from 0 to 255 otherwise, anything else stopping the
+start. The node sets it, and NCCL_IB_GID_INDEX, from the link's declared
+gid_index (node/tensorfold.hl `lanes_env`).
+
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index d2007ca8..c84cd1bc 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -332,7 +332,7 @@ pub const Model = struct {
+                 var devices: std.ArrayList([]const u8) = .empty;
+                 var dit = std.mem.splitScalar(u8, devs, ',');
+                 while (dit.next()) |x| try devices.append(a, x);
+-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
++                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = try rdma.gidIndex() }, &m.comm, m.stream);
+                 m.two.?.rings = &m.rdma_rings.?;
+             }
+         }
+@@ -464,7 +464,7 @@ pub const Model = struct {
+     /// connected, and started once both are (an all-gather as the barrier).
+     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+         if (comm.world != 2) return error.NotTwoRanks;
+-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
++        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = try rdma.gidIndex() });
+         errdefer r.destroy(gpa);
+         const per = @sizeOf(rdma.Info);
+         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 73ff3ee6..859fdd22 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -28,6 +28,21 @@ const host_register_devicemap = 0x02;
+ 
+ pub const Error = error{ VerbsFailed, PostFailed, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
++/// The GID index the ring opens on each device (port 1): TF_RDMA_GID_INDEX, 5 when unset. A link whose RoCE v2
++/// address sits at another index names it here; a value that is not a whole number from 0 to 255 stops the start.
++pub fn gidIndex() error{BadGidIndex}!u8 {
++    const raw = std.c.getenv("TF_RDMA_GID_INDEX");
++    return parseGidIndex(if (raw) |v| std.mem.span(v) else null);
++}
++
++pub fn parseGidIndex(value: ?[]const u8) error{BadGidIndex}!u8 {
++    const raw = value orelse return 5;
++    if (raw.len == 0 or raw.len > 3) return error.BadGidIndex;
++    for (raw) |c| if (c < '0' or c > '9') return error.BadGidIndex;
++    if (raw.len > 1 and raw[0] == '0') return error.BadGidIndex;
++    return std.fmt.parseInt(u8, raw, 10) catch error.BadGidIndex;
++}
++
+ /// The Python build's switches, with their defaults (TF_RDMA_SLOTS, TF_RDMA_STAGE_BLOCKS, ..., TF_RDMA_PDL as served).
+ pub const Settings = struct {
+     slots: u32 = 4,
+@@ -546,3 +561,15 @@ test "a failed neighbor stage releases both local stages' device waits" {
+     try std.testing.expectEqual(@as(u64, 1), first.abortWord().*);
+     try std.testing.expectEqual(@as(u64, 1), second.abortWord().*);
+ }
++
++test "TF_RDMA_GID_INDEX: unset is 5, a number is that index, anything else is refused" {
++    try std.testing.expectEqual(@as(u8, 5), try parseGidIndex(null));
++    try std.testing.expectEqual(@as(u8, 3), try parseGidIndex("3"));
++    try std.testing.expectEqual(@as(u8, 0), try parseGidIndex("0"));
++    try std.testing.expectEqual(@as(u8, 255), try parseGidIndex("255"));
++    try std.testing.expectError(error.BadGidIndex, parseGidIndex(""));
++    try std.testing.expectError(error.BadGidIndex, parseGidIndex("256"));
++    try std.testing.expectError(error.BadGidIndex, parseGidIndex("-1"));
++    try std.testing.expectError(error.BadGidIndex, parseGidIndex("3 "));
++    try std.testing.expectError(error.BadGidIndex, parseGidIndex("03"));
++}

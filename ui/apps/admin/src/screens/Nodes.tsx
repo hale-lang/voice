@@ -10,13 +10,15 @@ import { readout } from '../readout';
 import { toneOf } from '../tone';
 import { ContextWindow } from '../context';
 import { Value } from '../values';
+import { nodeModels, heldSaid, type NodeModel } from './node-models';
 
 type Seat = Schemas['Seat'];
 
 /**
- * Nodes, and one node's seats with assigned beside reported. The list is
- * the nodes summarized; the inspector reads the node whole (what it
- * declared), and a seat whole (its config).
+ * Nodes, and one node's models: what it runs and what it holds on its
+ * disk, first; its seats (assigned beside reported) in their details
+ * below. The list is the nodes summarized; the inspector reads the node
+ * whole (what it declared), and a seat whole (its config).
  */
 export function Nodes({ route, setInspector }: ScreenProps) {
   const nodeId = route.parts[1];
@@ -76,7 +78,15 @@ export function Nodes({ route, setInspector }: ScreenProps) {
           <Button onClick={() => go('nodes', 'new')} tone="primary">new node</Button>
         </p>
       </Panel>
-      {node && <Seats node={node} selected={seatId} fresh={readout(q)} />}
+      {node && <Models node={node} fresh={readout(q)} />}
+      {node && (
+        <details open={!!seatId} style={{ marginTop: 'var(--space-3)' }}>
+          <summary className="muted" style={{ cursor: 'pointer', marginBottom: 'var(--space-2)' }}>
+            Seats on {node.id}: {node.seats.length}, the details behind its models
+          </summary>
+          <Seats node={node} selected={seatId} fresh={readout(q)} />
+        </details>
+      )}
     </>
   );
 }
@@ -121,6 +131,65 @@ function OnDiskCell({ node }: { node: NodeSummary }) {
   const d = node.downloaded;
   if (!d) return <span className="faint" title="the node has not reported what its store holds">–</span>;
   return <span title={`${d.files} files held whole`}>{bytes(d.bytes)}</span>;
+}
+
+type Download = Schemas['NodeDownload'];
+
+/**
+ * What the node runs and holds, model by model (node-models.ts): each
+ * model a seat serves here (a placement's seat, its leader or the follower
+ * that runs the other half, or a seat of another engine), with its state
+ * and what its disk holds of it; then each variant on its disk that nothing
+ * here serves. A row of a seat opens it.
+ */
+function Models({ node, fresh }: { node: NodeSummary; fresh: string }) {
+  const placements = useGet('/admin/v1/placements');
+  const downloads = useGet('/admin/v1/nodes/{node}/downloads', { params: { path: { node: node.id } } });
+  const rows = nodeModels(node.id, node.seats, placements.data?.data ?? [], downloads.data?.data ?? []);
+  const served = rows.filter((r) => r.seat).length;
+  return (
+    <Panel title={`Models on ${node.id}`} readout={`${served} served · ${rows.length - served} on disk only · ${fresh}`}>
+      <Table<NodeModel>
+        rows={rows}
+        rowKey={(r) => r.key}
+        onSelect={(r) => (r.seat ? go('nodes', node.id, r.seat.id) : undefined)}
+        columns={[
+          { key: 'model', header: 'Model', render: (r) => <Mono>{r.model}</Mono> },
+          {
+            key: 'how',
+            header: 'How',
+            wrap: true,
+            render: (r) =>
+              r.placement ? (
+                <>
+                  <a href={href('placements', r.placement.id)}>placed as {r.placement.id}</a>
+                  <span className="muted"> · {r.placement.variant} under {r.placement.runtime}{r.part === 'leader' ? `, leading ${r.placement.nodes.filter((n) => n !== node.id).join('')}` : r.part === 'follower' ? `, the other half of ${r.placement.leader}'s` : ''}</span>
+                </>
+              ) : r.seat ? (
+                <span className="muted">a {r.seat.engine} seat</span>
+              ) : (
+                <span className="muted">{r.download?.variant}</span>
+              ),
+          },
+          {
+            key: 'state',
+            header: 'State',
+            render: (r) => (r.seat ? <Status tone={toneOf(r.seat.status)} label={reported(r.seat)} title={r.seat.reason ?? undefined} /> : <Status tone="quiet" label={r.placement ? 'placed, no seat here yet' : 'on disk, not served'} />),
+          },
+          {
+            key: 'disk',
+            header: 'On disk',
+            num: true,
+            render: (r) => (r.download ? (r.download.complete ? bytes(r.download.bytes) : <span className="c-wait">{heldSaid(r.download)} of {bytes(r.download.bytes)}</span>) : <span className="faint">–</span>),
+          },
+        ]}
+        empty={downloads.data && !downloads.data.reported_at ? 'Nothing served here, and the node has not said what its disk holds.' : 'Nothing served here, and nothing on its disk.'}
+      />
+      <p style={{ marginBottom: 0 }}>
+        <Button onClick={() => go('placements', 'new')}>place a model</Button>
+      </p>
+    </Panel>
+  );
 }
 
 function Seats({ node, selected, fresh }: { node: NodeSummary; selected?: string; fresh: string }) {
@@ -334,6 +403,7 @@ function NodeInspector({ node }: { node: Node }) {
           ]}
         />
       )}
+      <OnThisMachine node={node} />
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Offers</h3>
       {caps ? (
         <Kv rows={caps.engines.map((e) => ({ k: e.id, v: <>{e.kind}{e.models ? <span className="muted"> · {e.models.join(', ')}</span> : null}</> }))} />
@@ -344,7 +414,6 @@ function NodeInspector({ node }: { node: Node }) {
       <Hardware node={node} />
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Links</h3>
       <Links node={node} />
-      <OnThisMachine node={node} />
       {node.status !== 'revoked' && <Suggested node={node} />}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
       {local ? (
@@ -375,8 +444,6 @@ function NodeInspector({ node }: { node: Node }) {
     </>
   );
 }
-
-type Download = Schemas['NodeDownload'];
 
 /**
  * The models on the machine's disk (`listNodeDownloads`): each recipe

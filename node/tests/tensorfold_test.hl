@@ -1,0 +1,378 @@
+// A TensorFold seat (tensorfold.hl): what each rank is started with, as the
+// recipe's serve.sh starts it, with the GID index from the node's declared
+// link; what a variant's file sets fetch, a manifest read; and the inputs
+// its prepare step readies, kept under a key that changes with the weights,
+// the sets, the engine and the rank alone. The addresses are the lab's.
+import ".." as node;
+
+const SPARK: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}], \"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"192.168.101.1\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}]}";
+
+const NO_GID: String = "{\"max_in_flight\": 4, \"engines\": [], \"links\": [{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}]}]}";
+
+const LEADER: String = "{\"size\": 2, \"rank\": 0, \"peer\": \"flare\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+
+const FOLLOWER: String = "{\"size\": 2, \"rank\": 1, \"peer\": \"spark\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501}";
+
+fn sha(c: String) -> String {
+    let mut s = "";
+    while len(s) < 64 { s = s + c; }
+    return s[0..64];
+}
+
+/// A TensorFold variant: two weight files, the Engram set listed, the kit
+/// pinned by its manifest, and what its prepare step makes.
+fn variant(weights: String) -> String {
+    return "{\"id\": \"exl3-2.5bpw\", \"format\": \"exl3\", \"quantization\": \"2.5bpw\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/w\", \"revision\": \""
+        + sha("1")[0..40]
+        + "\"}, \"files\": [{\"path\": \"config.json\", \"bytes\": 10, \"sha256\": \""
+        + sha("a")
+        + "\"}, {\"path\": \"model-00001-of-00001.safetensors\", \"bytes\": 100, \"sha256\": \""
+        + weights
+        + "\"}], \"memory_bytes\": 217000000000, \"file_sets\": [{\"name\": \"engram\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/orig\", \"revision\": \""
+        + sha("2")[0..40]
+        + "\"}, \"files\": [{\"path\": \"model-00047-of-00048.safetensors\", \"bytes\": 50, \"sha256\": \""
+        + sha("c")
+        + "\"}]}, {\"name\": \"kit\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/kit\", \"revision\": \""
+        + sha("3")[0..40]
+        + "\"}, \"manifest\": {\"path\": \"kit/MANIFEST\", \"bytes\": 300, \"sha256\": \""
+        + sha("d")
+        + "\"}, \"bytes\": 30}], \"prepare\": \"dsv41-tp2\", \"prepared\": [{\"path\": \"model/serving-1017.safetensors\", \"bytes\": 5, \"sha256\": \""
+        + sha("e")
+        + "\"}, {\"path\": \"cache/rank-cache/rank0of2-aaaa.bin\", \"bytes\": 7, \"sha256\": \""
+        + sha("f")
+        + "\", \"rank\": 0}, {\"path\": \"cache/rank-cache/rank1of2-bbbb.bin\", \"bytes\": 8, \"sha256\": \""
+        + sha("0") + "\", \"rank\": 1}]}";
+}
+
+fn config(v: String, archive: String, cluster: String, placement: String) -> String {
+    return "{\"placement\": \"" + placement
+        + "\", \"model\": \"deepseek-v4.1-flash\", \"context_length\": 1048576, \"variant\": " + v
+        + ", \"runtime\": {\"id\": \"tensorfold-0.7.5\", \"server\": \"tensorfold\", \"accelerator\": \"cuda\", \"artifact\": {\"kind\": \"container\", \"image\": \"nvcr.io/nvidia/pytorch\", \"digest\": \"sha256:"
+        + sha("4") + "\", \"archive\": {\"url\": \"https://example.com/tf.tar.gz\", \"sha256\": \""
+        + archive
+        + "\", \"bytes\": 9}}, \"multi_node\": \"lanes\"}, \"cluster\": " + cluster + "}";
+}
+
+fn main() {
+    // ---- the link, as the recipe sets it, at the declared GID index -------------
+    std::test::assert_eq_str(
+        node::lanes_env(SPARK, "flare"),
+        "-e\nTF_RDMA_DEVICES=rocep1s0f0,roceP2p1s0f0\n-e\nTF_DS_RDMA_KERNELS=/engine/bin/rdma_gather.fatbin\n-e\nNCCL_IB_HCA=rocep1s0f0,roceP2p1s0f0\n-e\nNCCL_SOCKET_IFNAME=enp1s0f0np0\n-e\nTF_RDMA_GID_INDEX=3\n-e\nNCCL_IB_GID_INDEX=3\n",
+        "both halves' RDMA devices carry the ring and NCCL, at the link's GID index",
+    );
+    std::test::assert_eq_str(
+        node::lanes_env(NO_GID, "flare"),
+        "-e\nTF_RDMA_DEVICES=rocep1s0f0\n-e\nTF_DS_RDMA_KERNELS=/engine/bin/rdma_gather.fatbin\n-e\nNCCL_IB_HCA=rocep1s0f0\n-e\nNCCL_SOCKET_IFNAME=enp1s0f0np0\n",
+        "a link that declares no GID index leaves the engine's own",
+    );
+    std::test::assert_eq_str(node::lanes_env(SPARK, "spark2"), "", "no link: nothing");
+    std::test::assert_eq_str(
+        node::link_hcas(SPARK, "flare"),
+        "rocep1s0f0,roceP2p1s0f0",
+        "the follower's --rdma",
+    );
+
+    // ---- each rank's command ----------------------------------------------------
+    let lead = node::rank_launch(
+        LEADER,
+        "rocep1s0f0,roceP2p1s0f0",
+        "deepseek-v4.1-flash",
+        47100,
+        1048576,
+    );
+    std::test::assert_eq_str(
+        lead.env,
+        "-e\nTF_TP_WORLD=2\n-e\nTF_TP_MASTER=192.168.100.1\n-e\nTF_TP_PORT=29501\n-e\nTF_DS_RANK_CACHE=/cache/rank-cache\n-e\nTF_DS_KIT=/kit\n-e\nTENSORFOLD_CUDA_KERNELS=/kit/aot\n-e\nTF_DS_ENGRAM=/engram\n-e\nTF_DS_TOKEN_MAP=/cache/dsv41_token_map.json\n",
+        "rank 0 listens for rank 1 at the leader's link address",
+    );
+    std::test::assert_eq_str(
+        lead.command,
+        "/engine/bin/tensorfold-native\nserve\n/model\n--host\n127.0.0.1\n--port\n47100\n--name\ndeepseek-v4.1-flash\n--context\n1048576\n--parallel\n32\n--thinking\n--max-tokens\n32768\n--temperature\n1.0\n--top-p\n0.95\n--top-k\n20\n--prompt-cache-gib\n2\n--backend\ncuda",
+        "rank 0 serves on loopback, at the recipe's settings",
+    );
+    let follow = node::rank_launch(
+        FOLLOWER,
+        "rocep1s0f0,roceP2p1s0f0",
+        "deepseek-v4.1-flash",
+        0,
+        1048576,
+    );
+    std::test::assert_eq_str(
+        follow.env,
+        "-e\nTF_TP_CONNECT_SECONDS=86400\n",
+        "rank 1 waits for rank 0 as long as it is assigned",
+    );
+    std::test::assert_eq_str(
+        follow.command,
+        "/engine/bin/tf-dsv41-lanes\n/model\n/cache/rank-cache\n1\n2\n192.168.100.1\n29501\n/kit\n--pool\n7340032\n--context\n1048576\n--streams\n32\n--round-rows\n64\n--engram\n/engram\n--token-map\n/cache/dsv41_token_map.json\n--graphs\n1\n--side\n1\n--prefetch\n1\n--aio\n1\n--rdma\nrocep1s0f0,roceP2p1s0f0\n--rdma-kernels\n/engine/bin/rdma_gather.fatbin",
+        "rank 1 follows rank 0 with the same shape",
+    );
+
+    // ---- the container ----------------------------------------------------------
+    let argv = node::tensorfold_argv(
+        "voice.spark.ds",
+        "spark",
+        "/data",
+        "/data/models/ds",
+        "/data/sets/ds",
+        "/data/prepared/k",
+        "/data/runtimes/e",
+        node::lanes_env(SPARK, "flare"),
+        "nvcr.io/nvidia/pytorch@sha256:2140",
+        lead,
+    );
+    std::test::assert(
+        std::str::starts_with(
+            argv,
+            "docker\nrun\n--rm\n--init\n--name\nvoice.spark.ds\n--label\nnet.hale-lang.voice.node=spark\n--network\nhost\n--ipc\nhost\n--gpus\nall\n--device\n/dev/infiniband\n--ulimit\nmemlock=-1\n--ulimit\nstack=67108864\n-e\nTF_RDMA_DEVICES=",
+        ),
+        "on the host's network, with the GPUs, the RDMA devices and locked memory: " + argv,
+    );
+    for want in [
+        "\n--cap-add\nIPC_LOCK\n",
+        "\n-e\nTF_RDMA_GID_INDEX=3\n",
+        "\n-e\nTF_DS_STREAMS=32\n-e\nTF_DS_ROUND_ROWS=64\n-e\nTF_DS_WINDOW=7340032\n",
+        "\n-e\nTF_DS_IDX_SPLIT=8192\n",
+        "\n-e\nTENSORFOLD_GRAMMAR_LIB=/engine/lib/libtfgrammar.so\n",
+        "\n-e\nTF_DS_ROUND_MS=30.0,35.2,",
+        "\n-e\nTF_TP_MASTER=192.168.100.1\n",
+        "\n-v\n/data/models/ds:/model:ro\n",
+        "\n-v\n/data/blobs:/data/blobs:ro\n",
+        "\n-v\n/data/prepared/k:/data/prepared/k:ro\n",
+        "\n-v\n/data/prepared/k/cache:/cache:ro\n",
+        "\n-v\n/data/sets/ds/engram:/engram:ro\n",
+        "\n-v\n/data/sets/ds/kit:/kit:ro\n",
+        "\n-v\n/data/runtimes/e:/engine:ro\n",
+        "\nnvcr.io/nvidia/pytorch@sha256:2140\n/engine/bin/tensorfold-native\nserve\n",
+    ] {
+        std::test::assert(std::str::contains(argv, want), "rank 0's container has " + want);
+    }
+    std::test::assert(!std::str::contains(argv, "\n-p\n"), "it publishes no port: " + argv);
+    std::test::assert_eq_str(
+        node::health_path("tensorfold"),
+        "/v1/models",
+        "ready once it lists its model",
+    );
+
+    // ---- what a variant fetches -------------------------------------------------
+    let v = variant(sha("b"));
+    let pins = node::variant_pins("https://hub", v);
+    std::test::assert_eq_str(
+        pins,
+        "https://hub/o/w/resolve/" + sha("1")[0..40] + "/config.json\tconfig.json\t" + sha("a")
+            + "\t10\thub\n" + "https://hub/o/w/resolve/" + sha("1")[0..40]
+            + "/model-00001-of-00001.safetensors\tmodel-00001-of-00001.safetensors\t" + sha("b")
+            + "\t100\thub\n"
+            + "https://hub/o/orig/resolve/" + sha("2")[0..40]
+            + "/model-00047-of-00048.safetensors\tengram/model-00047-of-00048.safetensors\t"
+            + sha("c") + "\t50\thub\n" + "https://hub/o/kit/resolve/" + sha("3")[0..40]
+            + "/kit/MANIFEST\tkit/kit/MANIFEST\t"
+            + sha("d") + "\t300\thub\n",
+        "its files, each set's from its own repository, a manifest in place of what it lists",
+    );
+    std::test::assert(node::pins_bytes(pins) == 460, "the pins' bytes together");
+    std::test::assert_eq_str(
+        node::distinct_pins(
+            "u1\ta\t" + sha("1") + "\t5\thub\nu2\tb\t" + sha("2") + "\t6\thub\nu3\tc\t" + sha("1")
+                + "\t5\thub\n",
+        ),
+        "u1\ta\t" + sha("1") + "\t5\thub\nu2\tb\t" + sha("2") + "\t6\thub\n",
+        "files of the same content are one blob, fetched once",
+    );
+    let cfg = config(v, sha("5"), LEADER, "ds");
+    std::test::assert_eq_str(
+        node::archive_pins(
+            std::json::find_field_raw(std::json::find_field_raw(cfg, "runtime"), "artifact"),
+        ),
+        "https://example.com/tf.tar.gz\tthe runtime's archive\t" + sha("5") + "\t9\tweb\n",
+        "the engine archive its image runs is fetched as an archive runtime is",
+    );
+    std::test::assert_eq_str(node::managed_problem(cfg), "", "a TensorFold seat's config");
+    std::test::assert(
+        std::str::contains(
+            node::managed_problem(
+                std::str::replace(cfg, "\"name\": \"kit\"", "\"name\": \"tools\""),
+            ),
+            "engram or kit",
+        ),
+        "a set of another name is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::managed_problem(
+                std::str::replace(cfg, "\"path\": \"kit/MANIFEST\"", "\"path\": \"../MANIFEST\""),
+            ),
+            "relative path",
+        ),
+        "a manifest that climbs is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::managed_problem(
+                std::str::replace(
+                    cfg,
+                    "https://example.com/tf.tar.gz",
+                    "http://example.com/tf.tar.gz",
+                ),
+            ),
+            "engine archive",
+        ),
+        "an engine archive not over https is refused",
+    );
+
+    // ---- a manifest -------------------------------------------------------------
+    let manifest = "# a kit: 2 files\n# Columns: sha256, bytes, origin, two-node, path\n" + sha("6")
+        + "     10  git   -    aot/aot.json\n" + sha("7")
+        + "  20  rope  tp2  rope-plain-cos.f32\n\n";
+    std::test::assert_eq_str(
+        node::manifest_files(manifest),
+        sha("6") + "\t10\taot/aot.json\n" + sha("7") + "\t20\trope-plain-cos.f32\n",
+        "each file's sha256, size and path; comments and blank lines say nothing",
+    );
+    for bad in [
+        "# nothing\n",
+        sha("6") + " 10\n",
+        sha("6") + " 0 x.json\n",
+        sha("6") + " 10 ../x.json\n",
+        "ab 10 x.json\n",
+    ] {
+        std::test::assert(
+            std::str::starts_with(node::manifest_files(bad), "!"),
+            "not a manifest: " + bad,
+        );
+    }
+
+    // ---- a manifest held: its files fetched, then laid out ----------------------
+    let data = "/tmp/voice-tensorfold-test-" + to_string(std::process::pid());
+    run("rm\n-rf\n" + data);
+    std::io::fs::mkdir(data) or discard;
+    std::io::fs::mkdir(data + "/blobs") or discard;
+    let kit = node::file_set(v, "kit");
+    std::test::assert_eq_str(
+        node::manifest_pins(data + "/blobs", "https://hub", v),
+        "",
+        "nothing until the manifest is held",
+    );
+    std::test::assert_eq_str(node::set_layout(data + "/blobs", kit), "", "nor laid out");
+    std::io::fs::write_file(data + "/blobs/" + sha("d"), manifest) or discard;
+    std::test::assert_eq_str(
+        node::manifest_pins(data + "/blobs", "https://hub", v),
+        "https://hub/o/kit/resolve/" + sha("3")[0..40] + "/kit/aot/aot.json\tkit/aot/aot.json\t"
+            + sha("6") + "\t10\thub\n" + "https://hub/o/kit/resolve/" + sha("3")[0..40]
+            + "/kit/rope-plain-cos.f32\tkit/rope-plain-cos.f32\t"
+            + sha("7")
+            + "\t20\thub\n",
+        "the files it lists, beside it in its set's repository",
+    );
+    std::test::assert_eq_str(
+        node::set_layout(data + "/blobs", kit),
+        "aot/aot.json\t" + sha("6") + "\nrope-plain-cos.f32\t" + sha("7") + "\n",
+        "laid out at the paths it gives, the set's own folder",
+    );
+    std::test::assert_eq_str(
+        node::set_layout(data + "/blobs", node::file_set(v, "engram")),
+        "model-00047-of-00048.safetensors\t" + sha("c") + "\n",
+        "a set that lists its files, at their paths",
+    );
+    let short = std::str::replace(v, "\"bytes\": 30}", "\"bytes\": 31}");
+    std::test::assert(
+        std::str::contains(
+            node::manifest_pins(data + "/blobs", "https://hub", short),
+            "30 bytes, not the 31",
+        ),
+        "a manifest whose files are not the bytes its set pins is refused",
+    );
+
+    // ---- the readied inputs' key ------------------------------------------------
+    let here = node::prepared_dir(data, cfg);
+    std::test::assert(
+        std::str::starts_with(here, data + "/prepared/") && len(here) == len(data) + 42,
+        "a key of 32 hex digits: " + here,
+    );
+    std::test::assert_eq_str(
+        node::prepared_dir(data, config(v, sha("5"), LEADER, "another-placement")),
+        here,
+        "another placement of the same reads the same inputs",
+    );
+    for other in [
+        config(variant(sha("9")), sha("5"), LEADER, "ds"),
+        config(v, sha("8"), LEADER, "ds"),
+        config(v, sha("5"), FOLLOWER, "ds"),
+        config(std::str::replace(v, sha("d"), sha("e")), sha("5"), LEADER, "ds"),
+    ] {
+        std::test::assert(
+            node::prepared_dir(data, other) != here,
+            "other weights, sets, engine or rank: other inputs",
+        );
+    }
+    std::test::assert_eq_str(
+        node::prepared_files(v, 1),
+        "model/serving-1017.safetensors\t" + sha("e") + "\t5\ncache/rank-cache/rank1of2-bbbb.bin\t"
+            + sha("0") + "\t8\n",
+        "every rank's files and rank 1's own",
+    );
+    std::test::assert_eq_str(
+        node::rank_file(v, 0),
+        "cache/rank-cache/rank0of2-aaaa.bin\t" + sha("f") + "\t7",
+        "rank 0's weight file",
+    );
+    std::test::assert(
+        node::rank_of(cfg) == 0 && node::rank_of(config(v, sha("5"), FOLLOWER, "ds")) == 1,
+        "the rank its part gives it",
+    );
+
+    // ---- what a prepare step made, checked against the pins ---------------------
+    let work = data + "/work";
+    run("mkdir\n-p\n" + work + "/model\n" + work + "/cache/rank-cache");
+    let made = "{\"prepared\": [{\"path\": \"model/a.json\", \"bytes\": 2, \"sha256\": \""
+        + std::hex::encode(std::crypto::sha256(std::bytes::from_string("{}")))
+        + "\"}, {\"path\": \"cache/rank-cache/r0.bin\", \"bytes\": 3, \"sha256\": \""
+        + std::hex::encode(std::crypto::sha256(std::bytes::from_string("abc")))
+        + "\", \"rank\": 0}]}";
+    std::test::assert(
+        std::str::contains(node::prepared_problem(work, made, 0), "did not make model/a.json"),
+        "a file it did not make",
+    );
+    std::io::fs::write_file(work + "/model/a.json", "{}") or discard;
+    std::io::fs::write_file(work + "/cache/rank-cache/r0.bin", "abd") or discard;
+    std::test::assert(
+        std::str::contains(node::prepared_problem(work, made, 0), "r0.bin's sha256 is"),
+        "a file that is not the one pinned: " + node::prepared_problem(work, made, 0),
+    );
+    std::test::assert_eq_str(node::prepared_problem(work, made, 1), "", "rank 1 makes no r0.bin");
+    std::io::fs::write_file(work + "/cache/rank-cache/r0.bin", "abc") or discard;
+    std::test::assert_eq_str(node::prepared_problem(work, made, 0), "", "every file as pinned");
+
+    // ---- its prepare steps' containers ------------------------------------------
+    let step = node::prepare_argv(
+        "voice.spark.ds.prepare",
+        "spark",
+        "1000:1000",
+        "/data/blobs",
+        "/data/runtimes/e",
+        "/data/prepared/k.part/work",
+        node::PREPARE_INPUTS_ENV,
+        "nvcr.io/nvidia/pytorch@sha256:2140",
+        node::prepare_inputs_args(1),
+    );
+    std::test::assert_eq_str(
+        step,
+        "docker\nrun\n-d\n--name\nvoice.spark.ds.prepare\n--label\nnet.hale-lang.voice.node=spark\n--network\nnone\n--user\n1000:1000\n-e\nHOME=/tmp\n-e\nRANK_CACHE_BIN=/engine/bin/tf-dsv41-rank-cache\n-e\nPYTHON=python3\n-v\n/data/blobs:/data/blobs:ro\n-v\n/data/runtimes/e:/engine:ro\n-v\n/data/prepared/k.part/work:/work\nnvcr.io/nvidia/pytorch@sha256:2140\nbash\n/engine/tools/node_inputs.sh\n/work/model\n/work/cache\n1\n2",
+        "rank 1's inputs: no network, no GPU, the node's own account, its work folder the one place it writes",
+    );
+
+    // ---- what it carries --------------------------------------------------------
+    std::test::assert(
+        node::seat_carries_tools("managed", cfg),
+        "TensorFold reads DeepSeek's DSML calls itself",
+    );
+    std::test::assert(
+        node::served_tokens_tensorfold(cfg) == 1048576,
+        "a request of up to the model's context",
+    );
+    run("rm\n-rf\n" + data);
+}
+
+fn run(argv: String) {
+    std::process::run(argv) or discard;
+}

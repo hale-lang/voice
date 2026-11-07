@@ -209,10 +209,26 @@ locus Runner {
         let artifact = std::json::find_field_raw(runtime, "artifact");
         let server = std::json::find_string_field(runtime, "server");
         let models = self.data + "/models/" + seat;
-        let first = self.lay_out(models, std::json::find_field_raw(config, "variant"));
+        let variant = std::json::find_field_raw(config, "variant");
+        let first = self.lay_out(models, variant);
         if len(first) == 0 {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
+        }
+        // a TensorFold seat's: its readied inputs beside its weights, and
+        // its file sets, each a folder of its own (tensorfold.hl)
+        let sets = self.data + "/sets/" + seat;
+        let prepared = if server == "tensorfold" { prepared_dir(self.data, config) } else { "" };
+        if server == "tensorfold" {
+            if !std::io::fs::file_exists(prepared) {
+                self.tell(seat, "down", "its inputs are not readied (" + prepared + ")", "");
+                return;
+            }
+            let laid = self.lay_out_tensorfold(models, sets, prepared, variant, rank_of(config));
+            if len(laid) > 0 {
+                self.tell(seat, "down", laid, "");
+                return;
+            }
         }
         // what it holds once it runs (`footprint`): what the placement
         // reserved for it (its variant and its prompt cache), or, placed
@@ -248,7 +264,20 @@ locus Runner {
                 self.tell(seat, "down", refused_part, "");
                 return;
             }
-            env = link_env(self.capabilities, std::json::find_string_field(cluster, "peer"));
+            let peer = std::json::find_string_field(cluster, "peer");
+            env = if server == "tensorfold" {
+                lanes_env(self.capabilities, peer)
+            } else {
+                link_env(self.capabilities, peer)
+            };
+        } else if server == "tensorfold" {
+            self.tell(
+                seat,
+                "down",
+                "a tensorfold runtime runs across two nodes, and this seat is not a part of one",
+                "",
+            );
+            return;
         }
         let port = free_port(PORT_FROM + count(self.runs.items));
         if port < 0 {
@@ -294,7 +323,33 @@ locus Runner {
                 return;
             }
             run_out("docker\nrm\n-f\n" + r.container);
-            argv = if spans {
+            argv = if server == "tensorfold" {
+                tensorfold_argv(
+                    r.container,
+                    self.id,
+                    self.data,
+                    models,
+                    sets,
+                    prepared,
+                    unpack_archive(
+                        self.data,
+                        std::json::find_string_field(
+                            std::json::find_field_raw(artifact, "archive"),
+                            "sha256",
+                        ),
+                    ),
+                    env,
+                    std::json::find_string_field(artifact, "image") + "@"
+                        + std::json::find_string_field(artifact, "digest"),
+                    rank_launch(
+                        cluster,
+                        link_hcas(self.capabilities, std::json::find_string_field(cluster, "peer")),
+                        std::json::find_string_field(config, "model"),
+                        port,
+                        served_tokens_tensorfold(config),
+                    ),
+                )
+            } else if spans {
                 span_container_argv(
                     r.container,
                     self.id,
@@ -446,11 +501,15 @@ locus Runner {
     /// declares to the other, beside no other part across nodes (its ranks
     /// meet on the host's network, at one port).
     fn part_refusal(server: String, artifact: String, cluster: String) -> String {
-        if server != "vllm" || std::json::find_string_field(artifact, "kind") != "container" {
-            return "a model across two nodes runs vLLM's container, and its runtime is not one";
+        if (server != "vllm" && server != "tensorfold")
+            || std::json::find_string_field(artifact, "kind") != "container"
+        {
+            return "a model across two nodes runs vLLM's or TensorFold's container, and its runtime is neither";
         }
         let peer = std::json::find_string_field(cluster, "peer");
-        if len(link_env(self.capabilities, peer)) == 0 {
+        if len(link_env(self.capabilities, peer)) == 0
+            || (server == "tensorfold" && len(lanes_env(self.capabilities, peer)) == 0)
+        {
             return "this node declares no link to " + peer
                 + ", which its part across the two runs over";
         }
@@ -480,32 +539,65 @@ locus Runner {
     fn lay_out(dir: String, variant: String) -> String {
         run_out("rm\n-rf\n" + dir);
         run_out("mkdir\n-p\n" + dir);
+        let layout = variant_layout(variant);
+        if len(link_files(self.data, dir, layout)) > 0 { return ""; }
         let mut first = "";
         let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
         while !it.done {
             let path = std::json::find_string_field(it.element, "path");
-            let sha = std::json::find_string_field(it.element, "sha256");
-            let slash = last_slash(path);
-            if slash > 0 { run_out("mkdir\n-p\n" + dir + "/" + path[0..slash]); }
-            run_out("ln\n-sfn\n" + self.data + "/blobs/" + sha + "\n" + dir + "/" + path);
-            if !std::io::fs::file_exists(dir + "/" + path) { return ""; }
             if len(first) == 0 && std::str::ends_with(path, ".gguf") { first = path; }
             it = std::json::array_next(it);
         }
         return if len(first) > 0 { first } else { "." };
     }
 
+    /// A TensorFold seat's layout beside its weights (`models`, laid out):
+    /// the model folder's readied files linked into it from `prepared`, and
+    /// each file set a folder under `sets`; "" when all are there, else why.
+    @unbounded
+    fn lay_out_tensorfold(
+        models: String,
+        sets: String,
+        prepared: String,
+        variant: String,
+        rank: Int
+    ) -> String {
+        let files = prepared_files(variant, rank);
+        let v = std::str::bytes_view(files);
+        let mut from = 0;
+        while from < v.n {
+            let nl = line_end(v, from);
+            let path = tab_field(std::str::slice(v, from, nl), 0);
+            from = nl + 1;
+            if std::str::starts_with(path, "model/") {
+                let name = path[6..len(path)];
+                run_out("ln\n-sfn\n" + prepared + "/" + path + "\n" + models + "/" + name);
+                if !std::io::fs::file_exists(models + "/" + name) {
+                    return "its readied " + name + " is not in " + prepared;
+                }
+            }
+        }
+        run_out("rm\n-rf\n" + sets);
+        let blobs = self.data + "/blobs";
+        let mut it = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+        while !it.done {
+            let name = std::json::find_string_field(it.element, "name");
+            run_out("mkdir\n-p\n" + sets + "/" + name);
+            let layout = set_layout(blobs, it.element);
+            if len(layout) == 0 { return "its file set " + name + " is not held"; }
+            let missing = link_files(self.data, sets + "/" + name, layout);
+            if len(missing) > 0 {
+                return "its file set " + name + "'s " + missing + " could not be laid out";
+            }
+            it = std::json::array_next(it);
+        }
+        return "";
+    }
+
     /// An archive runtime unpacked, once, into `runtimes/<sha256>`.
     @unbounded
     fn unpacked(sha: String) -> String {
-        let dir = self.data + "/runtimes/" + sha;
-        if std::io::fs::file_exists(dir) { return dir; }
-        let tmp = dir + ".part";
-        run_out("rm\n-rf\n" + tmp);
-        run_out("mkdir\n-p\n" + tmp);
-        run_out("tar\nxzf\n" + self.data + "/blobs/" + sha + "\n-C\n" + tmp);
-        std::io::fs::rename(tmp, dir) or discard;
-        return dir;
+        return unpack_archive(self.data, sha);
     }
 
     /// A seat's server answers: where, and the context it took.
@@ -529,6 +621,66 @@ locus Runner {
             by_runner: true,
         };
     }
+}
+
+/// A variant's own files as its server reads them, `path\tsha256` a line.
+@bounded_by(variant)
+fn variant_layout(variant: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+    while !it.done {
+        out.append_str(
+            std::json::find_string_field(it.element, "path") + "\t"
+                + std::json::find_string_field(it.element, "sha256")
+                + "\n",
+        );
+        it = std::json::array_next(it);
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// Each file of `layout` (`path\tsha256` a line) linked under `dir` to its
+/// place in the store, in the folders its path names; "" when every one is
+/// there, else the first path that is not.
+@unbounded
+fn link_files(data: String, dir: String, layout: String) -> String {
+    let v = std::str::bytes_view(layout);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        if len(line) == 0 { continue; }
+        let path = tab_field(line, 0);
+        let slash = last_slash(path);
+        if slash > 0 { run_out("mkdir\n-p\n" + dir + "/" + path[0..slash]); }
+        run_out("ln\n-sfn\n" + data + "/blobs/" + tab_field(line, 1) + "\n" + dir + "/" + path);
+        if !std::io::fs::file_exists(dir + "/" + path) { return path; }
+    }
+    return "";
+}
+
+/// An archive (`blobs/<sha256>`) unpacked, once, into `runtimes/<sha256>`:
+/// an archive runtime, or the engine archive a container runs.
+@unbounded
+fn unpack_archive(data: String, sha: String) -> String {
+    let dir = data + "/runtimes/" + sha;
+    if std::io::fs::file_exists(dir) { return dir; }
+    std::io::fs::mkdir(data + "/runtimes") or discard;
+    let tmp = dir + ".part";
+    run_out("rm\n-rf\n" + tmp);
+    run_out("mkdir\n-p\n" + tmp);
+    run_out("tar\nxzf\n" + data + "/blobs/" + sha + "\n-C\n" + tmp);
+    std::io::fs::rename(tmp, dir) or discard;
+    return dir;
+}
+
+/// The context a TensorFold seat serves a request: the model's own
+/// (`context_length`), which its window holds with room for its other
+/// streams (`TF_WINDOW`).
+fn served_tokens_tensorfold(config: String) -> Int {
+    let native = std::json::find_int_field(config, "context_length");
+    return if native > 0 && native < TF_WINDOW { native } else { TF_WINDOW };
 }
 
 /// What a seat's server takes beside what its placement reserved (its
@@ -583,14 +735,17 @@ fn gpu_share(need: Int, gpu: Int) -> String {
 }
 
 /// The path a server answers its health on: the decision server's `/healthz` (200
-/// once its model is loaded), the others' `/health`.
+/// once its model is loaded), TensorFold's `/v1/models` (which it answers
+/// once both ranks have joined and loaded), the others' `/health`.
 fn health_path(server: String) -> String {
+    if server == "tensorfold" { return "/v1/models"; }
     return if server == "decision" { "/healthz" } else { "/health" };
 }
 
 /// The program a server is (`RuntimeCreate.server`).
 fn server_program(server: String) -> String {
     if server == "decision" { return "voice-decide"; }
+    if server == "tensorfold" { return "tensorfold-native"; }
     return if server == "vllm" { "vllm" } else { "llama-server" };
 }
 
@@ -736,11 +891,11 @@ fn served_tokens(config: String) -> Int {
 }
 
 /// The context, in tokens, a server that answers took: llama-server's
-/// `n_ctx` (`/props`), vLLM's `max_model_len` (`/v1/models`); 0 when it
-/// does not say.
+/// `n_ctx` (`/props`), vLLM's and TensorFold's `max_model_len`
+/// (`/v1/models`); 0 when it does not say.
 fn served_context(server: String, port: Int) -> Int {
     let base = "http://127.0.0.1:" + to_string(port);
-    if server == "vllm" {
+    if server == "vllm" || server == "tensorfold" {
         let r = std::http::get(base + "/v1/models") or { return 0; };
         if r.status != 200 { return 0; }
         let first = std::json::array_first(

@@ -33,11 +33,32 @@ its calls with (`tool_call_parser`, one vLLM v0.29.0 registers): DeepSeek-V4
 rest are served text only under vLLM (a GGUF seat carries them, through the
 model's own chat template).
 
+`deepseek-v4.1-flash-1017` is hand-made too: DeepSeek-V4.1-Flash-1017 as
+bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 v0.7.5 serves it, on
+TensorFold across two DGX Sparks (`runtimes/tensorfold-0.7.5.json`). Its one
+variant is `exl3`, the recipe's 2.5 bpw EXL3 quant, and it brings what
+TensorFold reads beside the weights as file sets, each pinned in its own
+repository: the original checkpoint's two Engram shards (`engram`, 203 GB),
+and the kernel kit (`kit`), pinned by the sha256 of its `MANIFEST`, whose
+383 files the node fetches and checks against the sha256 each line gives.
+Before a node first starts its rank, it readies the inputs that rank reads
+(`prepare: dsv41-tp2`): the model folder's two added files, then its rank's
+weight file (93 GB) and Engram's token map. Each is pinned under `prepared`,
+as this release's own inputs measured them, and kept for the next seat with
+the same weights, sets, engine and rank. Its `memory_bytes` gives each node
+a share of 120 GB, about all a 128 GB Spark gives models (122.5 GB), which
+is what the engine holds there at the served window (the recipe measured
+10.3 GiB left free on rank 0's node during a 1M-token prompt). So a node
+runs it alone: the fit refuses it beside another seat, and another seat
+beside it. Its server reads DeepSeek's DSML tool calls itself, so its seats
+carry `tools`.
+
 <!-- recipes -->
 | Recipe | License | Variants (download) | Served by |
 |---|---|---|---|
 | `deepseek-r1-0528-qwen3-8b` | mit | `safetensors-bf16` (16.4 GB) | vLLM, on CUDA |
 | `deepseek-v4-flash-0731` | mit | `gguf-q2_k_s` (98.6 GB), `safetensors-fp8` (166.9 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
+| `deepseek-v4.1-flash-1017` | mit | `exl3-2.5bpw` (388.5 GB) | TensorFold, on CUDA across two nodes |
 | `glm-4.7-flash` | mit | `gguf-q8_0` (31.8 GB), `safetensors-bf16` (62.5 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `gpt-oss-120b` | apache-2.0 | `gguf-mxfp4` (63.4 GB), `safetensors-mxfp4` (65.3 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |
 | `gpt-oss-20b` | apache-2.0 | `gguf-mxfp4` (12.1 GB), `safetensors-mxfp4` (13.8 GB) | llama.cpp, on Metal or CUDA; vLLM, on CUDA |

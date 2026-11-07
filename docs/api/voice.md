@@ -331,7 +331,7 @@ Schema: [ChatCompletionRequest](#schema-chatcompletionrequest)
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
-| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
+| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server or TensorFold, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
 | `tool_choice` | any |  |  |  |
 | `response_format` | object |  |  |  |
 | `metadata` | [Metadata](#schema-metadata) |  |  |  |
@@ -1699,14 +1699,14 @@ Schema: [RuntimeCreate](#schema-runtimecreate)
 | `license` | object | yes |  |  |
 | `license.name` | string | yes |  | length ≥ 1; length ≤ 64 |
 | `license.url` | string (uri) | yes |  | length ≤ 512 |
-| `server` | string, one of `vllm`, `llama-server`, `decision` | yes | The server program, which the node knows how to start and stop. `decision`: voice's decision server, `voice-decide`, which answers a decision model's requests (`CatalogModel.contract: decision`, asked as `/v1/systemone`): its MLX build, an archive that reads `mlx` on `metal`, or its native build, which reads `gguf` on any accelerator (an archive on macOS, a container on Linux). A decision recipe is placed only with a `decision` runtime, and a generative one never. |  |
-| `formats` | array of string, one of `safetensors`, `gguf`, `mlx` | yes | The weight formats it reads. | items ≥ 1; items ≤ 3 |
+| `server` | string, one of `vllm`, `llama-server`, `decision`, `tensorfold` | yes | The server program, which the node knows how to start and stop. `tensorfold`: TensorFold's native engine with its DeepSeek-V4.1 family, which serves `exl3` weights on `cuda` across two nodes (`multi_node: lanes`), from an image and the engine's archive (`artifact.archive`). `decision`: voice's decision server, `voice-decide`, which answers a decision model's requests (`CatalogModel.contract: decision`, asked as `/v1/systemone`): its MLX build, an archive that reads `mlx` on `metal`, or its native build, which reads `gguf` on any accelerator (an archive on macOS, a container on Linux). A decision recipe is placed only with a `decision` runtime, and a generative one never. |  |
+| `formats` | array of string, one of `safetensors`, `gguf`, `mlx`, `exl3` | yes | The weight formats it reads. | items ≥ 1; items ≤ 3 |
 | `accelerator` | string, one of `cuda`, `rocm`, `vulkan`, `metal`, `cpu` | yes | What it runs on. `cuda`: an NVIDIA GPU. `rocm`: an AMD GPU through ROCm. `vulkan`: an AMD or Intel GPU (or any with a Vulkan driver). `metal`: Apple silicon. `cpu` runs on any machine. A machine's GPU is placed on through its native API first (CUDA, ROCm, Metal), then Vulkan, then the processors. |  |
 | `platforms` | array of object | yes |  | items ≥ 1; items ≤ 4 |
 | `platforms[].os` | string, one of `linux`, `darwin` | yes |  |  |
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
-| `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
-| `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
+| `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. A `tensorfold` container runs an engine built apart from its image (`archive`): a tarball fetched and checked as an archive runtime is, unpacked once and mounted read-only. |  |
+| `multi_node` | string, one of `mp`, `lanes` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. `lanes`: TensorFold's two ranks, the leader serving (`tensorfold-native serve`) and the follower running its lanes (`tf-dsv41-lanes`), meeting at the leader's address on the link; a `lanes` runtime runs only across two nodes, and a placement on one never chooses it. |  |
 | `load_format` | string, one of `fastsafetensors` |  | How its server reads a model's weights, when its image ships a loader faster than the server's default; left out, the server's default. A fact of the image, not a setting: the node starts every seat of the runtime with it, on one node and on each rank across two. `fastsafetensors`: vLLM's `--load-format fastsafetensors`, which the image must ship (the package `fastsafetensors`); it reads the files straight to the GPU rather than through lazily mapped pages, 6.8 s for gpt-oss-120b's 65 GB on a DGX Spark where the default took 376 s, with the same output and memory. Only `vllm`'s. |  |
 
 Responses:
@@ -3553,7 +3553,7 @@ Type: object
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
-| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
+| `tools` | array of object |  | Function tools, passed to the seat as they are. Only a seat that carries tools serves a request that lists them (an `openai-compatible` seat; a managed seat under llama-server or TensorFold, or under vLLM when its variant names a `tool_call_parser`; a `static` seat only as its drill); the others refuse it and the request moves to the next seat. The answer's calls come back as `tool_calls` (deltas when streamed) with `finish_reason: "tool_calls"`. |  |
 | `tool_choice` | any |  |  |  |
 | `response_format` | object |  |  |  |
 | `metadata` | [Metadata](#schema-metadata) |  |  |  |
@@ -3652,7 +3652,7 @@ Type: object
 | `voice.available` | boolean | yes | True when at least one enabled seat on a connected node serves it, spending an account this key may spend, and its account has headroom. |  |
 | `voice.contract` | string, one of `generative`, `decision` |  | What it answers (`CatalogModel.contract`); a decision model answers only a structured request. |  |
 | `voice.capabilities` | object |  | What a seat that could serve this key carries through to the model. |  |
-| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server, one under vLLM whose variant names its tool-call parser (`RecipeVariant.tool_call_parser`), or the static engine's tool-call drill. False under vLLM for a variant that names none, and for the claude CLI. |  |
+| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server or TensorFold (which reads DeepSeek's DSML calls itself), one under vLLM whose variant names its tool-call parser (`RecipeVariant.tool_call_parser`), or the static engine's tool-call drill. False under vLLM for a variant that names none, and for the claude CLI. |  |
 
 <a id="schema-modellist"></a>
 
@@ -4153,10 +4153,10 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes |  |  |
-| `format` | string, one of `safetensors`, `gguf`, `mlx` | yes |  |  |
+| `format` | string, one of `safetensors`, `gguf`, `mlx`, `exl3` | yes |  |  |
 | `quantization` | string | yes |  |  |
-| `file_count` | integer | yes | How many files it lists. | ≥ 1 |
-| `total_bytes` | integer | yes | Its files' bytes together, what a node fetches. | ≥ 1 |
+| `file_count` | integer | yes | How many files it pins, its file sets' among them (a set pinned by a manifest counts the manifest). | ≥ 1 |
+| `total_bytes` | integer | yes | Its files' bytes together, its file sets' among them, what a node fetches. | ≥ 1 |
 | `memory_bytes` | integer | yes |  | ≥ 1 |
 
 <a id="schema-recipevariant"></a>
@@ -4173,7 +4173,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes | Distinct within its recipe. | pattern `^[a-z0-9][a-z0-9_.-]{0,62}$` |
-| `format` | string, one of `safetensors`, `gguf`, `mlx` | yes | Formats that hold only tensors; none runs code when loaded. |  |
+| `format` | string, one of `safetensors`, `gguf`, `mlx`, `exl3` | yes | Formats that hold only tensors; none runs code when loaded. `exl3`: ExLlamaV3's quantized tensors in safetensors files, which TensorFold serves (`RuntimeCreate.server: tensorfold`). |  |
 | `quantization` | string | yes |  | length ≥ 1; length ≤ 64 |
 | `source` | object | yes |  |  |
 | `source.hub` | string, one of `huggingface` | yes |  |  |
@@ -4188,6 +4188,27 @@ Type: object
 | `kv_bytes_per_token` | integer |  | What a token of context costs this variant's seat in KV cache, in bytes, as its server counts it: in the cache it keeps for these weights (`kv_cache_dtype`), for a conversation of 131072 tokens, the most a placement gives one, with what each conversation holds besides however long it is. A placement sizes its seat's prompt cache by it; left out, by the recipe's `kv_bytes_per_token`. | ≥ 1; ≤ 16777216 |
 | `reasoning_parser` | string, one of `deepseek_v4` |  | The parser vLLM takes the model's thinking out of its answer with, as vLLM names it, for a model vLLM does not choose one for itself: its thinking then comes as `reasoning_content`, not inline in its answer. A node starts vLLM with `--reasoning-parser` set to it. Only a safetensors variant names one; llama-server parses its own. |  |
 | `tool_call_parser` | string, one of `deepseek_v4`, `openai`, `glm47`, `qwen3_coder`, `granite4`, `hermes` |  | The parser vLLM reads the model's tool calls out of its answer with, as vLLM names it: a fact of the model, how it writes a call. A node starts vLLM with `--enable-auto-tool-choice` and `--tool-call-parser` set to it, on one node and on each rank across two, and the variant's seats carry `tools`; a vLLM seat whose variant names none refuses a request that lists them. Only a safetensors variant names one; llama-server applies the model's own chat template. |  |
+| `file_sets` | array of any \| any |  | What its server reads beside the weights, from other repositories, each pinned as the weights are: a set is fetched from its own source at its own revision, and a file is used only when its digest matches. Each set is named for where its server reads it, once. Only an `exl3` variant names sets. A set lists its files (`files`), or names one file of its source that lists them (`manifest`), pinned by its sha256, with the bytes of every file it lists together (`bytes`): the node fetches the manifest, then each file it lists at the path it gives beside the manifest, held to the sha256 and size it gives, and refuses a manifest whose files are not `bytes` together. A manifest says a file a line, its sha256 first, its size second and its path last, apart by spaces; a line that starts with `#` says nothing. A kit of hundreds of kernel files is pinned so in a variant small enough for a seat's config. | items ≥ 1; items ≤ 4 |
+| `file_sets[].name` | string, one of `engram`, `kit` | yes | `engram`: a DeepSeek-V4.1 checkpoint's Engram tables, which TensorFold reads at /engram. `kit`: TensorFold's kernel kit for the model, which it reads at /kit. |  |
+| `file_sets[].source` | object | yes |  |  |
+| `file_sets[].source.hub` | string, one of `huggingface` | yes |  |  |
+| `file_sets[].source.repo` | string | yes |  | length ≤ 128; pattern `^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$` |
+| `file_sets[].source.revision` | string | yes |  | pattern `^[0-9a-f]{40}$` |
+| `file_sets[].files` | array of object |  |  | items ≥ 1; items ≤ 300 |
+| `file_sets[].files[].path` | string | yes |  | length ≤ 256; pattern `^(?!/)(?!.*(^\|/)\.\.(/\|$))[A-Za-z0-9._/-]+\.(safetensors\|gguf\|json\|txt\|model\|tiktoken\|jinja)$` |
+| `file_sets[].files[].bytes` | integer | yes |  | ≥ 1 |
+| `file_sets[].files[].sha256` | string | yes |  | pattern `^[0-9a-f]{64}$` |
+| `file_sets[].manifest` | object |  |  |  |
+| `file_sets[].manifest.path` | string | yes |  | length ≤ 256; pattern `^(?!/)(?!.*(^\|/)\.\.(/\|$))[A-Za-z0-9._/-]+$` |
+| `file_sets[].manifest.bytes` | integer | yes |  | ≥ 1 |
+| `file_sets[].manifest.sha256` | string | yes |  | pattern `^[0-9a-f]{64}$` |
+| `file_sets[].bytes` | integer |  | Every file the set's manifest lists, together; a set that lists its files leaves it out. | ≥ 1 |
+| `prepare` | string, one of `dsv41-tp2` |  | What its node readies from its files before its server first starts, once, and keeps (`prepared`). `dsv41-tp2`: TensorFold's inputs for DeepSeek-V4.1 across two nodes, made in the runtime's image with the engine's tools (no GPU, no network): the model folder's two added files (the recipe's `serving_1017.py`), then the node's rank's weight file and Engram's token map (`node_inputs.sh`). A seat is `starting` meanwhile, its `reason` the step and how far. Only an `exl3` variant names one, with `prepared`. |  |
+| `prepared` | array of object |  | Each file its prepare step makes, pinned: the node checks every one it made against its size and sha256 before its server starts, and refuses the seat if one differs. Under `model/`, beside the weights; under `cache/`, its server's other inputs. A file only one rank's node makes names that rank. Kept under the node's data directory, keyed by the weights, the file sets, the engine and the rank, so a seat placed again reads them at once. | items ≥ 1; items ≤ 16 |
+| `prepared[].path` | string | yes |  | length ≤ 256; pattern `^(model\|cache)/(?!.*(^\|/)\.\.(/\|$))[A-Za-z0-9._/-]+$` |
+| `prepared[].bytes` | integer | yes |  | ≥ 1 |
+| `prepared[].sha256` | string | yes |  | pattern `^[0-9a-f]{64}$` |
+| `prepared[].rank` | integer |  |  | ≥ 0; ≤ 1 |
 
 <a id="schema-runtimecreate"></a>
 
@@ -4206,14 +4227,14 @@ Type: object
 | `license` | object | yes |  |  |
 | `license.name` | string | yes |  | length ≥ 1; length ≤ 64 |
 | `license.url` | string (uri) | yes |  | length ≤ 512 |
-| `server` | string, one of `vllm`, `llama-server`, `decision` | yes | The server program, which the node knows how to start and stop. `decision`: voice's decision server, `voice-decide`, which answers a decision model's requests (`CatalogModel.contract: decision`, asked as `/v1/systemone`): its MLX build, an archive that reads `mlx` on `metal`, or its native build, which reads `gguf` on any accelerator (an archive on macOS, a container on Linux). A decision recipe is placed only with a `decision` runtime, and a generative one never. |  |
-| `formats` | array of string, one of `safetensors`, `gguf`, `mlx` | yes | The weight formats it reads. | items ≥ 1; items ≤ 3 |
+| `server` | string, one of `vllm`, `llama-server`, `decision`, `tensorfold` | yes | The server program, which the node knows how to start and stop. `tensorfold`: TensorFold's native engine with its DeepSeek-V4.1 family, which serves `exl3` weights on `cuda` across two nodes (`multi_node: lanes`), from an image and the engine's archive (`artifact.archive`). `decision`: voice's decision server, `voice-decide`, which answers a decision model's requests (`CatalogModel.contract: decision`, asked as `/v1/systemone`): its MLX build, an archive that reads `mlx` on `metal`, or its native build, which reads `gguf` on any accelerator (an archive on macOS, a container on Linux). A decision recipe is placed only with a `decision` runtime, and a generative one never. |  |
+| `formats` | array of string, one of `safetensors`, `gguf`, `mlx`, `exl3` | yes | The weight formats it reads. | items ≥ 1; items ≤ 3 |
 | `accelerator` | string, one of `cuda`, `rocm`, `vulkan`, `metal`, `cpu` | yes | What it runs on. `cuda`: an NVIDIA GPU. `rocm`: an AMD GPU through ROCm. `vulkan`: an AMD or Intel GPU (or any with a Vulkan driver). `metal`: Apple silicon. `cpu` runs on any machine. A machine's GPU is placed on through its native API first (CUDA, ROCm, Metal), then Vulkan, then the processors. |  |
 | `platforms` | array of object | yes |  | items ≥ 1; items ≤ 4 |
 | `platforms[].os` | string, one of `linux`, `darwin` | yes |  |  |
 | `platforms[].arch` | string, one of `arm64`, `x86_64` | yes |  |  |
-| `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. |  |
-| `multi_node` | string, one of `mp` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. |  |
+| `artifact` | any | yes | Where it comes from. `container`: an image, pulled by its digest, never a tag; for several platforms, a manifest list's digest. `archive`: a tarball, fetched from `url` and used only when its sha256 matches. A `tensorfold` container runs an engine built apart from its image (`archive`): a tarball fetched and checked as an archive runtime is, unpacked once and mounted read-only. |  |
+| `multi_node` | string, one of `mp`, `lanes` |  | How its server spans two nodes, when it can; left out, a model it serves is placed on one node. `mp`: vLLM's own multi-node executor (`--nnodes`, `--node-rank`, `--master-addr`, the follower `--headless`), with no Ray cluster, as NVIDIA's guide to serving vLLM across two DGX Sparks runs it. `lanes`: TensorFold's two ranks, the leader serving (`tensorfold-native serve`) and the follower running its lanes (`tf-dsv41-lanes`), meeting at the leader's address on the link; a `lanes` runtime runs only across two nodes, and a placement on one never chooses it. |  |
 | `load_format` | string, one of `fastsafetensors` |  | How its server reads a model's weights, when its image ships a loader faster than the server's default; left out, the server's default. A fact of the image, not a setting: the node starts every seat of the runtime with it, on one node and on each rank across two. `fastsafetensors`: vLLM's `--load-format fastsafetensors`, which the image must ship (the package `fastsafetensors`); it reads the files straight to the GPU rather than through lazily mapped pages, 6.8 s for gpt-oss-120b's 65 GB on a DGX Spark where the default took 376 s, with the same output and memory. Only `vllm`'s. |  |
 
 <a id="schema-runtime"></a>
@@ -6949,7 +6970,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes |  |  |
-| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
+| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), or its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
 | `reason` | string \| null |  |  |  |
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |

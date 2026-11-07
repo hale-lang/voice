@@ -11,6 +11,7 @@ URL and sha256. A runtime names no command.
 | Runtime | Serves | On | Artifact |
 |---|---|---|---|
 | `vllm-26.09` | safetensors | CUDA, linux arm64 and x86_64 | `nvcr.io/nvidia/vllm:26.09-py3` |
+| `tensorfold-0.7.5` | exl3, DeepSeek-V4.1-Flash across two nodes | CUDA (DGX Spark, sm_121), linux arm64 | `nvcr.io/nvidia/pytorch:26.07-py3` and voice's engine archive, built by [`tensorfold/build.sh`](tensorfold/build.sh) |
 | `llama-server-b11913-cuda` | gguf | CUDA, linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-cuda-b11913` |
 | `llama-server-b11913-rocm` | gguf | ROCm (AMD), linux x86_64 | `ghcr.io/ggml-org/llama.cpp:server-rocm-b11913` |
 | `llama-server-b11913-vulkan` | gguf | Vulkan (AMD, Intel), linux arm64 and x86_64 | `ghcr.io/ggml-org/llama.cpp:server-vulkan-b11913` |
@@ -62,6 +63,63 @@ through the API. A shipped runtime never changes either: another build is
 another id. CI holds every file here to the contract
 (`spec/validate/curated.mjs`), and the api holds it to the same rules when it
 reads it.
+
+## `tensorfold-0.7.5`
+
+DeepSeek-V4.1-Flash on [TensorFold](https://github.com/ashhart/TensorFold)'s
+native engine, its `dsv41` family, tensor parallel across two DGX Sparks:
+the engine of
+[bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)
+v0.7.5 (`bertholomus/TensorFold@e100ee8b`, branch `deepseek-v41-zig-tp2`),
+served as that recipe serves it. It is `server: tensorfold`,
+`multi_node: lanes` (rank 0 `tensorfold-native serve`, rank 1
+`tf-dsv41-lanes`), and runs only across two nodes. It reads `exl3` alone,
+from a variant that brings the Engram tables and the kernel kit as file sets
+and names its prepare step (`recipes/deepseek-v4.1-flash-1017.json`).
+
+Its artifact is two pins: NVIDIA's PyTorch 26.07 image by digest, which the
+recipe builds and runs in, and the engine built from source apart from it
+(`artifact.archive`), which the node fetches, checks and mounts read-only at
+`/engine`. The
+[`runtime: tensorfold`](../.github/workflows/runtime-tensorfold.yml)
+workflow builds the archive in that image on an arm64 runner (no GPU is
+needed to compile it; `zig build test` runs the engine's host-side tests)
+and, run by hand, publishes it once as the release
+`runtime-tensorfold-<version>`. No image is published, and the archive holds
+nothing of NVIDIA's: its programs link only the C library and load CUDA at
+run time. It holds the engine's programs, the RDMA ring's kernels, the
+grammar library for structured output and forced tool calls (built from
+xgrammar v0.2.8's source rather than taken prebuilt from the kit), the
+engine's input tools and the recipe's `serving_1017.py` and chat template.
+The kit's own kernels are the variant's, fetched as pinned data.
+
+Two patches of voice's are applied ([`tensorfold/patches`](tensorfold/patches)):
+the RDMA ring opens the GID index the link declares (`TF_RDMA_GID_INDEX`;
+the engine line hard-wired 5, and the lab's Sparks have their RoCE v2
+address at 3), and rank 1 waits for rank 0 as long as its seat is assigned
+(`TF_TP_CONNECT_SECONDS`; it gave up after 300 s), since each node starts its
+rank when its own inputs are ready. Unset, each behaves as before.
+
+Measured on spark and flare (DGX Spark, GB10, ConnectX-7 link at GID index
+3) on 2026-11-07, each rank started with the arguments and environment the
+node gives it, with this archive (`80fc12b8…`) and the recipe's served shape
+(32 streams, rounds of 64 rows, a window of 7,340,032 positions,
+`--parallel 32`). One stream at a time, 512 output tokens, greedy, thinking
+off, streamed (`/v1/chat/completions`), on a code prompt and a prose prompt,
+the median of five; the baseline is `vllm-26.09` serving DeepSeek-V4-Flash-0731
+`safetensors-fp8` across the same two nodes as voice runs it (median of three):
+
+| | code tok/s | prose tok/s | time to first token |
+|---|---|---|---|
+| `tensorfold-0.7.5`, DeepSeek-V4.1-Flash-1017 EXL3 2.5 bpw | 115.7 | 65.9 | 0.16 s |
+| `vllm-26.09`, DeepSeek-V4-Flash-0731 fp8 | 26.0 | 25.9 | 0.25 s |
+
+The recipe's own figures for the same shape are 106.5 and 60.7. A first
+start readied each node's inputs in under three minutes (the model folder's
+files in 1 s, the 93 GB weight file and the token map in 108 to 117 s, their
+check against the pins in 52 s), and each rank's output was the recipe's,
+byte for byte (rank 1's weight file, made on both nodes, came out the same).
+Rank 0 answered `/v1/models` 29 s after it started, 20 s on a restart.
 
 ## `decision-0.3.0-mlx`
 

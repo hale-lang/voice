@@ -140,6 +140,39 @@ fn managed_problem(config: String) -> String {
         }
         it = std::json::array_next(it);
     }
+    // a file set's pins, as its variant's own
+    let mut sets = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
+    while !sets.done {
+        let name = std::json::find_string_field(sets.element, "name");
+        let ssrc = std::json::find_field_raw(sets.element, "source");
+        if (name != "engram" && name != "kit")
+            || len(std::json::find_string_field(ssrc, "repo")) == 0
+            || len(std::json::find_string_field(ssrc, "revision")) != 40
+        {
+            return "config.variant's file sets are engram or kit, each with a repo and a revision";
+        }
+        let m = std::json::find_field_raw(sets.element, "manifest");
+        let mut f = std::json::array_first(
+            if len(m) > 0 {
+                "[" + m + "]"
+            } else {
+                std::json::find_field_raw(sets.element, "files")
+            },
+        );
+        if f.done { return "config.variant's file set " + name + " lists no files"; }
+        while !f.done {
+            let path = std::json::find_string_field(f.element, "path");
+            if !hex(std::json::find_string_field(f.element, "sha256"), 64)
+                || std::json::find_int_field(f.element, "bytes") < 1
+                || !relative_path(path)
+            {
+                return "config.variant's file set " + name + " pins " + path
+                    + " without a relative path, its size and a sha256";
+            }
+            f = std::json::array_next(f);
+        }
+        sets = std::json::array_next(sets);
+    }
     let a = std::json::find_field_raw(std::json::find_field_raw(config, "runtime"), "artifact");
     let kind = std::json::find_string_field(a, "kind");
     if kind == "archive" {
@@ -156,6 +189,16 @@ fn managed_problem(config: String) -> String {
             || !hex(d[7..len(d)], 64)
         {
             return "config.runtime's container needs an image and a sha256 digest";
+        }
+        let e = std::json::find_field_raw(a, "archive");
+        if len(e) > 0
+            && (
+                !hex(std::json::find_string_field(e, "sha256"), 64)
+                    || std::json::find_int_field(e, "bytes") < 1
+                    || !std::str::starts_with(std::json::find_string_field(e, "url"), "https://")
+            )
+        {
+            return "config.runtime's engine archive needs an https url, a sha256 and its size";
         }
     } else {
         return "config.runtime needs an artifact";
@@ -190,6 +233,8 @@ const PUMP_WAIT_MS: Int = 1000;
 
 locus Fetcher {
     params {
+        // the node's id, whose prepare steps' containers carry it
+        id: String = "";
         data: String = "node-data";
         // the operator's capabilities file, whose managed engine's `local`
         // says where the hub is and which vault entry holds its token
@@ -237,60 +282,38 @@ locus Fetcher {
 
     /// Fetch every file a seat's config names that the store does not hold,
     /// and say how far, then why it is down: it is fetched and not yet run.
+    /// Its variant's files and its file sets' come from the hub, each from
+    /// its own repository at its own revision; a set pinned by a manifest is
+    /// every file the manifest lists, once the manifest itself verified.
+    /// Then its runtime: an archive, the engine archive its image runs, its
+    /// image. A variant whose server needs inputs readied from its files has
+    /// them readied (`prepare`) before its server is started.
     @unbounded
     fn fetch(seat: String, config: String) {
         let blobs = self.data + "/blobs";
         if !std::io::fs::file_exists(blobs) { std::io::fs::mkdir(blobs) or discard; }
+        let hub = hub_url(self.file);
         let variant = std::json::find_field_raw(config, "variant");
-        let src = std::json::find_field_raw(variant, "source");
-        let base = hub_url(self.file) + "/" + std::json::find_string_field(src, "repo")
-            + "/resolve/"
-            + std::json::find_string_field(src, "revision") + "/";
         let artifact = std::json::find_field_raw(
             std::json::find_field_raw(config, "runtime"),
             "artifact",
         );
-        let archive = std::json::find_string_field(artifact, "kind") == "archive";
-
-        let mut total = 0;
-        let mut done = 0;
-        let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
-        while !it.done {
-            let bytes = std::json::find_int_field(it.element, "bytes");
-            total = total + bytes;
-            if held(blobs, std::json::find_string_field(it.element, "sha256")) {
-                done = done + bytes;
-            }
-            it = std::json::array_next(it);
+        let pins = distinct_pins(variant_pins(hub, variant) + archive_pins(artifact));
+        // a manifest's files count at the bytes its set pins until it is held
+        let listed = distinct_pins(manifest_pins(blobs, hub, variant));
+        if std::str::starts_with(listed, "!") {
+            self.blobs.tell(seat, "down", listed[1..len(listed)], 0, 0);
+            return;
         }
-        if archive {
-            let bytes = std::json::find_int_field(artifact, "bytes");
-            total = total + bytes;
-            if held(blobs, std::json::find_string_field(artifact, "sha256")) {
-                done = done + bytes;
-            }
-        }
+        let total = pins_bytes(pins) + if len(listed) > 0 {
+            pins_bytes(listed)
+        } else {
+            manifest_sets_bytes(variant)
+        };
+        let mut done = pins_held(blobs, pins) + pins_held(blobs, listed);
         // what parts on disk already hold counts as fetched; a part longer
         // than its pin is never the file, and goes
-        let mut parts = 0;
-        it = std::json::array_first(std::json::find_field_raw(variant, "files"));
-        while !it.done {
-            parts = parts
-                + partial(
-                    blobs,
-                    std::json::find_string_field(it.element, "sha256"),
-                    std::json::find_int_field(it.element, "bytes"),
-                );
-            it = std::json::array_next(it);
-        }
-        if archive {
-            parts = parts
-                + partial(
-                    blobs,
-                    std::json::find_string_field(artifact, "sha256"),
-                    std::json::find_int_field(artifact, "bytes"),
-                );
-        }
+        let parts = pins_partial(blobs, pins) + pins_partial(blobs, listed);
         let free = df_available(run_out("df\n-Pk\n" + self.data));
         if total - done - parts > free {
             self.blobs.tell(
@@ -303,49 +326,16 @@ locus Fetcher {
             return;
         }
         self.blobs.tell(seat, "fetching", "", done, total);
-
-        it = std::json::array_first(std::json::find_field_raw(variant, "files"));
-        while !it.done {
-            let f = it.element;
-            let sha = std::json::find_string_field(f, "sha256");
-            let bytes = std::json::find_int_field(f, "bytes");
-            if !held(blobs, sha) {
-                let problem = self.blobs.blob(
-                    seat,
-                    base + std::json::find_string_field(f, "path"),
-                    std::json::find_string_field(f, "path"),
-                    sha,
-                    bytes,
-                    true,
-                    done,
-                    total,
-                );
-                if len(problem) > 0 {
-                    self.blobs.tell(seat, "down", problem, done, total);
-                    return;
-                }
-                done = done + bytes;
-            }
-            it = std::json::array_next(it);
+        done = self.fetch_pins(seat, pins, done, total);
+        if done < 0 { return; }
+        // each manifest held now: the files it lists, held to its pins
+        let more = distinct_pins(manifest_pins(blobs, hub, variant));
+        if std::str::starts_with(more, "!") {
+            self.blobs.tell(seat, "down", more[1..len(more)], done, total);
+            return;
         }
-        if archive && !held(blobs, std::json::find_string_field(artifact, "sha256")) {
-            let bytes = std::json::find_int_field(artifact, "bytes");
-            let problem = self.blobs.blob(
-                seat,
-                std::json::find_string_field(artifact, "url"),
-                "the runtime's archive",
-                std::json::find_string_field(artifact, "sha256"),
-                bytes,
-                false,
-                done,
-                total,
-            );
-            if len(problem) > 0 {
-                self.blobs.tell(seat, "down", problem, done, total);
-                return;
-            }
-            done = done + bytes;
-        }
+        done = self.fetch_pins(seat, more, done, total);
+        if done < 0 { return; }
         if std::json::find_string_field(artifact, "kind") == "container" {
             let image = std::json::find_string_field(artifact, "image") + "@"
                 + std::json::find_string_field(artifact, "digest");
@@ -368,10 +358,517 @@ locus Fetcher {
                 return;
             }
         }
+        if len(std::json::find_string_field(variant, "prepare")) > 0 {
+            let readied = self.prepare(seat, config, done, total);
+            if len(readied) > 0 {
+                self.blobs.tell(seat, "down", readied, done, total);
+                return;
+            }
+        }
         self.blobs.tell(seat, "starting", "fetched and verified; starting its server", done, total);
         RunWanted <- RunJob { seat: seat, config: config };
     }
 
+    /// Each pinned file (`pins`, `pin_line`s) the store does not hold,
+    /// fetched and verified, `done` of `total` said as it goes; the bytes
+    /// done after them, or -1 once one could not be, its seat told why.
+    @unbounded
+    fn fetch_pins(seat: String, pins: String, done: Int, total: Int) -> Int {
+        let blobs = self.data + "/blobs";
+        let mut at_ = done;
+        let v = std::str::bytes_view(pins);
+        let mut from = 0;
+        while from < v.n {
+            let nl = line_end(v, from);
+            let line = std::str::slice(v, from, nl);
+            from = nl + 1;
+            if len(line) == 0 { continue; }
+            let sha = tab_field(line, 2);
+            let bytes = std::str::parse_int(tab_field(line, 3)) or 0;
+            if held(blobs, sha) { continue; }
+            let problem = self.blobs.blob(
+                seat,
+                tab_field(line, 0),
+                tab_field(line, 1),
+                sha,
+                bytes,
+                tab_field(line, 4) == "hub",
+                at_,
+                total,
+            );
+            if len(problem) > 0 {
+                self.blobs.tell(seat, "down", problem, at_, total);
+                return -1;
+            }
+            at_ = at_ + bytes;
+        }
+        return at_;
+    }
+
+    /// A seat's inputs its server reads beside its files, readied by the
+    /// step its variant names (`prepare`, tensorfold.hl) in its runtime's
+    /// image, checked against the variant's pins (`prepared`) and kept under
+    /// `prepared/<key>`; "" once they are there (at once when a seat with the
+    /// same made them), else why not. Its seat says the step it is at.
+    @unbounded
+    fn prepare(seat: String, config: String, done: Int, total: Int) -> String {
+        let variant = std::json::find_field_raw(config, "variant");
+        if std::json::find_string_field(variant, "prepare") != PREPARE_DSV41 {
+            return "its variant's prepare step is not one this node knows";
+        }
+        let dir = prepared_dir(self.data, config);
+        if std::io::fs::file_exists(dir) { return ""; }
+        let artifact = std::json::find_field_raw(
+            std::json::find_field_raw(config, "runtime"),
+            "artifact",
+        );
+        let archive = std::json::find_field_raw(artifact, "archive");
+        if len(archive) == 0 {
+            return "its runtime names no engine archive to ready its inputs with";
+        }
+        let image = std::json::find_string_field(artifact, "image") + "@"
+            + std::json::find_string_field(artifact, "digest");
+        let engine = unpack_archive(self.data, std::json::find_string_field(archive, "sha256"));
+        let rank = rank_of(config);
+        // the step's work folder: the weights linked as the steps read them,
+        // the files they make beside them and in its cache
+        std::io::fs::mkdir(self.data + "/prepared") or discard;
+        let tmp = dir + ".part";
+        run_out("rm\n-rf\n" + tmp);
+        run_out("mkdir\n-p\n" + tmp + "/work/model\n" + tmp + "/work/cache");
+        if len(link_files(self.data, tmp + "/work/model", variant_layout(variant))) > 0 {
+            return "its weights could not be linked for its prepare step";
+        }
+        let user = std::str::trim(run_out("id\n-u")) + ":" + std::str::trim(run_out("id\n-g"));
+        let name = "voice." + self.id + "." + seat + ".prepare";
+        let blobs = self.data + "/blobs";
+        self.blobs.tell(
+            seat,
+            "starting",
+            "readying its inputs: the model folder's two files (step 1 of 2)",
+            done,
+            total,
+        );
+        let one = self.prepare_step(
+            seat,
+            name,
+            prepare_argv(
+                name,
+                self.id,
+                user,
+                blobs,
+                engine,
+                tmp + "/work",
+                "",
+                image,
+                PREPARE_MODEL_ARGS,
+            ),
+            "",
+            "",
+            0,
+            done,
+            total,
+        );
+        if len(one) > 0 { return "its model folder's files could not be readied: " + one; }
+        let own = rank_file(variant, rank);
+        let two = self.prepare_step(
+            seat,
+            name,
+            prepare_argv(
+                name,
+                self.id,
+                user,
+                blobs,
+                engine,
+                tmp + "/work",
+                PREPARE_INPUTS_ENV,
+                image,
+                prepare_inputs_args(rank),
+            ),
+            "rank " + to_string(rank) + "'s weight file",
+            tmp + "/work/cache/rank-cache",
+            std::str::parse_int(tab_field(own, 2)) or 0,
+            done,
+            total,
+        );
+        if len(two) > 0 {
+            return "rank " + to_string(rank) + "'s inputs could not be readied: " + two;
+        }
+        self.blobs.tell(
+            seat,
+            "starting",
+            "readying its inputs: checking what they made against the variant's pins",
+            done,
+            total,
+        );
+        let wrong = prepared_problem(tmp + "/work", variant, rank);
+        if len(wrong) > 0 { return "its readied inputs are not the ones pinned: " + wrong; }
+        // kept: what the steps made, without the links they read
+        run_out("mv\n" + tmp + "/work/cache\n" + tmp + "/cache");
+        run_out("mkdir\n-p\n" + tmp + "/model");
+        let files = prepared_files(variant, rank);
+        let v = std::str::bytes_view(files);
+        let mut from = 0;
+        while from < v.n {
+            let nl = line_end(v, from);
+            let path = tab_field(std::str::slice(v, from, nl), 0);
+            from = nl + 1;
+            if std::str::starts_with(path, "model/") {
+                run_out("mv\n" + tmp + "/work/" + path + "\n" + tmp + "/" + path);
+            }
+        }
+        run_out("rm\n-rf\n" + tmp + "/work");
+        std::io::fs::rename(tmp, dir) or {
+            return "its readied inputs could not be kept: " + err.detail;
+        };
+        return "";
+    }
+
+    /// One prepare step's container (`argv`, named `name`), run to its end
+    /// and removed; "" when it ended well, else what it said last. While it
+    /// runs, a file it writes under `watch` (`what`, `bytes` when done) says
+    /// how far, every ten seconds; a stop of the node removes it.
+    @unbounded
+    fn prepare_step(
+        seat: String,
+        name: String,
+        argv: String,
+        what: String,
+        watch: String,
+        bytes: Int,
+        done: Int,
+        total: Int
+    ) -> String {
+        run_out("docker\nrm\n-f\n" + name);
+        let started = std::process::run(argv) or std::process::ProcessOutput {
+            code: 127,
+            signal: 0,
+            stdout: "",
+            stderr: "docker could not be run",
+        };
+        if started.code != 0 { return std::str::trim(started.stderr); }
+        let mut turns = 0;
+        while !self.draining {
+            let state = std::str::trim(run_out("docker\ninspect\n-f\n{{.State.Status}}\n" + name));
+            if state != "running" && state != "created" { break; }
+            std::time::sleep(1000ms);
+            turns = turns + 1;
+            if len(watch) > 0 && turns % 10 == 0 {
+                let made = std::str::parse_int(
+                    tab_field(
+                        std::str::replace(std::str::trim(run_out("du\n-sb\n" + watch)), " ", "\t"),
+                        0,
+                    ),
+                ) or 0;
+                self.blobs.tell(
+                    seat,
+                    "starting",
+                    "readying its inputs: " + what + ", " + gib(made) + " of " + gib(bytes)
+                        + " (step 2 of 2)",
+                    done,
+                    total,
+                );
+            }
+        }
+        if self.draining {
+            run_out("docker\nrm\n-f\n" + name);
+            return "the node stopped";
+        }
+        let code = std::str::trim(run_out("docker\ninspect\n-f\n{{.State.ExitCode}}\n" + name));
+        let o = std::process::run(
+            "docker\nlogs\n--tail\n20\n" + name,
+        ) or std::process::ProcessOutput {
+            code: 1,
+            signal: 0,
+            stdout: "",
+            stderr: "",
+        };
+        run_out("docker\nrm\n-f\n" + name);
+        if code == "0" { return ""; }
+        let said = last_line(last_of(o.stdout + "\n" + o.stderr, 1500));
+        return "it ended with " + (if len(code) > 0 { code } else { "no exit code" })
+            + (if len(said) > 0 { ": " + said } else { "" });
+    }
+
+}
+
+// ---- what a seat fetches ------------------------------------------------
+//
+// A seat's files as pins, one a line: `url\tname\tsha256\tbytes\tfrom`,
+// `from` `hub` for a file of the hub (its token is sent there) or `web` for
+// the runtime's archives.
+
+/// A pin's line.
+fn pin_line(url: String, name: String, sha: String, bytes: Int, from: String) -> String {
+    return url + "\t" + name + "\t" + sha + "\t" + to_string(bytes) + "\t" + from + "\n";
+}
+
+/// The hub's URL of a file of a source (`repo`, `revision`).
+fn hub_file(hub: String, source: String, path: String) -> String {
+    return hub + "/" + std::json::find_string_field(source, "repo") + "/resolve/"
+        + std::json::find_string_field(source, "revision") + "/" + path;
+}
+
+/// A variant's pins: its files, then each file set's files, or the
+/// manifest that pins a set's.
+@bounded_by(variant)
+fn variant_pins(hub: String, variant: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let src = std::json::find_field_raw(variant, "source");
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "files"));
+    while !it.done {
+        let path = std::json::find_string_field(it.element, "path");
+        out.append_str(
+            pin_line(
+                hub_file(hub, src, path),
+                path,
+                std::json::find_string_field(it.element, "sha256"),
+                std::json::find_int_field(it.element, "bytes"),
+                "hub",
+            ),
+        );
+        it = std::json::array_next(it);
+    }
+    let mut sets = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !sets.done {
+        let set = sets.element;
+        let ssrc = std::json::find_field_raw(set, "source");
+        let m = std::json::find_field_raw(set, "manifest");
+        let mut f = std::json::array_first(
+            if len(m) > 0 { "[" + m + "]" } else { std::json::find_field_raw(set, "files") },
+        );
+        while !f.done {
+            let path = std::json::find_string_field(f.element, "path");
+            out.append_str(
+                pin_line(
+                    hub_file(hub, ssrc, path),
+                    std::json::find_string_field(set, "name") + "/" + path,
+                    std::json::find_string_field(f.element, "sha256"),
+                    std::json::find_int_field(f.element, "bytes"),
+                    "hub",
+                ),
+            );
+            f = std::json::array_next(f);
+        }
+        sets = std::json::array_next(sets);
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// A runtime's archives as pins: an archive runtime's, or the engine
+/// archive a container runs; "" for neither.
+fn archive_pins(artifact: String) -> String {
+    let a = if std::json::find_string_field(artifact, "kind") == "archive" {
+        artifact
+    } else {
+        std::json::find_field_raw(artifact, "archive")
+    };
+    if len(a) == 0 { return ""; }
+    return pin_line(
+        std::json::find_string_field(a, "url"),
+        "the runtime's archive",
+        std::json::find_string_field(a, "sha256"),
+        std::json::find_int_field(a, "bytes"),
+        "web",
+    );
+}
+
+/// The files the held manifests of a variant's sets list, as pins (each at
+/// its path beside its manifest); "" for a set whose manifest is not held
+/// yet, `!<why>` for a manifest that is not one, or whose files together are
+/// not the bytes its set pins.
+@bounded_by(variant)
+fn manifest_pins(blobs: String, hub: String, variant: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let mut sets = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !sets.done {
+        let set = sets.element;
+        let m = std::json::find_field_raw(set, "manifest");
+        let sha = std::json::find_string_field(m, "sha256");
+        if len(m) > 0 && held(blobs, sha) {
+            let name = std::json::find_string_field(set, "name");
+            let path = std::json::find_string_field(m, "path");
+            let slash = last_slash(path);
+            let dir = if slash > 0 { path[0..(slash + 1)] } else { "" };
+            let listed = manifest_files(std::io::fs::read_file(blobs + "/" + sha) or "");
+            if std::str::starts_with(listed, "!") {
+                return "!file set " + name + "'s manifest " + path + ": " + listed[1..len(listed)];
+            }
+            let mut sum = 0;
+            let v = std::str::bytes_view(listed);
+            let mut from = 0;
+            while from < v.n {
+                let nl = line_end(v, from);
+                let line = std::str::slice(v, from, nl);
+                from = nl + 1;
+                let file = tab_field(line, 2);
+                let bytes = std::str::parse_int(tab_field(line, 1)) or 0;
+                sum = sum + bytes;
+                out.append_str(
+                    pin_line(
+                        hub_file(hub, std::json::find_field_raw(set, "source"), dir + file),
+                        name + "/" + file,
+                        tab_field(line, 0),
+                        bytes,
+                        "hub",
+                    ),
+                );
+            }
+            if sum != std::json::find_int_field(set, "bytes") {
+                return "!file set " + name + "'s manifest lists " + to_string(sum)
+                    + " bytes, not the "
+                    + to_string(std::json::find_int_field(set, "bytes")) + " its set pins: refused";
+            }
+        }
+        sets = std::json::array_next(sets);
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// The bytes the manifest-pinned sets of a variant pin, together.
+@bounded_by(variant)
+fn manifest_sets_bytes(variant: String) -> Int {
+    let mut n = 0;
+    let mut sets = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !sets.done {
+        if len(std::json::find_field_raw(sets.element, "manifest")) > 0 {
+            n = n + std::json::find_int_field(sets.element, "bytes");
+        }
+        sets = std::json::array_next(sets);
+    }
+    return n;
+}
+
+/// A manifest's files, one a line, `sha256\tbytes\tpath`; `!<why>` for one
+/// that is not a manifest. A manifest says a file a line, its sha256 first,
+/// its size in bytes second and its path, relative to the manifest's
+/// folder, last, apart by spaces; a line that starts with `#` says nothing.
+@bounded_by(text)
+fn manifest_files(text: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let mut n = 0;
+    let v = std::str::bytes_view(text);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::trim(std::str::slice(v, from, nl));
+        from = nl + 1;
+        if len(line) == 0 || std::str::starts_with(line, "#") { continue; }
+        let sp = std::str::index_of(line, " ");
+        let last = last_space(line);
+        if sp != 64 || last < sp {
+            return "!its line " + line + " is not a file's sha256, size and path";
+        }
+        let sha = line[0..64];
+        let rest = std::str::trim(line[sp..len(line)]);
+        let sp2 = std::str::index_of(rest, " ");
+        let bytes = std::str::parse_int(if sp2 > 0 { rest[0..sp2] } else { "" }) or 0;
+        let path = line[(last + 1)..len(line)];
+        if !hex(sha, 64) || bytes < 1 || !relative_path(path) {
+            return "!its line " + line + " is not a file's sha256, size and path";
+        }
+        out.append_str(sha + "\t" + to_string(bytes) + "\t" + path + "\n");
+        n = n + 1;
+    }
+    if n == 0 { return "!it lists no files"; }
+    return std::str::clone(out.text_view());
+}
+
+/// The place of the last space in `s`, -1 for none.
+@bounded_by(s)
+fn last_space(s: String) -> Int {
+    let mut i = len(s) - 1;
+    while i >= 0 {
+        if s[i..(i + 1)] == " " { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// The `i`th tab-separated field of `line`, "" when there is none.
+@bounded_by(line)
+fn tab_field(line: String, i: Int) -> String {
+    let mut rest = line;
+    let mut k = 0;
+    while k < i {
+        let t = std::str::index_of(rest, "\t");
+        if t < 0 { return ""; }
+        rest = rest[(t + 1)..len(rest)];
+        k = k + 1;
+    }
+    let t = std::str::index_of(rest, "\t");
+    return if t < 0 { rest } else { rest[0..t] };
+}
+
+/// `pins` with each sha256 once, at its first line: files of the same
+/// content (a kit's identical licenses) are one blob, fetched once.
+@bounded_by(pins)
+fn distinct_pins(pins: String) -> String {
+    if std::str::starts_with(pins, "!") { return pins; }
+    let out = std::bytes::BytesBuilder { };
+    let mut seen = "\n";
+    let v = std::str::bytes_view(pins);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        let sha = tab_field(line, 2);
+        if len(line) > 0 && !std::str::contains(seen, "\n" + sha + "\n") {
+            seen = seen + sha + "\n";
+            out.append_str(line + "\n");
+        }
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// The bytes of a list of pins, together.
+@bounded_by(pins)
+fn pins_bytes(pins: String) -> Int {
+    let mut n = 0;
+    let v = std::str::bytes_view(pins);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        n = n + (std::str::parse_int(tab_field(std::str::slice(v, from, nl), 3)) or 0);
+        from = nl + 1;
+    }
+    return n;
+}
+
+/// The bytes of the pins the store holds.
+@bounded_by(pins)
+fn pins_held(blobs: String, pins: String) -> Int {
+    let mut n = 0;
+    let v = std::str::bytes_view(pins);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        if held(blobs, tab_field(line, 2)) {
+            n = n + (std::str::parse_int(tab_field(line, 3)) or 0);
+        }
+    }
+    return n;
+}
+
+/// The bytes the parts of unheld pins already hold (`partial`).
+@bounded_by(pins)
+fn pins_partial(blobs: String, pins: String) -> Int {
+    let mut n = 0;
+    let v = std::str::bytes_view(pins);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        if len(line) > 0 {
+            n = n
+                + partial(blobs, tab_field(line, 2), std::str::parse_int(tab_field(line, 3)) or 0);
+        }
+    }
+    return n;
 }
 
 /// The data directory's store of fetched files, `blobs/<sha256>`: each one

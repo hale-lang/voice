@@ -1494,6 +1494,80 @@ fn links(s: st::Store, label: String) {
     );
 }
 
+/// What a node's store holds, kept whole as it reported it, and replaced
+/// by its next report: a frontier model's hundreds of files and more, at
+/// the protocol's bound.
+fn inventories(s: st::Store, label: String) {
+    let at = `2026-11-05T00:00:00Z`;
+    s.insert_node(
+        st::NodeRow { id: "spark", name: "spark", token_digest: "ab01", created_at: at },
+        ch("create", "nodes/spark"),
+    )
+    or discard;
+    std::test::assert(
+        !(s.inventory("spark") or st::InventoryRow { present: true }).present,
+        label + ": nothing until the node reports",
+    );
+    // 4096 files, the most a node reports: about 300 KiB
+    let mut blobs = "";
+    let mut i = 0;
+    while i < 4096 {
+        blobs = blobs + std::str::pad_left(to_string(i), 64, "0") + " "
+            + to_string(1000000000 + i) + "\n";
+        i = i + 1;
+    }
+    // their sizes together, past what an int4 holds
+    let total = 4096 * 1000000000 + 4095 * 4096 / 2;
+    s.put_inventory(
+        st::InventoryRow {
+            node: "spark",
+            blobs: blobs,
+            files: 4096,
+            bytes: total,
+            reported_at: at,
+        },
+    ) or discard;
+    let got = s.inventory("spark") or st::InventoryRow { };
+    std::test::assert(got.present && got.node == "spark", label + ": the report is kept");
+    std::test::assert_eq_int(len(got.blobs), len(blobs), label + ": whole");
+    std::test::assert(got.blobs == blobs, label + ": as reported");
+    std::test::assert(got.files == 4096 && got.bytes == total, label + ": with its totals");
+    let short = s.inventory_summary("spark") or st::InventoryRow { };
+    std::test::assert(
+        short.present && len(short.blobs) == 0 && short.files == 4096 && short.bytes == total
+            && std::time::iso8601(short.reported_at) == std::time::iso8601(at),
+        label + ": its summary, without the files",
+    );
+    std::test::assert(
+        !(s.inventory_summary("flare") or st::InventoryRow { present: true }).present,
+        label + ": none for a node that never reported",
+    );
+    std::test::assert_eq_str(
+        std::time::iso8601(got.reported_at),
+        std::time::iso8601(at),
+        label + ": with when",
+    );
+    let later = `2026-11-05T01:00:00Z`;
+    s.put_inventory(
+        st::InventoryRow {
+            node: "spark",
+            blobs: std::str::repeat("a", 64) + " 7\n",
+            files: 1,
+            bytes: 7,
+            reported_at: later,
+        },
+    ) or discard;
+    let next = s.inventory("spark") or st::InventoryRow { };
+    std::test::assert(
+        next.blobs == std::str::repeat("a", 64) + " 7\n" && next.files == 1 && next.bytes == 7
+            && std::time::iso8601(next.reported_at) == std::time::iso8601(later),
+        label + ": the next report replaces it",
+    );
+    s.put_inventory(st::InventoryRow { node: "spark", blobs: "", reported_at: later }) or discard;
+    let none = s.inventory("spark") or st::InventoryRow { };
+    std::test::assert(none.present && len(none.blobs) == 0, label + ": an empty store is a report");
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -1561,6 +1635,7 @@ fn main() {
     annotations(mem, "memory");
     queued(mem, "memory");
     links(st::MemoryStore { }, "memory");
+    inventories(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1591,6 +1666,8 @@ fn main() {
     queued(pg, "postgres");
     pg.conn.exec("TRUNCATE link_check, seat, node RESTART IDENTITY CASCADE");
     links(pg, "postgres");
+    pg.conn.exec("TRUNCATE node_inventory, link_check, seat, node RESTART IDENTITY CASCADE");
+    inventories(pg, "postgres");
 }
 
 /// `h` hours after `base` (Unix seconds).

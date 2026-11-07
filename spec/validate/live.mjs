@@ -110,6 +110,8 @@ const nodeBodies = {
   reportCapabilities: capabilities,
   reportLocalControls: local,
   reportQuota: { seat: 'static', windows: [] },
+  // what its store holds: a file the live recipe pins, and one no variant lists
+  reportInventory: { blobs: [{ sha256: 'a'.repeat(64), bytes: 4920000000 }, { sha256: 'b'.repeat(64), bytes: 1000 }] },
   // no check holds a rank of this node's: what it reports is dropped
   reportLinkCheck: { id: 'lc-live', ok: true, bus_bytes_per_second: 0 },
   nodeDraining: { reason: 'live check' },

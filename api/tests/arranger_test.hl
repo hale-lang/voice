@@ -62,6 +62,38 @@ fn checked(store: st::Store, link: api::Link) {
     store.put_link_result(c.id, "flare", said) or discard;
 }
 
+/// What a node reports its store holds: every file variant `v` pins (its
+/// own, its file sets', a set's manifest), as downloads.hl reads them.
+fn holding(node: String, v: String) -> st::InventoryRow {
+    let mut out = st::InventoryRow { node: node, reported_at: api::now_seconds() };
+    out.blobs = blobs_of(std::json::find_field_raw(v, "files"));
+    let mut set = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
+    while !set.done {
+        out.blobs = out.blobs + blobs_of(std::json::find_field_raw(set.element, "files"));
+        let manifest = std::str::trim(std::json::find_field_raw(set.element, "manifest"));
+        if len(manifest) > 0 { out.blobs = out.blobs + blobs_of("[" + manifest + "]"); }
+        set = std::json::array_next(set);
+    }
+    return out;
+}
+
+fn blobs_of(files: String) -> String {
+    let mut out = "";
+    let mut f = std::json::array_first(files);
+    while !f.done {
+        out = out + std::json::find_string_field(f.element, "sha256") + " "
+            + to_string(std::json::find_int_field(f.element, "bytes")) + "\n";
+        f = std::json::array_next(f);
+    }
+    return out;
+}
+
+/// Variant `id` of shipped recipe `recipe`, as JSON.
+fn shipped_variant(recipe: String, id: String) -> String {
+    let file = std::io::fs::read_file(shipped("recipes") + "/" + recipe + ".json") or "";
+    return api::variant_body_of(std::str::trim(std::json::find_field_raw(file, "variants")), id);
+}
+
 fn pin(model: String, n: Int) -> api::ArrangementPin {
     return api::ArrangementPin { model: model, count: n };
 }
@@ -248,16 +280,36 @@ fn main() {
     let p0 = at(plain.add, 0) or api::PlanAdd { };
     std::test::assert_eq_str(nodes_of(p0.nodes), "flare", "with nothing held, the first node");
     std::test::assert(p0.download_bytes > 0, "which fetches it");
-    push(
-        f.holdings.items,
-        api::NodeHolding { node: "spark3", recipe: p0.recipe, variant: p0.variant },
-    ) or discard;
-    let held = api::plan_fleet(f, small, read.roles);
+    // spark3 reports its store holds that variant whole
+    store.put_inventory(holding("spark3", shipped_variant(p0.recipe, p0.variant))) or discard;
+    let mut g2 = placements.arrangement_fleet_in_gate(small) or api::ArrangeFleet { };
+    g2.placed = api::ArrangePlacedList { };
+    let held = api::plan_fleet(g2, small, read.roles);
     let p1 = at(held.add, 0) or api::PlanAdd { };
     std::test::assert(
         nodes_of(p1.nodes) == "spark3" && p1.download_bytes == 0
             && std::str::contains(p1.reason, "already on disk"),
         "the node that holds it: " + api::plan_text(held),
+    );
+
+    // ---- across a pair, held whole on each to be on disk ----------------
+    let mut ds_only = api::ArrangementWants { };
+    push(ds_only.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
+    let exl3 = shipped_variant("deepseek-v4.1-flash-1017", "exl3-2.5bpw");
+    store.put_inventory(holding("flare", exl3)) or discard;
+    let half = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
+    let h0 = at(half.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        h0.download_bytes == api::fetched_bytes(exl3)
+            && !std::str::contains(h0.reason, "already on disk"),
+        "held on flare alone: spark fetches its part: " + api::plan_text(half),
+    );
+    store.put_inventory(holding("spark", exl3)) or discard;
+    let both = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
+    let h1 = at(both.add, 0) or api::PlanAdd { };
+    std::test::assert(
+        h1.download_bytes == 0 && std::str::contains(h1.reason, "already on disk"),
+        "held whole on both: " + api::plan_text(both),
     );
 
     // ---- refusals ----------------------------------------------------------

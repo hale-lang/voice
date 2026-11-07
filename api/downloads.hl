@@ -1,0 +1,287 @@
+// What a node has on disk of the models voice knows
+// (`GET /admin/v1/nodes/{node}/downloads`, `Placements.downloads`). The node
+// reports the files its store holds whole, each by its sha256 and size
+// (`PUT /node/v1/inventory`, protocol.yaml `Inventory`), once it registers
+// and whenever that changes; the store keeps the last report as it came
+// (`node_inventory`). Read against the recipes, it says which variants the
+// node holds whole, which in part (the files a variant lists, held or not,
+// by sha256), and what it holds that no variant lists. A node keeps a
+// variant's files when its placement is removed, so placing a variant it
+// holds whole again is a reload, not a download; a suggestion says so
+// (`NodeSuggestion.downloaded`).
+
+/// `NodeDownload`: one recipe variant, as much of it as the node holds.
+type NodeDownload {
+    recipe: String = "";
+    variant: String = "";
+    bytes: Int = 0;
+    complete: Bool = false;
+    files_held: Int = 0;
+    files_total: Int = 0;
+    bytes_held: Int = 0;
+    has_placed: Bool = false;
+    placed: String = "";
+}
+
+/// `NodeDownloads`: what a node holds, by variant: those held whole first,
+/// then those held in part, at most `DOWNLOADS_MAX`; then what no variant
+/// lists.
+type NodeDownloads {
+    node: String = "";
+    has_reported_at: Bool = false;
+    reported_at: Time = `1970-01-01T00:00:00Z`;
+    files: Int = 0;
+    bytes: Int = 0;
+    data: bounded[NodeDownload; 64];
+    other_files: Int = 0;
+    other_bytes: Int = 0;
+}
+
+/// `NodeDownloaded`: what a node's store holds, in short, as its summary
+/// carries it: how many files and their size together, from the totals
+/// the store keeps beside its report, so a summary reads no file list.
+type NodeDownloaded { files: Int = 0; bytes: Int = 0; }
+
+/// The most files a node reports (protocol.yaml `Inventory`): about 300
+/// KiB as the store keeps them.
+const INVENTORY_MAX: Int = 4096;
+
+/// The most variants `listNodeDownloads` lists.
+const DOWNLOADS_MAX: Int = 64;
+
+/// One file a node holds: its sha256 and its size.
+type HeldBlob { sha: String = ""; bytes: Int = 0; }
+
+/// The files a node holds, by sha256.
+@form(hashmap)
+locus HeldBlobs { capacity { pool rows of HeldBlob indexed_by sha; } }
+
+/// A report as the store keeps it: one file a line, `<sha256> <bytes>`, in
+/// the order of their sha256, how many and their size together.
+type InventoryText { blobs: String = ""; files: Int = 0; bytes: Int = 0; }
+
+/// `Inventory`, checked: each file a 64-hex-digit sha256 and a size, in
+/// the order of their sha256, none twice, at most `INVENTORY_MAX`.
+@unbounded
+fn read_inventory(body: String) -> InventoryText fallible(ApiError) {
+    object_body(body) or raise;
+    let extra = only_keys(body, ",blobs,");
+    if len(extra) > 0 { fail invalid("the inventory has no field " + extra, extra); }
+    if kind_of(body, "blobs") != "array" { fail invalid("`blobs` is a required list", "blobs"); }
+    let lines = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let mut files = 0;
+    let mut bytes = 0;
+    let mut last = "";
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "blobs"));
+    while !it.done {
+        let b = std::str::trim(it.element);
+        let at = "blobs[" + to_string(files) + "]";
+        files = files + 1;
+        if files > INVENTORY_MAX {
+            fail invalid("at most " + to_string(INVENTORY_MAX) + " files", "blobs");
+        }
+        if !std::json::valid_object(b) || len(only_keys(b, ",sha256,bytes,")) > 0 {
+            fail invalid(at + " is {\"sha256\", \"bytes\"}", "blobs");
+        }
+        let sha = text_of(b, "sha256");
+        if !hex(sha, 64) { fail invalid(at + ".sha256 is 64 lowercase hex digits", "blobs"); }
+        let n = size_of(b, "bytes");
+        if n < 0 { fail invalid(at + ".bytes is a whole number of bytes, 0 or more", "blobs"); }
+        if len(last) > 0 && !(last < sha) {
+            fail invalid(
+                at + " is out of order or listed twice: the files go by sha256, each once",
+                "blobs",
+            );
+        }
+        last = sha;
+        lines.append_str(sha + " " + to_string(n) + "\n");
+        bytes = bytes + n;
+        it = std::json::array_next(it);
+    }
+    let text = lines.snapshot() or b"";
+    return InventoryText { blobs: std::str::from_bytes(text), files: files, bytes: bytes };
+}
+
+/// A whole number, 0 or more, member `name` of `obj`; -1 when it is
+/// anything else.
+fn size_of(obj: String, name: String) -> Int {
+    if std::json::string_field(obj, name).kind != "number" { return -1; }
+    let raw = std::str::trim(std::json::find_field_raw(obj, name));
+    if std::str::contains(raw, ".") || std::str::contains(raw, "e") || std::str::contains(raw, "E")
+    {
+        return -1;
+    }
+    return std::str::parse_int(raw) or - 1;
+}
+
+/// The files of a report the store keeps (`InventoryText.blobs`) into `h`.
+@unbounded
+fn hold_blobs(h: HeldBlobs, blobs: String) {
+    let v = std::str::bytes_view(blobs);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        let sp = std::str::index_of(line, " ");
+        if sp != 64 { continue; }
+        h.set(
+            HeldBlob {
+                sha: line[0..sp],
+                bytes: std::str::parse_int(line[(sp + 1)..len(line)]) or 0,
+            },
+        );
+    }
+}
+
+/// How much of a variant `h` holds: its files and their size together,
+/// and those of them held.
+type VariantHeld { files_total: Int = 0; files_held: Int = 0; bytes: Int = 0; bytes_held: Int = 0; }
+
+/// What `h` holds of `variant` (a recipe's variant, as JSON): each file it
+/// pins, by its sha256: its own files, and each of its file sets' (a set
+/// pinned by a manifest counts the manifest; the files the manifest lists
+/// are not named in the recipe, so they are not told apart from what no
+/// variant lists). Each file held is put in `listed` too, so what no
+/// variant lists can be told. What its prepare step makes is kept apart
+/// from the store, and is not counted.
+@unbounded
+fn variant_held(variant: String, h: HeldBlobs, listed: HeldBlobs) -> VariantHeld {
+    let mut out = files_held(
+        std::json::find_field_raw(variant, "files"),
+        h,
+        listed,
+        VariantHeld { },
+    );
+    let mut set = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !set.done {
+        out = files_held(std::json::find_field_raw(set.element, "files"), h, listed, out);
+        let manifest = std::str::trim(std::json::find_field_raw(set.element, "manifest"));
+        if len(manifest) > 0 {
+            out = files_held("[" + manifest + "]", h, listed, out);
+        }
+        set = std::json::array_next(set);
+    }
+    return out;
+}
+
+/// `out` with what `h` holds of `files` (a JSON list of pinned files)
+/// added.
+@unbounded
+fn files_held(files: String, h: HeldBlobs, listed: HeldBlobs, out: VariantHeld) -> VariantHeld {
+    let mut next = out;
+    let mut f = std::json::array_first(files);
+    while !f.done {
+        let sha = std::json::find_string_field(f.element, "sha256");
+        let n = std::json::find_int_field(f.element, "bytes");
+        next.files_total = next.files_total + 1;
+        next.bytes = next.bytes + n;
+        let got = h.get(sha) or HeldBlob { };
+        if len(got.sha) > 0 {
+            next.files_held = next.files_held + 1;
+            next.bytes_held = next.bytes_held + n;
+            listed.set(got);
+        }
+        f = std::json::array_next(f);
+    }
+    return next;
+}
+
+/// True when `h` holds every file of `variant`; false for a variant that
+/// lists none.
+fn variant_whole(variant: String, h: HeldBlobs) -> Bool {
+    let v = variant_held(variant, h, HeldBlobs { });
+    return v.files_total > 0 && v.files_held == v.files_total;
+}
+
+/// The placement that uses variant `variant` of recipe `recipe` on node
+/// `node` now, "" for none.
+fn placed_here(rows: st::PlacementRows, node: String, recipe: String, variant: String) -> String {
+    for p in rows.rows {
+        if !p.removed && places_on(p.body, node)
+            && std::json::find_string_field(p.body, "recipe") == recipe
+            && std::json::find_string_field(p.body, "variant") == variant
+        {
+            return p.id;
+        }
+    }
+    return "";
+}
+
+/// What node `node` holds, from its last report `inv`, read against
+/// `recipes` (a JSON list of recipes, in the order `listRecipes` lists
+/// them) and the placements `rows`.
+@unbounded
+fn node_downloads(
+    node: String,
+    inv: st::InventoryRow,
+    recipes: String,
+    rows: st::PlacementRows
+) -> NodeDownloads {
+    let mut out = NodeDownloads { node: node };
+    if !inv.present { return out; }
+    out.has_reported_at = true;
+    out.reported_at = inv.reported_at;
+    out.files = inv.files;
+    out.bytes = inv.bytes;
+    let h = HeldBlobs { };
+    hold_blobs(h, inv.blobs);
+    let listed = HeldBlobs { };
+    let mut partial = NodeDownloads { };
+    let mut r = std::json::array_first(recipes);
+    while !r.done {
+        let recipe = std::json::find_string_field(r.element, "id");
+        let mut v = std::json::array_first(std::json::find_field_raw(r.element, "variants"));
+        while !v.done {
+            let held = variant_held(v.element, h, listed);
+            if held.files_held > 0 {
+                let variant = std::json::find_string_field(v.element, "id");
+                let placed = placed_here(rows, node, recipe, variant);
+                let d = NodeDownload {
+                    recipe: recipe,
+                    variant: variant,
+                    bytes: held.bytes,
+                    complete: held.files_held == held.files_total,
+                    files_held: held.files_held,
+                    files_total: held.files_total,
+                    bytes_held: held.bytes_held,
+                    has_placed: len(placed) > 0,
+                    placed: placed,
+                };
+                if d.complete {
+                    push(out.data, d) or discard;
+                } else {
+                    push(partial.data, d) or discard;
+                }
+            }
+            v = std::json::array_next(v);
+        }
+        r = std::json::array_next(r);
+    }
+    for d in partial.data {
+        push(out.data, d) or discard;
+    }
+    // what no variant lists
+    let lv = std::str::bytes_view(inv.blobs);
+    let mut start = 0;
+    while start < lv.n {
+        let nl = st::line_end(lv, start);
+        let line = std::str::slice(lv, start, nl);
+        start = nl + 1;
+        let sp = std::str::index_of(line, " ");
+        if sp != 64 { continue; }
+        let seen = listed.get(line[0..sp]) or HeldBlob { };
+        if len(seen.sha) == 0 {
+            out.other_files = out.other_files + 1;
+            out.other_bytes = out.other_bytes
+                + (std::str::parse_int(line[(sp + 1)..len(line)]) or 0);
+        }
+    }
+    return out;
+}
+
+/// A node's store, in short, for its summary; null (`has` false) until it
+/// reports.
+fn node_downloaded_of(inv: st::InventoryRow) -> NodeDownloaded {
+    return NodeDownloaded { files: inv.files, bytes: inv.bytes };
+}

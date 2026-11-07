@@ -484,7 +484,7 @@ Still there on hale 0.32.6: with the copy reverted, `hale test api/tests/nodes_t
 
 **Working shape:** every program voice ships is built with `hale build --target-cpu baseline` (the Dockerfiles, `image.yml`, `runtime-decision.yml`), and CI refuses a shipped build without it (voice#143).
 
-**Resolved in hale 0.32.1** (hale-lang/hale#1839): `hale build` targets the portable baseline by default, and `--target-cpu native` asks for the build machine's. Voice still passes `--target-cpu baseline` everywhere and CI still guards it; the flag is now the default, so both could go.
+**Resolved in hale 0.32.1** (hale-lang/hale#1839): `hale build` targets the portable baseline by default, and `--target-cpu native` asks for the build machine's. Voice still passes `--target-cpu baseline` everywhere and CI still guards it, and both stay: hale-lang/hale#1870 makes `hale build` tune to the build machine's CPU by default again, so every program voice ships (the images built on CI runners, voice-decide in the decision runtimes, the darwin node tarball) needs the flag to run on another machine. Only a build that runs where it was built may drop it.
 
 ## A `drain()` hook never ran on SIGTERM unless something read `draining`
 

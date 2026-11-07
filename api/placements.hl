@@ -539,8 +539,9 @@ locus Placements {
         for r in all.data {
             if !c.has_runtime || r.id == c.runtime {
                 named_any = true;
-                // across two nodes, only a runtime whose server spans them
-                if parts == 1 || r.has_multi_node { push(usable.data, r) or discard; }
+                // across two nodes, only a runtime whose server spans them;
+                // on one, none that runs only across two
+                if serves_on(r, parts) { push(usable.data, r) or discard; }
             }
         }
         if c.has_runtime && !named_any {
@@ -550,7 +551,14 @@ locus Placements {
             );
         }
         if c.has_runtime && count(usable.data) == 0 {
-            fail bad("runtime " + c.runtime + " does not span nodes", "runtime");
+            fail bad(
+                if parts == 2 {
+                    "runtime " + c.runtime + " does not span nodes"
+                } else {
+                    "runtime " + c.runtime + " runs only across two nodes"
+                },
+                "runtime"
+            );
         }
         let judged = judge_on(
             recipe.variants.text,
@@ -1142,7 +1150,8 @@ fn runtime_for(format: String, hw: String, rts: RuntimeList, decision: Bool) -> 
         for p in r.platforms {
             if host_os_name(p.os) == os && host_arch_name(p.arch) == arch { here = true; }
         }
-        if reads && here {
+        // its kernels built for the machine's GPU, when it says which
+        if reads && here && (!r.has_compute_capabilities || computes_on(r, hw)) {
             let on = runtime_accelerator_name(r.accelerator);
             let rank = accelerator_rank(on);
             if (on == "cpu" || std::str::contains(accel, "," + on + ",")) && rank < best_rank {
@@ -1152,6 +1161,52 @@ fn runtime_for(format: String, hw: String, rts: RuntimeList, decision: Bool) -> 
         }
     }
     return best;
+}
+
+/// True when one of the machine's GPUs (its `hw`) declares a compute
+/// capability runtime `r` is built for (`RuntimeCreate.compute_capabilities`).
+@bounded_by(hw)
+fn computes_on(r: Runtime, hw: String) -> Bool {
+    let mut it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    while !it.done {
+        let cap = std::json::find_string_field(it.element, "compute_capability");
+        for cc in r.compute_capabilities {
+            if len(cap) > 0 && cc == cap { return true; }
+        }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// Which of the nodes of `j` has no GPU runtime `rt` (among `rts`) is
+/// built for (`RuntimeCreate.compute_capabilities`), as a reason says it;
+/// "" when every one has.
+@bounded_by(rts)
+fn other_gpu(rts: RuntimeList, rt: String, j: Judging) -> String {
+    for r in rts.data {
+        if r.id == rt && r.has_compute_capabilities {
+            let mut i = 0;
+            while i < count(j.hw) {
+                if !computes_on(r, at(j.hw, i) or "{}") {
+                    let built = st::JsonList { };
+                    for cc in r.compute_capabilities {
+                        built.add(cc);
+                    }
+                    return "its kernels are built for compute capability "
+                        + std::str::replace(built.text(), ", ", " or ")
+                        + (
+                            if count(j.hw) > 1 {
+                                ", and node " + (at(j.names, i) or "") + "'s GPU is not"
+                            } else {
+                                ", and the node's GPU is not"
+                            }
+                        );
+                }
+                i = i + 1;
+            }
+        }
+    }
+    return "";
 }
 
 /// True when the runtime `id` runs on processors, not an accelerator.
@@ -1204,7 +1259,8 @@ fn format_rank(format: String, hw: String, small: Bool) -> Int {
     if std::str::contains(accel, ",metal,") { return if format == "mlx" { 0 } else { 1 }; }
     if std::str::contains(accel, ",cuda,") {
         if small { return if format == "gguf" { 0 } else { 1 }; }
-        return if format == "safetensors" { 0 } else { 1 };
+        // the GPU's own forms: safetensors under vLLM, EXL3 under TensorFold
+        return if format == "safetensors" || format == "exl3" { 0 } else { 1 };
     }
     // an AMD or Intel GPU is served by llama.cpp: its own format first
     if std::str::contains(accel, ",rocm,") || std::str::contains(accel, ",vulkan,") {
@@ -1302,10 +1358,22 @@ fn judge_recipe(
     return judge_on(variants, j, rts, decision);
 }
 
+/// True when runtime `r` may serve a placement on `parts` nodes: across two,
+/// one whose server spans them (`multi_node`); on one, any but a server that
+/// runs only across two (`lanes`).
+fn serves_on(r: Runtime, parts: Int) -> Bool {
+    if parts > 1 { return r.has_multi_node; }
+    return !(r.has_multi_node && r.multi_node == MultiNode::lanes);
+}
+
 /// A recipe judged against the nodes of `j`.
 @bounded_by(variants)
-fn judge_on(variants: String, j: Judging, rts: RuntimeList, decision: Bool) -> Judged {
+fn judge_on(variants: String, j: Judging, all: RuntimeList, decision: Bool) -> Judged {
     let mut out = Judged { };
+    let mut rts = RuntimeList { };
+    for r in all.data {
+        if serves_on(r, count(j.hw)) { push(rts.data, r) or discard; }
+    }
     let hw = at(j.hw, 0) or "{}";
     let small = small_model(variants);
     let mut best_rank = 0;
@@ -1366,14 +1434,19 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
     }
     let runs = rt + " runs " + format + " on " + runtime_on(rts, rt)
         + (if parts > 1 { " across " + to_string(parts) + " nodes" } else { "" });
+    // across two nodes, the follower's GPU as well as the leader's
+    let gpu_short = other_gpu(rts, rt, j);
+    if len(gpu_short) > 0 {
+        return VariantFit {
+            variant: id,
+            has_runtime: true,
+            runtime: rt,
+            fits: false,
+            reason: runs + "; " + gpu_short,
+        };
+    }
     // what its seat takes on each node, its server's own beside its share
     let need = footprint(part_need(v, parts));
-    let mut size = 0;
-    let mut f = std::json::array_first(std::json::find_field_raw(v, "files"));
-    while !f.done {
-        size = size + std::json::find_int_field(f.element, "bytes");
-        f = std::json::array_next(f);
-    }
     let mut memory = "";
     let mut disk = "";
     let mut short = false;
@@ -1390,6 +1463,7 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
         memory = if i == 0 { said } else { memory + "; " + said };
         if need > room { short = true; }
         let free = std::json::find_int_field(node_hw, "disk_free_bytes");
+        let size = disk_need(v, i);
         let on_disk = name + gb(size) + " of " + gb(free) + " free";
         disk = if i == 0 { on_disk } else { disk + "; " + on_disk };
         if size > free { full = true; }
@@ -1427,6 +1501,50 @@ fn accelerators_said(hw: String) -> String {
     let kinds = accelerator_kinds(hw);
     if kinds == "," { return "no accelerator"; }
     return std::str::replace(kinds[1..(len(kinds) - 1)], ",", " and ");
+}
+
+/// What variant `v` keeps on the disk of the node that runs its rank
+/// `rank`: every file it fetches (its own, its file sets', a set pinned by a
+/// manifest at the bytes it says), and what that node's prepare step makes
+/// (`prepared`: each file every rank makes, and its own rank's).
+@bounded_by(v)
+fn disk_need(v: String, rank: Int) -> Int {
+    let mut size = files_bytes(std::json::find_field_raw(v, "files"));
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "file_sets"));
+    while !it.done {
+        let m = std::json::find_field_raw(it.element, "manifest");
+        size = size
+            + (
+                if len(m) > 0 {
+                    std::json::find_int_field(m, "bytes")
+                        + std::json::find_int_field(it.element, "bytes")
+                } else {
+                    files_bytes(std::json::find_field_raw(it.element, "files"))
+                }
+            );
+        it = std::json::array_next(it);
+    }
+    let mut p = std::json::array_first(std::json::find_field_raw(v, "prepared"));
+    while !p.done {
+        let ranked = len(std::json::find_field_raw(p.element, "rank")) > 0;
+        if !ranked || std::json::find_int_field(p.element, "rank") == rank {
+            size = size + std::json::find_int_field(p.element, "bytes");
+        }
+        p = std::json::array_next(p);
+    }
+    return size;
+}
+
+/// The bytes of a list of files, together.
+@bounded_by(files)
+fn files_bytes(files: String) -> Int {
+    let mut size = 0;
+    let mut f = std::json::array_first(files);
+    while !f.done {
+        size = size + std::json::find_int_field(f.element, "bytes");
+        f = std::json::array_next(f);
+    }
+    return size;
 }
 
 /// Every variant's reason, for a refusal.

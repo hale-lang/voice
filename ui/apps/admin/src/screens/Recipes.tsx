@@ -71,9 +71,13 @@ function Files({ files }: { files: Variant['files'] }) {
   );
 }
 
-/** A variant's download: its files together. */
+/** A variant's download: its files together, and its file sets' (a manifest and what it lists). */
 function size(v: Variant): number {
-  return v.files.reduce((n, f) => n + f.bytes, 0);
+  const sets = (v.file_sets ?? []).reduce(
+    (n, s) => n + (s.manifest ? s.manifest.bytes + (s.bytes ?? 0) : (s.files ?? []).reduce((m, f) => m + f.bytes, 0)),
+    0,
+  );
+  return v.files.reduce((n, f) => n + f.bytes, 0) + sets;
 }
 
 /** A recipe whole (`getRecipe`): every variant's files among it. */
@@ -111,6 +115,20 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
               { k: 'download', v: `${bytes(size(v))} in ${v.files.length} file${v.files.length === 1 ? '' : 's'}` },
               { k: 'source', v: <Mono>{`${v.source.repo}@${v.source.revision.slice(0, 12)}`}</Mono> },
               { k: 'files', v: <Files files={v.files} /> },
+              ...(v.file_sets ?? []).map((s) => ({
+                k: `set ${s.name}`,
+                v: s.manifest
+                  ? <>
+                      <Mono>{`${s.source.repo}@${s.source.revision.slice(0, 12)}`}</Mono>: the files <Mono>{s.manifest.path}</Mono> lists, {bytes(s.bytes ?? 0)}
+                    </>
+                  : <>
+                      <Mono>{`${s.source.repo}@${s.source.revision.slice(0, 12)}`}</Mono>
+                      <Files files={s.files ?? []} />
+                    </>,
+              })),
+              ...(v.prepare
+                ? [{ k: 'readied', v: `${v.prepare}, once on each node: ${(v.prepared ?? []).map((f) => f.path).join(', ')}` }]
+                : []),
             ]}
           />
         </div>

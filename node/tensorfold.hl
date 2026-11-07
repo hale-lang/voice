@@ -1,0 +1,442 @@
+// A TensorFold seat (`server: tensorfold`): DeepSeek-V4.1-Flash on
+// TensorFold's native engine, its `dsv41` family, tensor parallel across two
+// DGX Sparks (`multi_node: lanes`), as the recipe the runtime pins serves it
+// (bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 v0.7.5: its
+// scripts/serve.sh, scripts/node_run.sh and config.env.example).
+//
+// The runtime is a CUDA image by digest and the engine built apart from it
+// (`artifact.archive`, runtimes/tensorfold/build.sh), unpacked once into
+// `runtimes/<sha256>` and mounted read-only at /engine. The variant brings
+// the EXL3 weights, the Engram tables and the kernel kit (`file_sets`), each
+// laid out as links into the store: the weights at /model, the sets at
+// /engram and /kit.
+//
+// Before its first start each node readies what its rank reads beside them
+// (`prepare: dsv41-tp2`), once, in the runtime's image, with no GPU and no
+// network: the model folder's two added files (the recipe's
+// serving_1017.py), then the rank's weight file of about 93 GB and Engram's
+// token map (the engine's node_inputs.sh). Each is checked against the
+// variant's pins (`prepared`) and kept under `prepared/<key>`, the key all
+// they are made from and must be (`prepared_identity`: the step, the image,
+// the engine, every file by name and digest, the pins, the rank), so a seat
+// placed again with the same reads them at once while each file is there.
+//
+// Rank 1 (`tf-dsv41-lanes`) connects to rank 0's rendezvous on the link,
+// which rank 0 (`tensorfold-native serve`) listens for on its link address
+// alone: the port is unauthenticated. Rank 0's API listens on loopback. A
+// node may finish readying its inputs long after the other, so rank 1 waits
+// for rank 0 as long as its seat is assigned (`TF_TP_CONNECT_SECONDS`, a
+// patch of voice's to the engine, runtimes/tensorfold/patches), and the
+// RDMA ring opens the GID index the link declares (`TF_RDMA_GID_INDEX`,
+// another), as NCCL does.
+
+/// The prepare steps a variant may name (`RecipeVariant.prepare`).
+const PREPARE_DSV41: String = "dsv41-tp2";
+
+/// The shape both ranks are started with, the recipe's served one (its
+/// release gate's): a request of up to the model's context in a window of
+/// 7,340,032 positions shared by 32 streams, rounds of up to 64 rows, and
+/// rank 0 serving 32 requests at once. The ranks' settings check stops a
+/// launch whose ranks differ.
+const TF_WINDOW: Int = 7340032;
+const TF_STREAMS: Int = 32;
+const TF_ROUND_ROWS: Int = 64;
+const TF_PARALLEL: Int = 32;
+
+/// Both ranks' other variables, as the recipe serves them
+/// (`config.env.example`'s `ENGINE_ENV`, the 64-entry round table its
+/// release gate measured among them), but the grammar library: the
+/// engine archive's own, built from xgrammar's source, not the kit's.
+const TF_ENGINE_ENV: String = "TF_DS_GRAPHS=1\nTF_DS_HC_SIDE=1\nTF_DS_L2_PREFETCH=1\nTF_DS_ENGRAM_AIO=1\nTF_DS_REPLAY_FLOOR=1\nTF_DS_IDX_SPLIT=8192\nTENSORFOLD_PLAIN_SPECIALS=1\nTENSORFOLD_GRAMMAR_LIB=/engine/lib/libtfgrammar.so\nTENSORFOLD_SSE_KEEPALIVE=15\nTENSORFOLD_STATS_EVERY=60\nTF_DS_PROMPT_ALIAS=1\nTF_DS_ROUND_MS=30.0,35.2,39.9,44.9,48.6,52.1,55.6,59.1,62.7,66.3,69.6,72.9,75.5,78.2,81.3,84.4,87.5,90.6,93.7,96.8,99.9,103.0,106.1,109.2,112.2,115.3,122.0,123.9,125.5,127.2,130.5,134.6,138.8,142.9,145.9,148.2,150.6,152.9,155.3,157.6,160.0,162.3,164.7,167.0,169.4,171.7,174.1,176.4,179.0,181.6,184.2,186.9,189.5,192.1,194.7,197.3,199.9,202.5,205.1,207.8,210.4,213.0,215.6,218.2\n";
+
+/// Rank 0's server flags beside its shape, as the recipe serves them: the
+/// model thinks unless a request says not to, a reply is at most 32,768
+/// tokens unless it asks for fewer, sampled at the recipe's defaults (top_k
+/// 20, top_p 0.95, temperature 1.0), and kept prompt states may take 2 GiB.
+const TF_SERVER_FLAGS: String = "--thinking\n--max-tokens\n32768\n--temperature\n1.0\n--top-p\n0.95\n--top-k\n20\n--prompt-cache-gib\n2\n";
+
+/// How long rank 1 waits for rank 0's rendezvous: a day, longer than any
+/// node takes to ready its inputs; its seat leaving the assignment stops it.
+const TF_CONNECT_SECONDS: Int = 86400;
+
+/// The rank a seat's config gives it: its part's (`cluster.rank`), 0 alone.
+fn rank_of(config: String) -> Int {
+    let cluster = std::str::trim(std::json::find_field_raw(config, "cluster"));
+    return if len(cluster) > 0 { std::json::find_int_field(cluster, "rank") } else { 0 };
+}
+
+/// What a seat's readied inputs are made from and must be, as one text:
+/// the prepare step, the image it runs in (by digest) and the engine that
+/// makes and reads them (its archive's sha256), every file of the variant
+/// and of its sets (each by its name and sha256, a manifest's for a set it
+/// pins), every file the step must make as the variant pins it (`prepared`:
+/// path, size, sha256, rank), and the rank. Two seats with the same read
+/// the same inputs; any of it changed, inputs of their own.
+@unbounded
+fn prepared_identity(config: String) -> String {
+    let variant = std::json::find_field_raw(config, "variant");
+    let artifact = std::json::find_field_raw(
+        std::json::find_field_raw(config, "runtime"),
+        "artifact",
+    );
+    let b = std::bytes::BytesBuilder { };
+    b.append_str("prepare " + std::json::find_string_field(variant, "prepare") + "\n");
+    b.append_str(
+        "image " + std::json::find_string_field(artifact, "image") + "@"
+            + std::json::find_string_field(artifact, "digest")
+            + "\n",
+    );
+    b.append_str(
+        "engine "
+            + std::json::find_string_field(std::json::find_field_raw(artifact, "archive"), "sha256")
+            + "\n",
+    );
+    let pins = variant_pins("", variant);
+    let v = std::str::bytes_view(pins);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        b.append_str("file " + tab_field(line, 1) + " " + tab_field(line, 2) + "\n");
+        from = nl + 1;
+    }
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "prepared"));
+    while !it.done {
+        let ranked = len(std::json::find_field_raw(it.element, "rank")) > 0;
+        b.append_str(
+            "makes " + std::json::find_string_field(it.element, "path") + " "
+                + to_string(std::json::find_int_field(it.element, "bytes"))
+                + " "
+                + std::json::find_string_field(it.element, "sha256") + " "
+                + (
+                    if ranked {
+                        to_string(std::json::find_int_field(it.element, "rank"))
+                    } else {
+                        "-"
+                    }
+                )
+                + "\n",
+        );
+        it = std::json::array_next(it);
+    }
+    b.append_str("rank " + to_string(rank_of(config)) + " of 2\n");
+    return std::str::clone(b.text_view());
+}
+
+/// Why the inputs kept in `dir` cannot be read as rank `rank`'s, "" when
+/// they can: every file the variant pins for it there, at its size. A
+/// folder is kept only once each file in it matched its sha256, so its
+/// sizes say it is whole.
+@unbounded
+fn prepared_missing(dir: String, variant: String, rank: Int) -> String {
+    let files = prepared_files(variant, rank);
+    let v = std::str::bytes_view(files);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        let path = tab_field(line, 0);
+        let size = std::io::fs::file_size(dir + "/" + path) or - 1;
+        if size != (std::str::parse_int(tab_field(line, 2)) or 0) { return path; }
+    }
+    return "";
+}
+
+/// Where a seat's readied inputs are kept: `prepared/<key>`, the key the
+/// first 32 hex digits of the sha256 of `prepared_identity`.
+fn prepared_dir(data: String, config: String) -> String {
+    let key = std::hex::encode(
+        std::crypto::sha256(std::bytes::from_string(prepared_identity(config))),
+    );
+    return data + "/prepared/" + key[0..32];
+}
+
+/// The files the prepare step makes on the node of rank `rank`, from the
+/// variant's `prepared`: `path\tsha256\tbytes` a line, every rank's and its
+/// own.
+@bounded_by(variant)
+fn prepared_files(variant: String, rank: Int) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "prepared"));
+    while !it.done {
+        let ranked = len(std::json::find_field_raw(it.element, "rank")) > 0;
+        if !ranked || std::json::find_int_field(it.element, "rank") == rank {
+            out.append_str(
+                std::json::find_string_field(it.element, "path") + "\t"
+                    + std::json::find_string_field(it.element, "sha256")
+                    + "\t"
+                    + to_string(std::json::find_int_field(it.element, "bytes")) + "\n",
+            );
+        }
+        it = std::json::array_next(it);
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// The one file of rank `rank`'s readied inputs pinned to it alone (its
+/// weight file), as a `prepared_files` line; "" for none.
+@bounded_by(variant)
+fn rank_file(variant: String, rank: Int) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "prepared"));
+    while !it.done {
+        if len(std::json::find_field_raw(it.element, "rank")) > 0
+            && std::json::find_int_field(it.element, "rank") == rank
+        {
+            return std::json::find_string_field(it.element, "path") + "\t"
+                + std::json::find_string_field(it.element, "sha256")
+                + "\t"
+                + to_string(std::json::find_int_field(it.element, "bytes"));
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// Why the files a prepare step made under `work` (`model/`, `cache/`) are
+/// not the ones the variant pins for rank `rank`, "" when each is: there,
+/// its size, its sha256.
+@unbounded
+fn prepared_problem(work: String, variant: String, rank: Int) -> String {
+    let files = prepared_files(variant, rank);
+    let v = std::str::bytes_view(files);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let line = std::str::slice(v, from, nl);
+        from = nl + 1;
+        let path = tab_field(line, 0);
+        let sha = tab_field(line, 1);
+        let bytes = std::str::parse_int(tab_field(line, 2)) or 0;
+        let size = std::io::fs::file_size(work + "/" + path) or - 1;
+        if size < 0 { return "it did not make " + path; }
+        if size != bytes {
+            return "it made " + path + " of " + to_string(size) + " bytes, not the "
+                + to_string(bytes) + " pinned";
+        }
+        let digest = std::crypto::sha256_file(work + "/" + path) or {
+            return path + " could not be read back to check it: " + err.detail;
+        };
+        let got = std::hex::encode(digest);
+        if got != sha { return path + "'s sha256 is " + got + ", not the " + sha + " pinned"; }
+    }
+    return "";
+}
+
+/// `docker run`, detached, for a prepare step: the runtime's image as the
+/// node's own account, with no network and no GPU, the store and the
+/// engine read-only and the step's work folder (`work`, at /work) its
+/// only place to write; `args` what it runs (the image's entrypoint runs
+/// it), `env` (`-e` lines) its environment.
+fn prepare_argv(
+    name: String,
+    owner: String,
+    user: String,
+    blobs: String,
+    engine: String,
+    work: String,
+    env: String,
+    image: String,
+    args: String
+) -> String {
+    return "docker\nrun\n-d\n--name\n" + name + "\n--label\n" + OWNER_LABEL + "=" + owner
+        + "\n--network\nnone\n--user\n" + user + "\n-e\nHOME=/tmp\n" + env + "-v\n" + blobs + ":"
+        + blobs
+        + ":ro\n-v\n" + engine + ":/engine:ro\n-v\n" + work + ":/work\n" + image + "\n" + args;
+}
+
+/// The model folder's two added files (step 1): the recipe's
+/// serving_1017.py on the weights linked under /work/model, with its chat
+/// template, both from the engine archive.
+const PREPARE_MODEL_ARGS: String = "python3\n/engine/tools/serving_1017.py\n/work/model\n--template\n/engine/tools/chat_template.jinja";
+
+/// Rank `rank`'s weight file and Engram's token map (step 2): the engine's
+/// node_inputs.sh, its writer and Python named, into /work/cache.
+fn prepare_inputs_args(rank: Int) -> String {
+    return "bash\n/engine/tools/node_inputs.sh\n/work/model\n/work/cache\n" + to_string(rank)
+        + "\n2";
+}
+
+/// Step 2's environment: the engine's own writer of the weight file, and
+/// the image's Python, which has `tokenizers`.
+const PREPARE_INPUTS_ENV: String = "-e\nRANK_CACHE_BIN=/engine/bin/tf-dsv41-rank-cache\n-e\nPYTHON=python3\n";
+
+/// A file set's files as its server reads them, `path\tsha256` a line, the
+/// path within the set: a set's listed files at their paths, a manifest's
+/// at theirs beside it; "" while a manifest is not held.
+@bounded_by(set)
+fn set_layout(blobs: String, set: String) -> String {
+    let out = std::bytes::BytesBuilder { };
+    let m = std::json::find_field_raw(set, "manifest");
+    if len(m) > 0 {
+        let sha = std::json::find_string_field(m, "sha256");
+        if !held(blobs, sha) { return ""; }
+        let listed = manifest_files(std::io::fs::read_file(blobs + "/" + sha) or "");
+        if std::str::starts_with(listed, "!") { return ""; }
+        let v = std::str::bytes_view(listed);
+        let mut from = 0;
+        while from < v.n {
+            let nl = line_end(v, from);
+            let line = std::str::slice(v, from, nl);
+            from = nl + 1;
+            out.append_str(tab_field(line, 2) + "\t" + tab_field(line, 0) + "\n");
+        }
+    } else {
+        let mut it = std::json::array_first(std::json::find_field_raw(set, "files"));
+        while !it.done {
+            out.append_str(
+                std::json::find_string_field(it.element, "path") + "\t"
+                    + std::json::find_string_field(it.element, "sha256")
+                    + "\n",
+            );
+            it = std::json::array_next(it);
+        }
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// What `docker run` sets in a rank's environment for the link to `peer`,
+/// as the recipe sets it, one argument a line: the engine's RDMA ring and
+/// NCCL on every port's RDMA device, at the GID index the link declares
+/// (the engine's default, 5, when it declares none), NCCL's sockets on the
+/// first port's interface, and the ring's kernels from the engine archive;
+/// "" when this node declares no link to `peer`.
+@bounded_by(capabilities)
+fn lanes_env(capabilities: String, peer: String) -> String {
+    let end = link_end(capabilities, peer);
+    let first = std::json::array_first(end.ports);
+    if first.done { return ""; }
+    let mut hcas = "";
+    let mut it = first;
+    while !it.done {
+        let hca = std::json::find_string_field(it.element, "hca");
+        if len(hca) > 0 { hcas = if len(hcas) > 0 { hcas + "," + hca } else { hca }; }
+        it = std::json::array_next(it);
+    }
+    if len(hcas) == 0 { return ""; }
+    let gid = if end.gid_index >= 0 {
+        "-e\nTF_RDMA_GID_INDEX=" + to_string(end.gid_index) + "\n-e\nNCCL_IB_GID_INDEX="
+            + to_string(end.gid_index) + "\n"
+    } else {
+        ""
+    };
+    return "-e\nTF_RDMA_DEVICES=" + hcas
+        + "\n-e\nTF_DS_RDMA_KERNELS=/engine/bin/rdma_gather.fatbin\n-e\nNCCL_IB_HCA="
+        + hcas + "\n-e\nNCCL_SOCKET_IFNAME=" + std::json::find_string_field(first.element, "ifname")
+        + "\n" + gid;
+}
+
+/// The RDMA devices of this node's link to `peer`, comma separated, as the
+/// follower's `--rdma` takes them.
+@bounded_by(capabilities)
+fn link_hcas(capabilities: String, peer: String) -> String {
+    let mut hcas = "";
+    let mut it = std::json::array_first(link_end(capabilities, peer).ports);
+    while !it.done {
+        let hca = std::json::find_string_field(it.element, "hca");
+        if len(hca) > 0 { hcas = if len(hcas) > 0 { hcas + "," + hca } else { hca }; }
+        it = std::json::array_next(it);
+    }
+    return hcas;
+}
+
+/// Both ranks' shape and served switches, as `-e` lines (`TF_ENGINE_ENV`).
+@unbounded
+fn shape_env() -> String {
+    let out = std::bytes::BytesBuilder { };
+    out.append_str(
+        "-e\nTF_DS_STREAMS=" + to_string(TF_STREAMS) + "\n-e\nTF_DS_ROUND_ROWS="
+            + to_string(TF_ROUND_ROWS)
+            + "\n-e\nTF_DS_WINDOW="
+            + to_string(TF_WINDOW) + "\n",
+    );
+    let v = std::str::bytes_view(TF_ENGINE_ENV);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        out.append_str("-e\n" + std::str::slice(v, from, nl) + "\n");
+        from = nl + 1;
+    }
+    return std::str::clone(out.text_view());
+}
+
+/// A rank's own launch: its environment beyond the link's and the shape's
+/// (`-e` lines), and its command, one argument a line.
+type RankLaunch { env: String = ""; command: String = ""; }
+
+/// Rank `cluster.rank`'s launch for its part (`cluster`), serving `name`
+/// at `port` on loopback (rank 0) a request of up to `context` tokens;
+/// `hcas` the link's RDMA devices. Rank 1 follows rank 0 at its
+/// rendezvous, which rank 0 listens for on its link address.
+fn rank_launch(cluster: String, hcas: String, name: String, port: Int, context: Int) -> RankLaunch {
+    let master = std::json::find_string_field(cluster, "master_addr");
+    let tp_port = to_string(std::json::find_int_field(cluster, "master_port"));
+    if std::json::find_int_field(cluster, "rank") > 0 {
+        return RankLaunch {
+            env: "-e\nTF_TP_CONNECT_SECONDS=" + to_string(TF_CONNECT_SECONDS) + "\n",
+            command: "/engine/bin/tf-dsv41-lanes\n/model\n/cache/rank-cache\n1\n2\n" + master + "\n"
+                + tp_port
+                + "\n/kit\n--pool\n"
+                + to_string(TF_WINDOW) + "\n--context\n" + to_string(context) + "\n--streams\n"
+                + to_string(TF_STREAMS)
+                + "\n--round-rows\n" + to_string(TF_ROUND_ROWS)
+                + "\n--engram\n/engram\n--token-map\n/cache/dsv41_token_map.json\n--graphs\n1\n--side\n1\n--prefetch\n1\n--aio\n1\n--rdma\n"
+                + hcas + "\n--rdma-kernels\n/engine/bin/rdma_gather.fatbin",
+        };
+    }
+    return RankLaunch {
+        env: "-e\nTF_TP_WORLD=2\n-e\nTF_TP_MASTER=" + master + "\n-e\nTF_TP_PORT=" + tp_port
+            + "\n-e\nTF_DS_RANK_CACHE=/cache/rank-cache\n-e\nTF_DS_KIT=/kit\n-e\nTENSORFOLD_CUDA_KERNELS=/kit/aot\n-e\nTF_DS_ENGRAM=/engram\n-e\nTF_DS_TOKEN_MAP=/cache/dsv41_token_map.json\n",
+        command: "/engine/bin/tensorfold-native\nserve\n/model\n--host\n127.0.0.1\n--port\n"
+            + to_string(port) + "\n--name\n" + name + "\n--context\n" + to_string(context)
+            + "\n--parallel\n"
+            + to_string(TF_PARALLEL) + "\n" + TF_SERVER_FLAGS + "--backend\ncuda",
+    };
+}
+
+/// `docker run` for a TensorFold seat's rank, one argument a line: on the
+/// host's network and IPC with the GPUs and the RDMA devices, its locked
+/// memory as the ring registers it (`span_docker`, and `IPC_LOCK`), the
+/// link's environment (`env`), the shape's, the rank's own; the weights
+/// (`models`), the store and the readied inputs they link into, the file
+/// sets (`sets`, a folder of each) and the engine, all read-only; then the
+/// rank's command, which the image's own entrypoint runs.
+fn tensorfold_argv(
+    name: String,
+    owner: String,
+    data: String,
+    models: String,
+    sets: String,
+    prepared: String,
+    engine: String,
+    env: String,
+    image: String,
+    rank: RankLaunch
+) -> String {
+    return span_docker(
+        name,
+        owner,
+        env,
+        "--cap-add\nIPC_LOCK\n" + shape_env() + rank.env + "-v\n" + models + ":/model:ro\n-v\n"
+            + data
+            + "/blobs:"
+            + data
+            + "/blobs:ro\n-v\n" + prepared + ":" + prepared + ":ro\n-v\n" + prepared
+            + "/cache:/cache:ro\n-v\n" + sets + "/engram:/engram:ro\n-v\n" + sets
+            + "/kit:/kit:ro\n-v\n" + engine + ":/engine:ro\n",
+        image,
+    ) + rank.command;
+}
+
+/// The file set `name` of a variant, as JSON; "" for none.
+@bounded_by(variant)
+fn file_set(variant: String, name: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "name") == name {
+            return std::str::trim(it.element);
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}

@@ -139,26 +139,52 @@ fn hold_blobs(h: HeldBlobs, blobs: String) {
 type VariantHeld { files_total: Int = 0; files_held: Int = 0; bytes: Int = 0; bytes_held: Int = 0; }
 
 /// What `h` holds of `variant` (a recipe's variant, as JSON): each file it
-/// lists, by its sha256. Each file held is put in `listed` too, so what no
-/// variant lists can be told.
+/// pins, by its sha256: its own files, and each of its file sets' (a set
+/// pinned by a manifest counts the manifest; the files the manifest lists
+/// are not named in the recipe, so they are not told apart from what no
+/// variant lists). Each file held is put in `listed` too, so what no
+/// variant lists can be told. What its prepare step makes is kept apart
+/// from the store, and is not counted.
 @unbounded
 fn variant_held(variant: String, h: HeldBlobs, listed: HeldBlobs) -> VariantHeld {
-    let mut out = VariantHeld { };
-    let mut f = std::json::array_first(std::json::find_field_raw(variant, "files"));
+    let mut out = files_held(
+        std::json::find_field_raw(variant, "files"),
+        h,
+        listed,
+        VariantHeld { },
+    );
+    let mut set = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
+    while !set.done {
+        out = files_held(std::json::find_field_raw(set.element, "files"), h, listed, out);
+        let manifest = std::str::trim(std::json::find_field_raw(set.element, "manifest"));
+        if len(manifest) > 0 {
+            out = files_held("[" + manifest + "]", h, listed, out);
+        }
+        set = std::json::array_next(set);
+    }
+    return out;
+}
+
+/// `out` with what `h` holds of `files` (a JSON list of pinned files)
+/// added.
+@unbounded
+fn files_held(files: String, h: HeldBlobs, listed: HeldBlobs, out: VariantHeld) -> VariantHeld {
+    let mut next = out;
+    let mut f = std::json::array_first(files);
     while !f.done {
         let sha = std::json::find_string_field(f.element, "sha256");
         let n = std::json::find_int_field(f.element, "bytes");
-        out.files_total = out.files_total + 1;
-        out.bytes = out.bytes + n;
+        next.files_total = next.files_total + 1;
+        next.bytes = next.bytes + n;
         let got = h.get(sha) or HeldBlob { };
         if len(got.sha) > 0 {
-            out.files_held = out.files_held + 1;
-            out.bytes_held = out.bytes_held + n;
+            next.files_held = next.files_held + 1;
+            next.bytes_held = next.bytes_held + n;
             listed.set(got);
         }
         f = std::json::array_next(f);
     }
-    return out;
+    return next;
 }
 
 /// True when `h` holds every file of `variant`; false for a variant that

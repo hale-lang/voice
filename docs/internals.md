@@ -354,9 +354,10 @@ parent and no account until the operator gives it some.
 `/v1/models` answers what the caller could be served: a model is
 `available` when a seat on an account the key may spend serves it, and
 `voice.capabilities.tools` says whether such a seat carries `tools` to the
-model (an openai-compatible seat; a managed one under llama-server, or
-under vLLM when its variant names the parser vLLM reads the model's tool
-calls with, `tool_call_parser`, which the node starts vLLM with).
+model (an openai-compatible seat; a managed one under llama-server or
+TensorFold, or under vLLM when its variant names the parser vLLM reads the
+model's tool calls with, `tool_call_parser`, which the node starts vLLM
+with).
 
 ## The node
 
@@ -395,7 +396,33 @@ GPUs given to it on CUDA; or, on macOS, an archive unpacked into
 `runtimes/<sha256>` and run under `sandbox-exec`, writing only its own
 directory and reaching only loopback. The seat is `starting` until the
 server's health check answers, then `up`, and the session serves it
-through the openai-compatible path to that port. A seat that leaves the
+through the openai-compatible path to that port.
+
+A TensorFold seat ([`node/tensorfold.hl`](../node/tensorfold.hl)) is one
+rank of DeepSeek-V4.1-Flash across two DGX Sparks. Its variant fetches
+more than its weights: its file sets, each from its own repository at its
+own revision (the original checkpoint's two Engram shards, and the kernel
+kit, pinned by its manifest, whose 383 files are fetched once the manifest
+verified, each against the sha256 the manifest gives); and its runtime's
+engine archive, which the image runs. Then, once, the node readies what
+its rank reads beside them, in the runtime's image with no GPU and no
+network: the model folder's two added files, then its rank's weight file
+(about 93 GB) and Engram's token map. The seat is `starting` meanwhile,
+its reason the step and how far. Each file is checked against the
+variant's pins (`prepared`) and kept under `prepared/<key>`, the key all
+they are made from and must be (the step, the image, the engine, every file
+by name and digest, the pins and the rank), so a seat placed again starts
+at once while each kept file is there at its size. Each rank runs in the image on the host's network with the GPUs,
+the RDMA devices and locked memory, the engine at `/engine`, the weights
+at `/model`, the sets at `/engram` and `/kit` and the readied inputs at
+`/cache`, all read-only, with the recipe's served shape and switches. Its
+RDMA ring and NCCL open the GID index the link declares. The follower,
+`tf-dsv41-lanes`, connects to the leader's rendezvous on the link (which
+the leader listens for on its link address alone) and waits for it as long
+as its seat is assigned, since each node starts its rank when its own
+inputs are ready. The leader, `tensorfold-native serve`, answers on
+loopback, and its seat is `up` once `/v1/models` answers, which it does
+once both ranks have joined and loaded. A seat that leaves the
 assignment has its server stopped; one a stopped node left running is
 stopped when the node starts. It serves its
 local API from `node.yaml` (status, capabilities, local controls). It
@@ -800,7 +827,11 @@ only its own in-flight requests.
 The node's capabilities file, written by its operator, and its local
 controls. Everything else about what it runs comes from the coordinator, so
 it needs no database. Beside them, what the node fetched (`blobs/`, by
-sha256, with a `.part` and its `.ranges` for a file still being fetched) and what its servers keep between starts: a vLLM seat's compiled
+sha256, with a `.part` and its `.ranges` for a file still being fetched), the
+archives it unpacked (`runtimes/<sha256>`), a TensorFold seat's file sets
+laid out (`sets/<seat>/`) and the inputs its rank readied
+(`prepared/<key>/`, about 93 GB, kept for the next seat that would make
+the same), and what its servers keep between starts: a vLLM seat's compiled
 graphs and FlashInfer's kernel autotune, `cache/<runtime>/`, one directory
 per runtime, tens of megabytes, so a vLLM seat started again skips most of
 its warm-up: on a DGX Spark serving gpt-oss-120b, the engine's

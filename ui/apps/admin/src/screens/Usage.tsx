@@ -8,7 +8,8 @@ import type { ScreenProps } from '../App';
 import { go } from '../route';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
-import { AnnotationSection, AnnotationsPanel } from '../annotation';
+import { AnnotationSection, AnnotationsPanel, RefusedSummary } from '../annotation';
+import { refusalLine } from '../refusal';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
@@ -200,27 +201,19 @@ function Annotate({ filter, chosen, setChosen, allMatching, setAllMatching, page
       />
       <Button tone="primary" onClick={() => void run()} disabled={w.busy || !selected}>Annotate selected</Button>
       {selected > 0 && <Button onClick={() => { setChosen(new Set()); setOutcomes(null); }}>clear</Button>}
-      {w.error && <span className="c-wait">{w.error}</span>}
+      {w.error && <span className="c-fail">{w.error}</span>}
       {outcomes && (
         <span className="muted" aria-label="annotate outcome">
           {count(queued)} queued
           {refused.length > 0 && (
-            <span className="c-wait" title={refused.map((o) => `${o.request_id}: ${o.message}`).join('\n')}>
-              {' '}· {count(refused.length)} refused: {refusedLine(refused)}
+            <span className="c-wait" title={refused.map((o) => `${o.request_id}: ${refusalLine(o)}`).join('\n')}>
+              {' '}· {count(refused.length)} not queued: <RefusedSummary outcomes={refused} />
             </span>
           )}
         </span>
       )}
     </div>
   );
-}
-
-/** The refused, counted by why: "3 no text, 1 unknown". */
-function refusedLine(refused: RunOutcome[]): string {
-  const by = new Map<string, number>();
-  for (const o of refused) by.set(o.reason, (by.get(o.reason) ?? 0) + 1);
-  const words: Record<string, string> = { unknown: 'unknown', no_text: 'no text held or recorded', not_annotating: 'annotate off', no_annotator: 'no annotator in force' };
-  return [...by.entries()].map(([r, n]) => `${n} ${words[r] ?? r}`).join(', ');
 }
 
 /** A record that is not on the page shown: read by its id. */

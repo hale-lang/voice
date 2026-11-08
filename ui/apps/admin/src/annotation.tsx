@@ -6,6 +6,7 @@ import { useSteps, stepLabel, type Step } from './api/steps';
 import { readout } from './readout';
 import { href } from './route';
 import { Fold } from './peek';
+import { refusalOf, refusedGroups, type RunOutcome } from './refusal';
 import s from './annotation.module.css';
 
 type Answer = Schemas['AnnotationAnswer'];
@@ -195,26 +196,62 @@ export function LiveSteps({ steps }: { steps: Step[] }) {
 }
 
 /**
- * Runs a request's annotation again (`runAnnotation`): every annotator in
- * force for it, from its held text or its recording. The api's refusal (no
- * text, annotate off) is said beside it.
+ * Runs one request's annotation now: every annotator in force for it,
+ * from its held text or its recording. Asked of `runAnnotations` for the
+ * one request, which answers its outcome and why (`runAnnotation` refuses
+ * as a problem, without the reason or the project). `error` is the api's
+ * own failure, not a refusal.
  */
-export function RunAnnotation({ id, label }: { id: string; label: string }) {
+export function useRunAnnotation(id: string) {
   const w = useWrite();
-  const [queued, setQueued] = useState(false);
+  const [outcome, setOutcome] = useState<RunOutcome | null>(null);
+  async function run() {
+    setOutcome(null);
+    const r = await w.write('post', '/admin/v1/annotation-runs', { body: { request_ids: [id] } });
+    setOutcome(r?.data[0] ?? null);
+  }
+  return { run, busy: w.busy, error: w.error, outcome };
+}
+
+/** A refusal in plain words; annotation off links its project, where it is turned on. */
+export function RefusalText({ o }: { o: RunOutcome }) {
+  const r = refusalOf(o);
+  if (!r.turnOn) return <>{r.said}</>;
+  const to = r.turnOn.project ? href('projects', r.turnOn.project) : href('projects');
+  return <>{r.said}: turn it on in <a href={to} onClick={(e) => e.stopPropagation()}>Projects</a></>;
+}
+
+/** A run's refusals counted by why, annotation off naming and linking its projects. */
+export function RefusedSummary({ outcomes }: { outcomes: RunOutcome[] }) {
+  return (
+    <>
+      {refusedGroups(outcomes).map((g, i) => (
+        <span key={g.reason}>
+          {i > 0 && '; '}
+          {g.count} {g.words}
+          {g.reason === 'not_annotating' && (
+            <>
+              {g.projects.length > 0 && <> for {g.projects.map((p, j) => <span key={p}>{j > 0 && ', '}project <a href={href('projects', p)}>{p}</a></span>)}</>}
+              : turn it on in <a href={href('projects')}>Projects</a>
+            </>
+          )}
+        </span>
+      ))}
+    </>
+  );
+}
+
+/** A run of one request's annotation, as a button: queued, or why not, said beside it. */
+export function RunAnnotation({ id, label }: { id: string; label: string }) {
+  const r = useRunAnnotation(id);
   return (
     <span>
-      <Button
-        disabled={w.busy}
-        onClick={async () => {
-          const r = await w.write('post', '/admin/v1/annotations/{request_id}/run', { params: { path: { request_id: id } }, body: {} });
-          setQueued(r !== null);
-        }}
-      >
+      <Button disabled={r.busy} onClick={() => void r.run()}>
         {label}
       </Button>
-      {queued && !w.error && <span className="faint"> queued</span>}
-      {w.error && <span className="c-wait"> {w.error}</span>}
+      {r.outcome?.queued && <span className="faint"> queued</span>}
+      {r.outcome && !r.outcome.queued && <span className="c-wait"> <RefusalText o={r.outcome} /></span>}
+      {r.error && <span className="c-fail"> {r.error}</span>}
     </span>
   );
 }

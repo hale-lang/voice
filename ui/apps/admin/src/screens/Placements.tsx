@@ -5,14 +5,15 @@ import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
-import { toneOf } from '../tone';
 import { NodeMemory } from '../FleetMemory';
+import { placementState, type SeatReport } from './placement-state';
 
 /**
  * A model put on nodes: voice picks the variant and runtime that fit the
  * nodes' hardware, fetches them, and runs the server as a seat on the
  * leader; across two nodes, a seat on the follower runs the other half.
- * Each placement's seats are shown as their nodes report them.
+ * Each placement's seats are shown as their nodes report them: up,
+ * starting and how far, or why no seat serves it.
  */
 export function Placements({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
@@ -20,7 +21,7 @@ export function Placements({ route, setInspector }: ScreenProps) {
   const nodes = useNodes();
   const placement = q.data?.data.find((p) => p.id === selected);
   const creating = selected === 'new';
-  const seatAt = (ref: string | undefined) => { const [n] = (ref ?? '').split('/'); return nodes.data?.data.find((x) => x.id === n)?.seats.find((s) => s.ref === ref); };
+  const seatAt = (ref: string) => { const [n] = (ref ?? '').split('/'); return nodes.data?.data.find((x) => x.id === n)?.seats.find((s) => s.ref === ref); };
 
   useEffect(() => {
     setInspector(creating ? <PlacementForm /> : placement ? <PlacementInspector placement={placement} /> : null);
@@ -45,7 +46,7 @@ export function Placements({ route, setInspector }: ScreenProps) {
             { key: 'nodes', header: 'Nodes', render: (p) => p.nodes.join(', ') },
             { key: 'variant', header: 'Variant · runtime', render: (p) => `${p.variant} · ${p.runtime}` },
             { key: 'account', header: 'Account', render: (p) => <Mono>{p.account}</Mono> },
-            { key: 'seat', header: 'Seat', render: (p) => <Seats p={p} seatAt={seatAt} /> },
+            { key: 'seat', header: 'Seat', render: (p) => <Seats p={p} seatAt={seatAt} ready={nodes.isSuccess} /> },
           ]}
           empty="Nothing placed. Place a catalog model that names a recipe on a node."
         />
@@ -57,29 +58,26 @@ export function Placements({ route, setInspector }: ScreenProps) {
   );
 }
 
-/** A placement's seats: its leader's, and across two nodes its follower's when that is not up. */
-export function Seats({ p, seatAt }: { p: Placement; seatAt: (ref: string | undefined) => { status: string; reason?: string | null; progress?: { done_bytes: number; total_bytes: number } | null } | undefined }) {
-  const s = seatAt(p.seat);
-  const f = p.follower_seat ? seatAt(p.follower_seat) : undefined;
-  if (!s) return <span className="faint">–</span>;
+/**
+ * A placement's seats, as one state: up; starting, and how far (fetching,
+ * loading the model); or why no seat serves it.
+ */
+export function Seats({ p, seatAt, ready = true }: { p: Placement; seatAt: (ref: string) => SeatReport | undefined; ready?: boolean }) {
+  if (!ready) return <span className="faint">–</span>;
+  const st = placementState(p, seatAt);
+  const tone = st.state === 'up' ? 'quiet' : st.state === 'starting' ? 'wait' : 'fail';
   return (
     <>
-      <Status tone={toneOf(s.status)} label={seatState(s)} title={s.reason ?? undefined} />
-      {p.follower_seat && (!f || f.status !== 'up') && (
-        <span className="muted"> · follower {f ? <Status tone={toneOf(f.status)} label={seatState(f)} title={f.reason ?? undefined} /> : '–'}</span>
-      )}
+      <Status tone={tone} label={st.label} />
+      {st.detail && <span className="muted">: {st.detail}</span>}
     </>
   );
 }
 
-function seatState(s: { status: string; progress?: { done_bytes: number; total_bytes: number } | null }): string {
-  const p = s.progress;
-  if (s.status !== 'fetching' || !p || p.total_bytes <= 0) return s.status;
-  return `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
-}
-
 function PlacementInspector({ placement: p }: { placement: Placement }) {
   const w = useWrite();
+  const nodes = useNodes();
+  const seatAt = (ref: string) => nodes.data?.data.find((x) => x.id === ref.split('/')[0])?.seats.find((s) => s.ref === ref);
   const [node, seat] = p.seat.split('/');
   return (
     <>
@@ -96,6 +94,7 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
           { k: 'variant', v: <><Mono>{p.variant}</Mono> <span className="muted">· chosen by the {p.chosen_by}</span></> },
           { k: 'runtime', v: <a href={href('runtimes', p.runtime)}><Mono>{p.runtime}</Mono></a> },
           { k: 'nodes', v: p.nodes.join(', ') },
+          { k: 'state', v: <Seats p={p} seatAt={seatAt} ready={nodes.isSuccess} /> },
           { k: 'seat', v: <a href={href('nodes', node ?? '', seat ?? '')}><Mono>{p.seat}</Mono></a> },
           ...(p.follower_seat ? [{ k: 'follower', v: <><a href={href('nodes', p.follower_seat.split('/')[0] ?? '', seat ?? '')}><Mono>{p.follower_seat}</Mono></a> <span className="muted">· runs the other half, serves nothing itself</span></> }] : []),
           { k: 'account', v: <Mono>{p.account}</Mono> },

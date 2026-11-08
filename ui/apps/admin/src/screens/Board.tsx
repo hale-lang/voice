@@ -3,7 +3,7 @@ import { Panel, Loading, Unavailable, count, ago } from '@hale/components';
 import { useGet, useGetOnce, useAnnotations, type UsageRecord, type Schemas } from '../api/client';
 import { subscribeFlights, type Flight as InFlight } from '../api/events';
 import { readout } from '../readout';
-import { useWrite } from '../api/mutate';
+import { useRunAnnotation, RefusalText } from '../annotation';
 import { useLastStep, stepLabel, settles } from '../api/steps';
 import { useTitles } from '../titles';
 import { flights, state, type Flight } from './board-model';
@@ -195,29 +195,33 @@ function Tags({ id, waiting }: { id: string; waiting: boolean }) {
 }
 
 /**
- * Runs a turn's annotation again (`runAnnotation`), without opening the
- * row: the api's refusal on hover.
+ * Runs a turn's annotation again, without opening the row: queued, or why
+ * not, said beside it in plain words; the api's own failure as its message.
  */
 function Run({ id, label }: { id: string; label: string }) {
-  const w = useWrite();
+  const r = useRunAnnotation(id);
   // a row is a button, so this is a button by role, not a button in one
   const run = (e: SyntheticEvent) => {
     e.stopPropagation();
     e.preventDefault();
-    if (!w.busy) void w.write('post', '/admin/v1/annotations/{request_id}/run', { params: { path: { request_id: id } }, body: {} });
+    if (!r.busy) void r.run();
   };
   return (
-    <span
-      role="button"
-      tabIndex={0}
-      className={s.run}
-      aria-disabled={w.busy}
-      title={w.error ?? 'annotate this request again, every annotator in force'}
-      onClick={run}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') run(e); }}
-    >
-      {w.error ? 'refused' : label}
-    </span>
+    <>
+      <span
+        role="button"
+        tabIndex={0}
+        className={s.run}
+        aria-disabled={r.busy}
+        title="annotate this request again, every annotator in force"
+        onClick={run}
+        onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') run(e); }}
+      >
+        {label}
+      </span>
+      {r.outcome && !r.outcome.queued && <span className={s.refused}> <RefusalText o={r.outcome} /></span>}
+      {r.error && <span className={s.refused}> {r.error}</span>}
+    </>
   );
 }
 

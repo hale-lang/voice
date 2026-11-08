@@ -1,12 +1,29 @@
 import { useEffect, useState } from 'react';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Button, Confirm, micros, when } from '@hale/components';
-import { useGet, useRecipes, type CatalogModel } from '../api/client';
+import { useGet, useNodes, useRecipes, type CatalogModel } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
 import { ContextWindow } from '../context';
 import { NamedByList, useAliasesByModel } from '../aliases';
+import { modelState } from './placement-state';
+
+/**
+ * A model's availability as words: yes; starting, and how far, while a
+ * placement of it comes up; or why no seat serves it.
+ */
+function Availability({ m, short }: { m: CatalogModel; short?: boolean }) {
+  const placements = useGet('/admin/v1/placements');
+  const nodes = useNodes();
+  if (m.available) return short ? <Status tone="quiet" label="yes" /> : <>yes</>;
+  if (!placements.isSuccess || !nodes.isSuccess) return <span className="faint">–</span>;
+  const seatAt = (ref: string) => nodes.data.data.find((x) => x.id === ref.split('/')[0])?.seats.find((s) => s.ref === ref);
+  const st = modelState(m, placements.data.data, seatAt)!;
+  const tone = st.state === 'starting' ? 'wait' : 'fail';
+  if (short) return <Status tone={tone} label={st.label} title={st.detail} />;
+  return <span className={st.state === 'starting' ? 'c-wait' : 'c-fail'}>{st.label}: {st.detail}</span>;
+}
 
 /** The catalog: what callers may name, with its price. */
 export function Catalog({ route, setInspector }: ScreenProps) {
@@ -41,7 +58,7 @@ export function Catalog({ route, setInspector }: ScreenProps) {
             { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => (m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} · ${micros(m.price.output_per_mtok_micros, m.price.currency)}` : <span className="faint">free</span>) },
             { key: 'aliases', header: 'Named by', render: (m) => <NamedByList names={named.get(m.id)} /> },
             { key: 'seats', header: 'Seats', num: true, render: (m) => m.seats.length },
-            { key: 'avail', header: 'Available', render: (m) => (m.available ? <Status tone="quiet" label="yes" /> : <Status tone="wait" label="no seat" />) },
+            { key: 'avail', header: 'Available', render: (m) => <Availability m={m} short /> },
           ]}
           empty="No models. Add one, then a seat can serve it."
         />
@@ -146,7 +163,7 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
           { k: 'served', v: m.served_context_length ? <ContextWindow served={m.served_context_length} native={m.context_length} /> : <span className="faint">no seat has said</span> },
           { k: 'max output', v: m.max_output_tokens?.toLocaleString() ?? '–' },
           { k: 'price', v: m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },
-          { k: 'available', v: m.available ? 'yes' : <span className="c-wait">no seat serves it</span> },
+          { k: 'available', v: <Availability m={m} /> },
           { k: 'seats', v: m.seats.length ? m.seats.map((s) => <div key={s}><Mono>{s}</Mono></div>) : 'none' },
           { k: 'named by', v: <NamedByList names={named.get(m.id)} /> },
           { k: 'created', v: when(m.created_at) },

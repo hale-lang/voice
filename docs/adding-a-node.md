@@ -17,11 +17,15 @@ the coordinator runs on included.
 
 ## What it needs
 
-- A GPU: NVIDIA on Linux (with its driver and container toolkit), Apple
-  silicon on macOS. Every runtime voice ships runs on one.
 - On Linux, docker: voice runs a model's runtime there as a container. A
-  Mac runs its runtime itself. (`[dna.host.node] requires` says both, per
-  platform, so a habitat refuses a host that lacks them before installing.)
+  Mac runs its runtime itself, and needs Apple silicon. (`[dna.host.node]
+  requires` says so, per platform, so a habitat refuses a host that lacks
+  them before installing.)
+- A GPU for most models: NVIDIA on Linux (with its driver and container
+  toolkit), Apple silicon on macOS. A Linux host without one is still a
+  node: it serves a CPU runtime (a decision model's `decision-*-cpu`), an
+  upstream or a Claude seat, and a placement is judged against the
+  hardware the node declares, so nothing that needs a GPU is put on it.
 - The node program for the revision the api runs. A habitat installs the
   one published for that commit (`node/install.sh`, with the revision as
   `HALE_DNA_REVISION`): on Linux, `voice-node` taken out of voice's image,

@@ -2552,10 +2552,10 @@ Authentication: operatorToken
 What the node holds of the models voice knows, from what it last
 reported its store holds (`reportInventory`): each variant of a
 recipe voice ships or the operator allows that has a file on the
-node, whole or in part (a file a variant held whole lists counts
-toward it, not toward a variant held in part), and whether a
-placement uses it there now;
-then the files no such variant lists. A variant's files are those
+node, whole or in part (in part when it holds a file no other
+variant lists; a file it shares counts toward it only when it is
+listed), and whether a placement uses it there now;
+then the files no variant listed accounts for. A variant's files are those
 it pins: its own and its file sets' (a set pinned by a manifest
 counts the manifest; the files the manifest lists are not named in
 the recipe, so they are counted with the files no variant lists).
@@ -4732,8 +4732,8 @@ Type: object
 | `reported_at` | string \| null (date-time) |  | When the node last reported what it holds; null until it does, and then it holds nothing here. |  |
 | `files` | integer | yes | The files its store holds whole. | ≥ 0 |
 | `bytes` | integer | yes | Their size together. | ≥ 0 |
-| `data` | array of [NodeDownload](#schema-nodedownload) | yes | Each variant with a file on the node: those it holds whole first, then those it holds in part, each in the order `listRecipes` lists their recipes. At most 64. Variants of related models share small files byte for byte (a tokenizer, a config, a chat template), so a file the node holds counts first toward the variants it holds whole: a variant is held in part only when it holds a file of its own that no variant held whole lists, e.g. a weight shard fetched. Its `files_held` and `bytes_held` count every file of it held, shared or not. | items ≤ 64 |
-| `other_files` | integer | yes | The files it holds that no variant lists, e.g. a runtime's archive or a withdrawn recipe's weights. | ≥ 0 |
+| `data` | array of [NodeDownload](#schema-nodedownload) | yes | Each variant with a file on the node: those it holds whole first, then those it holds in part, each in the order `listRecipes` lists their recipes. At most 64. Variants of related models share small files byte for byte (a tokenizer, a config, a chat template), so a variant is held in part only when it holds a file of its own, one no other variant lists, e.g. a weight shard fetched; one holding only files it shares is not listed. Its `files_held` and `bytes_held` count every file of it held, shared or not. | items ≤ 64 |
+| `other_files` | integer | yes | The files it holds that no variant listed accounts for, e.g. a runtime's archive, a withdrawn recipe's weights, or a tokenizer variants share when none of them is listed. | ≥ 0 |
 | `other_bytes` | integer | yes | Their size together. | ≥ 0 |
 
 <a id="schema-nodedownload"></a>

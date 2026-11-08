@@ -74,6 +74,8 @@ type PlanKeep {
     model: String = "";
     recipe: String = "";
     nodes: bounded[String; 2];
+    // what it holds of each of its nodes' memory for models
+    held_bytes: Int = 0;
     serves: bounded[String; 8];
     reason: String = "";
 }
@@ -84,11 +86,14 @@ type PlanRemove {
     model: String = "";
     recipe: String = "";
     nodes: bounded[String; 2];
+    // what it gives back of each of its nodes' memory for models
+    held_bytes: Int = 0;
     reason: String = "";
 }
 
 /// `PlanAdd`: a model placed, in the form placing it would choose: the id
-/// it would be placed as, its variant and runtime, what its nodes fetch.
+/// it would be placed as, its variant and runtime, what it would reserve
+/// and hold of each of its nodes' memory for models, what its nodes fetch.
 /// `in_catalog` false when no catalog model names the recipe yet: `model`
 /// is then the recipe's id, the model it would be added as.
 type PlanAdd {
@@ -99,6 +104,8 @@ type PlanAdd {
     nodes: bounded[String; 2];
     variant: String = "";
     runtime: String = "";
+    reserved_bytes: Int = 0;
+    held_bytes: Int = 0;
     download_bytes: Int = 0;
     serves: bounded[String; 8];
     reason: String = "";
@@ -110,8 +117,15 @@ type PlanAlias { role: String = ""; alias: String = ""; model: String = ""; }
 /// `PlanDownload`: what a node fetches for the plan.
 type PlanDownload { node: String = ""; bytes: Int = 0; }
 
-/// `PlanUnmet`: a want the plan leaves unfilled, and why.
-type PlanUnmet { want: String = ""; reason: String = ""; }
+/// `PlanUnmet`: a want the plan leaves unfilled, and why; and the least
+/// its strongest candidate would hold of each node it needs, when a model
+/// can fill it at all (`least_held`).
+type PlanUnmet {
+    want: String = "";
+    reason: String = "";
+    has_need_bytes: Bool = false;
+    need_bytes: Int = 0;
+}
 
 /// `ArrangementPlan`.
 type ArrangementPlan {
@@ -223,7 +237,8 @@ type ArrangeChoice {
     served: String = "";
     variant: String = "";
     runtime: String = "";
-    // what it holds of each of its nodes' memory for models
+    // what it reserves and holds of each of its nodes' memory for models
+    reserved: Int = 0;
     held: Int = 0;
     download: Int = 0;
     on_disk: Bool = false;
@@ -854,6 +869,7 @@ fn options(
                             served: model.model,
                             variant: fit.variant,
                             runtime: fit.runtime,
+                            reserved: fit.reserved_bytes,
                             held: footprint(fit.reserved_bytes),
                             download: fetch,
                             on_disk: fetch == 0,
@@ -1250,6 +1266,7 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
                 placement: p.id,
                 model: p.model,
                 recipe: p.recipe,
+                held_bytes: p.held,
                 reason: "serves " + listed(serves) + " as it is placed: nothing moves",
             };
             for n in p.nodes.items {
@@ -1275,6 +1292,7 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
                 placement: p.id,
                 model: p.model,
                 recipe: p.recipe,
+                held_bytes: p.held,
                 reason: "serves none of the arrangement's wants" + taken,
             };
             for n in p.nodes.items {
@@ -1299,6 +1317,8 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
                 recipe: m.recipe.id,
                 variant: c.variant,
                 runtime: c.runtime,
+                reserved_bytes: c.reserved,
+                held_bytes: c.held,
                 download_bytes: c.download,
                 reason: "fits: " + c.reason + "; "
                     + (
@@ -1342,9 +1362,15 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
         }
         if c.kind == ChoiceKind::unmet {
             let why = at(found.whys.items, si) or "";
+            let need = least_held(f, s);
             push(
                 out.unmet,
-                PlanUnmet { want: s.label, reason: if len(why) > 0 { why } else { c.reason } },
+                PlanUnmet {
+                    want: s.label,
+                    reason: if len(why) > 0 { why } else { c.reason },
+                    has_need_bytes: need > 0,
+                    need_bytes: need,
+                },
             ) or discard;
         }
         si = si + 1;
@@ -1369,6 +1395,25 @@ fn plan_fleet(f: ArrangeFleet, w: ArrangementWants, roles: ArrangementRoles) -> 
         if !still { push(out.down, r.model) or discard; }
     }
     return out;
+}
+
+/// The least slot `s`'s strongest candidate would hold of each node it
+/// needs: the footprint of its smallest variant's share there, with only
+/// the cache that variant was fitted with; 0 when no model can fill it.
+fn least_held(f: ArrangeFleet, s: ArrangeSlot) -> Int {
+    let first = at(s.candidates, 0) or - 1;
+    if first < 0 { return 0; }
+    let m = at(f.models.items, first) or ArrangeModel { };
+    let named = count(s.named.items);
+    let parts = if named > 0 { named } else { if s.parts == 2 { 2 } else { 1 } };
+    let mut least = 0;
+    let mut it = std::json::array_first(m.recipe.variants.text);
+    while !it.done {
+        let need = part_need(it.element, parts);
+        if need > 0 && (least == 0 || need < least) { least = need; }
+        it = std::json::array_next(it);
+    }
+    return if least > 0 { footprint(least) } else { 0 };
 }
 
 /// Labels, as a reason lists them.

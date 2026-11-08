@@ -201,6 +201,24 @@ fn main() {
         std::test::assert(d.bytes > 0, "every node fetches: " + d.node);
     }
 
+    // ---- what each add holds of its nodes' memory for models ---------------
+    // its reservation and its server's own, as placing it would count them;
+    // across the pair, on each; and spark3's together within its budget
+    let budget = node::model_memory("{}", 130661072896);
+    let mut on_spark3 = 0;
+    for a in plan.add {
+        std::test::assert(
+            a.reserved_bytes > 0 && a.held_bytes == a.reserved_bytes + 2147483648,
+            "an add holds its reservation and its server's: " + a.recipe,
+        );
+        if nodes_of(a.nodes) == "spark3" { on_spark3 = on_spark3 + a.held_bytes; }
+    }
+    std::test::assert(
+        on_spark3 > 0 && on_spark3 <= budget,
+        "spark3's adds fit its budget: " + to_string(on_spark3) + " of " + to_string(budget),
+    );
+    std::test::assert(ds.held_bytes <= budget, "the pair's model holds each node's share");
+
     // ---- deterministic ---------------------------------------------------
     let again = placements.plan_arrangement(w) or api::ArrangementPlan { };
     std::test::assert_eq_str(
@@ -231,6 +249,14 @@ fn main() {
         std::str::contains(why, "no node has room for a reasoner"),
         "a reasoner does not fit after the pin and the roles before it: " + api::plan_text(crowded),
     );
+    for u in crowded.unmet {
+        if u.want == "reasoner" {
+            std::test::assert(
+                u.has_need_bytes && u.need_bytes > 2147483648,
+                "and says the least it would hold: " + to_string(u.need_bytes),
+            );
+        }
+    }
 
     // ---- the fewest moves: what is placed and wanted is kept -------------
     api::Catalog { store: store, recipes: recipes }.create(
@@ -258,7 +284,22 @@ fn main() {
         "the small model placed already is kept: " + api::plan_text(kept),
     );
     std::test::assert_eq_str(added_on(kept, "qwen3-0.6b"), "", "and not added again");
+    let tiny_now = placements.get(
+        api::PlacementRef { placement: "tiny-now" },
+    ) or api::Placement { };
+    std::test::assert(
+        tiny_now.has_held_bytes && tiny_now.held_bytes == tiny_now.reserved_bytes + 2147483648
+            && k.held_bytes == tiny_now.held_bytes,
+        "a placement holds its reservation and its server's, and the plan keeps it so",
+    );
     let r = at(kept.remove, 0) or api::PlanRemove { };
+    let granite_now = placements.get(
+        api::PlacementRef { placement: "granite-now" },
+    ) or api::Placement { };
+    std::test::assert(
+        r.held_bytes > 0 && r.held_bytes == granite_now.held_bytes,
+        "a removal gives back what its placement holds",
+    );
     std::test::assert(
         count(kept.remove) == 1 && r.placement == "granite-now"
             && std::str::contains(r.reason, "serves none")
@@ -346,6 +387,7 @@ fn main() {
             && std::str::contains(u.reason, "no runtime"),
         "DeepSeek alone on spark3 does not fit: " + u.reason,
     );
+    std::test::assert(u.has_need_bytes && u.need_bytes > 0, "and says what it would hold");
 
     // ---- a pin naming a catalog model is filled by that model -------------
     // `tiny` (qwen3-0.6b) is placed on spark3; `wanted` is another catalog

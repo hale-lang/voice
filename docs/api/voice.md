@@ -4694,6 +4694,7 @@ Type: object
 | `model` | string | yes |  |  |
 | `recipe` | string | yes |  |  |
 | `nodes` | array of string | yes |  |  |
+| `held_bytes` | integer | yes | What it holds of each of its nodes' memory for models, as the plan counts it (the placement's `held_bytes`). |  |
 | `serves` | array of string | yes | The wants it serves. |  |
 | `reason` | string | yes |  |  |
 
@@ -4711,6 +4712,7 @@ Type: object
 | `model` | string | yes |  |  |
 | `recipe` | string | yes |  |  |
 | `nodes` | array of string | yes |  |  |
+| `held_bytes` | integer | yes | What it gives back of each of its nodes' memory for models, as the plan counts it (the placement's `held_bytes`). |  |
 | `reason` | string | yes |  |  |
 
 <a id="schema-planadd"></a>
@@ -4730,6 +4732,8 @@ Type: object
 | `nodes` | array of string | yes | Its nodes, the first its leader. |  |
 | `variant` | string | yes |  |  |
 | `runtime` | string | yes |  |  |
+| `reserved_bytes` | integer | yes | What placing it would reserve for it of each of its nodes' memory for models, as the placement's `reserved_bytes`. |  |
+| `held_bytes` | integer | yes | What its seat would hold of each of its nodes' memory for models, as the placement's `held_bytes`. |  |
 | `download_bytes` | integer | yes | What its nodes fetch for it, together; 0 when they hold it already. |  |
 | `serves` | array of string | yes | The wants it serves. |  |
 | `reason` | string | yes | Why it goes there, as the fit says it, what it fetches, and the link it needs. |  |
@@ -4771,6 +4775,7 @@ Type: object
 |---|---|---|---|---|
 | `want` | string | yes |  |  |
 | `reason` | string | yes |  |  |
+| `need_bytes` | integer |  | The least its strongest candidate would hold of each node it needs: its smallest variant's share, with only the cache that variant was fitted with, and its server's own. Left out when no model can fill it. |  |
 
 <a id="schema-arrangementapply"></a>
 
@@ -4956,6 +4961,7 @@ Type: [PlacementCreate](#schema-placementcreate) & object
 | `fit` | array of [VariantFit](#schema-variantfit) | yes | Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made. |  |
 | `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. | ≥ 1 |
 | `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed; across two nodes, what is reserved on each. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
+| `held_bytes` | integer |  | What its seat holds of each of its nodes' memory for models once it runs: `reserved_bytes` and its server's own. A node's `model_memory_bytes` less what its placements hold is what a later placement fits in. Left out with `reserved_bytes`. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 
 <a id="schema-peeksummary"></a>

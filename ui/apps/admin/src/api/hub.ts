@@ -2,6 +2,7 @@ import { useEffect, useSyncExternalStore } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useGet, ALL_PAGES, type NodeSummary, type Schemas } from './client';
 import { AFFECTS, COVERED, deliver, deliverFlights, refresh, type Flight } from './events';
+import { ARRANGEMENTS, fleetMoved } from './fleet-reads';
 import { useOperatorToken } from './token';
 
 type AdminEvent = Schemas['AdminEvent'];
@@ -117,6 +118,9 @@ function observed(qc: QueryClient, node: NodeSummary): boolean {
   // its own downloads, and every node's suggestions, since a pair's is
   // read on both nodes' stores
   const stored = !before || storeOf(before) !== storeOf(node) || seatsOf(before) !== seatsOf(node);
+  // a node joining, or its state or seats moving, may change the fleet a
+  // saved arrangement was planned against
+  if (fleetMoved(before, node)) void qc.invalidateQueries({ queryKey: [ARRANGEMENTS] });
   void qc.invalidateQueries({
     predicate: (q) => {
       const [path, init] = q.queryKey as [unknown, { params?: { path?: { node?: string } } } | null | undefined];

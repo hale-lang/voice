@@ -838,9 +838,17 @@ locus Placements {
     }
 
     fn plan_in_gate(w: ArrangementWants) -> ArrangementPlan fallible(CtlError) {
+        let planned = self.planned_in_gate(w) or raise;
+        return planned.plan;
+    }
+
+    /// The plan for wants `w`, and the digest of the fleet it was made
+    /// from (`fleet_basis`), one read of the fleet for both.
+    fn planned_in_gate(w: ArrangementWants) -> Planned fallible(CtlError) {
         let f = self.arrangement_fleet_in_gate(w) or raise;
         let problem = check_wants(f, w, self.roles);
         if len(problem) > 0 { fail bad(problem, "wants"); }
+        let basis = fleet_basis(f.nodes, f.placed, f.checks, f.now);
         let plan = plan_fleet(f, w, self.roles);
         // each add under an id no placement has held, since an id is never
         // reused: its model and leader, or with `-2`, `-3`…
@@ -869,7 +877,7 @@ locus Placements {
             set(out.add, i, fresh) or discard;
             i = i + 1;
         }
-        return out;
+        return Planned { plan: out, basis: basis };
     }
 
     /// `listArrangements`.
@@ -942,6 +950,9 @@ locus Placements {
             body: ArrangementWants::api_encode(p.wants),
             created_at: if before.present { before.created_at } else { now },
             updated_at: now,
+            // a new revision with every save: a plan of the wants before
+            // does not mark these planned (`plan_arrangement_at`)
+            revision: st::random_id(12),
         };
         let after = Arrangement::api_encode(arrangement_of(row, ""));
         self.store.put_arrangement(
@@ -1000,10 +1011,13 @@ locus Placements {
         let row = self.store.arrangement(id) or fail store_down(err);
         if !row.present { fail missing("no arrangement " + id); }
         let wants = ArrangementWants::api_decode(row.body) or ArrangementWants { };
-        let plan = self.plan_in_gate(wants) or raise;
-        let basis = self.basis_in_gate() or raise;
-        self.store.plan_arrangement_at(id, now_seconds(), basis) or fail store_down(err);
-        return plan;
+        // recorded against the fleet the plan was made from, and only on
+        // the revision it planned: wants saved again meanwhile, on any
+        // instance, stay unplanned
+        let planned = self.planned_in_gate(wants) or raise;
+        self.store.plan_arrangement_at(id, row.revision, now_seconds(), planned.basis)
+        or fail store_down(err);
+        return planned.plan;
     }
 
     /// The fleet now as a plan depends on it (`fleet_basis`).

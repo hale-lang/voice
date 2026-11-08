@@ -1861,8 +1861,9 @@ locus PgStore {
         a.add(row.body);
         a.add(std::time::iso8601(row.created_at));
         a.add(std::time::iso8601(row.updated_at));
+        a.add(row.revision);
         self.step(
-            "INSERT INTO arrangement (id, name, body, created_at, updated_at) VALUES ($1, $2, $3::jsonb, $4::timestamptz, $5::timestamptz) ON CONFLICT (id) DO UPDATE SET name = excluded.name, body = excluded.body, updated_at = excluded.updated_at, planned_at = NULL, planned_basis = ''",
+            "INSERT INTO arrangement (id, name, body, created_at, updated_at, revision) VALUES ($1, $2, $3::jsonb, $4::timestamptz, $5::timestamptz, $6) ON CONFLICT (id) DO UPDATE SET name = excluded.name, body = excluded.body, updated_at = excluded.updated_at, revision = excluded.revision, planned_at = NULL, planned_basis = ''",
             a,
         ) or raise;
         self.commit_with(change) or raise;
@@ -1884,24 +1885,39 @@ locus PgStore {
         self.commit_with(change) or raise;
     }
 
-    fn plan_arrangement_at(id: String, at: Time, basis: String) fallible(StoreError) {
+    fn plan_arrangement_at(
+        id: String,
+        revision: String,
+        at: Time,
+        basis: String
+    ) -> Bool fallible(StoreError) {
         self.lock.enter();
-        self.plan_arrangement_at_locked(id, at, basis) or {
+        let wrote = self.plan_arrangement_at_locked(id, revision, at, basis) or {
             self.lock.leave();
             fail err;
         };
         self.lock.leave();
+        return wrote;
     }
 
-    fn plan_arrangement_at_locked(id: String, at: Time, basis: String) fallible(StoreError) {
+    fn plan_arrangement_at_locked(
+        id: String,
+        revision: String,
+        at: Time,
+        basis: String
+    ) -> Bool fallible(StoreError) {
         let a = db::Args { };
         a.add(id);
         a.add(std::time::iso8601(at));
         a.add(basis);
-        self.write(
-            "UPDATE arrangement SET planned_at = $2::timestamptz, planned_basis = $3 WHERE id = $1",
+        a.add(revision);
+        // only the revision planned: one saved since, on any instance, is
+        // left unplanned
+        let all = self.rows(
+            "WITH w AS (UPDATE arrangement SET planned_at = $2::timestamptz, planned_basis = $3 WHERE id = $1 AND revision = $4 RETURNING id) SELECT count(*) FROM w",
             a,
         ) or raise;
+        return std::str::trim(all) != "0" && len(std::str::trim(all)) > 0;
     }
 
     fn link_checks() -> LinkCheckRows fallible(StoreError) {
@@ -3729,7 +3745,7 @@ fn recipe_row(j: String) -> RecipeRow {
     };
 }
 
-const ARRANGEMENT_COLUMNS: String = "SELECT id, name, body, created_at, updated_at, planned_at, planned_basis FROM arrangement";
+const ARRANGEMENT_COLUMNS: String = "SELECT id, name, body, created_at, updated_at, revision, planned_at, planned_basis FROM arrangement";
 
 fn arrangement_row(j: String) -> ArrangementRow {
     if len(j) == 0 { return ArrangementRow { }; }
@@ -3739,6 +3755,7 @@ fn arrangement_row(j: String) -> ArrangementRow {
         body: std::str::trim(std::json::find_field_raw(j, "body")),
         created_at: pg_time(pg_text(j, "created_at")),
         updated_at: pg_time(pg_text(j, "updated_at")),
+        revision: pg_text(j, "revision"),
         planned: len(raw_or_empty(j, "planned_at")) > 0,
         planned_at: pg_time(pg_text(j, "planned_at")),
         planned_basis: pg_text(j, "planned_basis"),

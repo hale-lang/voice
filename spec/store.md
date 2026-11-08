@@ -1123,7 +1123,11 @@ roles), kept under an id (`putArrangement`) to be planned again on demand
 made and the fleet it was made against, a digest of the nodes that can take
 a model, their memory for models, what is placed and the links checked; a
 later read compares the fleet now, so the admin UI can say the fleet has
-changed since. Saving the wants again clears that record. A removed
+changed since. Saving the wants again clears that record and gives them a
+new revision (a random token, never one a deleted arrangement had); a plan
+is recorded only on the revision it planned, so a plan of older wants that
+finishes after a save, on any api instance, does not mark the newer ones
+planned. A removed
 arrangement's row goes; its id may be used again.
 
 ```sql
@@ -1133,6 +1137,7 @@ create table arrangement (
   body          jsonb not null,               -- ArrangementWants, as the api checked it
   created_at    timestamptz not null,
   updated_at    timestamptz not null,
+  revision      text not null,                -- the wants' revision: new with every save
   planned_at    timestamptz,                  -- when it was last planned
   planned_basis text not null default ''      -- the fleet it was planned against, a digest
 );

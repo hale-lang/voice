@@ -101,7 +101,7 @@ export function useInstances(): Instance[] {
  * written into the nodes list the screens read; the node's own reads (the
  * node whole, a seat whole) are read again.
  */
-function observed(qc: QueryClient, node: NodeSummary) {
+function observed(qc: QueryClient, node: NodeSummary): boolean {
   let before: NodeSummary | undefined;
   qc.setQueryData<{ data: NodeSummary[] }>(['/admin/v1/nodes', ALL_PAGES], (old) => {
     if (!old) return old;
@@ -110,6 +110,9 @@ function observed(qc: QueryClient, node: NodeSummary) {
     const data = at < 0 ? [...old.data, node] : old.data.map((n, i) => (i === at ? node : n));
     return { ...old, data };
   });
+  // a report that only moved the heartbeat on changes nothing a screen
+  // reads again: the list above already holds it
+  if (before && sansBeat(before) === sansBeat(node)) return false;
   // what its store holds, read again only when that or its seats changed:
   // its own downloads, and every node's suggestions, since a pair's is
   // read on both nodes' stores
@@ -122,6 +125,19 @@ function observed(qc: QueryClient, node: NodeSummary) {
       return mine && (path === '/admin/v1/nodes/{node}' || path === '/admin/v1/nodes/{node}/seats/{seat}' || (stored && path === '/admin/v1/nodes/{node}/downloads'));
     },
   });
+  // a seat placed, removed or moving changes what can be routed
+  return !before || seatStates(before) !== seatStates(node);
+}
+
+/** A node as reported, but for when it last reported: what a change is. */
+function sansBeat(n: NodeSummary): string {
+  const { last_heartbeat_at: _, ...rest } = n;
+  return JSON.stringify(rest);
+}
+
+/** A node's seats with their states, to tell one that moved. */
+function seatStates(n: NodeSummary): string {
+  return n.seats.map((s) => `${s.id}=${s.status}`).join(',');
 }
 
 /** A node's store, in short, to tell a change. */
@@ -182,9 +198,8 @@ export function useHub(): HubState {
             if (admin && before !== undefined && f.seq > before + 1) refresh(qc, admin === 'change' ? COVERED : AFFECTS[admin] ?? COVERED);
             if (admin && f.payload) adminFrame(qc, f.topic, f.payload);
             else if (f.topic === 'NodeObserved' && typeof f.payload?.body === 'string') {
-              observed(qc, JSON.parse(f.payload.body) as NodeSummary);
-              // a seat that moved changes what can be routed and where placements stand
-              void qc.invalidateQueries({ queryKey: ['/admin/v1/routes'] });
+              // a seat that moved changes what can be routed
+              if (observed(qc, JSON.parse(f.payload.body) as NodeSummary)) void qc.invalidateQueries({ queryKey: ['/admin/v1/routes'] });
             } else if (f.topic === 'InstanceBeat' && typeof f.payload?.instance === 'string' && typeof f.payload.at === 'string') {
               beat({ id: f.payload.instance, at: f.payload.at });
             }

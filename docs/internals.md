@@ -191,7 +191,14 @@ it in turn: a seat that refuses, does not answer, or fails before output is
 an attempt in `voice.attempts`, and the next is offered the request. Each
 attempt answers on a reply subject of its own, and a seat the api stops
 waiting for is sent `cancel`. When every seat fails, the `502` carries the
-request id and the attempts in `error.voice`. A seat whose node holds a
+request id and the attempts in `error.voice`. A seat that refuses for
+capacity (its ack's `refusal` is `capacity`: it, or its node, serves its
+most at once) has not failed and is no attempt: when every seat left
+refuses so, the request waits for a slot on this instance, in arrival
+order among the requests that may go to the same seats, offered again when an attempt here ends or
+every 250 ms, its caller looked for meanwhile, until its `voice.deadline`
+(`504 deadline_exceeded`) or for 60 s (`429 no_capacity`, `Retry-After`).
+The annotator's requests wait for none: its queue backs off on its own. A seat whose node holds a
 local cap of 0 is not offered. Chat Completions messages are converted to
 the standard's input items (content parts, tool calls and tool results),
 and what has no standard form is refused `400 unsupported`. The api serves
@@ -679,7 +686,8 @@ when it cannot reach the coordinator.
    for the model among the permitted accounts, with room by the api's own
    count. If the model's accounts are all exhausted, the answer is
    `503 no_capacity` with the earliest reset. If every seat is busy, the api
-   waits for the next snapshot, until the request's deadline.
+   waits for a slot, until the request's deadline or for 60 s, then
+   answers `429 no_capacity`.
 4. **Serve.** The api publishes `serve` on the node's subject as a request,
    naming a reply subject for this one, and the node answers `accepted` or
    `refused` at once. `refused`, or no answer, means the next candidate;

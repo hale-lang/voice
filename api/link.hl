@@ -8,15 +8,18 @@
 
 import "../lib/pond/realtime/nats" as nats;
 
-/// How one `serve` went. `ack` is `accepted`, `refused` (with `reason`),
-/// `unanswered` (no ack in time: a seat failure) or `lost` (the link is
-/// down). For an accepted request, `outcome` is the result's (`served`,
-/// `incomplete`, `failed`, `cancelled`), or `unfinished` when no result
-/// came before the wait ran out; `response` is the response object the
+/// How one `serve` went. `ack` is `accepted`, `refused` (with `reason`,
+/// and `refusal`, its kind), `unanswered` (no ack in time: a seat failure)
+/// or `lost` (the link is down). For an accepted request, `outcome` is the
+/// result's (`served`, `incomplete`, `failed`, `cancelled`), or
+/// `unfinished` when no result came before the wait ran out; `response` is the response object the
 /// terminal event carried, as JSON.
 type ServeOutcome {
     ack: String = "";
     reason: String = "";
+    // for `refused`: `capacity` when the seat or its node serves its most
+    // at once (`at_capacity`), `unavailable` for any other refusal
+    refusal: String = "";
     outcome: String = "unfinished";
     // the result's `served.model`, and its timing
     model: String = "";
@@ -63,20 +66,23 @@ interface Offer {
 /// One message of an open offer. `json` is the event object, or the result.
 type LinkMsg { kind: String = "none"; json: String = ""; }
 
-/// Offer `body` and read it to its result: the whole outcome, for an
-/// answer that is not streamed. The seat has `first` from each message to
-/// the next until its first output, and `idle` once output has come.
-fn serve_over(
-    link: Link,
-    node: String,
-    reply_to: String,
-    body: String,
+/// True when the seat refused only because it, or its node, serves its
+/// most at once (protocol.yaml `ServeAck.refusal`): it has not failed, and
+/// takes the request once a slot frees.
+fn at_capacity(o: ServeOutcome) -> Bool {
+    return o.ack == "refused" && o.refusal == "capacity";
+}
+
+/// Read an accepted offer to its result: the whole outcome, for an answer
+/// that is not streamed. The seat has `first` from each message to the
+/// next until its first output, and `idle` once output has come.
+fn read_over(
+    offer: Offer,
+    accepted: ServeOutcome,
     first: Duration,
     idle: Duration
 ) -> ServeOutcome {
-    let offer = link.offer(node, reply_to, body);
-    let mut out = offer.ack();
-    if out.ack != "accepted" { return out; }
+    let mut out = accepted;
     let mut deadline = std::time::monotonic() + first;
     let mut done = false;
     while !done && std::time::monotonic() < deadline {
@@ -239,6 +245,7 @@ locus NatsAttempt {
             }
             self.c.close();
             out.reason = std::json::find_string_field(ack, "reason");
+            out.refusal = std::json::find_string_field(ack, "refusal");
             return out;
         }
         self.open = true;

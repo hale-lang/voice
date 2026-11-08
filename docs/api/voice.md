@@ -92,7 +92,8 @@ model, are up on a connected node, carry the request's data class, and
 spend an account the key permits (narrowed by `voice.account` when the
 request names one). Accounts with no headroom left are skipped, and
 seats at their concurrency, or on a node at its in-flight cap, are
-skipped. Voice picks the account with the
+skipped; when every one is, the request waits for a slot (see "Rate
+limits, budgets and quota"). Voice picks the account with the
 most headroom, then the least loaded of its seats.
 
 The coordinator reaches nodes over NATS on the private network, and nodes
@@ -160,8 +161,17 @@ budget is a hard cap on spend per period. The coordinator reserves against
 every applicable limit and the budget before dispatch, using estimated
 input tokens plus the requested maximum output (the model's default maximum
 when the request sets none), and settles on actual usage. A refusal is
-`429` with `Retry-After`. Seat saturation is a routing fact and never
-produces a 429; the request queues.
+`429` with `Retry-After`.
+
+Seat saturation is a routing fact, not a failure. When every seat that
+could serve a request is serving its most at once, the request waits
+for a slot, in arrival order among the requests that may go to the
+same seats, and is served by whichever seat frees first; nothing is sent meanwhile, a
+stream included. It waits until its `voice.deadline`, or for 60 s when
+it gives none. One whose deadline passes first is `504
+deadline_exceeded`; one still waiting after 60 s is `429 no_capacity`
+with `Retry-After`. A busy seat never makes a `502`, and a seat that
+refused for capacity is not an attempt in `voice.attempts`.
 
 An account that is out of headroom is not the caller's limit. When every
 account that could serve a request is exhausted, the answer is `503`
@@ -286,10 +296,10 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. Or `no_capacity`: every seat that could serve the request stayed busy, serving its most at once, for the 60 s the request waited for a slot; the message names the model, and `voice.attempts` lists any seat that failed it meanwhile. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 504 | The request's `voice.deadline` passed before it was served. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 504 | The request's `voice.deadline` passed before it was served: while it waited for a slot, every seat that could serve it busy. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### POST `/v1/chat/completions`
 
@@ -348,10 +358,10 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. Or `no_capacity`: every seat that could serve the request stayed busy, serving its most at once, for the 60 s the request waited for a slot; the message names the model, and `voice.attempts` lists any seat that failed it meanwhile. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 504 | The request's `voice.deadline` passed before it was served. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 504 | The request's `voice.deadline` passed before it was served: while it waited for a slot, every seat that could serve it busy. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-catalog"></a>
 
@@ -376,7 +386,7 @@ Responses:
 |---|---|---|
 | 200 | The catalog as this key sees it. | `application/json` [ModelList](#schema-modellist) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/v1/models/{model}`
 
@@ -397,7 +407,7 @@ Responses:
 | 200 | The model. | `application/json` [Model](#schema-model) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-capabilities"></a>
 
@@ -421,7 +431,7 @@ Responses:
 |---|---|---|
 | 200 | Capabilities of the presented key. | `application/json` [Capabilities](#schema-capabilities) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-projects"></a>
 
@@ -682,7 +692,7 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### PUT `/admin/v1/projects/{project}/limits`
 

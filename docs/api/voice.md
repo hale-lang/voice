@@ -184,7 +184,7 @@ client can pace itself instead of discovering the wall by failing.
 - [recipes](#tag-recipes) (4)
 - [runtimes](#tag-runtimes) (4)
 - [placements](#tag-placements) (4)
-- [arrangements](#tag-arrangements) (3)
+- [arrangements](#tag-arrangements) (8)
 - [accounts](#tag-accounts) (5)
 - [nodes](#tag-nodes) (14)
 - [changes](#tag-changes) (2)
@@ -2021,6 +2021,142 @@ Responses:
 | 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/arrangements`
+
+**The arrangements kept** · `listArrangements`
+
+Authentication: operatorToken
+
+Each arrangement kept (`putArrangement`): its wants, when it was
+last planned, and whether the fleet has changed since (a node that
+can take a model joined, left or changed its memory for models, a
+placement came or went, a link was checked). A change is only said:
+nothing is planned again on its own.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The arrangements. | `application/json` object |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/arrangements/{arrangement}`
+
+**Describe an arrangement** · `getArrangement`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `arrangement` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The arrangement. | `application/json` [Arrangement](#schema-arrangement) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PUT `/admin/v1/arrangements/{arrangement}`
+
+**Keep wants as an arrangement** · `putArrangement`
+
+Authentication: operatorToken
+
+The wants are checked as `planArrangement` checks them, and kept
+under the id, replacing any kept there (and the record of its last
+plan). No plan is made: a kept arrangement is planned only when
+`planSavedArrangement` is asked.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `arrangement` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [ArrangementPut](#schema-arrangementput)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `name` | string |  | How it is shown; its id when left out. | length ≤ 200 |
+| `wants` | [ArrangementWants](#schema-arrangementwants) |  |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The arrangement, kept. | `application/json` [Arrangement](#schema-arrangement) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### DELETE `/admin/v1/arrangements/{arrangement}`
+
+**Forget an arrangement** · `removeArrangement`
+
+Authentication: operatorToken
+
+What it planned or applied stays as it is.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `arrangement` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The arrangement forgotten. | `application/json` [Arrangement](#schema-arrangement) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/arrangements/{arrangement}/plan`
+
+**Plan a kept arrangement again, against the fleet now** · `planSavedArrangement`
+
+Authentication: operatorToken
+
+The arrangement's wants planned as `planArrangement` plans them,
+against the fleet as it is now (after a node joined, say), with no
+side effect on the fleet: the plan is a proposal, applied only with
+`applyArrangement`. The plan's time and the fleet it was made
+against are recorded on the arrangement, so it reads unchanged
+until the fleet changes again.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `arrangement` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The plan. | `application/json` [ArrangementPlan](#schema-arrangementplan) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
@@ -4679,6 +4815,37 @@ Type: object
 | `detail` | string | yes |  |  |
 | `state` | string, one of `done`, `failed`, `not_run` | yes |  |  |
 | `reason` | string | yes | Why it failed; empty otherwise. |  |
+
+<a id="schema-arrangementput"></a>
+
+### ArrangementPut
+
+Wants to keep as an arrangement.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `name` | string |  | How it is shown; its id when left out. | length ≤ 200 |
+| `wants` | [ArrangementWants](#schema-arrangementwants) |  |  |  |
+
+<a id="schema-arrangement"></a>
+
+### Arrangement
+
+Wants kept under an id, to be planned again on demand.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `name` | string | yes |  |  |
+| `wants` | [ArrangementWants](#schema-arrangementwants) | yes |  |  |
+| `created_at` | string (date-time) | yes |  |  |
+| `updated_at` | string (date-time) | yes |  |  |
+| `planned_at` | string (date-time) |  | When it was last planned; left out when it has not been since it was kept. |  |
+| `fleet_changed` | boolean | yes | The fleet has changed since it was last planned; a re-plan is the operator's to ask for. |  |
 
 <a id="schema-nodesuggestions"></a>
 

@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample', arrangement: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -53,6 +53,11 @@ await setup('/admin/v1/recipes', recipe('live-placed'));
 await setup('/admin/v1/models', { id: 'live-local', recipe: 'live-placed' });
 await setup('/admin/v1/models', { id: 'live-local-2', recipe: 'live-placed' });
 await setup('/admin/v1/placements', { id: 'live-sample', model: 'live-local', nodes: ['laptop'], account: 'claude-work', runtime: 'llama-server-b11913-cuda' });
+// an arrangement kept (a PUT, so not `setup`'s POST), which the reads and the re-plan name
+{
+  const r = await fetch(base + '/admin/v1/arrangements/live-sample', { method: 'PUT', body: JSON.stringify({ wants: { roles: [{ role: 'small' }] } }), headers: { 'content-type': 'application/json', ...operator } });
+  if (r.status !== 200) { console.log('FAIL setup arrangement', r.status, (await r.text()).slice(0, 200)); process.exit(1); }
+}
 // a change the setup made, which `getChange` reads whole
 {
   const r = await fetch(base + '/admin/v1/changes?limit=1', { headers: operator });
@@ -76,6 +81,7 @@ const bodies = {
   createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'], account: 'claude-work' },
   planArrangement: { pins: [{ model: 'live-local', nodes: ['laptop'] }], roles: [{ role: 'small', priority: 1 }] },
   // a plan of nothing, which the fleet has moved on from: refused, drifted, nothing done
+  putArrangement: { name: 'Live', wants: { roles: [{ role: 'small' }] } },
   applyArrangement: { wants: {}, plan: { keep: [], remove: [], add: [], aliases: [], downloads: [], down: [], unmet: [] }, account: 'claude-work' },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },

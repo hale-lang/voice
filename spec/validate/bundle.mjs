@@ -63,6 +63,9 @@ const MAP = {
   ArrangementPlan: 'ArrangementPlan',
   ArrangementApply: 'ArrangementApply',
   ArrangementApplied: 'ArrangementApplied',
+  ArrangementPut: 'ArrangementPut',
+  Arrangement: 'Arrangement',
+  ArrangementList: 'GET /admin/v1/arrangements',
   Project: 'Project',
   ProjectCreate: 'ProjectCreate',
   ProjectUpdate: 'ProjectUpdate',
@@ -133,12 +136,13 @@ const MAP = {
 const NOT_COMPARED = {
   NodeRef: ['the path parameter `node`; no body', ['node']],
   NodeLinkRef: ['the path parameters `node` and `peer`; no body', ['node', 'peer']],
+  ArrangementRef: ['the path parameter `arrangement`; no body', ['arrangement']],
   Check: ['an element of a map of values (`Health.checks`): it crosses as its `status` alone under its `name`, so its schema is never on the wire; the map\'s value is compared as `Health.checks{}`', ['name', 'status']],
   'hale.Refusal': ['hale\'s own refusal of a malformed rpc (std::api), not part of voice\'s contract', ['refusal']],
 };
 
 // Fields of a row's request that are the path's or the query's.
-const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'peer', 'include_archived', 'annotator', 'rule', 'change']);
+const PARAMS = new Set(['model', 'project', 'key', 'account', 'node', 'seat', 'peer', 'include_archived', 'annotator', 'rule', 'change', 'arrangement']);
 // Records that stand for a list: the list rides in `items`. A row's list
 // is a `bounded` field of its own; these are left only inside a record
 // that stands for a value or null (`Restriction.names`).
@@ -148,7 +152,7 @@ const NULLABLES = new Set(['Restriction']);
 // Rows only voice writes: answers. A field such a row requires and the
 // contract does not is one voice always sends, which the contract allows;
 // on a request it would be one the row refuses to go without.
-const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeSummary', 'NodeList', 'NodeDownloads', 'NodeDownload', 'SeatView', 'SeatSummary', 'SeatList', 'Change', 'ChangeSummary', 'ChangeList', 'RecipeSummary', 'RecipeVariantSummary', 'RecipeList', 'UsageRecordSummary', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend', 'AnnotatorStats', 'ConversationTitleList', 'AnnotationStep', 'AnnotationStepList', 'AnnotatorResult', 'AnnotateReadiness', 'AnnotateRoute', 'AnnotateRouteSeat', 'ArrangementRoles', 'ArrangementRole', 'ArrangementPlan', 'PlanKeep', 'PlanRemove', 'PlanAdd', 'PlanAlias', 'PlanDownload', 'PlanUnmet', 'ArrangementApplied', 'ApplyStep']);
+const ANSWERS = new Set(['Health', 'CatalogModel', 'CatalogList', 'Model', 'ModelList', 'Capabilities', 'Project', 'ProjectList', 'Key', 'KeyList', 'Budget', 'LimitSet', 'Account', 'AccountList', 'Node', 'NodeSummary', 'NodeList', 'NodeDownloads', 'NodeDownload', 'SeatView', 'SeatSummary', 'SeatList', 'Change', 'ChangeSummary', 'ChangeList', 'RecipeSummary', 'RecipeVariantSummary', 'RecipeList', 'UsageRecordSummary', 'Attempt', 'VoiceExtension', 'ServedBy', 'ServedBy', 'UsageRecord', 'UsageList', 'UsageSummary', 'UsageGroupOut', 'UsageTiming', 'Problem', 'Annotation', 'AnnotationList', 'Annotator', 'AnnotatorList', 'AnnotationRule', 'AnnotationRuleList', 'AnnotationFacets', 'AnnotationTrend', 'AnnotatorStats', 'ConversationTitleList', 'AnnotationStep', 'AnnotationStepList', 'AnnotatorResult', 'AnnotateReadiness', 'AnnotateRoute', 'AnnotateRouteSeat', 'ArrangementRoles', 'ArrangementRole', 'ArrangementPlan', 'PlanKeep', 'PlanRemove', 'PlanAdd', 'PlanAlias', 'PlanDownload', 'PlanUnmet', 'ArrangementApplied', 'ApplyStep', 'Arrangement', 'ArrangementList']);
 
 const bschemas = bundle.components.schemas;
 const cschemas = contract.components.schemas;

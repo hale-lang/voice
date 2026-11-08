@@ -3,6 +3,7 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
 import { addSteps, type Step } from './steps';
+import { ARRANGEMENTS, RECIPE_READS, changeReads } from './fleet-reads';
 
 type AdminEvent = Schemas['AdminEvent'];
 const listeners = new Set<(event: AdminEvent) => void>();
@@ -41,7 +42,9 @@ function setFlights(next: Flight[]) {
  * through `deliver`.
  */
 export const AFFECTS: Record<string, string[]> = {
-  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
+  // a node joining, leaving or registering again: the saved arrangements
+  // say whether the fleet changed since they were planned
+  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness', ARRANGEMENTS],
   seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
   account: ['/admin/v1/accounts', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
@@ -58,8 +61,7 @@ export const AFFECTS: Record<string, string[]> = {
   annotation_step: [],
 };
 
-/** The node reads derived from the recipe set (`listNodeDownloads`, `suggestNodeModels`). */
-export const RECIPE_READS = ['/admin/v1/nodes/{node}/downloads', '/admin/v1/nodes/{node}/suggestions'];
+export { RECIPE_READS };
 
 /** What a (re)connect reads again: every admin read, for what was missed. */
 export const COVERED = ['/admin/v1'];
@@ -93,12 +95,10 @@ export function deliver(qc: QueryClient, event: AdminEvent) {
   if (event.type === 'reset') { refresh(qc, COVERED); return; }
   const paths = [...(AFFECTS[event.type] ?? [])];
   if (event.type === 'change' && typeof event.data.target === 'string') {
-    // `projects/work/budget` changes what `/admin/v1/projects` shows
-    const top = event.data.target.split('/')[0];
-    if (top) paths.push(`/admin/v1/${top}`);
-    // what a node has on disk, and what it is suggested, are read against
-    // every recipe: one allowed or withdrawn changes them
-    if (top === 'recipes') paths.push(...RECIPE_READS);
+    // `projects/work/budget` changes what `/admin/v1/projects` shows; a
+    // recipe, what nodes hold and are suggested; a node or a placement,
+    // the saved arrangements (fleet-reads.ts)
+    paths.push(...changeReads(event.data.target));
   }
   refresh(qc, paths);
 }

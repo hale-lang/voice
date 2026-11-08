@@ -1113,6 +1113,7 @@ or a request that named none, has none.
 
 ```sql
 alter table in_flight add column conversation text not null default '';
+```
 
 ### Migration 32: arrangements
 

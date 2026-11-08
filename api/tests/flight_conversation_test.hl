@@ -1,0 +1,84 @@
+// A request in flight carries the conversation it is a turn of, by the
+// rule its usage record keeps (`conversation_of`): its `prompt_cache_key`
+// when that is a string, none otherwise. The row keeps it through the store
+// (here the memory store; the Postgres store's columns are migration 31's),
+// and the `request` event tells it, or `null`.
+import ".." as api;
+import "../../store" as st;
+
+fn flight(plane: api::DataPlane, id: String) -> st::FlightRow {
+    let all = plane.store.flights_after(0, 100) or st::FlightRows { };
+    for f in all.rows {
+        if f.request_id == id { return f; }
+    }
+    return st::FlightRow { request_id: "missing" };
+}
+
+main locus App {
+    params {
+        plane: api::DataPlane = api::DataPlane { };
+    }
+
+    run() {
+        let k = st::KeyRow { id: "k1", project: "work" };
+        let c = api::Candidate { seat: st::SeatRow { ref: "n1/s1", account: "a1" } };
+        self.plane.inference.flying(
+            "req_turn",
+            k,
+            api::InferenceRequest {
+                model: "m",
+                body: "{\"model\": \"m\", \"input\": \"hi\", \"prompt_cache_key\": \"conv-7\"}",
+            },
+            c,
+        );
+        self.plane.inference.flying(
+            "req_alone",
+            k,
+            api::InferenceRequest {
+                model: "m",
+                body: "{\"model\": \"m\", \"input\": \"hi\", \"metadata\": {\"conversation\": \"x\"}}",
+            },
+            c,
+        );
+        self.plane.inference.flying(
+            "req_null",
+            k,
+            api::InferenceRequest {
+                model: "m",
+                body: "{\"model\": \"m\", \"input\": \"hi\", \"prompt_cache_key\": null}",
+            },
+            c,
+        );
+
+        let turn = flight(self.plane, "req_turn");
+        std::test::assert_eq_str(turn.request_id, "req_turn", "the turn is in flight");
+        std::test::assert_eq_str(turn.conversation, "conv-7", "with its conversation, read back");
+        std::test::assert_eq_str(turn.seat, "n1/s1", "on its seat");
+        std::test::assert_eq_str(
+            flight(self.plane, "req_alone").conversation,
+            "",
+            "a request that names no key is of none, whatever its metadata says",
+        );
+        std::test::assert_eq_str(
+            flight(self.plane, "req_null").conversation,
+            "",
+            "a key of null names none",
+        );
+
+        let told = api::flight_json(turn);
+        std::test::assert(
+            std::str::contains(told, "\"conversation\": \"conv-7\""),
+            "the request event tells it: " + told,
+        );
+        let none = api::flight_json(flight(self.plane, "req_alone"));
+        std::test::assert(
+            std::str::contains(none, "\"conversation\": null"),
+            "or null: " + none,
+        );
+        std::test::assert(std::json::valid_object(told), "as JSON: " + told);
+    }
+}
+
+fn main() {
+    App { };
+}

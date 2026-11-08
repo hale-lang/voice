@@ -1104,7 +1104,17 @@ create table node_inventory (
 );
 ```
 
-### Migration 31: arrangements
+### Migration 31: which conversation a request in flight is a turn of
+
+A request in flight names the conversation it is a turn of (its
+`prompt_cache_key`, the usage record's `conversation`), so a live view tells
+a conversation running from one whose turns have ended. A row from before,
+or a request that named none, has none.
+
+```sql
+alter table in_flight add column conversation text not null default '';
+
+### Migration 32: arrangements
 
 What the operator wants the whole fleet for (`ArrangementWants`: pins and
 roles), kept under an id (`putArrangement`) to be planned again on demand

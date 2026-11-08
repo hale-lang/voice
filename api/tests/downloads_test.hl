@@ -1,7 +1,7 @@
 // What a node has on disk, from what it reported its store holds, read
 // against the recipes: a variant held whole, and the placement that uses
-// it there now; one held in part, with how much; and the files no variant
-// lists. The report itself is checked: each file by its sha256, in order,
+// it there now; one held in part, with how much, when it holds a file no
+// variant held whole accounts for; and the files no variant lists. The report itself is checked: each file by its sha256, in order,
 // once.
 import ".." as api;
 import "../../store" as st;
@@ -90,8 +90,9 @@ fn main() {
     std::test::assert(len(refused("{\"files\": []}")) > 0, "a report without blobs is refused");
 
     // ---- what it holds ---------------------------------------------------
-    // chat's bf16 whole, its fp8 in part (the tokenizer the two share),
-    // nothing of its q4 or of coder, and two files no variant lists
+    // chat's bf16 whole, of its fp8 only the tokenizer the two share (the
+    // bf16's, so not the fp8's in part), nothing of its q4 or of coder,
+    // and two files no variant lists
     let inv = st::InventoryRow {
         node: "spark",
         blobs: h("2") + " 10\n" + h("3") + " 5000\n" + h("4") + " 5000\n" + h("b") + " 700\n"
@@ -112,7 +113,7 @@ fn main() {
         d.node == "spark" && d.has_reported_at && d.files == 5 && d.bytes == 11010,
         "the node's store, as it reported it",
     );
-    std::test::assert_eq_int(count(d.data), 2, "two variants with a file on the node");
+    std::test::assert_eq_int(count(d.data), 1, "one variant on the node: the one held whole");
     let whole = at(d.data, 0) or api::NodeDownload { };
     std::test::assert(
         whole.recipe == "chat" && whole.variant == "safetensors-bf16" && whole.complete
@@ -124,16 +125,89 @@ fn main() {
         whole.has_placed && whole.placed == "chat-on-spark",
         "with the placement that uses it there now",
     );
-    let part = at(d.data, 1) or api::NodeDownload { };
-    std::test::assert(
-        part.variant == "safetensors-fp8" && !part.complete && part.files_held == 1
-            && part.files_total == 2 && part.bytes_held == 10 && part.bytes == 5010,
-        "then the one held in part, with how much",
-    );
-    std::test::assert(!part.has_placed, "a placement removed uses it no more");
     std::test::assert(
         d.other_files == 2 && d.other_bytes == 1000,
         "the files no variant lists, apart",
+    );
+
+    // the fp8's shard fetched too: both held whole, the tokenizer each's
+    let mut fetching = inv;
+    fetching.blobs = h("2") + " 10\n" + h("3") + " 5000\n" + h("4") + " 5000\n" + h("5")
+        + " 5000\n";
+    let fd = api::node_downloads("spark", fetching, recipes(), rows);
+    std::test::assert_eq_int(count(fd.data), 2, "two variants held whole");
+    let part = at(fd.data, 1) or api::NodeDownload { };
+    std::test::assert(
+        part.variant == "safetensors-fp8" && part.complete
+            && part.files_held == 2 && part.files_total == 2,
+        "a shard of its own and the shared tokenizer: whole",
+    );
+    std::test::assert(!part.has_placed, "a placement removed uses it no more");
+    fetching.blobs = h("1") + " 4000\n" + h("3") + " 5000\n";
+    let one_shard = api::node_downloads("spark", fetching, recipes(), rows);
+    let shard = at(one_shard.data, 1) or api::NodeDownload { };
+    std::test::assert(
+        count(one_shard.data) == 2 && shard.variant == "safetensors-bf16" && !shard.complete
+            && shard.files_held == 1 && shard.files_total == 3 && shard.bytes_held == 5000
+            && shard.bytes == 10010,
+        "one shard of its own held: held in part, with how much",
+    );
+    std::test::assert(shard.has_placed, "with the placement that uses it");
+
+    // two fetches under way that share the tokenizer: each holds a shard of
+    // its own, so each is held in part
+    let pair = "[{\"id\": \"chat\", \"variants\": [{\"id\": \"bf16\", \"files\": ["
+        + file("tokenizer.json", 10, h("2")) + ", " + file("model-1.safetensors", 5000, h("3"))
+        + ", " + file("model-2.safetensors", 5000, h("4")) + "]}, {\"id\": \"fp8\", \"files\": ["
+        + file("tokenizer.json", 10, h("2")) + ", " + file("model-1.safetensors", 2500, h("5"))
+        + ", " + file("model-2.safetensors", 2500, h("6")) + "]}]}]";
+    fetching.blobs = h("2") + " 10\n" + h("3") + " 5000\n" + h("5") + " 2500\n";
+    let both = api::node_downloads("spark", fetching, pair, rows);
+    let bf = at(both.data, 0) or api::NodeDownload { };
+    let fp = at(both.data, 1) or api::NodeDownload { };
+    std::test::assert(
+        count(both.data) == 2 && bf.variant == "bf16" && !bf.complete && bf.files_held == 2
+            && bf.bytes_held == 5010 && fp.variant == "fp8" && !fp.complete
+            && fp.files_held == 2 && fp.bytes_held == 2510,
+        "two in part sharing a file: each listed, the shared file in each",
+    );
+    fetching.blobs = h("2") + " 10\n" + h("3") + " 5000\n";
+    let shared = api::node_downloads("spark", fetching, recipes(), rows);
+    let only_bf = at(shared.data, 0) or api::NodeDownload { };
+    let tok = at(shared.data, 1) or api::NodeDownload { };
+    std::test::assert(
+        count(shared.data) == 2 && only_bf.variant == "safetensors-bf16" && only_bf.files_held == 2
+            && tok.variant == "safetensors-fp8" && tok.files_held == 1,
+        "a shared file no variant held whole accounts for is each one's that lists it",
+    );
+
+    // one variant held whole beside its siblings and another model from the
+    // same base, sharing only its tokenizer and config: none is held in part
+    let family = "[{\"id\": \"style\", \"variants\": [{\"id\": \"mlx-bf16\", \"files\": ["
+        + file("tokenizer.json", 11, h("2")) + ", " + file("config.json", 1, h("3")) + ", "
+        + file("model.safetensors", 4000, h("4")) + "]}, {\"id\": \"mlx-4bit\", \"files\": ["
+        + file("tokenizer.json", 11, h("2")) + ", " + file("config.json", 1, h("3")) + ", "
+        + file("model.safetensors", 1000, h("5")) + "]}, {\"id\": \"gguf-q8\", \"files\": ["
+        + file("style.gguf", 2000, h("6"))
+        + "]}]}, {\"id\": \"distill\", \"variants\": [{\"id\": \"mlx-bf16\", \"files\": ["
+        + file("tokenizer.json", 11, h("2")) + ", " + file("chat_template.jinja", 2, h("7"))
+        + ", " + file("model.safetensors", 9000, h("8")) + "]}]}]";
+    let mut mac = inv;
+    mac.blobs = h("2") + " 11\n" + h("3") + " 1\n" + h("4") + " 4000\n" + h("c") + " 300\n";
+    mac.files = 4;
+    mac.bytes = 4312;
+    let mut on_mac = st::PlacementRows { };
+    push(on_mac.rows, placed("style-on-mac", "style", "mlx-bf16", "mac")) or discard;
+    let m = api::node_downloads("mac", mac, family, on_mac);
+    let mw = at(m.data, 0) or api::NodeDownload { };
+    std::test::assert(
+        count(m.data) == 1 && mw.recipe == "style" && mw.variant == "mlx-bf16" && mw.complete
+            && mw.placed == "style-on-mac",
+        "the one held whole alone: its siblings and kin share only small files",
+    );
+    std::test::assert(
+        m.other_files == 1 && m.other_bytes == 300,
+        "what no variant lists is other still",
     );
 
     // placed on another node, it is not placed here

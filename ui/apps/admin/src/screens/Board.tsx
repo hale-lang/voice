@@ -1,72 +1,18 @@
 import { useEffect, useMemo, useState, type SyntheticEvent } from 'react';
 import { Panel, Loading, Unavailable, count, ago } from '@hale/components';
-import { useGet, useGetOnce, useAnnotations, type UsageRecord, type UsageSummary, type Schemas } from '../api/client';
+import { useGet, useGetOnce, useAnnotations, type UsageRecord, type Schemas } from '../api/client';
+import { subscribeFlights, type Flight as InFlight } from '../api/events';
 import { readout } from '../readout';
 import { useWrite } from '../api/mutate';
 import { useLastStep, stepLabel, settles } from '../api/steps';
 import { useTitles } from '../titles';
+import { flights, state, type Flight } from './board-model';
 import s from './Board.module.css';
+
+export type { Flight } from './board-model';
 
 /** How far back the board looks, in seconds. */
 const WINDOW = 6 * 3600;
-
-/** A turn this recent keeps its conversation boarding, in seconds. */
-const ACTIVE = 120;
-
-/** How many conversations the board shows. */
-const ROWS = 24;
-
-/** The statuses a turn ends as that are not a failure. */
-const FINE = new Set(['served', 'incomplete']);
-
-type Group = UsageSummary['data'][number];
-
-/**
- * One row of the board: a conversation, by the `prompt_cache_key` its turns
- * share, its totals over the whole window as the api sums them. Requests
- * that named none are a row of their own.
- */
-export type Flight = {
-  conversation: string | null;
-  turns: number;
-  input: number;
-  output: number;
-  last_at: string;
-  last_request: string;
-};
-
-/** The summary's groups as rows, the most recently active first. */
-function flights(groups: Group[]): Flight[] {
-  const by = new Map<string, Flight>();
-  for (const g of groups) {
-    const c = (g.group as Record<string, string>).conversation ?? '';
-    // a conversation's turns in another currency are its turns still
-    const was = by.get(c);
-    const later = !was || Date.parse(g.last_at) > Date.parse(was.last_at);
-    by.set(c, {
-      conversation: c || null,
-      turns: (was?.turns ?? 0) + g.requests,
-      input: (was?.input ?? 0) + g.input_tokens,
-      output: (was?.output ?? 0) + g.output_tokens,
-      last_at: later ? g.last_at : was!.last_at,
-      last_request: later ? g.last_request : was!.last_request,
-    });
-  }
-  return [...by.values()].sort((a, b) => Date.parse(b.last_at) - Date.parse(a.last_at)).slice(0, ROWS);
-}
-
-type State = { label: string; tone: 'live' | 'ok' | 'fail' | 'quiet' };
-
-/** A conversation's status: in flight while its turns keep coming, else how its latest ended (served, failed, refused). */
-function state(f: Flight, last: UsageRecord | undefined, now: number): State {
-  if (last && !FINE.has(last.status)) {
-    // a limit, a budget or no seat to take it: refused; anything else failed
-    const refused = last.status === 'rate_limited' || last.status === 'budget_exhausted' || last.status === 'no_capacity';
-    return { label: refused ? 'refused' : last.status === 'cancelled' ? 'cancelled' : 'failed', tone: 'fail' };
-  }
-  if (now - Date.parse(f.last_at) < ACTIVE * 1000) return { label: 'in flight', tone: 'live' };
-  return { label: 'served', tone: f.turns > 1 ? 'ok' : 'quiet' };
-}
 
 /** How long a request may wait for its annotation before the board stops saying it is coming, in seconds. */
 const ANNOTATING = 180;
@@ -80,7 +26,8 @@ function hue(root: string): number {
 
 /**
  * The live board of the last six hours' conversations: one row each,
- * newest activity on top, lit while turns keep coming. The rows and their
+ * newest activity on top, lit while a request of it is in flight (the api's
+ * requests in flight, as the stream tells them). The rows and their
  * totals are the api's summary of the whole window, grouped by
  * conversation; a row reads its latest turn for the rest. A row's title is
  * the caller's `metadata.title`, or the first thing its user asked when the
@@ -96,7 +43,11 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
   // the projects that annotate: a turn of one waits for its tags
   const projects = useGet('/admin/v1/projects');
   const annotating = useMemo(() => new Set((projects.data?.data ?? []).filter((p) => p.annotates).map((p) => p.id)), [projects.data]);
-  // the clock a remark reads, so boarding ends without a new turn
+  // the requests in flight, as Network reads them: a row is lit while one
+  // of its conversation runs, and no longer
+  const [flying, setFlying] = useState<InFlight[]>([]);
+  useEffect(() => subscribeFlights(setFlying), []);
+  // the clock the annotating mark reads, so it ends without a new turn
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now()), 5000);
@@ -123,7 +74,7 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
             <span role="columnheader">status · tags</span>
           </div>
           {rows.map((f) => (
-            <Row key={f.conversation ?? ''} flight={f} now={now} annotating={annotating} onOpen={onOpen} />
+            <Row key={f.conversation ?? ''} flight={f} flying={flying} now={now} annotating={annotating} onOpen={onOpen} />
           ))}
         </div>
       )}
@@ -132,12 +83,12 @@ export function Board({ onOpen }: { onOpen: (f: Flight) => void }) {
 }
 
 /** A conversation's row: its totals, and what its latest turn says. */
-function Row({ flight: f, now, annotating, onOpen }: { flight: Flight; now: number; annotating: Set<string>; onOpen: (f: Flight) => void }) {
+function Row({ flight: f, flying, now, annotating, onOpen }: { flight: Flight; flying: InFlight[]; now: number; annotating: Set<string>; onOpen: (f: Flight) => void }) {
   const last = useGet('/admin/v1/usage/{request_id}', { params: { path: { request_id: f.last_request } } }).data;
   // the turn a title is read from: the first the board saw, so a new turn
   // does not fetch the recording again
   const [titled] = useState(f.last_request);
-  const r = state(f, last, now);
+  const r = state(f, last, flying);
   const titleOf = useTitles();
   const named = f.conversation ? titleOf(f.conversation, last?.project) : null;
   return (

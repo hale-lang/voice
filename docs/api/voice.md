@@ -5490,6 +5490,8 @@ Type: object
 | `queued` | boolean | yes |  |  |
 | `reason` | string, one of ``, `unknown`, `no_text`, `not_annotating`, `no_annotator` | yes | Why it was not queued, "" when it was: `unknown` (no such request), `no_text` (its text is neither held nor recorded: a request is recorded when its project or key peeks), `not_annotating` (its project and key do not annotate), `no_annotator` (none is in force for it). |  |
 | `message` | string | yes |  |  |
+| `project` | string | yes | The project the request was sent under, "" for `unknown`: where annotation is turned on (its `annotate`), for `not_annotating`. |  |
+| `key` | string | yes | The key it was sent under, "" for `unknown`; a key's `annotate` turns it on too. |  |
 
 <a id="schema-annotationrunlist"></a>
 

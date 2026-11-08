@@ -381,7 +381,7 @@ function AppliedView({ applied }: { applied: Applied }) {
               header: 'Seats',
               render: (s) => {
                 const p = s.action === 'add' && s.state === 'done' ? placed(s.target) : undefined;
-                return p ? <a href={href('placements', p.id)}><Seats p={p} seatAt={seatAt} /></a> : <span className="faint">–</span>;
+                return p ? <a href={href('placements', p.id)}><Seats p={p} seatAt={seatAt} ready={nodes.isSuccess} /></a> : <span className="faint">–</span>;
               },
             },
           ]}

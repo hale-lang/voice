@@ -5,7 +5,11 @@
 // and whenever that changes; the store keeps the last report as it came
 // (`node_inventory`). Read against the recipes, it says which variants the
 // node holds whole, which in part (the files a variant lists, held or not,
-// by sha256), and what it holds that no variant lists. A node keeps a
+// by sha256), and what it holds that no variant lists. Variants of related
+// models share small files byte for byte (a tokenizer, a config, a chat
+// template), so a file held counts first toward the variants held whole:
+// a variant is held in part only when it holds a file no variant held
+// whole accounts for. A node keeps a
 // variant's files when its placement is removed, so placing a variant it
 // holds whole again is a reload, not a download; a suggestion says so
 // (`NodeSuggestion.downloaded`).
@@ -135,30 +139,50 @@ fn hold_blobs(h: HeldBlobs, blobs: String) {
 }
 
 /// How much of a variant `h` holds: its files and their size together,
-/// and those of them held.
-type VariantHeld { files_total: Int = 0; files_held: Int = 0; bytes: Int = 0; bytes_held: Int = 0; }
+/// those of them held, and how many of those held are its own: not among
+/// the files `claimed`.
+type VariantHeld {
+    files_total: Int = 0;
+    files_held: Int = 0;
+    files_own: Int = 0;
+    bytes: Int = 0;
+    bytes_held: Int = 0;
+}
 
 /// What `h` holds of `variant` (a recipe's variant, as JSON): each file it
 /// pins, by its sha256: its own files, and each of its file sets' (a set
 /// pinned by a manifest counts the manifest; the files the manifest lists
 /// are not named in the recipe, so they are not told apart from what no
 /// variant lists). Each file held is put in `listed` too, so what no
-/// variant lists can be told. What its prepare step makes is kept apart
-/// from the store, and is not counted.
+/// variant lists can be told; each held and not in `claimed` is its own.
+/// What its prepare step makes is kept apart from the store, and is not
+/// counted.
 @unbounded
-fn variant_held(variant: String, h: HeldBlobs, listed: HeldBlobs) -> VariantHeld {
+fn variant_held(
+    variant: String,
+    h: HeldBlobs,
+    listed: HeldBlobs,
+    claimed: HeldBlobs
+) -> VariantHeld {
     let mut out = files_held(
         std::json::find_field_raw(variant, "files"),
         h,
         listed,
+        claimed,
         VariantHeld { },
     );
     let mut set = std::json::array_first(std::json::find_field_raw(variant, "file_sets"));
     while !set.done {
-        out = files_held(std::json::find_field_raw(set.element, "files"), h, listed, out);
+        out = files_held(
+            std::json::find_field_raw(set.element, "files"),
+            h,
+            listed,
+            claimed,
+            out,
+        );
         let manifest = std::str::trim(std::json::find_field_raw(set.element, "manifest"));
         if len(manifest) > 0 {
-            out = files_held("[" + manifest + "]", h, listed, out);
+            out = files_held("[" + manifest + "]", h, listed, claimed, out);
         }
         set = std::json::array_next(set);
     }
@@ -168,7 +192,13 @@ fn variant_held(variant: String, h: HeldBlobs, listed: HeldBlobs) -> VariantHeld
 /// `out` with what `h` holds of `files` (a JSON list of pinned files)
 /// added.
 @unbounded
-fn files_held(files: String, h: HeldBlobs, listed: HeldBlobs, out: VariantHeld) -> VariantHeld {
+fn files_held(
+    files: String,
+    h: HeldBlobs,
+    listed: HeldBlobs,
+    claimed: HeldBlobs,
+    out: VariantHeld
+) -> VariantHeld {
     let mut next = out;
     let mut f = std::json::array_first(files);
     while !f.done {
@@ -181,6 +211,8 @@ fn files_held(files: String, h: HeldBlobs, listed: HeldBlobs, out: VariantHeld) 
             next.files_held = next.files_held + 1;
             next.bytes_held = next.bytes_held + n;
             listed.set(got);
+            let other = claimed.get(sha) or HeldBlob { };
+            if len(other.sha) == 0 { next.files_own = next.files_own + 1; }
         }
         f = std::json::array_next(f);
     }
@@ -190,7 +222,7 @@ fn files_held(files: String, h: HeldBlobs, listed: HeldBlobs, out: VariantHeld) 
 /// True when `h` holds every file of `variant`; false for a variant that
 /// lists none.
 fn variant_whole(variant: String, h: HeldBlobs) -> Bool {
-    let v = variant_held(variant, h, HeldBlobs { });
+    let v = variant_held(variant, h, HeldBlobs { }, HeldBlobs { });
     return v.files_total > 0 && v.files_held == v.files_total;
 }
 
@@ -206,6 +238,30 @@ fn placed_here(rows: st::PlacementRows, node: String, recipe: String, variant: S
         }
     }
     return "";
+}
+
+/// Variant `variant` (as JSON) of recipe `recipe`, as much of it as node
+/// `node` holds (`held`), and the placement that uses it there now.
+fn node_download(
+    rows: st::PlacementRows,
+    node: String,
+    recipe: String,
+    variant: String,
+    held: VariantHeld
+) -> NodeDownload {
+    let id = std::json::find_string_field(variant, "id");
+    let placed = placed_here(rows, node, recipe, id);
+    return NodeDownload {
+        recipe: recipe,
+        variant: id,
+        bytes: held.bytes,
+        complete: held.files_held == held.files_total,
+        files_held: held.files_held,
+        files_total: held.files_total,
+        bytes_held: held.bytes_held,
+        has_placed: len(placed) > 0,
+        placed: placed,
+    };
 }
 
 /// What node `node` holds, from its last report `inv`, read against
@@ -227,39 +283,37 @@ fn node_downloads(
     let h = HeldBlobs { };
     hold_blobs(h, inv.blobs);
     let listed = HeldBlobs { };
-    let mut partial = NodeDownloads { };
+    // the variants held whole first; their files are accounted for
+    let none = HeldBlobs { };
+    let whole = HeldBlobs { };
     let mut r = std::json::array_first(recipes);
     while !r.done {
         let recipe = std::json::find_string_field(r.element, "id");
         let mut v = std::json::array_first(std::json::find_field_raw(r.element, "variants"));
         while !v.done {
-            let held = variant_held(v.element, h, listed);
-            if held.files_held > 0 {
-                let variant = std::json::find_string_field(v.element, "id");
-                let placed = placed_here(rows, node, recipe, variant);
-                let d = NodeDownload {
-                    recipe: recipe,
-                    variant: variant,
-                    bytes: held.bytes,
-                    complete: held.files_held == held.files_total,
-                    files_held: held.files_held,
-                    files_total: held.files_total,
-                    bytes_held: held.bytes_held,
-                    has_placed: len(placed) > 0,
-                    placed: placed,
-                };
-                if d.complete {
-                    push(out.data, d) or discard;
-                } else {
-                    push(partial.data, d) or discard;
-                }
+            let held = variant_held(v.element, h, listed, none);
+            if held.files_held > 0 && held.files_held == held.files_total {
+                push(out.data, node_download(rows, node, recipe, v.element, held)) or discard;
+                variant_held(v.element, h, whole, none);
             }
             v = std::json::array_next(v);
         }
         r = std::json::array_next(r);
     }
-    for d in partial.data {
-        push(out.data, d) or discard;
+    // then those held in part: each holding a file of its own, one no
+    // variant held whole accounts for
+    r = std::json::array_first(recipes);
+    while !r.done {
+        let recipe = std::json::find_string_field(r.element, "id");
+        let mut v = std::json::array_first(std::json::find_field_raw(r.element, "variants"));
+        while !v.done {
+            let held = variant_held(v.element, h, listed, whole);
+            if held.files_own > 0 && held.files_held < held.files_total {
+                push(out.data, node_download(rows, node, recipe, v.element, held)) or discard;
+            }
+            v = std::json::array_next(v);
+        }
+        r = std::json::array_next(r);
     }
     // what no variant lists
     let lv = std::str::bytes_view(inv.blobs);

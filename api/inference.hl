@@ -271,8 +271,9 @@ locus Inference {
                     continue;
                 }
                 if o.ack == "accepted" {
-                    // taken: the next request waiting has its turn
-                    self.leave(request_id);
+                    // taken: the next request waiting has its turn, and
+                    // this one keeps its place should the seat fail it
+                    self.taken(request_id);
                     self.flying(request_id, k, r, c);
                     o = read_over(offer, o, self.first, self.idle);
                     self.landed(request_id);
@@ -491,8 +492,9 @@ locus Inference {
                 }
                 let mut ending = "";
                 if o.ack == "accepted" {
-                    // taken: the next request waiting has its turn
-                    self.leave(request_id);
+                    // taken: the next request waiting has its turn, and
+                    // this one keeps its place should the seat fail it
+                    self.taken(request_id);
                     self.flying(request_id, k, r, c);
                     st.output = false;
                     // the seat has `first` from one message to the next until
@@ -931,10 +933,13 @@ locus Inference {
     }
 
     /// `w`, every seat it may go to busy: in the queue, if it is not yet,
-    /// offered again at its turn.
+    /// or waiting again at the place it took first (a seat took it, then
+    /// failed it), offered again at its turn.
     fn queued(w: Waiting) -> Waiting {
         let mut out = w;
-        if !out.queued {
+        if out.queued {
+            self.queue = queue_marked(self.queue, w.request_id, "w");
+        } else {
             self.queue = queue_joined(self.queue, w.key, w.request_id);
             out.queued = true;
         }
@@ -976,7 +981,13 @@ locus Inference {
         return out;
     }
 
-    /// Request `id` is no longer waiting: taken by a seat, or done.
+    /// A seat took request `id`: it no longer holds back those behind it,
+    /// but keeps its place until it is done (`leave`).
+    fn taken(request_id: String) {
+        self.queue = queue_marked(self.queue, request_id, "t");
+    }
+
+    /// Request `id` is done: served, or answered otherwise.
     fn leave(request_id: String) {
         self.queue = queue_left(self.queue, request_id);
     }
@@ -1485,10 +1496,21 @@ fn seats_key(model: String, c: Candidates) -> String {
     return key;
 }
 
-/// The queue for a slot, `request_id` at its end: a `<request id>\t<key>`
-/// line each, in arrival order (`seats_key`).
+/// The queue for a slot, `request_id` at its end, waiting: a
+/// `<request id>\t<state>\t<key>` line each, in arrival order
+/// (`seats_key`). Its state is `w` while it waits, `t` while a seat it was
+/// offered has it: it keeps its place, holding back no one, and waits
+/// there again (`queue_marked`) if that seat fails it.
 fn queue_joined(queue: String, key: String, request_id: String) -> String {
-    return queue + request_id + "\t" + key + "\n";
+    return queue + request_id + "\tw\t" + key + "\n";
+}
+
+/// The queue with `request_id`'s line in `state`, in its place.
+fn queue_marked(queue: String, request_id: String, state: String) -> String {
+    let at = std::str::index_of("\n" + queue, "\n" + request_id + "\t");
+    if at < 0 { return queue; }
+    let from = at + len(request_id) + 1;
+    return queue[0..from] + state + queue[(from + 1)..len(queue)];
 }
 
 /// The queue without `request_id`'s line.
@@ -1502,11 +1524,11 @@ fn queue_left(queue: String, request_id: String) -> String {
 
 /// True when a request for the seats `key` says waits in the queue.
 fn queue_waits(queue: String, key: String) -> Bool {
-    return std::str::contains(queue, "\t" + key + "\n");
+    return std::str::contains(queue, "\tw\t" + key + "\n");
 }
 
 /// True when a request for the seats `key` says came before `request_id`
-/// in the queue.
+/// in the queue and waits still.
 @bounded_by(queue)
 fn queue_ahead(queue: String, key: String, request_id: String) -> Bool {
     let mut rest = queue;
@@ -1516,9 +1538,11 @@ fn queue_ahead(queue: String, key: String, request_id: String) -> Bool {
         let line = rest[0..nl];
         rest = rest[(nl + 1)..len(rest)];
         let tab = std::str::index_of(line, "\t");
-        if tab >= 0 {
+        if tab >= 0 && len(line) > tab + 2 {
             if line[0..tab] == request_id { return false; }
-            if line[(tab + 1)..len(line)] == key { return true; }
+            if line[(tab + 1)..(tab + 2)] == "w" && line[(tab + 3)..len(line)] == key {
+                return true;
+            }
         }
     }
     return false;

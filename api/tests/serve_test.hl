@@ -364,11 +364,36 @@ fn slot_queue() {
     std::test::assert(api::queue_waits(q, "coder"), "coder has waiters");
     std::test::assert(!api::queue_waits(q, "code"), "a model whose id is a prefix has none");
     q = api::queue_left(q, "resp_a");
-    std::test::assert(!api::queue_ahead(q, "coder", "resp_c"), "once the first is taken, its turn");
+    std::test::assert(!api::queue_ahead(q, "coder", "resp_c"), "once the first is done, its turn");
     q = api::queue_left(q, "resp_c");
     q = api::queue_left(q, "resp_x");
-    std::test::assert_eq_str(q, "resp_b\tchat\n", "only the other model's is left");
+    std::test::assert_eq_str(q, "resp_b\tw\tchat\n", "only the other model's is left");
     std::test::assert(!api::queue_waits(q, "coder"), "and coder has none");
+}
+
+/// A waiting request a seat takes and then fails waits again in the place
+/// it first took, ahead of those that came after it: the instance's queue
+/// as `serve_held` and `stream_held` move it (`queued`, `taken`, `leave`).
+fn slot_queue_kept(e: api::DataPlane) {
+    let inf = e.inference;
+    let mut a = inf.queued(api::Waiting { request_id: "resp_a", key: "coder s1 s2" });
+    let b = inf.queued(api::Waiting { request_id: "resp_b", key: "coder s1 s2" });
+    std::test::assert(api::queue_ahead(inf.queue, b.key, "resp_b"), "b waits behind a");
+    // a seat takes a: b is no longer held back by it
+    inf.taken("resp_a");
+    std::test::assert(!api::queue_ahead(inf.queue, b.key, "resp_b"), "b's turn while a is served");
+    std::test::assert(api::queue_waits(inf.queue, b.key), "b still waits");
+    // the seat fails a, and every other seat is busy: a waits again, first
+    a = inf.queued(a);
+    std::test::assert(a.queued, "a is in the queue");
+    std::test::assert(!api::queue_ahead(inf.queue, a.key, "resp_a"), "a is at the head again");
+    std::test::assert(
+        api::queue_ahead(inf.queue, b.key, "resp_b"),
+        "b waits behind a again, not ahead: " + inf.queue,
+    );
+    inf.leave("resp_a");
+    inf.leave("resp_b");
+    std::test::assert_eq_str(inf.queue, "", "both done, the queue is empty");
 }
 
 /// The streamed answers: the standard event stream, and Chat Completions
@@ -1733,6 +1758,7 @@ fn main() {
     nodes.failing = "";
     busy_seats(e, key, nodes);
     slot_queue();
+    slot_queue_kept(e);
 
     // a node whose local cap is 0 is at its cap: its seats are not offered
     let before = nodes.offers;

@@ -4,6 +4,7 @@ import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Fi
 import { useGet, useNodes, type Node, type NodeSummary, type SeatSummary, type SeatView, type Schemas } from '../api/client';
 import { useHubState } from '../api/hub';
 import { useWrite } from '../api/mutate';
+import { Arrange } from './Arrange';
 import type { ScreenProps } from '../App';
 import { href, go } from '../route';
 import { readout } from '../readout';
@@ -26,6 +27,10 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   const q = useNodes();
   const node = q.data?.data.find((n) => n.id === nodeId);
   const creating = nodeId === 'new';
+  // the arranger: the whole fleet's wants, planned against these nodes
+  // (Arrange.tsx). A query, not a part: a node may be named anything a slug
+  // allows, `arrange` too
+  const arranging = !nodeId && route.query.has('arrange');
   const seat = node?.seats.find((s) => s.id === seatId);
   const newSeat = seatId === 'new';
   const qc = useQueryClient();
@@ -51,6 +56,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
 
   if (q.isPending) return <Loading what="nodes" />;
   if (q.isError) return <Unavailable what="Nodes" detail={q.error.message} />;
+  if (arranging) return <Arrange route={route} setInspector={setInspector} />;
   if (nodeId && !creating && !node) return <Missing what={`node ${nodeId}`} />;
 
   return (
@@ -75,7 +81,8 @@ export function Nodes({ route, setInspector }: ScreenProps) {
           empty="No nodes. Create one to get its enrollment token."
         />
         <p style={{ marginBottom: 0 }}>
-          <Button onClick={() => go('nodes', 'new')} tone="primary">new node</Button>
+          <Button onClick={() => go('nodes', 'new')} tone="primary">new node</Button>{' '}
+          <Button onClick={() => { location.hash = `${href('nodes')}?arrange`; }}>arrange</Button>
         </p>
       </Panel>
       {node && <Models node={node} fresh={readout(q)} />}

@@ -27,8 +27,10 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   const q = useNodes();
   const node = q.data?.data.find((n) => n.id === nodeId);
   const creating = nodeId === 'new';
-  // the arranger: the whole fleet's wants, planned against these nodes (Arrange.tsx)
-  const arranging = nodeId === 'arrange';
+  // the arranger: the whole fleet's wants, planned against these nodes
+  // (Arrange.tsx). A query, not a part: a node may be named anything a slug
+  // allows, `arrange` too
+  const arranging = !nodeId && route.query.has('arrange');
   const seat = node?.seats.find((s) => s.id === seatId);
   const newSeat = seatId === 'new';
   const qc = useQueryClient();
@@ -80,7 +82,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
         />
         <p style={{ marginBottom: 0 }}>
           <Button onClick={() => go('nodes', 'new')} tone="primary">new node</Button>{' '}
-          <Button onClick={() => go('nodes', 'arrange')}>arrange</Button>
+          <Button onClick={() => { location.hash = `${href('nodes')}?arrange`; }}>arrange</Button>
         </p>
       </Panel>
       {node && <Models node={node} fresh={readout(q)} />}

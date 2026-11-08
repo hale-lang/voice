@@ -1,10 +1,11 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Seats } from './Placements';
 import { Panel, Table, Status, Loading, Unavailable, Mono, Field, Select, NumberInput, Checkbox, Button, Confirm, TextInput, bytes, when, type Tone } from '@hale/components';
 import { api, describe, useGet, useNodes, useRecipes, type Schemas, type Placement } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href } from '../route';
+import { ArrangeFleet } from './ArrangeFleet';
 
 type Wants = Schemas['ArrangementWants'];
 type Pin = Schemas['ArrangementPin'];
@@ -14,7 +15,7 @@ type Applied = Schemas['ArrangementApplied'];
 type Kept = Schemas['Arrangement'];
 
 /** One line of the plan's diff, as the table shows it. */
-type Step = { key: string; kind: 'keep' | 'remove' | 'add' | 'alias'; what: React.ReactNode; nodes: string; detail: React.ReactNode };
+type Step = { key: string; kind: 'keep' | 'remove' | 'add' | 'alias'; what: React.ReactNode; nodes: string; detail: React.ReactNode; block?: string };
 
 const TONE: Record<Step['kind'], Tone> = { keep: 'quiet', remove: 'fail', add: 'active', alias: 'ok' };
 
@@ -32,6 +33,8 @@ export function Arrange(_: ScreenProps) {
   const [pins, setPins] = useState<Pin[]>([]);
   const [wanted, setWanted] = useState<RoleWant[]>([]);
   const [plan, setPlan] = useState<Plan | null>(null);
+  // the placement chosen, on the fleet's cards or in the plan's diff
+  const [chosen, setChosen] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [account, setAccount] = useState('');
@@ -247,8 +250,9 @@ export function Arrange(_: ScreenProps) {
         </span>
       </p>
       {error && <p className="c-fail">{error}</p>}
+      <ArrangeFleet plan={plan} selected={chosen} onSelect={setChosen} />
       {applied && <AppliedView applied={applied} />}
-      {plan && <PlanView plan={plan} />}
+      {plan && <PlanView plan={plan} selected={chosen} onSelect={setChosen} />}
       {plan && (plan.add.length > 0 || plan.remove.length > 0 || plan.aliases.length > 0) && (
         <Panel title="Apply" readout="the plan as shown, carried out">
           <p className="muted" style={{ marginTop: 0 }}>Voice plans again first, and changes nothing if the fleet has moved on. Then removals, adds, aliases, in that order; a step that fails stops the rest, and nothing done is undone.</p>
@@ -272,13 +276,24 @@ export function Arrange(_: ScreenProps) {
   );
 }
 
-/** The plan: its diff, what it costs, and what it leaves unmet. */
-function PlanView({ plan }: { plan: Plan }) {
+/**
+ * The plan: its diff, what it costs, and what it leaves unmet. A step's
+ * placement is the one chosen on the fleet's cards: choosing either
+ * selects the other, the step scrolled to.
+ */
+function PlanView({ plan, selected, onSelect }: { plan: Plan; selected: string | null; onSelect: (block: string) => void }) {
+  const diff = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!selected) return;
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    diff.current?.querySelector('[aria-selected="true"]')?.scrollIntoView({ block: 'nearest', behavior: still ? 'auto' : 'smooth' });
+  }, [selected]);
   const steps: Step[] = [
-    ...plan.remove.map((r) => ({ key: `remove ${r.placement}`, kind: 'remove' as const, what: <a href={href('placements', r.placement)}><Mono>{r.placement}</Mono></a>, nodes: r.nodes.join(', '), detail: <><Mono>{r.model}</Mono> · {r.reason}</> })),
-    ...plan.keep.map((k) => ({ key: `keep ${k.placement}`, kind: 'keep' as const, what: <a href={href('placements', k.placement)}><Mono>{k.placement}</Mono></a>, nodes: k.nodes.join(', '), detail: <><Mono>{k.model}</Mono> · {k.reason}</> })),
+    ...plan.remove.map((r) => ({ key: `remove ${r.placement}`, block: r.placement, kind: 'remove' as const, what: <a href={href('placements', r.placement)}><Mono>{r.placement}</Mono></a>, nodes: r.nodes.join(', '), detail: <><Mono>{r.model}</Mono> · {r.reason}</> })),
+    ...plan.keep.map((k) => ({ key: `keep ${k.placement}`, block: k.placement, kind: 'keep' as const, what: <a href={href('placements', k.placement)}><Mono>{k.placement}</Mono></a>, nodes: k.nodes.join(', '), detail: <><Mono>{k.model}</Mono> · {k.reason}</> })),
     ...plan.add.map((a) => ({
       key: `add ${a.placement}`,
+      block: a.placement,
       kind: 'add' as const,
       what: <><Mono>{a.model}</Mono>{a.in_catalog ? '' : <span className="muted"> (added to the catalog)</span>}</>,
       nodes: a.nodes.join(', '),
@@ -295,9 +310,12 @@ function PlanView({ plan }: { plan: Plan }) {
   return (
     <>
       <Panel title="Plan" readout={`${plan.add.length} to add · ${plan.remove.length} to remove · ${plan.keep.length} kept`}>
+        <div ref={diff}>
         <Table<Step>
           rows={steps}
           rowKey={(s) => s.key}
+          selectedKey={steps.find((x) => x.block !== undefined && x.block === selected)?.key}
+          onSelect={(x) => (x.block ? onSelect(x.block) : undefined)}
           columns={[
             { key: 'kind', header: '', render: (s) => <Status tone={TONE[s.kind]} label={s.kind} /> },
             { key: 'what', header: 'What', render: (s) => s.what },
@@ -306,6 +324,7 @@ function PlanView({ plan }: { plan: Plan }) {
           ]}
           empty="Nothing to change."
         />
+        </div>
       </Panel>
       <Panel title="Costs" readout={fetched ? `${bytes(fetched)} to fetch` : 'nothing to fetch'}>
         <Table<{ node: string; bytes: number }>

@@ -16,7 +16,6 @@ import { Api } from './screens/Api';
 import { Recipes } from './screens/Recipes';
 import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
-import { Arrange } from './screens/Arrange';
 import { Annotators } from './screens/Annotators';
 import { useAdminEvents } from './api/events';
 import { useHub, useHubCarriesAdmin } from './api/hub';
@@ -33,7 +32,6 @@ const NAV = [
   { href: href('accounts'), label: 'Accounts', key: 'accounts' },
   { href: href('catalog'), label: 'Catalog', key: 'catalog' },
   { href: href('placements'), label: 'Placements', key: 'placements' },
-  { href: href('arrange'), label: 'Arrange', key: 'arrange' },
   { href: href('recipes'), label: 'Recipes', key: 'recipes' },
   { href: href('runtimes'), label: 'Runtimes', key: 'runtimes' },
   { href: href('projects'), label: 'Projects', key: 'projects' },
@@ -72,7 +70,7 @@ function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, arrange: Arrange, recipes: Recipes, runtimes: Runtimes, projects: Projects, annotators: Annotators, api: Api }[section];
+  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects, annotators: Annotators, api: Api }[section];
   const Screen = screen ?? Overview;
 
   // The inspector belongs to the screen; a new screen starts it empty. A

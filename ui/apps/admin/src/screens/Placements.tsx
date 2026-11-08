@@ -6,6 +6,7 @@ import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
 import { toneOf } from '../tone';
+import { NodeMemory } from '../FleetMemory';
 
 /**
  * A model put on nodes: voice picks the variant and runtime that fit the
@@ -85,6 +86,9 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
       <h2 style={{ marginBottom: 'var(--space-3)' }}>
         <Mono>{p.id}</Mono>
       </h2>
+      <div style={{ marginBottom: 'var(--space-4)' }}>
+        <NodeMemory ids={p.nodes} lit={p.id} compact />
+      </div>
       <Kv
         rows={[
           { k: 'model', v: <a href={href('catalog', p.model)}><Mono>{p.model}</Mono></a> },
@@ -96,7 +100,7 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
           ...(p.follower_seat ? [{ k: 'follower', v: <><a href={href('nodes', p.follower_seat.split('/')[0] ?? '', seat ?? '')}><Mono>{p.follower_seat}</Mono></a> <span className="muted">· runs the other half, serves nothing itself</span></> }] : []),
           { k: 'account', v: <Mono>{p.account}</Mono> },
           { k: 'cache', v: p.cache_tokens ? `${p.cache_tokens.toLocaleString()} tokens, shared by the conversations it holds` : <span className="faint">32k, placed before voice sized it</span> },
-          { k: 'holds', v: p.reserved_bytes ? `${bytes(p.reserved_bytes)} of ${p.nodes.length > 1 ? `each of ${p.nodes.join(' and ')}'s` : `${p.leader}'s`} memory for models` : '–' },
+          { k: 'holds', v: p.held_bytes ? <>{bytes(p.held_bytes)} of {p.nodes.length > 1 ? `each of ${p.nodes.join(' and ')}'s` : `${p.leader}'s`} memory for models{p.reserved_bytes ? <span className="muted"> · {bytes(p.reserved_bytes)} reserved, the rest its server's</span> : null}</> : '–' },
           { k: 'placed', v: when(p.created_at) },
         ]}
       />

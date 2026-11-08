@@ -12,6 +12,9 @@ import { toneOf } from '../tone';
 import { ContextWindow } from '../context';
 import { Value } from '../values';
 import { nodeModels, heldSaid, type NodeModel } from './node-models';
+import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
+import { fleetNodes, memoryOf, placedBlocks } from '../fleet-memory';
+import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
 
 type Seat = Schemas['Seat'];
 
@@ -62,6 +65,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   return (
     <>
       <h1>Nodes</h1>
+      <FleetPanel current={nodeId} />
       <Panel title="Nodes" readout={readout(q, `${q.data.data.length} nodes`)}>
         <Table<NodeSummary>
           rows={q.data.data}
@@ -95,6 +99,46 @@ export function Nodes({ route, setInspector }: ScreenProps) {
         </details>
       )}
     </>
+  );
+}
+
+const DEMO = { nodes: fleetNodes(DEMO_NODES), now: placedBlocks(DEMO_PLACEMENTS) };
+
+/**
+ * The fleet's memory for models at a glance: a card a node, each placement
+ * in its hue (FleetMemory.tsx), live as the hub reports the nodes and the
+ * events tell placements changed. A card opens its node. A labeled demo
+ * fleet draws it with no fleet behind it.
+ */
+function FleetPanel({ current }: { current?: string }) {
+  const f = useFleetMemory();
+  const [source, setSource] = useState<'fleet' | 'demo'>(() => {
+    try { return sessionStorage.getItem('voice.memory.source') === 'demo' ? 'demo' : 'fleet'; } catch { return 'fleet'; }
+  });
+  const choose = (v: 'fleet' | 'demo') => {
+    setSource(v);
+    try { sessionStorage.setItem('voice.memory.source', v); } catch { /* storage can be disabled */ }
+  };
+  const shown = source === 'demo' ? { ...DEMO, links: demoLink } : f;
+  let used = 0;
+  let budget = 0;
+  for (const n of shown.nodes) {
+    const m = memoryOf(n, shown.now);
+    if (!m) continue;
+    budget += m.budgetBytes;
+    used += m.blocks.reduce((t, b) => t + b.bytes, 0);
+  }
+  const lead = <Toggle label="memory drawn from" value={source} options={[['fleet', 'fleet'], ['demo', 'demo fleet']]} onChange={choose} />;
+  return (
+    <Panel title="Memory" readout={source === 'demo' ? 'demo · synthetic, no host' : `${bytes(used)} of ${bytes(budget)} held · ${shown.nodes.length} nodes`}>
+      {source === 'fleet' && f.error ? (
+        <>{lead}<p className="faint">memory unavailable: {f.error}</p></>
+      ) : source === 'fleet' && f.pending ? (
+        <span className="faint pulse">reading memory…</span>
+      ) : (
+        <FleetMemory nodes={shown.nodes} now={shown.now} links={shown.links} compact current={source === 'fleet' ? current : undefined} onOpenNode={source === 'fleet' ? (id) => go('nodes', id) : undefined} lead={lead} />
+      )}
+    </Panel>
   );
 }
 
@@ -378,6 +422,9 @@ function NodeInspector({ node }: { node: Node }) {
       <h2 style={{ marginBottom: 'var(--space-3)' }}>
         <Mono>{node.id}</Mono>
       </h2>
+      <div style={{ marginBottom: 'var(--space-4)' }}>
+        <NodeMemory ids={[node.id]} />
+      </div>
       {editing ? (
         <Form
           error={w.error}

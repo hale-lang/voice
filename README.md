@@ -158,7 +158,7 @@ Served by the api at `/`, under the operator token:
 ## Developing
 
 With the [Hale toolchain](https://github.com/hale-lang/hale) at the release
-voice pins (`[dna] toolchain` in [`hale.toml`](./hale.toml), v0.32.7; the
+voice pins (`[dna] toolchain` in [`hale.toml`](./hale.toml), v0.32.8; the
 Dockerfile and CI use the same):
 
 ```sh

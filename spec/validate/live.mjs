@@ -75,6 +75,8 @@ const bodies = {
   createRuntime: runtime('live-2'),
   createPlacement: { id: 'live-2', model: 'live-local-2', nodes: ['laptop'], account: 'claude-work' },
   planArrangement: { pins: [{ model: 'live-local', nodes: ['laptop'] }], roles: [{ role: 'small', priority: 1 }] },
+  // a plan of nothing, which the fleet has moved on from: refused, drifted, nothing done
+  applyArrangement: { wants: {}, plan: { keep: [], remove: [], add: [], aliases: [], downloads: [], down: [], unmet: [] }, account: 'claude-work' },
   createProject: { id: 'live', name: 'Live' },
   updateProject: { name: 'Work' },
   createKey: { name: 'live', expires_at: '2099-01-01T00:00:00Z' },

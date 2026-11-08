@@ -127,7 +127,11 @@ The operator decides which weights and which servers may run:
   diff against what is placed now (keep, remove, add, alias), judged by the
   same fit a placement is, with what each node fetches and what goes down
   (`planArrangement`, `voice-api arrange plan --wants FILE`, the **Arrange**
-  screen). A plan changes nothing.
+  screen). A plan changes nothing until the operator applies it
+  (`applyArrangement`, `voice-api arrange apply`, the screen's **apply**):
+  voice plans again and refuses a plan the fleet has moved on from, then
+  removes, adds and points aliases in that order, stopping at a step that
+  fails and saying what was done.
 
 Voice ships a default catalog of recipes per memory tier and platform
 ([`recipes/README.md`](./recipes/README.md),

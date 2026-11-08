@@ -226,4 +226,125 @@ fn main() {
         count(again.add) == 0 && count(again.remove) == 0 && count(again.keep) == 4,
         "the fleet is as wanted: " + api::plan_text(again),
     );
+
+    // ---- an alias set holding the project, its others kept; refused at 32 --
+    let mut full = api::ProjectCreate { id: "full", name: "Full" };
+    let mut k = 0;
+    while k < 32 {
+        push(
+            full.aliases,
+            api::ModelAlias { name: "a" + to_string(k), model: "granite" },
+        ) or discard;
+        k = k + 1;
+    }
+    projects.create(full) or {
+        std::test::assert(false, "made: " + api::ctl_message(err));
+        return;
+    };
+    let mut refused33 = "";
+    let r33 = projects.set_alias_in_gate("full", "coding", "granite") or {
+        refused33 = api::ctl_message(err);
+        api::Project { id: "", name: "", status: api::Lifecycle::active }
+    };
+    std::test::assert(
+        std::str::contains(refused33, "the most it may"),
+        "a 33rd alias is refused: " + refused33,
+    );
+    let kept_full = store.project("full") or st::ProjectRow { };
+    std::test::assert_eq_int(
+        count(api::aliases_of(kept_full.aliases).items),
+        32,
+        "and nothing set",
+    );
+    let mut again5 = "";
+    let r5 = projects.set_alias_in_gate("full", "a5", "qwen3-coder-next") or {
+        again5 = api::ctl_message(err);
+        api::Project { id: "", name: "", status: api::Lifecycle::active }
+    };
+    std::test::assert_eq_str(again5, "", "an alias it has, pointed again");
+    let repointed = api::aliases_of((store.project("full") or st::ProjectRow { }).aliases);
+    let mut a5 = "";
+    for x in repointed.items {
+        if x.name == "a5" { a5 = x.model; }
+    }
+    std::test::assert(
+        count(repointed.items) == 32 && a5 == "qwen3-coder-next",
+        "pointed again, the others kept",
+    );
+
+    // ---- ids a plan makes: slugs, room for a suffix ------------------------
+    let mut on: api::NodeSet = api::NodeSet { };
+    push(on.items, "a-node-whose-name-runs-on-and-on-and-on-and-on") or discard;
+    let long = api::placement_id("Vendor/Some.Model:Name-With-A-Long-Tail", on);
+    std::test::assert(
+        api::is_slug(long) && len(long) <= 59 && api::is_slug(long + "-258"),
+        "a slug, with room for a suffix: " + long,
+    );
+    std::test::assert_eq_str(
+        api::placement_id("qwen3-0.6b", on)[0..11],
+        "qwen3-0-6b-",
+        "a dot is a dash",
+    );
+
+    // ---- the variant the plan approved is the one placed ------------------
+    // one Spark with 40 GB of disk: granite-4.0-h-tiny's q8 (7.4 GB), then
+    // granite-4.0-h-small's q6 (26.5 GB), since its q8 (34.3 GB) would not
+    // fit beside it; placing it must not choose q8 from the disk the node
+    // reports, which the tiny's download has not taken yet
+    let store2 = st::MemoryStore { };
+    let recipes2 = api::Recipes {
+        store: store2,
+        shipped: api::shipped_recipes(shipped("recipes")),
+    };
+    let runtimes2 = api::Runtimes {
+        store: store2,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let projects2 = api::Projects { store: store2 };
+    let p2 = api::Placements {
+        store: store2,
+        recipes: recipes2,
+        runtimes: runtimes2,
+        seats: api::Seats { store: store2, link: link },
+        roles: read.roles,
+        catalog: api::Catalog { store: store2, recipes: recipes2 },
+        projects: projects2,
+    };
+    api::Accounts { store: store2 }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+    add_node(
+        store2,
+        "narrow",
+        std::str::replace(
+            spark(""),
+            "\"disk_free_bytes\": 3500000000000",
+            "\"disk_free_bytes\": 40000000000",
+        ),
+    );
+    let mut g2 = api::ArrangementWants { };
+    let mut t1 = pin("granite-4.0-h-tiny", 0);
+    push(t1.nodes, "narrow") or discard;
+    let mut t2 = pin("granite-4.0-h-small", 0);
+    push(t2.nodes, "narrow") or discard;
+    push(g2.pins, t1) or discard;
+    push(g2.pins, t2) or discard;
+    let narrow = p2.plan_arrangement(g2) or api::ArrangementPlan { };
+    let small_add = at(narrow.add, 1) or api::PlanAdd { };
+    std::test::assert(
+        count(narrow.add) == 2 && small_add.variant == "gguf-q6_k",
+        "the plan takes small's q6: " + api::plan_text(narrow),
+    );
+    let went = p2.apply_arrangement(
+        api::ArrangementApply { wants: g2, plan: narrow, account: "local" },
+    ) or {
+        std::test::assert(false, "applied: " + api::ctl_message(err));
+        return;
+    };
+    std::test::assert(went.outcome == api::ApplyOutcome::applied, "applied: " + step_states(went));
+    let placed_small = store2.placement(small_add.placement) or st::PlacementRow { };
+    std::test::assert(
+        std::json::find_string_field(placed_small.body, "variant") == "gguf-q6_k",
+        "placed as the plan's q6, not q8: " + placed_small.body,
+    );
 }

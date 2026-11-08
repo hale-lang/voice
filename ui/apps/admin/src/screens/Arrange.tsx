@@ -148,7 +148,7 @@ export function Arrange(_: ScreenProps) {
 
   return (
     <>
-      <h1>Arrange</h1>
+      <h1><a href={href('nodes')}>Nodes</a> · Arrange</h1>
       <Panel title="Kept arrangements" readout={kept.data ? `${kept.data.data.length} kept` : undefined}>
         <Table<Kept>
           rows={kept.data?.data ?? []}

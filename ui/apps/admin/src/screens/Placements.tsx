@@ -58,7 +58,7 @@ export function Placements({ route, setInspector }: ScreenProps) {
 }
 
 /** A placement's seats: its leader's, and across two nodes its follower's when that is not up. */
-function Seats({ p, seatAt }: { p: Placement; seatAt: (ref: string | undefined) => { status: string; reason?: string | null; progress?: { done_bytes: number; total_bytes: number } | null } | undefined }) {
+export function Seats({ p, seatAt }: { p: Placement; seatAt: (ref: string | undefined) => { status: string; reason?: string | null; progress?: { done_bytes: number; total_bytes: number } | null } | undefined }) {
   const s = seatAt(p.seat);
   const f = p.follower_seat ? seatAt(p.follower_seat) : undefined;
   if (!s) return <span className="faint">–</span>;

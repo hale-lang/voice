@@ -1452,8 +1452,61 @@ fn downloads_add(d: Downloads, n: String, bytes: Int) -> Downloads {
 /// The id a placement the plan adds would take: its model and its leader,
 /// a slug of at most 63.
 fn placement_id(model: String, nodes: NodeSet) -> String {
-    let id = std::str::replace(model, ".", "-") + "-" + (at(nodes.items, 0) or "");
-    return if len(id) > 63 { id[0..63] } else { id };
+    let id = slugged(model + "-" + (at(nodes.items, 0) or ""));
+    // room for a suffix (`-257`) beside it, within 63
+    let base = if len(id) > PLACEMENT_BASE_MAX { id[0..PLACEMENT_BASE_MAX] } else { id };
+    let trimmed = trim_dashes(base);
+    return if len(trimmed) > 0 { trimmed } else { "placement" };
+}
+
+/// The most placements the store holds (store.hl `PlacementRows`).
+const PLACEMENTS_MAX: Int = 256;
+
+/// The longest a placement id the plan makes is before a suffix: 63 less
+/// `-` and the digits of `PLACEMENTS_MAX + 2`.
+const PLACEMENT_BASE_MAX: Int = 59;
+
+/// `s` as a slug: lowercase letters and digits kept, an uppercase letter
+/// lowered, any other run of characters one dash.
+@bounded_by(s)
+fn slugged(s: String) -> String {
+    let v = std::str::bytes_view(s);
+    let out = std::bytes::BytesBuilder { initial_cap: 64 };
+    let mut dash = false;
+    let mut i = 0;
+    while i < v.n {
+        let c = std::str::byte_at(v, i);
+        let lower = c >= 97 && c <= 122;
+        let digit = c >= 48 && c <= 57;
+        let upper = c >= 65 && c <= 90;
+        if lower || digit {
+            out.append_str(s[i..(i + 1)]);
+            dash = false;
+        } else if upper {
+            out.append_str(std::str::lower(s[i..(i + 1)]));
+            dash = false;
+        } else if !dash {
+            out.append_str("-");
+            dash = true;
+        }
+        i = i + 1;
+    }
+    let b = out.snapshot() or b"";
+    return trim_dashes(std::str::from_bytes(b));
+}
+
+/// `s` without dashes at either end.
+@bounded_by(s)
+fn trim_dashes(s: String) -> String {
+    let mut a = 0;
+    let mut b = len(s);
+    while a < b && s[a..(a + 1)] == "-" {
+        a = a + 1;
+    }
+    while b > a && s[(b - 1)..b] == "-" {
+        b = b - 1;
+    }
+    return s[a..b];
 }
 
 // ---- the plan, as a person reads it -----------------------------------------
@@ -1506,4 +1559,194 @@ fn serves_text(serves: bounded[String; 8]) -> String {
         out.add(s);
     }
     return out.text();
+}
+
+// ---- carrying a plan out ------------------------------------------------------
+//
+// A plan is carried out only when the operator applies it
+// (`POST /admin/v1/arrangement-applies`, `Placements.apply_arrangement`),
+// never by voice on its own. The api plans again first: a plan that is no
+// longer what the fleet would get is refused, the fresh one answered in
+// its place. Then, as ordinary placements, in an order that is safe: every
+// removal first, which frees the memory the adds are judged against (a
+// pair that takes its nodes whole, as TensorFold's DeepSeek does, needs
+// them empty); then each add, in the order the plan fills its wants (a
+// model the catalog has not yet added first, as the recipe's own); then
+// each alias, on the project named. A step that fails stops the rest: the
+// answer says which were done, which failed and why, and which were not
+// run. Nothing done is undone.
+
+/// `ArrangementApply`: a plan to carry out, the wants it was made for, the
+/// account the seats it adds spend, and the project whose aliases it
+/// points.
+type ArrangementApply {
+    wants: ArrangementWants = ArrangementWants { };
+    plan: ArrangementPlan = ArrangementPlan { };
+    account: String;
+    project: String = "";
+}
+
+/// What a step does.
+type ApplyAction = enum { remove, catalog, add, alias };
+
+fn apply_action_name(v: ApplyAction) -> String {
+    return match v {
+        ApplyAction::remove -> "remove",
+        ApplyAction::catalog -> "catalog",
+        ApplyAction::add -> "add",
+        ApplyAction::alias -> "alias"
+    };
+}
+
+/// What a step came to.
+type ApplyStepState = enum { done, failed, not_run };
+
+fn apply_step_state_name(v: ApplyStepState) -> String {
+    return match v {
+        ApplyStepState::done -> "done",
+        ApplyStepState::failed -> "failed",
+        ApplyStepState::not_run -> "not_run"
+    };
+}
+
+/// `ApplyStep`: one step of a plan carried out: removing a placement,
+/// adding a catalog model or a placement, pointing an alias.
+type ApplyStep {
+    action: ApplyAction = ApplyAction::remove;
+    target: String = "";
+    detail: String = "";
+    state: ApplyStepState = ApplyStepState::not_run;
+    reason: String = "";
+}
+
+/// How applying a plan came out: all done; stopped at a step that failed;
+/// or not begun, the plan no longer what the fleet would get.
+type ApplyOutcome = enum { applied, failed, drifted };
+
+/// `ArrangementApplied`: each step and what it came to, what to do next,
+/// and, when the plan had drifted, the fresh plan.
+type ArrangementApplied {
+    outcome: ApplyOutcome = ApplyOutcome::applied;
+    steps: bounded[ApplyStep; 160];
+    advice: String = "";
+    has_plan: Bool = false;
+    plan: ArrangementPlan = ArrangementPlan { };
+}
+
+/// What a plan does, as two plans are compared: what it keeps and removes,
+/// what it adds where and in which form, and the aliases it points; not
+/// its reasons, whose figures move with what nodes report (a node's free
+/// disk) while the plan stands.
+fn plan_key(p: ArrangementPlan) -> String {
+    let mut out = "";
+    for k in p.keep {
+        out = out + "keep " + k.placement + "\n";
+    }
+    for r in p.remove {
+        out = out + "remove " + r.placement + "\n";
+    }
+    for a in p.add {
+        out = out + "add " + a.placement + " " + a.model + " " + a.recipe + " on "
+            + names_said(a.nodes) + " " + a.variant + " " + a.runtime + "\n";
+    }
+    for a in p.aliases {
+        out = out + "alias " + a.alias + " " + a.model + "\n";
+    }
+    return out;
+}
+
+/// The steps plan `p` takes, in their order, none run yet: its removals,
+/// its adds (a catalog model first where the catalog has none), its aliases.
+fn apply_steps(p: ArrangementPlan, project: String) -> ArrangementApplied {
+    let mut out = ArrangementApplied { };
+    for r in p.remove {
+        push(
+            out.steps,
+            ApplyStep {
+                action: ApplyAction::remove,
+                target: r.placement,
+                detail: r.model + " from " + names_said(r.nodes),
+            },
+        ) or discard;
+    }
+    let mut cataloged = "\n";
+    for a in p.add {
+        if !a.in_catalog && !std::str::contains(cataloged, "\n" + a.model + "\n") {
+            cataloged = cataloged + a.model + "\n";
+            push(
+                out.steps,
+                ApplyStep {
+                    action: ApplyAction::catalog,
+                    target: a.model,
+                    detail: "a catalog model of recipe " + a.recipe,
+                },
+            ) or discard;
+        }
+        push(
+            out.steps,
+            ApplyStep {
+                action: ApplyAction::add,
+                target: a.placement,
+                detail: a.model + " on " + names_said(a.nodes) + ", " + a.variant + " under "
+                    + a.runtime,
+            },
+        ) or discard;
+    }
+    for a in p.aliases {
+        push(
+            out.steps,
+            ApplyStep {
+                action: ApplyAction::alias,
+                target: a.alias,
+                detail: a.alias + " -> " + a.model + " on project " + project,
+            },
+        ) or discard;
+    }
+    return out;
+}
+
+/// The add of `p` that placement `id` is, `placement` "" for none.
+fn plan_add(p: ArrangementPlan, id: String) -> PlanAdd {
+    for a in p.add {
+        if a.placement == id { return a; }
+    }
+    return PlanAdd { };
+}
+
+/// The alias of `p` that `alias` is, `alias` "" for none.
+fn plan_alias(p: ArrangementPlan, alias: String) -> PlanAlias {
+    for a in p.aliases {
+        if a.alias == alias { return a; }
+    }
+    return PlanAlias { };
+}
+
+/// What a failed apply leaves the operator to do.
+fn apply_advice(out: ArrangementApplied) -> String {
+    let mut done = 0;
+    let mut left = 0;
+    for s in out.steps {
+        if s.state == ApplyStepState::done { done = done + 1; }
+        if s.state == ApplyStepState::not_run { left = left + 1; }
+    }
+    return to_string(done) + " steps were done and stay done; " + to_string(left)
+        + " were not run. Nothing was undone. Fix what the failed step says, then plan again and apply the fresh plan: it starts from the fleet as the done steps left it.";
+}
+
+/// What applying a plan came to, as `api arrange apply` prints it: each
+/// step and its state, then what to do.
+fn applied_text(a: ArrangementApplied) -> String {
+    let mut out = "";
+    if a.outcome == ApplyOutcome::drifted {
+        return "drifted: " + a.advice + "\n\n" + plan_text(a.plan);
+    }
+    for s in a.steps {
+        out = out + apply_step_state_name(s.state) + "  " + apply_action_name(s.action) + " "
+            + s.target + "  " + s.detail
+            + (if len(s.reason) > 0 { "\n        " + s.reason } else { "" })
+            + "\n";
+    }
+    return out + (if a.outcome == ApplyOutcome::failed { "failed: " } else { "applied: " })
+        + a.advice
+        + "\n";
 }

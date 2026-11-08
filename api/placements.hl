@@ -98,6 +98,11 @@ locus Placements {
         // voice's role data (catalog/roles.json, arranger.hl `roles_of`),
         // read at start; none when it was refused or not found
         roles: ArrangementRoles = ArrangementRoles { };
+        // what applying an arrangement writes beside placements: a catalog
+        // model for a recipe the catalog has none of, a project's aliases;
+        // behind the same gate
+        catalog: Catalog = Catalog { store: self.store, gate: self.gate, recipes: self.recipes };
+        projects: Projects = Projects { store: self.store, gate: self.gate };
     }
 
     /// `listNodeDownloads`: what node `r` has on disk of the models voice
@@ -842,7 +847,145 @@ locus Placements {
         let f = self.arrangement_fleet_in_gate(w) or raise;
         let problem = check_wants(f, w, self.roles);
         if len(problem) > 0 { fail bad(problem, "wants"); }
-        return plan_fleet(f, w, self.roles);
+        let plan = plan_fleet(f, w, self.roles);
+        // each add under an id no placement has held, since an id is never
+        // reused: its model and leader, or with `-2`, `-3`…
+        let rows = self.store.placements() or fail store_down(err);
+        let mut taken = "\n";
+        for r in rows.rows {
+            taken = taken + r.id + "\n";
+        }
+        let mut out = plan;
+        let mut i = 0;
+        for a in plan.add {
+            // the store holds at most PLACEMENTS_MAX, so among the base and
+            // its suffixes to one past that, one is free
+            let mut id = a.placement;
+            let mut n = 2;
+            while std::str::contains(taken, "\n" + id + "\n") && n <= PLACEMENTS_MAX + 2 {
+                id = a.placement + "-" + to_string(n);
+                n = n + 1;
+            }
+            if std::str::contains(taken, "\n" + id + "\n") || !is_slug(id) {
+                fail clash("no free placement id for " + a.model + " on " + names_said(a.nodes));
+            }
+            taken = taken + id + "\n";
+            let mut fresh = a;
+            fresh.placement = id;
+            set(out.add, i, fresh) or discard;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// `applyArrangement`: plan `a` carried out, as ordinary placements, in
+    /// a safe order (arranger.hl, "carrying a plan out"); refused with the
+    /// fresh plan when it is no longer the plan the fleet would get.
+    fn apply_arrangement(a: ArrangementApply) -> ArrangementApplied fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.apply_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn apply_in_gate(a: ArrangementApply) -> ArrangementApplied fallible(CtlError) {
+        if count(a.plan.add) > 0 && len(a.account) == 0 {
+            fail bad("`account` names the account the seats it adds spend", "account");
+        }
+        if count(a.plan.aliases) > 0 {
+            if len(a.project) == 0 {
+                fail bad("`project` names the project whose aliases the plan points", "project");
+            }
+            let p = self.store.project(a.project) or fail store_down(err);
+            if !p.present { fail bad("no project " + a.project, "project"); }
+        }
+        let fresh = self.plan_in_gate(a.wants) or raise;
+        if plan_key(fresh) != plan_key(a.plan) {
+            return ArrangementApplied {
+                outcome: ApplyOutcome::drifted,
+                advice: "the fleet has changed since this plan was made, and nothing was done: here is the plan for it now; apply that one",
+                has_plan: true,
+                plan: fresh,
+            };
+        }
+        let mut out = apply_steps(fresh, a.project);
+        let mut i = 0;
+        let mut failed = false;
+        while i < count(out.steps) {
+            let mut s = at(out.steps, i) or ApplyStep { };
+            if failed { break; }
+            let why = self.apply_step(s, fresh, a) or {
+                ctl_message(err)
+            };
+            if len(why) > 0 {
+                s.state = ApplyStepState::failed;
+                s.reason = why;
+                failed = true;
+            } else {
+                s.state = ApplyStepState::done;
+            }
+            set(out.steps, i, s) or discard;
+            i = i + 1;
+        }
+        if failed {
+            out.outcome = ApplyOutcome::failed;
+            out.advice = apply_advice(out);
+        } else {
+            out.advice = "every step was done; each placement's seats come up as their nodes fetch what they name";
+        }
+        return out;
+    }
+
+    /// Step `s` of plan `p` done; "" when it was, else why not.
+    fn apply_step(
+        s: ApplyStep,
+        p: ArrangementPlan,
+        a: ArrangementApply
+    ) -> String fallible(CtlError) {
+        if s.action == ApplyAction::remove {
+            self.remove_in_gate(s.target) or raise;
+            return "";
+        }
+        if s.action == ApplyAction::catalog {
+            let mut recipe = "";
+            for x in p.add {
+                if x.model == s.target { recipe = x.recipe; }
+            }
+            self.catalog.create_in_gate(
+                CatalogModelCreate { id: s.target, has_recipe: true, recipe: recipe },
+            ) or raise;
+            return "";
+        }
+        if s.action == ApplyAction::add {
+            let add = plan_add(p, s.target);
+            // the variant and runtime the plan approved, pinned: placing it
+            // does not choose again from what the node reports, which the
+            // plan's earlier adds have not filled yet; refused, before any
+            // seat is made, when they no longer fit
+            let mut c = PlacementCreate {
+                id: add.placement,
+                model: add.model,
+                account: a.account,
+                has_variant: true,
+                variant: add.variant,
+                has_runtime: true,
+                runtime: add.runtime,
+            };
+            for n in add.nodes {
+                push(c.nodes, n) or discard;
+            }
+            self.create_in_gate(c) or raise;
+            return "";
+        }
+        if s.action == ApplyAction::alias {
+            let alias = plan_alias(p, s.target);
+            self.projects.set_alias_in_gate(a.project, alias.alias, alias.model) or raise;
+            return "";
+        }
+        return "no step " + apply_action_name(s.action);
     }
 
     /// The fleet as the store holds it now: its nodes in the order of

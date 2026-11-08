@@ -64,7 +64,7 @@ export function Arrange(_: ScreenProps) {
 
   return (
     <>
-      <h1>Arrange</h1>
+      <h1><a href={href('nodes')}>Nodes</a> · Arrange</h1>
       <Panel title="Pins" readout={`${pins.length} pinned`}>
         <p className="muted" style={{ marginTop: 0 }}>A model on a node, or split across two cabled to each other with their link checked. Name the nodes, or let voice pick any that fit.</p>
         {pins.map((p, i) => (

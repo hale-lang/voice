@@ -1,6 +1,7 @@
 import { useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Seats } from './Placements';
-import { Panel, Table, Status, Loading, Unavailable, Mono, Field, Select, NumberInput, Checkbox, Button, Confirm, bytes, type Tone } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Mono, Field, Select, NumberInput, Checkbox, Button, Confirm, TextInput, bytes, when, type Tone } from '@hale/components';
 import { api, describe, useGet, useNodes, useRecipes, type Schemas, type Placement } from '../api/client';
 import type { ScreenProps } from '../App';
 import { href } from '../route';
@@ -10,6 +11,7 @@ type Pin = Schemas['ArrangementPin'];
 type RoleWant = Schemas['ArrangementRoleWant'];
 type Plan = Schemas['ArrangementPlan'];
 type Applied = Schemas['ArrangementApplied'];
+type Kept = Schemas['Arrangement'];
 
 /** One line of the plan's diff, as the table shows it. */
 type Step = { key: string; kind: 'keep' | 'remove' | 'add' | 'alias'; what: React.ReactNode; nodes: string; detail: React.ReactNode };
@@ -36,6 +38,11 @@ export function Arrange(_: ScreenProps) {
   const [project, setProject] = useState('');
   const [applied, setApplied] = useState<Applied | null>(null);
   const accounts = useGet('/admin/v1/accounts');
+  const kept = useGet('/admin/v1/arrangements');
+  const qc = useQueryClient();
+  const [keepAs, setKeepAs] = useState('');
+  const [keepName, setKeepName] = useState('');
+  const [current, setCurrent] = useState<string | null>(null);
   const projects = useGet('/admin/v1/projects');
 
   if (roles.isPending) return <Loading what="roles" />;
@@ -89,12 +96,78 @@ export function Arrange(_: ScreenProps) {
     }
   }
 
+  /** The kept arrangement's wants, in the editor. */
+  function open(a: Kept) {
+    setPins(a.wants.pins ?? []);
+    setWanted(a.wants.roles ?? []);
+    setCurrent(a.id);
+    setKeepAs(a.id);
+    setKeepName(a.name);
+    setPlan(null);
+    setApplied(null);
+  }
+
+  /** A kept arrangement planned again, against the fleet now: asked for, never on its own. */
+  async function replan(a: Kept) {
+    open(a);
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.POST('/admin/v1/arrangements/{arrangement}/plan', { params: { path: { arrangement: a.id } } });
+      if (r.error !== undefined || !r.data) setError(describe(r.error, r.response.status));
+      else setPlan(r.data);
+      await qc.invalidateQueries({ queryKey: ['/admin/v1/arrangements'] });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** The wants in the editor, kept as `keepAs`. */
+  async function keep() {
+    setBusy(true);
+    setError(null);
+    try {
+      const r = await api.PUT('/admin/v1/arrangements/{arrangement}', { params: { path: { arrangement: keepAs } }, body: { name: keepName || undefined, wants: { pins, roles: wanted } } });
+      if (r.error !== undefined) setError(describe(r.error, r.response.status));
+      else setCurrent(keepAs);
+      await qc.invalidateQueries({ queryKey: ['/admin/v1/arrangements'] });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function forget(id: string) {
+    const r = await api.DELETE('/admin/v1/arrangements/{arrangement}', { params: { path: { arrangement: id } } });
+    if (r.error !== undefined) setError(describe(r.error, r.response.status));
+    if (current === id) setCurrent(null);
+    await qc.invalidateQueries({ queryKey: ['/admin/v1/arrangements'] });
+  }
+
   const setPin = (i: number, p: Partial<Pin>) => setPins(pins.map((x, j) => (j === i ? { ...x, ...p } : x)));
   const setRole = (i: number, w: Partial<RoleWant>) => setWanted(wanted.map((x, j) => (j === i ? { ...x, ...w } : x)));
 
   return (
     <>
       <h1><a href={href('nodes')}>Nodes</a> · Arrange</h1>
+      <Panel title="Kept arrangements" readout={kept.data ? `${kept.data.data.length} kept` : undefined}>
+        <Table<Kept>
+          rows={kept.data?.data ?? []}
+          rowKey={(a) => a.id}
+          selectedKey={current ?? undefined}
+          onSelect={open}
+          columns={[
+            { key: 'name', header: 'Arrangement', render: (a) => <><strong>{a.name}</strong> <Mono>{a.id}</Mono></> },
+            { key: 'wants', header: 'Wants', render: (a) => `${(a.wants.pins ?? []).length} pins · ${(a.wants.roles ?? []).map((r) => r.role).join(', ') || 'no roles'}` },
+            {
+              key: 'planned',
+              header: 'Planned',
+              render: (a) => (a.planned_at ? <>{when(a.planned_at)}{a.fleet_changed && <> · <Status tone="wait" label="the fleet has changed since" /></>}</> : <span className="faint">not since it was kept</span>),
+            },
+            { key: 'x', header: '', render: (a) => <span style={{ display: 'flex', gap: 'var(--space-2)' }}><Button tone={a.fleet_changed ? 'primary' : 'default'} disabled={busy} onClick={() => replan(a)}>re-plan</Button><Confirm label="forget" confirm="forget: what it applied stays" onConfirm={() => forget(a.id)} /></span> },
+          ]}
+          empty="None kept. State what the fleet is for below, and keep it to plan again later."
+        />
+      </Panel>
       <Panel title="Pins" readout={`${pins.length} pinned`}>
         <p className="muted" style={{ marginTop: 0 }}>A model on a node, or split across two cabled to each other with their link checked. Name the nodes, or let voice pick any that fit.</p>
         {pins.map((p, i) => (
@@ -164,9 +237,14 @@ export function Arrange(_: ScreenProps) {
         {roles.data.data.length === 0 && <p className="faint">voice has no role data (catalog/roles.json)</p>}
       </Panel>
 
-      <p style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+      <p style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'center', flexWrap: 'wrap' }}>
         <Button tone="primary" onClick={ask} disabled={busy || pins.some((p) => !p.model)}>{busy ? 'working…' : 'plan'}</Button>
         <span className="faint">a plan changes nothing</span>
+        <span style={{ marginLeft: 'auto', display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+          <TextInput mono value={keepAs} onChange={setKeepAs} pattern="^[a-z0-9][a-z0-9-]{0,62}$" placeholder="id, to keep it" />
+          <TextInput value={keepName} onChange={setKeepName} placeholder="name" />
+          <Button onClick={keep} disabled={busy || !keepAs}>{current === keepAs ? 'keep changes' : 'keep'}</Button>
+        </span>
       </p>
       {error && <p className="c-fail">{error}</p>}
       {applied && <AppliedView applied={applied} />}

@@ -1782,6 +1782,144 @@ locus PgStore {
         ) or raise;
     }
 
+    // ---- arrangements
+
+    fn arrangement(id: String) -> ArrangementRow fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.arrangement_locked(id) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn arrangement_locked(id: String) -> ArrangementRow fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        let j = self.row(
+            "SELECT row_to_json(t) FROM (" + ARRANGEMENT_COLUMNS + " WHERE id = $1) t",
+            a,
+        ) or raise;
+        return arrangement_row(j);
+    }
+
+    fn arrangements() -> ArrangementRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.arrangements_locked() or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn arrangements_locked() -> ArrangementRows fallible(StoreError) {
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (" + ARRANGEMENT_COLUMNS + " ORDER BY created_at, id) t",
+            db::Args { },
+        ) or raise;
+        let mut out = ArrangementRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, arrangement_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn put_arrangement(row: ArrangementRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.put_arrangement_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn put_arrangement_locked(row: ArrangementRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        let had = self.row(
+            "SELECT row_to_json(t) FROM (SELECT id FROM arrangement WHERE id = $1) t",
+            one_arg(row.id),
+        ) or raise;
+        if len(had) == 0 {
+            self.room(
+                "SELECT count(*) FROM arrangement",
+                db::Args { },
+                64,
+                "voice holds at most 64 arrangements",
+            ) or raise;
+        }
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.name);
+        a.add(row.body);
+        a.add(std::time::iso8601(row.created_at));
+        a.add(std::time::iso8601(row.updated_at));
+        a.add(row.revision);
+        self.step(
+            "INSERT INTO arrangement (id, name, body, created_at, updated_at, revision) VALUES ($1, $2, $3::jsonb, $4::timestamptz, $5::timestamptz, $6) ON CONFLICT (id) DO UPDATE SET name = excluded.name, body = excluded.body, updated_at = excluded.updated_at, revision = excluded.revision, planned_at = NULL, planned_basis = ''",
+            a,
+        ) or raise;
+        self.commit_with(change) or raise;
+        return len(had) == 0;
+    }
+
+    fn delete_arrangement(id: String, change: ChangeRow) fallible(StoreError) {
+        self.lock.enter();
+        self.delete_arrangement_locked(id, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn delete_arrangement_locked(id: String, change: ChangeRow) fallible(StoreError) {
+        self.begin() or raise;
+        self.step("DELETE FROM arrangement WHERE id = $1", one_arg(id)) or raise;
+        self.commit_with(change) or raise;
+    }
+
+    fn plan_arrangement_at(
+        id: String,
+        revision: String,
+        at: Time,
+        basis: String
+    ) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let wrote = self.plan_arrangement_at_locked(id, revision, at, basis) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return wrote;
+    }
+
+    fn plan_arrangement_at_locked(
+        id: String,
+        revision: String,
+        at: Time,
+        basis: String
+    ) -> Bool fallible(StoreError) {
+        let a = db::Args { };
+        a.add(id);
+        a.add(std::time::iso8601(at));
+        a.add(basis);
+        a.add(revision);
+        // only the revision planned: one saved since, on any instance, is
+        // left unplanned
+        let all = self.rows(
+            "WITH w AS (UPDATE arrangement SET planned_at = $2::timestamptz, planned_basis = $3 WHERE id = $1 AND revision = $4 RETURNING id) SELECT count(*) FROM w",
+            a,
+        ) or raise;
+        return std::str::trim(all) != "0" && len(std::str::trim(all)) > 0;
+    }
+
     fn link_checks() -> LinkCheckRows fallible(StoreError) {
         self.lock.enter();
         let taken = self.link_checks_locked() or {
@@ -3605,6 +3743,31 @@ fn recipe_row(j: String) -> RecipeRow {
         removed_at: pg_time(pg_text(j, "removed_at")),
         present: true
     };
+}
+
+const ARRANGEMENT_COLUMNS: String = "SELECT id, name, body, created_at, updated_at, revision, planned_at, planned_basis FROM arrangement";
+
+fn arrangement_row(j: String) -> ArrangementRow {
+    if len(j) == 0 { return ArrangementRow { }; }
+    return ArrangementRow {
+        id: pg_text(j, "id"),
+        name: pg_text(j, "name"),
+        body: std::str::trim(std::json::find_field_raw(j, "body")),
+        created_at: pg_time(pg_text(j, "created_at")),
+        updated_at: pg_time(pg_text(j, "updated_at")),
+        revision: pg_text(j, "revision"),
+        planned: len(raw_or_empty(j, "planned_at")) > 0,
+        planned_at: pg_time(pg_text(j, "planned_at")),
+        planned_basis: pg_text(j, "planned_basis"),
+        present: true
+    };
+}
+
+/// One argument, `v`.
+fn one_arg(v: String) -> db::Args {
+    let a = db::Args { };
+    a.add(v);
+    return a;
 }
 
 const RUNTIME_COLUMNS: String = "SELECT id, body, created_at, removed_at FROM runtime";

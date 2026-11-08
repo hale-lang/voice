@@ -7,10 +7,11 @@
 const ARRANGE_WITHIN_S: Int = 60;
 const APPLY_WITHIN_S: Int = 600;
 
-/// `api arrange plan --wants FILE [--api URL] [--token-file FILE]
-/// [--database URL] [--state DIR]`: post the wants in FILE (an
-/// `ArrangementWants`) to the api at URL (`http://127.0.0.1:8080` by
-/// default) and print the plan. `api arrange apply ... --account ACCOUNT
+/// `api arrange plan (--wants FILE | --arrangement ID) [--api URL]
+/// [--token-file FILE] [--database URL] [--state DIR]`: post the wants in
+/// FILE (an `ArrangementWants`) to the api at URL (`http://127.0.0.1:8080`
+/// by default), or plan the kept arrangement ID again against the fleet
+/// now, and print the plan. `api arrange apply ... --account ACCOUNT
 /// [--project PROJECT]` plans the same way, prints the plan and carries it
 /// out, the seats it adds spending ACCOUNT and its aliases set on PROJECT,
 /// and prints each step. The operator token is FILE's (`--token-file`), or
@@ -30,10 +31,13 @@ locus ArrangeCli {
             return 2;
         }
         let base = if std::str::ends_with(a.api, "/") { a.api[0..(len(a.api) - 1)] } else { a.api };
-        let wants = std::io::fs::read_file(a.wants) or {
-            log_error("arrange: no file " + a.wants, "");
-            return 1;
-        };
+        let mut wants = "";
+        if len(a.wants) > 0 {
+            wants = std::io::fs::read_file(a.wants) or {
+                log_error("arrange: no file " + a.wants, "");
+                return 1;
+            };
+        }
         let mut token = "";
         if len(a.token_file) > 0 {
             token = std::str::trim(std::io::fs::read_file(a.token_file) or "");
@@ -50,12 +54,34 @@ locus ArrangeCli {
             };
         }
         let headers = "Content-Type: application/json\r\nAuthorization: Bearer " + token;
+        // a kept arrangement: its wants, as the api keeps them, planned again
+        if len(a.arrangement) > 0 {
+            let kept = exchange(
+                base + "/admin/v1/arrangements/" + a.arrangement,
+                ARRANGE_WITHIN_S * 1s,
+                "GET",
+                headers,
+                "",
+            );
+            let missing = answer_problem(kept);
+            if len(missing) > 0 {
+                log_error("arrange: " + missing, "");
+                return 1;
+            }
+            wants = std::str::trim(std::json::find_field_raw(kept.body, "wants"));
+        }
         let got = exchange(
-            base + "/admin/v1/arrangement-plans",
+            base + (
+                if len(a.arrangement) > 0 {
+                    "/admin/v1/arrangements/" + a.arrangement + "/plan"
+                } else {
+                    "/admin/v1/arrangement-plans"
+                }
+            ),
             ARRANGE_WITHIN_S * 1s,
             "POST",
             headers,
-            wants,
+            if len(a.arrangement) > 0 { "{}" } else { wants },
         );
         let refused = answer_problem(got);
         if len(refused) > 0 {
@@ -111,6 +137,7 @@ type ArrangeArgs {
     state: String = "";
     account: String = "";
     project: String = "";
+    arrangement: String = "";
     problem: String = "";
 }
 
@@ -124,7 +151,7 @@ fn arrange_args() -> ArrangeArgs {
             ""
         },
     };
-    let usage = "usage: api arrange plan --wants FILE [--api URL] [--token-file FILE]; api arrange apply --wants FILE --account ACCOUNT [--project PROJECT] [--api URL] [--token-file FILE]";
+    let usage = "usage: api arrange plan (--wants FILE | --arrangement ID) [--api URL] [--token-file FILE]; api arrange apply (--wants FILE | --arrangement ID) --account ACCOUNT [--project PROJECT] [--api URL] [--token-file FILE]";
     if std::env::args_count() < 3 || (std::env::arg(2) != "plan" && std::env::arg(2) != "apply") {
         out.problem = usage;
         return out;
@@ -144,6 +171,8 @@ fn arrange_args() -> ArrangeArgs {
             out.database = value;
         } else if flag == "--state" {
             out.state = value;
+        } else if flag == "--arrangement" {
+            out.arrangement = value;
         } else if flag == "--account" && out.apply {
             out.account = value;
         } else if flag == "--project" && out.apply {
@@ -154,8 +183,8 @@ fn arrange_args() -> ArrangeArgs {
         }
         i = i + 2;
     }
-    if len(out.wants) == 0 {
-        out.problem = "arrange: --wants names the file of what the fleet is for";
+    if (len(out.wants) == 0) == (len(out.arrangement) == 0) {
+        out.problem = "arrange: --wants names the file of what the fleet is for, or --arrangement a kept arrangement: one of the two";
     } else if out.apply && len(out.account) == 0 {
         out.problem = "arrange apply: --account names the account the seats it adds spend";
     }

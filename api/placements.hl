@@ -844,9 +844,17 @@ locus Placements {
     }
 
     fn plan_in_gate(w: ArrangementWants) -> ArrangementPlan fallible(CtlError) {
+        let planned = self.planned_in_gate(w) or raise;
+        return planned.plan;
+    }
+
+    /// The plan for wants `w`, and the digest of the fleet it was made
+    /// from (`fleet_basis`), one read of the fleet for both.
+    fn planned_in_gate(w: ArrangementWants) -> Planned fallible(CtlError) {
         let f = self.arrangement_fleet_in_gate(w) or raise;
         let problem = check_wants(f, w, self.roles);
         if len(problem) > 0 { fail bad(problem, "wants"); }
+        let basis = fleet_basis(f.nodes, f.placed, f.checks, f.now);
         let plan = plan_fleet(f, w, self.roles);
         // each add under an id no placement has held, since an id is never
         // reused: its model and leader, or with `-2`, `-3`…
@@ -875,7 +883,153 @@ locus Placements {
             set(out.add, i, fresh) or discard;
             i = i + 1;
         }
+        return Planned { plan: out, basis: basis };
+    }
+
+    /// `listArrangements`.
+    fn list_arrangements() -> ArrangementList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.list_arrangements_in_gate() or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn list_arrangements_in_gate() -> ArrangementList fallible(CtlError) {
+        let rows = self.store.arrangements() or fail store_down(err);
+        let basis = self.basis_in_gate() or raise;
+        let mut out = ArrangementList { };
+        for r in rows.rows {
+            push(out.data, arrangement_of(r, basis)) or discard;
+        }
         return out;
+    }
+
+    /// `getArrangement`.
+    fn get_arrangement(r: ArrangementRef) -> Arrangement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.get_arrangement_in_gate(r.arrangement) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn get_arrangement_in_gate(id: String) -> Arrangement fallible(CtlError) {
+        let row = self.store.arrangement(id) or fail store_down(err);
+        if !row.present { fail missing("no arrangement " + id); }
+        let basis = self.basis_in_gate() or raise;
+        return arrangement_of(row, basis);
+    }
+
+    /// `putArrangement`: wants kept as arrangement `p.arrangement`, checked
+    /// as a plan checks them; a plan is not made.
+    fn put_arrangement(p: ArrangementPut) -> Arrangement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.put_arrangement_in_gate(p) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn put_arrangement_in_gate(p: ArrangementPut) -> Arrangement fallible(CtlError) {
+        if !is_slug(p.arrangement) {
+            fail bad(
+                "an arrangement's id is lowercase letters, digits and dashes, starting with a letter or digit, at most 63",
+                "arrangement"
+            );
+        }
+        if len(p.name) > 200 { fail bad("`name` is at most 200 characters", "name"); }
+        let f = self.arrangement_fleet_in_gate(p.wants) or raise;
+        let problem = check_wants(f, p.wants, self.roles);
+        if len(problem) > 0 { fail bad(problem, "wants"); }
+        let before = self.store.arrangement(p.arrangement) or fail store_down(err);
+        let now = now_seconds();
+        let row = st::ArrangementRow {
+            id: p.arrangement,
+            name: if len(p.name) > 0 { p.name } else { p.arrangement },
+            body: ArrangementWants::api_encode(p.wants),
+            created_at: if before.present { before.created_at } else { now },
+            updated_at: now,
+            // a new revision with every save: a plan of the wants before
+            // does not mark these planned (`plan_arrangement_at`)
+            revision: st::random_id(12),
+        };
+        let after = Arrangement::api_encode(arrangement_of(row, ""));
+        self.store.put_arrangement(
+            row,
+            checked_change(
+                if before.present { "update" } else { "create" },
+                "arrangements/" + p.arrangement,
+                if before.present {
+                    Arrangement::api_encode(arrangement_of(before, ""))
+                } else {
+                    ""
+                },
+                after,
+            ) or raise,
+        ) or fail store_down(err);
+        let kept = self.store.arrangement(p.arrangement) or fail store_down(err);
+        return arrangement_of(kept, "");
+    }
+
+    /// `removeArrangement`.
+    fn remove_arrangement(r: ArrangementRef) -> Arrangement fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.remove_arrangement_in_gate(r.arrangement) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn remove_arrangement_in_gate(id: String) -> Arrangement fallible(CtlError) {
+        let row = self.store.arrangement(id) or fail store_down(err);
+        if !row.present { fail missing("no arrangement " + id); }
+        let v = arrangement_of(row, "");
+        self.store.delete_arrangement(
+            id,
+            checked_change("delete", "arrangements/" + id, Arrangement::api_encode(v), "") or raise,
+        ) or fail store_down(err);
+        return v;
+    }
+
+    /// `planSavedArrangement`: arrangement `r`'s wants planned against the
+    /// fleet now, as `planArrangement` plans them; the plan's time and the
+    /// fleet it was made against recorded. Asked for, never on its own.
+    fn plan_saved_arrangement(r: ArrangementRef) -> ArrangementPlan fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.plan_saved_in_gate(r.arrangement) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    fn plan_saved_in_gate(id: String) -> ArrangementPlan fallible(CtlError) {
+        let row = self.store.arrangement(id) or fail store_down(err);
+        if !row.present { fail missing("no arrangement " + id); }
+        let wants = ArrangementWants::api_decode(row.body) or ArrangementWants { };
+        // recorded against the fleet the plan was made from, and only on
+        // the revision it planned: wants saved again meanwhile, on any
+        // instance, stay unplanned
+        let planned = self.planned_in_gate(wants) or raise;
+        self.store.plan_arrangement_at(id, row.revision, now_seconds(), planned.basis)
+        or fail store_down(err);
+        return planned.plan;
+    }
+
+    /// The fleet now as a plan depends on it (`fleet_basis`).
+    fn basis_in_gate() -> String fallible(CtlError) {
+        let f = self.arrangement_fleet_in_gate(ArrangementWants { }) or raise;
+        return fleet_basis(f.nodes, f.placed, f.checks, f.now);
     }
 
     /// `applyArrangement`: plan `a` carried out, as ordinary placements, in

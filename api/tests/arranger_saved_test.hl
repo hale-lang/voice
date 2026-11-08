@@ -1,0 +1,238 @@
+// Arrangements kept (arranger.hl, "arrangements kept"): wants saved under
+// an id, planned again on demand, each plan recording the fleet it was
+// made against, so a read says when the fleet has changed since; a node
+// joining plans nothing on its own.
+import ".." as api;
+import "../../store" as st;
+import "../../node" as node;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+/// A DGX Spark's two ports on its one cabled QSFP port, to `peer`.
+fn link_to(peer: String, a: String, b: String) -> String {
+    return "{\"peer\": \"" + peer + "\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \""
+        + a + "\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"" + b
+        + "\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}";
+}
+
+/// A DGX Spark's capabilities: a managed engine, its GB10 (compute
+/// capability 12.1, as TensorFold's kernels are built for), and its links.
+fn spark(links: String) -> String {
+    let memory = 130661072896;
+    return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": "
+        + to_string(memory) + ", \"model_memory_bytes\": "
+        + to_string(node::model_memory("{}", memory))
+        + ", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": "
+        + to_string(memory)
+        + ", \"unified\": true, \"compute_capability\": \"12.1\"}], \"disk_free_bytes\": 3500000000000}"
+        + (if len(links) > 0 { ", \"links\": [" + links + "]" } else { "" }) + "}";
+}
+
+fn add_node(store: st::Store, id: String, capabilities: String) {
+    store.insert_node(
+        st::NodeRow { id: id, name: id, max_in_flight: 4, created_at: api::now_seconds() },
+        api::change("create", "nodes/" + id, "", "{}"),
+    ) or discard;
+    store.put_fleet(st::FleetRow { node: id, capabilities: capabilities, present: true })
+    or discard;
+    store.put_beat(id, api::now_seconds(), 0) or discard;
+}
+
+/// The link between spark and flare, checked and passed.
+fn checked(store: st::Store, link: api::Link) {
+    let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
+    let usable = rts.usable_in_gate() or api::RuntimeList { };
+    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let said = api::link_result_json(
+        api::LinkCheckResult {
+            id: c.id,
+            ok: true,
+            has_bus_bytes_per_second: true,
+            bus_bytes_per_second: 20000000000,
+        },
+        api::now_seconds(),
+    );
+    store.put_link_result(c.id, "spark", said) or discard;
+    store.put_link_result(c.id, "flare", said) or discard;
+}
+
+fn pin(model: String, n: Int) -> api::ArrangementPin {
+    return api::ArrangementPin { model: model, count: n };
+}
+
+fn role(id: String, priority: Int) -> api::ArrangementRoleWant {
+    return api::ArrangementRoleWant { role: id, priority: priority };
+}
+
+fn nodes_of(n: bounded[String; 2]) -> String {
+    let out = st::JsonList { };
+    for x in n {
+        out.add(x);
+    }
+    return std::str::replace(out.text(), ", ", "+");
+}
+
+fn added_on(p: api::ArrangementPlan, recipe: String) -> String {
+    for a in p.add {
+        if a.recipe == recipe { return nodes_of(a.nodes); }
+    }
+    return "";
+}
+
+fn main() {
+    let read = api::roles_of(std::io::fs::read_file(shipped("catalog") + "/roles.json") or "");
+    let store = st::MemoryStore { };
+    let link = api::NatsLink { };
+    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(shipped("recipes")) };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let seats = api::Seats { store: store, link: link };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: seats,
+        roles: read.roles,
+    };
+    add_node(store, "spark", spark(link_to("flare", "192.168.100.1", "192.168.101.1")));
+    add_node(store, "flare", spark(link_to("spark", "192.168.100.2", "192.168.101.2")));
+    checked(store, link);
+
+    let mut w = api::ArrangementWants { };
+    push(w.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
+    push(w.roles, role("coder", 1)) or discard;
+
+    // ---- kept, checked as a plan checks them -------------------------------
+    let mut bad = api::ArrangementWants { };
+    push(bad.roles, role("juggler", 0)) or discard;
+    placements.put_arrangement(api::ArrangementPut { arrangement: "lab", wants: bad }) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "no role juggler"),
+            "an unknown role is refused: " + api::ctl_message(err),
+        );
+        api::Arrangement { }
+    };
+    placements.put_arrangement(api::ArrangementPut { arrangement: "Lab", wants: w }) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "lowercase"),
+            "an id is a slug: " + api::ctl_message(err),
+        );
+        api::Arrangement { }
+    };
+    let kept = placements.put_arrangement(
+        api::ArrangementPut { arrangement: "lab", name: "The lab", wants: w },
+    ) or {
+        std::test::assert(false, "kept: " + api::ctl_message(err));
+        return;
+    };
+    std::test::assert(
+        kept.id == "lab" && kept.name == "The lab" && count(kept.wants.pins) == 1
+            && !kept.has_planned_at,
+        "kept, not planned",
+    );
+    let changes = store.changes(st::ChangeQuery { limit: 5 }) or st::ChangeRows { };
+    let mut logged = false;
+    for c in changes.rows {
+        if c.target == "arrangements/lab" && c.action == "create" { logged = true; }
+    }
+    std::test::assert(logged, "keeping it is a change");
+
+    // ---- planned on demand, the fleet it was made against recorded ------------
+    let planned = placements.plan_saved_arrangement(api::ArrangementRef { arrangement: "lab" }) or {
+        std::test::assert(false, "planned: " + api::ctl_message(err));
+        return;
+    };
+    let mut coder = "";
+    for u in planned.unmet {
+        if u.want == "coder" { coder = u.reason; }
+    }
+    std::test::assert(
+        std::str::contains(coder, "no node has room for a coder"),
+        "two Sparks, the pair whole: the coder unmet: " + api::plan_text(planned),
+    );
+    let after = placements.get_arrangement(
+        api::ArrangementRef { arrangement: "lab" },
+    ) or api::Arrangement { };
+    std::test::assert(after.has_planned_at && !after.fleet_changed, "planned, the fleet as it was");
+
+    // ---- a third Spark joins: nothing is planned, the arrangement says so ----
+    add_node(store, "spark3", spark(""));
+    let joined = placements.get_arrangement(
+        api::ArrangementRef { arrangement: "lab" },
+    ) or api::Arrangement { };
+    std::test::assert(joined.fleet_changed, "the fleet has changed since it was planned");
+    std::test::assert(
+        std::time::unix(joined.planned_at) == std::time::unix(after.planned_at),
+        "and it was not planned again on its own",
+    );
+    let listed = placements.list_arrangements() or api::ArrangementList { };
+    let first = at(listed.data, 0) or api::Arrangement { };
+    std::test::assert(count(listed.data) == 1 && first.fleet_changed, "listed, changed");
+    let again = placements.plan_saved_arrangement(
+        api::ArrangementRef { arrangement: "lab" },
+    ) or api::ArrangementPlan { };
+    let mut on3 = "";
+    for a in again.add {
+        if a.recipe == "qwen3-coder-next" { on3 = names(a.nodes); }
+    }
+    std::test::assert_eq_str(on3, "spark3", "planned again, the coder on spark3");
+    let now = placements.get_arrangement(
+        api::ArrangementRef { arrangement: "lab" },
+    ) or api::Arrangement { };
+    std::test::assert(!now.fleet_changed, "planned against the fleet now");
+
+    // ---- a plan of older wants does not mark newer ones planned -------------
+    let older = store.arrangement("lab") or st::ArrangementRow { };
+    placements.put_arrangement(api::ArrangementPut { arrangement: "lab", name: "Lab v2", wants: w })
+    or discard;
+    let newer = store.arrangement("lab") or st::ArrangementRow { };
+    std::test::assert(
+        len(newer.revision) > 0 && newer.revision != older.revision && !newer.planned,
+        "saved again: a new revision, unplanned",
+    );
+    let stale_mark = store.plan_arrangement_at("lab", older.revision, api::now_seconds(), "x")
+    or true;
+    let after_stale = store.arrangement("lab") or st::ArrangementRow { };
+    std::test::assert(
+        !stale_mark && !after_stale.planned,
+        "the older revision's plan is not recorded",
+    );
+    let fresh_mark = store.plan_arrangement_at("lab", newer.revision, api::now_seconds(), "x")
+    or false;
+    std::test::assert(fresh_mark, "its own revision's is");
+    // the basis recorded is the fleet the plan was made from
+    placements.plan_saved_arrangement(api::ArrangementRef { arrangement: "lab" }) or discard;
+    let marked = store.arrangement("lab") or st::ArrangementRow { };
+    let f = placements.arrangement_fleet_in_gate(w) or api::ArrangeFleet { };
+    std::test::assert_eq_str(
+        marked.planned_basis,
+        api::fleet_basis(f.nodes, f.placed, f.checks, f.now),
+        "the fleet planned against",
+    );
+
+    // ---- kept again, its plan's record cleared; removed ----------------------
+    let renamed = placements.put_arrangement(
+        api::ArrangementPut { arrangement: "lab", name: "Lab", wants: w },
+    ) or api::Arrangement { };
+    std::test::assert(renamed.name == "Lab" && !renamed.has_planned_at, "kept again");
+    placements.remove_arrangement(api::ArrangementRef { arrangement: "lab" }) or discard;
+    placements.get_arrangement(api::ArrangementRef { arrangement: "lab" }) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "no arrangement lab"),
+            "removed: " + api::ctl_message(err),
+        );
+        api::Arrangement { }
+    };
+}
+
+fn names(n: bounded[String; 2]) -> String {
+    let out = st::JsonList { };
+    for x in n {
+        out.add(x);
+    }
+    return out.text();
+}

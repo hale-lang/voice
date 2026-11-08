@@ -125,19 +125,16 @@ function observed(qc: QueryClient, node: NodeSummary): boolean {
       return mine && (path === '/admin/v1/nodes/{node}' || path === '/admin/v1/nodes/{node}/seats/{seat}' || (stored && path === '/admin/v1/nodes/{node}/downloads'));
     },
   });
-  // a seat placed, removed or moving changes what can be routed
-  return !before || seatStates(before) !== seatStates(node);
+  // anything but the heartbeat can change what is routed: a seat placed,
+  // removed or moving, and a seat's load or its node's cap, which the
+  // route table's `free` is made of
+  return true;
 }
 
 /** A node as reported, but for when it last reported: what a change is. */
 function sansBeat(n: NodeSummary): string {
   const { last_heartbeat_at: _, ...rest } = n;
   return JSON.stringify(rest);
-}
-
-/** A node's seats with their states, to tell one that moved. */
-function seatStates(n: NodeSummary): string {
-  return n.seats.map((s) => `${s.id}=${s.status}`).join(',');
 }
 
 /** A node's store, in short, to tell a change. */

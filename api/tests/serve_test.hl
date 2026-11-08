@@ -24,6 +24,12 @@ locus Nodes {
         // a node that accepts and then sends nothing at all
         mute: String = "";
         tool: String = "";
+        // a node whose seat is serving its most at once: it refuses for
+        // capacity its next `busy_for` offers (-1: every one), then takes
+        // them, as a seat whose slot frees does
+        busy: String = "";
+        busy_for: Int = 0;
+        busy_offers: Int = 0;
         // when set, every seat answers as an openai-compatible one whose
         // upstream streamed this SSE (a tool call in fragments)
         compat_sse: String = "";
@@ -45,6 +51,18 @@ locus Nodes {
     fn offer(to: String, reply_to: String, body: String) -> api::Offer {
         self.offers = self.offers + 1;
         self.last_body = body;
+        if to == self.busy && self.busy_for != 0 {
+            if self.busy_for > 0 { self.busy_for = self.busy_for - 1; }
+            self.busy_offers = self.busy_offers + 1;
+            return Scripted {
+                tally: self.tally,
+                outcome: api::ServeOutcome {
+                    ack: "refused",
+                    reason: "seat static is serving 1, its most at once",
+                    refusal: "capacity",
+                },
+            };
+        }
         if to == self.refusing {
             return Scripted {
                 tally: self.tally,
@@ -176,6 +194,206 @@ locus Scripted {
         }
         self.ended = true;
     }
+}
+
+/// A seat at capacity is busy, not failed: a request every seat it may go
+/// to refuses so waits for a slot, in its model's queue, and is served when
+/// one frees; past its own deadline it is `504`, past voice's bound `429
+/// no_capacity` with `Retry-After`, never `502`. A streamed one waits the
+/// same, nothing sent until a seat takes it.
+fn busy_seats(e: api::DataPlane, key: String, nodes: Nodes) {
+    // laptop's one slot frees after two offers; desktop's seat is paused:
+    // a failure, not offered again
+    nodes.busy = "laptop";
+    nodes.busy_for = 2;
+    nodes.refusing = "desktop";
+    let t0 = std::time::monotonic_ns();
+    let waited = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    let ms = (std::time::monotonic_ns() - t0) / 1000000;
+    expect(waited, 200, "a request to a busy seat waits for its slot, then is served");
+    let v = std::json::find_field_raw(waited.body, "voice");
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(v, "served"), "seat"),
+        "laptop/static",
+        "by the busy seat once its slot freed",
+    );
+    std::test::assert_eq_int(nodes.busy_offers, 2, "offered again while it was busy");
+    std::test::assert(ms >= 400, "after waiting for it: " + to_string(ms) + " ms");
+    std::test::assert(
+        std::json::find_int_field(std::json::find_field_raw(v, "timing"), "queue_ms") >= 400,
+        "its wait is its queue_ms: " + std::json::find_field_raw(v, "timing"),
+    );
+    let attempts = std::json::find_field_raw(v, "attempts");
+    std::test::assert_eq_int(
+        occurrences(attempts, "\"seat\": \"laptop/static\""),
+        1,
+        "a refusal for capacity is no attempt, so no failover: " + attempts,
+    );
+    std::test::assert_eq_int(
+        occurrences(attempts, "\"seat\": \"desktop/static\""),
+        1,
+        "the paused seat failed once, and was not offered again: " + attempts,
+    );
+
+    // a streamed request waits the same: nothing is sent until a seat takes it
+    nodes.busy_for = 2;
+    let streamed = ask(
+        e,
+        "/v1/responses",
+        key,
+        "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
+    );
+    expect(streamed, 200, "a streamed request to a busy seat waits, then streams");
+    std::test::assert(
+        std::str::starts_with(streamed.body, "event: voice:attempt\ndata: {")
+            && !std::str::contains(streamed.body, "most at once"),
+        "its stream tells only the seat that failed, not the busy one's refusals: "
+            + streamed.body,
+    );
+    std::test::assert(
+        std::str::contains(streamed.body, "\"next_seat\": \"laptop/static\"")
+            && std::str::contains(streamed.body, "event: response.completed"),
+        "and is served whole by the seat that freed",
+    );
+
+    // a seat that stays busy: past voice's bound, 429 with Retry-After
+    nodes.refusing = "";
+    nodes.busy_for = -1;
+    let desktop_off = api::Seats { store: e.store, link: e.link };
+    desktop_off.update(
+        api::SeatUpdate { node: "desktop", seat: "static", has_enabled: true, enabled: false },
+    ) or discard;
+    e.inference.wait = 1s;
+    let t1 = std::time::monotonic_ns();
+    let full = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    let full_ms = (std::time::monotonic_ns() - t1) / 1000000;
+    expect(full, 429, "a request no slot freed for within the bound");
+    std::test::assert(full_ms >= 1000 && full_ms < 5000, "after the bound: " + to_string(full_ms));
+    std::test::assert_eq_str(full.headers, "Retry-After: 5", "with Retry-After");
+    let fe = std::json::find_field_raw(full.body, "error");
+    std::test::assert_eq_str(
+        std::json::find_string_field(fe, "code"),
+        "no_capacity",
+        "no_capacity",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(fe, "type"),
+        "too_many_requests",
+        "too many requests",
+    );
+    std::test::assert(
+        std::str::contains(
+            std::json::find_string_field(fe, "message"),
+            "every seat serving model echo-1 is busy",
+        ),
+        "naming the model and that its seats are busy: "
+            + std::json::find_string_field(fe, "message"),
+    );
+    let full_stream = ask(
+        e,
+        "/v1/responses",
+        key,
+        "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
+    );
+    expect(full_stream, 429, "a streamed one too, answered whole");
+    std::test::assert(
+        std::str::starts_with(full_stream.content_type, "application/json"),
+        "no stream begun",
+    );
+
+    // its own deadline, shorter than the bound: honoured, as 504
+    e.inference.wait = 60s;
+    let soon = std::time::iso8601(
+        std::time::from_nanos(std::time::nanos(std::time::current()) + 1000000000),
+    );
+    let t2 = std::time::monotonic_ns();
+    let late = ask(
+        e,
+        "/v1/responses",
+        key,
+        "{\"model\": \"echo-1\", \"input\": \"hi\", \"voice\": {\"deadline\": \"" + soon
+            + "\"}}",
+    );
+    let late_ms = (std::time::monotonic_ns() - t2) / 1000000;
+    expect(late, 504, "a request whose deadline passed while it waited: " + soon);
+    std::test::assert(late_ms < 5000, "at its deadline, not voice's bound: " + to_string(late_ms));
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(late.body, "error"), "code"),
+        "deadline_exceeded",
+        "deadline_exceeded",
+    );
+    nodes.busy = "";
+    nodes.busy_for = 0;
+    desktop_off.update(
+        api::SeatUpdate { node: "desktop", seat: "static", has_enabled: true, enabled: true },
+    ) or discard;
+}
+
+/// The queue for a slot keeps arrival order among the requests for the
+/// same seats: a request waits behind those that came before it for them,
+/// not behind another model's, nor one that may go to other seats.
+fn slot_queue() {
+    let mut two = api::Candidates { };
+    push(two.items, api::Candidate { seat: st::SeatRow { ref: "mini/coder" } }) or discard;
+    push(two.items, api::Candidate { seat: st::SeatRow { ref: "lin1/coder" } }) or discard;
+    let mut turned = api::Candidates { };
+    push(turned.items, api::Candidate { seat: st::SeatRow { ref: "lin1/coder" } }) or discard;
+    push(turned.items, api::Candidate { seat: st::SeatRow { ref: "mini/coder" } }) or discard;
+    let mut one = api::Candidates { };
+    push(one.items, api::Candidate { seat: st::SeatRow { ref: "lin1/coder" } }) or discard;
+    std::test::assert_eq_str(
+        api::seats_key("coder", two),
+        "coder lin1/coder mini/coder",
+        "the model and its seats, in order",
+    );
+    std::test::assert_eq_str(
+        api::seats_key("coder", turned),
+        api::seats_key("coder", two),
+        "whichever a conversation offers first",
+    );
+    std::test::assert(
+        api::seats_key("coder", one) != api::seats_key("coder", two),
+        "fewer seats are another queue",
+    );
+    let mut q = api::queue_joined("", "coder", "resp_a");
+    q = api::queue_joined(q, "chat", "resp_b");
+    q = api::queue_joined(q, "coder", "resp_c");
+    std::test::assert(!api::queue_ahead(q, "coder", "resp_a"), "the first is at the head");
+    std::test::assert(!api::queue_ahead(q, "chat", "resp_b"), "another model's is not behind it");
+    std::test::assert(api::queue_ahead(q, "coder", "resp_c"), "the third waits for the first");
+    std::test::assert(api::queue_waits(q, "coder"), "coder has waiters");
+    std::test::assert(!api::queue_waits(q, "code"), "a model whose id is a prefix has none");
+    q = api::queue_left(q, "resp_a");
+    std::test::assert(!api::queue_ahead(q, "coder", "resp_c"), "once the first is done, its turn");
+    q = api::queue_left(q, "resp_c");
+    q = api::queue_left(q, "resp_x");
+    std::test::assert_eq_str(q, "resp_b\tw\tchat\n", "only the other model's is left");
+    std::test::assert(!api::queue_waits(q, "coder"), "and coder has none");
+}
+
+/// A waiting request a seat takes and then fails waits again in the place
+/// it first took, ahead of those that came after it: the instance's queue
+/// as `serve_held` and `stream_held` move it (`queued`, `taken`, `leave`).
+fn slot_queue_kept(e: api::DataPlane) {
+    let inf = e.inference;
+    let mut a = inf.queued(api::Waiting { request_id: "resp_a", key: "coder s1 s2" });
+    let b = inf.queued(api::Waiting { request_id: "resp_b", key: "coder s1 s2" });
+    std::test::assert(api::queue_ahead(inf.queue, b.key, "resp_b"), "b waits behind a");
+    // a seat takes a: b is no longer held back by it
+    inf.taken("resp_a");
+    std::test::assert(!api::queue_ahead(inf.queue, b.key, "resp_b"), "b's turn while a is served");
+    std::test::assert(api::queue_waits(inf.queue, b.key), "b still waits");
+    // the seat fails a, and every other seat is busy: a waits again, first
+    a = inf.queued(a);
+    std::test::assert(a.queued, "a is in the queue");
+    std::test::assert(!api::queue_ahead(inf.queue, a.key, "resp_a"), "a is at the head again");
+    std::test::assert(
+        api::queue_ahead(inf.queue, b.key, "resp_b"),
+        "b waits behind a again, not ahead: " + inf.queue,
+    );
+    inf.leave("resp_a");
+    inf.leave("resp_b");
+    std::test::assert_eq_str(inf.queue, "", "both done, the queue is empty");
 }
 
 /// The streamed answers: the standard event stream, and Chat Completions
@@ -1538,6 +1756,9 @@ fn main() {
     );
     nodes.refusing = "";
     nodes.failing = "";
+    busy_seats(e, key, nodes);
+    slot_queue();
+    slot_queue_kept(e);
 
     // a node whose local cap is 0 is at its cap: its seats are not offered
     let before = nodes.offers;

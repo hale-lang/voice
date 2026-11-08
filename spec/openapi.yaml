@@ -90,7 +90,8 @@ info:
     spend an account the key permits (narrowed by `voice.account` when the
     request names one). Accounts with no headroom left are skipped, and
     seats at their concurrency, or on a node at its in-flight cap, are
-    skipped. Voice picks the account with the
+    skipped; when every one is, the request waits for a slot (see "Rate
+    limits, budgets and quota"). Voice picks the account with the
     most headroom, then the least loaded of its seats.
 
     The coordinator reaches nodes over NATS on the private network, and nodes
@@ -158,8 +159,17 @@ info:
     every applicable limit and the budget before dispatch, using estimated
     input tokens plus the requested maximum output (the model's default maximum
     when the request sets none), and settles on actual usage. A refusal is
-    `429` with `Retry-After`. Seat saturation is a routing fact and never
-    produces a 429; the request queues.
+    `429` with `Retry-After`.
+
+    Seat saturation is a routing fact, not a failure. When every seat that
+    could serve a request is serving its most at once, the request waits
+    for a slot, in arrival order among the requests that may go to the
+    same seats, and is served by whichever seat frees first; nothing is sent meanwhile, a
+    stream included. It waits until its `voice.deadline`, or for 60 s when
+    it gives none. One whose deadline passes first is `504
+    deadline_exceeded`; one still waiting after 60 s is `429 no_capacity`
+    with `Retry-After`. A busy seat never makes a `502`, and a seat that
+    refused for capacity is not an attempt in `voice.attempts`.
 
     An account that is out of headroom is not the caller's limit. When every
     account that could serve a request is exhausted, the answer is `503`
@@ -4235,6 +4245,10 @@ components:
       description: |
         A rate limit or the project's budget refuses the request. `code` is
         `rate_limited` or `budget_exhausted`; `voice.limit` names the limit.
+        Or `no_capacity`: every seat that could serve the request stayed
+        busy, serving its most at once, for the 60 s the request waited for
+        a slot; the message names the model, and `voice.attempts` lists any
+        seat that failed it meanwhile.
       headers:
         Retry-After:
           $ref: '#/components/headers/Retry-After'
@@ -4258,8 +4272,8 @@ components:
         `no_capacity`: seats exist, but every account they
         spend is out of headroom; `Retry-After` is the earliest reset.
         `metering_unavailable`: the ledger cannot record usage, so nothing is
-        served until it can. Seat saturation alone never produces this; it
-        queues.
+        served until it can. Seat saturation alone never produces this: the
+        request waits for a slot, and is `429 no_capacity` if none frees.
       headers:
         Retry-After:
           $ref: '#/components/headers/Retry-After'
@@ -4267,7 +4281,9 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     DeadlineExceeded:
-      description: The request's `voice.deadline` passed before it was served.
+      description: |
+        The request's `voice.deadline` passed before it was served: while it
+        waited for a slot, every seat that could serve it busy.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }

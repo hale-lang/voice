@@ -7,7 +7,11 @@
 // control, spending an account the key may spend, carrying the request's
 // data class. A seat that refuses, does not answer, or fails before any
 // output is an attempt, and the next seat is offered the request; every
-// attempt is in the answer's `voice.attempts`. Budgets and limits are
+// attempt is in the answer's `voice.attempts`. A seat that refuses for
+// capacity, serving its most at once, has not failed: when every seat left
+// refuses so, the request waits for a slot (`Inference.await_turn`), in
+// arrival order (`seats_key`), until its `voice.deadline` or for
+// `SLOT_WAIT`. Budgets and limits are
 // configuration only: they are reserved against in the store's
 // reservation transaction, which comes with the Postgres store.
 //
@@ -51,6 +55,9 @@ type InferenceRequest {
     // a string, "" when none; read once, when the request is read, so no
     // later step scans the body for it again
     conversation: String = "";
+    // the caller's connection, watched while the request waits for a slot
+    // (`caller_gone`); -1 for none, as in process
+    conn_fd: Int = -1;
 }
 
 /// `Served`: what actually served a request.
@@ -90,6 +97,8 @@ type VoiceExtension {
     price_micros: Int = 0;
     currency: String = "USD";
     wall_ms: Int = 0;
+    // of it, waiting for a seat's slot (`Inference.await_turn`)
+    queue_ms: Int = 0;
     // the seat's own timing, as its node measured it (protocol.yaml
     // `result.timing`), when the seat produced output
     has_engine_timing: Bool = false;
@@ -166,6 +175,16 @@ locus Inference {
         governed: Bool = false;
         held: HeldLimits = HeldLimits { };
         windows: Windows = Windows { };
+        // how long a request waits for a slot when every seat that could
+        // take it serves its most at once, unless its `voice.deadline` says
+        // (`SLOT_WAIT`); 0 waits none, as the annotator's, whose queue backs
+        // off on its own (annotate.hl)
+        wait: Duration = SLOT_WAIT;
+        // the requests waiting for a slot, in arrival order (`queue_joined`),
+        // and how many attempts this instance has ended: one that ends may
+        // free the slot a waiting request is offered next
+        queue: String = "";
+        ended: Int = 0;
     }
     bus { publish UsageToTell; }
 
@@ -195,122 +214,155 @@ locus Inference {
         }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
-        let mut s = self.serve_held(r, ctx, candidates) or raise;
+        let request_id = "resp_" + (random_hex(12) or fail entropy_failed(err.message));
+        // out of the queue for a slot however it ends (`await_turn`)
+        let mut s = self.serve_held(r, ctx, candidates, request_id) or {
+            self.leave(request_id);
+            fail err;
+        };
+        self.leave(request_id);
         s.headers = held.headers;
         return s;
     }
 
+    /// Offer `r` to its seats in turn until one serves it. A seat at
+    /// capacity has not failed: when every seat left refuses so, the
+    /// request waits for a slot (`await_turn`) and is offered again.
     fn serve_held(
         r: InferenceRequest,
         ctx: std::api::Context,
-        candidates: Candidates
+        candidates: Candidates,
+        request_id: String
     ) -> Served fallible(ApiError) {
         let started = std::time::monotonic_ns();
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
-        let id_hex = random_hex(12) or fail entropy_failed(err.message);
-        let request_id = "resp_" + id_hex;
         let mut attempts = Attempts { };
         let mut why = "";
         // whether every seat that failed it did so for its length
         let mut all_overflow = true;
         let mut n = 0;
-        for c in candidates.items {
-            // each attempt answers on a subject of its own, so a seat left
-            // behind cannot answer for the next one
-            n = n + 1;
-            let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
-            let t0 = std::time::monotonic_ns();
-            self.flying(request_id, k, r, c);
-            let o = serve_over(
-                self.link,
-                c.seat.node,
-                reply_to,
-                serve_message(request_id, reply_to, c, r),
-                self.first,
-                self.idle,
-            );
-            self.landed(request_id);
-            let ms = (std::time::monotonic_ns() - t0) / 1000000;
-            if o.ack == "accepted"
-                && (o.outcome == "served" || o.outcome == "incomplete")
-                && len(o.response) > 0
-            {
+        // the seats that failed it, never offered it again
+        let mut failed = "\n";
+        let mut w = self.waiting(r, candidates, request_id, started);
+        let mut offering = true;
+        while offering {
+            if w.queued {
+                w = self.await_turn(r, w);
+                if w.state != "turn" { fail waited_out(r, w, why, request_id, attempts.items); }
+            }
+            let mut busy = 0;
+            for c in candidates.items {
+                if std::str::contains(failed, "\n" + c.seat.ref + "\n") { continue; }
+                // each attempt answers on a subject of its own, so a seat left
+                // behind cannot answer for the next one
+                n = n + 1;
+                let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
+                let t0 = std::time::monotonic_ns();
+                let offer = self.link.offer(
+                    c.seat.node,
+                    reply_to,
+                    serve_message(request_id, reply_to, c, r),
+                );
+                let mut o = offer.ack();
+                if at_capacity(o) {
+                    busy = busy + 1;
+                    why = c.seat.ref + ": " + failure_of(o);
+                    continue;
+                }
+                if o.ack == "accepted" {
+                    // taken: the next request waiting has its turn, and
+                    // this one keeps its place should the seat fail it
+                    self.taken(request_id);
+                    self.flying(request_id, k, r, c);
+                    o = read_over(offer, o, self.first, self.idle);
+                    self.landed(request_id);
+                }
+                let ms = (std::time::monotonic_ns() - t0) / 1000000;
+                if o.ack == "accepted"
+                    && (o.outcome == "served" || o.outcome == "incomplete")
+                    && len(o.response) > 0
+                {
+                    push(
+                        attempts.items,
+                        Attempt {
+                            seat: c.seat.ref,
+                            account: c.seat.account,
+                            outcome: AttemptOutcome::served,
+                            wall_ms: ms,
+                        },
+                    ) or discard;
+                    let mut s = served(
+                        request_id,
+                        r.model,
+                        k,
+                        m,
+                        c,
+                        o,
+                        attempts.items,
+                        (std::time::monotonic_ns() - started) / 1000000,
+                        w.queue_ms,
+                    );
+                    // a decision model's answer, as the whole resource asked for
+                    if len(o.decision) > 0 {
+                        s.response = decision_resource(o.response, request_id, r);
+                    }
+                    self.settled(r, s, candidates.peek);
+                    if candidates.annotate { s.job = annotation_job(r, s); }
+                    return s;
+                }
+                let reason = failure_of(o);
+                why = c.seat.ref + ": " + reason;
+                failed = failed + c.seat.ref + "\n";
+                // a decision model that refused the questions themselves refuses
+                // them on any seat: the caller is told, as its own mistake
+                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
+                    fail decision_refusal(reason, "response_format");
+                }
                 push(
                     attempts.items,
                     Attempt {
                         seat: c.seat.ref,
                         account: c.seat.account,
-                        outcome: AttemptOutcome::served,
+                        outcome: AttemptOutcome::failed,
+                        error: reason,
                         wall_ms: ms,
                     },
                 ) or discard;
-                let mut s = served(
-                    request_id,
-                    r.model,
-                    k,
-                    m,
-                    c,
-                    o,
-                    attempts.items,
-                    (std::time::monotonic_ns() - started) / 1000000,
-                );
-                // a decision model's answer, as the whole resource asked for
-                if len(o.decision) > 0 {
-                    s.response = decision_resource(o.response, request_id, r);
+                // a seat whose window the request overflows: another may hold
+                // it, so the next is tried
+                let overflow = context_overflow(reason);
+                if !overflow { all_overflow = false; }
+                if o.output
+                    || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
+                {
+                    if o.output {
+                        self.unfinished(
+                            r,
+                            request_id,
+                            k,
+                            m,
+                            c,
+                            "failed",
+                            started,
+                            attempts.items,
+                            candidates.peek,
+                            reason,
+                            "",
+                        );
+                    }
+                    fail ApiError {
+                        status: 502,
+                        kind: "model_error",
+                        code: ErrorCode::upstream_failed,
+                        message: "seat " + why,
+                        has_voice: true,
+                        voice: attempts_voice(request_id, attempts.items),
+                    };
                 }
-                self.settled(r, s, candidates.peek);
-                if candidates.annotate { s.job = annotation_job(r, s); }
-                return s;
             }
-            let reason = failure_of(o);
-            why = c.seat.ref + ": " + reason;
-            // a decision model that refused the questions themselves refuses
-            // them on any seat: the caller is told, as its own mistake
-            if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
-                fail decision_refusal(reason, "response_format");
-            }
-            push(
-                attempts.items,
-                Attempt {
-                    seat: c.seat.ref,
-                    account: c.seat.account,
-                    outcome: AttemptOutcome::failed,
-                    error: reason,
-                    wall_ms: ms,
-                },
-            ) or discard;
-            // a seat whose window the request overflows: another may hold
-            // it, so the next is tried
-            let overflow = context_overflow(reason);
-            if !overflow { all_overflow = false; }
-            if o.output
-                || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
-            {
-                if o.output {
-                    self.unfinished(
-                        r,
-                        request_id,
-                        k,
-                        m,
-                        c,
-                        "failed",
-                        started,
-                        attempts.items,
-                        candidates.peek,
-                        reason,
-                        "",
-                    );
-                }
-                fail ApiError {
-                    status: 502,
-                    kind: "model_error",
-                    code: ErrorCode::upstream_failed,
-                    message: "seat " + why,
-                    has_voice: true,
-                    voice: attempts_voice(request_id, attempts.items),
-                };
-            }
+            // a seat at capacity takes it once a slot frees: it waits for one
+            if busy > 0 { w = self.queued(w); } else { offering = false; }
         }
         if all_overflow && count(attempts.items) > 0 {
             fail too_long(why, attempts_voice(request_id, attempts.items));
@@ -347,7 +399,14 @@ locus Inference {
         }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
-        return self.stream_held(r, ctx, out, candidates, held) or raise;
+        let request_id = "resp_" + (random_hex(12) or fail entropy_failed(err.message));
+        // out of the queue for a slot however it ends (`await_turn`)
+        let answer = self.stream_held(r, ctx, out, candidates, held, request_id) or {
+            self.leave(request_id);
+            fail err;
+        };
+        self.leave(request_id);
+        return answer;
     }
 
     fn stream_held(
@@ -355,13 +414,12 @@ locus Inference {
         ctx: std::api::Context,
         out: EventStream,
         candidates: Candidates,
-        held: Held
+        held: Held,
+        request_id: String
     ) -> std::http::Response fallible(ApiError) {
         let started = std::time::monotonic_ns();
         let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
         let m = self.store.model(r.model) or fail metering_failed(err);
-        let id_hex = random_hex(12) or fail entropy_failed(err.message);
-        let request_id = "resp_" + id_hex;
         out.headers = "X-Request-Id: " + request_id
             + (if len(held.headers) > 0 { "\r\n" + held.headers } else { "" });
         // the keep-alive span runs from here until something is sent
@@ -379,184 +437,237 @@ locus Inference {
         // whether every seat that failed it did so for its length
         let mut all_overflow = true;
         let mut n = 0;
-        for c in candidates.items {
-            n = n + 1;
-            let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
-            let t0 = std::time::monotonic_ns();
-            self.flying(request_id, k, r, c);
-            let offer = self.link.offer(
-                c.seat.node,
-                reply_to,
-                serve_message(request_id, reply_to, c, r),
-            );
-            let mut o = offer.ack();
-            let mut ending = "";
-            if o.ack == "accepted" {
-                st.output = false;
-                // the seat has `first` from one message to the next until
-                // its first output, then `idle`
-                let mut deadline = std::time::monotonic() + self.first;
-                let mut done = false;
-                while !done && std::time::monotonic() < deadline {
-                    let msg = offer.next(1s);
-                    if msg.kind == "event" {
-                        o = take_event(o, msg.json);
-                        if terminal(std::json::find_string_field(msg.json, "type")) {
-                            ending = msg.json;
-                        } else {
-                            while told < count(attempts.items) {
-                                let a = at(attempts.items, told) or Attempt {
-                                    outcome: AttemptOutcome::failed,
-                                };
-                                st = attempt_event(out, st, a, c.seat.ref);
-                                told = told + 1;
-                            }
-                            st = forward(out, st, msg.json);
-                        }
-                    } else if msg.kind == "result" {
-                        o = take_result(o, msg.json);
-                        done = true;
-                    } else if msg.kind == "lost" {
-                        done = true;
-                    } else {
-                        // a quiet gap: a comment, which opens the stream if
-                        // nothing has, and finds a caller that has gone
-                        out.keep_alive(self.keep_alive);
-                    }
-                    if msg.kind == "event" || msg.kind == "result" {
-                        deadline = std::time::monotonic()
-                            + (if o.output { self.idle } else { self.first });
-                    }
-                    if out.gone {
-                        // the caller went away: the seat is told to stop,
-                        // and what it spent on the caller is told
-                        offer.finish();
-                        if st.output || o.output {
-                            self.unfinished(
-                                r,
+        // the seats that failed it, never offered it again
+        let mut failed = "\n";
+        let mut w = self.waiting(r, candidates, request_id, started);
+        let mut offering = true;
+        while offering {
+            if w.queued {
+                // nothing is sent while it waits: a request that waits out
+                // its bound is answered whole, unless a seat that took it
+                // and failed had opened its stream
+                w = self.await_turn(r, w);
+                if w.state != "turn" {
+                    let e = waited_out(r, w, why, request_id, attempts.items);
+                    if !out.opened { fail e; }
+                    if w.state != "gone" {
+                        let last = at(
+                            candidates.items,
+                            count(candidates.items) - 1,
+                        ) or Candidate { };
+                        fail_stream(
+                            out,
+                            st,
+                            error_code_name(e.code),
+                            e.message,
+                            failed_voice(
                                 request_id,
                                 k,
                                 m,
-                                c,
-                                "cancelled",
-                                started,
+                                last,
                                 attempts.items,
-                                candidates.peek,
-                                "the caller went away",
-                                out.text_so_far(),
-                            );
-                        }
-                        self.landed(request_id);
-                        return out.end();
+                                (std::time::monotonic_ns() - started) / 1000000,
+                            ),
+                        );
                     }
+                    return out.end();
                 }
-                offer.finish();
             }
-            self.landed(request_id);
-            let ms = (std::time::monotonic_ns() - t0) / 1000000;
-            if o.ack == "accepted"
-                && (o.outcome == "served" || o.outcome == "incomplete")
-                && len(o.response) > 0
-            {
-                while told < count(attempts.items) {
-                    let a = at(attempts.items, told) or Attempt { outcome: AttemptOutcome::failed };
-                    st = attempt_event(out, st, a, c.seat.ref);
-                    told = told + 1;
+            let mut busy = 0;
+            for c in candidates.items {
+                if std::str::contains(failed, "\n" + c.seat.ref + "\n") { continue; }
+                n = n + 1;
+                let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
+                let t0 = std::time::monotonic_ns();
+                let offer = self.link.offer(
+                    c.seat.node,
+                    reply_to,
+                    serve_message(request_id, reply_to, c, r),
+                );
+                let mut o = offer.ack();
+                if at_capacity(o) {
+                    busy = busy + 1;
+                    why = c.seat.ref + ": " + failure_of(o);
+                    continue;
+                }
+                let mut ending = "";
+                if o.ack == "accepted" {
+                    // taken: the next request waiting has its turn, and
+                    // this one keeps its place should the seat fail it
+                    self.taken(request_id);
+                    self.flying(request_id, k, r, c);
+                    st.output = false;
+                    // the seat has `first` from one message to the next until
+                    // its first output, then `idle`
+                    let mut deadline = std::time::monotonic() + self.first;
+                    let mut done = false;
+                    while !done && std::time::monotonic() < deadline {
+                        let msg = offer.next(1s);
+                        if msg.kind == "event" {
+                            o = take_event(o, msg.json);
+                            if terminal(std::json::find_string_field(msg.json, "type")) {
+                                ending = msg.json;
+                            } else {
+                                while told < count(attempts.items) {
+                                    let a = at(attempts.items, told) or Attempt {
+                                        outcome: AttemptOutcome::failed,
+                                    };
+                                    st = attempt_event(out, st, a, c.seat.ref);
+                                    told = told + 1;
+                                }
+                                st = forward(out, st, msg.json);
+                            }
+                        } else if msg.kind == "result" {
+                            o = take_result(o, msg.json);
+                            done = true;
+                        } else if msg.kind == "lost" {
+                            done = true;
+                        } else {
+                            // a quiet gap: a comment, which opens the stream if
+                            // nothing has, and finds a caller that has gone
+                            out.keep_alive(self.keep_alive);
+                        }
+                        if msg.kind == "event" || msg.kind == "result" {
+                            deadline = std::time::monotonic()
+                                + (if o.output { self.idle } else { self.first });
+                        }
+                        if out.gone {
+                            // the caller went away: the seat is told to stop,
+                            // and what it spent on the caller is told
+                            offer.finish();
+                            if st.output || o.output {
+                                self.unfinished(
+                                    r,
+                                    request_id,
+                                    k,
+                                    m,
+                                    c,
+                                    "cancelled",
+                                    started,
+                                    attempts.items,
+                                    candidates.peek,
+                                    "the caller went away",
+                                    out.text_so_far(),
+                                );
+                            }
+                            self.landed(request_id);
+                            return out.end();
+                        }
+                    }
+                    offer.finish();
+                    self.landed(request_id);
+                }
+                let ms = (std::time::monotonic_ns() - t0) / 1000000;
+                if o.ack == "accepted"
+                    && (o.outcome == "served" || o.outcome == "incomplete")
+                    && len(o.response) > 0
+                {
+                    while told < count(attempts.items) {
+                        let a = at(attempts.items, told) or Attempt {
+                            outcome: AttemptOutcome::failed,
+                        };
+                        st = attempt_event(out, st, a, c.seat.ref);
+                        told = told + 1;
+                    }
+                    push(
+                        attempts.items,
+                        Attempt {
+                            seat: c.seat.ref,
+                            account: c.seat.account,
+                            outcome: AttemptOutcome::served,
+                            wall_ms: ms,
+                        },
+                    ) or discard;
+                    let mut s = served(
+                        request_id,
+                        r.model,
+                        k,
+                        m,
+                        c,
+                        o,
+                        attempts.items,
+                        (std::time::monotonic_ns() - started) / 1000000,
+                        w.queue_ms,
+                    );
+                    // a decision model's answer, as the whole resource asked for
+                    if len(o.decision) > 0 {
+                        s.response = decision_resource(o.response, request_id, r);
+                    }
+                    finish_stream(out, st, ending, s);
+                    self.settled(r, s, candidates.peek);
+                    if candidates.annotate { out.job = annotation_job(r, s); }
+                    return out.end();
+                }
+                let reason = failure_of(o);
+                why = c.seat.ref + ": " + reason;
+                failed = failed + c.seat.ref + "\n";
+                // a decision model that refused the questions themselves refuses
+                // them on any seat: the caller is told, as its own mistake
+                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
+                    fail decision_refusal(reason, "response_format");
                 }
                 push(
                     attempts.items,
                     Attempt {
                         seat: c.seat.ref,
                         account: c.seat.account,
-                        outcome: AttemptOutcome::served,
+                        outcome: AttemptOutcome::failed,
+                        error: reason,
                         wall_ms: ms,
                     },
                 ) or discard;
-                let mut s = served(
-                    request_id,
-                    r.model,
-                    k,
-                    m,
-                    c,
-                    o,
-                    attempts.items,
-                    (std::time::monotonic_ns() - started) / 1000000,
-                );
-                // a decision model's answer, as the whole resource asked for
-                if len(o.decision) > 0 {
-                    s.response = decision_resource(o.response, request_id, r);
-                }
-                finish_stream(out, st, ending, s);
-                self.settled(r, s, candidates.peek);
-                if candidates.annotate { out.job = annotation_job(r, s); }
-                return out.end();
-            }
-            let reason = failure_of(o);
-            why = c.seat.ref + ": " + reason;
-            // a decision model that refused the questions themselves refuses
-            // them on any seat: the caller is told, as its own mistake
-            if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
-                fail decision_refusal(reason, "response_format");
-            }
-            push(
-                attempts.items,
-                Attempt {
-                    seat: c.seat.ref,
-                    account: c.seat.account,
-                    outcome: AttemptOutcome::failed,
-                    error: reason,
-                    wall_ms: ms,
-                },
-            ) or discard;
-            // a seat whose window the request overflows: another may hold
-            // it, so the next is tried
-            let overflow = context_overflow(reason);
-            if !overflow { all_overflow = false; }
-            if st.output
-                || o.output
-                || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
-            {
-                if st.output || o.output {
-                    self.unfinished(
-                        r,
-                        request_id,
-                        k,
-                        m,
-                        c,
-                        "failed",
-                        started,
-                        attempts.items,
-                        candidates.peek,
-                        reason,
-                        out.text_so_far(),
-                    );
-                }
-                if out.opened {
-                    fail_stream(
-                        out,
-                        st,
-                        "upstream_failed",
-                        "seat " + why,
-                        failed_voice(
+                // a seat whose window the request overflows: another may hold
+                // it, so the next is tried
+                let overflow = context_overflow(reason);
+                if !overflow { all_overflow = false; }
+                if st.output
+                    || o.output
+                    || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
+                {
+                    if st.output || o.output {
+                        self.unfinished(
+                            r,
                             request_id,
                             k,
                             m,
                             c,
+                            "failed",
+                            started,
                             attempts.items,
-                            (std::time::monotonic_ns() - started) / 1000000,
-                        ),
-                    );
-                    return out.end();
+                            candidates.peek,
+                            reason,
+                            out.text_so_far(),
+                        );
+                    }
+                    if out.opened {
+                        fail_stream(
+                            out,
+                            st,
+                            "upstream_failed",
+                            "seat " + why,
+                            failed_voice(
+                                request_id,
+                                k,
+                                m,
+                                c,
+                                attempts.items,
+                                (std::time::monotonic_ns() - started) / 1000000,
+                            ),
+                        );
+                        return out.end();
+                    }
+                    fail ApiError {
+                        status: 502,
+                        kind: "model_error",
+                        code: ErrorCode::upstream_failed,
+                        message: "seat " + why,
+                        has_voice: true,
+                        voice: attempts_voice(request_id, attempts.items),
+                    };
                 }
-                fail ApiError {
-                    status: 502,
-                    kind: "model_error",
-                    code: ErrorCode::upstream_failed,
-                    message: "seat " + why,
-                    has_voice: true,
-                    voice: attempts_voice(request_id, attempts.items),
-                };
             }
+            // a seat at capacity takes it once a slot frees: it waits for one
+            if busy > 0 { w = self.queued(w); } else { offering = false; }
         }
         let overflowed = all_overflow && count(attempts.items) > 0;
         if out.opened {
@@ -792,9 +903,93 @@ locus Inference {
         ) or discard;
     }
 
-    /// Its attempt ended: no longer in flight.
+    /// Its attempt ended: no longer in flight, and perhaps a slot free.
     fn landed(request_id: String) {
+        self.ended = self.ended + 1;
         self.store.drop_flight(request_id) or discard;
+    }
+
+    /// How request `id`, offered first at `started`, waits for a slot:
+    /// until its `voice.deadline`, or for this instance's `wait`. Behind
+    /// any request already waiting for the same seats (`seats_key`), so
+    /// they are served in arrival order.
+    fn waiting(r: InferenceRequest, c: Candidates, id: String, started: Int) -> Waiting {
+        let mut w = Waiting {
+            request_id: id,
+            key: seats_key(r.model, c),
+            since_ns: started,
+            until_ns: started + self.wait / 1ns,
+        };
+        if self.wait / 1ns > 0 && len(r.deadline) > 0 {
+            let at = rfc3339(r.deadline) or std::time::from_nanos(0);
+            if std::time::nanos(at) > 0 {
+                w.until_ns = started + std::time::nanos(at)
+                    - std::time::nanos(std::time::current());
+                w.by_deadline = true;
+            }
+        }
+        if queue_waits(self.queue, w.key) { w = self.queued(w); }
+        return w;
+    }
+
+    /// `w`, every seat it may go to busy: in the queue, if it is not yet,
+    /// or waiting again at the place it took first (a seat took it, then
+    /// failed it), offered again at its turn.
+    fn queued(w: Waiting) -> Waiting {
+        let mut out = w;
+        if out.queued {
+            self.queue = queue_marked(self.queue, w.request_id, "w");
+        } else {
+            self.queue = queue_joined(self.queue, w.key, w.request_id);
+            out.queued = true;
+        }
+        out.offered_ns = std::time::monotonic_ns();
+        out.ended = self.ended;
+        return out;
+    }
+
+    /// Wait for `w`'s turn: no request for the same seats ahead of it, and an
+    /// attempt on this instance ended since it was last offered, or
+    /// `SLOT_POLL` passed (a slot another instance's request held may have
+    /// freed). Its state says how the wait ended: `turn`; `expired`, its
+    /// bound passed; or `gone`, its caller went away.
+    @unbounded
+    fn await_turn(r: InferenceRequest, w: Waiting) -> Waiting {
+        let mut out = w;
+        out.state = "";
+        let poll = SLOT_POLL / 1ns;
+        let mut watched = std::time::monotonic_ns();
+        while true {
+            let now = std::time::monotonic_ns();
+            if now >= out.until_ns {
+                out.state = "expired";
+            } else if now - watched >= poll && caller_gone(r.conn_fd) {
+                out.state = "gone";
+            } else if !queue_ahead(self.queue, out.key, out.request_id)
+                && (self.ended != out.ended || now - out.offered_ns >= poll)
+            {
+                out.state = "turn";
+            }
+            if now - watched >= poll { watched = now; }
+            if len(out.state) > 0 {
+                out.queue_ms = (now - out.since_ns) / 1000000;
+                if out.state != "turn" { self.leave(out.request_id); }
+                return out;
+            }
+            std::time::sleep(SLOT_TICK);
+        }
+        return out;
+    }
+
+    /// A seat took request `id`: it no longer holds back those behind it,
+    /// but keeps its place until it is done (`leave`).
+    fn taken(request_id: String) {
+        self.queue = queue_marked(self.queue, request_id, "t");
+    }
+
+    /// Request `id` is done: served, or answered otherwise.
+    fn leave(request_id: String) {
+        self.queue = queue_left(self.queue, request_id);
     }
 
     fn settled(r: InferenceRequest, s: Served, peek: Bool) {
@@ -1184,6 +1379,175 @@ fn model_routes(table: String, model: String) -> String {
     return "[]";
 }
 
+/// How long a request waits for a slot when every seat that could take it
+/// is busy, unless its `voice.deadline` says otherwise: a minute. Nothing
+/// is sent to the caller while it waits, so the wait stays inside the idle
+/// read timeouts of the clients and proxies before voice (the common SDKs'
+/// are minutes, a proxy's commonly 60 s or more), and a minute is ample
+/// for an interactive request ahead of it to end. Past it the caller is
+/// answered `429 no_capacity`, and a client retries after `Retry-After`.
+const SLOT_WAIT: Duration = 60s;
+
+/// The `Retry-After` of a request that waited `SLOT_WAIT` for a slot.
+const SLOT_RETRY_AFTER: Int = 5;
+
+/// How often a request at the head of its model's queue is offered again
+/// when nothing on this instance ended, and how often its caller is looked
+/// for; and the step it sleeps between looks at the queue.
+const SLOT_POLL: Duration = 250ms;
+const SLOT_TICK: Duration = 20ms;
+
+/// A request waiting for a slot (`Inference.waiting`): since when, until
+/// when (monotonic ns), whether that is its own `voice.deadline`, whether
+/// it is in the queue, when it was last offered and how many attempts the
+/// instance had ended then; how its last wait ended (`await_turn`) and how
+/// long it has waited.
+type Waiting {
+    request_id: String = "";
+    // the seats it may go to (`seats_key`)
+    key: String = "";
+    since_ns: Int = 0;
+    until_ns: Int = 0;
+    by_deadline: Bool = false;
+    queued: Bool = false;
+    offered_ns: Int = 0;
+    ended: Int = 0;
+    state: String = "";
+    queue_ms: Int = 0;
+}
+
+/// The answer to a request whose wait for a slot ended with none: past its
+/// own `voice.deadline`, `504 deadline_exceeded`; past voice's bound, `429
+/// no_capacity` with `Retry-After`, never a seat failure; a caller gone is
+/// answered nothing it reads. `why` is the last seat's refusal.
+fn waited_out(
+    r: InferenceRequest,
+    w: Waiting,
+    why: String,
+    request_id: String,
+    attempts: bounded[Attempt; 8]
+) -> ApiError {
+    let busy = "every seat serving model " + r.model + " is busy"
+        + (if len(why) > 0 { " (the last, " + why + ")" } else { "" });
+    if w.state == "gone" {
+        return ApiError {
+            status: 499,
+            kind: "invalid_request",
+            code: ErrorCode::invalid_request,
+            message: "the caller went away while its request waited for a slot: " + busy,
+        };
+    }
+    if w.by_deadline {
+        return ApiError {
+            status: 504,
+            kind: "server_error",
+            code: ErrorCode::deadline_exceeded,
+            message: "the request's voice.deadline passed while it waited for a slot: " + busy,
+            has_voice: true,
+            voice: attempts_voice(request_id, attempts),
+        };
+    }
+    return ApiError {
+        status: 429,
+        kind: "too_many_requests",
+        code: ErrorCode::no_capacity,
+        message: busy + ", and none freed in " + to_string(w.queue_ms / 1000) + " s",
+        has_voice: true,
+        voice: attempts_voice(request_id, attempts),
+        retry_after: SLOT_RETRY_AFTER,
+    };
+}
+
+/// True when the caller on connection `fd` has closed it: a read that
+/// finds its end, not one that times out (the caller sends nothing more
+/// once its request is read). A millisecond at most; -1 is no connection.
+fn caller_gone(fd: Int) -> Bool {
+    if fd < 0 { return false; }
+    std::io::tcp::set_recv_timeout(fd, 1ms) or {
+        return true;
+    };
+    let b = std::bytes::BytesBuilder { initial_cap: 1 };
+    // -2 is the timeout: still there; 0 its end; any other below 0 an error
+    let got = std::io::tcp::recv_into(fd, b, 1);
+    return got == 0 || (got < 0 && got != -2);
+}
+
+/// What requests that wait in turn have in common: their model and the
+/// seats they may go to, in a fixed order (a conversation's seat comes
+/// first for it alone). A request does not wait behind one whose seats
+/// differ, as one whose key may spend another account: a seat it may take
+/// could free while that one waits.
+fn seats_key(model: String, c: Candidates) -> String {
+    let mut key = model;
+    let mut last = "";
+    let mut more = true;
+    while more {
+        let mut least = "";
+        for x in c.items {
+            if x.seat.ref > last && (len(least) == 0 || x.seat.ref < least) { least = x.seat.ref; }
+        }
+        if len(least) == 0 {
+            more = false;
+        } else {
+            key = key + " " + least;
+            last = least;
+        }
+    }
+    return key;
+}
+
+/// The queue for a slot, `request_id` at its end, waiting: a
+/// `<request id>\t<state>\t<key>` line each, in arrival order
+/// (`seats_key`). Its state is `w` while it waits, `t` while a seat it was
+/// offered has it: it keeps its place, holding back no one, and waits
+/// there again (`queue_marked`) if that seat fails it.
+fn queue_joined(queue: String, key: String, request_id: String) -> String {
+    return queue + request_id + "\tw\t" + key + "\n";
+}
+
+/// The queue with `request_id`'s line in `state`, in its place.
+fn queue_marked(queue: String, request_id: String, state: String) -> String {
+    let at = std::str::index_of("\n" + queue, "\n" + request_id + "\t");
+    if at < 0 { return queue; }
+    let from = at + len(request_id) + 1;
+    return queue[0..from] + state + queue[(from + 1)..len(queue)];
+}
+
+/// The queue without `request_id`'s line.
+fn queue_left(queue: String, request_id: String) -> String {
+    let at = std::str::index_of("\n" + queue, "\n" + request_id + "\t");
+    if at < 0 { return queue; }
+    let rest = queue[at..len(queue)];
+    let nl = std::str::index_of(rest, "\n");
+    return queue[0..at] + rest[(nl + 1)..len(rest)];
+}
+
+/// True when a request for the seats `key` says waits in the queue.
+fn queue_waits(queue: String, key: String) -> Bool {
+    return std::str::contains(queue, "\tw\t" + key + "\n");
+}
+
+/// True when a request for the seats `key` says came before `request_id`
+/// in the queue and waits still.
+@bounded_by(queue)
+fn queue_ahead(queue: String, key: String, request_id: String) -> Bool {
+    let mut rest = queue;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        if nl < 0 { return false; }
+        let line = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        let tab = std::str::index_of(line, "\t");
+        if tab >= 0 && len(line) > tab + 2 {
+            if line[0..tab] == request_id { return false; }
+            if line[(tab + 1)..(tab + 2)] == "w" && line[(tab + 3)..len(line)] == key {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /// Why an offer did not serve, in a line.
 fn failure_of(o: ServeOutcome) -> String {
     if o.ack == "refused" { return "refused: " + o.reason; }
@@ -1209,7 +1573,8 @@ fn served(
     c: Candidate,
     o: ServeOutcome,
     attempts: bounded[Attempt; 8],
-    wall_ms: Int
+    wall_ms: Int,
+    queue_ms: Int
 ) -> Served {
     let usage = std::json::find_field_raw(o.response, "usage");
     let input = std::json::find_int_field(usage, "input_tokens");
@@ -1235,6 +1600,7 @@ fn served(
         price_micros: price,
         currency: if m.priced { m.price.currency } else { "USD" },
         wall_ms: wall_ms,
+        queue_ms: queue_ms,
         has_engine_timing: output > 0 && o.engine_ms >= o.first_output_ms,
         first_output_ms: o.first_output_ms,
         engine_ms: o.engine_ms,
@@ -1874,7 +2240,7 @@ fn voice_json(v: VoiceExtension) -> String {
         + ", \"key\": " + jq(v.key) + ", \"served\": " + served_by_json(v.served)
         + ", \"price_micros\": " + to_string(v.price_micros) + ", \"currency\": " + jq(v.currency)
         + ", \"timing\": "
-        + timing_json(v.wall_ms, v.has_engine_timing, v.first_output_ms, v.engine_ms)
+        + timing_json(v.wall_ms, v.queue_ms, v.has_engine_timing, v.first_output_ms, v.engine_ms)
         + ", \"attempts\": " + attempts
         + (if len(v.decision) > 0 { ", \"decision\": " + v.decision } else { "" }) + "}";
 }
@@ -1882,8 +2248,15 @@ fn voice_json(v: VoiceExtension) -> String {
 /// `Timing`: the coordinator's wall time, and, when the seat produced
 /// output, the seat's own: to its first output, and to its end. What
 /// generation took is the time between the two.
-fn timing_json(wall_ms: Int, has_engine: Bool, first_output_ms: Int, engine_ms: Int) -> String {
-    return "{\"wall_ms\": " + to_string(wall_ms) + ", \"queue_ms\": 0, \"load_ms\": 0"
+fn timing_json(
+    wall_ms: Int,
+    queue_ms: Int,
+    has_engine: Bool,
+    first_output_ms: Int,
+    engine_ms: Int
+) -> String {
+    return "{\"wall_ms\": " + to_string(wall_ms) + ", \"queue_ms\": " + to_string(queue_ms)
+        + ", \"load_ms\": 0"
         + (
             if has_engine {
                 ", \"first_output_ms\": " + to_string(first_output_ms) + ", \"engine_ms\": "

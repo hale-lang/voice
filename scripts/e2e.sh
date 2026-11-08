@@ -539,8 +539,8 @@ for i in $(seq 1 100); do
 done
 ask_json "$key" '{"model": "echo-1", "input": "not annotated"}' >"$work/quiet.json"
 quiet_id=$(field id <"$work/quiet.json")
-# the four asked one after another (the chat seat takes fewer at once, and
-# voice queues no caller): each answered at once, their annotations then
+# the four asked one after another (the chat seat takes one at a time):
+# each answered at once, their annotations then
 # queued together on the one-at-a-time decision seat
 for n in 1 2 3 4; do
   ask_json "$nkey" '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' >"$work/noted-$n.json"
@@ -771,6 +771,27 @@ busy=$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'im
 wait $asked
 [ "$busy" = "1" ] || { echo "the node did not count the request it was serving: in_flight $busy"; exit 1; }
 echo "the node counted its request in flight"
+# a seat at capacity is busy, not failed: two requests at once to the one
+# seat, which takes one at a time and 2 s to its first output, are both
+# served there, the second waiting for the first's slot, never a 502
+curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "from the laptop", "first_output_ms": 2000}}' >/dev/null
+wait_for up
+responds >"$work/busy-1.json" &
+busy1=$!
+sleep 0.5
+responds >"$work/busy-2.json" &
+busy2=$!
+wait $busy1 $busy2
+python3 - "$work/busy-1.json" "$work/busy-2.json" <<'PY' || { echo "a request to a busy seat did not wait for its slot"; cat "$work/busy-1.json" "$work/busy-2.json"; tail -20 "$work/api.log"; exit 1; }
+import json, sys
+first, second = (json.load(open(f)) for f in sys.argv[1:])
+for r in (first, second):
+    assert r.get("voice", {}).get("served", {}).get("seat") == "laptop/static", r
+queued = second["voice"]["timing"]["queue_ms"]
+assert queued >= 1000, second["voice"]["timing"]
+assert [a["outcome"] for a in second["voice"]["attempts"]] == ["served"], second["voice"]["attempts"]
+PY
+echo "a request to a seat at capacity waited $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["voice"]["timing"]["queue_ms"])' "$work/busy-2.json") ms for its slot and was served"
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 

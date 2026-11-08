@@ -74,8 +74,10 @@ const cellsOf = (bytes: number, unit: number) => Math.round(Math.max(0, bytes) /
  * then each block in order, contiguous, then free cells to its total. A
  * block holds the cells its running end rounds to, at least one, so small
  * ones show and rounding never drifts across a machine; its overhead is
- * its last cells. Blocks that overfill the machine run past its total, and
- * those cells are marked `over`. A removed block is not drawn.
+ * its last cells. Blocks run past the machine's total when they overfill
+ * it, or when the cells small blocks are given at the least add up past
+ * it; only the cells the bytes past its budget round to are marked
+ * `over`. A removed block is not drawn.
  */
 export function layoutMemory(m: MemoryModel, unit: number): MemoryCell[] {
   const total = Math.max(1, cellsOf(m.totalBytes, unit));
@@ -98,7 +100,11 @@ export function layoutMemory(m: MemoryModel, unit: number): MemoryCell[] {
     });
   }
   while (out.length < total) out.push({ kind: 'free' });
-  for (let i = total; i < out.length; i++) out[i] = { ...out[i]!, over: true };
+  // overfilled by the bytes, not by the cell each small block is given:
+  // the last cells, as many as the bytes past the budget round to
+  const overBytes = bytesAt - m.totalBytes;
+  const over = overBytes > 0 ? Math.min(out.length, Math.max(1, cellsOf(overBytes, unit))) : 0;
+  for (let i = out.length - over; i < out.length; i++) out[i] = { ...out[i]!, over: true };
   return out;
 }
 

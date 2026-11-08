@@ -81,3 +81,17 @@ test('blocks shown together each get a hue apart from the others, the same every
   for (const h of hues.values()) assert.ok(HUE_SLOTS.includes(h));
   assert.equal(huesFor(Array.from({ length: 14 }, (_, i) => `m${i}`)).size, 14, 'past the slots, they share');
 });
+
+test('the cell each small block is given at the least is no overflow: overflow follows the bytes', () => {
+  // a 2 TiB machine in 4 GiB cells, its budget all but full, 61 blocks
+  const unit = memoryUnit(2048 * GIB);
+  assert.equal(unit, 4 * GIB);
+  const blocks = [{ key: 'big', label: 'big', bytes: 1780 * GIB }, ...Array.from({ length: 60 }, (_, i) => ({ key: `s${i}`, label: 's', bytes: 2.2 * GIB }))];
+  const m = { totalBytes: 2048 * GIB, budgetBytes: 1920 * GIB, blocks };
+  assert.ok(memoryTotals(m).free > 0);
+  const cells = layoutMemory(m, unit);
+  assert.ok(cells.length > 512, 'more cells than the machine, each small block one');
+  assert.equal(cells.filter((c) => c.over).length, 0, 'yet nothing is over');
+  const over = layoutMemory({ ...m, blocks: [...blocks, { key: 'x', label: 'x', bytes: 20 * GIB }] }, unit);
+  assert.equal(over.filter((c) => c.over).length, 3, '12 GiB past the budget: 3 cells');
+});

@@ -288,7 +288,7 @@ Responses:
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 504 | The request's `voice.deadline` passed before it was served. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### POST `/v1/chat/completions`
@@ -350,7 +350,7 @@ Responses:
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 504 | The request's `voice.deadline` passed before it was served. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-catalog"></a>
@@ -376,7 +376,7 @@ Responses:
 |---|---|---|
 | 200 | The catalog as this key sees it. | `application/json` [ModelList](#schema-modellist) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/v1/models/{model}`
 
@@ -397,7 +397,7 @@ Responses:
 | 200 | The model. | `application/json` [Model](#schema-model) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-capabilities"></a>
 
@@ -421,7 +421,7 @@ Responses:
 |---|---|---|
 | 200 | Capabilities of the presented key. | `application/json` [Capabilities](#schema-capabilities) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-projects"></a>
 
@@ -475,7 +475,7 @@ Schema: [ProjectCreate](#schema-projectcreate)
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
 | `models` | array \| null |  | Catalog visibility. Null means the whole catalog. |  |
 | `parent` | [ProjectIdValue](#schema-projectidvalue) |  | The project it is a child of: one of no parent of its own, not archived. With no `accounts` of its own, a child inherits its parent's, read when it is used; giving it `accounts` narrows it. |  |
-| `accounts` | array \| null |  | Accounts the project may spend. Null means any. |  |
+| `accounts` | array \| null |  | Accounts the project may spend. Null means any; an empty list means none, so each request its keys send is refused `no_eligible_seat`. |  |
 | `budget` | [BudgetSet](#schema-budgetset) |  |  |  |
 | `limits` | array of [Limit](#schema-limit) |  |  |  |
 
@@ -682,7 +682,7 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts. `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this; it queues. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### PUT `/admin/v1/projects/{project}/limits`
 
@@ -3929,7 +3929,7 @@ Type: object
 | `data_classes` | array of [DataClass](#schema-dataclass) |  | Data classes the project may send. Defaults to `[internal]`. |  |
 | `models` | array \| null |  | Catalog visibility. Null means the whole catalog. |  |
 | `parent` | [ProjectIdValue](#schema-projectidvalue) |  | The project it is a child of: one of no parent of its own, not archived. With no `accounts` of its own, a child inherits its parent's, read when it is used; giving it `accounts` narrows it. |  |
-| `accounts` | array \| null |  | Accounts the project may spend. Null means any. |  |
+| `accounts` | array \| null |  | Accounts the project may spend. Null means any; an empty list means none, so each request its keys send is refused `no_eligible_seat`. |  |
 | `budget` | [BudgetSet](#schema-budgetset) |  |  |  |
 | `limits` | array of [Limit](#schema-limit) |  |  |  |
 
@@ -3993,7 +3993,7 @@ Type: object
 | `owners` | array of string | yes |  |  |
 | `data_classes` | array of [DataClass](#schema-dataclass) | yes |  |  |
 | `models` | array \| null |  |  |  |
-| `accounts` | array \| null |  |  |  |
+| `accounts` | array \| null |  | Accounts the project may spend, its parent's when it inherits them. Null means any; an empty list means none, so each request its keys send is refused `no_eligible_seat`. |  |
 | `budget` | [Budget](#schema-budget) \| null |  |  |  |
 | `limits` | array of [Limit](#schema-limit) |  |  |  |
 | `parent` | string \| null |  | The project this one is a child of. Voice makes each organism of its habitat a project, `tenant-<organism>`, on its first call, a child of the habitat's project, `habitat-<name>`, the habitat itself, voice's customer: what the habitat may spend is that project's accounts. |  |

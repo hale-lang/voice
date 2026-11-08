@@ -1,0 +1,182 @@
+// A `no_eligible_seat` refusal names the first condition that ruled each
+// seat out, in a fixed order: the project's accounts, the key's, theirs
+// together, the seats' accounts, their data class, then whether one is up.
+// The annotation queue asks again only for the last (`seat_capacity`).
+import ".." as api;
+import "../../store" as st;
+
+fn refusal(e: api::DataPlane, key: String, voice: String) -> String {
+    let r = e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer " + key,
+            body: "{\"model\": \"echo-1\", \"input\": \"hi\"" + voice + "}",
+        },
+    );
+    std::test::assert_eq_int(r.status, 503, "refused: " + r.body);
+    let err = std::json::find_field_raw(r.body, "error");
+    std::test::assert_eq_str(std::json::find_string_field(err, "code"), "no_eligible_seat", r.body);
+    return std::json::find_string_field(err, "message");
+}
+
+fn key_of(keys: api::Keys, k: api::KeyCreate) -> String {
+    let made = keys.create(k) or { api::Key { status: api::KeyStatus::revoked } };
+    std::test::assert(made.has_secret, "a key for " + k.project);
+    return made.secret;
+}
+
+fn project(
+    projects: api::Projects,
+    id: String,
+    accounts: bounded[String; 32],
+    classes: bounded[String; 32]
+) {
+    let mut p = api::ProjectCreate {
+        id: id,
+        name: id,
+        has_models: true,
+        has_accounts: true,
+    };
+    for a in accounts { push(p.accounts, a) or discard; }
+    for c in classes { push(p.data_classes, c) or discard; }
+    push(p.models, "echo-1") or discard;
+    let made = projects.create(p) or {
+        std::test::assert(false, "project " + id);
+        return;
+    };
+    std::test::assert_eq_str(made.id, id, "project " + id);
+}
+
+fn says(got: String, want: String, what: String) {
+    std::test::assert_eq_str(got, want, what);
+}
+
+fn main() {
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    accounts.create(api::AccountCreate { id: "other", name: "Other" }) or discard;
+    nodes.create(api::NodeCreate { id: "laptop" }) or discard;
+    let mut seat = api::SeatCreate {
+        node: "laptop",
+        id: "s1",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hi\"}") or std::json::Value::null(),
+    };
+    push(seat.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(seat) or discard;
+
+    let mut none = st::Names { };
+    let mut both_classes = st::Names { };
+    push(both_classes.items, "internal") or discard;
+    push(both_classes.items, "customer") or discard;
+
+    // a project that may spend no account: named first, though its seat's
+    // node is not up either
+    project(projects, "bare", none.items, both_classes.items);
+    let bare = key_of(keys, api::KeyCreate { project: "bare", name: "k" });
+    says(
+        refusal(e, bare, ""),
+        "project bare may spend no account (its accounts are empty): grant one in Projects",
+        "a project with no account",
+    );
+
+    let mut static_only = st::Names { };
+    push(static_only.items, "static") or discard;
+    project(projects, "work", static_only.items, both_classes.items);
+    // a key that may spend no account
+    let mut k = api::KeyCreate { project: "work", name: "none", has_accounts: true };
+    let keyless = key_of(keys, k);
+    says(
+        refusal(e, keyless, ""),
+        "this key may spend no account (its accounts are empty): grant it one",
+        "a key with no account",
+    );
+
+    // a project whose accounts no seat serving the model spends
+    let mut other_only = st::Names { };
+    push(other_only.items, "other") or discard;
+    project(projects, "elsewhere", other_only.items, both_classes.items);
+    let elsewhere = key_of(keys, api::KeyCreate { project: "elsewhere", name: "k" });
+    says(
+        refusal(e, elsewhere, ""),
+        "no seat serving model echo-1 spends an account this key may spend (this key may spend other; the seats spend static)",
+        "seats that spend other accounts",
+    );
+
+    // a data class no seat it may spend takes
+    let work = key_of(keys, api::KeyCreate { project: "work", name: "k" });
+    says(
+        refusal(e, work, ", \"voice\": {\"data_class\": \"customer\"}"),
+        "no seat serving model echo-1 takes data class customer (those this key may spend take internal)",
+        "a data class no seat takes",
+    );
+
+    // all else allowed: the node is not up
+    let pending = refusal(e, work, "");
+    says(pending, "the node of seat s1 (laptop) is pending", "a node not up");
+    std::test::assert(
+        api::seat_capacity(
+            api::ApiError { code: api::ErrorCode::no_eligible_seat, message: pending },
+        ),
+        "a node not up is the fleet's, for now",
+    );
+
+    // a disabled seat, among those it could go to
+    seats.update(
+        api::SeatUpdate { node: "laptop", seat: "s1", has_enabled: true, enabled: false },
+    ) or discard;
+    let disabled = refusal(e, work, "");
+    says(disabled, "no seat serving model echo-1 is up: seat s1 is disabled", "a disabled seat");
+    std::test::assert(
+        api::seat_capacity(
+            api::ApiError { code: api::ErrorCode::no_eligible_seat, message: disabled },
+        ),
+        "a seat not up is the fleet's, for now",
+    );
+
+    // the annotation queue gives up at once on each configuration refusal
+    let mut finals = st::Names { };
+    push(finals.items, "no seat serves model echo-1") or discard;
+    push(
+        finals.items,
+        "project bare may spend no account (its accounts are empty): grant one in Projects",
+    ) or discard;
+    push(
+        finals.items,
+        "this key may spend no account (its accounts are empty): grant it one",
+    ) or discard;
+    push(
+        finals.items,
+        "no seat serving model echo-1 spends an account this key may spend (this key may spend other; the seats spend static)",
+    ) or discard;
+    push(
+        finals.items,
+        "no seat serving model echo-1 takes data class customer (those this key may spend take internal)",
+    ) or discard;
+    for m in finals.items {
+        std::test::assert(
+            !api::seat_capacity(
+                api::ApiError { code: api::ErrorCode::no_eligible_seat, message: m },
+            ),
+            "final: " + m,
+        );
+    }
+    std::test::assert(
+        api::seat_capacity(
+            api::ApiError {
+                code: api::ErrorCode::no_eligible_seat,
+                message: "no seat serving model echo-1 is up yet, as the router last judged",
+            },
+        ),
+        "the router's lag is the fleet's, for now",
+    );
+}

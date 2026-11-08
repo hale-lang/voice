@@ -42,7 +42,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
             { key: 'name', header: 'Name', render: (p) => p.name },
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
-            { key: 'accounts', header: 'Accounts', render: (p) => (p.inherits ? <span className="muted">{p.parent}'s</span> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none</span>) : <span className="muted">any</span>) },
+            { key: 'accounts', header: 'Accounts', render: (p) => (spendsNone(p, q.data.data) ? <SpendsNone /> : p.inherits ? <span className="muted">{p.parent}'s</span> : p.accounts ? p.accounts.join(', ') : <span className="muted">any</span>) },
             { key: 'spent', header: 'Spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
             { key: 'budget', header: 'Allowance', num: true, render: (p) => (p.budget ? `${micros(p.budget.allowance_micros, p.budget.currency)} / ${p.budget.period}` : '') },
           ]}
@@ -122,6 +122,21 @@ function CreateProject() {
       </Form>
     </>
   );
+}
+
+/** True when `p` may spend no account: its own accounts `[]` (none, unlike
+ * `null`, any), or its parent's when it inherits them. Every request its
+ * keys send is refused `no_eligible_seat`. */
+function spendsNone(p: Project, all: Project[]): boolean {
+  if (p.inherits) {
+    const parent = all.find((q) => q.id === p.parent);
+    return Boolean(parent && !parent.inherits && parent.accounts && parent.accounts.length === 0);
+  }
+  return Boolean(p.accounts && p.accounts.length === 0);
+}
+
+function SpendsNone() {
+  return <Status tone="fail" label="none" title="may spend no account: requests will be refused; grant one" />;
 }
 
 function ProjectInspector({ project: p }: { project: Project }) {
@@ -213,7 +228,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
           { k: 'models', v: p.models ? (p.models.length ? p.models.join(', ') : <span className="c-wait">none</span>) : 'the whole catalog' },
           { k: 'aliases', v: <Aliases project={p} /> },
           ...(p.parent ? [{ k: 'parent', v: <a href={`#/projects/${p.parent}`}><Mono>{p.parent}</Mono></a> }] : []),
-          { k: 'accounts', v: p.inherits ? <>{p.parent}'s, inherited</> : p.accounts ? (p.accounts.length ? p.accounts.join(', ') : <span className="c-wait">none: nothing serves it</span>) : 'any' },
+          { k: 'accounts', v: spendsNone(p, projects.data?.data ?? []) ? <><SpendsNone /> <span className="muted">may spend no account{p.inherits ? ` (inherits ${p.parent}'s, which are none)` : ''}: requests will be refused; grant one with edit access</span></> : p.inherits ? <>{p.parent}'s, inherited</> : p.accounts ? p.accounts.join(', ') : 'any (no restriction)' },
           { k: 'position', v: p.position ?? '–' },
           { k: 'created', v: when(p.created_at) },
         ]}

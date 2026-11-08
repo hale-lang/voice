@@ -993,9 +993,7 @@ locus Inference {
             let why = if out.serving == 0 {
                 "no seat serves model " + r.model
             } else {
-                to_string(out.serving) + " seat(s) serve model " + r.model
-                    + ", none up on a node that is up, with an account this key may spend and data class "
-                    + r.data_class
+                unmet(self.store, seats, p, k, r) or fail metering_failed(err)
             };
             fail ApiError {
                 status: 503,
@@ -1021,6 +1019,143 @@ locus Inference {
         if !allowed(s, p, k, r) { return false; }
         return seat_ready(self.store, s) or fail metering_failed(err);
     }
+}
+
+/// Why no seat may take `r` though seats serve its model: the first
+/// condition unmet, in a fixed order. The project's and the key's accounts
+/// first, since nothing else matters while they spend none; then whether
+/// any seat serving the model spends an account they may, and takes the
+/// request's data class; then whether one of those is up. Each before the
+/// last holds until someone changes the configuration; the last is the
+/// fleet's, for now (`fleet_for_now`). Names the caller's own project and
+/// accounts, never another project.
+fn unmet(
+    store: st::Store,
+    seats: st::SeatRows,
+    p: st::ProjectRow,
+    k: st::KeyRow,
+    r: InferenceRequest
+) -> String fallible(st::StoreError) {
+    if !p.accounts.any && count(p.accounts.names.items) == 0 {
+        let whose = if p.inherits {
+            "it inherits its parent's, which grant none"
+        } else {
+            "its accounts are empty"
+        };
+        return "project " + p.id + " may spend no account (" + whose + "): grant one in Projects";
+    }
+    if !k.accounts.any && count(k.accounts.names.items) == 0 {
+        return "this key may spend no account (its accounts are empty): grant it one";
+    }
+    let spends = spends_of(p, k);
+    if !spends.any && count(spends.names.items) == 0 {
+        return "this key may spend no account: it names " + names_text(k.accounts.names.items)
+            + ", none of which project " + p.id + " may spend ("
+            + names_text(p.accounts.names.items) + ")";
+    }
+    let model = "model " + r.model;
+    let mut theirs = st::Names { };
+    let mut classes = st::Names { };
+    let mut spendable = 0;
+    let mut classed = 0;
+    for s in seats.rows {
+        if seat_serves(s, r.model) {
+            if !has_name(theirs.items, s.account) { push(theirs.items, s.account) or discard; }
+            let may = if len(r.account) > 0 {
+                s.account == r.account
+            } else {
+                allows(spends, s.account)
+            };
+            if may {
+                spendable = spendable + 1;
+                for dc in s.data_classes.items {
+                    if !has_name(classes.items, dc) { push(classes.items, dc) or discard; }
+                }
+                if has_name(s.data_classes.items, r.data_class) { classed = classed + 1; }
+            }
+        }
+    }
+    if spendable == 0 {
+        if len(r.account) > 0 {
+            return "no seat serving " + model + " spends account " + r.account
+                + ", the one this request names (the seats spend " + names_text(theirs.items) + ")";
+        }
+        return "no seat serving " + model
+            + " spends an account this key may spend (this key may spend "
+            + names_text(spends.names.items) + "; the seats spend " + names_text(theirs.items)
+            + ")";
+    }
+    if classed == 0 {
+        return "no seat serving " + model + " takes data class " + r.data_class
+            + " (those this key may spend take " + names_text(classes.items) + ")";
+    }
+    // each seat it could go to, and why it cannot now
+    let mut whys = st::Names { };
+    let mut nodes_only = true;
+    let mut more = 0;
+    for s in seats.rows {
+        if seat_serves(s, r.model) && allowed_but_enabled(s, p, k, r) {
+            let why = if s.enabled {
+                seat_unready(store, s) or raise
+            } else {
+                "seat " + s.id + " is disabled"
+            };
+            if len(why) > 0 {
+                if !std::str::starts_with(why, "the node of seat") { nodes_only = false; }
+                if count(whys.items) < 4 {
+                    push(whys.items, why) or discard;
+                } else {
+                    more = more + 1;
+                }
+            }
+        }
+    }
+    if count(whys.items) == 0 {
+        // each is up now, though the router's last table offered none
+        return "no seat serving " + model + " is up yet, as the router last judged";
+    }
+    let mut listed = joined(whys.items, "; ");
+    if more > 0 { listed = listed + "; and " + to_string(more) + " more"; }
+    if nodes_only { return listed; }
+    return "no seat serving " + model + " is up: " + listed;
+}
+
+/// True when `message`, a `no_eligible_seat` refusal's, says only that the
+/// fleet cannot take the request now (`unmet`'s last condition): seats it
+/// may go to serve the model, none up. Every other is the configuration's,
+/// final until someone changes it.
+fn fleet_for_now(message: String) -> Bool {
+    return std::str::starts_with(message, "the node of seat")
+        || (std::str::starts_with(message, "no seat serving model ")
+                && (std::str::contains(message, " is up: ")
+                        || std::str::ends_with(message, " is up yet, as the router last judged")));
+}
+
+/// `ns` as a phrase: "a, b", or "none".
+fn names_text(ns: bounded[String; 32]) -> String {
+    if count(ns) == 0 { return "none"; }
+    return joined(ns, ", ");
+}
+
+fn joined(ns: bounded[String; 32], sep: String) -> String {
+    let mut out = "";
+    for n in ns {
+        out = if len(out) == 0 { n } else { out + sep + n };
+    }
+    return out;
+}
+
+/// `allowed`, but a disabled seat too: whether `r` could go to `s` were it
+/// enabled.
+fn allowed_but_enabled(
+    s: st::SeatRow,
+    p: st::ProjectRow,
+    k: st::KeyRow,
+    r: InferenceRequest
+) -> Bool {
+    let mut on = s;
+    on.enabled = true;
+    return allowed(on, p, k, r);
 }
 
 /// True when `r` may be offered to `s`: enabled, carrying its data class,
@@ -1832,34 +1967,53 @@ fn tool_calls_json(response: String) -> String {
 /// leader's seat, rank 0, while the follower's on the other node is up too
 /// (`part_up`); the follower's serves nothing itself.
 fn seat_ready(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError) {
+    let why = seat_unready(store, s) or raise;
+    return len(why) == 0;
+}
+
+/// Why seat `s` could not take a request now, as `seat_ready` judges it,
+/// in a phrase naming the seat; "" when it could.
+fn seat_unready(store: st::Store, s: st::SeatRow) -> String fallible(st::StoreError) {
     let a = store.account(s.account) or raise;
-    if !a.present || a.archived { return false; }
+    if !a.present || a.archived {
+        return "seat " + s.id + "'s account " + s.account + " is archived";
+    }
     let cluster = std::json::find_field_raw(s.config, "cluster");
     if len(std::str::trim(cluster)) > 0 {
-        if std::json::find_int_field(cluster, "rank") != 0 { return false; }
-        if !(part_up(store, std::json::find_string_field(cluster, "peer"), s.id) or raise) {
-            return false;
+        if std::json::find_int_field(cluster, "rank") != 0 {
+            return "seat " + s.id + " is a follower's part, which serves nothing itself";
+        }
+        let peer = std::json::find_string_field(cluster, "peer");
+        if !(part_up(store, peer, s.id) or raise) {
+            return "seat " + s.id + "'s follower part on node " + peer + " is not up";
         }
     }
     let n = store.node(s.node) or raise;
-    if !n.present { return false; }
+    let of = "the node of seat " + s.id + " (" + s.node + ")";
+    if !n.present { return of + " is not registered"; }
     let status = node_status(store, n, now_seconds()) or raise;
-    if status != "up" { return false; }
+    if status != "up" { return of + " is " + status; }
     let f = store.fleet(n.id) or raise;
-    if f.draining || f.applied_version < n.assignment_version || locally_paused(f.local, s.id) {
-        return false;
+    if f.draining { return of + " is draining"; }
+    if f.applied_version < n.assignment_version {
+        return of + " has not applied its assignment yet";
+    }
+    if locally_paused(f.local, s.id) {
+        return "seat " + s.id + " is held by a local control on its node";
     }
     // a node whose local cap is 0 refuses every request: it is at its cap
     if kind_of(f.local, "max_in_flight") == "number"
         && std::json::find_int_field(f.local, "max_in_flight") < 1
     {
-        return false;
+        return of + " has a local cap of 0 requests";
     }
     let states = store.seat_states(n.id) or raise;
     for st in states.rows {
-        if st.seat == s.id { return st.status == "up"; }
+        if st.seat == s.id {
+            return if st.status == "up" { "" } else { "seat " + s.id + " is " + st.status };
+        }
     }
-    return false;
+    return "seat " + s.id + " has no state from its node yet";
 }
 
 /// True when seat `id` on node `node`, a follower's part, is up: reported

@@ -6,10 +6,11 @@ type LinkCheck = Schemas['LinkCheck'];
 /**
  * A labeled, synthetic fleet for the node cards with no fleet behind them:
  * three DGX Sparks, `spark` and `flare` cabled to each other, and
- * `spark3`. Now gpt-oss-120b runs on spark, and the coder, granite and a
- * small model on spark3; the plan puts DeepSeek-V4.1-Flash across spark and
+ * `spark3`, and a 24 GiB Mac, `mac`, a fifth their size, drawn in the same
+ * grid. Now gpt-oss-120b runs on spark, the coder, granite and a small
+ * model on spark3, and phi-4-mini-reasoning on the Mac; the plan puts DeepSeek-V4.1-Flash across spark and
  * flare on TensorFold in gpt-oss's place, keeps the coder and the small
- * model, and gives part of granite's room to the decider. Sizes follow voice's shipped recipes; nothing here
+ * model and the Mac's, and gives part of granite's room to the decider. Sizes follow voice's shipped recipes; nothing here
  * is read from, or sent to, any host.
  */
 
@@ -45,7 +46,27 @@ function spark(id: string, name: string): NodeSummary {
   } as NodeSummary;
 }
 
-export const DEMO_NODES: NodeSummary[] = [spark('flare', 'Spark 2 · flare'), spark('spark', 'Spark 1'), spark('spark3', 'Spark 3')];
+/** A 24 GiB Mac: less the 4 GiB a machine keeps at the least. */
+const MAC = 24 * GIB;
+const MAC_MODELS = MAC - 4 * GIB;
+
+function mac(id: string, name: string): NodeSummary {
+  return {
+    ...spark(id, name),
+    hardware: {
+      os: 'darwin',
+      arch: 'arm64',
+      memory_bytes: MAC,
+      model_memory_bytes: MAC_MODELS,
+      accelerators: [{ kind: 'metal', name: 'Apple M4 Pro', memory_bytes: MAC, unified: true }],
+      disk_free_bytes: 0.4e12,
+    },
+    max_in_flight: 2,
+    effective_max_in_flight: 2,
+  } as NodeSummary;
+}
+
+export const DEMO_NODES: NodeSummary[] = [spark('flare', 'Spark 2 · flare'), mac('mac', 'MacBook Pro'), spark('spark', 'Spark 1'), spark('spark3', 'Spark 3')];
 
 function placed(id: string, model: string, recipe: string, nodes: string[], variant: string, runtime: string, reserved: number): Placement {
   return {
@@ -59,6 +80,7 @@ export const DEMO_PLACEMENTS: Placement[] = [
   placed('coder', 'qwen3-coder-next', 'qwen3-coder-next', ['spark3'], 'gguf-q8_0', 'llama-server-b11913-cuda', 86.0),
   placed('granite', 'granite-4.0-h-small', 'granite-4.0-h-small', ['spark3'], 'gguf-q4_k_m', 'llama-server-b11913-cuda', 16.2),
   placed('tiny', 'qwen3-0.6b', 'qwen3-0.6b', ['spark3'], 'safetensors-bf16', 'vllm-0.11-cuda', 5.6),
+  placed('mini', 'phi-4-mini-reasoning', 'phi-4-mini-reasoning', ['mac'], 'gguf-q8_0', 'llama-server-b11913-metal', 4.6),
 ];
 
 const add = (placement: string, model: string, nodes: string[], variant: string, runtime: string, reserved: number, serves: string[], reason: string, download: number) => ({
@@ -75,7 +97,7 @@ const remove = (placement: string, model: string, nodes: string[], reserved: num
 });
 
 export const DEMO_PLAN: Plan = {
-  keep: [keep('coder', 'qwen3-coder-next', ['spark3'], 86.0, ['coder']), keep('tiny', 'qwen3-0.6b', ['spark3'], 5.6, ['small'])],
+  keep: [keep('coder', 'qwen3-coder-next', ['spark3'], 86.0, ['coder']), keep('tiny', 'qwen3-0.6b', ['spark3'], 5.6, ['small']), keep('mini', 'phi-4-mini-reasoning', ['mac'], 4.6, ['thinker'])],
   remove: [
     remove('oss', 'gpt-oss-120b', ['spark'], 66.0, "serves none of the arrangement's wants; its room on spark goes to pin deepseek-v4.1-flash-1017"),
     remove('granite', 'granite-4.0-h-small', ['spark3'], 16.2, "serves none of the arrangement's wants; its room on spark3 goes to decider"),

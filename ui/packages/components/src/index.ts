@@ -14,7 +14,7 @@ export { Loading, Unavailable, Missing, Empty, Stale } from './States';
 export { Form, Field, TextInput, TextArea, NumberInput, Select, Checkbox, ListInput, Button, Confirm, Secret } from './Form';
 export { MemoryCard, MemoryKey, MemoryNeed, MemoryTip } from './MemoryCard';
 export type { MemoryCardProps, MemoryPoint } from './MemoryCard';
-export { layoutMemory, planCells, orderForPlan, memoryTotals, memoryUnit, hueOf, huesFor, HUE_SLOTS, CELLS_MAX } from './memory-layout';
+export { layoutMemory, planCells, orderForPlan, memoryTotals, memoryUnit, unitSaid, apportion, hueOf, huesFor, HUE_SLOTS, CELLS } from './memory-layout';
 export type { MemoryBlock, MemoryCell, MemoryMark, MemoryModel, MemoryTotals } from './memory-layout';
 export { SchemaForm } from './SchemaForm';
 export type { JsonSchema, JsonObject } from './SchemaForm';

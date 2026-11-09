@@ -53,6 +53,26 @@ export type FleetPair = { key: string; nodes: [string, string]; link?: LinkCheck
 /** A want a plan leaves unfilled, and the least it would hold on a node. */
 export type FleetUnmet = { want: string; reason: string; needBytes?: number };
 
+/**
+ * An accelerator's name as a person reads it. A node names an AMD or Intel
+ * card as it is sold (node/hardware.hl); one older than that may still
+ * send `lspci`'s whole line (`03:00.0 VGA compatible controller: Advanced
+ * Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE]
+ * (rev c0)`), shortened here the same way: its last bracketed name not the
+ * vendor's own, the first it lists, led by the vendor (`AMD Radeon RX
+ * 9070`). Any other name is left as it is.
+ */
+export function acceleratorName(name: string): string {
+  const raw = name.trim();
+  if (!/^([0-9a-f]{4}:)?[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]\s/i.test(raw) && !/ controller: /.test(raw)) return name;
+  const desc = raw.slice(raw.indexOf(': ') + 2).replace(/\s*\(rev [^)]*\)\s*$/, '');
+  const brand = /^Advanced Micro Devices|^AMD\b/.test(desc) ? 'AMD' : /^Intel\b/.test(desc) ? 'Intel' : /^NVIDIA\b/.test(desc) ? 'NVIDIA' : '';
+  const marked = [...desc.matchAll(/\[([^\]]+)\]/g)].map((m) => m[1]!.trim()).filter((x) => x && !/^(AMD\/ATI|AMD|ATI)$/.test(x));
+  const sold = marked.length ? marked[marked.length - 1]!.split('/')[0]!.trim() : '';
+  if (!sold) return brand ? `${brand} GPU` : desc;
+  return brand && !sold.startsWith(`${brand} `) ? `${brand} ${sold}` : sold;
+}
+
 /** The nodes models are placed on: those not revoked, in the order of their ids. */
 export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
   return nodes
@@ -60,9 +80,9 @@ export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
     .map((n) => {
       const hw = n.hardware;
       const acc = hw?.accelerators ?? [];
-      const names = [...new Set(acc.filter((a) => a.kind !== 'vulkan' || acc.length === 1).map((a) => a.name))];
+      const names = [...new Set(acc.filter((a) => a.kind !== 'vulkan' || acc.length === 1).map((a) => acceleratorName(a.name)))];
       const accelerator = names.length === 0 ? undefined : names.map((x) => {
-        const k = acc.filter((a) => a.name === x && (a.kind !== 'vulkan' || acc.length === 1)).length;
+        const k = acc.filter((a) => acceleratorName(a.name) === x && (a.kind !== 'vulkan' || acc.length === 1)).length;
         return k > 1 ? `${k}× ${x}` : x;
       }).join(' + ');
       return { id: n.id, name: n.name ?? undefined, status: n.status, accelerator, memoryBytes: hw?.memory_bytes, budgetBytes: hw?.model_memory_bytes };

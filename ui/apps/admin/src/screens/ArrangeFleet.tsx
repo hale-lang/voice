@@ -18,7 +18,7 @@ const DEMO = {
  * The arranger's fleet, drawn (FleetMemory.tsx): each node's memory as it
  * is placed now, and once planned, as the plan would leave it, the one or
  * the other; what the plan cannot fit in a tray. Choosing a model selects
- * its step in the plan. A labeled demo fleet (three Sparks and a plan for
+ * its step in the plan. A labeled demo fleet (three Sparks, a Mac and a plan for
  * them) draws it with no fleet behind it.
  */
 export function ArrangeFleet({ plan, selected, onSelect }: { plan: Plan | null; selected: string | null; onSelect: (block: string) => void }) {

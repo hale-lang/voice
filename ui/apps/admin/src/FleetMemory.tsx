@@ -1,6 +1,6 @@
 import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { useQueries } from '@tanstack/react-query';
-import { MemoryCard, MemoryKey, MemoryNeed, MemoryTip, Mono, Status, bytes, huesFor, memoryUnit, planCells, type MemoryPoint } from '@hale/components';
+import { MemoryCard, MemoryKey, MemoryNeed, MemoryTip, Mono, Status, bytes, huesFor, planCells, unitSaid, CELLS, type MemoryPoint } from '@hale/components';
 import { api, describe, useGet, useNodes, type Schemas } from './api/client';
 import { useRefetchInterval } from './api/live';
 import { cardGroups, fleetNodes, linkSaid, memoryOf, pairsOf, placedBlocks, type FleetBlock, type FleetNode, type FleetPair, type FleetUnmet } from './fleet-memory';
@@ -55,7 +55,6 @@ export function FleetMemory(p: FleetMemoryProps) {
   const setView = (v: 'now' | 'plan') => (p.onView ? p.onView(v) : setOwnView(v));
   const kept = useMemo(() => (p.plan ? new Set(p.plan.filter((b) => b.mark === 'kept').map((b) => b.key)) : undefined), [p.plan]);
   const shownNodes = p.only ? p.only.map((id) => p.nodes.find((n) => n.id === id)).filter((n): n is FleetNode => !!n) : p.nodes;
-  const unit = memoryUnit(Math.max(1, ...p.nodes.map((n) => n.memoryBytes ?? 0)));
   const blocks = view === 'plan' && p.plan ? p.plan : p.now;
   const pairs = pairsOf(blocks, p.links);
   const groups = p.only ? [p.only.filter((id) => shownNodes.some((n) => n.id === id))] : cardGroups(shownNodes, [...pairsOf(p.now), ...pairsOf(p.plan ?? [])]);
@@ -90,8 +89,7 @@ export function FleetMemory(p: FleetMemoryProps) {
           subtitle={subtitle}
           status={status}
           model={planModel ?? nowModel}
-          cells={planModel ? planCells(nowModel, planModel, unit) : undefined}
-          unit={unit}
+          cells={planModel ? planCells(nowModel, planModel) : undefined}
           compact={p.compact}
           highlight={lit}
           selected={p.selected}
@@ -110,7 +108,7 @@ export function FleetMemory(p: FleetMemoryProps) {
       <div className={s.bar}>
         {p.lead}
         {p.plan && <Toggle label="which fleet is drawn" value={view} options={[['now', 'now'], ['plan', 'plan']]} onChange={setView} />}
-        <MemoryKey unit={unit} plan={view === 'plan' && !!p.plan} overhead="its server's own" />
+        <MemoryKey plan={view === 'plan' && !!p.plan} overhead="its server's own" />
       </div>
       <div className={s.cards}>
         {groups.map((g) => {
@@ -126,7 +124,7 @@ export function FleetMemory(p: FleetMemoryProps) {
         })}
         {shownNodes.length === 0 && <span className="faint">No node to draw.</span>}
       </div>
-      {view === 'plan' && p.unmet && p.unmet.length > 0 && <Tray unmet={p.unmet} unit={unit} />}
+      {view === 'plan' && p.unmet && p.unmet.length > 0 && <Tray unmet={p.unmet} nodes={p.nodes} />}
       {hover && info(hover.key) && (
         <MemoryTip at={hover.at}>
           <BlockSaid block={info(hover.key)!} hue={hues.get(hover.key) ?? 205} pair={pairs.find((x) => x.key === hover.key)} />
@@ -194,21 +192,30 @@ function BlockSaid({ block: b, hue, pair }: { block: FleetBlock; hue: number; pa
   );
 }
 
-/** What a plan leaves unfilled, each at the size it would take: the "doesn't fit" tray. */
-function Tray({ unmet, unit }: { unmet: FleetUnmet[]; unit: number }) {
+/**
+ * What a plan leaves unfilled, each at the size it would take: the "doesn't
+ * fit" tray. A want's need is what it would hold of each node it needs, not
+ * of one node in particular, so it is said in bytes, and drawn in cells of
+ * the node with the most memory, the most room any card has: past a
+ * hundred, it fits on no node whole.
+ */
+function Tray({ unmet, nodes }: { unmet: FleetUnmet[]; nodes: FleetNode[] }) {
+  const largest = nodes.reduce<FleetNode | undefined>((a, n) => (n.memoryBytes != null && n.memoryBytes > (a?.memoryBytes ?? 0) ? n : a), undefined);
+  const unit = largest?.memoryBytes ? largest.memoryBytes / CELLS : 0;
   return (
     <section className={s.tray} aria-label="does not fit">
       <h3>Does not fit · {unmet.length}</h3>
       <ul>
         {unmet.map((u) => {
-          const cells = u.needBytes ? Math.max(1, Math.round(u.needBytes / unit)) : 0;
+          const cells = u.needBytes && unit > 0 ? Math.max(1, Math.round(u.needBytes / unit)) : 0;
+          const against = largest ? `${cells} cells of ${largest.id}'s ${CELLS} (1 cell ≈ ${unitSaid(unit)})` : '';
           return (
             <li key={u.want}>
               <div className={s.trayHead}>
                 <Status tone="wait" label={u.want} />
-                <span className="mono muted">{u.needBytes ? `at least ${bytes(u.needBytes)} · ${cells} cells` : 'no model can fill it'}</span>
+                <span className="mono muted">{u.needBytes ? `at least ${bytes(u.needBytes)} a node${against ? ` · ${against}` : ''}` : 'no model can fill it'}</span>
               </div>
-              {cells > 0 && <MemoryNeed cells={cells} label={`${u.want} needs ${bytes(u.needBytes)} on a node`} />}
+              {cells > 0 && largest && <MemoryNeed cells={cells} label={`${u.want} needs ${bytes(u.needBytes)} on each node it takes: ${against}`} />}
               <div className={s.why}>{u.reason}</div>
             </li>
           );

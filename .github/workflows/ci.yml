@@ -420,6 +420,11 @@ jobs:
           git clone --quiet "$GITHUB_WORKSPACE" "$fresh/voice"
           echo "FRESH=$fresh/voice" >> "$GITHUB_ENV"
           test ! -e "$fresh/voice/api/api"
+      - name: Compose renders the habitat's database and broker when it hands them over, and its own otherwise
+        run: |
+          cd "$FRESH"
+          docker compose version
+          scripts/compose-reuse.sh
       - name: The compose images build from the same clone
         run: cd "$FRESH" && docker compose build
       - name: Compose's migrate service migrates, twice (the second applies nothing)
@@ -433,9 +438,51 @@ jobs:
           grep -q "applied=$n version=$n" "$RUNNER_TEMP/migrate.1.log"
           grep -q "applied=0 version=$n" "$RUNNER_TEMP/migrate.2.log"
           test -z "$(git status --porcelain --untracked-files=all)" || { git status --short; exit 1; }
+      # `hale habitat graft voice --reuse database --reuse broker`: the
+      # habitat's Postgres and NATS (here, two containers on this machine's
+      # address, as a habitat's are on its LAN address), handed over as
+      # HALE_DNA_DATABASE_DSN and HALE_DNA_BROKER_*, their passwords in its
+      # vault, with COMPOSE_PROFILES naming neither role as voice's own
+      - name: Grafted with --reuse database --reuse broker, voice uses the habitat's and starts neither of its own
+        run: |
+          cd "$FRESH"
+          docker compose down -v
+          ip=$(hostname -I | awk '{print $1}')
+          docker run -d --name habitat-db -e POSTGRES_USER=heart_zz -e POSTGRES_PASSWORD=heartpw -e POSTGRES_DB=heart_zz -p "$ip:5544:5432" postgres:17
+          docker run -d --name habitat-nats -p "$ip:4333:4222" -p 127.0.0.1:8333:8222 -v "$PWD/scripts/e2e-broker-nats.conf:/etc/nats/broker.conf:ro" nats:2.11-alpine -c /etc/nats/broker.conf -m 8222
+          for i in $(seq 1 60); do docker exec habitat-db pg_isready -q -U heart_zz -d heart_zz && break; sleep 1; done
+          vault=$RUNNER_TEMP/vault
+          mkdir -m 700 "$vault"
+          printf heartpw >"$vault/postgres-heart_zz"
+          printf brokerpw >"$vault/nats-heart-zz"
+          printf '%s' 'no"de\pw' >"$vault/nats-heart-zz-node"
+          chmod 600 "$vault"/*
+          export COMPOSE_PROFILES=none HALE_VAULT_DIR="$vault" \
+            HALE_DNA_DATABASE_DSN="postgres://heart_zz@$ip:5544/heart_zz?sslmode=disable&vault=postgres-heart_zz" \
+            HALE_DNA_BROKER_URL="nats://$ip:4333" HALE_DNA_BROKER_USER=heart-zz HALE_DNA_BROKER_VAULT=nats-heart-zz \
+            HALE_DNA_BROKER_SUBJECTS='heart.zz.>' HALE_DNA_BROKER_NODE_USER=heart-zz-node HALE_DNA_BROKER_NODE_VAULT=nats-heart-zz-node
+          docker compose up -d --wait --wait-timeout 120 || { docker compose ps --all; docker compose logs --no-color; exit 1; }
+          docker compose ps --all
+          ran=$(docker compose ps --all --format '{{.Service}}' | sort | tr '\n' ' ')
+          test "$ran" = "api brain migrate " || { echo "services run: $ran"; exit 1; }
+          test -z "$(docker ps -aq --filter label=com.docker.compose.project=voice --filter label=com.docker.compose.service=postgres)"
+          test -z "$(docker ps -aq --filter label=com.docker.compose.project=voice --filter label=com.docker.compose.service=nats)"
+          # migrate brought the habitat's database up to the head
+          n=$(ls store/migrations/*.sql | wc -l)
+          docker compose logs --no-color migrate | grep "applied=$n version=$n"
+          test "$(docker exec habitat-db psql -U heart_zz -d heart_zz -tAc "select to_regclass('public.recipe') is not null")" = t
+          curl -fsS http://127.0.0.1:8080/healthz
+          # the api and the brain on the habitat's database and broker
+          docker compose logs --no-color api brain | tee "$RUNNER_TEMP/reuse.log"
+          test "$(grep -c "grafted: voice's own NATS is the habitat's broker" "$RUNNER_TEMP/reuse.log")" -ge 2
+          test "$(curl -fsS 'http://127.0.0.1:8333/connz?auth=true' | python3 -c 'import json, sys; print(sum(c.get("authorized_user") == "heart-zz" for c in json.load(sys.stdin)["connections"]))')" -ge 2
+          test "$(docker exec habitat-db psql -U heart_zz -d heart_zz -tAc "select count(*) from pg_stat_activity where usename = 'heart_zz' and pid <> pg_backend_pid()")" -ge 1
       - name: Down
         if: always()
-        run: cd "$FRESH" && docker compose down -v
+        run: |
+          cd "$FRESH"
+          docker compose down -v
+          docker rm -f habitat-db habitat-nats || true
 
   image:
     name: image

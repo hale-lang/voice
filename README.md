@@ -44,7 +44,7 @@ cache holds what was said, and its usage records are grouped by it.
 
 ## Getting started
 
-You need Docker with Compose.
+You need Docker with Compose 2.20 or later.
 
 ```sh
 git clone https://github.com/hale-lang/voice && cd voice
@@ -55,6 +55,9 @@ curl localhost:8080/healthz
 To run voice as an organism of a hale habitat instead, graft it from the
 toolchain's nursery with `hale habitat graft voice`; it needs no checkout or
 build of its own (hale's habitat chapter, in `docs/src/habitat.md`, has the rest).
+Voice brings its own Postgres and NATS; `--reuse database --reuse broker` has
+the habitat provide them instead, and voice's compose then connects to the
+habitat's and starts neither of its own (compose.yaml says how).
 
 This starts Postgres, NATS, the api (on `localhost:8080`, with the admin UI
 at `/`; its live hub on `8085`) and the brain: the coordinator. Nodes serve the models, each on its

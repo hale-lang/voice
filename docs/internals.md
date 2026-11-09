@@ -117,7 +117,15 @@ rest stops the api (and the brain) at start, rather than running it
 standalone; so does a vault without the heart's own broker password. `HALE_DNA_HEAD_URL`, `HALE_DNA_APPLICATION_ID`,
 `HALE_DNA_OIDC_ISSUER`, `HALE_DNA_OIDC_CLIENT` and
 `HALE_DNA_OIDC_CLIENT_VAULT` replace `--head`, `--application`,
-`--issuer`, `--client` and `--client-vault` when they are set. The
+`--issuer`, `--client` and `--client-vault` when they are set. Voice's
+compose brings its own Postgres and NATS (the `database` and `broker`
+profiles, on by default through `.env`); grafted with `--reuse database
+--reuse broker`, it passes the habitat's hand-over through instead
+(`--database ${HALE_DNA_DATABASE_DSN}`, `--nats ${HALE_DNA_BROKER_URL}` and
+the broker's account, the habitat's vault mounted where a password is
+read; nodes are handed the broker's URL), and the habitat leaves the
+roles it provides out of `COMPOSE_PROFILES`, so neither server of voice's
+starts. The
 database is migrated by compose's `migrate` service (`voice-api migrate`,
 from voice's image) before the api and the brain start, at every apply,
 its own ledger making a run at the head a no-op that exits 0: neither the

@@ -41,6 +41,31 @@
 #
 #   hale dna secret show operator-token
 #
+# Postgres and NATS are the heart roles voice brings (hale.toml, `[dna]
+# brings`): the `database` and `broker` profiles, which the repository's
+# .env turns on (COMPOSE_PROFILES=database,broker), so `docker compose up`
+# runs both. Grafted with `hale habitat graft voice --reuse database
+# --reuse broker`, the habitat provisions them instead and hands them over:
+#
+#   HALE_DNA_DATABASE_DSN   the database, its password not in it: the DSN
+#                           names the vault entry that holds it (vault=)
+#   HALE_DNA_BROKER_URL     the broker, no credential in it, with _USER,
+#                           _VAULT (the vault entry of _USER's password),
+#                           _SUBJECTS (the prefix every subject is under),
+#                           _NODE_USER and _NODE_VAULT (the nodes' account)
+#
+# `migrate`, the api and the brain then use the habitat's (each falls back
+# to compose's own when its variable is unset), and nodes are handed the
+# habitat's broker URL to dial. The habitat names the profiles of the roles
+# it leaves to voice in COMPOSE_PROFILES, which wins over .env: `none` when
+# it provides both, so neither `postgres` nor `nats` starts. A habitat
+# that sets no COMPOSE_PROFILES starts both, unused when it hands its own.
+# What waits on `postgres` or `nats` waits only when it runs
+# (`depends_on: ... required: false`, Docker Compose 2.20 or later).
+# No secret is on a command line: the habitat's passwords are read from its
+# vault (HALE_VAULT_DIR, mounted read-only into each service that reads
+# one).
+#
 # `migrate` brings the schema up to date (spec/store.md) and exits, and
 # the api and the brain wait on it; the api keeps its configuration in
 # Postgres and reaches the node over NATS; the brain publishes the route
@@ -71,8 +96,34 @@ x-voice: &voice
   build: .
   image: ghcr.io/hale-lang/voice:${HALE_DNA_REVISION:-dev}
 
+# the database migrate, the api and the brain use: the habitat's when it
+# provides one (`--reuse database`), else compose's own `postgres`
+x-database: &database "${HALE_DNA_DATABASE_DSN:-postgres://voice:voice@postgres:5432/voice?sslmode=disable}"
+
+# the NATS the api and the brain use: the habitat's broker when it provides
+# one (`--reuse broker`), else compose's own `nats`. The broker's account
+# (lib/broker) comes with it, whole or not at all; unset, it is "", which
+# voice reads as none.
+x-broker: &broker "${HALE_DNA_BROKER_URL:-nats://nats:4222}"
+x-broker-env: &broker-env
+  HALE_DNA_BROKER_URL: ${HALE_DNA_BROKER_URL:-}
+  HALE_DNA_BROKER_USER: ${HALE_DNA_BROKER_USER:-}
+  HALE_DNA_BROKER_VAULT: ${HALE_DNA_BROKER_VAULT:-}
+  HALE_DNA_BROKER_SUBJECTS: ${HALE_DNA_BROKER_SUBJECTS:-}
+  HALE_DNA_BROKER_INBOX: ${HALE_DNA_BROKER_INBOX:-}
+  HALE_DNA_BROKER_NODE_USER: ${HALE_DNA_BROKER_NODE_USER:-}
+  HALE_DNA_BROKER_NODE_VAULT: ${HALE_DNA_BROKER_NODE_VAULT:-}
+
+# the habitat's vault, read-only, at the path it names, for each service
+# that reads a password from it (the habitat's database or broker, the
+# operator token); standalone, an empty directory nothing reads
+x-vault: &vault "${HALE_VAULT_DIR:-./deploy/no-vault}:${HALE_VAULT_DIR:-/run/voice/no-vault}:ro"
+
 services:
   postgres:
+    # the `database` role voice brings; not started when the habitat
+    # provides it (COMPOSE_PROFILES without `database`)
+    profiles: ["database"]
     image: postgres:17
     restart: unless-stopped
     # a ceiling the habitat counts against its host's memory for models
@@ -91,6 +142,9 @@ services:
       retries: 30
 
   nats:
+    # the `broker` role voice brings; not started when the habitat provides
+    # it (COMPOSE_PROFILES without `broker`)
+    profiles: ["broker"]
     image: nats:2.11-alpine
     restart: unless-stopped
     mem_limit: 256m
@@ -110,11 +164,18 @@ services:
   migrate:
     mem_limit: 256m
     <<: *voice
-    command: ["voice-api", "migrate", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable", "--migrations", "/usr/share/voice/migrations"]
+    command: ["voice-api", "migrate", "--database", *database, "--migrations", "/usr/share/voice/migrations"]
     restart: "no"
+    environment:
+      HALE_VAULT_DIR: ${HALE_VAULT_DIR:-}
+    volumes:
+      - *vault
+    # compose's own Postgres, when it runs one (the `database` profile):
+    # the habitat's is up before it applies voice's services
     depends_on:
       postgres:
         condition: service_healthy
+        required: false
 
   api:
     mem_limit: 1g
@@ -123,7 +184,8 @@ services:
     # the database `voice-api admin-token` reads the operator token from,
     # when it runs in this container (docker compose exec api ...)
     environment:
-      VOICE_DATABASE_URL: postgres://voice:voice@postgres:5432/voice?sslmode=disable
+      <<: *broker-env
+      VOICE_DATABASE_URL: *database
       # grafted, the habitat's vault and the entry it drew the operator
       # token into (hale.toml [dna.secrets.operator-token]); unset
       # standalone, where the api mints its own
@@ -138,11 +200,11 @@ services:
       # the habitat's name, which names its callers' projects
       # (<habitat>-habitat, <habitat>-<organism>); unset standalone
       HALE_DNA_HABITAT_NAME: ${HALE_DNA_HABITAT_NAME:-}
-    # the habitat's vault, read-only, at the path it names; standalone, an
-    # empty directory nothing reads
     volumes:
-      - "${HALE_VAULT_DIR:-./deploy/no-vault}:${HALE_VAULT_DIR:-/run/voice/no-vault}:ro"
-    command: ["voice-api", "--host", "0.0.0.0", "--port", "8080", "--nats", "nats://nats:4222", "--node-nats", "nats://${VOICE_NODE_HOST:-${HALE_DNA_HOST_NAME:-127.0.0.1}}:${VOICE_NATS_PORT:-4222}", "--ui", "/usr/share/voice/ui", "--recipes", "/usr/share/voice/recipes", "--runtimes", "/usr/share/voice/runtimes", "--picks", "/usr/share/voice/catalog/picks.json", "--roles", "/usr/share/voice/catalog/roles.json", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable"]
+      - *vault
+    # --node-nats: the NATS a node dials, the habitat's broker when it
+    # provides one, else compose's own by the name this host is reached by
+    command: ["voice-api", "--host", "0.0.0.0", "--port", "8080", "--nats", *broker, "--node-nats", "${HALE_DNA_BROKER_URL:-nats://${VOICE_NODE_HOST:-${HALE_DNA_HOST_NAME:-127.0.0.1}}:${VOICE_NATS_PORT:-4222}}", "--ui", "/usr/share/voice/ui", "--recipes", "/usr/share/voice/recipes", "--runtimes", "/usr/share/voice/runtimes", "--picks", "/usr/share/voice/catalog/picks.json", "--roles", "/usr/share/voice/catalog/roles.json", "--database", *database]
     ports:
       - "${VOICE_API_BIND:-${HALE_DNA_HOST_LISTEN:-127.0.0.1}}:8080:8080"
       # the hub: the fleet's heartbeats, live, to the admin UI (api/hub.hl),
@@ -151,8 +213,10 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      # compose's own NATS, when it runs one (the `broker` profile)
       nats:
         condition: service_healthy
+        required: false
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
       interval: 2s
@@ -163,12 +227,18 @@ services:
     mem_limit: 256m
     <<: *voice
     restart: unless-stopped
-    command: ["voice-brain", "--database", "postgres://voice:voice@postgres:5432/voice?sslmode=disable", "--nats", "nats://nats:4222"]
+    command: ["voice-brain", "--database", *database, "--nats", *broker]
+    environment:
+      <<: *broker-env
+      HALE_VAULT_DIR: ${HALE_VAULT_DIR:-}
+    volumes:
+      - *vault
     depends_on:
       migrate:
         condition: service_completed_successfully
       nats:
         condition: service_healthy
+        required: false
       api:
         condition: service_started
 

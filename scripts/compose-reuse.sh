@@ -25,9 +25,24 @@ handed=(
   HALE_DNA_BROKER_NODE_VAULT=nats-heart-zz-node
 )
 
-# the render under exactly the environment given (and the repository's
-# .env, as compose reads it), as JSON
-render() { env -i PATH="$PATH" HOME="$HOME" "$@" docker compose config --format json; }
+# the render under the environment given and none of the variables compose
+# reads otherwise (the repository's .env, as compose reads it), as JSON
+clean=(-u COMPOSE_PROFILES -u HALE_VAULT_DIR -u HALE_DNA_HOST_NAME -u HALE_DNA_HOST_LISTEN -u HALE_DNA_DATABASE_DSN
+  -u HALE_DNA_BROKER_URL -u HALE_DNA_BROKER_USER -u HALE_DNA_BROKER_VAULT -u HALE_DNA_BROKER_SUBJECTS
+  -u HALE_DNA_BROKER_INBOX -u HALE_DNA_BROKER_NODE_USER -u HALE_DNA_BROKER_NODE_VAULT
+  -u VOICE_NODE_HOST -u VOICE_NATS_PORT -u VOICE_NATS_BIND -u VOICE_API_BIND)
+render() {
+  local out err
+  err=$(mktemp)
+  if ! out=$(env "${clean[@]}" "$@" docker compose config --format json 2>"$err"); then
+    echo "docker compose config failed under: $*" >&2
+    cat "$err" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  printf '%s\n' "$out"
+}
 
 # check <case> <expected JSON> <render's JSON on stdin>
 check() {

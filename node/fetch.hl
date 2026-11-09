@@ -336,27 +336,17 @@ locus Fetcher {
         }
         done = self.fetch_pins(seat, more, done, total);
         if done < 0 { return; }
+        // said once the seat starts: its image pulled anonymously
+        let mut note = "";
         if std::json::find_string_field(artifact, "kind") == "container" {
             let image = std::json::find_string_field(artifact, "image") + "@"
                 + std::json::find_string_field(artifact, "digest");
-            let pulled = std::process::run(
-                "docker\npull\n" + image,
-            ) or std::process::ProcessOutput {
-                code: 127,
-                signal: 0,
-                stdout: "",
-                stderr: "docker could not be run",
-            };
-            if pulled.code != 0 {
-                self.blobs.tell(
-                    seat,
-                    "down",
-                    "its runtime's image could not be pulled: " + std::str::trim(pulled.stderr),
-                    done,
-                    total,
-                );
+            let pulled = self.pull_image(image);
+            if std::str::starts_with(pulled, "!") {
+                self.blobs.tell(seat, "down", pulled[1..len(pulled)], done, total);
                 return;
             }
+            note = pulled;
         }
         if len(std::json::find_string_field(variant, "prepare")) > 0 {
             let readied = self.prepare(seat, config, done, total);
@@ -365,8 +355,47 @@ locus Fetcher {
                 return;
             }
         }
-        self.blobs.tell(seat, "starting", "fetched and verified; starting its server", done, total);
+        self.blobs.tell(seat, "starting", starting_reason(note), done, total);
         RunWanted <- RunJob { seat: seat, config: config };
+    }
+
+    /// A container runtime's image, pulled by its digest: "" once it is
+    /// there; a note to say when the node's saved docker login for its
+    /// registry was refused and it was pulled anonymously instead; else "!"
+    /// and why it is not. The anonymous pull reads a fresh, empty docker
+    /// config, so no saved login is sent; by digest, it can only fetch the
+    /// pinned image. The saved config is never read.
+    @unbounded
+    fn pull_image(image: String) -> String {
+        let pulled = run_full(pull_argv(image));
+        if pulled.code == 0 { return ""; }
+        if !pull_refused(pulled.stderr) {
+            return "!its runtime's image could not be pulled: " + std::str::trim(pulled.stderr);
+        }
+        let registry = image_registry(image);
+        let made = run_full("mktemp\n-d\n-t\nvoice-pull-XXXXXX");
+        let dir = std::str::trim(made.stdout);
+        if made.code != 0 || len(dir) == 0 {
+            return "!" + pull_refused_reason(
+                registry,
+                self.id,
+                "no empty docker config could be made for an anonymous pull",
+            );
+        }
+        let anon = run_full(anonymous_pull_argv(dir, image));
+        run_out("rm\n-rf\n" + dir);
+        if anon.code != 0 {
+            log_warn(
+                "the node's saved docker login was refused, and an anonymous pull failed",
+                std::log::kv("registry", registry),
+            );
+            return "!" + pull_refused_reason(registry, self.id, std::str::trim(anon.stderr));
+        }
+        log_warn(
+            "the node's saved docker login was refused; the image was pulled anonymously",
+            std::log::kv("registry", registry),
+        );
+        return pulled_anonymously_note(registry);
     }
 
     /// Each pinned file (`pins`, `pin_line`s) the store does not hold,
@@ -1497,6 +1526,100 @@ locus Blobs {
             total: total,
         };
     }
+}
+
+/// A command run, as `std::process::run` takes it (its argv a line a
+/// word); code 127 when it cannot be run at all.
+@unbounded
+fn run_full(argv: String) -> std::process::ProcessOutput {
+    let nl = std::str::index_of(argv, "\n");
+    let program = if nl >= 0 { argv[0..nl] } else { argv };
+    return std::process::run(argv) or std::process::ProcessOutput {
+        code: 127,
+        signal: 0,
+        stdout: "",
+        stderr: program + " could not be run",
+    };
+}
+
+/// The pull of an image by its reference (`name@sha256:...`).
+fn pull_argv(image: String) -> String {
+    return "docker\npull\n" + image;
+}
+
+/// The same pull with `dir`, a fresh empty directory, as docker's config:
+/// no saved login is sent, so the registry is asked anonymously.
+fn anonymous_pull_argv(dir: String, image: String) -> String {
+    return "docker\n--config\n" + dir + "\npull\n" + image;
+}
+
+/// Whether a pull failed as its registry refused the login it was sent
+/// (or wanted one): docker's words for it, or a 401 or 403 status.
+@unbounded
+fn pull_refused(stderr: String) -> Bool {
+    let s = std::str::lower(stderr);
+    for word in ["denied", "unauthorized", "authentication required", "forbidden"] {
+        if std::str::contains(s, word) { return true; }
+    }
+    return has_number(s, "401") || has_number(s, "403");
+}
+
+/// Whether `s` holds `code` as a number of its own, not inside a digest or
+/// a longer number.
+@unbounded
+fn has_number(s: String, code: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    let mut i = std::str::index_of(s, code);
+    while i >= 0 {
+        let end = i + len(code);
+        let before = if i == 0 { 32 } else { std::str::byte_at(v, i - 1) };
+        let after = if end >= v.n { 32 } else { std::str::byte_at(v, end) };
+        if !alnum(before) && !alnum(after) { return true; }
+        i = std::str::index_of_from(s, code, i + 1);
+    }
+    return false;
+}
+
+fn alnum(b: Int) -> Bool {
+    return (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
+}
+
+/// The registry an image reference names: its first part when that has a
+/// dot or a port or is `localhost`, as docker reads it, else Docker Hub.
+fn image_registry(image: String) -> String {
+    let at_ = std::str::index_of(image, "@");
+    let name = if at_ >= 0 { image[0..at_] } else { image };
+    let slash = std::str::index_of(name, "/");
+    if slash < 0 { return "docker.io"; }
+    let first = name[0..slash];
+    if std::str::contains(first, ".") || std::str::contains(first, ":") || first == "localhost" {
+        return first;
+    }
+    return "docker.io";
+}
+
+/// What a seat says of an image pulled anonymously, its saved login for
+/// `registry` refused.
+fn pulled_anonymously_note(registry: String) -> String {
+    return "pulled anonymously: the node's saved docker login for " + registry + " was refused";
+}
+
+/// Why a seat is down when its saved login for `registry` was refused and
+/// an anonymous pull failed too (`why`, docker's words), and what fixes it.
+fn pull_refused_reason(registry: String, node: String, why: String) -> String {
+    return "the image could not be pulled: a saved docker login for " + registry
+        + " was refused, and anonymously too: " + why
+        + ". If the image is public, run `docker logout " + registry
+        + "` as the node's user on " + node;
+}
+
+/// A seat's reason as its server starts, with what its fetch had to say.
+fn starting_reason(note: String) -> String {
+    return if len(note) > 0 {
+        "fetched and verified (" + note + "); starting its server"
+    } else {
+        "fetched and verified; starting its server"
+    };
 }
 
 /// The bytes a part of an unheld file already holds, 0 for none; a part

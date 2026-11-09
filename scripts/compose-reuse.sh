@@ -45,8 +45,11 @@ render() {
 }
 
 # check <case> <expected JSON> <render's JSON on stdin>
+# (the program is an argument: stdin is the render)
 check() {
-  python3 - "$1" "$2" <<'PY'
+  python3 -c "$checker" "$1" "$2"
+}
+checker=$(cat <<'PY'
 import json, sys
 case, want = sys.argv[1], json.loads(sys.argv[2])
 cfg = json.load(sys.stdin)
@@ -88,7 +91,7 @@ if bad:
     sys.exit(1)
 print(f"ok   {case}: {', '.join(got)}")
 PY
-}
+)
 
 own_db='postgres://voice:voice@postgres:5432/voice?sslmode=disable'
 own_nats='nats://nats:4222'

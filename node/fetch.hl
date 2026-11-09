@@ -362,9 +362,11 @@ locus Fetcher {
     /// A container runtime's image, pulled by its digest: "" once it is
     /// there; a note to say when the node's saved docker login for its
     /// registry was refused and it was pulled anonymously instead; else "!"
-    /// and why it is not. The anonymous pull reads a fresh, empty docker
-    /// config, so no saved login is sent; by digest, it can only fetch the
-    /// pinned image. The saved config is never read.
+    /// and why it is not. The anonymous pull reads a fresh docker config
+    /// that holds no login and names no credential helper
+    /// (`anonymous_config`), so none is sent, on the same daemon; by
+    /// digest, it can only fetch the pinned image. The saved config is
+    /// never read.
     @unbounded
     fn pull_image(image: String) -> String {
         let pulled = run_full(pull_argv(image));
@@ -382,6 +384,22 @@ locus Fetcher {
                 "no empty docker config could be made for an anonymous pull",
             );
         }
+        // the daemon the first pull reached: the same context, its
+        // metadata (and any TLS files) linked from the saved config's
+        // directory, never read
+        let context = std::str::trim(run_out("docker\ncontext\nshow"));
+        let saved = docker_config_dir();
+        if std::io::fs::file_exists(saved + "/contexts") {
+            run_out("ln\n-s\n" + saved + "/contexts\n" + dir + "/contexts");
+        }
+        std::io::fs::write_file(dir + "/config.json", anonymous_config(context)) or {
+            run_out("rm\n-rf\n" + dir);
+            return "!" + pull_refused_reason(
+                registry,
+                self.id,
+                "no empty docker config could be made for an anonymous pull",
+            );
+        };
         let anon = run_full(anonymous_pull_argv(dir, image));
         run_out("rm\n-rf\n" + dir);
         if anon.code != 0 {
@@ -1551,6 +1569,30 @@ fn pull_argv(image: String) -> String {
 /// no saved login is sent, so the registry is asked anonymously.
 fn anonymous_pull_argv(dir: String, image: String) -> String {
     return "docker\n--config\n" + dir + "\npull\n" + image;
+}
+
+/// The docker config the anonymous pull reads. Its one login is for a
+/// registry that cannot exist, empty: a config with none would have docker
+/// pick a credential helper on its own (`pass`, `secretservice`,
+/// `osxkeychain`), which holds the same saved login. It names the docker
+/// context the node's user is on (`context`, from `docker context show`),
+/// so the pull reaches the daemon the first one did.
+fn anonymous_config(context: String) -> String {
+    let named = if len(context) > 0 && context != "default" {
+        ", \"currentContext\": \"" + std::json::escape_string(context) + "\""
+    } else {
+        ""
+    };
+    return "{\"auths\": {\"anonymous.invalid\": {}}" + named + "}";
+}
+
+/// The saved docker config's directory: `DOCKER_CONFIG`, else
+/// `~/.docker`. Only its `contexts` is linked; nothing in it is read.
+fn docker_config_dir() -> String {
+    if std::env::var_exists("DOCKER_CONFIG") && len(std::env::var("DOCKER_CONFIG")) > 0 {
+        return std::env::var("DOCKER_CONFIG");
+    }
+    return std::env::var("HOME") + "/.docker";
 }
 
 /// Whether a pull failed as its registry refused the login it was sent

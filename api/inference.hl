@@ -40,6 +40,9 @@ type InferenceRequest {
     data_class: String = "internal";
     // the voice.deadline as written, "" for none
     deadline: String = "";
+    // the request as the standard's: a Responses body as it came, the
+    // members the coordinator keeps still in it (`standard_body` leaves
+    // them out), or a Chat body converted
     body: String = "{}";
     // the api instance that admitted it (main.hl), kept on its usage
     instance: String = "";
@@ -261,6 +264,7 @@ locus Inference {
                 let t0 = std::time::monotonic_ns();
                 let offer = self.link.offer(
                     c.seat.node,
+                    request_id,
                     reply_to,
                     serve_message(request_id, reply_to, c, r),
                 );
@@ -481,6 +485,7 @@ locus Inference {
                 let t0 = std::time::monotonic_ns();
                 let offer = self.link.offer(
                     c.seat.node,
+                    request_id,
                     reply_to,
                     serve_message(request_id, reply_to, c, r),
                 );
@@ -730,7 +735,7 @@ locus Inference {
                     key: k.id,
                     model: r.model,
                     created_at: now_seconds(),
-                    input: r.body,
+                    input: standard_body(r.body),
                     output: "{\"id\": " + jq(request_id) + ", \"status\": " + jq(status)
                         + ", \"error\": " + jq(why) + ", \"output\": "
                         + (if len(partial) > 0 {
@@ -1004,7 +1009,7 @@ locus Inference {
                     key: s.voice.key,
                     model: r.model,
                     created_at: now_seconds(),
-                    input: r.body,
+                    input: standard_body(r.body),
                     output: s.response,
                 },
             ) or {
@@ -1666,42 +1671,58 @@ fn output_text(response: String) -> String {
     return std::str::from_bytes(b);
 }
 
-/// The `serve` message (protocol.yaml `Serve`).
+/// The `serve` message (protocol.yaml `Serve`), as it goes on the wire:
+/// written once, its `body` the standard request (`standard_into`), never
+/// a String first, since a body may be 12 MiB and a copy of it is that again.
 fn serve_message(
     request_id: String,
     reply_to: String,
     c: Candidate,
     r: InferenceRequest
-) -> String {
-    return "{\"type\": \"serve\", \"request_id\": " + jq(request_id) + ", \"reply_to\": "
+) -> Bytes {
+    let head = "{\"type\": \"serve\", \"request_id\": " + jq(request_id) + ", \"reply_to\": "
         + jq(reply_to) + ", \"seat\": " + jq(c.seat.id)
         + ", \"model\": " + jq(r.model) + ", \"engine_model\": "
         + (if len(c.engine_name) > 0 { jq(c.engine_name) } else { "null" })
         + ", \"deadline\": " + (if len(r.deadline) > 0 { jq(r.deadline) } else { "null" })
-        + ", \"endpoint\": " + jq(r.seat_endpoint) + ", \"body\": "
-        + (if len(r.served_body) > 0 { r.served_body } else { r.body }) + "}";
+        + ", \"endpoint\": " + jq(r.seat_endpoint) + ", \"body\": ";
+    let decided = len(r.served_body) > 0;
+    let out = std::bytes::BytesBuilder {
+        initial_cap: len(head) + (if decided { len(r.served_body) } else { len(r.body) }) + 2,
+    };
+    out.append_str(head);
+    if decided { out.append_str(r.served_body); } else { standard_into(out, r.body); }
+    out.append_str("}");
+    return out.finish() or b"";
 }
 
 // ---- the wire ----------------------------------------------------------
 
 /// The body's members but `voice`, `stream`, `stream_options` and
-/// `background`, which the coordinator keeps (protocol.yaml `Serve.body`).
-/// Those members are small and the rest may be 12 MiB, so a body with none
-/// of them is passed on as it is, and one with any is cut around them, each
-/// kept member copied once as written, not rebuilt.
+/// `background`, which the coordinator keeps (protocol.yaml `Serve.body`),
+/// for what records the request as it was served (peeked, annotated).
 fn standard_body(body: String) -> String {
-    let mut it = std::json::object_first(body);
-    let mut dropping = false;
-    while !it.done && !dropping {
-        dropping = coordinator_member(std::json::obj_key_string(it, body));
-        it = std::json::object_next(it, body);
-    }
-    if !dropping { return body; }
-    let src = std::bytes::from_string(body);
+    if !has_coordinator_member(body) { return body; }
     let out = std::bytes::BytesBuilder { initial_cap: len(body) + 2 };
+    cut_into(out, body);
+    let b = out.finish() or b"{}";
+    return std::str::from_bytes(b);
+}
+
+/// `body` as the standard request, written to `out`. Those members are
+/// small and the rest may be 12 MiB, so a body with none of them is
+/// written as it is, and one with any is cut around them, each kept member
+/// copied once as written, not rebuilt.
+fn standard_into(out: std::bytes::BytesBuilder, body: String) {
+    if has_coordinator_member(body) { cut_into(out, body); } else { out.append_str(body); }
+}
+
+/// `body` without the coordinator's members, written to `out`.
+fn cut_into(out: std::bytes::BytesBuilder, body: String) {
+    let src = std::bytes::from_string(body);
     out.append_str("{");
     let mut kept = 0;
-    it = std::json::object_first(body);
+    let mut it = std::json::object_first(body);
     while !it.done {
         if !coordinator_member(std::json::obj_key_string(it, body)) {
             if kept > 0 { out.append_str(", "); }
@@ -1712,8 +1733,16 @@ fn standard_body(body: String) -> String {
         it = std::json::object_next(it, body);
     }
     out.append_str("}");
-    let b = out.finish() or b"{}";
-    return std::str::from_bytes(b);
+}
+
+/// Whether `body` has a member the coordinator keeps (`coordinator_member`).
+fn has_coordinator_member(body: String) -> Bool {
+    let mut it = std::json::object_first(body);
+    while !it.done {
+        if coordinator_member(std::json::obj_key_string(it, body)) { return true; }
+        it = std::json::object_next(it, body);
+    }
+    return false;
 }
 
 /// `c` with the candidate `key` prefers first, the rest in their order. The
@@ -2169,7 +2198,9 @@ fn read_inference(raw: String, endpoint: String) -> InferenceRequest fallible(Ap
     }
     let voice = std::json::find_field_raw(body, "voice");
     let has_voice = kind_of(body, "voice") == "object";
-    let standard = if endpoint == "chat" { chat_body(body) or raise } else { standard_body(body) };
+    // a Chat body converted now; a Responses body kept as it came, its
+    // coordinator members cut only where it is written (`standard_into`)
+    let standard = if endpoint == "chat" { chat_body(body) or raise } else { body };
     return InferenceRequest {
         endpoint: endpoint,
         has_model: true,
@@ -2420,7 +2451,7 @@ fn annotation_job(r: InferenceRequest, s: Served) -> AnnotationJob {
         created_at: now_seconds(),
         model: s.model,
         data_class: r.data_class,
-        input: r.body,
+        input: standard_body(r.body),
         output: s.response,
         present: true,
     };

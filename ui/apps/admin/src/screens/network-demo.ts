@@ -13,7 +13,9 @@ const ALIASES: Record<string, { name: string; model: string }[]> = {
   research: [{ name: 'reasoning', model: 'deepseek-r1-q4' }],
 };
 export const DEMO_TICK_MS = 1800;
-export const demoProjectColor = (project: string) => ['#bbf879', '#45f4ff', '#f17cff', '#ffbb74', '#a99aff', '#78ffe0', '#ff8eac'][Math.max(0, PROJECTS.findIndex(([id]) => id === project))]!;
+// each project's path colour: the theme's vivid tokens, so the paths follow the theme
+const PROJECT_COLORS = ['lime', 'cyan', 'magenta', 'orange', 'violet', 'mint', 'pink'].map((c) => `var(--color-vivid-${c})`);
+export const demoProjectColor = (project: string) => PROJECT_COLORS[Math.max(0, PROJECTS.findIndex(([id]) => id === project))]!;
 
 /** Explicitly synthetic, local-only fixture. Model names are illustrative catalog aliases. */
 export function demoFleet(tick: number, now: number): Fleet {

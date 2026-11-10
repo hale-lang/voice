@@ -1,0 +1,129 @@
+// The operator charged to a project (spec/openapi.yaml, "Two planes"):
+// the operator token with `Voice-Project: <project>` on the caller plane
+// is a request of that project's operator key, as the admin UI's Chat
+// sends it. The request goes the way any caller's goes, through the same
+// routing, the project's limits and budget and the usage ledger; only who
+// it is differs, and the ledger says so: its key is the operator's.
+//
+// A project's operator key is voice's to make, on the operator's first
+// request charged to the project: `<project>-operator`, named `operator`,
+// which no token names (its digest is empty, as a system key's is). Its
+// models, accounts and limits change as any key's do, so the operator's
+// own requests to a project can be narrowed apart from its callers'; it is
+// never revoked (archive the project instead), so the operator can always
+// be charged to an active project.
+
+/// The header naming the project the operator's request is charged to.
+const VOICE_PROJECT: String = "Voice-Project";
+
+/// The operator key's name, as the project's key list shows it.
+const OPERATOR_KEY_NAME: String = "operator";
+
+/// A project's operator key's id.
+fn operator_key_id(project: String) -> String {
+    return project + "-operator";
+}
+
+/// True for a project's operator key.
+fn is_operator_key(k: st::KeyRow) -> Bool {
+    return !k.internal && k.id == operator_key_id(k.project);
+}
+
+/// The caller a caller-plane request names: its project key, or, with
+/// `Voice-Project`, the operator charged to that project, as its operator
+/// key. A project key never names another project: `Voice-Project` is
+/// taken with the operator token alone.
+fn caller_of(
+    store: st::Store,
+    keys: KeyBearer,
+    operator: AdminBearer,
+    req: std::http::Request
+) -> std::api::Context fallible(ApiError) {
+    let authorization = std::http::header(req, "Authorization");
+    let project = std::str::trim(std::http::header(req, VOICE_PROJECT));
+    if len(project) > 0 {
+        if !operator.admits(authorization) { fail operator_only(); }
+        let k = operator_key(store, project) or raise;
+        let who = std::api::Principal { mode: "bearer", name: k.id, via: "http" };
+        return std::api::Context { caller: who, role: "caller", via: "http" };
+    }
+    return keys.context(authorization) or {
+        // the operator token alone names no project to charge
+        if operator.admits(authorization) { fail project_unnamed(); }
+        fail err;
+    };
+}
+
+/// `project`'s operator key, made now when it has none; refused for a
+/// project that is not there, is voice's own, or is archived.
+fn operator_key(store: st::Store, project: String) -> st::KeyRow fallible(ApiError) {
+    let p = store.project(project) or fail metering_failed(err);
+    if !p.present || p.internal { fail no_such_project(project); }
+    if p.archived {
+        fail ApiError {
+            status: 403,
+            kind: "permission_error",
+            code: ErrorCode::invalid_request,
+            message: "project " + project + " is archived: nothing is charged to it",
+            has_param: true,
+            param: VOICE_PROJECT,
+        };
+    }
+    let id = operator_key_id(project);
+    let now = now_seconds();
+    let mut k = store.key(id) or fail metering_failed(err);
+    if !k.present {
+        let row = st::KeyRow {
+            id: id,
+            project: project,
+            name: OPERATOR_KEY_NAME,
+            created_at: now
+        };
+        // of two first requests at once, one makes it and the other reads it
+        store.insert_key(
+            row,
+            change("create", key_target(row), "", key_json(key_view(row, now))),
+        ) or fail store_failed(err);
+        k = store.key(id) or fail metering_failed(err);
+    }
+    if !k.present || k.project != project || key_status(k, now) != KeyStatus::active {
+        fail no_such_project(project);
+    }
+    if !k.used || std::time::unix(now) - std::time::unix(k.last_used_at) >= 60 {
+        store.touch_key(k.id, now) or fail metering_failed(err);
+    }
+    return k;
+}
+
+fn no_such_project(project: String) -> ApiError {
+    return ApiError {
+        status: 404,
+        kind: "not_found",
+        code: ErrorCode::not_found,
+        message: "no project " + project + " to charge the operator's request to",
+        has_param: true,
+        param: VOICE_PROJECT,
+    };
+}
+
+/// `Voice-Project` with a credential that is not the operator token.
+fn operator_only() -> ApiError {
+    return ApiError {
+        status: 401,
+        kind: "authentication_error",
+        code: ErrorCode::invalid_key,
+        message: "`Voice-Project` is taken with the operator token alone: a project key's requests are its own project's",
+    };
+}
+
+/// The operator token with no project named.
+fn project_unnamed() -> ApiError {
+    return ApiError {
+        status: 400,
+        kind: "invalid_request",
+        code: ErrorCode::invalid_request,
+        message: "the operator's request names the project it is charged to: `Voice-Project: <project>`",
+        has_param: true,
+        param: VOICE_PROJECT,
+    };
+}

@@ -338,6 +338,23 @@ done
 [ "$now" -ge $((told + 3)) ] || { echo "the events queued while the nerves stalled did not land ($now on the stream, $((told + 3)) expected)"; tail -5 "$work/api.log"; exit 1; }
 echo "answers did not wait on stalled nerves, and the three events queued meanwhile landed after"
 
+# the operator, charged to a project (api/operator_key.hl), as the admin
+# UI's Chat streams: the same path as a key's, its answer and its usage
+# record naming the project's operator key, and the seat that served it
+curl -s -N --max-time 40 -X POST "$api/v1/responses" -H @"$work/admin.h" -H 'Voice-Project: work' -H 'content-type: application/json' -d '{"model": "echo-1", "input": "hi", "stream": true}' >"$work/operator.sse"
+python3 - "$work/operator.sse" >"$work/operator.id" <<'PY' || { echo "the operator's stream was not the project's: $(head -c 600 "$work/operator.sse")"; exit 1; }
+import json, sys
+done = [json.loads(l[6:]) for l in open(sys.argv[1]) if l.startswith("data: {") and '"response.completed"' in l]
+v = done[-1]["response"]["voice"]
+assert v["project"] == "work" and v["key"] == "work-operator" and v["served"]["seat"] == "laptop/static", v
+print(v["request_id"])
+PY
+curl -fsS -H @"$work/admin.h" "$api/admin/v1/usage/$(cat "$work/operator.id")" | python3 -c 'import json,sys; r = json.load(sys.stdin); assert r["project"] == "work" and r["key"] == "work-operator", r' \
+  || { echo "the operator's request is not on the ledger as the project's operator key"; exit 1; }
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'Voice-Project: work' -d '{"model": "echo-1", "input": "hi"}')
+[ "$code" = 401 ] || { echo "a project key took Voice-Project: $code"; exit 1; }
+echo "the operator, charged to a project, streamed as its operator key, on the ledger so; a project key may not name a project"
+
 # a body over 12 MiB (`max_request_bytes` of the listener, which the data
 # plane shares) is refused 413 `too_large` before it is read; one just under
 # it is served, through a NATS message well over the 1 MiB default

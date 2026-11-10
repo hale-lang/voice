@@ -736,7 +736,8 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
   const schema = (engineDef?.config_schema ?? { type: 'object' }) as JsonSchema;
   const cancel = () => (onDone ? onDone() : go('nodes', node.id));
   // a placement's seat runs its model's weights: its engine, what it serves
-  // and its config are the placement's, changed on Placements
+  // and its config are the placement's, changed on Placements, and its
+  // concurrency is what its runtime is started with, never sent from here
   const placed = typeof seat?.config?.placement === 'string' ? seat.config.placement : '';
   return (
     <>
@@ -746,7 +747,7 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
         onSubmit={async () => {
           const body: Seat = { id, engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config };
           const r = seat
-            ? await w.write('patch', '/admin/v1/nodes/{node}/seats/{seat}', { params: { path: { node: node.id, seat: seat.id } }, body: placed ? { account, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled } : { engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config } })
+            ? await w.write('patch', '/admin/v1/nodes/{node}/seats/{seat}', { params: { path: { node: node.id, seat: seat.id } }, body: placed ? { account, data_classes: dataClasses, enabled } : { engine, account, serves, data_classes: dataClasses, concurrency: concurrency ?? 1, enabled, config } })
             : await w.write('post', '/admin/v1/nodes/{node}/seats', { params: { path: { node: node.id } }, body });
           if (r) {
             if (onDone) onDone();
@@ -782,9 +783,15 @@ function SeatForm({ node, seat, onDone }: { node: Node; seat?: SeatView; onDone?
         <Field label="data classes" help="what this seat may carry">
           <ListInput value={dataClasses} onChange={setDataClasses} />
         </Field>
-        <Field label="concurrency" help="requests this seat serves at once">
-          <NumberInput value={concurrency} onChange={setConcurrency} min={1} />
-        </Field>
+        {placed ? (
+          <Field label="concurrency" help="what its runtime is started with: voice sets it, not this form">
+            <span>{seat?.concurrency ?? 1} at once</span>
+          </Field>
+        ) : (
+          <Field label="concurrency" help="requests this seat serves at once">
+            <NumberInput value={concurrency} onChange={setConcurrency} min={1} />
+          </Field>
+        )}
         <Checkbox checked={enabled} onChange={setEnabled} label="enabled" />
         {!placed && schema.properties && (
           <>

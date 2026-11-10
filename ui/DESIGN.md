@@ -182,8 +182,22 @@ hale project ever needs a graph engine, it is a fourth package,
 framework-free like tokens, and iris is where hale's one existing engine
 lives.
 
-Dark first. The tokens are written so a light theme is a second set of
-values, not a rewrite, and it is not built until something needs it.
+Dark first, and themed. Carbon, the original carbon-and-slate look, is the
+default; the tokens package also carries Paper (its light pair), a
+high-contrast pair held to 7:1, and Blueprint, VFD and Ledger. Each theme is a
+complete set of the same tokens (the build refuses one that misses a token),
+and every text, state, signal and accent colour keeps WCAG AA (4.5:1) on every
+surface; faint text, the quiet tier, keeps 3:1. The rail's *theme* line opens
+the picker: a theme, following the system's light or dark (between a theme's
+pair), a custom accent and a base hue. The accent keeps its hue and moves only
+as far in lightness as it must to read on every surface (OKLCH, clamped to
+sRGB); hover, the muted tint, the focus ring and the selection follow from it.
+The base hue tints surfaces, rules and quiet text and gives way where it would
+cost contrast. The states (ok, waiting, failed) are never derived from the
+accent or overridden. The choice is kept per browser and applied by an inline
+script before the first paint. Nothing in the UI writes a colour of its own:
+views, charts and the network field draw in tokens, and identity hues (a
+model's memory, a thread) take the theme's lightness for them.
 
 ## Acceptance
 

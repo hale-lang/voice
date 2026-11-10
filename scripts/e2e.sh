@@ -96,8 +96,13 @@ if [ -n "${DATABASE_URL:-}" ]; then
 fi
 # a seat has 30 s to its first output (120 s by default), then may be silent
 # 10 s (30 s by default), so the steps that kill a node mid-stream end in
-# seconds
-HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
+# seconds. glibc's mmap threshold is fixed at 1 MiB, so each block over it
+# (a copy of a 12 MiB body) is mapped on its own and unmapped when freed:
+# the api's resident size is then what it holds, which the 12 MiB step
+# measures, not what glibc's heap kept of earlier requests (its threshold
+# otherwise rises to the largest block freed, up to 32 MiB, and freed
+# blocks stay resident to be reused, or not, as they fit)
+GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1048576 HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
   api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
@@ -335,24 +340,53 @@ echo "answers did not wait on stalled nerves, and the three events queued meanwh
 # a body over 12 MiB (`max_request_bytes` of the listener, which the data
 # plane shares) is refused 413 `too_large` before it is read; one just under
 # it is served, through a NATS message well over the 1 MiB default
-# (deploy/nats/nats.conf allows 16 MiB). Its cost is linear in its size: the
-# api's peak stays under 200 MB, streamed under 256 MB (it was ~9.5 GB at
-# 12 MiB before hale 0.25.1; FRICTION.md).
+# (deploy/nats/nats.conf allows 16 MiB). Its cost is linear in its size (it
+# was ~9.5 GB at 12 MiB before hale 0.25.1; FRICTION.md): each request's
+# own, measured from the api's resident size just before it, its peak reset
+# then (clear_refs), never the process's lifetime peak. What it may add is
+# the copies of the body its path holds at once, and half a body for the
+# rest, so one copy more fails. At the peak (the NATS publish) they are:
+#   4  hale's std::http reading it: the bytes as read, their body slice,
+#      that as text, and the body cut from the text by the parser
+#   2  std::http::build_context(req): the Context holds the request, body
+#      and all, copied in and out (DataPlane.route)
+#   1  read_inference: the body, answered into the handler's arena
+#   1  the serve message (serve_message), the body written into it
+#   2  the NATS frame (pond's pub_frame): the frame, and the builder it is
+#      finished from, freed just after
+# 10 in all; streamed, 11: its `stream` member is cut as the serve message
+# is written, from the body as bytes (std has no append of a String's
+# range). The api's own are the serve message and that one; the rest are
+# hale's std and pond's, and the bound comes down as they go.
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (13 * 1024 * 1024)}))' >"$work/big.json"
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near.json"
 python3 -c 'import json; print(json.dumps({"model": "echo-1", "stream": True, "input": "x" * (12 * 1024 * 1024 - 4096)}))' >"$work/near-stream.json"
+body_kb=$(($(wc -c <"$work/near.json") / 1024))
+vm() { awk -v k="$1:" '$1 == k {print $2}' "/proc/$api_pid/status"; }
+# the api's peak reset to its resident size now, which is answered (kB)
+reset_peak() {
+  echo 5 >"/proc/$api_pid/clear_refs" 2>/dev/null || { echo "the api's peak could not be reset (/proc/$api_pid/clear_refs)" >&2; exit 1; }
+  local rss hwm; rss=$(vm VmRSS); hwm=$(vm VmHWM)
+  [ "$hwm" -le $((rss + 1024)) ] || { echo "the api's peak was not reset: VmHWM $hwm kB, VmRSS $rss kB" >&2; exit 1; }
+  echo "$rss"
+}
+# that a request grew the api by under `copies` bodies and a half since `base`
+held() {
+  local base=$1 copies=$2 what=$3 grown bound
+  grown=$(($(vm VmHWM) - base)); bound=$((copies * body_kb + body_kb / 2))
+  [ "$grown" -lt "$bound" ] || { echo "$what grew the api by $grown kB from $base kB, over the $bound kB of $copies bodies and a half"; exit 1; }
+  echo "$what grew the api by $((grown / 1024)) MB from $((base / 1024)) MB: under $copies bodies and a half ($((bound / 1024)) MB)"
+}
 big=$(curl -s -w '\n%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/big.json" || true)
 case "$big" in *'"kind":"too_large"'*413) echo "a 13 MiB body is refused 413 too_large" ;; *) echo "a 13 MiB body: $big" | tail -c 300; exit 1 ;; esac
+base=$(reset_peak)
 near=$(curl -s -o "$work/near.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near.json" || true)
 [ "$near" = "200" ] || { echo "a body just under 12 MiB was answered $near: $(head -c 300 "$work/near.out")"; tail -5 "$work/api.log"; tail -5 "$work/node.log"; exit 1; }
-peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
-[ -n "$peak_kb" ] && [ "$peak_kb" -lt 204800 ] || { echo "the api peaked at ${peak_kb:-?} kB serving a body just under 12 MiB"; exit 1; }
-echo "a body just under 12 MiB is served, through a NATS message over the 1 MiB default; the api peaked at $((peak_kb / 1024)) MB"
+held "$base" 10 "a body just under 12 MiB, served through a NATS message over the 1 MiB default,"
+base=$(reset_peak)
 streamed=$(curl -s -o "$work/near-stream.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' --data-binary @"$work/near-stream.json" || true)
 [ "$streamed" = "200" ] && grep -q '^event: response.completed' "$work/near-stream.out" || { echo "a streamed body just under 12 MiB was answered $streamed: $(head -c 300 "$work/near-stream.out")"; exit 1; }
-peak_kb=$(awk '/^VmHWM:/ {print $2}' "/proc/$api_pid/status")
-[ -n "$peak_kb" ] && [ "$peak_kb" -lt 262144 ] || { echo "the api peaked at ${peak_kb:-?} kB streaming a body just under 12 MiB"; exit 1; }
-echo "streamed, it is served too; the api peaked at $((peak_kb / 1024)) MB"
+held "$base" 11 "streamed, it is served too, and"
 
 # one streamed inference held open does not hold the api: an admin read, the
 # node link, the event stream and a cancel all complete promptly beside it

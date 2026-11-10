@@ -1,0 +1,402 @@
+// Links found from cabled ports (cabling.hl): the lab's two pairs of DGX
+// Sparks as their nodes find their ports (spark and flare on IPv4 /30s with
+// IPv6 link-local addresses too; negra and aguita on IPv4 /24s with IPv6
+// off), each Spark's two halves sharing one QSFP cable, so each port sees
+// both of the other's and its own other half. Paired by what each sees,
+// addressed at what they have, the GID that carries it picked; a link an
+// operator declares wins; a pair with no address is cabled, not addressed.
+import ".." as api;
+import "../../store" as st;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+/// One cabled port: its addresses (with prefixes) and RoCE v2 GIDs
+/// (`index=address`) and what it sees, each a comma-separated list.
+fn port(
+    ifname: String,
+    mac: String,
+    hca: String,
+    addrs: String,
+    gids: String,
+    sees: String
+) -> String {
+    return "{\"ifname\": " + api::jq(ifname) + ", \"mac\": " + api::jq(mac)
+        + ", \"speed_mbps\": 200000, \"mtu\": 9000, \"hca\": " + api::jq(hca) + ", \"addresses\": ["
+        + quoted(addrs) + "], \"gids\": [" + gid_list(gids) + "], \"neighbors\": [" + quoted(sees)
+        + "]}";
+}
+
+@unbounded
+fn quoted(list: String) -> String {
+    if len(list) == 0 { return ""; }
+    let mut out = "";
+    let mut rest = list + ",";
+    while len(rest) > 0 {
+        let c = std::str::index_of(rest, ",");
+        if len(out) > 0 { out = out + ", "; }
+        out = out + api::jq(rest[0..c]);
+        rest = rest[(c + 1)..len(rest)];
+    }
+    return out;
+}
+
+@unbounded
+fn gid_list(list: String) -> String {
+    if len(list) == 0 { return ""; }
+    let mut out = "";
+    let mut rest = list + ",";
+    while len(rest) > 0 {
+        let c = std::str::index_of(rest, ",");
+        let one = rest[0..c];
+        let eq = std::str::index_of(one, "=");
+        if len(out) > 0 { out = out + ", "; }
+        out = out + "{\"index\": " + one[0..eq] + ", \"address\": "
+            + api::jq(one[(eq + 1)..len(one)])
+            + "}";
+        rest = rest[(c + 1)..len(rest)];
+    }
+    return out;
+}
+
+/// A Spark's capabilities with its cabled ports (a JSON list's members)
+/// and declared links.
+fn spark_caps(ports: String, links: String) -> String {
+    return "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": 129922760704, \"model_memory_bytes\": 121802588160, \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 129922760704, \"unified\": true}], \"disk_free_bytes\": 3500000000000}"
+        + (if len(links) > 0 { ", \"links\": [" + links + "]" } else { "" })
+        + (if len(ports) > 0 { ", \"ports\": [" + ports + "]" } else { "" }) + "}";
+}
+
+const SPARK_SEES: String = "4c:bb:47:eb:ca:15,4c:bb:47:ec:74:6f,4c:bb:47:ec:74:73";
+const SPARK2_SEES: String = "4c:bb:47:eb:ca:11,4c:bb:47:ec:74:6f,4c:bb:47:ec:74:73";
+const FLARE_SEES: String = "4c:bb:47:eb:ca:11,4c:bb:47:eb:ca:15,4c:bb:47:ec:74:73";
+const FLARE2_SEES: String = "4c:bb:47:eb:ca:11,4c:bb:47:eb:ca:15,4c:bb:47:ec:74:6f";
+
+/// spark's two halves: on IPv4 when `v4`, on IPv6 link-local when `v6`.
+fn spark(v4: Bool, v6: Bool) -> String {
+    return port(
+        "enP2p1s0f0np0",
+        "4c:bb:47:eb:ca:15",
+        "roceP2p1s0f0",
+        both(v4, "192.168.101.1/30", v6, "fe80::4ebb:47ff:feeb:ca15/64"),
+        "1=fe80::4ebb:47ff:feeb:ca15" + (if v4 { ",3=192.168.101.1" } else { "" }),
+        SPARK2_SEES,
+    ) + ", "
+        + port(
+            "enp1s0f0np0",
+            "4c:bb:47:eb:ca:11",
+            "rocep1s0f0",
+            both(v4, "192.168.100.1/30", v6, "fe80::4ebb:47ff:feeb:ca11/64"),
+            "1=fe80::4ebb:47ff:feeb:ca11" + (if v4 { ",3=192.168.100.1" } else { "" }),
+            SPARK_SEES,
+        );
+}
+
+fn flare(v4: Bool, v6: Bool) -> String {
+    return port(
+        "enP2p1s0f0np0",
+        "4c:bb:47:ec:74:73",
+        "roceP2p1s0f0",
+        both(v4, "192.168.101.2/30", v6, "fe80::4ebb:47ff:feec:7473/64"),
+        "1=fe80::4ebb:47ff:feec:7473" + (if v4 { ",3=192.168.101.2" } else { "" }),
+        FLARE2_SEES,
+    ) + ", "
+        + port(
+            "enp1s0f0np0",
+            "4c:bb:47:ec:74:6f",
+            "rocep1s0f0",
+            both(v4, "192.168.100.2/30", v6, "fe80::4ebb:47ff:feec:746f/64"),
+            "1=fe80::4ebb:47ff:feec:746f" + (if v4 { ",3=192.168.100.2" } else { "" }),
+            FLARE_SEES,
+        );
+}
+
+fn both(a: Bool, x: String, b: Bool, y: String) -> String {
+    if a && b { return x + "," + y; }
+    if a { return x; }
+    if b { return y; }
+    return "";
+}
+
+/// negra and aguita: IPv4 /24s, IPv6 off on the link (no link-local
+/// address; the GIDs are there still), seen by ARP and LLDP.
+fn negra() -> String {
+    return port(
+        "enP2p1s0f0np0",
+        "4c:bb:47:eb:f0:ca",
+        "roceP2p1s0f0",
+        "192.168.101.2/24",
+        "1=fe80::4ebb:47ff:feeb:f0ca,3=192.168.101.2",
+        "4c:bb:47:eb:f0:c6,4c:bb:47:ec:82:e2,4c:bb:47:ec:82:e6",
+    ) + ", "
+        + port(
+            "enp1s0f0np0",
+            "4c:bb:47:eb:f0:c6",
+            "rocep1s0f0",
+            "192.168.100.2/24",
+            "1=fe80::4ebb:47ff:feeb:f0c6,3=192.168.100.2",
+            "4c:bb:47:eb:f0:ca,4c:bb:47:ec:82:e2,4c:bb:47:ec:82:e6",
+        );
+}
+
+fn aguita() -> String {
+    return port(
+        "enP2p1s0f0np0",
+        "4c:bb:47:ec:82:e6",
+        "roceP2p1s0f0",
+        "192.168.101.1/24",
+        "1=fe80::4ebb:47ff:feec:82e6,3=192.168.101.1",
+        "4c:bb:47:eb:f0:c6,4c:bb:47:eb:f0:ca",
+    ) + ", "
+        + port(
+            "enp1s0f0np0",
+            "4c:bb:47:ec:82:e2",
+            "rocep1s0f0",
+            "192.168.100.1/24",
+            "1=fe80::4ebb:47ff:feec:82e2,3=192.168.100.1",
+            "4c:bb:47:eb:f0:c6",
+        );
+}
+
+fn add_node(store: st::Store, id: String, capabilities: String) {
+    store.insert_node(
+        st::NodeRow { id: id, name: id, max_in_flight: 4, created_at: api::now_seconds() },
+        api::change("create", "nodes/" + id, "", "{}"),
+    ) or discard;
+    store.put_fleet(st::FleetRow { node: id, capabilities: capabilities, present: true })
+    or discard;
+    store.put_beat(id, api::now_seconds(), 0) or discard;
+}
+
+fn first_port(link: String) -> String {
+    return std::json::array_first(std::json::find_field_raw(link, "ports")).element;
+}
+
+fn main() {
+    // the contract: a node's cabled ports are taken as it declares them
+    let decoded = api::node_capabilities(
+        spark_caps(spark(true, true), ""),
+    ) or api::no_capabilities();
+    std::test::assert(decoded.has_ports && count(decoded.ports) == 2, "the ports are taken");
+    let encoded = api::NodeCapabilities::api_encode(decoded);
+    std::test::assert(
+        std::str::contains(encoded, "\"neighbors\"")
+            && std::str::contains(encoded, "4c:bb:47:ec:74:73")
+            && std::str::contains(encoded, "\"gids\""),
+        "and kept as declared: " + encoded,
+    );
+
+    // spark and flare: paired by what their ports see, met on the IPv4
+    // pair the lower id's first port is on, every port at its own IPv4
+    // address, at the GID that carries it (3)
+    let s4 = spark_caps(spark(true, true), "");
+    let f4 = spark_caps(flare(true, true), "");
+    let sf = api::found_link("spark", s4, "flare", f4);
+    std::test::assert(sf.cabled && sf.addressed, "cabled and addressed");
+    std::test::assert_eq_str(
+        sf.link,
+        "{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enP2p1s0f0np0\", \"address\": \"192.168.101.1\", \"hca\": \"roceP2p1s0f0\"}, {\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}], \"gid_index\": 3}",
+        "spark's end: both halves, IPv4, GID 3",
+    );
+    let fs = api::found_link("flare", f4, "spark", s4);
+    std::test::assert_eq_str(
+        std::json::find_string_field(first_port(fs.link), "address"),
+        "192.168.101.2",
+        "flare's end meets spark's on the same pair, chosen alike from either end",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(fs.link, "gid_index"), 3, "flare's GID too");
+
+    // negra and aguita: /24s, no link-local address, seen by ARP and LLDP
+    let n4 = spark_caps(negra(), "");
+    let a4 = spark_caps(aguita(), "");
+    let na = api::found_link("negra", n4, "aguita", a4);
+    std::test::assert(na.addressed, "the other pair too: " + na.link);
+    std::test::assert_eq_str(
+        std::json::find_string_field(first_port(na.link), "address"),
+        "192.168.101.2",
+        "on its IPv4 /24",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(na.link, "gid_index"), 3, "at GID 3");
+    let an = api::found_link("aguita", a4, "negra", n4);
+    std::test::assert(
+        an.addressed
+            && std::json::find_string_field(first_port(an.link), "address") == "192.168.101.1",
+        "aguita sees one of negra's halves, and negra sees both of its: one sighting either way pairs them: "
+            + an.link,
+    );
+    // the two pairs share addresses, but no port of one sees the other's
+    std::test::assert(
+        !api::found_link("spark", s4, "negra", n4).cabled,
+        "spark is not cabled to negra",
+    );
+    std::test::assert(!api::found_link("aguita", a4, "flare", f4).cabled, "nor aguita to flare");
+
+    // no IPv4: the link-local addresses, at the RoCE v2 GID that carries
+    // them (1); the leader's address reached out of each node's own port
+    let s6 = spark_caps(spark(false, true), "");
+    let f6 = spark_caps(flare(false, true), "");
+    let ll = api::found_link("spark", s6, "flare", f6);
+    std::test::assert(ll.addressed, "IPv6 link-local addresses meet: " + ll.link);
+    std::test::assert_eq_str(
+        std::json::find_string_field(first_port(ll.link), "address"),
+        "fe80::4ebb:47ff:feeb:ca15",
+        "without its prefix or a scope",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(ll.link, "gid_index"), 1, "at GID 1");
+    let fl = api::found_link("flare", f6, "spark", s6);
+    std::test::assert_eq_str(
+        api::reached_from("fe80::4ebb:47ff:feeb:ca15", fl.link),
+        "fe80::4ebb:47ff:feeb:ca15%enP2p1s0f0np0",
+        "flare reaches spark's address out of its own first port",
+    );
+    std::test::assert_eq_str(
+        api::reached_from("192.168.101.1", fl.link),
+        "192.168.101.1",
+        "IPv4 as it is",
+    );
+    // IPv4 on one end alone: they meet on IPv6 link-local
+    let mixed = api::found_link("spark", s4, "flare", f6);
+    std::test::assert_eq_int(
+        std::json::find_int_field(mixed.link, "gid_index"),
+        1,
+        "one family both share",
+    );
+
+    // no address at all: cabled, not addressed, its ports shown
+    let s0 = spark_caps(spark(false, false), "");
+    let f0 = spark_caps(flare(false, false), "");
+    let none = api::found_link("spark", s0, "flare", f0);
+    std::test::assert(
+        none.cabled && !none.addressed && len(none.link) == 0,
+        "cabled but not addressed",
+    );
+    std::test::assert(
+        std::str::contains(none.ports, "\"ifname\": \"enP2p1s0f0np0\"")
+            && !std::str::contains(none.ports, "\"address\"")
+            && std::str::contains(none.ports, "\"speed_mbps\": 200000"),
+        "its ports, with no address: " + none.ports,
+    );
+
+    // through the store: an operator's declared link wins; a found one
+    // fills in for a peer with none declared
+    let store = st::MemoryStore { };
+    let link = api::NatsLink { };
+    let declared = "{\"peer\": \"flare\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"192.168.100.1\", \"hca\": \"rocep1s0f0\"}], \"gid_index\": 5}";
+    add_node(store, "spark", spark_caps(spark(true, true), declared));
+    add_node(store, "flare", f4);
+    add_node(store, "negra", n4);
+    add_node(store, "aguita", a4);
+    let fleet = api::fleet_caps(store) or api::FleetCaps { };
+    std::test::assert_eq_int(count(fleet.items), 4, "the nodes with cabled ports");
+    let spark_links = api::effective_links(fleet, "spark", spark_caps(spark(true, true), declared));
+    std::test::assert_eq_str(
+        spark_links,
+        declared,
+        "spark's declared link wins over the one found",
+    );
+    let flare_links = api::effective_links(fleet, "flare", f4);
+    std::test::assert(
+        std::str::contains(flare_links, "\"peer\": \"spark\"")
+            && std::str::contains(flare_links, "\"gid_index\": 3")
+            && !std::str::contains(flare_links, "negra"),
+        "flare declares none, and its found one to spark is used: " + flare_links,
+    );
+    let linked = api::linked(store, "flare", f4) or "";
+    std::test::assert_eq_str(
+        api::link_ports(linked, "spark"),
+        std::str::trim(std::json::find_field_raw(api::link_to(linked, "spark"), "ports")),
+        "the capabilities as the coordinator uses them carry it",
+    );
+    std::test::assert(
+        std::str::contains(linked, "\"hardware\"") && std::str::contains(linked, "\"ports\""),
+        "and the rest as declared",
+    );
+    std::test::assert_eq_str(
+        api::linked(store, "x", "{\"max_in_flight\": 1}") or "",
+        "{\"max_in_flight\": 1}",
+        "no ports: as declared",
+    );
+
+    // the node's view: declared, found, addressed or not
+    let views = api::node_links(store, "spark", spark_caps(spark(true, true), declared))
+    or api::NodeLinks { };
+    let json = api::node_links_json(views);
+    std::test::assert(
+        std::str::contains(
+            json,
+            "{\"peer\": \"flare\", \"paired\": true, \"source\": \"declared\", \"addressed\": true",
+        )
+            && std::str::contains(json, "\"gid_index\": 5")
+            && !std::str::contains(json, "\"source\": \"discovered\""),
+        "spark's link to flare as declared, flare's found one back: " + json,
+    );
+    let fviews = api::node_links_json(api::node_links(store, "flare", f4) or api::NodeLinks { });
+    std::test::assert(
+        std::str::contains(
+            fviews,
+            "\"peer\": \"spark\", \"paired\": true, \"source\": \"discovered\", \"addressed\": true",
+        )
+            && std::str::contains(
+                fviews,
+                "\"ports\": [{\"ifname\": \"enP2p1s0f0np0\", \"address\": \"192.168.101.2\"",
+            )
+            && std::str::contains(fviews, "\"gid_index\": 3"),
+        "flare's found link: " + fviews,
+    );
+    let bare = st::MemoryStore { };
+    add_node(bare, "spark", s0);
+    add_node(bare, "flare", f0);
+    let bviews = api::node_links_json(api::node_links(bare, "spark", s0) or api::NodeLinks { });
+    std::test::assert(
+        std::str::contains(
+            bviews,
+            "\"peer\": \"flare\", \"paired\": true, \"source\": \"discovered\", \"addressed\": false",
+        ),
+        "cabled, not addressed: " + bviews,
+    );
+    let lone = st::MemoryStore { };
+    add_node(lone, "spark", s4);
+    std::test::assert_eq_str(
+        api::node_links_json(api::node_links(lone, "spark", s4) or api::NodeLinks { }),
+        "",
+        "cabled to no node voice knows: no link (the ports say the rest)",
+    );
+
+    // a check of a found link: both nodes assigned their rank, each with
+    // its end of the link; over link-local addresses, rank 0's address
+    // reached out of each node's own port
+    let ls = st::MemoryStore { };
+    add_node(ls, "spark", s6);
+    add_node(ls, "flare", f6);
+    let rts = api::Runtimes { store: ls, shipped: api::shipped_runtimes(shipped("runtimes")) };
+    let usable = rts.usable_in_gate() or api::RuntimeList { };
+    let c = api::check_link_in(ls, link, usable, "spark", "flare") or api::no_check();
+    std::test::assert(len(c.id) > 0, "a found link is checked as a declared one is");
+    let rows = ls.link_checks() or st::LinkCheckRows { };
+    let jobs = api::link_jobs(
+        rows,
+        "flare",
+        api::linked(ls, "flare", f6) or "",
+        api::now_seconds(),
+    );
+    let job = at(jobs.items, 0) or api::LinkJob { };
+    std::test::assert_eq_str(
+        job.master_addr,
+        "fe80::4ebb:47ff:feeb:ca15%enP2p1s0f0np0",
+        "scoped to flare's port",
+    );
+    std::test::assert(
+        std::str::contains(api::link_jobs_json(jobs), "\"link\": {\"peer\": \"spark\"")
+            && std::str::contains(job.link, "\"gid_index\": 1"),
+        "with flare's end of the link: " + api::link_jobs_json(jobs),
+    );
+    let refused = api::check_link_in(bare, link, usable, "spark", "flare") or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "no addressed link to flare"),
+            "a link with no address is not checked: " + api::ctl_message(err),
+        );
+        api::no_check()
+    };
+    std::test::assert(len(refused.id) == 0, "and none started");
+}

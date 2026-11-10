@@ -1,0 +1,371 @@
+// Links found from cabled ports (protocol.yaml `Capabilities.ports`): two
+// nodes whose RoCE ports see each other's hardware addresses on their link
+// are cabled to each other, and the coordinator uses the link it finds as
+// one the nodes declared (`Link`), unless a node's capabilities declare a
+// link to that peer, which wins. Nothing is configured on the machines:
+// each port is used at the address it has, IPv4 before IPv6 link-local
+// (which needs none), and the RoCE v2 GID that carries that address is its
+// `gid_index`. A pair whose ports have neither address is cabled but not
+// addressed, and is shown so, never checked or placed on.
+
+/// A node's capabilities, as the fleet holds them.
+type NodeCaps { id: String = ""; capabilities: String = ""; }
+
+/// The fleet's nodes that may be cabled to another: registered, not
+/// revoked, and declaring cabled ports.
+type FleetCaps { items: bounded[NodeCaps; 64]; }
+
+/// What the coordinator found between a node and a peer from their cabled
+/// ports: whether they are cabled, and if so the node's end of the link
+/// (`Link` JSON) when the two meet on an address, and its ports as the
+/// node's view shows them (`NodeLink.ports`) when they do not.
+type FoundLink {
+    cabled: Bool = false;
+    addressed: Bool = false;
+    link: String = "";
+    ports: String = "";
+}
+
+/// The nodes that declare cabled ports, with their capabilities.
+fn fleet_caps(store: st::Store) -> FleetCaps fallible(st::StoreError) {
+    let out = FleetCaps { };
+    let nodes = store.nodes() or raise;
+    for n in nodes.rows {
+        if n.revoked { continue; }
+        let f = store.fleet(n.id) or raise;
+        if !f.present || !has_ports(f.capabilities) { continue; }
+        push(out.items, NodeCaps { id: n.id, capabilities: f.capabilities }) or discard;
+    }
+    return out;
+}
+
+/// Whether capabilities declare any cabled port.
+fn has_ports(caps: String) -> Bool {
+    return !std::json::array_first(std::json::find_field_raw(caps, "ports")).done;
+}
+
+/// Node `node`'s capabilities (`caps`) with its links as the coordinator
+/// uses them: those it declares, then those found from its cabled ports to
+/// peers it declares none to, addressed (`found_link`), at most four.
+fn linked(store: st::Store, node: String, caps: String) -> String fallible(st::StoreError) {
+    if !has_ports(caps) { return caps; }
+    let fleet = fleet_caps(store) or raise;
+    return with_links(caps, effective_links(fleet, node, caps));
+}
+
+/// The links node `node` (`caps`) has: declared, then found, as a JSON list.
+@bounded_by(fleet)
+fn effective_links(fleet: FleetCaps, node: String, caps: String) -> String {
+    let out = st::JsonList { };
+    let mut peers = "\n";
+    let mut n = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(caps, "links"));
+    while !it.done && n < 4 {
+        out.add(std::str::trim(it.element));
+        peers = peers + std::json::find_string_field(it.element, "peer") + "\n";
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    for o in fleet.items {
+        if n >= 4 { break; }
+        if o.id == node || std::str::contains(peers, "\n" + o.id + "\n") { continue; }
+        let f = found_link(node, caps, o.id, o.capabilities);
+        if f.addressed {
+            out.add(f.link);
+            n = n + 1;
+        }
+    }
+    return out.text();
+}
+
+/// `caps` with its `links` replaced by `links` (a JSON list's insides),
+/// left out when that is empty.
+fn with_links(caps: String, links: String) -> String {
+    let c = std::str::trim(caps);
+    let out = st::JsonList { };
+    let mut it = std::json::object_first(c);
+    while !it.done {
+        let key = std::json::obj_key_string(it, c);
+        if key != "links" { out.add(jq(key) + ": " + std::json::obj_value_raw(it, c)); }
+        it = std::json::object_next(it, c);
+    }
+    if len(links) > 0 { out.add("\"links\": [" + links + "]"); }
+    return "{" + out.text() + "}";
+}
+
+/// The link node `a` (`caps_a`) has to node `b` (`caps_b`) as their cabled
+/// ports say it: the ports of `a` that see one of `b`'s or are seen by one
+/// (`neighbors`), the pair the two meet on chosen alike from either end
+/// (`meeting`), and `a`'s ports that reach `b` on that pair's family, each
+/// at its address, at the GID index of the first's.
+fn found_link(a: String, caps_a: String, b: String, caps_b: String) -> FoundLink {
+    let pa = std::json::find_field_raw(caps_a, "ports");
+    let pb = std::json::find_field_raw(caps_b, "ports");
+    let mut out = FoundLink { };
+    let m = if a < b { meeting(pa, pb, false) } else { meeting(pb, pa, true) };
+    if m.a < 0 { return out; }
+    out.cabled = true;
+    let first = port_at(pa, m.a);
+    if len(m.family) == 0 {
+        out.ports = view_ports(pa, pb, "", "");
+        return out;
+    }
+    let addr = port_address(first, m.family);
+    let gid = gid_of(first, addr);
+    out.addressed = true;
+    out.ports = view_ports(pa, pb, m.family, std::json::find_string_field(first, "ifname"));
+    out.link = "{\"peer\": " + jq(b) + ", \"ports\": ["
+        + link_ports_of(pa, pb, m.family, std::json::find_string_field(first, "ifname"), gid)
+        + "]" + (if gid >= 0 { ", \"gid_index\": " + to_string(gid) } else { "" }) + "}";
+    return out;
+}
+
+/// The pair of ports two nodes meet on: `a`'s index into the first list
+/// and the second's, and the address family they share (`4`, `6`, or ""
+/// for none), -1 when no port of the one sees one of the other. The pair
+/// is the first by family (IPv4 in one subnet, then IPv6 link-local, then
+/// neither) and then by the lower node id's interface name and the
+/// other's, so both ends choose it alike (`swapped`: the first list is the
+/// higher id's, and the answer is turned back).
+@unbounded
+fn meeting(lo: String, hi: String, swapped: Bool) -> Meeting {
+    let mut best = Meeting { };
+    let mut best_rank = 9;
+    let mut i = 0;
+    let mut pi = std::json::array_first(lo);
+    while !pi.done {
+        let mut j = 0;
+        let mut qi = std::json::array_first(hi);
+        while !qi.done {
+            if adjacent(pi.element, qi.element) {
+                let fam = shared_family(pi.element, qi.element);
+                let rank = if fam == "4" { 0 } else if fam == "6" { 1 } else { 2 };
+                if rank < best_rank {
+                    best_rank = rank;
+                    best = Meeting { a: i, b: j, family: fam };
+                }
+            }
+            j = j + 1;
+            qi = std::json::array_next(qi);
+        }
+        i = i + 1;
+        pi = std::json::array_next(pi);
+    }
+    if swapped && best.a >= 0 { return Meeting { a: best.b, b: best.a, family: best.family }; }
+    return best;
+}
+
+/// Two ports that meet: each its node's index into its ports.
+type Meeting { a: Int = -1; b: Int = -1; family: String = ""; }
+
+/// Whether one port sees the other on its link.
+fn adjacent(p: String, q: String) -> Bool {
+    return sees(p, std::json::find_string_field(q, "mac"))
+        || sees(q, std::json::find_string_field(p, "mac"));
+}
+
+/// Whether port `p` lists `mac` among its neighbours.
+@bounded_by(p)
+fn sees(p: String, mac: String) -> Bool {
+    if len(mac) == 0 { return false; }
+    let mut it = std::json::array_first(std::json::find_field_raw(p, "neighbors"));
+    while !it.done {
+        if std::str::trim(it.element) == "\"" + mac + "\"" { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// The family two adjacent ports can meet on: `4` when each has an IPv4
+/// address in one subnet with the other's, `6` when each has an IPv6
+/// link-local one, "" otherwise.
+fn shared_family(p: String, q: String) -> String {
+    let a4 = port_cidr(p, "4");
+    let b4 = port_cidr(q, "4");
+    if len(a4) > 0 && len(b4) > 0 && same_subnet(a4, b4) { return "4"; }
+    if len(port_cidr(p, "6")) > 0 && len(port_cidr(q, "6")) > 0 { return "6"; }
+    return "";
+}
+
+/// A port's first address of `family` (`4`, or `6` for link-local), with
+/// its prefix length; "" for none.
+@bounded_by(p)
+fn port_cidr(p: String, family: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(p, "addresses"));
+    while !it.done {
+        let a = std::str::trim(it.element);
+        let s = if std::str::starts_with(a, "\"") && len(a) >= 2 { a[1..(len(a) - 1)] } else { a };
+        if family == "6" && std::str::starts_with(s, "fe80:") { return s; }
+        if family == "4" && !std::str::contains(s, ":") && len(s) > 0 { return s; }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// A port's address of `family`, without its prefix length.
+fn port_address(p: String, family: String) -> String {
+    let c = port_cidr(p, family);
+    let slash = std::str::index_of(c, "/");
+    return if slash >= 0 { c[0..slash] } else { c };
+}
+
+/// The index of the port's RoCE v2 GID that carries `address`; -1 for none.
+@bounded_by(p)
+fn gid_of(p: String, address: String) -> Int {
+    if len(address) == 0 { return -1; }
+    let mut it = std::json::array_first(std::json::find_field_raw(p, "gids"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "address") == address {
+            return std::json::find_int_field(it.element, "index");
+        }
+        it = std::json::array_next(it);
+    }
+    return -1;
+}
+
+/// Whether two IPv4 addresses with prefixes are on one subnet, by both
+/// prefixes.
+fn same_subnet(a: String, b: String) -> Bool {
+    let sa = std::str::index_of(a, "/");
+    let sb = std::str::index_of(b, "/");
+    if sa < 0 || sb < 0 { return false; }
+    let ia = v4_value(a[0..sa]);
+    let ib = v4_value(b[0..sb]);
+    if ia < 0 || ib < 0 || ia == ib { return false; }
+    let la = std::str::parse_int(a[(sa + 1)..len(a)]) or - 1;
+    let lb = std::str::parse_int(b[(sb + 1)..len(b)]) or - 1;
+    if la < 1 || la > 32 || la != lb { return false; }
+    let size = pow2(32 - la);
+    return ia / size == ib / size;
+}
+
+/// 2 to the `n`.
+@bounded_by(n)
+fn pow2(n: Int) -> Int {
+    let mut out = 1;
+    let mut i = 0;
+    while i < n {
+        out = out * 2;
+        i = i + 1;
+    }
+    return out;
+}
+
+/// A dotted IPv4 address as a number; -1 when it is not one.
+@bounded_by(s)
+fn v4_value(s: String) -> Int {
+    let mut out = 0;
+    let mut parts = 0;
+    let mut rest = s + ".";
+    while len(rest) > 0 {
+        let dot = std::str::index_of(rest, ".");
+        let n = std::str::parse_int(rest[0..dot]) or - 1;
+        if n < 0 || n > 255 { return -1; }
+        out = out * 256 + n;
+        parts = parts + 1;
+        rest = rest[(dot + 1)..len(rest)];
+    }
+    return if parts == 4 { out } else { -1 };
+}
+
+/// The `i`th of a JSON list of ports; "" past its end.
+@bounded_by(ports)
+fn port_at(ports: String, i: Int) -> String {
+    let mut k = 0;
+    let mut it = std::json::array_first(ports);
+    while !it.done {
+        if k == i { return std::str::trim(it.element); }
+        k = k + 1;
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// Whether port `p` sees, or is seen by, any of `others`.
+@bounded_by(others)
+fn reaches(p: String, others: String) -> Bool {
+    let mut it = std::json::array_first(others);
+    while !it.done {
+        if adjacent(p, it.element) { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// The node's ports that reach the peer's (`theirs`) on `family`, as
+/// `LinkPort`s: `first` (an interface name) first, then the others with an
+/// address of that family whose GID index for it is `gid` (one
+/// `NCCL_IB_GID_INDEX` serves every port's device), at most four.
+@bounded_by(ours)
+fn link_ports_of(ours: String, theirs: String, family: String, first: String, gid: Int) -> String {
+    let head = st::JsonList { };
+    let rest = st::JsonList { };
+    let mut n = 0;
+    let mut it = std::json::array_first(ours);
+    while !it.done {
+        let p = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        let ifname = std::json::find_string_field(p, "ifname");
+        let addr = port_address(p, family);
+        if !reaches(p, theirs) || len(addr) == 0 || n >= 4 { continue; }
+        if ifname != first && gid_of(p, addr) != gid { continue; }
+        let hca = std::json::find_string_field(p, "hca");
+        let one = "{\"ifname\": " + jq(ifname) + ", \"address\": " + jq(addr)
+            + (if len(hca) > 0 { ", \"hca\": " + jq(hca) } else { "" }) + "}";
+        if ifname == first { head.add(one); } else { rest.add(one); }
+        n = n + 1;
+    }
+    let r = rest.text();
+    return head.text() + (if len(r) > 0 { ", " + r } else { "" });
+}
+
+/// The node's ports that reach the peer's, as its view shows them
+/// (`NodeLink.ports`): `first` first, each with its address of `family`
+/// when it has one, its RDMA device and speed.
+@bounded_by(ours)
+fn view_ports(ours: String, theirs: String, family: String, first: String) -> String {
+    let head = st::JsonList { };
+    let rest = st::JsonList { };
+    let mut it = std::json::array_first(ours);
+    while !it.done {
+        let p = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        if !reaches(p, theirs) { continue; }
+        let ifname = std::json::find_string_field(p, "ifname");
+        let addr = if len(family) > 0 { port_address(p, family) } else { "" };
+        let hca = std::json::find_string_field(p, "hca");
+        let one = "{\"ifname\": " + jq(ifname)
+            + (if len(addr) > 0 { ", \"address\": " + jq(addr) } else { "" })
+            + (if len(hca) > 0 { ", \"hca\": " + jq(hca) } else { "" }) + ", \"speed_mbps\": "
+            + to_string(std::json::find_int_field(p, "speed_mbps")) + "}";
+        if ifname == first { head.add(one); } else { rest.add(one); }
+    }
+    let r = rest.text();
+    let h = head.text();
+    return h + (if len(h) > 0 && len(r) > 0 { ", " } else { "" }) + r;
+}
+
+/// The link `caps` has to `peer`, as its JSON; "" for none.
+@bounded_by(caps)
+fn link_to(caps: String, peer: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(caps, "links"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "peer") == peer {
+            return std::str::trim(it.element);
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// An address on a link as a node reaches it from its end, `link` (its
+/// `Link` JSON): an IPv6 link-local one scoped to its first port
+/// (`fe80::...%<ifname>`), any other as it is.
+fn reached_from(address: String, link: String) -> String {
+    if !std::str::starts_with(address, "fe80:") || std::str::contains(address, "%") {
+        return address;
+    }
+    let first = std::json::array_first(std::json::find_field_raw(link, "ports"));
+    if first.done { return address; }
+    return address + "%" + std::json::find_string_field(first.element, "ifname");
+}

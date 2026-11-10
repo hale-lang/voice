@@ -163,6 +163,7 @@ locus Placements {
         let blobs = HeldBlobs { };
         hold_blobs(blobs, (self.store.inventory(node) or fail store_down(err)).blobs);
         let f = self.store.fleet(node) or fail store_down(err);
+        let caps = linked(self.store, node, f.capabilities) or fail store_down(err);
         let hw = std::str::trim(std::json::find_field_raw(f.capabilities, "hardware"));
         let declared = len(hw) > 0 && std::json::valid_object(hw);
         let os = if declared { std::json::find_string_field(hw, "os") } else { "" };
@@ -229,7 +230,7 @@ locus Placements {
             out = self.suggest_pair(
                 out,
                 node,
-                f.capabilities,
+                caps,
                 hw,
                 held,
                 usable,
@@ -282,7 +283,7 @@ locus Placements {
                     capabilities,
                     hw,
                     peer,
-                    pf.capabilities,
+                    linked(self.store, peer, pf.capabilities) or fail store_down(err),
                     phw,
                     checks,
                     now_seconds(),
@@ -634,6 +635,8 @@ locus Placements {
         } else {
             ""
         };
+        let lead_link = if parts == 2 { link_to(lead.capabilities, follower) } else { "" };
+        let follow_link = if parts == 2 { link_to(follow.capabilities, leader) } else { "" };
         out.seat = leader + "/" + c.id;
         self.make_seat(
             c,
@@ -642,7 +645,7 @@ locus Placements {
             out,
             recipe,
             all,
-            if parts == 2 { cluster_json(0, follower, master) } else { "" },
+            if parts == 2 { cluster_json(0, follower, master, lead_link) } else { "" },
         ) or raise;
         if parts == 2 {
             out.has_follower_seat = true;
@@ -654,7 +657,7 @@ locus Placements {
                 out,
                 recipe,
                 all,
-                cluster_json(1, leader, master),
+                cluster_json(1, leader, master, follow_link),
             ) or {
                 self.seats.remove_read(SeatRef { node: leader, seat: c.id }) or discard;
                 fail err;
@@ -719,7 +722,12 @@ locus Placements {
                 "nodes"
             );
         }
-        return Placeable { capabilities: f.capabilities, managed: managed };
+        // its links as the coordinator uses them: declared, or found from its
+        // cabled ports (cabling.hl)
+        return Placeable {
+            capabilities: linked(self.store, id, f.capabilities) or fail store_down(err),
+            managed: managed,
+        };
     }
 
     /// The hardware node `id` declared (`p`'s capabilities), as JSON.
@@ -1170,7 +1178,8 @@ locus Placements {
                 f.nodes.items,
                 ArrangeNode {
                     id: next,
-                    capabilities: fl.capabilities,
+                    // its links as the coordinator uses them (cabling.hl)
+                    capabilities: linked(self.store, next, fl.capabilities) or fail store_down(err),
                     hw: if len(hw) > 0 { hw } else { "{}" },
                     problem: placeable_problem(next, fl.capabilities),
                 },
@@ -1437,10 +1446,10 @@ fn pair_problem(
     let unlike = pair_hardware_problem(leader, hw_l, follower, hw_f);
     if len(unlike) > 0 { return unlike; }
     if len(link_ports(caps_l, follower)) == 0 {
-        return "node " + leader + " declares no link to " + follower;
+        return "node " + leader + " has no link to " + follower;
     }
     if len(link_ports(caps_f, leader)) == 0 {
-        return "node " + follower + " declares no link to " + leader;
+        return "node " + follower + " has no link to " + leader;
     }
     return pair_link_problem(checks, leader, follower, now);
 }
@@ -1656,12 +1665,14 @@ fn managed_config(
 }
 
 /// A seat's part of a placement across two nodes (`ClusterPart`): its rank,
-/// the other node, and where the ranks meet, the leader's address on the
-/// link at voice's rendezvous port (links.hl `SPAN_PORT`).
-fn cluster_json(rank: Int, peer: String, master: String) -> String {
+/// the other node, where the ranks meet, the leader's address on the link
+/// (`master`) as this node reaches it at voice's rendezvous port (links.hl
+/// `SPAN_PORT`), and this node's end of the link (`link`, its `Link` JSON;
+/// cabling.hl `reached_from`).
+fn cluster_json(rank: Int, peer: String, master: String, link: String) -> String {
     return "{\"size\": 2, \"rank\": " + to_string(rank) + ", \"peer\": " + jq(peer)
-        + ", \"master_addr\": " + jq(master) + ", \"master_port\": " + to_string(SPAN_PORT)
-        + "}";
+        + ", \"master_addr\": " + jq(reached_from(master, link)) + ", \"master_port\": "
+        + to_string(SPAN_PORT) + (if len(link) > 0 { ", \"link\": " + link } else { "" }) + "}";
 }
 
 /// The node a placement is on, of those it names: its leader, and across

@@ -12,6 +12,7 @@ import { toneOf } from '../tone';
 import { ContextWindow } from '../context';
 import { Value } from '../values';
 import { nodeModels, heldSaid, type NodeModel } from './node-models';
+import { cablingState, linkState } from './link-state';
 import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
 import { acceleratorName, fleetNodes, memoryOf, placedBlocks } from '../fleet-memory';
 import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
@@ -282,41 +283,40 @@ function reported(s: SeatSummary | SeatView): string {
   return `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
 }
 
-/** What the machine has, as the node measured it: what placement fits models to. */
 /**
- * The nodes this one is cabled to, as its capabilities file declares them:
- * the ports that reach each, whether the peer declares the link back, and
- * the link's latest check. A model is placed across the two once it passed.
+ * The nodes this one is cabled to: the links its capabilities file
+ * declares, and those voice found from its cabled ports and its peers'
+ * (a declared one wins), each with its ports, whether the peer has one
+ * back, and its state, from cabled and not addressed to its latest check.
+ * With no link, what is cabled. A model is placed across two once their
+ * link's check passed.
  */
 function Links({ node }: { node: Node }) {
   const w = useWrite();
-  const declared = node.capabilities?.links ?? [];
-  if (declared.length === 0) return <span className="faint">none declared: its capabilities file names no node it is cabled to</span>;
+  const links = node.links ?? [];
+  const cabling = cablingState(node.capabilities?.ports, links);
+  if (links.length === 0) return <span className={node.capabilities?.ports?.length ? 'c-wait' : 'faint'}>{cabling}</span>;
   return (
     <>
       <Kv
-        rows={declared.map((l) => {
-          const seen = node.links?.find((x) => x.peer === l.peer);
-          const c = seen?.check;
-          const label = !c ? '' : c.status === 'passed' && c.degraded ? 'passed, degraded' : c.status;
-          const tone = !c ? 'quiet' : c.status === 'failed' ? 'fail' : c.status === 'running' || c.degraded ? 'wait' : 'quiet';
+        rows={links.map((l) => {
+          const st = linkState(l, node.status === 'up');
+          const c = l.check;
           return {
             k: l.peer,
             v: (
               <>
-                <a href={href('nodes', l.peer)}>{l.peer}</a>{': '}
-                <Mono>{l.ports.map((p) => `${p.ifname} ${p.address}${p.hca ? ` · ${p.hca}` : ''}`).join(', ')}</Mono>
-                {!seen?.paired && <span className="c-wait"> · {l.peer} declares no link back</span>}
-                {c ? (
-                  <>
+                <Status tone={st.tone} label={st.text} title={c?.reason ?? undefined} />
+                <span className="muted"> · {l.source === 'declared' ? 'declared' : 'found'}</span>
+                {l.ports && l.ports.length > 0 && (
+                  <div>
+                    <Mono>{l.ports.map((p) => `${p.ifname}${p.address ? ` ${p.address}` : ''}${p.hca ? ` · ${p.hca}` : ''}`).join(', ')}</Mono>
+                    {l.gid_index !== undefined && <span className="muted"> · GID {l.gid_index}</span>}
                     {' · '}
-                    <Status tone={tone} label={label} title={c.reason ?? undefined} />
-                    {c.bus_bytes_per_second ? <span className="muted"> · {bytes(c.bus_bytes_per_second)}/s</span> : null}
-                  </>
-                ) : (
-                  <span className="muted"> · never checked</span>
+                    <a href={href('nodes', l.peer)}>{l.peer}</a>
+                  </div>
                 )}
-                {seen?.paired && node.status === 'up' && c?.status !== 'running' && (
+                {st.checkable && (
                   <>
                     {' '}
                     <Button onClick={() => void w.write('post', '/admin/v1/nodes/{node}/links/{peer}/check', { params: { path: { node: node.id, peer: l.peer } } })} disabled={w.busy}>check</Button>
@@ -332,6 +332,7 @@ function Links({ node }: { node: Node }) {
   );
 }
 
+/** What the machine has, as the node measured it: what placement fits models to. */
 function Hardware({ node }: { node: Node }) {
   const hw = node.capabilities?.hardware;
   if (!hw) return <span className="faint">{node.capabilities ? 'not measured: no model is placed on this node' : 'not declared yet: the node has not registered'}</span>;

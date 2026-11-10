@@ -69,7 +69,8 @@ It:
   (below);
 - writes `~/.voice/node-data/capabilities.json`: the managed engine, which
   runs the models placed on the node, and the claude CLI when the vault holds
-  a Claude account's token and `claude` is on PATH; and, on a machine it
+  a Claude account's token and the node's account has `claude` (below); and,
+  on a machine it
   shares, the memory left for models (`hardware.model_memory_bytes`, never
   more than the machine's less a sixteenth kept for its system, at least
   4 GiB, which the node holds to however the file says it): in a
@@ -112,6 +113,16 @@ The seat names its account's token: `{"engine": "claude", "account": "work",
 is setting another member and placing the node again. By hand, put the
 token in `~/.voice/vault/claude-token--<account>` (mode 600) before
 installing.
+
+The claude CLI is the node's account's own, found where that account
+installs it, in order: what its login shell finds (`command -v claude`,
+given 5 s), `~/.local/bin/claude` (Claude Code's native installer),
+`~/.claude/local/claude` (an older install), then the system's directories
+(`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). The install
+prints the one it found, and the service's PATH (the LaunchDaemon's and the
+unit's) puts its directory first, so the `claude` the node starts is that
+one. With no CLI, or no token, the node offers no claude engine. Installing
+the CLI later is placing the node again.
 
 The node finds NATS where the api tells it when it registers (the api's
 `--node-nats`), so the machine needs a route to that address as well as to

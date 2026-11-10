@@ -1071,7 +1071,14 @@ already there.
   usage and its cost is 0, the seat being flat-rate. A missing binary (exit
   127), a nonzero exit or an error result before output, 300 s of silence or
   no output fails the seat, and cancelling the request kills the child.
-  Other CLI engines follow that shape.
+  The `claude` it starts is the one on the service's PATH, which the install
+  writes with the directory of the CLI it found for the node's account (its
+  login shell's, `~/.local/bin`, `~/.claude/local`, then the system's) first:
+  the install offers the engine only when it found one, so the engine it
+  declares and the program the node runs are the same. A PATH, not an
+  absolute path in the engine: an npm-installed CLI is a `#!/usr/bin/env
+  node` script whose `node` sits beside it, and the capability format needs
+  nothing new. Other CLI engines follow that shape.
 
   **One node, several logins (hale-lang/voice#2).** Two accounts on one CLI
   are two seats of one `claude-cli` engine (or two engines), each naming its

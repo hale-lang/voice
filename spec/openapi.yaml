@@ -31,7 +31,8 @@ info:
 
     ## Two planes
 
-    - **Caller plane** (`/v1/...`): authenticated by a project key.
+    - **Caller plane** (`/v1/...`): authenticated by a project key, or by
+      the operator token charged to a project (below).
     - **Admin plane** (`/admin/v1/...`): authenticated by the operator token.
       Configures the model catalog, accounts, nodes, projects, their budgets
       and limits, and their keys; reads usage.
@@ -49,6 +50,20 @@ info:
 
     Every request is attributed to exactly one project and one key, so usage
     can be tracked and budgeted per project and broken down per key.
+
+    **The operator, charged to a project.** The caller plane also takes the
+    operator token with a `Voice-Project` header naming the project the
+    request is charged to (the admin UI's Chat sends its requests so). Such
+    a request is the project's in every way a key's is: the same routing,
+    the project's models and aliases, its limits and budget, its usage
+    records. Its key is the project's **operator key**, `<project>-operator`
+    (named `operator`), which voice makes on the operator's first request
+    charged to the project; no token names it, and it is never revoked
+    (`409`), but its models, accounts and limits change as any key's do. A
+    project that is not there is `404 not_found`, an archived one `403`;
+    `Voice-Project` with any credential but the operator token is `401
+    invalid_key` (a project key's requests are its own project's), and the
+    operator token without it `400 invalid_request`.
 
     Under DNA, projects are positions, budgets are grants and limits are policy
     rows, and changing them is a reviewed decision. A deployment that requires
@@ -321,8 +336,12 @@ paths:
         **State (MVP).** Voice does not store responses in the MVP. `store` is
         accepted and treated as false; a request with `previous_response_id`
         fails with `previous_response_not_found`. `background` is not supported.
+      security:
+        - projectKey: []
+        - operatorToken: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/VoiceProject'
       requestBody:
         required: true
         content:
@@ -408,8 +427,12 @@ paths:
         once it has begun ends with a final chunk whose `finish_reason` is
         `error`, carrying an `error` object, `usage: null` and `voice`, then
         `data: [DONE]`: a truncated answer never ends as a complete one.
+      security:
+        - projectKey: []
+        - operatorToken: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/VoiceProject'
       requestBody:
         required: true
         content:
@@ -459,6 +482,11 @@ paths:
       tags: [catalog]
       operationId: listModels
       summary: List models visible to this key
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/VoiceProject'
       description: |
         Local and hosted models appear together; the `voice` extension says
         which is which, its price, and which data classes it may carry. Nodes,
@@ -471,8 +499,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ModelList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -481,8 +515,12 @@ paths:
       tags: [catalog]
       operationId: getModel
       summary: Describe one model
+      security:
+        - projectKey: []
+        - operatorToken: []
       parameters:
         - $ref: '#/components/parameters/ModelId'
+        - $ref: '#/components/parameters/VoiceProject'
       responses:
         '200':
           description: The model.
@@ -490,8 +528,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Model'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/ModelNotFound'
         '503':
@@ -502,6 +544,11 @@ paths:
       tags: [capabilities]
       operationId: getCapabilities
       summary: What this key may do, and how much is left
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/VoiceProject'
       description: |
         Read at start so a client can pace itself. Returns the project and key,
         the models the key may name, every limit that applies with its
@@ -513,8 +560,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Capabilities'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '503':
           $ref: '#/components/responses/Unavailable'
 
@@ -960,7 +1013,9 @@ paths:
       description: |
         Revocation is immediate at the coordinator; in-flight requests finish.
         A project's system key (`Key.internal`), which no token names, is
-        never revoked (`409`); archive the project instead.
+        never revoked (`409`); archive the project instead. Nor is its
+        operator key, `<project>-operator` (see "The operator, charged to a
+        project"): narrow its models, accounts or limits instead.
       security:
         - operatorToken: []
       responses:
@@ -4030,7 +4085,7 @@ components:
     operatorToken:
       type: http
       scheme: bearer
-      description: "The operator token, presented as `Authorization: Bearer va-...` on the admin plane. The api mints it on its first start and keeps it in its store; `voice-api admin-token` prints it."
+      description: "The operator token, presented as `Authorization: Bearer va-...` on the admin plane, and on the caller plane with `Voice-Project` naming the project the request is charged to. The api mints it on its first start and keeps it in its store; `voice-api admin-token` prints it."
 
   parameters:
     ModelId:
@@ -4197,6 +4252,15 @@ components:
       name: cursor
       in: query
       schema: { type: string }
+    VoiceProject:
+      name: Voice-Project
+      in: header
+      required: false
+      description: |
+        With the operator token, the project the request is charged to, as
+        that project's operator key (see "The operator, charged to a
+        project"). Refused with a project key (`401 invalid_key`).
+      schema: { $ref: '#/components/schemas/ProjectIdValue' }
     IdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -4292,7 +4356,7 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     ModelNotFound:
-      description: No model by that name in the catalog.
+      description: No model by that name in the catalog; or, for the operator, no project by the name `Voice-Project` gives.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }

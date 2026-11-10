@@ -69,7 +69,9 @@ in production. `npm run gen` regenerates the client from
 `npm run build` writes `apps/admin/dist`.
 
 Layout: `packages/tokens` (`@hale/tokens`, JSON to CSS custom properties,
-no framework), `packages/components` (`@hale/components`, React, no voice
+the themes and the arithmetic that keeps a custom accent legible, no
+framework; `npm run test -w @hale/tokens` checks every theme's completeness
+and contrast), `packages/components` (`@hale/components`, React, no voice
 nouns; voice's own state-word mapping lives in `apps/admin/src/tone.ts`),
 `apps/admin` (`@voice/admin`).
 

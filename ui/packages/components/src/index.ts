@@ -17,5 +17,6 @@ export type { MemoryCardProps, MemoryPoint } from './MemoryCard';
 export { layoutMemory, planCells, orderForPlan, memoryTotals, memoryUnit, unitSaid, apportion, hueOf, huesFor, HUE_SLOTS, CELLS } from './memory-layout';
 export type { MemoryBlock, MemoryCell, MemoryMark, MemoryModel, MemoryTotals } from './memory-layout';
 export { SchemaForm } from './SchemaForm';
+export { Appearance, useTheme } from './Appearance';
 export type { JsonSchema, JsonObject } from './SchemaForm';
 export { micros, count, ago, until, when, bytes } from './format';

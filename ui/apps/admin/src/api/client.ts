@@ -282,6 +282,37 @@ export function useRecipes() {
   });
 }
 
+/**
+ * How every recipe fits the fleet now (`listRecipeFits`): the nodes and
+ * pairs judged against, from the first page, and every recipe's variants
+ * judged on each, following the pages to the last. One query under its
+ * path, so the events that change a fit (fleet-reads.ts `FITS`) read it
+ * again; the answer shown stays until the new one lands.
+ */
+export function useRecipeFits() {
+  const refetchInterval = useRefetchInterval();
+  return useQuery({
+    queryKey: ['/admin/v1/recipe-fits', ALL_PAGES],
+    refetchInterval,
+    queryFn: async (): Promise<Schemas['RecipeFits']> => {
+      const page = async (cursor?: string) => {
+        const r = await api.GET('/admin/v1/recipe-fits', { params: { query: cursor ? { cursor } : {} } });
+        if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+        return r.data;
+      };
+      const first = await page();
+      const data = [...first.data];
+      let cursor = first.next_cursor ?? undefined;
+      for (let pages = 1; cursor && pages < PAGES_MAX; pages++) {
+        const next = await page(cursor);
+        data.push(...next.data);
+        cursor = next.next_cursor ?? undefined;
+      }
+      return { ...first, data, next_cursor: null };
+    },
+  });
+}
+
 /** The conversations' titles read at most, the newest first: five pages. */
 const TITLE_PAGES = 5;
 

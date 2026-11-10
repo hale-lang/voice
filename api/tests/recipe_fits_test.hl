@@ -1,0 +1,370 @@
+// How every recipe fits the fleet now (`listRecipeFits`, fits.hl): a node
+// whose GPU has memory of its own (lin1, an AMD Radeon RX 9070 of 17.1 GB
+// in a machine that offers models 28.5 GB), two DGX Sparks whose GB10s
+// share the machine's memory, cabled to each other with their link
+// checked, and a node with no managed engine. Each variant is judged on
+// every node and on the pair by the rules a placement is: what fits now,
+// what fits only once the placements there are freed, and what the
+// hardware never fits; with the runtime, the room it has, the disk, and
+// whether the node holds the files already.
+import ".." as api;
+import "../../store" as st;
+import "../../node" as node;
+
+fn shipped(dir: String) -> String {
+    return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
+}
+
+const GIB: Int = 1073741824;
+
+/// lin1's hardware, as its node reports it.
+const LIN1: String = "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 32700000000, \"model_memory_bytes\": 28500000000, \"accelerators\": [{\"kind\": \"rocm\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}, {\"kind\": \"vulkan\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}";
+
+/// What granite-4.0-h-tiny's Q8_0 reserved on lin1.
+const GRANITE_RESERVED: Int = 12100000000;
+
+/// A DGX Spark's two ports on its one cabled QSFP port, to `peer`.
+fn link_to(peer: String, a: String, b: String) -> String {
+    return "{\"peer\": \"" + peer + "\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \""
+        + a + "\", \"hca\": \"rocep1s0f0\"}, {\"ifname\": \"enP2p1s0f0np0\", \"address\": \"" + b
+        + "\", \"hca\": \"roceP2p1s0f0\"}], \"gid_index\": 3}";
+}
+
+/// A node's capabilities: a managed engine (`managed`), and `hardware`, and
+/// its links (a JSON list's members).
+fn caps(managed: Bool, hardware: String, links: String) -> String {
+    return "{\"max_in_flight\": 4, \"engines\": ["
+        + (
+            if managed {
+                "{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}"
+            } else {
+                "{\"id\": \"echo\", \"kind\": \"static\", \"config_schema\": {}}"
+            }
+        )
+        + "], \"hardware\": " + hardware
+        + (if len(links) > 0 { ", \"links\": [" + links + "]" } else { "" }) + "}";
+}
+
+/// A DGX Spark's hardware: 121 GiB, its GB10 sharing it.
+fn spark_hw() -> String {
+    let memory = 121 * GIB;
+    return "{\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": " + to_string(memory)
+        + ", \"model_memory_bytes\": " + to_string(node::model_memory("{}", memory))
+        + ", \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": "
+        + to_string(memory) + ", \"unified\": true}], \"disk_free_bytes\": 3500000000000}";
+}
+
+fn add_node(store: st::Store, id: String, capabilities: String) {
+    store.insert_node(
+        st::NodeRow { id: id, name: id, max_in_flight: 4, created_at: api::now_seconds() },
+        api::change("create", "nodes/" + id, "", "{}"),
+    ) or discard;
+    store.put_fleet(st::FleetRow { node: id, capabilities: capabilities, present: true })
+    or discard;
+    store.put_beat(id, api::now_seconds(), 0) or discard;
+}
+
+/// A passed check of the link between spark and flare.
+fn checked(store: st::Store, link: api::Link) {
+    let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
+    let usable = rts.usable_in_gate() or api::RuntimeList { };
+    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let said = api::link_result_json(
+        api::LinkCheckResult {
+            id: c.id,
+            ok: true,
+            has_bus_bytes_per_second: true,
+            bus_bytes_per_second: 23900000000,
+        },
+        api::now_seconds(),
+    );
+    store.put_link_result(c.id, "spark", said) or discard;
+    store.put_link_result(c.id, "flare", said) or discard;
+}
+
+/// A variant's files as the store keeps a node's report.
+@unbounded
+fn held_whole(node: String, variant: String) -> st::InventoryRow {
+    let mut out = st::InventoryRow { node: node, reported_at: api::now_seconds() };
+    let mut f = std::json::array_first(std::json::find_field_raw(variant, "files"));
+    while !f.done {
+        let n = std::json::find_int_field(f.element, "bytes");
+        out.blobs = out.blobs + std::json::find_string_field(f.element, "sha256") + " "
+            + to_string(n) + "\n";
+        out.files = out.files + 1;
+        out.bytes = out.bytes + n;
+        f = std::json::array_next(f);
+    }
+    return out;
+}
+
+/// Variant `variant` of `recipe` judged on `nodes` (`a` or `a,b`); an empty
+/// judgment (no runtime, no reason) when the answer has none.
+fn cell(f: api::RecipeFits, recipe: String, variant: String, nodes: String) -> api::TargetFit {
+    for r in f.data {
+        if r.recipe.id != recipe { continue; }
+        for v in r.variants {
+            if v.variant != variant { continue; }
+            for t in v.on {
+                let mut said = "";
+                for n in t.nodes {
+                    said = if len(said) == 0 { n } else { said + "," + n };
+                }
+                if said == nodes { return t; }
+            }
+        }
+    }
+    return api::TargetFit { };
+}
+
+fn fit_node(f: api::RecipeFits, id: String) -> api::FitNode {
+    for n in f.nodes {
+        if n.node == id { return n; }
+    }
+    return api::FitNode { };
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let link = api::NatsLink { };
+    let recipes = api::Recipes { store: store, shipped: api::shipped_recipes(shipped("recipes")) };
+    let catalog = api::Catalog { store: store, recipes: recipes };
+    let runtimes = api::Runtimes {
+        store: store,
+        shipped: api::shipped_runtimes(shipped("runtimes")),
+    };
+    let placements = api::Placements {
+        store: store,
+        recipes: recipes,
+        runtimes: runtimes,
+        seats: api::Seats { store: store, link: link },
+        picks: std::io::fs::read_file(shipped("catalog") + "/picks.json") or "",
+    };
+    api::Accounts { store: store }.create(
+        api::AccountCreate { id: "local", name: "Local" },
+    ) or discard;
+
+    add_node(store, "lin1", caps(true, LIN1, ""));
+    add_node(
+        store,
+        "spark",
+        caps(true, spark_hw(), link_to("flare", "192.168.100.1", "192.168.101.1")),
+    );
+    add_node(
+        store,
+        "flare",
+        caps(true, spark_hw(), link_to("spark", "192.168.100.2", "192.168.101.2")),
+    );
+    add_node(store, "static", caps(false, LIN1, ""));
+
+    // ---- the pair is listed, but judged on only once its link is checked --
+    let before = placements.fits(api::RecipeAsk { }) or {
+        std::test::assert(false, "fits: " + api::ctl_message(err));
+        return;
+    };
+    let pair = at(before.pairs, 0) or api::FitPair { };
+    std::test::assert(
+        count(before.pairs) == 1 && (at(pair.nodes, 0) or "") == "flare"
+            && (at(pair.nodes, 1) or "") == "spark" && pair.has_problem
+            && std::str::contains(pair.problem, "has not been checked"),
+        "flare and spark are a pair, in the fleet's order, not checked yet: " + pair.problem,
+    );
+    std::test::assert(
+        cell(before, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark").reason == "",
+        "an unchecked pair is not judged on",
+    );
+    checked(store, link);
+
+    // lin1 holds granite on its card
+    catalog.create(
+        api::CatalogModelCreate {
+            id: "granite-4.0-h-tiny",
+            has_recipe: true,
+            recipe: "granite-4.0-h-tiny",
+        },
+    ) or discard;
+    let mut granite = api::Placement {
+        id: "granite",
+        model: "granite-4.0-h-tiny",
+        account: "local",
+        recipe: "granite-4.0-h-tiny",
+        variant: "gguf-q8_0",
+        runtime: "llama-server-b11913-rocm",
+        leader: "lin1",
+        seat: "lin1/granite",
+        has_reserved_bytes: true,
+        reserved_bytes: GRANITE_RESERVED,
+        created_at: api::now_seconds()
+    };
+    push(granite.nodes, "lin1") or discard;
+    let body = api::placement_json(granite);
+    store.insert_placement(
+        st::PlacementRow {
+            id: "granite",
+            model: "granite-4.0-h-tiny",
+            body: body,
+            created_at: granite.created_at,
+        },
+        api::change("create", "placements/granite", "", body),
+    ) or discard;
+
+    // spark holds qwen3-0.6b's GGUF whole
+    let qwen = recipes.get_in_gate("qwen3-0.6b") or api::Recipe { };
+    store.put_inventory(held_whole("spark", api::variant_body_of(qwen.variants.text, "gguf-q8_0")))
+    or discard;
+
+    let f = placements.fits(api::RecipeAsk { }) or {
+        std::test::assert(false, "fits: " + api::ctl_message(err));
+        return;
+    };
+
+    // ---- the nodes, as the fit is judged against them --------------------
+    let lin1 = fit_node(f, "lin1");
+    std::test::assert(
+        lin1.gpu && lin1.memory_bytes == 17100000000 && lin1.model_memory_bytes == 17100000000
+            && lin1.held_bytes == api::footprint(GRANITE_RESERVED)
+            && lin1.free_bytes == 17100000000 - api::footprint(GRANITE_RESERVED)
+            && lin1.accelerator == "AMD Radeon RX 9070" && lin1.disk_free_bytes == 500000000000,
+        "lin1's models are served from its card: 17.1 GB, granite's held of it",
+    );
+    let spark = fit_node(f, "spark");
+    std::test::assert(
+        !spark.gpu && spark.memory_bytes == 121 * GIB
+            && spark.model_memory_bytes == node::model_memory("{}", 121 * GIB)
+            && spark.free_bytes == spark.model_memory_bytes && !spark.has_problem,
+        "a Spark's are the machine's, its GB10 sharing them, none held",
+    );
+    let lone = fit_node(f, "static");
+    std::test::assert(
+        lone.has_problem && std::str::contains(lone.problem, "offers no managed engine"),
+        "a node with no managed engine says so: " + lone.problem,
+    );
+    std::test::assert(
+        cell(f, "qwen3-0.6b", "gguf-q8_0", "static").reason == "",
+        "and nothing is judged on it",
+    );
+    let checked_pair = at(f.pairs, 0) or api::FitPair { };
+    std::test::assert(!checked_pair.has_problem, "the pair, checked, can take a model");
+
+    // ---- a discrete GPU: fits now, fits once freed, never -----------------
+    let small = cell(f, "granite-4.0-h-tiny", "gguf-q4_k_m", "lin1");
+    std::test::assert(
+        !small.fits && small.fits_empty && small.has_placed && small.placed == "granite",
+        "granite is placed on lin1, named there: " + small.reason,
+    );
+    let decider = cell(f, "jev-style-2b-decision-v3", "gguf-f16", "lin1");
+    std::test::assert(
+        !decider.fits && decider.fits_empty && decider.runtime == "decision-0.1.2-rocm"
+            && decider.gpu && decider.room_bytes == 17100000000 - api::footprint(GRANITE_RESERVED)
+            && decider.room_empty_bytes == 17100000000 && !decider.has_held_bytes
+            && std::str::contains(decider.reason, "free of its GPU's 17.1 GB")
+            && !decider.has_empty_reason && !decider.tools,
+        "the decider's f16 fits lin1's card once granite is freed, not beside it: "
+            + decider.reason,
+    );
+    let q4 = cell(f, "jev-style-2b-decision-v3", "gguf-q4_k_m", "spark");
+    std::test::assert(
+        q4.fits && q4.has_held_bytes && q4.held_bytes >= q4.need_bytes
+            && q4.held_bytes <= q4.room_bytes,
+        "its Q4_K_M fits a Spark, holding what it needs and no more than the room: " + q4.reason,
+    );
+    let flash = cell(f, "deepseek-v4-flash-0731", "gguf-q2_k_s", "lin1");
+    std::test::assert(
+        !flash.fits && !flash.fits_empty && flash.has_empty_reason
+            && std::str::contains(flash.empty_reason, "of 17.1 GB free of its GPU's 17.1 GB"),
+        "DeepSeek-V4-Flash never fits lin1's card: " + flash.empty_reason,
+    );
+
+    // ---- unified memory, and tools and reasoning under the runtime --------
+    let gpt = cell(f, "gpt-oss-20b", "safetensors-mxfp4", "spark");
+    std::test::assert(
+        gpt.fits && !gpt.gpu && gpt.runtime == "vllm-26.09" && gpt.tools && !gpt.reasoning
+            && gpt.room_bytes == spark.model_memory_bytes && gpt.disk_free_bytes == 3500000000000,
+        "gpt-oss-20b fits a Spark's shared memory under vLLM, carrying tools: " + gpt.reason,
+    );
+    let gguf = cell(f, "gpt-oss-20b", "gguf-mxfp4", "spark");
+    std::test::assert(
+        gguf.fits && gguf.runtime == "llama-server-b11913-cuda" && gguf.tools && gguf.reasoning,
+        "its GGUF under llama-server carries tools and reasoning: " + gguf.runtime,
+    );
+
+    // ---- downloaded ------------------------------------------------------
+    std::test::assert(
+        cell(f, "qwen3-0.6b", "gguf-q8_0", "spark").downloaded
+            && !cell(f, "qwen3-0.6b", "gguf-q8_0", "flare").downloaded
+            && !cell(f, "qwen3-0.6b", "safetensors-bf16", "spark").downloaded,
+        "spark holds qwen3-0.6b's GGUF whole; flare does not, nor spark its safetensors",
+    );
+    std::test::assert(
+        !cell(f, "qwen3-0.6b", "gguf-q8_0", "flare,spark").downloaded,
+        "across the pair, only when both hold it",
+    );
+
+    // ---- a linked pair ---------------------------------------------------
+    let alone = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "spark");
+    std::test::assert(
+        !alone.fits && !alone.fits_empty,
+        "DeepSeek-V4-Flash's fp8 never fits one Spark: " + alone.reason,
+    );
+    let across = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark");
+    std::test::assert(
+        across.fits && across.runtime == "vllm-26.09" && across.need_bytes < alone.need_bytes
+            && across.tools && across.reasoning
+            && std::str::contains(across.reason, "across 2 nodes"),
+        "across the pair it fits, each node holding its share: " + across.reason,
+    );
+    let small_pair = cell(f, "qwen3-0.6b", "gguf-q8_0", "flare,spark");
+    std::test::assert(
+        !small_pair.fits && !small_pair.fits_empty
+            && std::str::contains(small_pair.reason, "no runtime that spans nodes"),
+        "a GGUF has no runtime that spans nodes: " + small_pair.reason,
+    );
+
+    // a placement across the pair: another across it fits once it is freed
+    let mut ds = api::Placement {
+        id: "ds",
+        model: "deepseek",
+        account: "local",
+        recipe: "deepseek-v4-flash-0731",
+        variant: "safetensors-fp8",
+        runtime: "vllm-26.09",
+        leader: "flare",
+        seat: "flare/ds",
+        has_reserved_bytes: true,
+        reserved_bytes: 10 * GIB,
+        created_at: api::now_seconds()
+    };
+    push(ds.nodes, "flare") or discard;
+    push(ds.nodes, "spark") or discard;
+    let ds_body = api::placement_json(ds);
+    store.insert_placement(
+        st::PlacementRow { id: "ds", model: "deepseek", body: ds_body, created_at: ds.created_at },
+        api::change("create", "placements/ds", "", ds_body),
+    ) or discard;
+    let g = placements.fits(api::RecipeAsk { }) or api::RecipeFits { };
+    std::test::assert(
+        cell(g, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark").placed == "ds",
+        "the pair's placement is named on it",
+    );
+    let rival = cell(g, "gpt-oss-120b", "safetensors-mxfp4", "flare,spark");
+    std::test::assert(
+        !rival.fits && rival.fits_empty
+            && std::str::contains(rival.reason, "takes part in placement ds across nodes already"),
+        "a node takes part in one placement across nodes at a time: " + rival.reason,
+    );
+
+    // ---- paged as listRecipes is ----------------------------------------
+    let page = placements.fits(api::RecipeAsk { limit: 2 }) or api::RecipeFits { };
+    std::test::assert(
+        count(page.data) == 2 && page.has_next_cursor && count(page.nodes) == 4,
+        "a page of two recipes, every node with it",
+    );
+    let bad = placements.fits(api::RecipeAsk { cursor: "no-such-recipe" }) or {
+        std::test::assert(
+            std::str::contains(api::ctl_message(err), "`cursor` names no recipe"),
+            "a cursor that names no recipe is refused",
+        );
+        return;
+    };
+    std::test::assert(count(bad.data) < 0, "a cursor that names no recipe is refused");
+}

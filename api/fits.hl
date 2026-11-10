@@ -1,0 +1,309 @@
+// How every recipe fits the fleet now (`GET /admin/v1/recipe-fits`,
+// `Placements.fits`): each variant of each recipe judged on every node a
+// model may be placed on, and across every pair of nodes cabled to each
+// other that could take a model together, by the rules a placement is
+// judged by (placements.hl `judge_variant`, `reserve`, `beside_problem`,
+// `pair_problem`), against what the nodes' placements hold now; and again
+// against the same nodes with nothing placed, which tells a variant kept
+// off by the placements there (it fits once they are freed) from one the
+// hardware never fits. Beside each judgment: the runtime that would serve
+// it, what its seat would take of the room that runtime has (a GPU's own
+// memory, or the machine's), what it keeps on disk, whether the node holds
+// its files whole already (downloads.hl), and what its seat would carry
+// (tools, reasoning) under that runtime (catalog.hl `managed_tools`,
+// `managed_reasoning`). The work is bounded: a page of recipes, each of at
+// most 8 variants, on at most 16 nodes and 32 pairs.
+
+/// `FitNode`: a node models are placed on, as a fit is judged against it:
+/// the memory its models are served from (its first accelerator's: a GPU's
+/// own, or the machine's when that GPU shares it, or it has none), what
+/// models may use of it and what its placements hold, its disk free; or why
+/// no model can be placed on it.
+type FitNode {
+    node: String = "";
+    has_problem: Bool = false;
+    problem: String = "";
+    os: String = "";
+    arch: String = "";
+    // the kinds of its accelerators, as `,cuda,`; and the first one's name
+    accelerators: String = "";
+    has_accelerator: Bool = false;
+    accelerator: String = "";
+    // the memory is a GPU's own, not the machine's
+    gpu: Bool = false;
+    memory_bytes: Int = 0;
+    model_memory_bytes: Int = 0;
+    held_bytes: Int = 0;
+    free_bytes: Int = 0;
+    disk_free_bytes: Int = 0;
+}
+
+/// `FitPair`: two nodes cabled to each other, which a model may be split
+/// across, the first its leader; or why none can be.
+type FitPair {
+    nodes: bounded[String; 2];
+    has_problem: Bool = false;
+    problem: String = "";
+}
+
+/// `TargetFit`: one variant judged on a node or a pair.
+type TargetFit {
+    nodes: bounded[String; 2];
+    fits: Bool = false;
+    // it fits the same nodes with nothing placed on them
+    fits_empty: Bool = false;
+    has_runtime: Bool = false;
+    runtime: String = "";
+    // the room the runtime has is a GPU's own memory
+    gpu: Bool = false;
+    // what its seat takes on each node at the least, the room its runtime
+    // has there now (the least of the nodes'), and with nothing placed
+    need_bytes: Int = 0;
+    room_bytes: Int = 0;
+    room_empty_bytes: Int = 0;
+    // what it would hold of each node placed now, its prompt cache with it
+    has_held_bytes: Bool = false;
+    held_bytes: Int = 0;
+    disk_bytes: Int = 0;
+    disk_free_bytes: Int = 0;
+    downloaded: Bool = false;
+    has_placed: Bool = false;
+    placed: String = "";
+    tools: Bool = false;
+    reasoning: Bool = false;
+    reason: String = "";
+    has_empty_reason: Bool = false;
+    empty_reason: String = "";
+}
+
+/// `VariantFits`: a variant, judged on every node and pair.
+type VariantFits {
+    variant: String = "";
+    on: bounded[TargetFit; 48];
+}
+
+/// `RecipeFit`: a recipe as `listRecipes` lists it, each variant judged.
+type RecipeFit {
+    recipe: RecipeSummary = RecipeSummary { };
+    variants: bounded[VariantFits; 8];
+}
+
+/// `RecipeFits`: the nodes and pairs judged against, and a page of
+/// recipes, each variant judged on each.
+type RecipeFits {
+    nodes: bounded[FitNode; 16];
+    pairs: bounded[FitPair; 32];
+    data: bounded[RecipeFit; 32];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
+
+/// The recipes of a page, whole.
+type FitRecipes { items: bounded[Recipe; 32]; }
+
+/// What each node's store holds whole of the page's variants, a node at a
+/// time (`nodes`), each `\n<recipe>\t<variant>\n` a line (`held`).
+type FitHeld {
+    nodes: bounded[String; 16];
+    held: bounded[String; 16];
+}
+
+/// The kind of a machine's first accelerator, the one voice serves a model
+/// on before its processors; `cpu` when it has none.
+fn first_accelerator(hw: String) -> String {
+    let it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    if it.done { return "cpu"; }
+    let kind = std::json::find_string_field(it.element, "kind");
+    return if len(kind) > 0 { kind } else { "cpu" };
+}
+
+/// Node `n` as a fit is judged against it, `held` of its memory for
+/// models held by its placements.
+fn fit_node(n: ArrangeNode, held: Int) -> FitNode {
+    let hw = n.hw;
+    let mut out = FitNode { node: n.id };
+    if len(n.problem) > 0 {
+        out.has_problem = true;
+        out.problem = n.problem;
+    }
+    if !std::json::valid_object(hw) || len(std::json::find_string_field(hw, "os")) == 0 {
+        return out;
+    }
+    let on = first_accelerator(hw);
+    let first = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    let gpu = gpu_memory(hw, on);
+    out.os = std::json::find_string_field(hw, "os");
+    out.arch = std::json::find_string_field(hw, "arch");
+    out.accelerators = accelerator_kinds(hw);
+    if !first.done {
+        out.has_accelerator = true;
+        out.accelerator = std::json::find_string_field(first.element, "name");
+    }
+    out.gpu = gpu >= 0;
+    out.memory_bytes = if gpu >= 0 { gpu } else { std::json::find_int_field(hw, "memory_bytes") };
+    out.model_memory_bytes = models_memory(hw, on);
+    out.held_bytes = held;
+    out.free_bytes = room_on(judging_add(Judging { }, n.id, hw, held), 0, on);
+    out.disk_free_bytes = std::json::find_int_field(hw, "disk_free_bytes");
+    return out;
+}
+
+/// The node of `nodes` named `id`.
+fn fit_node_of(nodes: ArrangeNodes, id: String) -> ArrangeNode {
+    for n in nodes.items {
+        if n.id == id { return n; }
+    }
+    return ArrangeNode { id: id };
+}
+
+/// The variants of `recipes` a store holding `blobs` holds whole, each
+/// `\n<recipe>\t<variant>\n` a line.
+@bounded_by(recipes)
+fn held_variants(recipes: FitRecipes, blobs: HeldBlobs) -> String {
+    let mut out = "\n";
+    for r in recipes.items {
+        let mut it = std::json::array_first(r.variants.text);
+        while !it.done {
+            if variant_whole(it.element, blobs) {
+                out = out + r.id + "\t" + std::json::find_string_field(it.element, "id") + "\n";
+            }
+            it = std::json::array_next(it);
+        }
+    }
+    return out;
+}
+
+/// True when node `node` holds variant `variant` of `recipe` whole.
+fn held_whole(h: FitHeld, node: String, recipe: String, variant: String) -> Bool {
+    let mut i = 0;
+    while i < count(h.nodes) {
+        if (at(h.nodes, i) or "") == node {
+            return std::str::contains(at(h.held, i) or "", "\n" + recipe + "\t" + variant + "\n");
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// True when `a` and `b` name the same nodes.
+fn same_nodes(a: NodeSet, b: NodeSet) -> Bool {
+    if count(a.items) != count(b.items) { return false; }
+    for n in a.items {
+        if !in_set(b, n) { return false; }
+    }
+    return true;
+}
+
+/// Why recipe `recipe` cannot go on `nodes` beside `placed`, "" when it
+/// can (`beside_problem`, a placement's recipe taken for its model: a node
+/// serves a recipe's model once, and takes part in one placement across
+/// nodes at a time).
+fn beside_recipe(placed: ArrangePlacedList, recipe: String, nodes: NodeSet) -> String {
+    for p in placed.items {
+        for n in nodes.items {
+            if in_set(p.nodes, n) {
+                let why = beside_problem(
+                    recipe,
+                    count(nodes.items),
+                    p.id,
+                    p.recipe,
+                    count(p.nodes.items) > 1,
+                    n,
+                );
+                if len(why) > 0 { return why; }
+            }
+        }
+    }
+    return "";
+}
+
+/// The placement of `recipe` on exactly `nodes`, "" when there is none.
+fn placed_as(placed: ArrangePlacedList, recipe: String, nodes: NodeSet) -> String {
+    for p in placed.items {
+        if p.recipe == recipe && same_nodes(p.nodes, nodes) { return p.id; }
+    }
+    return "";
+}
+
+/// Variant `v` of `recipe` judged on `set` (one node of `nodes`, or two),
+/// beside what `placed` holds there and with nothing placed, by the
+/// runtimes of `usable` that may serve it on that many nodes.
+@bounded_by(v)
+fn target_fit(
+    recipe: Recipe,
+    v: String,
+    set: NodeSet,
+    nodes: ArrangeNodes,
+    placed: ArrangePlacedList,
+    usable: RuntimeList,
+    held: FitHeld
+) -> TargetFit {
+    let parts = count(set.items);
+    let decision = recipe.contract == ModelContract::decision;
+    let id = std::json::find_string_field(v, "id");
+    let mut now = Judging { };
+    let mut empty = Judging { };
+    let mut whole = true;
+    for n in set.items {
+        let hw = fit_node_of(nodes, n).hw;
+        now = judging_add(now, n, hw, held_on(placed, n));
+        empty = judging_add(empty, n, hw, 0);
+        if !held_whole(held, n, recipe.id, id) { whole = false; }
+    }
+    let mut rts = RuntimeList { };
+    for r in usable.data {
+        if serves_on(r, parts) { push(rts.data, r) or discard; }
+    }
+    let fit = judge_variant(v, now, rts, decision);
+    let bare = judge_variant(v, empty, rts, decision);
+    let mut out = TargetFit {
+        fits: fit.fits,
+        fits_empty: bare.fits,
+        has_runtime: fit.has_runtime,
+        runtime: fit.runtime,
+        downloaded: whole,
+        reason: fit.reason,
+    };
+    for n in set.items {
+        push(out.nodes, n) or discard;
+    }
+    if !bare.fits {
+        out.has_empty_reason = true;
+        out.empty_reason = bare.reason;
+    }
+    let beside = beside_recipe(placed, recipe.id, set);
+    if fit.fits && len(beside) > 0 {
+        out.fits = false;
+        out.reason = beside;
+    }
+    let at_placed = placed_as(placed, recipe.id, set);
+    if len(at_placed) > 0 {
+        out.has_placed = true;
+        out.placed = at_placed;
+    }
+    let mut i = 0;
+    while i < parts {
+        let size = disk_need(v, i);
+        if size > out.disk_bytes { out.disk_bytes = size; }
+        let free = at(now.disk, i) or 0;
+        if i == 0 || free < out.disk_free_bytes { out.disk_free_bytes = free; }
+        i = i + 1;
+    }
+    if !fit.has_runtime { return out; }
+    let on = runtime_on(rts, fit.runtime);
+    out.gpu = gpu_memory(at(now.hw, 0) or "{}", on) >= 0;
+    out.need_bytes = footprint(part_need(v, parts));
+    out.room_bytes = least_room(now, on);
+    out.room_empty_bytes = least_room(empty, on);
+    if out.fits {
+        let sized = reserve(PlacementFit { }, recipe, id, fit.runtime, now, rts);
+        out.has_held_bytes = true;
+        out.held_bytes = footprint(sized.reserved_bytes);
+    }
+    // what its seat would carry under that runtime, as a placed seat's
+    // config says it (`managed_config`: its variant and runtime)
+    let config = "{\"runtime\": " + runtime_body_of(rts, fit.runtime) + ", \"variant\": " + v + "}";
+    out.tools = managed_tools(config);
+    out.reasoning = managed_reasoning(config);
+    return out;
+}

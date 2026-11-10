@@ -1,58 +1,327 @@
-import { useEffect, useState } from 'react';
-import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, TextArea, Button, Confirm, bytes, when } from '@hale/components';
-import { useGet, useRecipes, type Recipe, type RecipeSummary, type Schemas } from '../api/client';
+import { useEffect, useMemo, useState } from 'react';
+import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, TextArea, Button, Confirm, Checkbox, Status, bytes, when, type Column, type Tone } from '@hale/components';
+import { useGet, useRecipeFits, type Recipe, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
 import { tokens } from '../context';
+import { acceleratorName } from '../fleet-memory';
+import { usePlaceRecipe } from '../place';
+import {
+  CAPABILITIES, DEFAULT_VIEW, SORTS, STATUSES, STATUS_SAID, bestIn, choicesOf, downloadedOn, filterRows, headroomOf, queryOf, rowsOf, sortRows, statusOf, targetKey, targetSaid,
+  targetsOf, toggled, viewOf, whyOf, type FitNode, type FitRow, type FitStatus, type FitView, type RecipeFits, type TargetFit,
+} from './recipe-fit';
+import s from './RecipeFit.module.css';
 
 type Variant = Recipe['variants'][number];
 
+/** The hash that opens `parts` with view `v` kept in its query. */
+function viewHref(v: FitView, ...parts: string[]): string {
+  const q = queryOf(v);
+  return href(...parts) + (q ? `?${q}` : '');
+}
+
 /**
- * The weights the operator allows: what a placement may install, and from
- * where. The list is the recipes summarized; the inspector reads one whole,
- * its files among it.
+ * The weights the operator allows, and how each fits the fleet now, as
+ * `llmfit` ranks models by the machine at hand: every variant judged on
+ * every node and linked pair by the rules a placement is judged by
+ * (`listRecipeFits`), read again as the fleet changes (a placement made or
+ * removed, a node joining, leaving or reporting a download or new
+ * hardware). Sorted and filtered here, the view kept in the URL's query;
+ * a row opens its fit on each node, and places it on one.
  */
 export function Recipes({ route, setInspector }: ScreenProps) {
   const selected = route.parts[1];
-  const q = useRecipes();
-  const recipe = q.data?.data.find((r) => r.id === selected);
+  const variant = route.parts[2];
+  const view = viewOf(route.query);
+  const q = useRecipeFits();
   const creating = selected === 'new';
-  const recipeKey = recipe?.id;
+  const placer = usePlaceRecipe();
+  const rows = useMemo(() => (q.data ? rowsOf(q.data) : []), [q.data]);
+  const row = rows.find((r) => r.recipe.id === selected && (!variant || r.variant.id === variant));
+  const said = queryOf(view);
 
   useEffect(() => {
-    setInspector(creating ? <AllowRecipe /> : recipeKey ? <RecipeWhole id={recipeKey} /> : null);
-  }, [creating, recipeKey, setInspector]);
+    setInspector(creating ? <AllowRecipe /> : selected ? <RecipeFitInspector id={selected} variant={variant} view={viewOf(new URLSearchParams(said))} /> : null);
+  }, [creating, selected, variant, said, setInspector]);
 
   if (q.isPending) return <Loading what="recipes" />;
   if (q.isError) return <Unavailable what="Recipes" detail={q.error.message} />;
-  if (selected && !creating && !recipe) return <Missing what={`recipe ${selected}`} />;
+  if (selected && !creating && !rows.some((r) => r.recipe.id === selected)) return <Missing what={`recipe ${selected}`} />;
+
+  const set = (next: Partial<FitView>) => { location.hash = viewHref({ ...view, ...next }, ...route.parts); };
+  const shown = bestIn(sortRows(filterRows(rows, view), view), view.on);
+  const recipes = new Set(rows.map((r) => r.recipe.id)).size;
 
   return (
     <>
       <h1>Recipes</h1>
-      <Panel title="Recipes" readout={readout(q, `${q.data.data.length} recipes`)}>
-        <Table<RecipeSummary>
-          rows={q.data.data}
-          rowKey={(r) => r.id}
-          selectedKey={selected}
-          onSelect={(r) => go('recipes', r.id)}
-          columns={[
-            { key: 'id', header: 'Recipe', render: (r) => <Mono>{r.id}</Mono> },
-            { key: 'origin', header: 'Origin', render: (r) => r.origin },
-            { key: 'license', header: 'License', render: (r) => r.license.name },
-            { key: 'ctx', header: 'Context', num: true, render: (r) => (r.context_length ? tokens(r.context_length) : <span className="faint">–</span>) },
-            { key: 'variants', header: 'Variants', render: (r) => r.variants.map((v) => `${v.id} (${v.format})`).join(', ') },
-            { key: 'size', header: 'Smallest', num: true, render: (r) => bytes(Math.min(...r.variants.map((v) => v.total_bytes))) },
-          ]}
-          empty="No recipes. Voice ships some; an operator allows others."
-        />
-        <p style={{ marginBottom: 0 }}>
+      <Hardware fits={q.data} view={view} set={set} readout={readout(q, `${q.data.nodes.length} nodes`)} />
+      <Panel title="Fit" readout={readout(q, `${shown.length} of ${rows.length} variants`, `${recipes} recipes`)}>
+        <Filters fits={q.data} rows={rows} view={view} set={set} />
+        <FitTable fits={q.data} rows={shown} view={view} selected={row?.key} placer={placer} />
+        <p style={{ marginBottom: 0, display: 'flex', gap: 'var(--space-3)', alignItems: 'center', flexWrap: 'wrap' }}>
           <Button onClick={() => go('recipes', 'new')} tone="primary">allow a recipe</Button>
+          <Spending placer={placer} />
         </p>
+        {placer.w.pending && <p className="c-wait">Proposed, pending review: {placer.w.pending}</p>}
+        {placer.w.error && <p className="c-fail">{placer.w.error}</p>}
       </Panel>
     </>
+  );
+}
+
+type Placer = ReturnType<typeof usePlaceRecipe>;
+
+/** The account a placement spends, when there is a choice; or that there is none. */
+function Spending({ placer }: { placer: Placer }) {
+  if (!placer.payer) return <span className="c-wait">No account to spend: add one on Accounts to place a model.</span>;
+  if (placer.accounts.length < 2) return null;
+  return (
+    <span style={{ display: 'inline-flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+      <span className="faint">placing spends</span>
+      <Select value={placer.payer} onChange={placer.setAccount} options={placer.accounts.map((a) => ({ value: a.id }))} />
+    </span>
+  );
+}
+
+/** The memory a node's models are served from, as its chip says it. */
+function memorySaid(n: FitNode): string {
+  return n.gpu ? 'GPU' : n.accelerator ? 'unified' : 'memory';
+}
+
+/**
+ * What the fit is judged against: each node's memory for models (a GPU's
+ * own, or the machine's), what is free of it, its accelerator and its disk
+ * free; each linked pair. Choosing one keeps the table to what fits there.
+ */
+function Hardware({ fits, view, set, readout: said }: { fits: RecipeFits; view: FitView; set: (v: Partial<FitView>) => void; readout: string }) {
+  const pick = (key: string) => {
+    const on = toggled(view.on, key);
+    // a node chosen alone shows what fits there now, until the operator says otherwise
+    set({ on, fit: on.length > view.on.length && view.fit.length === 0 ? ['fits'] : view.fit });
+  };
+  const node = (id: string) => fits.nodes.find((n) => n.node === id);
+  return (
+    <Panel title="Hardware" readout={said}>
+      {fits.nodes.length === 0 ? (
+        <p className="faint" style={{ margin: 0 }}>No node yet: a recipe fits once a node with a managed engine declares its hardware.</p>
+      ) : (
+        <div className={s.hardware}>
+          {fits.nodes.map((n) => {
+            const used = n.model_memory_bytes > 0 ? Math.min(1, Math.max(0, n.held_bytes / n.model_memory_bytes)) : 0;
+            return (
+              <button key={n.node} type="button" className={s.target} aria-pressed={view.on.includes(n.node)} disabled={!!n.problem} title={n.problem ?? `only what ${n.node} can take`} onClick={() => pick(n.node)}>
+                <span className={s.targetName}>{n.node}</span>
+                {n.problem ? (
+                  <span className="faint">{n.problem}</span>
+                ) : (
+                  <>
+                    <span className="muted">{n.accelerator ? acceleratorName(n.accelerator) : 'processors only'}</span>
+                    <span>
+                      {bytes(Math.max(0, n.free_bytes))} free <span className="faint">of {bytes(n.model_memory_bytes)} {memorySaid(n)}</span>
+                    </span>
+                    <span className={s.meter} aria-hidden="true"><span className={s.meterHeld} style={{ display: 'block', width: `${used * 100}%` }} /></span>
+                    <span className="faint">{bytes(n.disk_free_bytes)} disk free</span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+          {fits.pairs.map((p) => {
+            const key = targetKey(p.nodes);
+            const free = Math.min(...p.nodes.map((id) => node(id)?.free_bytes ?? 0));
+            return (
+              <button key={key} type="button" className={s.target} aria-pressed={view.on.includes(key)} disabled={!!p.problem} title={p.problem ?? `only what ${targetSaid(key)} can take together`} onClick={() => pick(key)}>
+                <span className={s.targetName}>{targetSaid(key)}</span>
+                {p.problem ? <span className="faint">{p.problem}</span> : (
+                  <>
+                    <span className="muted">linked, a model split across the two</span>
+                    <span>{bytes(Math.max(0, free))} free <span className="faint">on each, at the least</span></span>
+                  </>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+/** A row of toggles, each choice on or off. */
+function Chips<T extends string>({ label, values, chosen, said, onChange }: { label: string; values: T[]; chosen: T[]; said?: (v: T) => string; onChange: (v: T[]) => void }) {
+  if (values.length === 0) return null;
+  return (
+    <span className={s.filter} role="group" aria-label={label}>
+      <span className={s.filterLabel}>{label}</span>
+      {values.map((v) => (
+        <button key={v} type="button" className={s.chip} aria-pressed={chosen.includes(v)} onClick={() => onChange(toggled(chosen, v))}>{said ? said(v) : v}</button>
+      ))}
+    </span>
+  );
+}
+
+/** The view's filters and its order. */
+function Filters({ fits, rows, view, set }: { fits: RecipeFits; rows: FitRow[]; view: FitView; set: (v: Partial<FitView>) => void }) {
+  const { formats, runtimes } = choicesOf(rows);
+  const targets = targetsOf(fits);
+  const plain = queryOf(view) === '';
+  return (
+    <div className={s.filters}>
+      <span className={`${s.filter} ${s.search}`}>
+        <TextInput value={view.q} onChange={(q) => set({ q })} placeholder="search recipes, variants, quantizations" />
+      </span>
+      <Chips label="on" values={targets} chosen={view.on.filter((k) => targets.includes(k))} said={targetSaid} onChange={(on) => set({ on })} />
+      <Chips label="fit" values={STATUSES} chosen={view.fit} said={(v) => STATUS_SAID[v]} onChange={(fit) => set({ fit })} />
+      <Chips label="format" values={formats} chosen={view.format} onChange={(format) => set({ format })} />
+      <Chips label="runtime" values={runtimes} chosen={view.runtime} onChange={(runtime) => set({ runtime })} />
+      <Chips label="carries" values={CAPABILITIES} chosen={view.cap} onChange={(cap) => set({ cap })} />
+      <span className={s.filter}>
+        <Checkbox checked={view.downloaded} onChange={(downloaded) => set({ downloaded })} label="downloaded" />
+      </span>
+      <span className={s.filter}>
+        <span className={s.filterLabel}>sort</span>
+        <Select value={view.sort} onChange={(v) => set({ sort: v as FitView['sort'] })} options={SORTS} />
+        <button type="button" className={s.chip} aria-pressed={view.desc} onClick={() => set({ desc: !view.desc })} title="turn the order over">{view.desc ? 'desc' : 'asc'}</button>
+      </span>
+      {!plain && <button type="button" className={s.chip} onClick={() => set(DEFAULT_VIEW)}>clear</button>}
+    </div>
+  );
+}
+
+const TONE: Record<FitStatus, Tone> = { fits: 'ok', placed: 'active', freed: 'wait', never: 'quiet' };
+const SHORT: Record<FitStatus, string> = { fits: 'fits', placed: 'placed', freed: 'if freed', never: 'never' };
+
+/** A cell's state, with why on hover. */
+function FitCell({ cell }: { cell: TargetFit | undefined }) {
+  if (!cell) return <span className="faint">–</span>;
+  const st = statusOf(cell);
+  return <Status tone={TONE[st]} label={SHORT[st]} title={whyOf(cell)} />;
+}
+
+/** What a variant's seat carries, under the runtime it fits best with (or any it has). */
+function Caps({ row }: { row: FitRow }) {
+  const cell = row.best?.cell ?? [...row.cells.values()].find((c) => c.runtime);
+  const caps = [
+    ...(cell?.tools ? ['tools'] : []),
+    ...(cell?.reasoning ? ['reasoning'] : []),
+    ...(row.recipe.contract === 'decision' ? ['decision'] : []),
+  ];
+  return caps.length ? <span className={s.caps}>{caps.join(' · ')}</span> : <span className="faint">–</span>;
+}
+
+/** Every variant shown, a recipe's together, its fit on each node and pair. */
+function FitTable({ fits, rows, view, selected, placer }: { fits: RecipeFits; rows: FitRow[]; view: FitView; selected?: string; placer: Placer }) {
+  const targets = targetsOf(fits);
+  const first = new Set<string>();
+  const seen = new Set<string>();
+  for (const r of rows) if (!seen.has(r.recipe.id)) { seen.add(r.recipe.id); first.add(r.key); }
+  const columns: Column<FitRow>[] = [
+    { key: 'model', header: 'Model', render: (r) => (first.has(r.key) ? <span className={s.group}>{r.recipe.id}</span> : null) },
+    { key: 'variant', header: 'Variant', render: (r) => <Mono>{r.variant.id}</Mono> },
+    { key: 'format', header: 'Format', render: (r) => `${r.variant.format} · ${r.variant.quantization}` },
+    { key: 'memory', header: 'Needs', num: true, render: (r) => bytes(r.variant.memory_bytes) },
+    { key: 'size', header: 'Size', num: true, render: (r) => bytes(r.variant.total_bytes) },
+    { key: 'context', header: 'Context', num: true, render: (r) => (r.recipe.context_length ? tokens(r.recipe.context_length) : <span className="faint">–</span>) },
+    { key: 'caps', header: 'Carries', render: (r) => <Caps row={r} /> },
+    {
+      key: 'best',
+      header: 'Best fit',
+      render: (r) => (r.best ? (
+        <span title={whyOf(r.best.cell)} className={r.best.status === 'fits' ? undefined : 'muted'}>
+          {targetSaid(r.best.key)} <span className="faint">· {r.best.cell.runtime}{r.best.status === 'freed' ? ', once freed' : r.best.status === 'placed' ? ', placed' : ''}</span>
+        </span>
+      ) : <span className="faint">fits nowhere</span>),
+    },
+    { key: 'headroom', header: 'Headroom', num: true, render: (r) => { const h = r.best?.status === 'fits' ? headroomOf(r.best.cell) : null; return h == null ? <span className="faint">–</span> : bytes(h); } },
+    ...targets.map((t): Column<FitRow> => ({ key: `on:${t}`, header: <span className={view.on.includes(t) ? s.inScope : undefined}>{targetSaid(t)}</span>, render: (r) => <FitCell cell={r.cells.get(t)} /> })),
+    { key: 'downloaded', header: 'Downloaded', render: (r) => { const on = downloadedOn(r); return on.length ? on.join(', ') : <span className="faint">–</span>; } },
+    {
+      key: 'place',
+      header: '',
+      render: (r) => (r.best?.status === 'fits' ? (
+        <span onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+          <Button disabled={placer.w.busy || !placer.payer} onClick={() => void placer.place(r.recipe.id, r.best!.cell.nodes, r.variant.id)}>place on {targetSaid(r.best.key)}</Button>
+        </span>
+      ) : null),
+    },
+  ];
+  return (
+    <Table<FitRow>
+      rows={rows}
+      rowKey={(r) => r.key}
+      selectedKey={selected}
+      onSelect={(r) => { location.hash = viewHref(view, 'recipes', r.recipe.id, r.variant.id); }}
+      columns={columns}
+      empty={rows.length === 0 ? 'Nothing matches this view.' : undefined}
+    />
+  );
+}
+
+/**
+ * One variant's fit on every node and pair, each with what it would take
+ * and what it leaves, and a button to place it there; then the recipe
+ * whole. With no variant named, the recipe's first.
+ */
+function RecipeFitInspector({ id, variant, view }: { id: string; variant?: string; view: FitView }) {
+  const fits = useRecipeFits().data;
+  const placer = usePlaceRecipe();
+  const rows = fits ? rowsOf(fits).filter((r) => r.recipe.id === id) : [];
+  const row = rows.find((r) => r.variant.id === variant) ?? rows[0];
+  return (
+    <>
+      {row && (
+        <>
+          <h2 style={{ marginBottom: 'var(--space-3)' }}>
+            <Mono>{row.recipe.id}</Mono> <span className="muted"><Mono>{row.variant.id}</Mono></span>
+          </h2>
+          {rows.length > 1 && (
+            <p className="faint" style={{ fontSize: 'var(--size-sm)' }}>
+              {rows.map((r) => (r === row ? <b key={r.key} style={{ marginRight: 'var(--space-2)' }}>{r.variant.id}</b> : <a key={r.key} href={viewHref(view, 'recipes', id, r.variant.id)} style={{ marginRight: 'var(--space-2)' }}>{r.variant.id}</a>))}
+            </p>
+          )}
+          <Kv
+            rows={[...row.cells.entries()].map(([key, c]) => ({
+              k: targetSaid(key),
+              v: <TargetDetail cell={c} onPlace={statusOf(c) === 'fits' ? () => void placer.place(row.recipe.id, c.nodes, row.variant.id) : undefined} disabled={placer.w.busy || !placer.payer} />,
+            }))}
+          />
+          {row.cells.size === 0 && <p className="faint">No node can take a model yet.</p>}
+          <p><Spending placer={placer} /></p>
+          {placer.w.pending && <p className="c-wait">Proposed, pending review: {placer.w.pending}</p>}
+          {placer.w.error && <p className="c-fail">{placer.w.error}</p>}
+        </>
+      )}
+      <RecipeWhole id={id} />
+    </>
+  );
+}
+
+/** A variant on one node or pair: its state, its runtime, what it takes of the room there and of the disk. */
+function TargetDetail({ cell: c, onPlace, disabled }: { cell: TargetFit; onPlace?: () => void; disabled: boolean }) {
+  const st = statusOf(c);
+  const h = headroomOf(c);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <span style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
+        <Status tone={TONE[st]} label={STATUS_SAID[st]} />
+        {c.runtime && <span className="muted">under <a href={href('runtimes', c.runtime)}><Mono>{c.runtime}</Mono></a></span>}
+        {c.placed && <a href={href('placements', c.placed)}>as {c.placed}</a>}
+        {c.downloaded && <Status tone="ok" label="downloaded" title="its files are on disk already: placing it loads them, with nothing to download" />}
+        {onPlace && <Button onClick={onPlace} disabled={disabled}>place here</Button>}
+      </span>
+      {c.runtime && (
+        <span className="faint" style={{ fontSize: 'var(--size-xs)' }}>
+          needs {bytes(c.need_bytes)} of {bytes(Math.max(0, c.room_bytes))} free {c.gpu ? 'on its GPU' : 'for models'}
+          {c.held_bytes != null ? `; holds ${bytes(c.held_bytes)} with its cache, ${bytes(h ?? 0)} left` : ''}
+          {c.room_empty_bytes !== c.room_bytes ? `; ${bytes(c.room_empty_bytes)} with nothing placed` : ''}
+          ; {bytes(c.disk_bytes)} of {bytes(c.disk_free_bytes)} disk
+        </span>
+      )}
+      <span className="faint" style={{ fontSize: 'var(--size-xs)' }}>{whyOf(c)}</span>
+    </div>
   );
 }
 

@@ -16,6 +16,7 @@ import { cablingState, linkState } from './link-state';
 import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
 import { acceleratorName, fleetNodes, memoryOf, modelMemory, placedBlocks } from '../fleet-memory';
 import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
+import { usePlaceRecipe } from '../place';
 
 type Seat = Schemas['Seat'];
 
@@ -556,50 +557,20 @@ function DownloadRow({ v }: { v: Download }) {
 
 type Suggestion = Schemas['NodeSuggestion'];
 
-/** `s` as a placement id: lowercase letters, digits and dashes, at most 63. */
-function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/-+/g, '-').replace(/^-+/, '').slice(0, 60).replace(/-+$/, '');
-}
-
 /**
  * What voice would place here, a model per category it ships, from its
  * default catalog for the node's platform and memory tier
  * (`suggestNodeModels`): what fits, or is placed already, or why nothing
  * does. Placing one adds its recipe to the catalog as a model when none is
- * there yet, then places it on this node, spending the account chosen.
+ * there yet, then places it on this node, spending the account chosen
+ * (`usePlaceRecipe`).
  */
 function Suggested({ node }: { node: Node }) {
   const q = useGet('/admin/v1/nodes/{node}/suggestions', { params: { path: { node: node.id } } });
-  const models = useGet('/admin/v1/models');
-  const accounts = useGet('/admin/v1/accounts');
-  const w = useWrite();
-  const [account, setAccount] = useState('');
-  const options = (accounts.data?.data ?? []).filter((a) => a.status !== 'archived');
-  // an account that bills no one is the natural payer of a local seat
-  const payer = account || (options.find((a) => (a.billing ?? 'none') === 'none') ?? options[0])?.id || '';
-  const placements = useGet('/admin/v1/placements');
+  const { place: placeRecipe, payer, setAccount, accounts: options, w } = usePlaceRecipe();
   const place = async (s: Suggestion, peer?: string) => {
-    if (!s.recipe || !payer) return;
-    const recipe = s.recipe;
-    const all = models.data?.data ?? [];
-    // the catalog model whose weights are this recipe: one named for it
-    // first; a model's id says nothing of its weights, so one of the same
-    // id with another recipe is not it, and a new one takes a free id
-    const bound = all.find((m) => m.id === recipe && m.recipe === recipe) ?? all.find((m) => m.kind === 'local' && m.recipe === recipe);
-    let model = bound?.id ?? null;
-    if (!model) {
-      model = await w.createFresh('/admin/v1/models', recipe, new Set(all.map((m) => m.id)), (id) => ({ id, owned_by: 'local', kind: 'local', recipe }));
-      if (!model) return;
-    }
-    const chosen = model;
-    // a placement's id is a slug, never reused, even once removed
-    await w.createFresh('/admin/v1/placements', slug(`${recipe}-on-${node.id}${peer ? `-and-${peer}` : ''}`), new Set((placements.data?.data ?? []).map((p) => p.id)), (id) => ({
-      id,
-      model: chosen,
-      account: payer,
-      nodes: peer ? [node.id, peer] : [node.id],
-      ...(s.variant ? { variant: s.variant } : {}),
-    }));
+    if (!s.recipe) return;
+    await placeRecipe(s.recipe, peer ? [node.id, peer] : [node.id], s.variant ?? undefined);
   };
   return (
     <>

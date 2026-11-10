@@ -233,9 +233,12 @@ export function resolveTheme(choice, prefersLight) {
  * refuses to be read or holds something else gives the default: the page
  * still has a theme.
  */
-export function readChoice(key, storage = globalThis.localStorage) {
+export function readChoice(key, storage) {
   try {
-    const s = JSON.parse(storage?.getItem(key) ?? 'null');
+    // acquired here, guarded: reading `localStorage` itself throws where
+    // the browser denies storage
+    const st = arguments.length > 1 ? storage : globalThis.localStorage;
+    const s = JSON.parse(st?.getItem(key) ?? 'null');
     if (!s || s.v !== 1) return defaultChoice();
     return {
       theme: themeNamed(s.theme).name,
@@ -254,7 +257,7 @@ export function readChoice(key, storage = globalThis.localStorage) {
  * anything renders (boot.js). True when kept; false when storage refused,
  * and the choice holds for this visit only.
  */
-export function writeChoice(key, choice, storage = globalThis.localStorage) {
+export function writeChoice(key, choice, storage) {
   const pair = followPair(choice);
   const shown = choice.follow ? [pair.light, pair.dark] : [themeNamed(choice.theme).name];
   const vars = {};
@@ -263,7 +266,8 @@ export function writeChoice(key, choice, storage = globalThis.localStorage) {
     if (Object.keys(v).length) vars[name] = v;
   }
   try {
-    storage.setItem(key, JSON.stringify({ v: 1, ...choice, ...pair, vars }));
+    const st = arguments.length > 2 ? storage : globalThis.localStorage;
+    st.setItem(key, JSON.stringify({ v: 1, ...choice, ...pair, vars }));
     return true;
   } catch {
     return false;

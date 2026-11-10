@@ -306,3 +306,18 @@ test('the inline script is boot itself, called with the key', () => {
   // it runs as a classic script: no module syntax
   assert.doesNotThrow(() => new Function(src));
 });
+
+test('a localStorage whose getter throws gives the default and keeps nothing', () => {
+  const had = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    get() { throw new Error('SecurityError: storage is denied'); },
+  });
+  try {
+    assert.deepEqual(readChoice('k'), defaultChoice());
+    assert.equal(writeChoice('k', defaultChoice()), false);
+  } finally {
+    if (had) Object.defineProperty(globalThis, 'localStorage', had);
+    else delete globalThis.localStorage;
+  }
+});

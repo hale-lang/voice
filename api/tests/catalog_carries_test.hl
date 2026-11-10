@@ -1,0 +1,136 @@
+// What a catalog model's seats carry, on the admin plane: `tools` and
+// `reasoning`, from every enabled seat that serves it, ready or not, by its
+// engine's kind and, for a managed seat, its runtime's server and variant.
+import ".." as api;
+import "../../store" as st;
+
+fn seat(
+    store: st::MemoryStore,
+    node: String,
+    id: String,
+    engine: String,
+    model: String,
+    config: String,
+    enabled: Bool
+) {
+    let mut row = st::SeatRow {
+        ref: node + "/" + id,
+        node: node,
+        id: id,
+        engine: engine,
+        account: "work",
+        enabled: enabled,
+        config: config,
+    };
+    push(row.serves.items, st::SeatModel { model: model }) or discard;
+    store.insert_seat(
+        row,
+        api::change("create", "nodes/" + node + "/seats/" + id, "", "{}"),
+    ) or discard;
+}
+
+fn model(catalog: api::Catalog, id: String) -> api::CatalogModel {
+    catalog.create(api::CatalogModelCreate { id: id }) or discard;
+    return catalog.get(api::ModelRef { model: id }) or api::CatalogModel {
+        kind: api::ModelKind::local,
+    };
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let catalog = api::Catalog { store: store };
+    store.insert_node(
+        st::NodeRow { id: "box", name: "box", created_at: api::now_seconds() },
+        api::change("create", "nodes/box", "", "{}"),
+    ) or discard;
+    store.put_fleet(
+        st::FleetRow {
+            node: "box",
+            capabilities: "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}, {\"id\": \"ollama\", \"kind\": \"openai-compatible\"}, {\"id\": \"static\", \"kind\": \"static\"}]}",
+            present: true,
+        },
+    ) or discard;
+    store.insert_account(
+        st::AccountRow { id: "work", name: "Work", created_at: api::now_seconds() },
+        api::change("create", "accounts/work", "", "{}"),
+    ) or discard;
+
+    seat(
+        store,
+        "box",
+        "claude",
+        "claude",
+        "sub",
+        "{\"token_vault\": \"claude-token--work\"}",
+        true,
+    );
+    seat(
+        store,
+        "box",
+        "up",
+        "ollama",
+        "remote",
+        "{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"m\"}",
+        true,
+    );
+    seat(store, "box", "echo", "static", "echo", "{\"text\": \"hi\"}", true);
+    seat(
+        store,
+        "box",
+        "llama",
+        "managed",
+        "llama",
+        "{\"placement\": \"p1\", \"runtime\": {\"server\": \"llama-server\"}, \"variant\": {}}",
+        true,
+    );
+    seat(
+        store,
+        "box",
+        "vllm",
+        "managed",
+        "vllm",
+        "{\"placement\": \"p2\", \"runtime\": {\"server\": \"vllm\"}, \"variant\": {\"reasoning_parser\": \"qwen3\"}}",
+        true,
+    );
+    seat(
+        store,
+        "box",
+        "plain",
+        "managed",
+        "plain",
+        "{\"placement\": \"p3\", \"runtime\": {\"server\": \"vllm\"}, \"variant\": {}}",
+        true,
+    );
+    seat(
+        store,
+        "box",
+        "off",
+        "ollama",
+        "off",
+        "{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"m\"}",
+        false,
+    );
+
+    let sub = model(catalog, "sub");
+    std::test::assert(!sub.tools && !sub.reasoning, "the claude CLI answers text alone");
+    let remote = model(catalog, "remote");
+    std::test::assert(remote.tools, "an openai-compatible seat carries tools");
+    std::test::assert(remote.reasoning, "and relays its upstream's reasoning");
+    std::test::assert(!remote.available, "whether or not it is ready now");
+    let echo = model(catalog, "echo");
+    std::test::assert(
+        !echo.tools && !echo.reasoning,
+        "the static engine, with no drill, carries neither",
+    );
+    let llama = model(catalog, "llama");
+    std::test::assert(llama.tools && llama.reasoning, "llama-server carries both");
+    let vllm = model(catalog, "vllm");
+    std::test::assert(vllm.reasoning, "vLLM with a reasoning parser separates the reasoning");
+    std::test::assert(!vllm.tools, "and carries no tools with no tool-call parser");
+    let plain = model(catalog, "plain");
+    std::test::assert(!plain.reasoning, "vLLM with no reasoning parser plays none");
+    let off = model(catalog, "off");
+    std::test::assert(!off.tools && !off.reasoning, "a disabled seat carries nothing");
+    let none = model(catalog, "none");
+    std::test::assert(!none.tools && !none.reasoning, "a model no seat serves carries nothing");
+}

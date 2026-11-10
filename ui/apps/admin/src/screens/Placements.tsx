@@ -89,7 +89,7 @@ function PlacementInspector({ placement: p }: { placement: Placement }) {
       </div>
       <Kv
         rows={[
-          { k: 'model', v: <a href={href('catalog', p.model)}><Mono>{p.model}</Mono></a> },
+          { k: 'model', v: <a href={href('models', p.model)}><Mono>{p.model}</Mono></a> },
           { k: 'recipe', v: <a href={href('recipes', p.recipe)}><Mono>{p.recipe}</Mono></a> },
           { k: 'variant', v: <><Mono>{p.variant}</Mono> <span className="muted">· chosen by the {p.chosen_by}</span></> },
           { k: 'runtime', v: <a href={href('runtimes', p.runtime)}><Mono>{p.runtime}</Mono></a> },

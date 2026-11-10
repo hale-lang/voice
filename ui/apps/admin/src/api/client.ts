@@ -251,6 +251,28 @@ export function useNodes() {
   });
 }
 
+/**
+ * Each of `ids` read whole (`getNode`), as `useGet` reads one (the same
+ * cache, the same refresh): what each declared, its engines among it.
+ */
+export function useNodesWhole(ids: string[]) {
+  const refetchInterval = useRefetchInterval();
+  return useQueries({
+    queries: ids.map((node) => {
+      const init = { params: { path: { node } } };
+      return {
+        queryKey: ['/admin/v1/nodes/{node}', init] as const,
+        refetchInterval,
+        queryFn: async (): Promise<Node> => {
+          const r = await api.GET('/admin/v1/nodes/{node}', init);
+          if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+          return r.data;
+        },
+      };
+    }),
+  });
+}
+
 /** Every recipe, summarized (`listRecipes`): its variants' files counted, not listed. */
 export function useRecipes() {
   return useAllPages<RecipeSummary>('/admin/v1/recipes', async (cursor) => {

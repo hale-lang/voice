@@ -81,12 +81,14 @@ export function apportion(quotas: number[], cells: number, least?: boolean[]): n
   const n = quotas.map((q, i) => (q > 0 ? Math.max(least?.[i] === false ? 0 : 1, Math.floor(q)) : 0));
   let left = cells - n.reduce((a, b) => a + b, 0);
   const by = (cmp: (a: number, b: number) => number) => quotas.map((_, i) => i).sort((a, b) => cmp(a, b) || a - b);
-  // the largest remainders first, each one more
-  for (const i of by((a, b) => (quotas[b]! - n[b]!) - (quotas[a]! - n[a]!))) {
-    if (left <= 0) break;
-    if (quotas[i]! <= 0) continue;
-    n[i]! += 1;
-    left -= 1;
+  // the largest remainders first, each one more, round after round while cells are left
+  while (left > 0 && quotas.some((q) => q > 0)) {
+    for (const i of by((a, b) => (quotas[b]! - n[b]!) - (quotas[a]! - n[a]!))) {
+      if (left <= 0) break;
+      if (quotas[i]! <= 0) continue;
+      n[i]! += 1;
+      left -= 1;
+    }
   }
   // overshot by the cells small ones were given: take back from the most overgiven that keep one
   while (left < 0) {
@@ -133,7 +135,12 @@ export function layoutMemory(m: MemoryModel, fixed?: Map<string, number>): Memor
   const pinnedCells = pinned.reduce<number>((a, b) => a + (b ?? 0), 0);
   // the free cells alone may round to none: a machine full but for a sliver is drawn full
   const least = shares.map((x) => x.key !== ' free');
-  const rest = apportion(quotas.map((q, i) => (pinned[i] === undefined ? q : 0)), Math.max(0, CELLS - pinnedCells), least);
+  // the cells left once some are pinned, shared among the rest in proportion:
+  // pinned counts are whole, so the rest's quotas are scaled to what is left
+  const target = Math.max(0, CELLS - pinnedCells);
+  const loose = quotas.map((q, i) => (pinned[i] === undefined ? q : 0));
+  const looseSum = loose.reduce((a, b) => a + b, 0);
+  const rest = apportion(looseSum > 0 ? loose.map((q) => (q * target) / looseSum) : loose, target, least);
   const counts = shares.map((_, i) => pinned[i] ?? rest[i]!);
   const out: MemoryCell[] = [];
   for (let i = 0; i < counts[0]!; i++) out.push({ kind: 'reserve' });

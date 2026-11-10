@@ -91,9 +91,9 @@ test('a plan keeps what it keeps in place, its additions take the freed cells, a
   assert.equal(after.length, CELLS);
   assert.deepEqual(of(after, 'coder'), of(before, 'coder'), 'kept cells stay put');
   assert.ok(after.filter((c) => c.block === 'coder').every((c) => c.mark === 'kept'));
-  assert.deepEqual(of(after, 'small'), Array.from({ length: 8 }, (_, i) => 45 + i), 'the addition takes the first freed cells');
+  assert.deepEqual(of(after, 'small'), Array.from({ length: 9 }, (_, i) => 45 + i), 'the addition takes the first freed cells');
   assert.ok(after.filter((c) => c.block === 'small').every((c) => c.mark === 'added'));
-  assert.equal(count(after, (c) => c.was === 'granite'), 12, 'the rest of what granite held is freed, and says so');
+  assert.equal(count(after, (c) => c.was === 'granite'), 11, 'the rest of what granite held is freed, and says so');
   assert.equal(of(after, 'granite').length, 0, 'a removed block holds nothing in the plan');
 });
 
@@ -134,4 +134,25 @@ test('the cell each small block is given at the least is no overflow: overflow f
   const over = layoutMemory(model(2048, 1920, [...blocks, ['x', 20]]));
   assert.equal(over.length, CELLS);
   assert.equal(over.filter((c) => c.over).length, 1, '12 GiB past the budget, in cells of about 20.6 GiB: one');
+});
+
+test('a plan that keeps several fractional shares and removes others is still a hundred cells', () => {
+  const kept = ['k1', 'k2', 'k3'];
+  const now = model(100, 93, [['k1', 5.4], ['k2', 5.4], ['k3', 5.4], ['r1', 25.6], ['r2', 25.6], ['r3', 25.6]]);
+  const before = layoutMemory(now);
+  assert.equal(before.length, CELLS);
+  const plan = { ...now, blocks: now.blocks.map((b) => ({ ...b, mark: kept.includes(b.key) ? 'kept' : 'removed' })) };
+  const after = planCells(now, plan);
+  assert.equal(after.length, CELLS, 'the pinned kept cells leave the rest of the hundred to the free');
+  for (const k of kept) assert.deepEqual(of(after, k), of(before, k), `${k} stays put`);
+  assert.equal(count(after, (c) => c.was), count(before, (c) => c.block?.startsWith('r')), 'every removed cell is freed, and says so');
+  // many plans of kept and removed fractional shares: always a hundred
+  let seed = 11;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+  for (let t = 0; t < 300; t++) {
+    const blocks = Array.from({ length: 2 + Math.floor(rnd() * 8) }, (_, i) => [`b${i}`, 0.3 + rnd() * 12]);
+    const m = model(100, 90 + rnd() * 6, blocks);
+    const p = { ...m, blocks: [...m.blocks.map((b) => ({ ...b, mark: rnd() < 0.5 ? 'kept' : 'removed' })), { key: 'new', label: 'new', bytes: rnd() * 20 * GIB, mark: 'added' }] };
+    assert.equal(planCells(m, p).length, CELLS, `plan ${t}`);
+  }
 });

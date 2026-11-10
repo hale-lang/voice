@@ -10,8 +10,14 @@
 // the assistant's role first, each text delta and each tool call, and a last
 // chunk with the finish reason, `usage` and `voice`; then `data: [DONE]`.
 //
-// The stream opens at the first event of a seat that accepted, so a request
-// every seat refuses is answered whole (`502`, as unstreamed). A seat that
+// The stream opens once a seat that took the request is at work: its first
+// event, its node's `alive`, or a second gone without its failure. A request
+// every seat refuses, or fails at once, is answered whole (`502`, as
+// unstreamed). It opens with the response begun: on `/v1/responses` the
+// api's own `response.created` and `response.in_progress` (a seat's are not
+// sent again), on `/v1/chat/completions` the assistant's role; a caller sees
+// the request taken within a second, whatever its engine sends first (an
+// engine may send nothing until a tool call is whole). A seat that
 // fails once the stream is open (after output, or the last seat) ends it with
 // that evidence: on `/v1/responses` an `error` event, then `response.failed`
 // carrying the response as far as it came (its output so far, its error, its
@@ -20,12 +26,16 @@
 // `voice`. Either way `data: [DONE]` follows, and a truncated answer never
 // ends as a complete one does.
 //
-// A seat is waited for between events, not for the whole answer: it has the
-// first-output span (120 s) from one message to the next until its first
-// output, then the idle span (30 s). Whenever nothing has been sent for 15 s
-// while a seat that accepted is waited for, the api sends an SSE comment
-// (`: keep-alive`), opening the stream if no event has, so a proxy does not
-// cut a quiet connection. A caller that goes away is found by the write that
+// A seat is waited for between messages, not for the whole answer: it has
+// the first-output span (120 s) from one message to the next until its first
+// output, then the idle span (30 s). Its node's `alive` (its engine at work,
+// though it sends no event yet: a tool call it sends whole at the end) is a
+// message too. Whenever nothing has been sent for 15 s while a seat that
+// accepted is waited for, the api sends a keep-alive, so neither a proxy nor
+// a caller that times out between events cuts a quiet stream: on
+// `/v1/responses` the `response.in_progress` event again, its response as it
+// last stood; on `/v1/chat/completions`, which has no such chunk, an SSE
+// comment (`: keep-alive`). A caller that goes away is found by the write that
 // fails, an event's or a keep-alive's. The first write after a caller closes
 // is taken, and only answered with a reset, so a keep-alive is followed a
 // second later by an empty comment (`:`), the write that fails: a caller gone
@@ -104,28 +114,35 @@ locus EventStream {
         };
     }
 
-    /// An SSE comment when nothing was sent for `every`, opening the stream
-    /// if nothing has, so an idle connection is not cut; on a connection, an
-    /// empty comment a second after it. A write that fails marks the caller
-    /// `gone`: a caller that closed takes the first write after it and
-    /// answers it with a reset, so it is the second that fails.
-    fn keep_alive(every: Duration) {
-        if self.gone { return; }
+    /// A keep-alive when nothing was sent for `every`, opening the stream if
+    /// nothing has, so an idle connection is not cut: the event `name` with
+    /// `data`, or an SSE comment when `name` is ""; true when it was sent. On
+    /// a connection, an empty comment follows a second after it. A write
+    /// that fails marks the caller `gone`: a caller that closed takes the
+    /// first write after it and answers it with a reset, so it is the second
+    /// that fails.
+    fn keep_alive(every: Duration, name: String, data: String) -> Bool {
+        if self.gone { return false; }
         let now = std::time::monotonic_ns();
         if self.probe_ns > 0 && now >= self.probe_ns {
             self.probe_ns = 0;
             self.w.body.chunk(":\n\n") or { self.gone = true; };
-            return;
+            return false;
         }
-        if now - self.sent_ns < every / 1ns { return; }
-        self.open();
-        self.sent_ns = now;
-        if self.conn_fd < 0 {
-            self.kept.append_str(": keep-alive\n\n");
-            return;
+        if now - self.sent_ns < every / 1ns { return false; }
+        if len(name) > 0 {
+            self.send(name, data);
+        } else {
+            self.open();
+            self.sent_ns = now;
+            if self.conn_fd < 0 {
+                self.kept.append_str(": keep-alive\n\n");
+                return true;
+            }
+            self.w.body.chunk(": keep-alive\n\n") or { self.gone = true; };
         }
-        self.w.body.chunk(": keep-alive\n\n") or { self.gone = true; };
-        self.probe_ns = now + 1000000000;
+        if self.conn_fd >= 0 { self.probe_ns = now + 1000000000; }
+        return true;
     }
 
     /// What a seat's events said: the last response object, and the text.
@@ -177,6 +194,9 @@ type StreamState {
     seq: Int = 0;
     // the assistant's role was sent (chat)
     role_sent: Bool = false;
+    // the api began the response when a seat took it (`begin`): a seat's
+    // `response.created` and `response.in_progress` are not sent again
+    begun: Bool = false;
     // tool calls begun (chat), the last one's index
     tools: Int = 0;
     // output reached the caller from the seat serving now
@@ -229,6 +249,7 @@ fn forward(out: EventStream, s: StreamState, event: String) -> StreamState {
     let kind = std::json::find_string_field(event, "type");
     if output_event(kind) { st.output = true; }
     out.note(event);
+    if st.begun && (kind == "response.created" || kind == "response.in_progress") { return st; }
     if st.endpoint == "responses" {
         out.send(kind, renumbered(event, st.seq));
         st.seq = st.seq + 1;
@@ -289,6 +310,56 @@ fn forward(out: EventStream, s: StreamState, event: String) -> StreamState {
             ),
         );
     }
+    return st;
+}
+
+/// The response begun, once, when a seat that took the request is at work: on
+/// `/v1/responses` `response.created` and `response.in_progress`, its
+/// response as the request makes it; on `/v1/chat/completions` the
+/// assistant's role. A caller already gone is sent none, and one gone
+/// after the first is sent no more.
+fn begin(out: EventStream, s: StreamState, body: String) -> StreamState {
+    let mut st = s;
+    if st.begun || out.gone { return st; }
+    st.begun = true;
+    if st.endpoint != "responses" {
+        if !st.role_sent {
+            out.send("", chat_chunk(st, "{\"role\": \"assistant\", \"content\": \"\"}", "", ""));
+            st.role_sent = true;
+        }
+        return st;
+    }
+    let pending = pending_response(st, body);
+    out.snapshot = pending;
+    out.send(
+        "response.created",
+        "{\"type\": \"response.created\", \"response\": " + pending + ", \"sequence_number\": "
+            + to_string(st.seq) + "}",
+    );
+    st.seq = st.seq + 1;
+    if out.gone { return st; }
+    out.send("response.in_progress", in_progress(out, st));
+    st.seq = st.seq + 1;
+    return st;
+}
+
+/// `response.in_progress`, its response as it last stood.
+fn in_progress(out: EventStream, s: StreamState) -> String {
+    return "{\"type\": \"response.in_progress\", \"response\": " + out.snapshot
+        + ", \"sequence_number\": " + to_string(s.seq) + "}";
+}
+
+/// A quiet stream kept alive (`EventStream.keep_alive`): on a begun
+/// `/v1/responses` stream `response.in_progress` again, else a comment.
+fn keep_alive(out: EventStream, s: StreamState, every: Duration) -> StreamState {
+    let mut st = s;
+    if st.endpoint == "responses" && st.begun && len(out.snapshot) > 0 {
+        if out.keep_alive(every, "response.in_progress", in_progress(out, st)) {
+            st.seq = st.seq + 1;
+        }
+        return st;
+    }
+    out.keep_alive(every, "", "");
     return st;
 }
 
@@ -367,7 +438,7 @@ fn fail_stream(
                 + ", \"message\": " + jq(message) + ", \"param\": null}}",
         );
         // a stream a keep-alive opened may have no response yet
-        let snapshot = if len(out.snapshot) > 0 { out.snapshot } else { pending_response(s) };
+        let snapshot = if len(out.snapshot) > 0 { out.snapshot } else { pending_response(s, "{}") };
         out.send(
             "response.failed",
             "{\"type\": \"response.failed\", \"response\": "
@@ -390,17 +461,29 @@ fn fail_stream(
     out.send("", "[DONE]");
 }
 
-/// A response object for a stream no seat sent one on: the standard's
-/// defaults, as a node's engine would have begun it.
-fn pending_response(s: StreamState) -> String {
+/// A response object for a stream no seat sent one on yet: the standard's
+/// defaults, as a node's engine begins it, with what `body` (the request)
+/// sets of them.
+fn pending_response(s: StreamState, body: String) -> String {
     return "{\"id\": " + jq(s.request_id) + ", \"object\": \"response\", \"created_at\": "
         + to_string(s.created) + ", \"completed_at\": null, \"status\": \"in_progress\""
         + ", \"incomplete_details\": null, \"model\": " + jq(s.model)
-        + ", \"previous_response_id\": null, \"instructions\": null, \"output\": [], \"error\": null"
+        + ", \"previous_response_id\": null, \"instructions\": "
+        + member_or(body, "instructions", "null") + ", \"output\": [], \"error\": null"
         + ", \"tools\": [], \"tool_choice\": \"auto\", \"truncation\": \"disabled\", \"parallel_tool_calls\": false, \"text\": {\"format\": {\"type\": \"text\"}}"
-        + ", \"top_p\": 1, \"presence_penalty\": 0, \"frequency_penalty\": 0, \"top_logprobs\": 0, \"temperature\": 1, \"reasoning\": null, \"usage\": null"
-        + ", \"max_output_tokens\": null, \"max_tool_calls\": null, \"store\": false, \"background\": false, \"service_tier\": \"default\", \"metadata\": {}"
+        + ", \"top_p\": " + member_or(body, "top_p", "1")
+        + ", \"presence_penalty\": 0, \"frequency_penalty\": 0, \"top_logprobs\": 0, \"temperature\": "
+        + member_or(body, "temperature", "1") + ", \"reasoning\": null, \"usage\": null"
+        + ", \"max_output_tokens\": " + member_or(body, "max_output_tokens", "null")
+        + ", \"max_tool_calls\": null, \"store\": false, \"background\": false, \"service_tier\": \"default\", \"metadata\": "
+        + member_or(body, "metadata", "{}")
         + ", \"safety_identifier\": null, \"prompt_cache_key\": null}";
+}
+
+/// `body`'s member `name` as it is written, else `otherwise`.
+fn member_or(body: String, name: String, otherwise: String) -> String {
+    let raw = std::str::trim(std::json::find_field_raw(body, name));
+    return if len(raw) > 0 { raw } else { otherwise };
 }
 
 /// The last response object a seat sent, failed: its status `failed`, its

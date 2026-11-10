@@ -23,6 +23,13 @@ locus Nodes {
         slow_waits: Int = 0;
         // a node that accepts and then sends nothing at all
         mute: String = "";
+        // a node quiet for `lull_waits` waits after its first output, as an
+        // engine at work on a tool call it sends whole at the end; with
+        // `lull_alive` its node says it is at work (`alive`) each wait, as
+        // one whose engine sends keep-alive comments does
+        lull: String = "";
+        lull_waits: Int = 0;
+        lull_alive: Bool = false;
         tool: String = "";
         // a node whose seat is serving its most at once: it refuses for
         // capacity its next `busy_for` offers (-1: every one), then takes
@@ -142,6 +149,8 @@ locus Nodes {
             script: script,
             result: result,
             hold: hold,
+            lull: if to == self.lull { self.lull_waits } else { 0 },
+            lull_alive: self.lull_alive,
             ended: false,
         };
     }
@@ -159,6 +168,10 @@ locus Scripted {
         result: String = "";
         ended: Bool = true;
         hold: Int = 0;
+        // quiet waits once an output delta has gone, each `alive` or not
+        lull: Int = 0;
+        lull_alive: Bool = false;
+        said: Bool = false;
     }
     fn ack() -> api::ServeOutcome { return self.outcome; }
     /// The script's next event, then its result.
@@ -175,6 +188,12 @@ locus Scripted {
                 std::time::sleep(wait);
                 return api::LinkMsg { kind: "none" };
             }
+            if self.said && self.lull > 0 {
+                self.lull = self.lull - 1;
+                std::time::sleep(wait);
+                return api::LinkMsg { kind: if self.lull_alive { "alive" } else { "none" } };
+            }
+            if std::str::contains(line, ".delta\"") { self.said = true; }
             self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
             if !std::str::starts_with(line, "pause ") && len(line) > 0 {
                 return api::LinkMsg { kind: "event", json: line };
@@ -416,8 +435,10 @@ fn streamed_with_sse(e: api::DataPlane, key: String, nodes: Nodes) {
         "with its request id",
     );
     std::test::assert(
-        std::str::starts_with(r.body, "event: response.created\ndata: {"),
-        "that starts with response.created",
+        std::str::starts_with(r.body, "event: response.created\ndata: {")
+            && occurrences(r.body, "event: response.created\n") == 1
+            && occurrences(r.body, "event: response.in_progress\n") == 1,
+        "that starts with response.created, once, the seat's not sent again: " + r.body,
     );
     std::test::assert(
         std::str::contains(r.body, "event: response.output_text.delta\n")
@@ -580,8 +601,9 @@ fn streamed_failures(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
     );
     std::test::assert_eq_int(r.status, 200, "a stream whose seat dies: " + r.body);
     std::test::assert(
-        std::str::contains(r.body, "\n: keep-alive\n"),
-        "kept alive while the seat is silent",
+        occurrences(r.body, "event: response.in_progress\n") >= 2
+            && !std::str::contains(r.body, ": keep-alive"),
+        "kept alive while the seat is silent, by response.in_progress again: " + r.body,
     );
     std::test::assert(
         std::str::contains(r.body, "event: error\ndata: {\"type\": \"error\""),
@@ -621,6 +643,10 @@ fn streamed_failures(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
     std::test::assert(
         !std::str::contains(c.body, "\"finish_reason\": \"stop\""),
         "never as a complete one",
+    );
+    std::test::assert(
+        std::str::contains(c.body, "\n: keep-alive\n"),
+        "a quiet chat stream is kept alive by a comment",
     );
     nodes.dying = "";
 
@@ -664,7 +690,7 @@ fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
         "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
     );
     std::test::assert(
-        std::str::contains(r.body, "\n: keep-alive\n")
+        occurrences(r.body, "event: response.in_progress\n") >= 2
             && std::str::contains(r.body, "event: response.completed\n"),
         "a seat quiet 3 s before its first output, past the idle span, is waited for: " + r.body,
     );
@@ -683,8 +709,13 @@ fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
     );
     std::test::assert_eq_int(m.status, 200, "a seat that accepts and stays quiet: " + m.body);
     std::test::assert(
-        std::str::starts_with(m.body, ": keep-alive\n\n"),
-        "its stream opened by a keep-alive",
+        std::str::starts_with(
+            m.body,
+            "event: response.created\ndata: {\"type\": \"response.created\", \"response\": {\"id\": \"resp_",
+        )
+            && std::str::contains(m.body, "\"status\": \"in_progress\"")
+            && std::str::contains(m.body, "event: response.in_progress\n"),
+        "its stream opened at once, the response begun by the api though the seat sent nothing",
     );
     std::test::assert(
         std::str::contains(m.body, "event: error\n")
@@ -727,6 +758,63 @@ fn first_output_span(e: api::DataPlane, key: String, nodes: Nodes, laptop: Strin
     std::test::assert_eq_int(nodes.cancelled(), before + 1, "its seat cancelled");
     nodes.mute = "";
     e.inference.first = 120s;
+    e.inference.idle = 30s;
+    e.inference.keep_alive = 15s;
+}
+
+/// A seat at work on what it sends whole at the end (a tool call) is quiet
+/// past the idle span: while its node says it is at work (`alive`, from its
+/// engine's keep-alive comments) it is waited for, streamed or not; one that
+/// says nothing for the idle span has failed.
+fn quiet_at_work(e: api::DataPlane, key: String, nodes: Nodes, laptop: String) {
+    beat(e, laptop);
+    e.inference.idle = 2s;
+    e.inference.keep_alive = 1s;
+    nodes.lull = "laptop";
+    nodes.lull_waits = 4;
+    nodes.lull_alive = true;
+    let ask_r = "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}";
+    let ask_c = "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": true}";
+    let r = ask(e, "/v1/responses", key, ask_r);
+    std::test::assert(
+        std::str::contains(r.body, "event: response.completed\n")
+            && !std::str::contains(r.body, "event: error"),
+        "a seat at work 4 s after its first output, past the 2 s idle span, is waited for: "
+            + r.body,
+    );
+    std::test::assert(
+        occurrences(r.body, "event: response.in_progress\n") >= 3,
+        "its caller kept alive meanwhile by response.in_progress: " + r.body,
+    );
+    let c = ask(e, "/v1/chat/completions", key, ask_c);
+    std::test::assert(
+        std::str::contains(c.body, "\"finish_reason\": \"stop\"")
+            && std::str::contains(c.body, "\n: keep-alive\n"),
+        "a chat stream too, kept alive by comments: " + c.body,
+    );
+    let whole = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    expect(whole, 200, "and an unstreamed answer");
+
+    // the same lull with nothing said: the seat has failed at the idle span
+    beat(e, laptop);
+    nodes.lull_alive = false;
+    let q = ask(e, "/v1/responses", key, ask_r);
+    std::test::assert(
+        std::str::contains(q.body, "event: error\n")
+            && std::str::contains(q.body, "the seat sent nothing within the idle span")
+            && !std::str::contains(q.body, "response.completed"),
+        "a seat quiet past the idle span, saying nothing, has failed: " + q.body,
+    );
+    beat(e, laptop);
+    let qc = ask(e, "/v1/chat/completions", key, ask_c);
+    std::test::assert(
+        std::str::contains(qc.body, "\"finish_reason\": \"error\""),
+        "a chat stream as well: " + qc.body,
+    );
+    beat(e, laptop);
+    let qw = ask(e, "/v1/responses", key, "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+    expect(qw, 502, "and unstreamed, it fails");
+    nodes.lull = "";
     e.inference.idle = 30s;
     e.inference.keep_alive = 15s;
 }
@@ -1658,6 +1746,7 @@ fn main() {
     );
     streamed_failures(e, key, nodes, laptop);
     first_output_span(e, key, nodes, laptop);
+    quiet_at_work(e, key, nodes, laptop);
     rate_limits(e, key, laptop);
 
     // a seat that refuses: the request moves to another

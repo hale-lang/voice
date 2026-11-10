@@ -474,7 +474,7 @@ serves the request on its seat with the static engine, streaming the
 standard's events and the result to the reply subject the request named
 (`protocol.yaml`); a `cancel` stops it. It serves several at once: each
 accepted `serve` goes to a slot of its own ([`node/serve.hl`](../node/serve.hl),
-64, each its own thread), up to each seat's `concurrency`, and a `serve`
+40, each its own thread), up to each seat's `concurrency`, and a `serve`
 past it is refused for capacity, so the request waits for a slot or goes to
 another seat. The node has no in-flight cap of its own: its capacity is its
 seats' concurrency. A placement's seat's concurrency is what its runtime is

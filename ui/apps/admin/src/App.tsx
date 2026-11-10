@@ -1,5 +1,7 @@
 import { useIsFetching, useQueryClient } from '@tanstack/react-query';
 import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button, Select, DETAIL_LAYOUTS, type DetailLayout } from '@hale/components';
+import { Appearance } from '@hale/components';
+import { THEME_KEY } from './theme-key';
 import { EventLog } from './EventLog';
 import { useRoute, href, go } from './route';
 import { useGet } from './api/client';
@@ -89,6 +91,7 @@ function Admin() {
           <RailHeader app="voice" sub="admin" />
           <RailNav items={NAV.map((n) => ({ ...n, active: n.key === section }))} />
           <RailPrincipal>
+            <Appearance storageKey={THEME_KEY} />
             <div style={{ marginBottom: 'var(--space-3)' }}>
               <div className="faint" style={{ marginBottom: 2 }}>open items as</div>
               <Select value={layout} onChange={(v) => setLayout(v as DetailLayout)} options={DETAIL_LAYOUTS} />

@@ -126,6 +126,107 @@ locus Placements {
         return node_downloads(node, inv, recipes, rows);
     }
 
+    /// `listRecipeFits`: a page of recipes, each variant judged on every
+    /// node and pair of the fleet, now and with nothing placed (fits.hl).
+    fn fits(a: RecipeAsk) -> RecipeFits fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.fits_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    @unbounded
+    fn fits_in_gate(a: RecipeAsk) -> RecipeFits fallible(CtlError) {
+        let page = self.recipes.list_in_gate(a) or raise;
+        let mut out = RecipeFits {
+            has_next_cursor: page.has_next_cursor,
+            next_cursor: page.next_cursor,
+        };
+        let mut recipes = FitRecipes { };
+        for s in page.data {
+            push(recipes.items, self.recipes.get_in_gate(s.id) or raise) or discard;
+        }
+        let nodes = self.fleet_nodes_in_gate() or raise;
+        let placed = self.placed_now_in_gate() or raise;
+        let usable = self.runtimes.usable_in_gate() or raise;
+        let checks = self.store.link_checks() or fail store_down(err);
+        let now = now_seconds();
+        // each node, and what its store holds whole of the page's variants
+        let mut held = FitHeld { };
+        for n in nodes.items {
+            push(out.nodes, fit_node(n, held_on(placed, n.id))) or discard;
+            let blobs = HeldBlobs { };
+            hold_blobs(blobs, (self.store.inventory(n.id) or fail store_down(err)).blobs);
+            push(held.nodes, n.id) or discard;
+            push(held.held, held_variants(recipes, blobs)) or discard;
+        }
+        // the sets judged on: each node a model can be placed on, then each
+        // pair cabled to each other that can take one together
+        let mut sets = "";
+        for n in nodes.items {
+            if len(n.problem) == 0 { sets = sets + n.id + "\n"; }
+        }
+        let mut i = 0;
+        while i < count(nodes.items) {
+            let x = at(nodes.items, i) or ArrangeNode { };
+            let mut j = i + 1;
+            while j < count(nodes.items) {
+                let y = at(nodes.items, j) or ArrangeNode { };
+                j = j + 1;
+                if len(link_ports(x.capabilities, y.id)) == 0
+                    && len(link_ports(y.capabilities, x.id)) == 0
+                {
+                    continue;
+                }
+                let mut problem = x.problem;
+                if len(problem) == 0 { problem = y.problem; }
+                if len(problem) == 0 {
+                    problem = pair_problem(
+                        x.id,
+                        x.capabilities,
+                        x.hw,
+                        y.id,
+                        y.capabilities,
+                        y.hw,
+                        checks,
+                        now,
+                    );
+                }
+                let mut pair = FitPair { has_problem: len(problem) > 0, problem: problem };
+                push(pair.nodes, x.id) or discard;
+                push(pair.nodes, y.id) or discard;
+                push(out.pairs, pair) or discard;
+                if len(problem) == 0 { sets = sets + x.id + "\t" + y.id + "\n"; }
+            }
+            i = i + 1;
+        }
+        let mut k = 0;
+        for s in page.data {
+            let recipe = at(recipes.items, k) or Recipe { };
+            k = k + 1;
+            let mut rf = RecipeFit { recipe: s };
+            let mut it = std::json::array_first(recipe.variants.text);
+            while !it.done {
+                let v = std::str::trim(it.element);
+                it = std::json::array_next(it);
+                let mut vf = VariantFits { variant: std::json::find_string_field(v, "id") };
+                let mut rest = sets;
+                while len(rest) > 0 {
+                    let nl = std::str::index_of(rest, "\n");
+                    let set = set_nodes(rest[0..nl]);
+                    rest = rest[(nl + 1)..len(rest)];
+                    push(vf.on, target_fit(recipe, v, set, nodes, placed, usable, held)) or discard;
+                }
+                push(rf.variants, vf) or discard;
+            }
+            push(out.data, rf) or discard;
+        }
+        return out;
+    }
+
     /// `s` with `downloaded` set when every node of `held` holds its
     /// variant whole.
     fn on_disk(
@@ -1145,15 +1246,12 @@ locus Placements {
         return "no step " + apply_action_name(s.action);
     }
 
-    /// The fleet as the store holds it now: its nodes in the order of
-    /// their ids, so a plan does not depend on when each enrolled; what is
-    /// placed; and the models wants `w` may be filled with.
-    fn arrangement_fleet_in_gate(w: ArrangementWants) -> ArrangeFleet fallible(CtlError) {
-        let mut f = ArrangeFleet {
-            now: now_seconds(),
-            usable: self.runtimes.usable_in_gate() or raise,
-            checks: self.store.link_checks() or fail store_down(err),
-        };
+    /// The nodes not revoked, in the order of their ids, so what is judged
+    /// against them does not depend on when each enrolled: each with its
+    /// links as the coordinator uses them (cabling.hl), its hardware, and
+    /// why no model can be placed on it.
+    fn fleet_nodes_in_gate() -> ArrangeNodes fallible(CtlError) {
+        let mut out = ArrangeNodes { };
         let nodes = self.store.nodes() or fail store_down(err);
         let mut ids = "\n";
         for n in nodes.rows {
@@ -1170,16 +1268,22 @@ locus Placements {
             let fl = self.store.fleet(next) or fail store_down(err);
             let hw = std::str::trim(std::json::find_field_raw(fl.capabilities, "hardware"));
             push(
-                f.nodes.items,
+                out.items,
                 ArrangeNode {
                     id: next,
-                    // its links as the coordinator uses them (cabling.hl)
                     capabilities: linked(self.store, next, fl.capabilities) or fail store_down(err),
                     hw: if len(hw) > 0 { hw } else { "{}" },
                     problem: placeable_problem(next, fl.capabilities),
                 },
             ) or discard;
         }
+        return out;
+    }
+
+    /// What is placed now, each placement with what it holds of each of
+    /// its nodes' memory for models (`held_by`).
+    fn placed_now_in_gate() -> ArrangePlacedList fallible(CtlError) {
+        let mut out = ArrangePlacedList { };
         let catalog = self.store.models() or fail store_down(err);
         let rows = self.store.placements() or fail store_down(err);
         for r in rows.rows {
@@ -1190,7 +1294,7 @@ locus Placements {
                     if m.id == p.model { decision = m.contract == "decision"; }
                 }
                 push(
-                    f.placed.items,
+                    out.items,
                     ArrangePlaced {
                         id: p.id,
                         model: p.model,
@@ -1203,6 +1307,21 @@ locus Placements {
                 ) or discard;
             }
         }
+        return out;
+    }
+
+    /// The fleet as the store holds it now: its nodes in the order of
+    /// their ids, so a plan does not depend on when each enrolled; what is
+    /// placed; and the models wants `w` may be filled with.
+    fn arrangement_fleet_in_gate(w: ArrangementWants) -> ArrangeFleet fallible(CtlError) {
+        let mut f = ArrangeFleet {
+            now: now_seconds(),
+            usable: self.runtimes.usable_in_gate() or raise,
+            checks: self.store.link_checks() or fail store_down(err),
+            nodes: self.fleet_nodes_in_gate() or raise,
+            placed: self.placed_now_in_gate() or raise,
+        };
+        let catalog = self.store.models() or fail store_down(err);
         // the models a want may be filled with: each pin's, and each wanted
         // role's candidates, the strongest first
         let mut wanted = "";

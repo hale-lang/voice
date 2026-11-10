@@ -3,7 +3,7 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
 import { addSteps, type Step } from './steps';
-import { ARRANGEMENTS, RECIPE_READS, changeReads } from './fleet-reads';
+import { ARRANGEMENTS, FITS, RECIPE_READS, changeReads } from './fleet-reads';
 
 type AdminEvent = Schemas['AdminEvent'];
 const listeners = new Set<(event: AdminEvent) => void>();
@@ -42,9 +42,10 @@ function setFlights(next: Flight[]) {
  * through `deliver`.
  */
 export const AFFECTS: Record<string, string[]> = {
-  // a node joining, leaving or registering again: the saved arrangements
-  // say whether the fleet changed since they were planned
-  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness', ARRANGEMENTS],
+  // a node joining, leaving or registering again: the
+  // saved arrangements say whether the fleet changed since they were
+  // planned, and the fits are judged against it
+  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness', ARRANGEMENTS, FITS],
   seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
   account: ['/admin/v1/accounts', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],

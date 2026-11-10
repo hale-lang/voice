@@ -132,13 +132,32 @@ the api.
 
 Two machines cabled to each other (two DGX Sparks over their ConnectX-7
 QSFP ports) can serve a model too large for either, split across the two.
-Each declares its end of the link in its capabilities file, beside its
-engines: the other node's id, and the local ports cabled to it, each its
-interface, its IPv4 address on the link and its RDMA device; and the RoCE
-GID index, when NCCL's own choice is not the one the addresses are on. The
-addresses are the machine's own, set up by whoever runs its network (voice
-configures no host networking). A DGX Spark's one cabled port is two ports
-here, one per half of its ConnectX-7:
+Cable them, place a node on each, and the link appears on both nodes' pages:
+nothing is declared or configured.
+
+Each node finds its cabled ports itself, at start and whenever a carrier
+comes or goes: every interface with an RDMA (RoCE) device and a carrier, its
+hardware address, speed, addresses and RoCE v2 GIDs, and the hardware
+addresses it sees on the link (its neighbour tables after a ping to every
+node on the link, or to the other end of a /30, and LLDP where the machine
+runs it). The coordinator pairs two nodes whose ports see each other, and
+uses the ports at the addresses they have: IPv4 when both ends have it on
+one subnet, else their IPv6 link-local addresses, which every port has
+unless IPv6 is off on it. The GID index is the RoCE v2 GID that carries the
+address (3 for IPv4 on a Spark, 1 for link-local). Voice changes no host
+networking: a pair with neither address shows as cabled, not addressed.
+
+The node's page says where its links stand: `2 ports cabled (200 Gb/s), no
+peer found`; `cabled to flare, not addressed`; `cabled to flare · not
+checked`; `cabled to flare · link check passed 22.9 GB/s`; `degraded:
+<why>`.
+
+An operator may still declare a link in the node's capabilities file, beside
+its engines, and a declared link wins over the one found for the same peer:
+the other node's id, and the local ports cabled to it, each its interface,
+its IPv4 or IPv6 link-local address on the link and its RDMA device; and the
+RoCE GID index. A DGX Spark's one cabled port is two ports here, one per
+half of its ConnectX-7:
 
 ```json
 "links": [{"peer": "flare", "gid_index": 3, "ports": [
@@ -146,9 +165,9 @@ here, one per half of its ConnectX-7:
   {"ifname": "enP2p1s0f0np0", "address": "192.168.101.1", "hca": "roceP2p1s0f0"}]}]
 ```
 
-Once both nodes declare the link and are up, check it: each runs a rank of
-an NCCL all-reduce over it, in the image a model across the two would run
-in, and says what it measured.
+Once both nodes have the link and are up, check it (or press `check` on the
+node's page): each runs a rank of an NCCL all-reduce over it, in the image a
+model across the two would run in, and says what it measured.
 
 ```sh
 curl -X POST $api/admin/v1/nodes/spark/links/flare/check -H @admin.h   # running

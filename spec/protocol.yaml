@@ -289,10 +289,30 @@ components:
             The direct links to other nodes its operator declared on the
             machine, in the node's capabilities file beside its engines
             (each machine's own interfaces and addresses): for each peer,
-            the local ports cabled to it. A model is placed across two
-            nodes only when each declares the other and their link passed
-            its check (openapi.yaml `checkNodeLink`).
+            the local ports cabled to it. A link declared here wins over
+            the one the coordinator finds from `ports` for the same peer.
+            A model is placed across two nodes only when each has a link
+            to the other, declared or found, and their link passed its
+            check (openapi.yaml `checkNodeLink`).
           items: { $ref: '#/components/schemas/Link' }
+        ports:
+          type: array
+          maxItems: 8
+          description: |
+            The machine's cabled ports, as the node finds them: each
+            network interface with an RDMA (RoCE) device and a carrier.
+            The node looks at start and again whenever a carrier comes or
+            goes, and reports its capabilities again when what it found
+            changed (`reportCapabilities`). The coordinator pairs two
+            nodes' ports by what each sees on its link (`neighbors`), and
+            uses the link it finds as a declared one (`Link`): its first
+            port the pair of ports that share an address family (and an
+            IPv4 subnet), each port at the address it already has, IPv4
+            before IPv6 link-local, and the RoCE v2 GID that carries that
+            address as its `gid_index`. Voice configures no host
+            networking: a port with neither address is cabled but not
+            addressed.
+          items: { $ref: '#/components/schemas/CabledPort' }
 
     Link:
       type: object
@@ -324,7 +344,9 @@ components:
             The RoCE GID index the ports' RDMA devices use
             (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one
             the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX
-            Spark's ConnectX-7.
+            Spark's ConnectX-7, 1 for RoCE v2 over its IPv6 link-local
+            address. A link the coordinator finds has the RoCE v2 GID that
+            carries its first port's address.
           examples: [3]
 
     LinkPort:
@@ -338,14 +360,81 @@ components:
           examples: [enp1s0f0np0]
         address:
           type: string
-          pattern: '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
-          description: Its IPv4 address on the link, without a prefix length.
-          examples: [192.168.100.1]
+          pattern: '^([0-9]{1,3}(\.[0-9]{1,3}){3}|fe80:[0-9a-f:]{2,35})$'
+          description: |
+            Its address on the link, without a prefix length: IPv4, or its
+            IPv6 link-local address (`fe80::/64`, without a scope), which a
+            node reaches on the interface of its own end of the link.
+          examples: [192.168.100.1, 'fe80::4ebb:47ff:feeb:ca11']
         hca:
           type: string
           pattern: '^[A-Za-z0-9._-]{1,64}$'
           description: Its RDMA (RoCE) device, when it has one.
           examples: [rocep1s0f0]
+
+    CabledPort:
+      type: object
+      description: |
+        One port of the machine with an RDMA (RoCE) device and a carrier:
+        what the coordinator pairs nodes' links from (`Capabilities.ports`).
+        Read from the kernel (`/sys/class/net`, `/sys/class/infiniband`)
+        and its neighbour tables, never configured.
+      required: [ifname, mac, speed_mbps]
+      properties:
+        ifname:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,15}$'
+          examples: [enp1s0f0np0]
+        mac:
+          type: string
+          pattern: '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'
+          description: Its hardware address.
+          examples: ['4c:bb:47:eb:ca:11']
+        speed_mbps:
+          type: integer
+          minimum: 0
+          description: Its link speed, in Mb/s, as the kernel says it (`speed`); 0 when it does not.
+          examples: [200000]
+        mtu:
+          type: integer
+          minimum: 0
+          examples: [9000]
+        hca:
+          type: string
+          pattern: '^[A-Za-z0-9._-]{1,64}$'
+          description: Its RDMA device.
+          examples: [rocep1s0f0]
+        addresses:
+          type: array
+          maxItems: 8
+          description: |
+            Its addresses with their prefix lengths, as the machine has them:
+            IPv4 and IPv6 link-local. Others are left out.
+          items: { type: string, examples: [192.168.100.1/30, 'fe80::4ebb:47ff:feeb:ca11/64'] }
+        gids:
+          type: array
+          maxItems: 8
+          description: Its RDMA device's RoCE v2 GIDs, each by its index, and the address it carries.
+          items:
+            type: object
+            required: [index, address]
+            properties:
+              index: { type: integer, minimum: 0, maximum: 255, examples: [3] }
+              address:
+                type: string
+                description: The GID as an address, an IPv4-mapped GID as its IPv4 address.
+                examples: [192.168.100.1, 'fe80::4ebb:47ff:feeb:ca11']
+        neighbors:
+          type: array
+          maxItems: 16
+          description: |
+            The hardware addresses the node sees on the link: its neighbour
+            tables' (IPv6 neighbour discovery after a ping to all nodes on
+            the link, `ff02::1`, and ARP after a ping to the other end of a
+            /30 or /31) and LLDP's, where the machine runs it.
+          items:
+            type: string
+            pattern: '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'
 
     Hardware:
       type: object
@@ -522,12 +611,23 @@ components:
           description: The other node; this node's link to it (`Capabilities.links`) carries the model.
         master_addr:
           type: string
-          description: The leader's address on its link to the follower, the first of its ports.
+          description: |
+            The leader's address on its link to the follower, the first of
+            its ports; an IPv6 link-local address scoped to this node's own
+            first port (`fe80::...%<ifname>`).
         master_port:
           type: integer
           minimum: 1
           maximum: 65535
           description: Where on it the ranks meet.
+        link:
+          $ref: '#/components/schemas/Link'
+          description: |
+            This node's end of the link to `peer`, as the coordinator uses
+            it: the one its capabilities declare, or else the one the
+            coordinator found from both nodes' `ports`. Left out by a
+            coordinator that does not find links; the node then uses its
+            declared one.
 
     StaticConfig:
       type: object
@@ -765,8 +865,11 @@ components:
         rank: { type: integer, minimum: 0, maximum: 1 }
         master_addr:
           type: string
-          description: Rank 0's address on the link.
+          description: Rank 0's address on the link; an IPv6 link-local address scoped to this node's own first port (`fe80::...%<ifname>`).
         master_port: { type: integer, minimum: 1, maximum: 65535 }
+        link:
+          $ref: '#/components/schemas/Link'
+          description: This node's end of the link, as for `ClusterPart.link`.
         image:
           type: string
           description: The image it runs in, by digest (`<image>@sha256:...`), the runtime a model across the link would run in.

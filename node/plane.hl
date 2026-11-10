@@ -89,6 +89,11 @@ locus Plane {
         token: String = "";
         credential: std::secret::Credential = std::secret::Credential { };
         capabilities: String = "";
+        // the cabled ports, as last found (cabling.hl): declared with the
+        // capabilities, and reported again when they change
+        ports: String = "[]";
+        ports_due: Bool = false;
+        ports_retry: Bool = false;
         registered: Bool = false;
         interval_ms: Int = 5000;
         // the local controls the coordinator was last told
@@ -119,6 +124,7 @@ locus Plane {
         subscribe LoadChanged as on_load;
         subscribe LinkCheckDone as on_checked;
         subscribe BlobKept as on_kept;
+        subscribe PortsFound as on_ports;
         publish PlaneJoined;
         publish AssignmentRead;
         publish LocalApplied;
@@ -172,6 +178,7 @@ locus Plane {
             self.inventory_due = false;
             self.report_inventory();
         }
+        if self.ports_due { self.report_capabilities(); }
         self.check_local();
         if len(self.checked) > 0 { self.report_checked(); }
         if std::time::monotonic_ns() >= self.next_beat { self.heartbeat(); }
@@ -200,6 +207,31 @@ locus Plane {
         if resp.status == 0 || resp.status >= 500 { return; }
         if resp.status == 401 || resp.status == 403 { self.registered = false; }
         self.checked = self.checked[(nl + 1)..len(self.checked)];
+    }
+
+    /// The cabled ports changed: the capabilities are reported again next
+    /// turn.
+    fn on_ports(p: FoundPorts) {
+        self.ports = p.ports;
+        self.ports_due = true;
+    }
+
+    /// `PUT /node/v1/capabilities`, with the cabled ports as now found;
+    /// told again with the next heartbeat when the api could not be
+    /// reached or failed.
+    @unbounded
+    fn report_capabilities() {
+        self.ports_due = false;
+        let resp = self.call(
+            "PUT",
+            "/node/v1/capabilities",
+            with_ports(self.capabilities, self.ports),
+        );
+        if resp.status == 401 || resp.status == 403 {
+            self.registered = false;
+            return;
+        }
+        if resp.status == 0 || resp.status >= 500 { self.ports_retry = true; }
     }
 
     /// The fetcher kept a file: what the store holds is told next turn.
@@ -241,7 +273,7 @@ locus Plane {
     fn register() {
         let local = read_local(self.data);
         let body = "{\"protocol\": 2, \"version\": " + q(NODE_VERSION) + ", \"capabilities\": "
-            + self.capabilities + ", \"local\": " + local + "}";
+            + with_ports(self.capabilities, self.ports) + ", \"local\": " + local + "}";
         let resp = self.call("POST", "/node/v1/register", body);
         if resp.status == 0 { return; }
         if resp.status == 401 || resp.status == 403 {
@@ -265,6 +297,9 @@ locus Plane {
         if self.interval_ms < 1000 { self.interval_ms = 5000; }
         self.local = local;
         self.registered = true;
+        // the ports went with the registration
+        self.ports_due = false;
+        self.ports_retry = false;
         // a coordinator registered with is told what the store holds
         self.inventory = "";
         self.inventory_due = true;
@@ -314,6 +349,10 @@ locus Plane {
         if self.inventory_retry {
             self.inventory_retry = false;
             self.inventory_due = true;
+        }
+        if self.ports_retry {
+            self.ports_retry = false;
+            self.ports_due = true;
         }
         let version = if self.applied >= 0 {
             ", \"assignment_version\": " + to_string(self.applied)

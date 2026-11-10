@@ -1,6 +1,6 @@
 import { memo, type CSSProperties, type ReactNode } from 'react';
 import { bytes } from './format';
-import { hueOf as ownHue, layoutMemory, memoryTotals, type MemoryCell, type MemoryMark, type MemoryModel } from './memory-layout';
+import { CELLS, hueOf as ownHue, layoutMemory, memoryTotals, memoryUnit, unitSaid, type MemoryCell, type MemoryMark, type MemoryModel } from './memory-layout';
 import s from './MemoryCard.module.css';
 
 /** Where a pointer or a focused entry is, for a tip beside it. */
@@ -11,12 +11,12 @@ export type MemoryCardProps = {
   name: string;
   /** What the head shows for it; `name` when left out. */
   title?: ReactNode;
+  /** `title` as text: said on hover and to a screen reader, since the head is one line, clipped. */
+  titleText?: string;
   subtitle?: ReactNode;
   /** Its state, at the head's end. */
   status?: ReactNode;
   model: MemoryModel;
-  /** The bytes a cell stands for, the same on every card shown together (`memoryUnit`). */
-  unit: number;
   /** The cells, when given (`planCells`); else `model` laid out. */
   cells?: MemoryCell[];
   /** Small cells and no legend: a card among many, or a header. */
@@ -68,39 +68,41 @@ function blockAt(target: EventTarget | null): string | null {
 }
 
 /**
- * A machine's memory, drawn: its name and state, a grid of cells (each
- * `unit` bytes: what it holds back hatched, each block in a hue of its own,
- * contiguous, free cells as outlines), its totals, and each block listed.
- * The grid is sixteen cells wide on every card, so a larger machine is a
- * taller card. Hovering a block's cells or its entry lights it; its entry
+ * A machine's memory, drawn: its name and state, a grid of a hundred cells
+ * (each a hundredth of the machine: what it holds back hatched, each block
+ * in a hue of its own, contiguous, free cells as outlines), its totals in
+ * bytes and what its cell stands for, and each block listed. Every card is
+ * the same ten-by-ten grid, whatever the machine's size, so cards compare
+ * by how full they are. Hovering a block's cells or its entry lights it; its entry
  * is a button, so the same works from the keyboard.
  */
 export const MemoryCard = memo(function MemoryCard(p: MemoryCardProps) {
-  const cells = p.cells ?? layoutMemory(p.model, p.unit);
+  const cells = p.cells ?? layoutMemory(p.model);
   const hueOf = (k: string) => p.hues?.get(k) ?? ownHue(k);
   const totals = memoryTotals(p.model);
+  const unit = memoryUnit(p.model);
   const legend = p.legend ?? !p.compact;
   const lit = p.highlight && cells.some((c) => c.block === p.highlight || c.was === p.highlight) ? p.highlight : null;
   const shown = p.model.blocks;
   const said = [
-    `${p.name}: ${bytes(totals.total)}`,
+    `${p.name}: ${bytes(totals.total)} in ${CELLS} cells, 1 cell about ${unitSaid(unit)}`,
     totals.reserve > 0 ? `${bytes(totals.reserve)} held back` : '',
     ...shown.map((b) => `${b.label} ${bytes(b.bytes)}${b.mark ? `, ${MARK_SAID[b.mark]}` : ''}`),
     totals.free >= 0 ? `${bytes(totals.free)} free` : `overfilled by ${bytes(-totals.free)}`,
   ].filter(Boolean).join('; ');
   const head = (
     <div className={s.head}>
-      <span className={s.title}>{p.title ?? p.name}</span>
+      <span className={s.title} title={p.titleText ?? p.name}>{p.title ?? p.name}</span>
       {p.status}
     </div>
   );
   return (
-    <section className={`${s.card} ${p.compact ? s.compact : ''} ${p.animate ? s.animate : ''}`} aria-label={`${p.name} memory`}>
+    <section className={`${s.card} ${p.compact ? s.compact : ''} ${p.animate ? s.animate : ''}`} aria-label={`${p.titleText ?? p.name} memory`}>
       <div className={s.inner}>
         {p.onOpen ? (
           <button type="button" className={s.open} onClick={p.onOpen} aria-label={`open ${p.name}`}>{head}</button>
         ) : head}
-        {p.subtitle && <div className={s.sub}>{p.subtitle}</div>}
+        {p.subtitle && <div className={s.sub} title={typeof p.subtitle === 'string' ? p.subtitle : undefined}>{p.subtitle}</div>}
         <div
           className={`${s.grid} ${lit ? s.dim : ''}`}
           role="img"
@@ -118,6 +120,7 @@ export const MemoryCard = memo(function MemoryCard(p: MemoryCardProps) {
           <span>used <b>{bytes(totals.used)}</b></span>
           <span>held back <b>{bytes(totals.reserve)}</b></span>
           {totals.free >= 0 ? <span>free <b>{bytes(totals.free)}</b></span> : <span className="c-fail">over by <b>{bytes(-totals.free)}</b></span>}
+          <span className={s.cellSaid} title={`a cell is a hundredth of ${totals.free >= 0 ? 'this machine' : 'what this machine is asked to hold'}`}>1 cell ≈ <b>{unitSaid(unit)}</b></span>
         </div>
         {legend && shown.length > 0 && (
           <ul className={s.legend}>
@@ -148,10 +151,11 @@ export const MemoryCard = memo(function MemoryCard(p: MemoryCardProps) {
 });
 
 /**
- * The key to every card shown together: what a cell stands for, and how
- * each kind of cell is drawn, in words beside each.
+ * The key to every card shown together: that a cell is a hundredth of its
+ * own machine (each card says how much that is), and how each kind of cell
+ * is drawn, in words beside each.
  */
-export function MemoryKey({ unit, plan, overhead }: { unit: number; plan?: boolean; overhead?: string }) {
+export function MemoryKey({ plan, overhead }: { plan?: boolean; overhead?: string }) {
   const items: [string, string][] = [
     [`${s.reserve}`, 'held back by the machine'],
     [`${s.block}`, 'a model, its own hue'],
@@ -161,7 +165,7 @@ export function MemoryKey({ unit, plan, overhead }: { unit: number; plan?: boole
   ];
   return (
     <ul className={s.key} aria-label="memory key">
-      <li className={s.unit}>1 cell = {bytes(unit)}</li>
+      <li className={s.unit}>1 cell = 1% of its node · each card says how much</li>
       {items.map(([cls, what]) => (
         <li key={what}>
           <span className={`${s.cell} ${cls}`} style={{ '--h': 205 } as CSSProperties} aria-hidden="true" />
@@ -172,7 +176,7 @@ export function MemoryKey({ unit, plan, overhead }: { unit: number; plan?: boole
   );
 }
 
-/** A run of `n` cells standing for something that does not fit, as a tray shows it. */
+/** A run of `n` cells standing for something that does not fit, as a tray shows it: twenty wide, two cards' rows side by side. */
 export function MemoryNeed({ cells, label }: { cells: number; label: string }) {
   return (
     <span className={s.need} role="img" aria-label={label}>

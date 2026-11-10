@@ -13,7 +13,7 @@ import { ContextWindow } from '../context';
 import { Value } from '../values';
 import { nodeModels, heldSaid, type NodeModel } from './node-models';
 import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
-import { fleetNodes, memoryOf, placedBlocks } from '../fleet-memory';
+import { acceleratorName, fleetNodes, memoryOf, placedBlocks } from '../fleet-memory';
 import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
 
 type Seat = Schemas['Seat'];
@@ -343,7 +343,7 @@ function Hardware({ node }: { node: Node }) {
         ...(hw.accelerators.length
           ? hw.accelerators.map((a, i) => ({
               k: hw.accelerators.length > 1 ? `accelerator ${i}` : 'accelerator',
-              v: <>{a.name} <span className="muted">· {a.kind} · {a.unified ? `unified memory` : bytes(a.memory_bytes)}</span></>,
+              v: <><span title={acceleratorName(a.name) !== a.name ? a.name : undefined}>{acceleratorName(a.name)}</span> <span className="muted">· {a.kind} · {a.unified ? `unified memory` : bytes(a.memory_bytes)}</span></>,
             }))
           : [{ k: 'accelerator', v: <span className="c-wait">none: a model needs one</span> }]),
         { k: 'disk free', v: bytes(hw.disk_free_bytes) },

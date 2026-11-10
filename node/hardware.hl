@@ -252,17 +252,74 @@ fn compute_capability_text(s: String) -> Bool {
 }
 
 /// The machine's GPUs as the kernel's DRM devices say them, one a line:
-/// `<vendor id> <dedicated memory in bytes> <name>`. An integrated GPU
-/// reports a small carve-out, a discrete one its own memory: AMD's driver
-/// as `mem_info_vram_total`, Intel's (i915) as `lmem_total_bytes`. Its one
-/// argument, when given, is a root the `/sys` it reads is under (a test's).
-const DRM_GPUS: String = "for d in \"${1:-}\"/sys/class/drm/card[0-9]*; do case \"${d##*/}\" in *-*) continue;; esac; v=$(cat \"$d/device/vendor\" 2>/dev/null) || continue; m=$(cat \"$d/device/mem_info_vram_total\" 2>/dev/null || cat \"$d/lmem_total_bytes\" 2>/dev/null || echo 0); s=$(basename \"$(readlink -f \"$d/device\")\"); n=$(lspci -s \"$s\" 2>/dev/null | sed 's/^[^:]*: //'); echo \"$v $m ${n:-GPU}\"; done";
+/// `<vendor id> <dedicated memory in bytes> <device id> <product name>`,
+/// a tab, and `lspci`'s line for its slot. An integrated GPU reports a
+/// small carve-out, a discrete one its own memory: AMD's driver as
+/// `mem_info_vram_total`, Intel's (i915) as `lmem_total_bytes`. The product
+/// name is the driver's `product_name` where it has one, else empty. Its
+/// one argument, when given, is a root the `/sys` it reads is under (a
+/// test's).
+const DRM_GPUS: String = "for d in \"${1:-}\"/sys/class/drm/card[0-9]*; do case \"${d##*/}\" in *-*) continue;; esac; v=$(cat \"$d/device/vendor\" 2>/dev/null) || continue; m=$(cat \"$d/device/mem_info_vram_total\" 2>/dev/null || cat \"$d/lmem_total_bytes\" 2>/dev/null || echo 0); i=$(cat \"$d/device/device\" 2>/dev/null || echo 0); p=$(cat \"$d/device/product_name\" 2>/dev/null | head -n 1); s=$(basename \"$(readlink -f \"$d/device\")\"); n=$(lspci -s \"$s\" 2>/dev/null | head -n 1); printf '%s %s %s %s\\t%s\\n' \"$v\" \"$m\" \"$i\" \"$p\" \"$n\"; done";
+
+/// A GPU's name as its card is sold, from `lspci`'s line for it `pci`
+/// (`03:00.0 VGA compatible controller: Advanced Micro Devices, Inc.
+/// [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE] (rev c0)`): its
+/// last bracketed name that is not the vendor's own, the first of those it
+/// lists (`Radeon RX 9070`); else the driver's `product`; else its device
+/// id. Led by the vendor (`vendor`, `0x1002` AMD, `0x8086` Intel) once:
+/// `AMD Radeon RX 9070`, `Intel Arc A770`, `AMD GPU 0x7550`.
+@bounded_by(pci)
+fn gpu_name(vendor: String, device: String, product: String, pci: String) -> String {
+    let brand = if vendor == "0x1002" {
+        "AMD"
+    } else if vendor == "0x8086" {
+        "Intel"
+    } else {
+        vendor
+    };
+    let marketed = marketed_name(pci);
+    let name = if len(marketed) > 0 { marketed } else { std::str::trim(product) };
+    if len(name) == 0 {
+        let id = std::str::trim(device);
+        return brand + " GPU" + (if len(id) > 0 && id != "0" { " " + id } else { "" });
+    }
+    return if name == brand || std::str::starts_with(name, brand + " ") {
+        name
+    } else {
+        brand + " " + name
+    };
+}
+
+/// The name a card is sold by, in `lspci`'s line for it: the description
+/// past its slot and class (`... controller: `), its last bracketed name
+/// that is not the vendor's own (`[AMD/ATI]`), the first of a
+/// slash-separated list; "" when it has none (`Device 7550`).
+@bounded_by(pci)
+fn marketed_name(pci: String) -> String {
+    let line = std::str::trim(pci);
+    let colon = std::str::index_of(line, ": ");
+    let t = if colon >= 0 { line[(colon + 2)..len(line)] } else { line };
+    let mut name = "";
+    let mut at = std::str::index_of(t, "[");
+    while at >= 0 {
+        let close = std::str::index_of_from(t, "]", at);
+        if close < 0 { break; }
+        let inner = std::str::trim(t[(at + 1)..close]);
+        if len(inner) > 0 && inner != "AMD/ATI" && inner != "AMD" && inner != "ATI" {
+            name = inner;
+        }
+        at = std::str::index_of_from(t, "[", close);
+    }
+    let slash = std::str::index_of(name, "/");
+    return std::str::trim(if slash >= 0 { name[0..slash] } else { name });
+}
 
 /// A GPU worth placing on: dedicated memory of at least 2 GiB, not an
 /// integrated one's carve-out.
 const DISCRETE_MIN_BYTES: Int = 2147483648;
 
-/// The non-NVIDIA GPUs in `drm` (`DRM_GPUS`' lines) as accelerators: an
+/// The non-NVIDIA GPUs in `drm` (`DRM_GPUS`' lines) as accelerators, each
+/// by its product name (`gpu_name`): an
 /// AMD card (`0x1002`) is `rocm` when the machine has ROCm's compute device
 /// (`kfd`) and `vulkan` too; an Intel card (`0x8086`) is `vulkan`. Each
 /// with its own memory; only discrete cards, the first `ACCELERATORS_MAX`.
@@ -276,13 +333,20 @@ fn other_accelerators(drm: String, kfd: Bool) -> String {
         let nl = line_end(v, start);
         let line = std::str::trim(std::str::slice(v, start, nl));
         start = nl + 1;
-        let sp = std::str::index_of(line, " ");
+        let tab = std::str::index_of(line, "\t");
+        let head = if tab >= 0 { line[0..tab] } else { line };
+        let pci = if tab >= 0 { line[(tab + 1)..len(line)] } else { "" };
+        let sp = std::str::index_of(head, " ");
         if sp < 0 { continue; }
-        let vendor = line[0..sp];
-        let rest = line[(sp + 1)..len(line)];
+        let vendor = head[0..sp];
+        let rest = head[(sp + 1)..len(head)];
         let sp2 = std::str::index_of(rest, " ");
         let mem = std::str::parse_int(if sp2 < 0 { rest } else { rest[0..sp2] }) or 0;
-        let name = if sp2 < 0 { "GPU" } else { std::str::trim(rest[(sp2 + 1)..len(rest)]) };
+        let ids = if sp2 < 0 { "" } else { rest[(sp2 + 1)..len(rest)] };
+        let sp3 = std::str::index_of(ids, " ");
+        let device = if sp3 < 0 { ids } else { ids[0..sp3] };
+        let product = if sp3 < 0 { "" } else { ids[(sp3 + 1)..len(ids)] };
+        let name = gpu_name(vendor, device, product, pci);
         if mem < DISCRETE_MIN_BYTES { continue; }
         let amd = vendor == "0x1002";
         if !amd && vendor != "0x8086" { continue; }

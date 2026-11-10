@@ -38,6 +38,7 @@ NERVES_PORT=${NERVES_PORT:-14297}
 # never one of the stubs' above (UPSTREAM_PORT + 1 is NERVES_PORT)
 NOHEAD_PORT=${NOHEAD_PORT:-14300}
 DECIDE_PORT=${DECIDE_PORT:-14301}
+KEPT_PORT=${KEPT_PORT:-14302}
 work=$(mktemp -d)
 container=""
 org_container="voice-e2e-org-$$"
@@ -532,6 +533,35 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
 }
 quiet_cancel quiet "" "$UPSTREAM_PORT" "$QUIET_PORT"
 quiet_cancel nohead nohead "$NOHEAD_PORT" "$((QUIET_PORT + 1))"
+
+# an engine at work on a tool call it sends whole at the end (TensorFold's
+# grammar-constrained path) is quiet after its first output past the idle
+# span (10 s here), sending only SSE keep-alive comments (18 s of them): its
+# node tells the api it is at work (`alive`), so the seat is waited for, and
+# the caller's stream is kept alive with `response.in_progress` meanwhile (every
+# 15 s)
+python3 scripts/silent-upstream.py "$KEPT_PORT" "$work/kept-upstream.log" kept &
+pids+=($!)
+for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$KEPT_PORT") 2>/dev/null && break; sleep 0.1; done
+post /admin/v1/models '{"id": "kept-1"}' >/dev/null
+ktoken=$(post /admin/v1/nodes '{"id": "kept"}' | field enrollment_token)
+post /admin/v1/nodes/kept/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "kept-1"}], "config": {"base_url": "http://127.0.0.1:'"$KEPT_PORT"'/v1", "model": "stub-7b"}}' >/dev/null
+echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/kept-caps.json"
+node/node --id kept --api "$api" --token "$ktoken" --data "$work/kept-data" --capabilities "$work/kept-caps.json" --port "$((QUIET_PORT + 3))" --readings-port "$((QUIET_PORT + 1003))" >"$work/kept.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/kept/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
+curl -s -N --max-time 40 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "kept-1", "input": "write it", "stream": true, "tools": [{"type": "function", "name": "write", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]}' >"$work/kept.sse"
+python3 - "$work/kept.sse" <<'PY' || { echo "a seat at work past the idle span, sending keep-alives, was not waited for: $(head -c 600 "$work/kept.sse")"; tail -5 "$work/kept.log"; exit 1; }
+import sys
+names = [l[7:] for l in open(sys.argv[1]).read().split("\n") if l.startswith("event: ")]
+assert names[:2] == ["response.created", "response.in_progress"], names
+assert names.count("response.created") == 1, names
+# the seat's own in_progress is not sent again: the rest are the api's keep-alives
+assert names.count("response.in_progress") >= 2, names
+assert "response.function_call_arguments.delta" in names and names[-1] == "response.completed", names
+assert "error" not in names, names
+PY
+echo "a seat quiet 18 s past its first output, past the 10 s idle span, its engine sending keep-alives: waited for, its call served"
 
 # annotations queued on NATS: four requests of a project that annotates,
 # their annotations at once on a decision seat that takes one at a time, each stage a

@@ -126,6 +126,35 @@ fn stub_conn(s: std::io::tcp::Stream) {
         std::time::sleep(5s);
         return;
     }
+    if std::str::starts_with(req, "POST /kept/chat/completions ") {
+        // an engine at work on something it sends whole at the end (a tool
+        // call): one event, then only keep-alive comments, then the rest,
+        // framed CRLF, a character cut across two writes
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + chunk(
+                    "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+                ),
+        ) or discard;
+        let mut n = 0;
+        while n < 3 {
+            std::time::sleep(300ms);
+            s.send(chunk(": keepalive\n\n")) or discard;
+            n = n + 1;
+        }
+        let rest = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo café\"}}]}\r\n\r\n";
+        let cut = std::str::index_of(rest, "é") + 1;
+        s.send(chunk(rest[0..cut])) or discard;
+        std::time::sleep(100ms);
+        s.send(chunk(rest[cut..len(rest)])) or discard;
+        s.send(
+            chunk(
+                "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: [DONE]\r\n\r\n",
+            )
+                + "0\r\n\r\n",
+        ) or discard;
+        return;
+    }
     if std::str::starts_with(req, "POST /cut/chat/completions ") {
         // closes mid-stream: one event, no terminal chunk, no [DONE]
         s.send(
@@ -402,6 +431,37 @@ main locus App {
             n_waited >= 900 && n_waited < 3000,
             "two quiet reads gave control back in about a second each: " + to_string(n_waited)
                 + " ms",
+        );
+        // keep-alive comments are no events but the engine at work: each
+        // read that brings one says so (`heard`), and the stream goes on
+        let kept = node::upstream_over_wire(
+            "resp_ka",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/kept\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let mut heard = 0;
+        let mut kept_said = "";
+        while !kept.done {
+            let d = kept.next_data();
+            if kept.heard { heard = heard + 1; }
+            if len(d) > 0 {
+                std::test::assert(!kept.heard, "an event is not a keep-alive");
+                kept_said = kept_said + kept.feed(d);
+            }
+        }
+        let kept_end = kept.finish();
+        std::test::assert(heard >= 3, "each keep-alive heard: " + to_string(heard));
+        std::test::assert_eq_str(
+            kept_end.outcome,
+            "served",
+            "and the run served: " + kept_end.failure,
+        );
+        std::test::assert(
+            std::str::contains(kept_said, "\"delta\":\"lo café\""),
+            "a CRLF-framed event, its character cut across writes, read whole: " + kept_said,
         );
         let cut = node::run_compat(
             "resp_k6",

@@ -3,9 +3,13 @@ answers a POST with the head of a chunked `text/event-stream` and one event,
 then sends nothing and holds the connection open. Each request is a line in
 the file named by the second argument.
 
-    python3 scripts/silent-upstream.py PORT REQUESTS_FILE [nohead]
+    python3 scripts/silent-upstream.py PORT REQUESTS_FILE [nohead|kept]
 
 With `nohead` it reads the request and never answers: not a byte of a head.
+With `kept` it is an engine at work on a tool call it sends whole at the
+end, as TensorFold's grammar-constrained path does: after its event, only
+SSE keep-alive comments, every 2 s for 18 s, then the call, whole, and the
+stream's end.
 """
 import socket
 import sys
@@ -13,9 +17,19 @@ import threading
 import time
 
 port, log = int(sys.argv[1]), sys.argv[2]
-nohead = len(sys.argv) > 3 and sys.argv[3] == "nohead"
+mode = sys.argv[3] if len(sys.argv) > 3 else ""
+nohead = mode == "nohead"
 
 EVENT = b'data: {"model":"stub-7b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"}}]}\n\n'
+CALL = (
+    b'data: {"model":"stub-7b","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_k","type":"function","function":{"name":"write","arguments":"{\\"path\\":\\"nums.txt\\"}"}}]}}]}\n\n'
+    b'data: {"model":"stub-7b","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+    b"data: [DONE]\n\n"
+)
+
+
+def chunk(b):
+    return b"%x\r\n" % len(b) + b + b"\r\n"
 
 
 def serve(conn):
@@ -32,8 +46,14 @@ def serve(conn):
             conn.sendall(
                 b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
                 b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
-                + b"%x\r\n" % len(EVENT) + EVENT + b"\r\n"
+                + chunk(EVENT)
             )
+        if mode == "kept":
+            for _ in range(9):
+                time.sleep(2)
+                conn.sendall(chunk(b": keepalive\n\n"))
+            conn.sendall(chunk(CALL) + b"0\r\n\r\n")
+            return
         # silent from here, until the client goes away
         while conn.recv(4096):
             pass

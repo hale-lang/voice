@@ -4,9 +4,13 @@
 // becomes `messages`; the upstream is asked for a stream; its chunks come
 // back as the standard's events, the same ones the static engine emits.
 //
-// The upstream, http or https, is read with the stdlib client's
-// `std::http::SseReader`, an event at a time, and relayed as it arrives: each
-// chunk's event is published as soon as it is read.
+// The upstream, http or https, is read off the stdlib client's
+// `std::http::BodyReader` a piece at a time and framed here into events, so
+// that what is not an event is seen too: a keep-alive comment (`: ...`) is
+// the engine at work, though it sends nothing yet (TensorFold, holding a
+// tool call back until it is whole), and the session tells the api so
+// (`alive`, protocol.yaml). Each event is relayed as it arrives: published
+// as soon as it is read.
 
 /// A seat's openai-compatible config. `problem` is why it is not one, ""
 /// when it is.
@@ -253,7 +257,8 @@ fn sse_data(block: String) -> String {
     let mut start = 0;
     while start < v.n {
         let at = line_end(v, start);
-        let ln = std::str::slice(v, start, at);
+        let mut ln = std::str::slice(v, start, at);
+        if std::str::ends_with(ln, "\r") { ln = ln[0..(len(ln) - 1)]; }
         start = at + 1;
         if std::str::starts_with(ln, "data:") {
             let d = ln[5..len(ln)];
@@ -274,7 +279,44 @@ type Datum {
     closed: Bool = false;
     // nothing arrived within the read window: the stream is open and quiet
     idle: Bool = false;
+    // bytes arrived that are not an event yet: a keep-alive comment, or
+    // part of an event; the upstream is at work
+    alive: Bool = false;
     failure: String = "";
+}
+
+/// What the stream held framed: an event (`found`, `d`), or none yet,
+/// `alive` when comments or blocks with no data were let go on the way.
+type Framed { found: Bool = false; alive: Bool = false; d: Datum = Datum { }; }
+
+/// The most of one event held while it arrives, as the stdlib reader's.
+const COMPAT_EVENT_MAX: Int = 16777216;
+
+/// The first event block of an SSE stream's text: `found` once a blank line
+/// ends one (`used` its bytes, the blank line's too), `data` its `data:`
+/// lines joined by newlines ("" for a comment or a block of other fields).
+/// Lines end at LF or CRLF.
+type SseBlock { found: Bool = false; used: Int = 0; data: String = ""; }
+
+@unbounded
+fn sse_block(text: String) -> SseBlock {
+    let v = std::str::bytes_view(text);
+    let mut start = 0;
+    while start < v.n {
+        let at = line_end(v, start);
+        if at >= v.n { return SseBlock { }; }
+        let mut ln = std::str::slice(v, start, at);
+        if std::str::ends_with(ln, "\r") { ln = ln[0..(len(ln) - 1)]; }
+        start = at + 1;
+        if len(ln) == 0 {
+            return SseBlock {
+                found: true,
+                used: start,
+                data: sse_data(std::str::slice(v, 0, start)),
+            };
+        }
+    }
+    return SseBlock { };
 }
 
 /// The whole run of an exchange is bounded, not each read: a model that
@@ -294,13 +336,15 @@ locus HttpSse {
         request: String = "";
         vault: String = "";
         // the exchange, begun by `open`; until then a reader of a port nobody serves
-        rd: std::http::SseReader = std::http::SseReader {
+        rd: std::http::BodyReader = std::http::BodyReader {
             req: std::http::ClientRequest {
                 method: "GET",
                 url: std::http::parse_url("http://127.0.0.1:1/") or std::http::Url { },
                 body: b"",
             },
         };
+        // the stream's bytes not yet framed into an event
+        rx: std::bytes::BytesBuilder = std::bytes::BytesBuilder { initial_cap: 8192 };
         // a keyed upstream is read whole (see `open`)
         keyed: Bool = false;
         canned: CannedSse = CannedSse { };
@@ -327,11 +371,11 @@ locus HttpSse {
             }
             return;
         }
-        self.rd = std::http::SseReader {
+        self.rd = std::http::BodyReader {
             req: std::http::ClientRequest {
                 method: "POST",
                 url: parsed,
-                headers: headers,
+                headers: headers + "\r\nAccept: text/event-stream",
                 body: std::bytes::from_string(self.request),
             },
             timeout_ms: COMPAT_TOTAL_MS,
@@ -369,26 +413,58 @@ locus HttpSse {
             return Datum { failure: "the upstream at " + self.url + " could not be reached" };
         };
         if !opened { return Datum { idle: true }; }
-        if self.rd.body.status == 0 {
+        if self.rd.status == 0 {
             return Datum { failure: "the upstream at " + self.url + " could not be reached" };
         }
-        if self.rd.body.status < 200 || self.rd.body.status >= 300 {
+        if self.rd.status < 200 || self.rd.status >= 300 {
             let text = std::bytes::BytesBuilder { initial_cap: 1024 };
             let mut reading = true;
             while reading {
-                let piece = self.rd.body.chunk_within(COMPAT_READ_MS) or b"";
+                let piece = self.rd.chunk_within(COMPAT_READ_MS) or b"";
                 if len(piece) == 0 { reading = false; } else { text.append(piece); }
             }
             let body = std::str::from_bytes(text.snapshot() or b"");
-            return error_datum(self.rd.body.status, body);
+            return error_datum(self.rd.status, body);
         }
-        let e = self.rd.event_within(COMPAT_READ_MS) or {
+        // an event already read, else the next piece of the stream
+        let held = self.framed();
+        if held.found { return held.d; }
+        if held.alive { return Datum { alive: true }; }
+        let piece = self.rd.chunk_within(COMPAT_READ_MS) or {
             if err.kind == "idle" { return Datum { idle: true }; }
+            // an unfinished last event is dropped, as a reader of SSE does
             if err.kind == "end" { return Datum { ended: true, closed: true }; }
             return Datum { failure: "the upstream ended its stream early" };
         };
-        if e.data == "[DONE]" { return Datum { ended: true }; }
-        return Datum { data: e.data };
+        self.rx.append(piece);
+        if self.rx.len() > COMPAT_EVENT_MAX {
+            return Datum {
+                failure: "the upstream sent an event over " + to_string(COMPAT_EVENT_MAX)
+                    + " bytes",
+            };
+        }
+        let more = self.framed();
+        if more.found { return more.d; }
+        // bytes, but no event yet: a keep-alive, or part of an event
+        return Datum { alive: true };
+    }
+
+    /// The first event held whole, its bytes let go: `found` with its
+    /// payload, or the end (`[DONE]`). Comments and blocks with no data
+    /// before it are let go too, `alive` when there were any.
+    @unbounded
+    fn framed() -> Framed {
+        let mut alive = false;
+        while true {
+            let text = std::str::from_bytes(self.rx.snapshot() or b"");
+            let b = sse_block(text);
+            if !b.found { break; }
+            self.rx.shift_front(b.used);
+            if b.data == "[DONE]" { return Framed { found: true, d: Datum { ended: true } }; }
+            if len(b.data) > 0 { return Framed { found: true, d: Datum { data: b.data } }; }
+            alive = true;
+        }
+        return Framed { alive: alive };
     }
 }
 
@@ -456,6 +532,9 @@ locus Upstream {
         canned: CannedSse = CannedSse { };
         done: Bool = false;
         failure: String = "";
+        // the last read brought no event but bytes: a keep-alive comment,
+        // or part of an event; the engine is at work (`alive`, serve.hl)
+        heard: Bool = false;
         // the events built
         item_id: String = "";
         created: Int = 0;
@@ -499,6 +578,7 @@ locus Upstream {
     fn next_data() -> String {
         if self.done { return ""; }
         let d = if self.use_wire { self.wire.next() } else { self.canned.next() };
+        self.heard = d.alive;
         if len(d.failure) > 0 {
             self.failure = d.failure;
             self.done = true;

@@ -216,18 +216,30 @@ body (hale's `std::http::SseWriter`): `/v1/responses` sends the standard
 event stream, a `voice:attempt` event before the next seat's first when a
 seat fails before output, the terminal event with `voice`, then `data:
 [DONE]`; `/v1/chat/completions` sends `chat.completion.chunk`s, the last
-with `usage` and `voice`, then `data: [DONE]`. The stream opens at the
-first event a seat sends, or at the first keep-alive (below), so a request
-every seat refuses is still answered whole. A seat that fails once the
+with `usage` and `voice`, then `data: [DONE]`. The stream opens once a
+seat that took the request is at work (its first event, its node's
+`alive`, or a second without its failure), so a request every seat refuses
+or fails at once is still answered whole. It opens with the response begun
+by the api, whatever the engine sends first: `response.created` and
+`response.in_progress` (a seat's own are not sent again), or the chat
+stream's assistant role. A seat that fails once the
 stream has begun ends it with the evidence: an `error` event and
 `response.failed` carrying the response so far with `voice`, or a last
 chunk finished `error` with an `error` object and `voice`; a truncated
 answer never ends as a complete one. A seat is waited for between messages,
 not for the whole answer: 120 s until its first output (`--seat-first-s`; a
 slow model, or an engine that answers at the end), then 30 s between events
-(`--seat-idle-s`). While a seat that accepted is waited for, the stream gets
-an SSE comment (`: keep-alive`) whenever 15 s pass with nothing sent, so a
-proxy does not cut it. A caller that goes away is found by the next write
+(`--seat-idle-s`). A message is an event or the node's `alive`
+(protocol.yaml): the node reads an upstream's SSE itself
+(`std::http::BodyReader`, framed in node/compat.hl), and bytes that are no
+event (an engine's keep-alive comment, as TensorFold sends every 15 s while
+it holds a tool call back until it is whole) say the engine is at work, so
+the slot publishes `alive`, at most once a second. A seat silent for the
+span, keep-alives and all, has failed. While a seat that accepted is waited
+for, the stream gets a keep-alive whenever 15 s pass with nothing sent, so
+neither a proxy nor a client that times out between events cuts it:
+`response.in_progress` again on `/v1/responses`, an SSE comment
+(`: keep-alive`) on `/v1/chat/completions`, which has no such chunk. A caller that goes away is found by the next write
 that fails, an event's or a keep-alive's. The first write after a caller
 closes is accepted (the caller answers it with a reset), so each keep-alive
 is followed a second later by an empty comment (`:`), the write that fails:

@@ -1847,7 +1847,7 @@ Schema: [PlacementCreate](#schema-placementcreate)
 | `id` | string | yes | Chosen at creation, stable forever, never reused; the id of the seat it creates on its leader. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `account` | string | yes | The account the seat spends, as any seat names one; a local account that bills nothing, for a model on the operator's own machines. |  |
 | `model` | string | yes | A local catalog model that names a recipe. |  |
-| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each declares a link to the other (protocol.yaml `Link`), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
+| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each has a link to the other (protocol.yaml `Link`, declared or found from its cabled ports), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
 | `variant` | string |  | The operator's choice of form, taken only if it fits; left out, the coordinator picks. |  |
 | `runtime` | string |  | The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks. |  |
 
@@ -2745,9 +2745,10 @@ Assigns both nodes their rank of an NCCL all-reduce over the link
 would serve a model across it (the one voice ships or the operator
 allows that spans nodes, for the nodes' platform), and answers the
 check, `running`. Its result is the link's `check` on both nodes
-once both report. Both nodes must be up, declare the link to each
-other, and have the same platform; a check of the pair already
-running is answered as it is.
+once both report. Both nodes must be up, have an addressed link to
+each other (declared, or found from their cabled ports:
+`NodeLink`), and have the same platform; a check of the pair
+already running is answered as it is.
 
 Parameters:
 
@@ -3135,7 +3136,8 @@ Schema: [schemas-Capabilities](#schema-schemas-capabilities)
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
-| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
+| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A link declared here wins over the one the coordinator finds from `ports` for the same peer. A model is placed across two nodes only when each has a link to the other, declared or found, and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
+| `ports` | array of [CabledPort](#schema-cabledport) |  | The machine's cabled ports, as the node finds them: each network interface with an RDMA (RoCE) device and a carrier. The node looks at start and again whenever a carrier comes or goes, and reports its capabilities again when what it found changed (`reportCapabilities`). The coordinator pairs two nodes' ports by what each sees on its link (`neighbors`), and uses the link it finds as a declared one (`Link`): its first port the pair of ports that share an address family (and an IPv4 subnet), each port at the address it already has, IPv4 before IPv6 link-local, and the RoCE v2 GID that carries that address as its `gid_index`. Voice configures no host networking: a port with neither address is cabled but not addressed. | items ≤ 8 |
 
 Responses:
 
@@ -4618,7 +4620,7 @@ Type: object
 | `id` | string | yes | Chosen at creation, stable forever, never reused; the id of the seat it creates on its leader. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `account` | string | yes | The account the seat spends, as any seat names one; a local account that bills nothing, for a model on the operator's own machines. |  |
 | `model` | string | yes | A local catalog model that names a recipe. |  |
-| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each declares a link to the other (protocol.yaml `Link`), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
+| `nodes` | array of [NodeIdValue](#schema-nodeidvalue) | yes | The nodes it runs on, the first of them its leader, which holds the seat that serves it. Two, for a model split across them: the second, its follower, holds a seat of the same id that runs the other half and serves nothing itself. Two nodes are placed on only when they have the same platform and accelerator, each has a link to the other (protocol.yaml `Link`, declared or found from its cabled ports), their link passed its latest check (`checkNodeLink`), neither takes part in another placement across nodes, and the runtime spans nodes (`RuntimeCreate.multi_node`). The variant is judged on each: each holds half its weights, its whole cache for the context it is fitted to (vLLM keeps a latent-attention model's cache whole on every rank, so voice counts it whole on each), and its server's own. | items ≥ 1; items ≤ 2 |
 | `variant` | string |  | The operator's choice of form, taken only if it fits; left out, the coordinator picks. |  |
 | `runtime` | string |  | The operator's choice of runtime, taken only if it runs the variant on the nodes; left out, the coordinator picks. |  |
 
@@ -5723,14 +5725,25 @@ Type: [NodeSummary](#schema-nodesummary) & object
 
 ### NodeLink
 
-One link a node declared, as the coordinator sees it.
+One link of a node, as the coordinator sees it: one its
+capabilities declare, or one the coordinator found by pairing its
+cabled ports with another node's (`Capabilities.ports`). A
+declared link wins over a found one to the same peer.
 
 Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `peer` | string | yes |  |  |
-| `paired` | boolean | yes | True when the peer declares a link back to this node. |  |
+| `paired` | boolean | yes | True when the peer has a link back to this node, declared or found. |  |
+| `source` | string, one of `declared`, `discovered` | yes | `declared` in its capabilities file; `discovered` from its cabled ports. |  |
+| `addressed` | boolean | yes | True when its ports have addresses to meet on (`LinkPort.address`). A found link whose ports have neither an IPv4 nor an IPv6 link-local address is cabled but not addressed: it is not checked or placed on until they have one. |  |
+| `ports` | array of object |  | Its local ports, the first the one the two meet on; a port not addressed has no `address`. | items ≤ 4 |
+| `ports[].ifname` | string | yes |  |  |
+| `ports[].address` | string |  |  |  |
+| `ports[].hca` | string |  |  |  |
+| `ports[].speed_mbps` | integer |  |  | ≥ 0 |
+| `gid_index` | integer |  | The RoCE GID index it uses; a found link's is the RoCE v2 GID that carries its first port's address. | ≥ 0; ≤ 255 |
 | `check` | [LinkCheck](#schema-linkcheck) |  | The latest check of the link between the two, whichever started it; left out when none was run. |  |
 
 <a id="schema-linkcheck"></a>
@@ -7456,7 +7469,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `ifname` | string | yes | Its network interface, by the name the machine gives it. | pattern `^[A-Za-z0-9._-]{1,15}$` |
-| `address` | string | yes | Its IPv4 address on the link, without a prefix length. | pattern `^[0-9]{1,3}(\.[0-9]{1,3}){3}$` |
+| `address` | string | yes | Its address on the link, without a prefix length: IPv4, or its IPv6 link-local address (`fe80::/64`, without a scope), which a node reaches on the interface of its own end of the link. | pattern `^([0-9]{1,3}(\.[0-9]{1,3}){3}\|fe80:[0-9a-f:]{2,35})$` |
 | `hca` | string |  | Its RDMA (RoCE) device, when it has one. | pattern `^[A-Za-z0-9._-]{1,64}$` |
 
 <a id="schema-link"></a>
@@ -7471,7 +7484,31 @@ Type: object
 |---|---|---|---|---|
 | `peer` | [Slug](#schema-slug) | yes | The node at the other end. |  |
 | `ports` | array of [LinkPort](#schema-linkport) | yes | The local ports cabled to the peer, the first the one the two meet on: a model's ranks start from its address. Every port's RDMA device carries the model's traffic (`NCCL_IB_HCA`), and the first port's interface the rest (`NCCL_SOCKET_IFNAME`, `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, `UCX_NET_DEVICES`), as NVIDIA's guide to serving vLLM across two DGX Sparks sets them. A DGX Spark's one cabled QSFP port is two ports here, one for each PCIe half of its ConnectX-7. | items ≥ 1; items ≤ 4 |
-| `gid_index` | integer |  | The RoCE GID index the ports' RDMA devices use (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX Spark's ConnectX-7. | ≥ 0; ≤ 255 |
+| `gid_index` | integer |  | The RoCE GID index the ports' RDMA devices use (`NCCL_IB_GID_INDEX`), when NCCL's own choice is not the one the link's addresses are on: 3 for RoCE v2 over IPv4 on a DGX Spark's ConnectX-7, 1 for RoCE v2 over its IPv6 link-local address. A link the coordinator finds has the RoCE v2 GID that carries its first port's address. | ≥ 0; ≤ 255 |
+
+<a id="schema-cabledport"></a>
+
+### CabledPort
+
+One port of the machine with an RDMA (RoCE) device and a carrier:
+what the coordinator pairs nodes' links from (`Capabilities.ports`).
+Read from the kernel (`/sys/class/net`, `/sys/class/infiniband`)
+and its neighbour tables, never configured.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `ifname` | string | yes |  | pattern `^[A-Za-z0-9._-]{1,15}$` |
+| `mac` | string | yes | Its hardware address. | pattern `^[0-9a-f]{2}(:[0-9a-f]{2}){5}$` |
+| `speed_mbps` | integer | yes | Its link speed, in Mb/s, as the kernel says it (`speed`); 0 when it does not. | ≥ 0 |
+| `mtu` | integer |  |  | ≥ 0 |
+| `hca` | string |  | Its RDMA device. | pattern `^[A-Za-z0-9._-]{1,64}$` |
+| `addresses` | array of string |  | Its addresses with their prefix lengths, as the machine has them: IPv4 and IPv6 link-local. Others are left out. | items ≤ 8 |
+| `gids` | array of object |  | Its RDMA device's RoCE v2 GIDs, each by its index, and the address it carries. | items ≤ 8 |
+| `gids[].index` | integer | yes |  | ≥ 0; ≤ 255 |
+| `gids[].address` | string | yes | The GID as an address, an IPv4-mapped GID as its IPv4 address. |  |
+| `neighbors` | array of string |  | The hardware addresses the node sees on the link: its neighbour tables' (IPv6 neighbour discovery after a ping to all nodes on the link, `ff02::1`, and ARP after a ping to the other end of a /30 or /31) and LLDP's, where the machine runs it. | items ≤ 16 |
 
 <a id="schema-schemas-capabilities"></a>
 
@@ -7488,7 +7525,8 @@ Type: object
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
 | `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
-| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A model is placed across two nodes only when each declares the other and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
+| `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A link declared here wins over the one the coordinator finds from `ports` for the same peer. A model is placed across two nodes only when each has a link to the other, declared or found, and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
+| `ports` | array of [CabledPort](#schema-cabledport) |  | The machine's cabled ports, as the node finds them: each network interface with an RDMA (RoCE) device and a carrier. The node looks at start and again whenever a carrier comes or goes, and reports its capabilities again when what it found changed (`reportCapabilities`). The coordinator pairs two nodes' ports by what each sees on its link (`neighbors`), and uses the link it finds as a declared one (`Link`): its first port the pair of ports that share an address family (and an IPv4 subnet), each port at the address it already has, IPv4 before IPv6 link-local, and the RoCE v2 GID that carries that address as its `gid_index`. Voice configures no host networking: a port with neither address is cabled but not addressed. | items ≤ 8 |
 
 <a id="schema-seat"></a>
 
@@ -7586,8 +7624,9 @@ Type: object
 | `id` | string | yes |  |  |
 | `peer` | [Slug](#schema-slug) | yes |  |  |
 | `rank` | integer | yes |  | ≥ 0; ≤ 1 |
-| `master_addr` | string | yes | Rank 0's address on the link. |  |
+| `master_addr` | string | yes | Rank 0's address on the link; an IPv6 link-local address scoped to this node's own first port (`fe80::...%<ifname>`). |  |
 | `master_port` | integer | yes |  | ≥ 1; ≤ 65535 |
+| `link` | [Link](#schema-link) |  | This node's end of the link, as for `ClusterPart.link`. |  |
 | `image` | string | yes | The image it runs in, by digest (`<image>@sha256:...`), the runtime a model across the link would run in. |  |
 
 <a id="schema-assignment"></a>

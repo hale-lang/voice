@@ -1,0 +1,195 @@
+// The cabled ports as the node finds them (cabling.hl), on a fixture of a
+// DGX Spark's sysfs as the lab's pair lays it out: its ConnectX-7's four
+// netdevs, the two `f0` halves cabled at 200 Gb/s to the other Spark with
+// IPv4 /30s and IPv6 link-local addresses, the `f1` halves without a
+// carrier, its 10 GbE port and Wi-Fi without RDMA; and its neighbour tables
+// and LLDP as `ip` and `lldpcli` print them there.
+import ".." as node;
+
+/// The lab's Spark (`spark`), laid out under `$0`: per netdev its carrier,
+/// speed, address and MTU, and per RoCE port its GID table (RoCE v1 and v2
+/// for the IPv6 link-local address at 0 and 1, for the IPv4 one at 2 and 3),
+/// one line, as `run_out` takes an argument a line.
+const SPARK_SYSFS: String = "set -e; net=$0/sys/class/net; port() { d=$net/$1; mkdir -p $d/device; echo $2 > $d/address; echo $3 > $d/mtu; if [ -n \"$4\" ]; then echo $4 > $d/carrier; fi; if [ -n \"$5\" ]; then echo $5 > $d/speed; fi; }; gid() { p=$net/$1/device/infiniband/$2/ports/1; mkdir -p $p/gids $p/gid_attrs/types $p/gid_attrs/ndevs; echo $4 > $p/gids/$3; echo \"$5\" > $p/gid_attrs/types/$3; echo $1 > $p/gid_attrs/ndevs/$3; }; zero() { p=$net/$1/device/infiniband/$2/ports/1; mkdir -p $p/gids; echo 0000:0000:0000:0000:0000:0000:0000:0000 > $p/gids/$3; }; port enp1s0f0np0 4c:bb:47:eb:ca:11 9000 1 200000; gid enp1s0f0np0 rocep1s0f0 0 fe80:0000:0000:0000:4ebb:47ff:feeb:ca11 'IB/RoCE v1'; gid enp1s0f0np0 rocep1s0f0 1 fe80:0000:0000:0000:4ebb:47ff:feeb:ca11 'RoCE v2'; gid enp1s0f0np0 rocep1s0f0 2 0000:0000:0000:0000:0000:ffff:c0a8:6401 'IB/RoCE v1'; gid enp1s0f0np0 rocep1s0f0 3 0000:0000:0000:0000:0000:ffff:c0a8:6401 'RoCE v2'; zero enp1s0f0np0 rocep1s0f0 4; port enp1s0f1np1 4c:bb:47:eb:ca:12 1500 0 -1; zero enp1s0f1np1 rocep1s0f1 0; port enP2p1s0f0np0 4c:bb:47:eb:ca:15 9000 1 200000; gid enP2p1s0f0np0 roceP2p1s0f0 0 fe80:0000:0000:0000:4ebb:47ff:feeb:ca15 'IB/RoCE v1'; gid enP2p1s0f0np0 roceP2p1s0f0 1 fe80:0000:0000:0000:4ebb:47ff:feeb:ca15 'RoCE v2'; gid enP2p1s0f0np0 roceP2p1s0f0 2 0000:0000:0000:0000:0000:ffff:c0a8:6501 'IB/RoCE v1'; gid enP2p1s0f0np0 roceP2p1s0f0 3 0000:0000:0000:0000:0000:ffff:c0a8:6501 'RoCE v2'; zero enP2p1s0f0np0 roceP2p1s0f0 4; port enP2p1s0f1np1 4c:bb:47:eb:ca:16 1500 0 -1; zero enP2p1s0f1np1 roceP2p1s0f1 0; port enP7s7 4c:bb:47:eb:ca:10 1500 1 10000; port wlP9s9 f0:68:e3:d7:d9:34 1500; mkdir -p $net/lo && echo 00:00:00:00:00:00 > $net/lo/address";
+
+/// `ip -o addr show` on it.
+const SPARK_ADDRS: String = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n2: enP7s7    inet 10.73.20.13/24 brd 10.73.20.255 scope global dynamic noprefixroute enP7s7\\       valid_lft 67411sec preferred_lft 67411sec\n2: enP7s7    inet6 fe80::8f45:e4a2:f57d:551b/64 scope link noprefixroute \\       valid_lft forever preferred_lft forever\n3: enp1s0f0np0    inet 192.168.100.1/30 brd 192.168.100.3 scope global noprefixroute enp1s0f0np0\\       valid_lft forever preferred_lft forever\n3: enp1s0f0np0    inet6 fe80::4ebb:47ff:feeb:ca11/64 scope link \\       valid_lft forever preferred_lft forever\n5: enP2p1s0f0np0    inet 192.168.101.1/30 brd 192.168.101.3 scope global noprefixroute enP2p1s0f0np0\\       valid_lft forever preferred_lft forever\n5: enP2p1s0f0np0    inet6 fe80::4ebb:47ff:feeb:ca15/64 scope link \\       valid_lft forever preferred_lft forever\n";
+
+/// `ip neigh show` on it, after the probes: the other Spark's halves, and
+/// its own other half (a Spark's two halves share one QSFP port).
+const SPARK_NEIGH: String = "10.73.20.15 dev enP7s7 lladdr 4c:bb:47:ec:82:e1 STALE \n192.168.101.2 dev enP2p1s0f0np0 lladdr 4c:bb:47:ec:74:73 STALE \n192.168.100.2 dev enp1s0f0np0 lladdr 4c:bb:47:ec:74:6f STALE \n10.73.20.1 dev enP7s7 lladdr a8:9c:6c:9c:a8:7d REACHABLE \nfe80::4ebb:47ff:feeb:ca11 dev enP2p1s0f0np0 lladdr 4c:bb:47:eb:ca:11 STALE \nfe80::4ebb:47ff:feec:746f dev enp1s0f0np0 lladdr 4c:bb:47:ec:74:6f STALE \nfe80::4ebb:47ff:feeb:ca15 dev enp1s0f0np0 lladdr 4c:bb:47:eb:ca:15 STALE \nfe80::4ebb:47ff:feec:7473 dev enp1s0f0np0 lladdr 4c:bb:47:ec:74:73 STALE \n192.168.100.9 dev enp1s0f0np0  FAILED \n";
+
+/// `lldpcli -f keyvalue show neighbors` on it.
+const SPARK_LLDP: String = "lldp.enP7s7.via=LLDP\nlldp.enP7s7.chassis.mac=a8:9c:6c:b0:f6:af\nlldp.enp1s0f0np0.via=LLDP\nlldp.enp1s0f0np0.chassis.mac=4c:bb:47:ec:74:6e\nlldp.enp1s0f0np0.chassis.name=flare\nlldp.enp1s0f0np0.port.mac=4c:bb:47:ec:74:6f\nlldp.enP2p1s0f0np0.chassis.name=flare\nlldp.enP2p1s0f0np0.port.mac=4c:bb:47:ec:74:73\nlldp.enP2p1s0f0np0.port.descr=enP2p1s0f0np0\n";
+
+fn main() {
+    let root = std::str::trim(node::run_out("mktemp\n-d"));
+    node::run_out("sh\n-c\n" + SPARK_SYSFS + "\n" + root);
+
+    std::test::assert_eq_str(
+        node::carriers(root),
+        "enP2p1s0f0np0 1\nenP2p1s0f1np1 0\nenp1s0f0np0 1\nenp1s0f1np1 0\n",
+        "the interfaces with an RDMA device, and their carriers; the 10 GbE port and Wi-Fi have none",
+    );
+
+    let seen = node::neighbor_lines(SPARK_NEIGH) + node::lldp_lines(SPARK_LLDP);
+    std::test::assert(
+        std::str::contains(seen, "enp1s0f0np0 4c:bb:47:ec:74:6f\n")
+            && std::str::contains(seen, "enP2p1s0f0np0 4c:bb:47:ec:74:73\n")
+            && !std::str::contains(seen, "192.168.100.9"),
+        "each table's entries with a hardware address, by interface: " + seen,
+    );
+
+    let ports = node::cabled_ports(root, SPARK_ADDRS, seen);
+    let first = std::json::array_first(ports);
+    let a = first.element;
+    let second = std::json::array_next(first);
+    let b = second.element;
+    std::test::assert(
+        !first.done && !second.done && std::json::array_next(second).done,
+        "the two cabled halves: " + ports,
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(a, "ifname"),
+        "enP2p1s0f0np0",
+        "sorted by interface",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(b, "ifname"),
+        "enp1s0f0np0",
+        "the other half",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(b, "mac"),
+        "4c:bb:47:eb:ca:11",
+        "its hardware address",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(b, "speed_mbps"), 200000, "200 Gb/s");
+    std::test::assert_eq_int(std::json::find_int_field(b, "mtu"), 9000, "jumbo frames");
+    std::test::assert_eq_str(
+        std::json::find_string_field(b, "hca"),
+        "rocep1s0f0",
+        "its RDMA device",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(b, "addresses")),
+        "[\"192.168.100.1/30\", \"fe80::4ebb:47ff:feeb:ca11/64\"]",
+        "its IPv4 and link-local addresses, with their prefixes",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(b, "gids")),
+        "[{\"index\": 1, \"address\": \"fe80::4ebb:47ff:feeb:ca11\"}, {\"index\": 3, \"address\": \"192.168.100.1\"}]",
+        "its RoCE v2 GIDs alone, each by index and address",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(b, "neighbors")),
+        "[\"4c:bb:47:eb:ca:15\", \"4c:bb:47:ec:74:6f\", \"4c:bb:47:ec:74:73\"]",
+        "what it sees, once each and sorted, its own address left out",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(a, "neighbors")),
+        "[\"4c:bb:47:eb:ca:11\", \"4c:bb:47:ec:74:73\"]",
+        "and the other half's, from both",
+    );
+    std::test::assert_eq_str(
+        node::cabled_ports(root, "", ""),
+        node::cabled_ports(root, "", ""),
+        "a look is the same twice",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::cabled_ports(root, "", ""),
+            "\"addresses\": [], \"gids\": [{\"index\": 1",
+        ),
+        "a port with no address is still cabled",
+    );
+    std::test::assert_eq_str(
+        node::cabled_ports(root + "/none", "", ""),
+        "[]",
+        "no sysfs, no ports",
+    );
+
+    // a GID as an address, as `ip` writes it
+    std::test::assert_eq_str(
+        node::gid_address("0000:0000:0000:0000:0000:ffff:c0a8:6401"),
+        "192.168.100.1",
+        "IPv4-mapped",
+    );
+    std::test::assert_eq_str(
+        node::gid_address("fe80:0000:0000:0000:4ebb:47ff:feeb:ca11"),
+        "fe80::4ebb:47ff:feeb:ca11",
+        "link-local",
+    );
+    std::test::assert_eq_str(
+        node::ipv6_text("2001:0db8:0000:0000:0001:0000:0000:0001"),
+        "2001:db8::1:0:0:1",
+        "the first of two equal runs",
+    );
+    std::test::assert_eq_str(
+        node::ipv6_text("2001:0db8:0000:0001:0001:0001:0001:0001"),
+        "2001:db8:0:1:1:1:1:1",
+        "a lone zero group stays",
+    );
+    std::test::assert_eq_str(
+        node::ipv6_text("0000:0000:0000:0000:0000:0000:0000:0001"),
+        "::1",
+        "a leading run",
+    );
+    std::test::assert_eq_str(
+        node::ipv6_text("fe80:0000:0000:0000:0000:0000:0000:0000"),
+        "fe80::",
+        "a trailing run",
+    );
+
+    // the probes: every node on a link-local link, the other end of a /30
+    std::test::assert_eq_str(
+        node::probes(SPARK_ADDRS, "enp1s0f0np0"),
+        "ping\n-c\n1\n-W\n1\n-I\nenp1s0f0np0\n192.168.100.2\n\nping\n-6\n-c\n1\n-w\n1\nff02::1%enp1s0f0np0\n\n",
+        "both families probed",
+    );
+    std::test::assert_eq_str(
+        node::point_to_point_peer("192.168.100.2/30"),
+        "192.168.100.1",
+        "a /30's other host",
+    );
+    std::test::assert_eq_str(
+        node::point_to_point_peer("10.0.0.4/31"),
+        "10.0.0.5",
+        "a /31's other address",
+    );
+    std::test::assert_eq_str(
+        node::point_to_point_peer("192.168.100.2/24"),
+        "",
+        "a /24 has no one other end",
+    );
+    // the lab's other pair: IPv4 /24s, IPv6 off on the link
+    let negra = "3: enp1s0f0np0    inet 192.168.100.2/24 brd 192.168.100.255 scope global noprefixroute enp1s0f0np0\\       valid_lft forever preferred_lft forever\n";
+    std::test::assert_eq_str(
+        node::port_addresses(negra, "enp1s0f0np0"),
+        "192.168.100.2/24\n",
+        "an IPv4 /24 alone",
+    );
+    std::test::assert_eq_str(
+        node::probes(negra, "enp1s0f0np0"),
+        "",
+        "nothing to ping: its ARP table and LLDP say",
+    );
+
+    std::test::assert_eq_str(
+        node::with_ports("{\"max_in_flight\": 1}", "[{\"ifname\": \"x\"}]"),
+        "{\"max_in_flight\": 1, \"ports\": [{\"ifname\": \"x\"}]}",
+        "the ports declared with the capabilities",
+    );
+    std::test::assert_eq_str(
+        node::with_ports("{\"max_in_flight\": 1}", "[]"),
+        "{\"max_in_flight\": 1}",
+        "none, left out",
+    );
+    std::test::assert_eq_str(
+        node::union_lines("a\n", "b\na\n"),
+        "a\nb\n",
+        "what was seen is kept, once",
+    );
+
+    node::run_out("rm\n-rf\n" + root);
+}

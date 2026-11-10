@@ -51,11 +51,18 @@ type LinkCheck {
     finished_at: Time = `1970-01-01T00:00:00Z`;
 }
 
-/// `NodeLink` (openapi.yaml): one link a node declared, as the coordinator
-/// sees it.
+/// `NodeLink` (openapi.yaml): one link a node has, as the coordinator sees
+/// it: declared, or found from its cabled ports (cabling.hl).
 type NodeLink {
     peer: String;
     paired: Bool;
+    // `declared` or `discovered`
+    source: String = "declared";
+    addressed: Bool = true;
+    // its ports, as a JSON list's insides
+    ports: String = "";
+    has_gid_index: Bool = false;
+    gid_index: Int = 0;
     has_check: Bool = false;
     check: LinkCheck = no_check();
 }
@@ -98,6 +105,8 @@ type LinkJob {
     master_addr: String = "";
     master_port: Int = 0;
     image: String = "";
+    // the node's end of the link (`Link` JSON), "" when it has none
+    link: String = "";
 }
 
 type LinkJobs { items: bounded[LinkJob; 4]; }
@@ -272,25 +281,30 @@ fn pair_link_problem(rows: st::LinkCheckRows, a: String, b: String, now: Time) -
         + c.reason;
 }
 
-/// The ranks of checks node `node` is to run at `now`: those it has a rank
-/// in, still running, that it has not reported.
+/// The ranks of checks node `node` (its capabilities with its links as the
+/// coordinator uses them, `caps`: cabling.hl `linked`) is to run at `now`:
+/// those it has a rank in, still running, that it has not reported, each
+/// with the node's end of the link and rank 0's address as it reaches it.
 @bounded_by(rows)
-fn link_jobs(rows: st::LinkCheckRows, node: String, now: Time) -> LinkJobs {
+fn link_jobs(rows: st::LinkCheckRows, node: String, caps: String, now: Time) -> LinkJobs {
     let mut out = LinkJobs { };
     for r in rows.rows {
         let rank = if r.node_a == node { 0 } else if r.node_b == node { 1 } else { -1 };
         if rank < 0 { continue; }
         if (rank == 0 && len(r.result_a) > 0) || (rank == 1 && len(r.result_b) > 0) { continue; }
         if link_check_of(r, now).status != LinkCheckStatus::running { continue; }
+        let peer = if rank == 0 { r.node_b } else { r.node_a };
+        let link = link_to(caps, peer);
         push(
             out.items,
             LinkJob {
                 id: r.id,
-                peer: if rank == 0 { r.node_b } else { r.node_a },
+                peer: peer,
                 rank: rank,
-                master_addr: r.master_addr,
+                master_addr: reached_from(r.master_addr, link),
                 master_port: LINK_CHECK_PORT,
                 image: r.image,
+                link: link,
             },
         ) or discard;
     }
@@ -304,42 +318,95 @@ fn link_jobs_json(jobs: LinkJobs) -> String {
             "{\"id\": " + jq(j.id) + ", \"peer\": " + jq(j.peer) + ", \"rank\": "
                 + to_string(j.rank) + ", \"master_addr\": " + jq(j.master_addr)
                 + ", \"master_port\": " + to_string(j.master_port) + ", \"image\": "
-                + jq(j.image) + "}",
+                + jq(j.image) + (if len(j.link) > 0 { ", \"link\": " + j.link } else { "" }) + "}",
         );
     }
     return out.text();
 }
 
-/// The links node `node` declared (`capabilities`), each with whether its
-/// peer declares one back and its latest check.
+/// The links node `node` has (`capabilities`, its declared ones), each with
+/// whether its peer has one back and its latest check: those it declares,
+/// then those found from its cabled ports and its peers' (cabling.hl),
+/// addressed or not, at most four.
 fn node_links(
     store: st::Store,
     node: String,
     capabilities: String
 ) -> NodeLinks fallible(st::StoreError) {
     let mut out = NodeLinks { };
-    let peers = link_peers(capabilities);
-    if len(peers) == 0 { return out; }
+    let fleet = fleet_caps(store) or raise;
     let rows = store.link_checks() or raise;
     let now = now_seconds();
-    let mut rest = peers;
-    while len(rest) > 0 {
-        let nl = std::str::index_of(rest, "\n");
-        let peer = rest[0..nl];
-        rest = rest[(nl + 1)..len(rest)];
+    let mut declared = "\n";
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "links"));
+    while !it.done {
+        let l = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        let peer = std::json::find_string_field(l, "peer");
+        declared = declared + peer + "\n";
         let f = store.fleet(peer) or raise;
-        let mut l = NodeLink {
+        let back = f.present
+            && len(
+                link_ports(
+                    with_links(f.capabilities, effective_links(fleet, peer, f.capabilities)),
+                    node,
+                ),
+            )
+            > 0;
+        let mut v = NodeLink {
             peer: peer,
-            paired: f.present && len(link_ports(f.capabilities, node)) > 0,
+            paired: back,
+            ports: list_insides(std::json::find_field_raw(l, "ports")),
         };
-        let r = latest_check(rows, node, peer);
-        if r.present {
-            l.has_check = true;
-            l.check = link_check_of(r, now);
+        if std::json::string_field(l, "gid_index").kind == "number" {
+            v.has_gid_index = true;
+            v.gid_index = std::json::find_int_field(l, "gid_index");
         }
-        push(out.items, l) or discard;
+        push(out.items, with_check(v, rows, node, now)) or discard;
+    }
+    for o in fleet.items {
+        if o.id == node || std::str::contains(declared, "\n" + o.id + "\n") { continue; }
+        let f = found_link(node, capabilities, o.id, o.capabilities);
+        if !f.cabled { continue; }
+        let mut v = NodeLink {
+            peer: o.id,
+            paired: len(
+                link_ports(
+                    with_links(o.capabilities, effective_links(fleet, o.id, o.capabilities)),
+                    node,
+                ),
+            )
+                > 0
+                || (!f.addressed && found_link(o.id, o.capabilities, node, capabilities).cabled),
+            source: "discovered",
+            addressed: f.addressed,
+            ports: f.ports,
+        };
+        if f.addressed && std::json::string_field(f.link, "gid_index").kind == "number" {
+            v.has_gid_index = true;
+            v.gid_index = std::json::find_int_field(f.link, "gid_index");
+        }
+        push(out.items, with_check(v, rows, node, now)) or discard;
     }
     return out;
+}
+
+/// A link's view with its latest check, when it has one.
+fn with_check(l: NodeLink, rows: st::LinkCheckRows, node: String, now: Time) -> NodeLink {
+    let mut v = l;
+    let r = latest_check(rows, node, l.peer);
+    if r.present {
+        v.has_check = true;
+        v.check = link_check_of(r, now);
+    }
+    return v;
+}
+
+/// A JSON list's insides: what is between its brackets.
+fn list_insides(list: String) -> String {
+    let t = std::str::trim(list);
+    if len(t) < 2 || !std::str::starts_with(t, "[") { return ""; }
+    return std::str::trim(t[1..(len(t) - 1)]);
 }
 
 fn link_check_json(c: LinkCheck) -> String {
@@ -365,7 +432,10 @@ fn node_links_json(links: NodeLinks) -> String {
     let out = st::JsonList { };
     for l in links.items {
         out.add(
-            "{\"peer\": " + jq(l.peer) + ", \"paired\": " + jbool(l.paired)
+            "{\"peer\": " + jq(l.peer) + ", \"paired\": " + jbool(l.paired) + ", \"source\": "
+                + jq(l.source) + ", \"addressed\": " + jbool(l.addressed) + ", \"ports\": ["
+                + l.ports + "]"
+                + (if l.has_gid_index { ", \"gid_index\": " + to_string(l.gid_index) } else { "" })
                 + (if l.has_check { ", \"check\": " + link_check_json(l.check) } else { "" })
                 + "}",
         );
@@ -444,11 +514,11 @@ fn check_link_in(
     can_run_rank(store, nb, now) or raise;
     let fa = store.fleet(a) or fail store_down(err);
     let fb = store.fleet(b) or fail store_down(err);
-    let ports = link_ports(fa.capabilities, b);
-    if len(ports) == 0 { fail bad("node " + a + " declares no link to " + b, "peer"); }
-    if len(link_ports(fb.capabilities, a)) == 0 {
-        fail bad("node " + b + " declares no link to " + a, "peer");
-    }
+    let caps_a = linked(store, a, fa.capabilities) or fail store_down(err);
+    let caps_b = linked(store, b, fb.capabilities) or fail store_down(err);
+    let ports = link_ports(caps_a, b);
+    if len(ports) == 0 { fail bad(no_link(a, fa.capabilities, b), "peer"); }
+    if len(link_ports(caps_b, a)) == 0 { fail bad(no_link(b, fb.capabilities, a), "peer"); }
     let hw_a = std::str::trim(std::json::find_field_raw(fa.capabilities, "hardware"));
     let hw_b = std::str::trim(std::json::find_field_raw(fb.capabilities, "hardware"));
     if len(hw_a) == 0 || len(hw_b) == 0 {
@@ -483,6 +553,18 @@ fn check_link_in(
     tell_assignment(store, link, a) or fail store_down(err);
     tell_assignment(store, link, b) or fail store_down(err);
     return link_check_of(row, now);
+}
+
+/// Why node `a` (`caps`, as it declared them) has no link to `b` to use:
+/// cabled but not addressed, or neither declared nor found.
+fn no_link(a: String, caps: String, b: String) -> String {
+    if has_ports(caps) {
+        return "node " + a + " has no addressed link to " + b
+            + ": its capabilities declare none, and none of its cabled ports reaches " + b
+            + " on an IPv4 or IPv6 link-local address";
+    }
+    return "node " + a + " has no link to " + b
+        + ": its capabilities declare none, and it found no cabled port";
 }
 
 /// A node that can run its rank now: not revoked, and up.

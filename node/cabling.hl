@@ -1,0 +1,547 @@
+// The machine's cabled ports (protocol.yaml `CabledPort`), found, never
+// configured: each network interface with an RDMA (RoCE) device and a
+// carrier, its hardware address, speed and MTU, its IPv4 and IPv6
+// link-local addresses, the RoCE v2 GIDs that carry them, and the hardware
+// addresses the node sees on its link. The node declares them in its
+// capabilities (`Capabilities.ports`), and the coordinator pairs two nodes'
+// ports by what each sees on its link: a link between them needs no
+// declaration. What is seen comes from the kernel's neighbour tables, after
+// a ping to every node on the link (IPv6, `ff02::1`) or to the other end of
+// a /30 or /31 (IPv4), and from LLDP where the machine runs it.
+//
+// `Cabling` looks again every few seconds at the carriers alone (sysfs
+// reads), and probes the links when one comes or goes, and every minute
+// while a cabled port has seen no one. What it finds goes to the plane
+// (`PortsFound`), which reports the node's capabilities again.
+
+/// The most ports a node declares (`Capabilities.ports`).
+const PORTS_MAX: Int = 8;
+
+/// The most hardware addresses a port declares it sees.
+const NEIGHBORS_MAX: Int = 16;
+
+/// How many of an RDMA port's GID table entries are read.
+const GIDS_READ: Int = 64;
+
+/// The interfaces under `root` ("" for the machine's own; a test's) with
+/// an RDMA device, and their carriers, one `<ifname> <carrier>` a line,
+/// sorted: what is compared every few seconds to see a cable come or go.
+@unbounded
+fn carriers(root: String) -> String {
+    let dir = root + "/sys/class/net";
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let mut out = "";
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if len(rdma_device(root, name)) == 0 { continue; }
+        let carrier = std::str::trim(std::io::fs::read_file(dir + "/" + name + "/carrier") or "");
+        out = out + name + " " + (if carrier == "1" { "1" } else { "0" }) + "\n";
+    }
+    return sorted_lines(out);
+}
+
+/// The RDMA device of interface `ifname` under `root`, "" for none: the
+/// first under its device's `infiniband`. Once a port a look.
+@unbounded
+fn rdma_device(root: String, ifname: String) -> String {
+    let dir = root + "/sys/class/net/" + ifname + "/device/infiniband";
+    if (std::io::fs::list_dir_count(dir) or 0) == 0 { return ""; }
+    return std::io::fs::list_dir_at(dir, 0) or "";
+}
+
+/// The cabled ports under `root` as `Capabilities.ports` takes them (a
+/// JSON list, sorted by interface, at most `PORTS_MAX`): each interface
+/// with an RDMA device and a carrier, its addresses from `ip -o addr show`
+/// (`addrs`), its RoCE v2 GIDs from sysfs, and what it sees on its link,
+/// `seen` (`<ifname> <mac>` a line: `neighbor_lines`, `lldp_lines`).
+@unbounded
+fn cabled_ports(root: String, addrs: String, seen: String) -> String {
+    let lines = carriers(root);
+    let out = std::bytes::BytesBuilder { initial_cap: 512 };
+    let mut n = 0;
+    let mut rest = lines;
+    while len(rest) > 0 && n < PORTS_MAX {
+        let nl = std::str::index_of(rest, "\n");
+        let line = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        if !std::str::ends_with(line, " 1") { continue; }
+        let ifname = line[0..(len(line) - 2)];
+        if n > 0 { out.append_str(", "); }
+        n = n + 1;
+        out.append_str(port_json(root, ifname, addrs, seen));
+    }
+    let b = out.snapshot() or b"";
+    return "[" + std::str::from_bytes(b) + "]";
+}
+
+/// One cabled port as `CabledPort` JSON.
+@unbounded
+fn port_json(root: String, ifname: String, addrs: String, seen: String) -> String {
+    let dir = root + "/sys/class/net/" + ifname;
+    let mac = std::str::lower(std::str::trim(std::io::fs::read_file(dir + "/address") or ""));
+    let speed = std::str::parse_int(
+        std::str::trim(std::io::fs::read_file(dir + "/speed") or ""),
+    ) or 0;
+    let mtu = std::str::parse_int(std::str::trim(std::io::fs::read_file(dir + "/mtu") or "")) or 0;
+    let hca = rdma_device(root, ifname);
+    let own = port_addresses(addrs, ifname);
+    let mut s = "{\"ifname\": \"" + std::json::escape_string(ifname) + "\", \"mac\": \""
+        + std::json::escape_string(mac) + "\", \"speed_mbps\": "
+        + to_string(if speed > 0 { speed } else { 0 }) + ", \"mtu\": "
+        + to_string(if mtu > 0 { mtu } else { 0 }) + ", \"hca\": \""
+        + std::json::escape_string(hca) + "\"";
+    s = s + ", \"addresses\": [" + quoted_lines(own, 8) + "]";
+    s = s + ", \"gids\": [" + roce_v2_gids(root, ifname, hca) + "]";
+    s = s + ", \"neighbors\": [" + quoted_lines(port_neighbors(seen, ifname, mac), NEIGHBORS_MAX)
+        + "]";
+    return s + "}";
+}
+
+/// `ip -o addr show`'s addresses of interface `ifname`, one a line with
+/// its prefix length: IPv4, and IPv6 link-local; others left out.
+@bounded_by(addrs)
+fn port_addresses(addrs: String, ifname: String) -> String {
+    let mut out = "";
+    let mut rest = addrs;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        let words = std::str::replace(std::str::replace(line, "\t", " "), "\\", " ");
+        if !std::str::contains(" " + words + " ", " " + ifname + " ") { continue; }
+        let v4 = word_after(words, "inet");
+        if len(v4) > 0 {
+            out = out + v4 + "\n";
+            continue;
+        }
+        let v6 = word_after(words, "inet6");
+        if std::str::starts_with(v6, "fe80:") { out = out + v6 + "\n"; }
+    }
+    return out;
+}
+
+/// The word after `key` in a line of words, "" when there is none.
+@bounded_by(line)
+fn word_after(line: String, key: String) -> String {
+    let at = std::str::index_of(" " + line + " ", " " + key + " ");
+    if at < 0 { return ""; }
+    let rest = std::str::trim(line[(at + len(key))..len(line)]);
+    let sp = std::str::index_of(rest, " ");
+    return if sp >= 0 { rest[0..sp] } else { rest };
+}
+
+/// The RoCE v2 GIDs of `hca`'s port 1 that belong to `ifname`, as
+/// `CabledPort.gids`' members: each its index and the address it carries.
+@unbounded
+fn roce_v2_gids(root: String, ifname: String, hca: String) -> String {
+    if len(hca) == 0 { return ""; }
+    let dir = root + "/sys/class/net/" + ifname + "/device/infiniband/" + hca + "/ports/1";
+    let count = std::io::fs::list_dir_count(dir + "/gids") or 0;
+    let mut out = "";
+    let mut n = 0;
+    let mut i = 0;
+    while i < count && i < GIDS_READ && n < 8 {
+        let gid = std::str::lower(
+            std::str::trim(std::io::fs::read_file(dir + "/gids/" + to_string(i)) or ""),
+        );
+        let index = i;
+        i = i + 1;
+        if len(gid) == 0 || gid == "0000:0000:0000:0000:0000:0000:0000:0000" { continue; }
+        let kind = std::str::trim(
+            std::io::fs::read_file(dir + "/gid_attrs/types/" + to_string(index)) or "",
+        );
+        if kind != "RoCE v2" { continue; }
+        let ndev = std::str::trim(
+            std::io::fs::read_file(dir + "/gid_attrs/ndevs/" + to_string(index)) or "",
+        );
+        if len(ndev) > 0 && ndev != ifname { continue; }
+        if n > 0 { out = out + ", "; }
+        n = n + 1;
+        out = out + "{\"index\": " + to_string(index) + ", \"address\": \""
+            + std::json::escape_string(gid_address(gid)) + "\"}";
+    }
+    return out;
+}
+
+/// A GID as sysfs writes it (eight groups of four hex digits) as the
+/// address it carries: an IPv4-mapped one as its IPv4 address, any other
+/// as IPv6 as `ip` writes it (RFC 5952: leading zeros dropped, the longest
+/// run of two or more zero groups as `::`). Once a GID a probe.
+@unbounded
+fn gid_address(gid: String) -> String {
+    if std::str::starts_with(gid, "0000:0000:0000:0000:0000:ffff:") && len(gid) == 39 {
+        let hi = hex_value(gid[30..34]);
+        let lo = hex_value(gid[35..39]);
+        return to_string(hi / 256) + "." + to_string(hi % 256) + "." + to_string(lo / 256) + "."
+            + to_string(lo % 256);
+    }
+    return ipv6_text(gid);
+}
+
+/// Hex digits' value, lower case; -1 for anything else.
+@bounded_by(s)
+fn hex_value(s: String) -> Int {
+    let v = std::str::bytes_view(s);
+    let mut n = 0;
+    let mut i = 0;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        let d = if b >= 48 && b <= 57 { b - 48 } else if b >= 97 && b <= 102 { b - 87 } else { -1 };
+        if d < 0 { return -1; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// Eight colon-separated groups as RFC 5952 writes them.
+@bounded_by(full)
+fn ipv6_text(full: String) -> String {
+    let groups = std::bytes::BytesBuilder { initial_cap: 40 };
+    let mut parts = "";
+    let mut rest = full + ":";
+    let mut count = 0;
+    while len(rest) > 0 && count < 8 {
+        let c = std::str::index_of(rest, ":");
+        let g = rest[0..c];
+        rest = rest[(c + 1)..len(rest)];
+        let mut k = 0;
+        while k < len(g) - 1 && g[k..(k + 1)] == "0" {
+            k = k + 1;
+        }
+        parts = parts + g[k..len(g)] + "\n";
+        count = count + 1;
+    }
+    if count != 8 { return full; }
+    // the longest run of zero groups, two or more, the first of equals
+    let mut best_at = -1;
+    let mut best_len = 0;
+    let mut run_at = -1;
+    let mut run_len = 0;
+    let mut i = 0;
+    let mut scan = parts;
+    while i < 8 {
+        let nl = std::str::index_of(scan, "\n");
+        let g = scan[0..nl];
+        scan = scan[(nl + 1)..len(scan)];
+        if g == "0" {
+            if run_at < 0 { run_at = i; }
+            run_len = run_len + 1;
+            if run_len > best_len {
+                best_at = run_at;
+                best_len = run_len;
+            }
+        } else {
+            run_at = -1;
+            run_len = 0;
+        }
+        i = i + 1;
+    }
+    if best_len < 2 { best_at = -1; }
+    i = 0;
+    scan = parts;
+    let mut prev_gap = false;
+    while i < 8 {
+        let nl = std::str::index_of(scan, "\n");
+        let g = scan[0..nl];
+        scan = scan[(nl + 1)..len(scan)];
+        if best_at >= 0 && i >= best_at && i < best_at + best_len {
+            if i == best_at { groups.append_str("::"); }
+            prev_gap = true;
+        } else {
+            if i > 0 && !prev_gap { groups.append_str(":"); }
+            groups.append_str(g);
+            prev_gap = false;
+        }
+        i = i + 1;
+    }
+    let b = groups.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// What `ip neigh show` says each interface sees, as `<ifname> <mac>`
+/// lines: every entry with a hardware address.
+@bounded_by(neigh)
+fn neighbor_lines(neigh: String) -> String {
+    let mut out = "";
+    let mut rest = neigh;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        let dev = word_after(line, "dev");
+        let mac = std::str::lower(word_after(line, "lladdr"));
+        if len(dev) > 0 && is_mac(mac) { out = out + dev + " " + mac + "\n"; }
+    }
+    return out;
+}
+
+/// What LLDP says each interface sees (`lldpcli -f keyvalue show
+/// neighbors`), as `<ifname> <mac>` lines: each neighbour's port, by its
+/// hardware address.
+@bounded_by(lldp)
+fn lldp_lines(lldp: String) -> String {
+    let mut out = "";
+    let mut rest = lldp;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = std::str::trim(if nl >= 0 { rest[0..nl] } else { rest });
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        if !std::str::starts_with(line, "lldp.") { continue; }
+        let at = std::str::index_of(line, ".port.mac=");
+        if at < 0 { continue; }
+        let ifname = line[5..at];
+        let mac = std::str::lower(line[(at + 10)..len(line)]);
+        if len(ifname) > 0 && is_mac(mac) { out = out + ifname + " " + mac + "\n"; }
+    }
+    return out;
+}
+
+/// The hardware addresses `seen` lists for `ifname`, its own (`mac`) and
+/// any twice left out, one a line, sorted.
+@bounded_by(seen)
+fn port_neighbors(seen: String, ifname: String, mac: String) -> String {
+    let mut out = "\n";
+    let mut rest = seen;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        if !std::str::starts_with(line, ifname + " ") { continue; }
+        let m = line[(len(ifname) + 1)..len(line)];
+        if m == mac || std::str::contains(out, "\n" + m + "\n") { continue; }
+        out = out + m + "\n";
+    }
+    return sorted_lines(out[1..len(out)]);
+}
+
+/// `aa:bb:cc:dd:ee:ff`, lower case, and not all zeros.
+fn is_mac(s: String) -> Bool {
+    if len(s) != 17 || s == "00:00:00:00:00:00" { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = 0;
+    while i < 17 {
+        let b = std::str::byte_at(v, i);
+        let ok = if i % 3 == 2 { b == 58 } else { (b >= 48 && b <= 57) || (b >= 97 && b <= 102) };
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// Lines, each as a JSON string, comma separated, the first `max`.
+@bounded_by(lines)
+fn quoted_lines(lines: String, max: Int) -> String {
+    let mut out = "";
+    let mut n = 0;
+    let mut rest = lines;
+    while len(rest) > 0 && n < max {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        if len(line) == 0 { continue; }
+        if n > 0 { out = out + ", "; }
+        out = out + "\"" + std::json::escape_string(line) + "\"";
+        n = n + 1;
+    }
+    return out;
+}
+
+/// Lines (each ending in a newline), sorted.
+@unbounded
+fn sorted_lines(lines: String) -> String {
+    let mut out = "";
+    let mut rest = lines;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        // insert before the first line that sorts after it
+        let mut before = "";
+        let mut after = out;
+        while len(after) > 0 {
+            let e = std::str::index_of(after, "\n");
+            let other = after[0..e];
+            if other > line { break; }
+            before = before + other + "\n";
+            after = after[(e + 1)..len(after)];
+        }
+        out = before + line + "\n" + after;
+    }
+    return out;
+}
+
+/// The lines of `a`, then those of `b` that `a` has not, at most 256.
+@unbounded
+fn union_lines(a: String, b: String) -> String {
+    let mut out = a;
+    let mut rest = b;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl >= 0 { rest[0..nl] } else { rest };
+        rest = if nl >= 0 { rest[(nl + 1)..len(rest)] } else { "" };
+        if len(line) == 0 || std::str::contains("\n" + out, "\n" + line + "\n") { continue; }
+        out = out + line + "\n";
+    }
+    let mut count = 0;
+    let mut scan = out;
+    while len(scan) > 0 {
+        let nl = std::str::index_of(scan, "\n");
+        scan = scan[(nl + 1)..len(scan)];
+        count = count + 1;
+    }
+    return if count > 256 { a } else { out };
+}
+
+/// The capabilities `caps` (a JSON object) with the cabled ports `ports`
+/// (`cabled_ports`), when there are any.
+fn with_ports(caps: String, ports: String) -> String {
+    let p = std::str::trim(ports);
+    if len(p) == 0 || p == "[]" { return caps; }
+    let c = std::str::trim(caps);
+    if !std::str::ends_with(c, "}") { return caps; }
+    return c[0..(len(c) - 1)] + ", \"ports\": " + p + "}";
+}
+
+/// The pings that make a cabled port's neighbours known, one argv a line
+/// group (`\n\n` between): every node on the link for one with an IPv6
+/// link-local address, the other end of a /30 or /31 for an IPv4 one.
+/// `addrs` is `ip -o addr show`'s output, `ifname` the port's.
+@bounded_by(addrs)
+fn probes(addrs: String, ifname: String) -> String {
+    let mut out = "";
+    let mut rest = port_addresses(addrs, ifname);
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let a = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        if std::str::starts_with(a, "fe80:") {
+            out = out + "ping\n-6\n-c\n1\n-w\n1\nff02::1%" + ifname + "\n\n";
+            continue;
+        }
+        let other = point_to_point_peer(a);
+        if len(other) > 0 {
+            out = out + "ping\n-c\n1\n-W\n1\n-I\n" + ifname + "\n" + other + "\n\n";
+        }
+    }
+    return out;
+}
+
+/// The other end of a /30 or /31 IPv4 address (`a.b.c.d/len`), "" for
+/// any other prefix.
+fn point_to_point_peer(cidr: String) -> String {
+    let slash = std::str::index_of(cidr, "/");
+    if slash < 0 { return ""; }
+    let prefix = std::str::parse_int(cidr[(slash + 1)..len(cidr)]) or 0;
+    let addr = cidr[0..slash];
+    let dot = last_dot(addr);
+    if dot < 0 { return ""; }
+    let last = std::str::parse_int(addr[(dot + 1)..len(addr)]) or - 1;
+    if last < 0 || last > 255 { return ""; }
+    let head = addr[0..(dot + 1)];
+    if prefix == 31 { return head + to_string(if last % 2 == 0 { last + 1 } else { last - 1 }); }
+    if prefix == 30 {
+        let host = last % 4;
+        if host == 1 { return head + to_string(last + 1); }
+        if host == 2 { return head + to_string(last - 1); }
+    }
+    return "";
+}
+
+@bounded_by(s)
+fn last_dot(s: String) -> Int {
+    let mut i = len(s) - 1;
+    while i >= 0 {
+        if s[i..(i + 1)] == "." { return i; }
+        i = i - 1;
+    }
+    return -1;
+}
+
+/// The cabled ports found, as `Capabilities.ports` JSON.
+type FoundPorts { ports: String = "[]"; }
+
+topic PortsFound { payload: FoundPorts; }
+
+/// How often the links are probed while a cabled port has seen no one, and
+/// the neighbour tables read again.
+const PROBE_EVERY_NS: Int = 60000000000;
+
+/// Finds the machine's cabled ports, and tells the plane when what it
+/// finds changes.
+locus Cabling {
+    params {
+        // the ports last told (`Capabilities.ports`), as the node started
+        // with them
+        ports: String = "[]";
+        // the carriers last read (`carriers`)
+        last: String = "";
+        // what each port has seen since its carrier came, `<ifname> <mac>`
+        // a line
+        seen: String = "";
+        // monotonic ns
+        next_probe: Int = 0;
+    }
+
+    bus {
+        publish PortsFound;
+    }
+
+    // the carriers every five seconds
+    run() {
+        while !self.draining {
+            self.step();
+            std::time::sleep(5000ms);
+        }
+    }
+
+    @unbounded
+    fn step() {
+        let now_carriers = carriers("");
+        let changed = now_carriers != self.last;
+        if changed {
+            self.last = now_carriers;
+            self.seen = "";
+        }
+        if !changed && std::time::monotonic_ns() < self.next_probe { return; }
+        self.next_probe = std::time::monotonic_ns() + PROBE_EVERY_NS;
+        let addrs = run_out("ip\n-o\naddr\nshow");
+        // a port that has seen no one yet is probed
+        let mut rest = now_carriers;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let line = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            if !std::str::ends_with(line, " 1") { continue; }
+            let ifname = line[0..(len(line) - 2)];
+            if std::str::contains("\n" + self.seen, "\n" + ifname + " ") { continue; }
+            self.probe(probes(addrs, ifname));
+        }
+        self.seen = union_lines(
+            self.seen,
+            neighbor_lines(run_out("ip\nneigh\nshow"))
+                + lldp_lines(run_out("lldpcli\n-f\nkeyvalue\nshow\nneighbors")),
+        );
+        let ports = cabled_ports("", addrs, self.seen);
+        if ports != self.ports {
+            self.ports = ports;
+            log_info("cabled ports found", std::log::kv("ports", ports));
+            PortsFound <- FoundPorts { ports: ports };
+        }
+    }
+
+    /// Each ping in `argvs` (`probes`), its answer not waited on past a
+    /// second.
+    @unbounded
+    fn probe(argvs: String) {
+        let mut rest = argvs;
+        while len(rest) > 0 {
+            let end = std::str::index_of(rest, "\n\n");
+            if end < 0 { return; }
+            run_out(rest[0..end]);
+            rest = rest[(end + 2)..len(rest)];
+        }
+    }
+}

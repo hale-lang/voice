@@ -168,6 +168,99 @@ fn on_loopback(url: String) -> Bool {
     return host == "localhost" || host == "127.0.0.1";
 }
 
+/// The system's own program directories, the service's PATH past the
+/// claude CLI's (docker and the rest are found here).
+const SYSTEM_PATH: String = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// True when the node offers the claude-cli engine: its vault holds a
+/// Claude account's token and its account has the CLI (`cli`, found).
+@unbounded
+fn offers_claude(vault: String, cli: String) -> Bool {
+    return len(cli) > 0 && len(claude_labels(vault)) > 0;
+}
+
+/// The claude CLI the node's account runs, as an absolute path; "" when it
+/// has none. Looked for where that account installs it, in order: what its
+/// login shell finds (`login`, that lookup's output), `~/.local/bin` (the
+/// native installer's), `~/.claude/local` (an older install's), then the
+/// `system` directories. Never root's: the node runs as its account.
+@unbounded
+fn find_claude(login: String, home: String, system: String) -> String {
+    // a login shell's profile may print before it
+    let found = std::str::trim(last_line(login));
+    if std::str::starts_with(found, "/") && executable(found) { return found; }
+    let mut dirs = home + "/.local/bin:" + home + "/.claude/local:" + system + ":";
+    while len(dirs) > 0 {
+        let at = std::str::index_of(dirs, ":");
+        let dir = dirs[0..at];
+        dirs = dirs[(at + 1)..len(dirs)];
+        if std::str::starts_with(dir, "/") && executable(dir + "/claude") {
+            return dir + "/claude";
+        }
+    }
+    return "";
+}
+
+/// True when `file` is a file the node can run.
+@unbounded
+fn executable(file: String) -> Bool {
+    let o = std::process::run("sh\n-c\n[ -f \"$0\" ] && [ -x \"$0\" ]\n" + file) or {
+        return false;
+    };
+    return o.code == 0;
+}
+
+/// The service's PATH: the claude CLI's directory first, so the `claude`
+/// the node starts is the one the install found, then `system` without it.
+@unbounded
+fn service_path(claude: String, system: String) -> String {
+    let slash = last_slash(claude);
+    if slash <= 0 { return system; }
+    let dir = claude[0..slash];
+    let mut out = dir;
+    let mut rest = system + ":";
+    while len(rest) > 0 {
+        let at = std::str::index_of(rest, ":");
+        let d = rest[0..at];
+        rest = rest[(at + 1)..len(rest)];
+        if len(d) > 0 && d != dir { out = out + ":" + d; }
+    }
+    return out;
+}
+
+/// How long the account's login shell may take to say where its claude is.
+const LOGIN_LOOKUP_MS: Int = 5000;
+
+/// Where `user`'s login shell finds `claude`: that shell's own PATH, with
+/// its profile, as `user` (`sudo -i`, the install being root). Bounded, its
+/// stdin closed, so a profile that waits cannot hold the install; "" when
+/// it finds none, fails or takes too long.
+@unbounded
+fn login_claude(user: String) -> String {
+    let c = std::process::spawn_with(
+        "sudo\n-n\n-u\n" + user + "\n-i\nsh\n-c\ncommand -v claude",
+        std::process::SpawnOptions { },
+    ) or std::process::Child { };
+    if c.pid <= 0 { return ""; }
+    std::process::close_stdin(c);
+    let began = std::time::monotonic_ns();
+    let mut out = "";
+    while true {
+        out = out + (std::process::read_stdout(c) or "");
+        let code = std::process::try_wait(c) or - 1;
+        if code != -2 {
+            out = out + (std::process::read_stdout(c) or "");
+            return if code == 0 { out } else { "" };
+        }
+        if (std::time::monotonic_ns() - began) / 1000000 > LOGIN_LOOKUP_MS {
+            std::process::kill(c) or discard;
+            return "";
+        }
+        std::time::sleep(20ms);
+    }
+    return "";
+}
+
 /// The service's name, the same on both: the systemd unit
 /// (`voice-node-<id>.service`) and the launchd label.
 fn service_name(id: String) -> String { return "voice-node-" + id; }
@@ -190,7 +283,6 @@ fn install() {
     let data = voice + "/node-data";
     let vault = voice + "/vault";
     let enrollment = "node-" + id + "-enrollment";
-    let path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
     let key = std::str::trim(std::io::fs::read_file(token_file) or "");
     if len(key) == 0 { fail_install("no operator token in " + token_file); }
@@ -214,8 +306,12 @@ fn install() {
     // the Claude accounts' tokens the habitat handed over, kept in the
     // node's vault, since the habitat's copy is gone once this returns
     keep_claude_tokens(vault);
-    let claude = len(claude_labels(vault)) > 0
-        && len(std::str::trim(run_out("sh\n-c\nPATH=\"$0\" command -v claude\n" + path))) > 0;
+    // the claude CLI the node's account runs, from its own install
+    // locations; the service's PATH reaches it first, so the program the
+    // node starts is the one found here
+    let cli = find_claude(login_claude(a.user), a.home, SYSTEM_PATH);
+    let path = service_path(cli, SYSTEM_PATH);
+    let claude = offers_claude(vault, cli);
     // the memory left for models, where some of the machine is another's
     let model_memory = model_memory_for(machine_memory(os_of(run_out("uname\n-s"))), api);
     // the links its operator declared there are kept as they are
@@ -252,6 +348,7 @@ fn install() {
         path: path,
         log: voice + "/node-" + id + ".log"
     };
+    if len(cli) > 0 { println("claude CLI: " + cli); }
     let start = !flag_given("--no-start");
     if mac {
         std::io::fs::write_file(daemon_plist_path(s.name), launchd_daemon_plist(s)) or fail_install(

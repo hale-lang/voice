@@ -33,6 +33,7 @@ locus RefusingApi {
 
 fn main() {
     claude_tokens_kept();
+    claude_found();
     let api = FakeApi { };
     let fresh = node::enroll(api, "new", false);
     std::test::assert(
@@ -239,6 +240,122 @@ fn claude_tokens_kept() {
             "-rw-------",
         ),
         "a kept token is private",
+    );
+    node::run_out("rm\n-rf\n" + root);
+}
+
+/// The claude CLI is looked for where the node's account installs it, in
+/// order, and the service's PATH reaches the one found first.
+fn claude_found() {
+    let root = "/tmp/voice-install-claude-" + to_string(std::time::monotonic_ns());
+    let home = root + "/home";
+    let sys = root + "/sys";
+    let login = root + "/login";
+    node::run_out(
+        "mkdir\n-p\n" + home + "/.local/bin\n" + home + "/.claude/local\n" + sys + "\n" + login,
+    );
+    let empty = sys + ":" + root + "/none";
+    std::test::assert_eq_str(
+        node::find_claude("", home, empty),
+        "",
+        "no claude anywhere, none found",
+    );
+    std::io::fs::write_file(sys + "/claude", "#!/bin/sh\n") or discard;
+    std::test::assert_eq_str(
+        node::find_claude("", home, empty),
+        "",
+        "a file it cannot run is not the CLI",
+    );
+    node::run_out("chmod\n755\n" + sys + "/claude");
+    std::test::assert_eq_str(
+        node::find_claude("", home, empty),
+        sys + "/claude",
+        "the system's directories, last",
+    );
+    std::io::fs::write_file(home + "/.claude/local/claude", "#!/bin/sh\n") or discard;
+    node::run_out("chmod\n755\n" + home + "/.claude/local/claude");
+    std::test::assert_eq_str(
+        node::find_claude("", home, empty),
+        home + "/.claude/local/claude",
+        "an older install's ~/.claude/local before them",
+    );
+    std::io::fs::write_file(home + "/.local/bin/claude", "#!/bin/sh\n") or discard;
+    node::run_out("chmod\n755\n" + home + "/.local/bin/claude");
+    std::test::assert_eq_str(
+        node::find_claude("", home, empty),
+        home + "/.local/bin/claude",
+        "the native installer's ~/.local/bin before that",
+    );
+    std::io::fs::write_file(login + "/claude", "#!/bin/sh\n") or discard;
+    node::run_out("chmod\n755\n" + login + "/claude");
+    std::test::assert_eq_str(
+        node::find_claude("welcome back\n" + login + "/claude\n", home, empty),
+        login + "/claude",
+        "what the account's login shell finds, first, past what its profile printed",
+    );
+    std::test::assert_eq_str(
+        node::find_claude("claude: aliased\n", home, empty),
+        home + "/.local/bin/claude",
+        "a login shell's answer that is no program is passed over",
+    );
+    std::test::assert_eq_str(
+        node::find_claude(root + "/gone/claude", home, empty),
+        home + "/.local/bin/claude",
+        "and one that is not there",
+    );
+
+    let vault = root + "/vault";
+    node::run_out("mkdir\n-p\n" + vault);
+    let cli = home + "/.local/bin/claude";
+    std::test::assert(!node::offers_claude(vault, cli), "the CLI without a token offers no engine");
+    std::io::fs::write_file(vault + "/claude-token--work", "tok") or discard;
+    std::test::assert(!node::offers_claude(vault, ""), "nor a token without the CLI");
+    std::test::assert(node::offers_claude(vault, cli), "both, the claude-cli engine");
+
+    let system = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+    std::test::assert_eq_str(
+        node::service_path("", system),
+        system,
+        "no claude, the system's PATH",
+    );
+    std::test::assert_eq_str(
+        node::service_path("/Users/op/.local/bin/claude", system),
+        "/Users/op/.local/bin:" + system,
+        "the claude CLI's directory first",
+    );
+    std::test::assert_eq_str(
+        node::service_path("/usr/local/bin/claude", system),
+        "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
+        "ahead of a system directory with another claude",
+    );
+
+    let s = node::Service {
+        name: "voice-node-mac",
+        user: "op",
+        home: "/Users/op",
+        node_bin: "/Users/op/.voice/bin/voice-node",
+        id: "mac",
+        api: "http://10.73.20.5:8080",
+        token_vault: "node-mac-enrollment",
+        data: "/Users/op/.voice/node-data",
+        capabilities: "/Users/op/.voice/node-data/capabilities.json",
+        vault_dir: "/Users/op/.voice/vault",
+        path: node::service_path("/Users/op/.local/bin/claude", system),
+        log: "/Users/op/.voice/node-mac.log",
+    };
+    std::test::assert(
+        std::str::contains(
+            node::launchd_daemon_plist(s),
+            "<key>PATH</key><string>/Users/op/.local/bin:/opt/homebrew/bin:",
+        ),
+        "the LaunchDaemon runs the node with the claude CLI's directory first on PATH",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::systemd_unit(s),
+            "Environment=\"PATH=/Users/op/.local/bin:/opt/homebrew/bin:",
+        ),
+        "and so does the systemd unit",
     );
     node::run_out("rm\n-rf\n" + root);
 }

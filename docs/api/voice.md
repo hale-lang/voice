@@ -191,7 +191,7 @@ client can pace itself instead of discovering the wall by failing.
 - [keys](#tag-keys) (5)
 - [usage](#tag-usage) (14)
 - [models](#tag-models) (5)
-- [recipes](#tag-recipes) (4)
+- [recipes](#tag-recipes) (5)
 - [runtimes](#tag-runtimes) (4)
 - [placements](#tag-placements) (4)
 - [arrangements](#tag-arrangements) (8)
@@ -1668,6 +1668,50 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 404 | No such resource. `Hale-Error-Class: not_found`. | `application/json` [AdminNotFound](#schema-adminnotfound) |
 | 409 | The request conflicts with the state it meets (a resource with that id exists, a restriction a key outruns). `Hale-Error-Class: conflict`. | `application/json` [AdminConflict](#schema-adminconflict) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/recipe-fits`
+
+**How every recipe fits the fleet now** · `listRecipeFits`
+
+Authentication: operatorToken
+
+Every variant of a page of recipes, judged on every node a model may
+be placed on, and across every pair of nodes cabled to each other
+whose link's latest check passed, by the rules `createPlacement`
+judges a placement by: a runtime that reads its format there (across
+a pair, one that spans nodes), each node's share of it in the room
+that runtime has (a GPU's own memory, or the machine's when its GPU
+shares it or it runs on the processors) less what the node's
+placements hold, its files on each node's disk, a node serving a
+recipe's model once and taking part in one placement across nodes at
+a time. Each variant is judged twice: against what is placed now
+(`fits`), and against the same nodes with nothing placed
+(`fits_empty`), so a variant kept off by what is placed there is told
+from one the hardware never fits. The nodes and pairs judged against
+come with every page, each node with the memory its models are
+served from and what of it is free. Pages follow `listRecipes`: a
+page holds at most 32 recipes, in its order; a `cursor` is a page's
+`next_cursor`, and one that names no recipe, or a `limit` outside 1
+to 32, is a `422`. A recipe's whole work is its variants (at most 8)
+on at most 16 nodes and 32 pairs.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The nodes and pairs judged against, and a page of recipes, each variant judged on each. | `application/json` [RecipeFits](#schema-recipefits) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-runtimes"></a>
@@ -4932,6 +4976,120 @@ Type: object
 | `data` | array of [NodeDownload](#schema-nodedownload) | yes | Each variant with a file on the node: those it holds whole first, then those it holds in part, each in the order `listRecipes` lists their recipes. At most 64. Variants of related models share small files byte for byte (a tokenizer, a config, a chat template), so a variant is held in part only when it holds a file of its own, one no other variant lists, e.g. a weight shard fetched; one holding only files it shares is not listed. Its `files_held` and `bytes_held` count every file of it held, shared or not. | items ≤ 64 |
 | `other_files` | integer | yes | The files it holds that no variant listed accounts for, e.g. a runtime's archive, a withdrawn recipe's weights, or a tokenizer variants share when none of them is listed. | ≥ 0 |
 | `other_bytes` | integer | yes | Their size together. | ≥ 0 |
+
+<a id="schema-recipefits"></a>
+
+### RecipeFits
+
+The nodes and pairs a fit is judged against, and a page of recipes, each variant judged on each (`listRecipeFits`).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `nodes` | array of [FitNode](#schema-fitnode) | yes | Every node not revoked, in the order of their ids. | items ≤ 16 |
+| `pairs` | array of [FitPair](#schema-fitpair) | yes | Every two nodes of which one declares a link to the other (or the coordinator found one from their cabled ports), the first in the order of their ids its leader; with why no model can be split across them, when none can. | items ≤ 32 |
+| `data` | array of [RecipeFit](#schema-recipefit) | yes |  | items ≤ 32 |
+| `next_cursor` | string \| null |  |  |  |
+
+<a id="schema-fitnode"></a>
+
+### FitNode
+
+A node as a fit is judged against it: the memory its models are
+served from, its first accelerator's (a GPU's own memory, or the
+machine's when its GPU shares it or it has none), what models may
+use of it (`model_memory_bytes`, no more than a GPU's own), what its
+placements hold of it and what is free; its disk free. Left at 0
+when it has declared no hardware.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `node` | string | yes |  |  |
+| `problem` | string |  | Why no model can be placed on it (no managed engine, no hardware declared); left out when one can. |  |
+| `os` | string | yes |  |  |
+| `arch` | string | yes |  |  |
+| `accelerators` | string | yes | The kinds of its accelerators, as `,rocm,vulkan,`; `,` for none. |  |
+| `accelerator` | string |  | Its first accelerator's name, as the node gives it; left out when it has none. |  |
+| `gpu` | boolean | yes | Its models are served from a GPU's own memory, not the machine's. |  |
+| `memory_bytes` | integer | yes |  | ≥ 0 |
+| `model_memory_bytes` | integer | yes |  | ≥ 0 |
+| `held_bytes` | integer | yes | What its placements hold of it, as each placement's `held_bytes`. | ≥ 0 |
+| `free_bytes` | integer | yes | What is left for a model (`model_memory_bytes` less `held_bytes`); below 0 when its placements hold more. |  |
+| `disk_free_bytes` | integer | yes |  | ≥ 0 |
+
+<a id="schema-fitpair"></a>
+
+### FitPair
+
+Two nodes cabled to each other, which a model may be split across, the first its leader.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `nodes` | array of string | yes |  | items ≥ 2; items ≤ 2 |
+| `problem` | string |  | Why no model can be split across them (unlike platforms or accelerators, a link not declared back, a link not checked or whose latest check failed); left out when one can, and only then is a variant judged across them. |  |
+
+<a id="schema-recipefit"></a>
+
+### RecipeFit
+
+A recipe, as `listRecipes` lists it, and each of its variants judged.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `recipe` | [RecipeSummary](#schema-recipesummary) | yes |  |  |
+| `variants` | array of [VariantFits](#schema-variantfits) | yes |  | items ≤ 8 |
+
+<a id="schema-variantfits"></a>
+
+### VariantFits
+
+A variant judged on each node a model may be placed on, then across each pair that can take one.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `variant` | string | yes |  |  |
+| `on` | array of [TargetFit](#schema-targetfit) | yes |  | items ≤ 48 |
+
+<a id="schema-targetfit"></a>
+
+### TargetFit
+
+One variant judged on one node or across a pair, as
+`createPlacement` would judge it there now (`fits`), and with
+nothing placed on those nodes (`fits_empty`). Fits now; fits once
+what is placed there is freed (`fits` false, `fits_empty` true); or
+never on that hardware (both false, `empty_reason` says why).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `nodes` | array of string | yes |  | items ≥ 1; items ≤ 2 |
+| `fits` | boolean | yes |  |  |
+| `fits_empty` | boolean | yes |  |  |
+| `runtime` | string |  | The runtime that would serve it there; left out when none reads its format there. |  |
+| `gpu` | boolean | yes | The room that runtime has is a GPU's own memory, not the machine's. |  |
+| `need_bytes` | integer | yes | What its seat takes of each node at the least, its share of the variant and its server's own; 0 with no runtime. | ≥ 0 |
+| `room_bytes` | integer | yes | The room its runtime has now, on the node with the least, after what is placed there. |  |
+| `room_empty_bytes` | integer | yes | The room its runtime has with nothing placed. |  |
+| `held_bytes` | integer |  | What it would hold of each node placed now, its seat's prompt cache sized from the room left as `createPlacement` sizes it; left out when it does not fit now. `room_bytes` less this is the room left after it. | ≥ 0 |
+| `disk_bytes` | integer | yes | What it keeps on each node's disk, at the most. | ≥ 0 |
+| `disk_free_bytes` | integer | yes | The disk free, on the node with the least. | ≥ 0 |
+| `downloaded` | boolean | yes | Every node holds its files whole already (`listNodeDownloads`), so placing it is a reload, not a download. |  |
+| `placed` | string |  | The placement of its recipe on exactly these nodes, when there is one. |  |
+| `tools` | boolean | yes | Its seat would carry a request's `tools` under that runtime (`CatalogModel.tools`). |  |
+| `reasoning` | boolean | yes | Its seat would play the model's reasoning back as reasoning under that runtime (`CatalogModel.reasoning`). |  |
+| `reason` | string | yes | Why it fits now, as a placement's fit says it, or why not. |  |
+| `empty_reason` | string |  | Why it does not fit even with nothing placed; left out when it does. |  |
 
 <a id="schema-nodedownload"></a>
 

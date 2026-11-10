@@ -2243,6 +2243,56 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /admin/v1/recipe-fits:
+    get:
+      tags: [recipes]
+      operationId: listRecipeFits
+      summary: How every recipe fits the fleet now
+      description: |
+        Every variant of a page of recipes, judged on every node a model may
+        be placed on, and across every pair of nodes cabled to each other
+        whose link's latest check passed, by the rules `createPlacement`
+        judges a placement by: a runtime that reads its format there (across
+        a pair, one that spans nodes), each node's share of it in the room
+        that runtime has (a GPU's own memory, or the machine's when its GPU
+        shares it or it runs on the processors) less what the node's
+        placements hold, its files on each node's disk, a node serving a
+        recipe's model once and taking part in one placement across nodes at
+        a time. Each variant is judged twice: against what is placed now
+        (`fits`), and against the same nodes with nothing placed
+        (`fits_empty`), so a variant kept off by what is placed there is told
+        from one the hardware never fits. The nodes and pairs judged against
+        come with every page, each node with the memory its models are
+        served from and what of it is free. Pages follow `listRecipes`: a
+        page holds at most 32 recipes, in its order; a `cursor` is a page's
+        `next_cursor`, and one that names no recipe, or a `limit` outside 1
+        to 32, is a `422`. A recipe's whole work is its variants (at most 8)
+        on at most 16 nodes and 32 pairs.
+      security:
+        - operatorToken: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 32, default: 32 }
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: The nodes and pairs judged against, and a page of recipes, each variant judged on each.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecipeFits'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /admin/v1/runtimes:
     get:
       tags: [runtimes]
@@ -6658,6 +6708,178 @@ components:
           type: integer
           minimum: 0
           description: Their size together.
+
+    RecipeFits:
+      type: object
+      description: The nodes and pairs a fit is judged against, and a page of recipes, each variant judged on each (`listRecipeFits`).
+      required: [nodes, pairs, data]
+      properties:
+        nodes:
+          type: array
+          maxItems: 16
+          description: Every node not revoked, in the order of their ids.
+          items: { $ref: '#/components/schemas/FitNode' }
+        pairs:
+          type: array
+          maxItems: 32
+          description: |
+            Every two nodes of which one declares a link to the other (or
+            the coordinator found one from their cabled ports), the first
+            in the order of their ids its leader; with why no model can be
+            split across them, when none can.
+          items: { $ref: '#/components/schemas/FitPair' }
+        data:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/RecipeFit' }
+        next_cursor:
+          type: [string, 'null']
+
+    FitNode:
+      type: object
+      description: |
+        A node as a fit is judged against it: the memory its models are
+        served from, its first accelerator's (a GPU's own memory, or the
+        machine's when its GPU shares it or it has none), what models may
+        use of it (`model_memory_bytes`, no more than a GPU's own), what its
+        placements hold of it and what is free; its disk free. Left at 0
+        when it has declared no hardware.
+      required: [node, os, arch, accelerators, gpu, memory_bytes, model_memory_bytes, held_bytes, free_bytes, disk_free_bytes]
+      properties:
+        node: { type: string }
+        problem:
+          type: string
+          description: Why no model can be placed on it (no managed engine, no hardware declared); left out when one can.
+        os: { type: string }
+        arch: { type: string }
+        accelerators:
+          type: string
+          description: The kinds of its accelerators, as `,rocm,vulkan,`; `,` for none.
+          examples: [',cuda,']
+        accelerator:
+          type: string
+          description: Its first accelerator's name, as the node gives it; left out when it has none.
+        gpu:
+          type: boolean
+          description: Its models are served from a GPU's own memory, not the machine's.
+        memory_bytes: { type: integer, minimum: 0 }
+        model_memory_bytes: { type: integer, minimum: 0 }
+        held_bytes:
+          type: integer
+          minimum: 0
+          description: What its placements hold of it, as each placement's `held_bytes`.
+        free_bytes:
+          type: integer
+          description: What is left for a model (`model_memory_bytes` less `held_bytes`); below 0 when its placements hold more.
+        disk_free_bytes: { type: integer, minimum: 0 }
+
+    FitPair:
+      type: object
+      description: Two nodes cabled to each other, which a model may be split across, the first its leader.
+      required: [nodes]
+      properties:
+        nodes:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items: { type: string }
+        problem:
+          type: string
+          description: |
+            Why no model can be split across them (unlike platforms or
+            accelerators, a link not declared back, a link not checked or
+            whose latest check failed); left out when one can, and only
+            then is a variant judged across them.
+
+    RecipeFit:
+      type: object
+      description: A recipe, as `listRecipes` lists it, and each of its variants judged.
+      required: [recipe, variants]
+      properties:
+        recipe: { $ref: '#/components/schemas/RecipeSummary' }
+        variants:
+          type: array
+          maxItems: 8
+          items: { $ref: '#/components/schemas/VariantFits' }
+
+    VariantFits:
+      type: object
+      description: A variant judged on each node a model may be placed on, then across each pair that can take one.
+      required: [variant, on]
+      properties:
+        variant: { type: string }
+        on:
+          type: array
+          maxItems: 48
+          items: { $ref: '#/components/schemas/TargetFit' }
+
+    TargetFit:
+      type: object
+      description: |
+        One variant judged on one node or across a pair, as
+        `createPlacement` would judge it there now (`fits`), and with
+        nothing placed on those nodes (`fits_empty`). Fits now; fits once
+        what is placed there is freed (`fits` false, `fits_empty` true); or
+        never on that hardware (both false, `empty_reason` says why).
+      required: [nodes, fits, fits_empty, gpu, need_bytes, room_bytes, room_empty_bytes, disk_bytes, disk_free_bytes, downloaded, tools, reasoning, reason]
+      properties:
+        nodes:
+          type: array
+          minItems: 1
+          maxItems: 2
+          items: { type: string }
+        fits: { type: boolean }
+        fits_empty: { type: boolean }
+        runtime:
+          type: string
+          description: The runtime that would serve it there; left out when none reads its format there.
+        gpu:
+          type: boolean
+          description: The room that runtime has is a GPU's own memory, not the machine's.
+        need_bytes:
+          type: integer
+          minimum: 0
+          description: What its seat takes of each node at the least, its share of the variant and its server's own; 0 with no runtime.
+        room_bytes:
+          type: integer
+          description: The room its runtime has now, on the node with the least, after what is placed there.
+        room_empty_bytes:
+          type: integer
+          description: The room its runtime has with nothing placed.
+        held_bytes:
+          type: integer
+          minimum: 0
+          description: |
+            What it would hold of each node placed now, its seat's prompt
+            cache sized from the room left as `createPlacement` sizes it;
+            left out when it does not fit now. `room_bytes` less this is the
+            room left after it.
+        disk_bytes:
+          type: integer
+          minimum: 0
+          description: What it keeps on each node's disk, at the most.
+        disk_free_bytes:
+          type: integer
+          minimum: 0
+          description: The disk free, on the node with the least.
+        downloaded:
+          type: boolean
+          description: Every node holds its files whole already (`listNodeDownloads`), so placing it is a reload, not a download.
+        placed:
+          type: string
+          description: The placement of its recipe on exactly these nodes, when there is one.
+        tools:
+          type: boolean
+          description: Its seat would carry a request's `tools` under that runtime (`CatalogModel.tools`).
+        reasoning:
+          type: boolean
+          description: Its seat would play the model's reasoning back as reasoning under that runtime (`CatalogModel.reasoning`).
+        reason:
+          type: string
+          description: Why it fits now, as a placement's fit says it, or why not.
+        empty_reason:
+          type: string
+          description: Why it does not fit even with nothing placed; left out when it does.
 
     NodeDownload:
       type: object

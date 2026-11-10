@@ -192,11 +192,6 @@ locus Placements {
                     + "\n";
             }
         }
-        let room = if declared {
-            std::json::find_int_field(hw, "model_memory_bytes") - held
-        } else {
-            0
-        };
         let usable = self.runtimes.usable_in_gate() or raise;
         let mut rest = cats;
         while len(rest) > 0 {
@@ -606,7 +601,7 @@ locus Placements {
             out.variant = c.variant;
             out.runtime = chosen.runtime;
             out.chosen_by = PlacementChooser::operator;
-            fitted = reserve(fitted, recipe, c.variant, chosen.runtime, judging);
+            fitted = reserve(fitted, recipe, c.variant, chosen.runtime, judging, usable);
         } else {
             if best < 0 {
                 fail bad(
@@ -694,9 +689,9 @@ locus Placements {
                     total = total + (self.held_by(r) or raise);
                 }
             }
-            let memory = std::json::find_int_field(
+            let memory = models_memory(
                 if n == leader { hw } else { hw_f },
-                "model_memory_bytes",
+                runtime_on(all, out.runtime),
             );
             if total > memory {
                 self.remove_in_gate(c.id) or discard;
@@ -1488,27 +1483,30 @@ fn fit_recipe(recipe: Recipe, j: Judging, usable: RuntimeList, decision: Bool) -
     let out = PlacementFit { judged: judged };
     if judged.best < 0 { return out; }
     let chosen = at(judged.fit, judged.best) or VariantFit { };
-    return reserve(out, recipe, chosen.variant, chosen.runtime, j);
+    return reserve(out, recipe, chosen.variant, chosen.runtime, j, usable);
 }
 
 /// `f` with variant `variant` of `recipe`, served by `runtime`, reserved
 /// on the nodes of `j`: its seat's prompt cache, room for CACHED
 /// conversations of the model's context (at most CONVERSATION_MAX), from
-/// at most half the room the variant leaves on the node with the least,
-/// never less than the context it was fitted with; and what each node
-/// reserves, its share of the variant and the whole cache (`part_need`).
+/// at most half the room the variant leaves on the node with the least
+/// (`least_room`, where `runtime`, among `rts`, runs), never less than the
+/// context it was fitted with; and what each node reserves, its share of
+/// the variant and the whole cache (`part_need`).
 fn reserve(
     f: PlacementFit,
     recipe: Recipe,
     variant: String,
     runtime: String,
-    j: Judging
+    j: Judging,
+    rts: RuntimeList
 ) -> PlacementFit {
     let mut out = f;
     let v = variant_body_of(recipe.variants.text, variant);
     let need = part_need(v, count(j.hw));
     let per_token = kv_per_token(v, recipe.kv_bytes_per_token);
-    let pool = cache_pool(least_room(j) - footprint(need), per_token, recipe.context_length, need);
+    let room = least_room(j, runtime_on(rts, runtime));
+    let pool = cache_pool(room - footprint(need), per_token, recipe.context_length, need);
     out.variant = variant;
     out.runtime = runtime;
     out.cache_tokens = pool;
@@ -1892,9 +1890,48 @@ fn accelerator_kinds(hw: String) -> String {
     return std::str::from_bytes(b);
 }
 
+// ---- the room for models ----------------------------------------------
+
+/// What a model served on accelerator `on` (a runtime's, `cpu` for the
+/// processors) may hold of a machine of hardware `hw`, before its other
+/// placements: the machine's memory for models (`model_memory_bytes`, as
+/// the node offers it), and on a GPU with memory of its own (not unified,
+/// `gpu_memory`) no more than that GPU's. A runtime on a GPU that shares
+/// the machine's memory (a GB10's, Apple silicon's) and one on the
+/// processors draw on the machine's. Every fit counts a node's room by
+/// this: a placement's, a suggestion's, the arranger's.
+@bounded_by(hw)
+fn models_memory(hw: String, on: String) -> Int {
+    let model = std::json::find_int_field(hw, "model_memory_bytes");
+    let gpu = gpu_memory(hw, on);
+    return if gpu >= 0 && gpu < model { gpu } else { model };
+}
+
+/// The memory of a machine's GPU a runtime on accelerator `on` runs on,
+/// when the GPU has its own: the first of the machine's accelerators of
+/// that kind (an AMD card is listed twice, as `rocm` and as `vulkan`; the
+/// first is the one a seat's server is given, node/hardware.hl
+/// `gpu_memory_of`); -1 on the processors, on a GPU that shares the
+/// machine's memory (`unified`), or when it does not say.
+@bounded_by(hw)
+fn gpu_memory(hw: String, on: String) -> Int {
+    if on == "cpu" { return -1; }
+    let mut it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "kind") == on {
+            if std::json::find_bool_field(it.element, "unified") { return -1; }
+            let memory = std::json::find_int_field(it.element, "memory_bytes");
+            return if memory > 0 { memory } else { -1 };
+        }
+        it = std::json::array_next(it);
+    }
+    return -1;
+}
+
 /// The nodes a variant is judged against: one, or a pair it is split
 /// across, each with its name (for a reason), its hardware, the memory it
-/// has left for models and what its other placements hold of it.
+/// has left for models (on its processors, or a GPU that shares it:
+/// `room_on` counts a GPU's own) and what its other placements hold of it.
 type Judging {
     names: bounded[String; 2];
     hw: bounded[String; 2];
@@ -1917,13 +1954,24 @@ fn judging_add(j: Judging, name: String, hw: String, held: Int) -> Judging {
     return out;
 }
 
-/// The least room for models any of `j`'s nodes has left.
-fn least_room(j: Judging) -> Int {
+/// The room node `i` of `j` has left for a model served on accelerator
+/// `on`: its room for models, less what that falls short of on a GPU with
+/// memory of its own (`models_memory`).
+fn room_on(j: Judging, i: Int, on: String) -> Int {
+    let hw = at(j.hw, i) or "{}";
+    let short = std::json::find_int_field(hw, "model_memory_bytes") - models_memory(hw, on);
+    return (at(j.room, i) or 0) - short;
+}
+
+/// The least room for a model served on accelerator `on` any of `j`'s
+/// nodes has left (`room_on`).
+fn least_room(j: Judging, on: String) -> Int {
     let mut least = -1;
-    let mut first = true;
-    for r in j.room {
-        if first || r < least { least = r; }
-        first = false;
+    let mut i = 0;
+    while i < count(j.hw) {
+        let r = room_on(j, i, on);
+        if i == 0 || r < least { least = r; }
+        i = i + 1;
     }
     return least;
 }
@@ -2058,8 +2106,11 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
             reason: runs + "; " + gpu_short,
         };
     }
-    // what its seat takes on each node, its server's own beside its share
+    // what its seat takes on each node, its server's own beside its share,
+    // in the room its runtime has there: a GPU's own memory, or the
+    // machine's (`models_memory`)
     let need = footprint(part_need(v, parts));
+    let on = runtime_on(rts, rt);
     let mut memory = "";
     let mut disk = "";
     let mut short = false;
@@ -2067,11 +2118,18 @@ fn judge_variant(v: String, j: Judging, rts: RuntimeList, decision: Bool) -> Var
     let mut i = 0;
     while i < parts {
         let node_hw = at(j.hw, i) or "{}";
-        let room = at(j.room, i) or 0;
+        let room = room_on(j, i, on);
         let held = at(j.held, i) or 0;
         let name = if parts > 1 { (at(j.names, i) or "") + ": " } else { "" };
+        let bound = models_memory(node_hw, on);
         let said = name + gb(need) + " of " + gb(if room > 0 { room } else { 0 })
-            + " free for models"
+            + (
+                if bound < std::json::find_int_field(node_hw, "model_memory_bytes") {
+                    " free of its GPU's " + gb(bound)
+                } else {
+                    " free for models"
+                }
+            )
             + (if held > 0 { " (" + gb(held) + " held by its other placements)" } else { "" });
         memory = if i == 0 { said } else { memory + "; " + said };
         if need > room { short = true; }

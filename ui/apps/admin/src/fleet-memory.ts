@@ -19,7 +19,7 @@ export type FleetNode = {
   status: NodeSummary['status'];
   /** Its accelerator, as it named it; several of one kind counted. */
   accelerator?: string;
-  /** The machine's memory, and what models may use of it; left out until it measured them. */
+  /** The memory its models are served from (`modelMemory`: the machine's, or a GPU's own), and what models may use of it; left out until it measured them. */
   memoryBytes?: number;
   budgetBytes?: number;
 };
@@ -73,6 +73,22 @@ export function acceleratorName(name: string): string {
   return brand && !sold.startsWith(`${brand} `) ? `${brand} ${sold}` : sold;
 }
 
+/**
+ * The memory a node's models are served from, as placement judges it
+ * (api/placements.hl `models_memory`): on a GPU with memory of its own
+ * (not `unified`), the first the node lists, that GPU's, and what models
+ * may use of it no more than what the node offers them; otherwise the
+ * machine's, and what the node offers (`model_memory_bytes`). Voice serves
+ * a model on a node's GPU before its processors, so a card draws that.
+ */
+export function modelMemory(hw: Schemas['Hardware']): { totalBytes: number; budgetBytes: number; gpu: boolean } {
+  const card = hw.accelerators[0];
+  if (card && !card.unified && card.memory_bytes > 0) {
+    return { totalBytes: card.memory_bytes, budgetBytes: Math.min(hw.model_memory_bytes, card.memory_bytes), gpu: true };
+  }
+  return { totalBytes: hw.memory_bytes, budgetBytes: hw.model_memory_bytes, gpu: false };
+}
+
 /** The nodes models are placed on: those not revoked, in the order of their ids. */
 export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
   return nodes
@@ -85,7 +101,8 @@ export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
         const k = acc.filter((a) => acceleratorName(a.name) === x && (a.kind !== 'vulkan' || acc.length === 1)).length;
         return k > 1 ? `${k}× ${x}` : x;
       }).join(' + ');
-      return { id: n.id, name: n.name ?? undefined, status: n.status, accelerator, memoryBytes: hw?.memory_bytes, budgetBytes: hw?.model_memory_bytes };
+      const m = hw ? modelMemory(hw) : undefined;
+      return { id: n.id, name: n.name ?? undefined, status: n.status, accelerator, memoryBytes: m?.totalBytes, budgetBytes: m?.budgetBytes };
     })
     .sort((a, b) => a.id.localeCompare(b.id));
 }

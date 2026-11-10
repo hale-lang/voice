@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceleratorName, nameBeside, fleetNodes, placedBlocks, plannedBlocks, unmetOf, memoryOf, pairsOf, cardGroups, linkSaid } from './fleet-memory.ts';
+import { acceleratorName, nameBeside, fleetNodes, modelMemory, placedBlocks, plannedBlocks, unmetOf, memoryOf, pairsOf, cardGroups, linkSaid } from './fleet-memory.ts';
 import { DEMO_NODES, DEMO_PLACEMENTS, DEMO_PLAN, demoLink } from './fleet-memory-demo.ts';
 import { layoutMemory, planCells, memoryUnit, memoryTotals, unitSaid, CELLS } from '../../../packages/components/src/memory-layout.ts';
 
@@ -107,4 +107,23 @@ test('a card heads a node by its id and what its name adds, not the id again', (
   assert.equal(nameBeside(node('spark')), 'Spark 1');
   assert.equal(nameBeside({ id: 'lin1', name: 'lin1' }), '');
   assert.equal(nameBeside({ id: 'lin1' }), '');
+});
+
+test('a node whose GPU has memory of its own draws that GPU, and a placement past it overfills it', () => {
+  // lin1: an RX 9070 of 17.1 GB in a machine of 32.7 GB offering models 28.5 GB
+  const card = { kind: 'rocm', name: 'AMD Radeon RX 9070', memory_bytes: 17.1e9, unified: false };
+  const hw = { os: 'linux', arch: 'x86_64', memory_bytes: 32.7e9, model_memory_bytes: 28.5e9, accelerators: [card, { ...card, kind: 'vulkan' }], disk_free_bytes: 5e11 };
+  assert.deepEqual(modelMemory(hw), { totalBytes: 17.1e9, budgetBytes: 17.1e9, gpu: true });
+  assert.deepEqual(modelMemory({ ...hw, model_memory_bytes: 12e9 }), { totalBytes: 17.1e9, budgetBytes: 12e9, gpu: true }, 'what the node offers, when less');
+  const spark = DEMO_NODES.find((n) => n.id === 'spark').hardware;
+  assert.deepEqual(modelMemory(spark), { totalBytes: spark.memory_bytes, budgetBytes: spark.model_memory_bytes, gpu: false }, 'a GB10 shares the machine\'s');
+  const [lin1] = fleetNodes([{ ...DEMO_NODES[0], id: 'lin1', name: 'lin1', hardware: hw }]);
+  const placed = placedBlocks([
+    { id: 'granite', model: 'granite-4.0-h-tiny', nodes: ['lin1'], leader: 'lin1', held_bytes: 14.2e9 },
+    { id: 'decide', model: 'jev-style-2b-decision-v3', nodes: ['lin1'], leader: 'lin1', held_bytes: 7.0e9 },
+  ]);
+  const t = memoryTotals(memoryOf(lin1, placed));
+  assert.equal(t.reserve, 0, 'none of the card held back');
+  assert.ok(Math.abs(t.free + 4.1e9) < 1e6, 'over by 4.1 GB: ' + t.free);
+  assert.ok(layoutMemory(memoryOf(lin1, placed)).some((c) => c.over), 'its cells say it is overfilled');
 });

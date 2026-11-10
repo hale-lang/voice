@@ -15,7 +15,7 @@ import { Value } from '../values';
 import { nodeModels, heldSaid, type NodeModel } from './node-models';
 import { cablingState, linkState } from './link-state';
 import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
-import { acceleratorName, fleetNodes, memoryOf, placedBlocks } from '../fleet-memory';
+import { acceleratorName, fleetNodes, memoryOf, modelMemory, placedBlocks } from '../fleet-memory';
 import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
 
 type Seat = Schemas['Seat'];
@@ -337,11 +337,12 @@ function Links({ node }: { node: Node }) {
 function Hardware({ node }: { node: Node }) {
   const hw = node.capabilities?.hardware;
   if (!hw) return <span className="faint">{node.capabilities ? 'not measured: no model is placed on this node' : 'not declared yet: the node has not registered'}</span>;
+  const models = modelMemory(hw);
   return (
     <Kv
       rows={[
         { k: 'platform', v: `${hw.os} · ${hw.arch}` },
-        { k: 'memory', v: <>{bytes(hw.memory_bytes)}{hw.model_memory_bytes < hw.memory_bytes ? <span className="muted"> · {bytes(hw.model_memory_bytes)} for models</span> : null}</> },
+        { k: 'memory', v: <>{bytes(hw.memory_bytes)}{models.gpu ? <span className="muted"> · {bytes(models.budgetBytes)} for models, on its GPU</span> : models.budgetBytes < hw.memory_bytes ? <span className="muted"> · {bytes(models.budgetBytes)} for models</span> : null}</> },
         ...(hw.accelerators.length
           ? hw.accelerators.map((a, i) => ({
               k: hw.accelerators.length > 1 ? `accelerator ${i}` : 'accelerator',

@@ -40,6 +40,9 @@ export function Arrange(_: ScreenProps) {
   const [account, setAccount] = useState('');
   const [project, setProject] = useState('');
   const [applied, setApplied] = useState<Applied | null>(null);
+  // why applying failed: shown with what applying came to, under the button
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const outcome = useRef<HTMLDivElement>(null);
   const accounts = useGet('/admin/v1/accounts');
   const kept = useGet('/admin/v1/arrangements');
   const qc = useQueryClient();
@@ -47,6 +50,12 @@ export function Arrange(_: ScreenProps) {
   const [keepName, setKeepName] = useState('');
   const [current, setCurrent] = useState<string | null>(null);
   const projects = useGet('/admin/v1/projects');
+
+  // what applying came to is shown under the button that applied, in view:
+  // the plan above it can be long
+  useEffect(() => {
+    if (applied || applyError) outcome.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [applied, applyError]);
 
   if (roles.isPending) return <Loading what="roles" />;
   if (roles.isError) return <Unavailable what="Arrange" detail={roles.error.message} />;
@@ -70,6 +79,7 @@ export function Arrange(_: ScreenProps) {
       } else {
         setPlan(r.data);
         setApplied(null);
+        setApplyError(null);
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -82,18 +92,19 @@ export function Arrange(_: ScreenProps) {
   async function apply() {
     if (!plan) return;
     setBusy(true);
-    setError(null);
+    setApplyError(null);
+    setApplied(null);
     try {
       const r = await api.POST('/admin/v1/arrangement-applies', { body: { wants: { pins, roles: wanted }, plan, account, project: project || undefined } });
       if (r.error !== undefined || !r.data) {
-        setError(describe(r.error, r.response.status));
+        setApplyError(describe(r.error, r.response.status));
         return;
       }
       setApplied(r.data);
       // drifted: the fleet has moved on, and the fresh plan is the one to look at
       if (r.data.outcome === 'drifted' && r.data.plan) setPlan(r.data.plan);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setApplyError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -108,6 +119,7 @@ export function Arrange(_: ScreenProps) {
     setKeepName(a.name);
     setPlan(null);
     setApplied(null);
+    setApplyError(null);
   }
 
   /** A kept arrangement planned again, against the fleet now: asked for, never on its own. */
@@ -251,7 +263,6 @@ export function Arrange(_: ScreenProps) {
       </p>
       {error && <p className="c-fail">{error}</p>}
       <ArrangeFleet plan={plan} selected={chosen} onSelect={setChosen} />
-      {applied && <AppliedView applied={applied} />}
       {plan && <PlanView plan={plan} selected={chosen} onSelect={setChosen} />}
       {plan && (plan.add.length > 0 || plan.remove.length > 0 || plan.aliases.length > 0) && (
         <Panel title="Apply" readout="the plan as shown, carried out">
@@ -270,8 +281,13 @@ export function Arrange(_: ScreenProps) {
             disabled={busy || (plan.add.length > 0 && !account) || (plan.aliases.length > 0 && !project)}
             onConfirm={apply}
           />
+          {busy && <span className="faint"> applying…</span>}
         </Panel>
       )}
+      <div ref={outcome}>
+        {applyError && <p className="c-fail">apply failed: {applyError}</p>}
+        {applied && <AppliedView applied={applied} />}
+      </div>
     </>
   );
 }

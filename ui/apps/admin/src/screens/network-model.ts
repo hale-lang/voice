@@ -73,7 +73,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   for (const p of fleet.projects) add({ id: entityId('project', p.id), name: p.id, kind: 'project', state: p.status, active: 0, href: link('projects', p.id), details: [['Name', p.name], ['State', p.status]] });
   const model = (name: string, meaning: string) => {
     const id = entityId('model', name);
-    if (!vertices.has(id)) add({ id, name, kind: 'model', state: 'configured', active: 0, href: link('catalog', name), details: [['Catalog model', name], ['Meaning', meaning]] });
+    if (!vertices.has(id)) add({ id, name, kind: 'model', state: 'configured', active: 0, href: link('models', name), details: [['Catalog model', name], ['Meaning', meaning]] });
     return id;
   };
   for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: link('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });

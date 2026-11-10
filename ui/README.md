@@ -125,5 +125,12 @@ One per part of the admin API:
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token
   rotation.
 - **Seats:** a form per engine, rendered from its `config_schema`.
-- **Catalog, Projects and keys:** budgets, limits, a key's secret shown once.
+- **Models:** every model, however it is served, in one list: its source
+  read off what serves it (a placement: local; a `claude-cli` seat: a
+  subscription; an `openai-compatible` seat: an api; `static`: a test), the
+  account it spends, where it is served, its state and why, context, tools
+  and reasoning, price or flat-rate, and load. A row opens its placement or
+  its seat. "Add a model" places a local one, or makes a Claude
+  subscription's or a remote API's catalog model and seat.
+- **Projects and keys:** budgets, limits, a key's secret shown once.
 - **Changes:** the audit log.

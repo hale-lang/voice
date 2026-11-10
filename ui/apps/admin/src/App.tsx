@@ -10,7 +10,7 @@ import { Usage } from './screens/Usage';
 import { Routes } from './screens/Routes';
 import { Changes } from './screens/Changes';
 import { Accounts } from './screens/Accounts';
-import { Catalog } from './screens/Catalog';
+import { Models } from './screens/Models';
 import { Projects } from './screens/Projects';
 import { Api } from './screens/Api';
 import { Recipes } from './screens/Recipes';
@@ -25,12 +25,12 @@ import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } fro
 
 const NAV = [
   { href: href(), label: 'Overview', key: '' },
+  { href: href('models'), label: 'Models', key: 'models' },
   { href: href('network'), label: 'Network', key: 'network' },
   { href: href('usage'), label: 'Usage', key: 'usage' },
   { href: href('routes'), label: 'Route table', key: 'routes' },
   { href: href('nodes'), label: 'Nodes', key: 'nodes' },
   { href: href('accounts'), label: 'Accounts', key: 'accounts' },
-  { href: href('catalog'), label: 'Catalog', key: 'catalog' },
   { href: href('placements'), label: 'Placements', key: 'placements' },
   { href: href('recipes'), label: 'Recipes', key: 'recipes' },
   { href: href('runtimes'), label: 'Runtimes', key: 'runtimes' },
@@ -70,7 +70,7 @@ function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, catalog: Catalog, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects, annotators: Annotators, api: Api }[section];
+  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, models: Models, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects, annotators: Annotators, api: Api }[section];
   const Screen = screen ?? Overview;
 
   // The inspector belongs to the screen; a new screen starts it empty. A

@@ -4431,6 +4431,8 @@ Type: [CatalogModelCreate](#schema-catalogmodelcreate) & object
 | … | all of [CatalogModelCreate](#schema-catalogmodelcreate) |  |  |  |
 | `seats` | array of string | yes | Seats that serve this model, written `<node>/<seat>`. |  |
 | `available` | boolean | yes | As on `/v1/models`. |  |
+| `tools` | boolean | yes | An enabled seat that serves it carries a request's `tools` through to the model, ready now or not (as `/v1/models`' `voice.capabilities.tools` says of the seats a key could use). |  |
+| `reasoning` | boolean | yes | An enabled seat that serves it plays the model's reasoning back as reasoning (a `reasoning` output item, `reasoning_content` on chat completions) when the model reasons: an openai-compatible seat, which relays its upstream's; a managed seat under llama-server, or under vLLM whose variant names a `reasoning_parser`. The claude CLI and the static engine answer text alone. |  |
 | `served_context_length` | integer |  | The least context, in tokens, a seat that could serve it now took (`SeatView.context`); left out when none has said. Less than `context_length` when its seats serve less than the model is made for. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 

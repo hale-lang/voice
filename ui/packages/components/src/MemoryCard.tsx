@@ -11,6 +11,8 @@ export type MemoryCardProps = {
   name: string;
   /** What the head shows for it; `name` when left out. */
   title?: ReactNode;
+  /** `title` as text: said on hover and to a screen reader, since the head is one line, clipped. */
+  titleText?: string;
   subtitle?: ReactNode;
   /** Its state, at the head's end. */
   status?: ReactNode;
@@ -90,17 +92,17 @@ export const MemoryCard = memo(function MemoryCard(p: MemoryCardProps) {
   ].filter(Boolean).join('; ');
   const head = (
     <div className={s.head}>
-      <span className={s.title}>{p.title ?? p.name}</span>
+      <span className={s.title} title={p.titleText ?? p.name}>{p.title ?? p.name}</span>
       {p.status}
     </div>
   );
   return (
-    <section className={`${s.card} ${p.compact ? s.compact : ''} ${p.animate ? s.animate : ''}`} aria-label={`${p.name} memory`}>
+    <section className={`${s.card} ${p.compact ? s.compact : ''} ${p.animate ? s.animate : ''}`} aria-label={`${p.titleText ?? p.name} memory`}>
       <div className={s.inner}>
         {p.onOpen ? (
           <button type="button" className={s.open} onClick={p.onOpen} aria-label={`open ${p.name}`}>{head}</button>
         ) : head}
-        {p.subtitle && <div className={s.sub}>{p.subtitle}</div>}
+        {p.subtitle && <div className={s.sub} title={typeof p.subtitle === 'string' ? p.subtitle : undefined}>{p.subtitle}</div>}
         <div
           className={`${s.grid} ${lit ? s.dim : ''}`}
           role="img"

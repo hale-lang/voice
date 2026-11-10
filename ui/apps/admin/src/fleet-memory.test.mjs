@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { acceleratorName, fleetNodes, placedBlocks, plannedBlocks, unmetOf, memoryOf, pairsOf, cardGroups, linkSaid } from './fleet-memory.ts';
+import { acceleratorName, nameBeside, fleetNodes, placedBlocks, plannedBlocks, unmetOf, memoryOf, pairsOf, cardGroups, linkSaid } from './fleet-memory.ts';
 import { DEMO_NODES, DEMO_PLACEMENTS, DEMO_PLAN, demoLink } from './fleet-memory-demo.ts';
 import { layoutMemory, planCells, memoryUnit, memoryTotals, unitSaid, CELLS } from '../../../packages/components/src/memory-layout.ts';
 
@@ -100,4 +100,11 @@ test('an accelerator named by lspci\'s whole line reads as it is sold', () => {
   for (const n of ['NVIDIA GB10', 'Apple M4 Pro', 'AMD Radeon RX 9070', 'NVIDIA GeForce RTX 4090']) assert.equal(acceleratorName(n), n, `${n} as it is`);
   const amd = { ...DEMO_NODES[0], id: 'amd', hardware: { ...DEMO_NODES[0].hardware, accelerators: [{ kind: 'rocm', name: '03:00.0 VGA compatible controller: Advanced Micro Devices, Inc. [AMD/ATI] Navi 48 [Radeon RX 9070/9070 XT/9070 GRE] (rev c0)', memory_bytes: 17095983104, unified: false }] } };
   assert.equal(fleetNodes([amd])[0].accelerator, 'AMD Radeon RX 9070');
+});
+
+test('a card heads a node by its id and what its name adds, not the id again', () => {
+  assert.equal(nameBeside(node('flare')), 'Spark 2');
+  assert.equal(nameBeside(node('spark')), 'Spark 1');
+  assert.equal(nameBeside({ id: 'lin1', name: 'lin1' }), '');
+  assert.equal(nameBeside({ id: 'lin1' }), '');
 });

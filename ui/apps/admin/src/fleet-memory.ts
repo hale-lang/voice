@@ -90,6 +90,15 @@ export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
+/**
+ * A node's name as its card says it beside its id: without the parts of it
+ * that only repeat the id (`Spark 2 · flare` on `flare` is `Spark 2`), and
+ * nothing when it is the id.
+ */
+export function nameBeside(n: { id: string; name?: string }): string {
+  return (n.name ?? '').split(' · ').map((x) => x.trim()).filter((x) => x && x !== n.id).join(' · ');
+}
+
 /** What is placed now, a block a placement. */
 export function placedBlocks(placements: Placement[]): FleetBlock[] {
   return placements.map((p) => ({

@@ -3,7 +3,7 @@ import { useQueries } from '@tanstack/react-query';
 import { MemoryCard, MemoryKey, MemoryNeed, MemoryTip, Mono, Status, bytes, huesFor, planCells, unitSaid, CELLS, type MemoryPoint } from '@hale/components';
 import { api, describe, useGet, useNodes, type Schemas } from './api/client';
 import { useRefetchInterval } from './api/live';
-import { cardGroups, fleetNodes, linkSaid, memoryOf, pairsOf, placedBlocks, type FleetBlock, type FleetNode, type FleetPair, type FleetUnmet } from './fleet-memory';
+import { cardGroups, fleetNodes, nameBeside, linkSaid, memoryOf, pairsOf, placedBlocks, type FleetBlock, type FleetNode, type FleetPair, type FleetUnmet } from './fleet-memory';
 import { toneOf } from './tone';
 import s from './FleetMemory.module.css';
 
@@ -81,11 +81,13 @@ export function FleetMemory(p: FleetMemoryProps) {
       );
     }
     const planModel = view === 'plan' && p.plan ? memoryOf(n, p.plan, kept) : null;
+    const said = nameBeside(n);
     return (
       <div key={n.id} className={`${s.slot} ${p.current === n.id ? s.current : ''}`}>
         <MemoryCard
           name={n.id}
-          title={n.name && n.name !== n.id ? <>{n.id} <span className="faint">{n.name}</span></> : undefined}
+          title={said ? <>{n.id} <span className="faint">{said}</span></> : undefined}
+          titleText={said ? `${n.id} ${said}` : n.id}
           subtitle={subtitle}
           status={status}
           model={planModel ?? nowModel}

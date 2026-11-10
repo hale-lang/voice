@@ -33,7 +33,8 @@ same `voice` extension and `metadata`.
 
 ## Two planes
 
-- **Caller plane** (`/v1/...`): authenticated by a project key.
+- **Caller plane** (`/v1/...`): authenticated by a project key, or by
+  the operator token charged to a project (below).
 - **Admin plane** (`/admin/v1/...`): authenticated by the operator token.
   Configures the model catalog, accounts, nodes, projects, their budgets
   and limits, and their keys; reads usage.
@@ -51,6 +52,20 @@ plane and nodes' enrollment tokens are enforced from the MVP on.
 
 Every request is attributed to exactly one project and one key, so usage
 can be tracked and budgeted per project and broken down per key.
+
+**The operator, charged to a project.** The caller plane also takes the
+operator token with a `Voice-Project` header naming the project the
+request is charged to (the admin UI's Chat sends its requests so). Such
+a request is the project's in every way a key's is: the same routing,
+the project's models and aliases, its limits and budget, its usage
+records. Its key is the project's **operator key**, `<project>-operator`
+(named `operator`), which voice makes on the operator's first request
+charged to the project; no token names it, and it is never revoked
+(`409`), but its models, accounts and limits change as any key's do. A
+project that is not there is `404 not_found`, an archived one `403`;
+`Voice-Project` with any credential but the operator token is `401
+invalid_key` (a project key's requests are its own project's), and the
+operator token without it `400 invalid_request`.
 
 Under DNA, projects are positions, budgets are grants and limits are policy
 rows, and changing them is a reviewed decision. A deployment that requires
@@ -209,7 +224,7 @@ client can pace itself instead of discovering the wall by failing.
 
 - **projectKey** (http, bearer): A project key, presented as `Authorization: Bearer vk-...`; or, from an organism of voice's habitat, the key the habitat drew for it, which voice makes a project of its own, `tenant-<organism>`, a child of the habitat's project, `habitat-<name>`, that inherits its accounts.
 - **enrollmentToken** (http, bearer): A node's enrollment token, presented as `Authorization: Bearer vn-...` on the node plane.
-- **operatorToken** (http, bearer): The operator token, presented as `Authorization: Bearer va-...` on the admin plane. The api mints it on its first start and keeps it in its store; `voice-api admin-token` prints it.
+- **operatorToken** (http, bearer): The operator token, presented as `Authorization: Bearer va-...` on the admin plane, and on the caller plane with `Voice-Project` naming the project the request is charged to. The api mints it on its first start and keeps it in its store; `voice-api admin-token` prints it.
 
 ## Servers
 
@@ -225,7 +240,7 @@ Caller plane. Open Responses, plus Chat Completions for compatibility.
 
 **Create a response (Open Responses)** · `createResponse`
 
-Authentication: projectKey
+Authentication: projectKey, or operatorToken
 
 Conforms to Open Responses `2026-04-24` `POST /responses`, extended with
 an optional `voice` object on the request and a required `voice` object
@@ -281,6 +296,7 @@ Parameters:
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
 | `Idempotency-Key` | header | string |  | When a client retries with the same key within the retention window, voice returns the original result instead of serving and billing again. |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
 
 Request body
 
@@ -301,7 +317,7 @@ Responses:
 | 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No model by that name in the catalog; or, for the operator, no project by the name `Voice-Project` gives. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. Or `no_capacity`: every seat that could serve the request stayed busy, serving its most at once, for the 60 s the request waited for a slot; the message names the model, and `voice.attempts` lists any seat that failed it meanwhile. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -312,7 +328,7 @@ Responses:
 
 **Create a chat completion (compatibility)** · `createChatCompletion`
 
-Authentication: projectKey
+Authentication: projectKey, or operatorToken
 
 OpenAI Chat Completions, for clients that do not speak Open Responses.
 Routing, retries, limits and the `voice` extension behave exactly as on
@@ -327,6 +343,7 @@ Parameters:
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
 | `Idempotency-Key` | header | string |  | When a client retries with the same key within the retention window, voice returns the original result instead of serving and billing again. |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
 
 Request body
 
@@ -363,7 +380,7 @@ Responses:
 | 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No model by that name in the catalog; or, for the operator, no project by the name `Voice-Project` gives. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 413 | The request body is over 12 MiB. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 429 | A rate limit or the project's budget refuses the request. `code` is `rate_limited` or `budget_exhausted`; `voice.limit` names the limit. Or `no_capacity`: every seat that could serve the request stayed busy, serving its most at once, for the 60 s the request waited for a slot; the message names the model, and `voice.attempts` lists any seat that failed it meanwhile. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 502 | Every eligible seat failed; `voice.attempts` lists them. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -380,40 +397,52 @@ Caller plane. Models visible to the presented key.
 
 **List models visible to this key** · `listModels`
 
-Authentication: projectKey
+Authentication: projectKey, or operatorToken
 
 Local and hosted models appear together; the `voice` extension says
 which is which, its price, and which data classes it may carry. Nodes,
 seats and accounts are never listed here. A name the key's project
 gives a model (`ModelAlias`) is listed too, as that model by the name.
 
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
 | 200 | The catalog as this key sees it. | `application/json` [ModelList](#schema-modellist) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/v1/models/{model}`
 
 **Describe one model** · `getModel`
 
-Authentication: projectKey
+Authentication: projectKey, or operatorToken
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
 | `model` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
 | 200 | The model. | `application/json` [Model](#schema-model) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 404 | No model by that name in the catalog. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No model by that name in the catalog; or, for the operator, no project by the name `Voice-Project` gives. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-capabilities"></a>
@@ -426,18 +455,27 @@ Caller plane. What the presented key may do, and how much is left.
 
 **What this key may do, and how much is left** · `getCapabilities`
 
-Authentication: projectKey
+Authentication: projectKey, or operatorToken
 
 Read at start so a client can pace itself. Returns the project and key,
 the models the key may name, every limit that applies with its
 remaining quota, and the project's budget.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
 | 200 | Capabilities of the presented key. | `application/json` [Capabilities](#schema-capabilities) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-projects"></a>
@@ -892,7 +930,9 @@ Authentication: operatorToken
 
 Revocation is immediate at the coordinator; in-flight requests finish.
 A project's system key (`Key.internal`), which no token names, is
-never revoked (`409`); archive the project instead.
+never revoked (`409`); archive the project instead. Nor is its
+operator key, `<project>-operator` (see "The operator, charged to a
+project"): narrow its models, accounts or limits instead.
 
 Parameters:
 

@@ -6,7 +6,8 @@
 ///
 ///   - the caller plane: the OpenAI-compatible inference wire
 ///     (`/v1/responses`, `/v1/chat/completions`, streamed), the models a key
-///     sees and its capabilities, under the caller's project key. These are
+///     sees and its capabilities, under the caller's project key (or the
+///     operator token charged to a project, operator_key.hl). These are
 ///     the open standard's shapes and error envelope, which never move;
 ///   - the node link: `/node/v1/*`, under a node's enrollment token, the
 ///     registration answered on the node's own connection;
@@ -158,12 +159,12 @@ locus DataPlane {
             return self.infer(req, "chat") or raise;
         }
         if std::http::is_route(c, "GET", "/v1/models") {
-            let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+            let ctx = self.caller(req) or raise;
             let l = self.models.list(ctx) or raise;
             return caller_json(model_list_json(l));
         }
         if std::http::is_route(c, "GET", "/v1/models/:model") {
-            let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+            let ctx = self.caller(req) or raise;
             let m = self.models.get(
                 ModelRef { model: std::http::path_param(c.params, "model") },
                 ctx,
@@ -171,7 +172,7 @@ locus DataPlane {
             return caller_json(model_json(m));
         }
         if std::http::is_route(c, "GET", "/v1/capabilities") {
-            let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+            let ctx = self.caller(req) or raise;
             let caps = self.models.capabilities(ctx) or raise;
             return caller_json(capabilities_json(caps));
         }
@@ -333,6 +334,12 @@ locus DataPlane {
         return no_route(req);
     }
 
+    /// The caller of a caller-plane request: its project key, or the
+    /// operator charged to the project `Voice-Project` names (operator_key.hl).
+    fn caller(req: std::http::Request) -> std::api::Context fallible(ApiError) {
+        return caller_of(self.store, self.bearer, self.operator, req) or raise;
+    }
+
     /// An inference request: the caller's key, then the row's handler,
     /// which admits it and has a seat serve it. Requests are served at
     /// once, each a coroutine of the listener's: each waits on an offer of
@@ -340,7 +347,7 @@ locus DataPlane {
     /// statement at a time (store/pg_store.hl), and a request's limits are
     /// checked and counted with no wait between (`Inference.hold`).
     fn infer(req: std::http::Request, endpoint: String) -> std::http::Response fallible(ApiError) {
-        let ctx = self.bearer.context(std::http::header(req, "Authorization")) or raise;
+        let ctx = self.caller(req) or raise;
         let mut r = read_inference(req.body, endpoint) or raise;
         r.conn_fd = req.conn_fd;
         if r.stream {

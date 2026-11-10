@@ -1,0 +1,145 @@
+// The operator charged to a project (operator_key.hl): the operator token
+// with `Voice-Project` on the caller plane is a request of the project's
+// operator key, held to the project's limits as any of its keys is; a
+// project that is not there is refused, and a project key never takes the
+// header.
+import ".." as api;
+import "../../store" as st;
+
+fn operator(e: api::DataPlane) -> String {
+    return "Authorization: Bearer " + (e.store.operator_token("va-test") or "");
+}
+
+fn call(
+    e: api::DataPlane,
+    method: String,
+    path: String,
+    headers: String,
+    body: String
+) -> std::http::Response {
+    return e.handle(
+        std::http::Request { method: method, path: path, headers: headers, body: body },
+    );
+}
+
+fn code(r: std::http::Response) -> String {
+    return std::json::find_string_field(std::json::find_field_raw(r.body, "error"), "code");
+}
+
+const HI: String = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
+
+fn main() {
+    let e = api::DataPlane { };
+    let catalog = api::Catalog { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    let mut shut = api::ProjectCreate { id: "work", name: "Work" };
+    // no request at all: the operator's requests count as any key's
+    push(
+        shut.limits,
+        st::Limit {
+            scope: st::LimitScope::project,
+            window_seconds: 60,
+            has_requests: true,
+            requests: 0,
+        },
+    ) or discard;
+    projects.create(shut) or discard;
+    projects.create(api::ProjectCreate { id: "home", name: "Home" }) or discard;
+    let made = keys.create(api::KeyCreate { project: "home", name: "ci" }) or {
+        api::Key { status: api::KeyStatus::revoked }
+    };
+    let key = "Authorization: Bearer " + made.secret;
+
+    // the operator, charged to work: past work's limit
+    let limited = call(e, "POST", "/v1/responses", operator(e) + "\r\nVoice-Project: work", HI);
+    std::test::assert_eq_int(limited.status, 429, "held to the project's limit: " + limited.body);
+    std::test::assert_eq_str(code(limited), "rate_limited", "rate_limited");
+    std::test::assert(
+        std::str::contains(limited.headers, "Retry-After: "),
+        "with Retry-After: " + limited.headers,
+    );
+    let streamed = call(
+        e,
+        "POST",
+        "/v1/responses",
+        operator(e) + "\r\nVoice-Project: work",
+        "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
+    );
+    std::test::assert_eq_int(streamed.status, 429, "a stream too: " + streamed.body);
+
+    // charged to home, which has no limit: admitted, and then no seat
+    let home = call(e, "POST", "/v1/responses", operator(e) + "\r\nVoice-Project: home", HI);
+    std::test::assert(
+        home.status != 401 && home.status != 404 && home.status != 429,
+        "past the key and the limits: " + to_string(home.status) + " " + home.body,
+    );
+
+    // as the project's operator key, which the project's key list shows
+    let caps = call(e, "GET", "/v1/capabilities", operator(e) + "\r\nVoice-Project: work", "");
+    std::test::assert_eq_int(caps.status, 200, "capabilities: " + caps.body);
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(caps.body, "project"), "id"),
+        "work",
+        "the project charged",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(std::json::find_field_raw(caps.body, "key"), "id"),
+        "work-operator",
+        "the operator's key",
+    );
+    let listed = keys.list(api::ProjectRef { project: "work" }) or api::KeyList { };
+    let mut found = false;
+    for k in listed.data {
+        if k.id == "work-operator" && k.name == "operator" && k.status == api::KeyStatus::active {
+            found = true;
+        }
+    }
+    std::test::assert(found, "the operator key, made on its first request");
+    let models = call(e, "GET", "/v1/models", operator(e) + "\r\nVoice-Project: work", "");
+    std::test::assert_eq_int(models.status, 200, "the project's models: " + models.body);
+    std::test::assert(std::str::contains(models.body, "\"echo-1\""), "echo-1 among them");
+
+    // never revoked
+    let mut failed = "";
+    keys.revoke(api::KeyRef { project: "work", key: "work-operator" }) or {
+        failed = api::ctl_class(err);
+    };
+    std::test::assert_eq_str(failed, "conflict", "the operator key is not revoked");
+
+    // a project that is not there, or voice's own
+    let unknown = call(e, "POST", "/v1/responses", operator(e) + "\r\nVoice-Project: nope", HI);
+    std::test::assert_eq_int(unknown.status, 404, "no such project: " + unknown.body);
+    std::test::assert_eq_str(code(unknown), "not_found", "not_found");
+    let archived = api::ProjectCreate { id: "old", name: "Old" };
+    projects.create(archived) or discard;
+    projects.archive(api::ProjectRef { project: "old" }) or discard;
+    let gone = call(e, "POST", "/v1/responses", operator(e) + "\r\nVoice-Project: old", HI);
+    std::test::assert_eq_int(gone.status, 403, "an archived project: " + gone.body);
+
+    // the operator token names no project of its own
+    let bare = call(e, "POST", "/v1/responses", operator(e), HI);
+    std::test::assert_eq_int(bare.status, 400, "the operator names a project: " + bare.body);
+    std::test::assert(
+        std::str::contains(bare.body, "Voice-Project"),
+        "saying how: " + bare.body,
+    );
+
+    // a project key never takes the header: not charged to work, nor home
+    let other = call(e, "POST", "/v1/responses", key + "\r\nVoice-Project: work", HI);
+    std::test::assert_eq_int(other.status, 401, "a key cannot name a project: " + other.body);
+    std::test::assert_eq_str(code(other), "invalid_key", "invalid_key");
+    let own = call(e, "POST", "/v1/responses", key + "\r\nVoice-Project: home", HI);
+    std::test::assert_eq_int(own.status, 401, "not even its own: " + own.body);
+    let models_other = call(e, "GET", "/v1/models", key + "\r\nVoice-Project: work", "");
+    std::test::assert_eq_int(models_other.status, 401, "nor on the models it sees");
+    let wrong = call(
+        e,
+        "POST",
+        "/v1/responses",
+        "Authorization: Bearer va-wrong\r\nVoice-Project: work",
+        HI,
+    );
+    std::test::assert_eq_int(wrong.status, 401, "a wrong operator token: " + wrong.body);
+}

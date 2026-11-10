@@ -51,6 +51,12 @@ export function Arrange(_: ScreenProps) {
   const [current, setCurrent] = useState<string | null>(null);
   const projects = useGet('/admin/v1/projects');
 
+  // what applying came to is shown under the button that applied, in view:
+  // the plan above it can be long
+  useEffect(() => {
+    if (applied || applyError) outcome.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [applied, applyError]);
+
   if (roles.isPending) return <Loading what="roles" />;
   if (roles.isError) return <Unavailable what="Arrange" detail={roles.error.message} />;
 
@@ -103,12 +109,6 @@ export function Arrange(_: ScreenProps) {
       setBusy(false);
     }
   }
-
-  // what applying came to is shown under the button that applied, in view:
-  // the plan above it can be long
-  useEffect(() => {
-    if (applied || applyError) outcome.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }, [applied, applyError]);
 
   /** The kept arrangement's wants, in the editor. */
   function open(a: Kept) {

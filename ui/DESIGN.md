@@ -122,8 +122,9 @@ right ones comparable.
   filters by. Tabular numerals, right-aligned, units muted.
 - **Accounts.** Windows, limits, the seats that spend it, and whether it is
   exhausted and until when.
-- **Nodes.** Capabilities as declared, the effective cap and what bounds it,
-  local controls as reported, and the seats with assigned beside reported.
+- **Nodes.** Capabilities as declared, its load against its capacity (the
+  sum of its seats' concurrency), local controls as reported, and the seats
+  with assigned beside reported.
   Enrollment and token rotation, with the token shown once.
 - **Seats.** A form per engine, rendered from its `config_schema`; the
   node's verdict (`refused` with its reason) beside the form.

@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 're
 import { count } from '@hale/components';
 import { subscribeAdminEvents, subscribeFlights, type Flight } from './api/events';
 import { api, type Schemas, type UsageRecord, type UsageRecordSummary } from './api/client';
+import { capacityOf } from './api/fleet-reads';
 import { go } from './route';
 import { DEFAULT, clamp, dragged, keyed, room as roomFor, type Size } from './resize';
 import s from './EventLog.module.css';
@@ -208,7 +209,7 @@ function lineOf(e: AdminEvent): Line | null {
         at,
         tag: '◆ node',
         tone: down ? 'fail' : 'node',
-        text: `${n.id} ${n.status}${n.version ? ` · ${n.version}` : ''} · ${n.in_flight ?? 0}/${n.effective_max_in_flight ?? n.max_in_flight ?? '–'} in flight`,
+        text: `${n.id} ${n.status}${n.version ? ` · ${n.version}` : ''} · ${n.in_flight ?? 0}/${capacityOf(n)} in flight`,
         open: () => go('nodes', n.id),
         replayed,
       };

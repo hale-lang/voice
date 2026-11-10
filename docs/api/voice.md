@@ -76,9 +76,9 @@ operator, through an API.
   sends every node its seats as an assignment; the node runs them,
   refuses any outside what it offers, and reports their state. A node
   that is offline gets its seats when it returns.
-- A node's operator can **pause** the node or a seat, or lower its
-  in-flight cap, on the machine. Local controls only restrict, and the
-  node reports them.
+- A node's operator can **pause** the node or a seat on the machine.
+  Local controls only restrict, and the node reports them. A node has
+  no in-flight cap of its own: its capacity is its seats' concurrency.
 - An **account** is what pays and what has limits: a subscription, a
   metered API key, or nothing for a local engine. Several seats may share
   one account (the same login on two machines), and they share its
@@ -91,9 +91,10 @@ operator, through an API.
 model, are up on a connected node, carry the request's data class, and
 spend an account the key permits (narrowed by `voice.account` when the
 request names one). Accounts with no headroom left are skipped, and
-seats at their concurrency, or on a node at its in-flight cap, are
-skipped; when every one is, the request waits for a slot (see "Rate
-limits, budgets and quota"). Voice picks the account with the
+seats at their concurrency are skipped; when every one is, the request
+waits for a slot (see "Rate limits, budgets and quota"). A placement's
+seat's concurrency is what its runtime is started with (`Seat.concurrency`
+in the node protocol); any other seat's is what its operator set. Voice picks the account with the
 most headroom, then the least loaded of its seats.
 
 The coordinator reaches nodes over NATS on the private network, and nodes
@@ -2385,7 +2386,6 @@ Schema: [NodeCreate](#schema-nodecreate)
 |---|---|---|---|---|
 | `id` | [NodeIdValue](#schema-nodeidvalue) | yes |  |  |
 | `name` | string |  |  | length ≤ 128 |
-| `max_in_flight` | integer \| null |  | The coordinator's cap for the node. Null leaves the node's declared cap in charge. | ≥ 1 |
 
 Responses:
 
@@ -2426,13 +2426,14 @@ Responses:
 
 ### PATCH `/admin/v1/nodes/{node}`
 
-**Rename a node or set its in-flight cap** · `updateNode`
+**Rename a node** · `updateNode`
 
 Authentication: operatorToken
 
-The cap cannot exceed the node's declared `max_in_flight`; the node's
-effective cap is the smallest of the declared, this, and any local
-cap. The change reaches the node as a new assignment.
+The change reaches the node as a new assignment. A node has no
+in-flight cap of its own (its capacity is its seats' concurrency):
+a body that sets `max_in_flight`, to a number or null, is refused
+(422) naming its removal.
 
 Parameters:
 
@@ -2449,7 +2450,6 @@ Schema: [NodeUpdate](#schema-nodeupdate)
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
-| `max_in_flight` | integer \| null |  |  | ≥ 1 |
 
 Responses:
 
@@ -2526,6 +2526,8 @@ must be valid against that engine's `config_schema`. A node that has
 not connected yet has declared nothing; the seat is accepted and
 reported with a problem until the node connects and takes it or
 refuses it. The seat reaches the node as a new assignment.
+A seat whose `config` is a placement's serves what its runtime is
+started with, so a `concurrency` for it is refused (422).
 
 Parameters:
 
@@ -2546,7 +2548,7 @@ Schema: [Seat](#schema-seat)
 | `account` | string | yes | The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits. |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
 | `data_classes` | array of string |  | Data classes this seat may carry. Defaults to `[internal]`. |  |
-| `concurrency` | integer |  | Requests this seat serves at once. | default `1`; ≥ 1 |
+| `concurrency` | integer |  | Requests this seat serves at once. A placement's seat's is what its runtime is started with (TensorFold's `--parallel`, 32; llama-server's slots, as many requests of the context its placement promises as its prompt cache holds, one to four; vLLM's `--max-num-seqs`, 32; the decision server's 1), derived from its config, and the node holds it to that whatever this says. Any other seat's is what its operator set. | default `1`; ≥ 1 |
 | `enabled` | boolean |  |  | default `true` |
 | `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
 
@@ -2618,7 +2620,7 @@ Schema: [SeatUpdate](#schema-seatupdate)
 | `account` | string |  |  |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) |  |  | items ≥ 1 |
 | `data_classes` | array of string |  |  |  |
-| `concurrency` | integer |  |  | ≥ 1 |
+| `concurrency` | integer |  | A seat that is no placement's. A placement's seat serves what its runtime is started with, and a value for it is refused (422). | ≥ 1 |
 | `enabled` | boolean |  |  |  |
 | `config` | object |  |  |  |
 
@@ -3134,7 +3136,7 @@ Schema: [schemas-Capabilities](#schema-schemas-capabilities)
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
-| `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
+| `max_in_flight` | integer |  | Read past: a node has no cap of its own, its capacity is its seats' `concurrency`. A node declares the most it serves at once, its slots, for a coordinator from before, which requires it; a capabilities file that still says it is read past too. | ≥ 1; deprecated |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
 | `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A link declared here wins over the one the coordinator finds from `ports` for the same peer. A model is placed across two nodes only when each has a link to the other, declared or found, and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 | `ports` | array of [CabledPort](#schema-cabledport) |  | The machine's cabled ports, as the node finds them: each network interface with an RDMA (RoCE) device and a carrier. The node looks at start and again whenever a carrier comes or goes, and reports its capabilities again when what it found changed (`reportCapabilities`). The coordinator pairs two nodes' ports by what each sees on its link (`neighbors`), and uses the link it finds as a declared one (`Link`): its first port the pair of ports that share an address family (and an IPv4 subnet), each port at the address it already has, IPv4 before IPv6 link-local, and the RoCE v2 GID that carries that address as its `gid_index`. Voice configures no host networking: a port with neither address is cabled but not addressed. | items ≤ 8 |
@@ -3195,7 +3197,6 @@ Schema: [LocalControls](#schema-localcontrols)
 |---|---|---|---|---|
 | `paused` | boolean | yes |  |  |
 | `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
 | `reason` | string \| null |  | Why, for the admin to read. |  |
 
 Responses:
@@ -4980,7 +4981,7 @@ Type: [PlacementCreate](#schema-placementcreate) & object
 | `seat` | string | yes | The seat it created, `<leader>/<id>`. |  |
 | `follower_seat` | string |  | Across two nodes, the seat it created on its follower, `<follower>/<id>`, which serves nothing itself; left out on one node. |  |
 | `fit` | array of [VariantFit](#schema-variantfit) | yes | Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made. |  |
-| `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. | ≥ 1 |
+| `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. A llama-server seat is started with as many slots as it holds requests of that context (32k, or the model's own when it is made for less), one to four, and divides it among them: its concurrency. | ≥ 1 |
 | `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed; across two nodes, what is reserved on each. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
 | `held_bytes` | integer |  | What its seat holds of each of its nodes' memory for models once it runs: `reserved_bytes` and its server's own. A node's `model_memory_bytes` less what its placements hold is what a later placement fits in. Left out with `reserved_bytes`. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
@@ -5659,7 +5660,6 @@ Type: object
 |---|---|---|---|---|
 | `id` | [NodeIdValue](#schema-nodeidvalue) | yes |  |  |
 | `name` | string |  |  | length ≤ 128 |
-| `max_in_flight` | integer \| null |  | The coordinator's cap for the node. Null leaves the node's declared cap in charge. | ≥ 1 |
 
 <a id="schema-nodeupdate"></a>
 
@@ -5672,7 +5672,6 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `name` | string |  |  | length ≤ 128 |
-| `max_in_flight` | integer \| null |  |  | ≥ 1 |
 
 <a id="schema-nodesummary"></a>
 
@@ -5693,9 +5692,7 @@ Type: object
 | `version` | string \| null |  | The node software's version, as it reported on connecting. |  |
 | `hardware` | [Hardware](#schema-hardware) |  | What the machine has, as the node measured it (`capabilities.hardware`); left out until it says. |  |
 | `local` | [LocalControls](#schema-localcontrols) \| null |  | Its local controls, as it last reported. Null until it first connects. |  |
-| `max_in_flight` | integer \| null |  | The coordinator's cap for the node, or null for none. |  |
-| `effective_max_in_flight` | integer \| null |  | The smallest of the declared, coordinator and local caps. Null until it first connects. |  |
-| `in_flight` | integer |  |  |  |
+| `in_flight` | integer |  | The requests it serves now, against its capacity, the sum of its seats' `concurrency`. |  |
 | `assignment_version` | integer |  | The latest assignment for this node. |  |
 | `applied_version` | integer \| null |  | The assignment the node last reported applying. |  |
 | `seats` | array of [SeatSummary](#schema-seatsummary) | yes |  | items ≤ 16 |
@@ -5794,7 +5791,7 @@ Type: object
 | `account` | string |  |  |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) |  |  | items ≥ 1 |
 | `data_classes` | array of string |  |  |  |
-| `concurrency` | integer |  |  | ≥ 1 |
+| `concurrency` | integer |  | A seat that is no placement's. A placement's seat serves what its runtime is started with, and a value for it is refused (422). | ≥ 1 |
 | `enabled` | boolean |  |  |  |
 | `config` | object |  |  |  |
 
@@ -5816,7 +5813,7 @@ Type: object
 | `account` | string | yes |  |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
 | `data_classes` | array of string |  |  |  |
-| `concurrency` | integer |  |  | ≥ 1 |
+| `concurrency` | integer |  | The requests it serves at once. A placement's seat's is what its runtime is started with (`Seat.concurrency` in the node protocol). | ≥ 1 |
 | `enabled` | boolean |  |  |  |
 | `ref` | string | yes | The seat's full name, `<node>/<seat>`. |  |
 | `node` | string | yes |  |  |
@@ -5847,7 +5844,7 @@ Type: [Seat](#schema-seat) & object
 | `status` | string, one of `pending`, `offline`, `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `pending`: the node has not yet reported on the assignment that carries this version of the seat. `offline`: its node is not connected. The rest are as the node reported them (`SeatState` in the protocol). |  |
 | `reason` | string \| null |  | The node's reason, for `down`, `paused` and `refused`. |  |
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
-| `context` | integer |  | A managed seat's: the context, in tokens, its server took, as its node last reported (`SeatState.context`). Left out until it says. It is never more than the recipe's `context_length`, and a llama.cpp seat's is at most 32768. | ≥ 1 |
+| `context` | integer |  | A managed seat's: the context, in tokens, its server took, as its node last reported (`SeatState.context`). Left out until it says. A llama.cpp seat's is what each of its slots holds: its prompt cache divided among its slots, never less than the context its placement promises (32768, or the model's own when it is made for less). | ≥ 1 |
 | `in_flight` | integer | yes |  |  |
 | `problems` | array of string | yes | What the coordinator sees wrong with it, e.g. a model not in the catalog or an archived account. |  |
 
@@ -7389,8 +7386,9 @@ Type: object
 ### LocalControls
 
 What the node's operator set on the machine. Each field only
-restricts: a paused node or seat takes no new requests, and a local
-cap only lowers the effective one.
+restricts: a paused node or seat takes no new requests. A node from
+before may send a local `max_in_flight`: the coordinator reads past
+it, as no cap of a node's stands.
 
 Type: object
 
@@ -7398,7 +7396,6 @@ Type: object
 |---|---|---|---|---|
 | `paused` | boolean | yes |  |  |
 | `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
 | `reason` | string \| null |  | Why, for the admin to read. |  |
 
 <a id="schema-slug"></a>
@@ -7523,7 +7520,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
-| `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
+| `max_in_flight` | integer |  | Read past: a node has no cap of its own, its capacity is its seats' `concurrency`. A node declares the most it serves at once, its slots, for a coordinator from before, which requires it; a capabilities file that still says it is read past too. | ≥ 1; deprecated |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
 | `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A link declared here wins over the one the coordinator finds from `ports` for the same peer. A model is placed across two nodes only when each has a link to the other, declared or found, and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 | `ports` | array of [CabledPort](#schema-cabledport) |  | The machine's cabled ports, as the node finds them: each network interface with an RDMA (RoCE) device and a carrier. The node looks at start and again whenever a carrier comes or goes, and reports its capabilities again when what it found changed (`reportCapabilities`). The coordinator pairs two nodes' ports by what each sees on its link (`neighbors`), and uses the link it finds as a declared one (`Link`): its first port the pair of ports that share an address family (and an IPv4 subnet), each port at the address it already has, IPv4 before IPv6 link-local, and the RoCE v2 GID that carries that address as its `gid_index`. Voice configures no host networking: a port with neither address is cabled but not addressed. | items ≤ 8 |
@@ -7544,7 +7541,7 @@ Type: object
 | `account` | string | yes | The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits. |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
 | `data_classes` | array of string |  | Data classes this seat may carry. Defaults to `[internal]`. |  |
-| `concurrency` | integer |  | Requests this seat serves at once. | default `1`; ≥ 1 |
+| `concurrency` | integer |  | Requests this seat serves at once. A placement's seat's is what its runtime is started with (TensorFold's `--parallel`, 32; llama-server's slots, as many requests of the context its placement promises as its prompt cache holds, one to four; vLLM's `--max-num-seqs`, 32; the decision server's 1), derived from its config, and the node holds it to that whatever this says. Any other seat's is what its operator set. | default `1`; ≥ 1 |
 | `enabled` | boolean |  |  | default `true` |
 | `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
 
@@ -7561,7 +7558,7 @@ Type: object
 | `account` | string | yes |  |  |
 | `engine_model` | string \| null |  | The seat's own name for the model, passed through in `serve`. |  |
 | `rank` | number | yes | Lower is better. Account headroom first, then seat load, with a little jitter so instances spread. |  |
-| `free` | integer | yes | Slots the seat had free as of this table, bounded by its concurrency and its node's effective cap. An instance decrements its copy when it sends `serve`; the node's answer is the truth. | ≥ 0 |
+| `free` | integer | yes | Slots the seat had free as of this table: its concurrency (a placement's seat's, what its runtime is started with) less what it has in flight; a node has no cap of its own. An instance decrements its copy when it sends `serve`; the node's answer is the truth. | ≥ 0 |
 | `data_classes` | array of string | yes |  |  |
 
 <a id="schema-modelroutes"></a>
@@ -7640,7 +7637,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `version` | integer | yes | Increases with every change. The node applies the newest it has. |  |
-| `max_in_flight` | integer | yes | The coordinator's cap for this node, at most the node's declared `max_in_flight`. | ≥ 1 |
+| `max_in_flight` | integer | yes | The sum of its seats' `concurrency` (at least 1), for a node from before, which reads it as its cap. A node now reads past it: it has no cap of its own. | ≥ 1; deprecated |
 | `seats` | array of [Seat](#schema-seat) | yes | A seat the node is running and this list leaves out is stopped once its in-flight requests finish. | items ≤ 16 |
 | `link_checks` | array of [LinkCheckJob](#schema-linkcheckjob) |  | The link checks the node is to run, one rank of each. A node runs each once and reports it; a check it has reported, or one thirty minutes old, is left out. | items ≤ 4 |
 

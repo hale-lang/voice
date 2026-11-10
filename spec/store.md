@@ -1142,3 +1142,16 @@ create table arrangement (
   planned_basis text not null default ''      -- the fleet it was planned against, a digest
 );
 ```
+
+### Migration 33: a node's capacity is its seats'
+
+A node has no in-flight cap of its own: it serves each seat up to the
+seat's concurrency, so the coordinator's cap goes. A placement's seat keeps
+its row's `concurrency` as it was, unread: what it serves at once is what
+its runtime is started with (lib/concurrency), derived from its config
+wherever it is counted, so a seat placed before is served at its runtime's
+concurrency without being placed again.
+
+```sql
+alter table node drop column max_in_flight;
+```

@@ -46,7 +46,7 @@ sample.key = key.id;
 // a second model is left for the create
 const hardware = { os: 'linux', arch: 'arm64', memory_bytes: 137438953472, model_memory_bytes: 120000000000, accelerators: [{ kind: 'cuda', name: 'NVIDIA GB10', memory_bytes: 137438953472, unified: true }], disk_free_bytes: 3500000000000 };
 {
-  const r = await fetch(base + '/node/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${nodeToken}` }, body: JSON.stringify({ protocol: 2, version: 'live', capabilities: { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object' } }, { id: 'managed', kind: 'managed', models: null, config_schema: { type: 'object' } }], hardware }, local: { paused: false, paused_seats: [], max_in_flight: null, reason: null } }) });
+  const r = await fetch(base + '/node/v1/register', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${nodeToken}` }, body: JSON.stringify({ protocol: 2, version: 'live', capabilities: { engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object' } }, { id: 'managed', kind: 'managed', models: null, config_schema: { type: 'object' } }], hardware }, local: { paused: false, paused_seats: [], reason: null } }) });
   if (r.status !== 200) { console.log('FAIL setup register', r.status, (await r.text()).slice(0, 200)); process.exit(1); }
 }
 await setup('/admin/v1/recipes', recipe('live-placed'));
@@ -91,8 +91,8 @@ const bodies = {
   setLimits: { limits: [{ scope: 'project', window_seconds: 60, requests: 600 }, { scope: 'model', model: 'echo-1', window_seconds: 3600, requests: 200 }] },
   createAccount: { id: 'static', name: 'Static' },
   updateAccount: { name: 'Claude (work)', billing: 'subscription' },
-  createNode: { id: 'desktop', max_in_flight: 4 },
-  updateNode: { max_in_flight: 8 },
+  createNode: { id: 'desktop' },
+  updateNode: { name: 'Desktop' },
   createSeat: { id: 'live', engine: 'static', account: 'claude-work', serves: [{ model: 'echo-1', as: null }], data_classes: ['public', 'internal'], concurrency: 2, config: { text: 'hi', chunk_chars: 4 } },
   updateSeat: { concurrency: 4 },
   createChatCompletion: { model: 'echo-1', messages: [{ role: 'user', content: 'hi' }] },
@@ -109,8 +109,8 @@ const bodies = {
 // the node plane: the node's enrollment token, and the bodies it sends
 // (it registers first, as the spec lists it)
 let nodeAuth = { authorization: `Bearer ${nodeToken}` };
-const capabilities = { max_in_flight: 4, engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object', required: ['text'] } }] };
-const local = { paused: false, paused_seats: [], max_in_flight: null, reason: null };
+const capabilities = { engines: [{ id: 'static', kind: 'static', models: null, config_schema: { type: 'object', required: ['text'] } }] };
+const local = { paused: false, paused_seats: [], reason: null };
 const nodeBodies = {
   registerNode: { protocol: 2, version: 'live', capabilities, local },
   nodeHeartbeat: { in_flight: 0, seats: [{ id: 'static', status: 'up', in_flight: 0 }] },

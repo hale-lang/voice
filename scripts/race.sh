@@ -9,7 +9,7 @@
 #   - node PATCHes on one instance and seat PATCHes on the other, in
 #     parallel, each move the node's assignment version on by one: the
 #     final version is the first plus the number of writes;
-#   - two PATCHes to different fields of one node, one on each instance,
+#   - two PATCHes to different fields of one seat, one on each instance,
 #     both land.
 #
 # Needs api/api built, psql and python3.
@@ -89,12 +89,12 @@ end = call(a, "GET", "/admin/v1/nodes/nv")[1]["assignment_version"]
 assert end == start + 2 * n, f"assignment version {start} -> {end}, expected {start + 2 * n}: bumps were lost"
 print(f"{2 * n} concurrent writes on two instances: assignment version {start} -> {end}")
 
-# two fields of one node, one on each instance, at once
+# two fields of one seat, one on each instance, at once
 with ThreadPoolExecutor(max_workers=2) as pool:
-    x = pool.submit(call, a, "PATCH", "/admin/v1/nodes/nv", {"name": "both"})
-    y = pool.submit(call, b, "PATCH", "/admin/v1/nodes/nv", {"max_in_flight": 3})
+    x = pool.submit(call, a, "PATCH", "/admin/v1/nodes/nv/seats/s", {"enabled": False})
+    y = pool.submit(call, b, "PATCH", "/admin/v1/nodes/nv/seats/s", {"concurrency": 3})
     x.result(); y.result()
-node = call(a, "GET", "/admin/v1/nodes/nv")[1]
-assert node["name"] == "both" and node["max_in_flight"] == 3, node
+seat = call(a, "GET", "/admin/v1/nodes/nv/seats/s")[1]
+assert seat["enabled"] is False and seat["concurrency"] == 3, seat
 print("two fields written at once on two instances: both kept")
 PY

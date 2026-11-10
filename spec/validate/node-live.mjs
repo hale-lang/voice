@@ -6,7 +6,7 @@ const spec = JSON.parse(fs.readFileSync(bundle, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
 const calls = [
   ['get', '/healthz'], ['get', '/node/v1/status'], ['get', '/node/v1/capabilities'],
-  ['get', '/node/v1/local'], ['put', '/node/v1/local', { paused: true, paused_seats: [], max_in_flight: null, reason: 'test' }],
+  ['get', '/node/v1/local'], ['put', '/node/v1/local', { paused: true, paused_seats: [], reason: 'test' }],
   ['get', '/node/v1/status'],
 ];
 let fails = 0;

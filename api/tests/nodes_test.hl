@@ -12,7 +12,7 @@ fn why(err: api::CtlError) -> String {
 
 /// What a failed call falls back to; each assertion on it then fails.
 fn no_node() -> api::Node {
-    return api::Node { status: api::NodeStatus::revoked, has_max_in_flight: true };
+    return api::Node { status: api::NodeStatus::revoked, has_applied_version: true };
 }
 
 fn no_seat() -> api::SeatView {
@@ -24,7 +24,7 @@ fn no_summary() -> api::SeatSummary {
 }
 
 fn no_listed() -> api::NodeSummary {
-    return api::NodeSummary { status: api::NodeStatus::revoked, has_max_in_flight: true };
+    return api::NodeSummary { status: api::NodeStatus::revoked, has_applied_version: true };
 }
 
 fn model(id: String) -> st::SeatModel {
@@ -63,7 +63,10 @@ fn main() {
     let token = made.enrollment_token;
     std::test::assert(made.status == api::NodeStatus::pending, "pending until it connects");
     std::test::assert(!made.has_capabilities, "it has declared nothing");
-    std::test::assert(!made.has_max_in_flight, "no coordinator cap");
+    std::test::assert(
+        !std::str::contains(api::Node::api_encode(made), "max_in_flight"),
+        "no cap of its own",
+    );
     std::test::assert_eq_int(made.assignment_version, 1, "its first assignment");
     let got = nodes.get(api::NodeRef { node: "laptop" }) or no_node();
     std::test::assert_eq_str(got.id, "laptop", "get");
@@ -92,24 +95,37 @@ fn main() {
     nodes.create(api::NodeCreate { id: "Laptop" }) or { failed = why(err); };
     std::test::assert(std::str::starts_with(failed, "invalid id: "), "an id is a slug: " + failed);
     failed = "";
-    nodes.create(api::NodeCreate { id: "x", has_max_in_flight: true, max_in_flight: 0 }) or {
+    nodes.create(api::NodeCreate { id: "x", has_max_in_flight: true, max_in_flight: 4 }) or {
         failed = why(err);
     };
-    std::test::assert(std::str::starts_with(failed, "invalid "), "a cap is at least 1: " + failed);
+    std::test::assert(
+        std::str::starts_with(failed, "invalid max_in_flight: `max_in_flight` was removed"),
+        "a node has no cap of its own to create it with: " + failed,
+    );
     failed = "";
     nodes.get(api::NodeRef { node: "nope" }) or { failed = why(err); };
     std::test::assert_eq_str(failed, "not_found : no node nope", "an unknown node");
 
-    let capped = nodes.update(
+    // a node's cap, as an update from before asks for it, set or cleared:
+    // refused by name, and nothing changes
+    for u in [
         api::NodeUpdate { node: "laptop", has_max_in_flight: true, max_in_flight: 4 },
-    ) or no_node();
-    std::test::assert(capped.has_max_in_flight && capped.max_in_flight == 4, "set a cap");
-    std::test::assert_eq_int(capped.assignment_version, 2, "a new assignment");
-    std::test::assert_eq_str(capped.name, "Laptop", "a field not set stays");
-    let uncapped = nodes.update(
         api::NodeUpdate { node: "laptop", clear_max_in_flight: true },
-    ) or no_node();
-    std::test::assert(!uncapped.has_max_in_flight, "the cap lifted");
+    ] {
+        failed = "";
+        nodes.update(u) or { failed = why(err); };
+        std::test::assert(
+            std::str::starts_with(failed, "invalid max_in_flight: `max_in_flight` was removed: ")
+                && std::str::contains(failed, "its capacity is their sum"),
+            "a node's own cap is refused, naming the removal: " + failed,
+        );
+    }
+    std::test::assert_eq_int(version(nodes, "laptop"), 1, "no new assignment");
+    let capped = nodes.update(api::NodeUpdate { node: "laptop", has_name: true, name: "Laptop" })
+    or no_node();
+    std::test::assert_eq_int(capped.assignment_version, 2, "a new assignment");
+    let renamed = nodes.update(api::NodeUpdate { node: "laptop" }) or no_node();
+    std::test::assert_eq_str(renamed.name, "Laptop", "a field not set stays");
     failed = "";
     nodes.update(api::NodeUpdate { node: "laptop", has_id: true, id: "other" }) or {
         failed = why(err);

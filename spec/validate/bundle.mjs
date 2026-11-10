@@ -316,6 +316,8 @@ const RULES = [
   [/^Health\.(checks|store)$/, 'map', '`checks` is a map of dependency to state'],
   [/^(AccountUpdate|CatalogModelUpdate|NodeUpdate|SeatUpdate|ProjectUpdate)\.(id|budget|limits|recipe)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
   [/^AnnotatorUpdate\.(id|stage)$/, 'wire', 'a field the contract does not take, named so the handler refuses it by name instead of ignoring it'],
+  [/^(NodeCreate|NodeUpdate)\.max_in_flight$/, 'wire', 'a node\'s own cap, removed: named so the handler refuses it by name instead of ignoring it'],
+  [/^Node\.capabilities\.max_in_flight$/, 'wire', 'deprecated in the contract: a node declares it for a coordinator from before, and the api reads past it'],
   [/^UsageSummary\.data\[\]\.refused$/, 'wire', 'a summary counts the requests the ledger holds, and refusals are not written to it'],
 ];
 // Places whose every gap is the wire's, whatever the field: the standard

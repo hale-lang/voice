@@ -130,7 +130,7 @@ function observed(qc: QueryClient, node: NodeSummary): boolean {
     },
   });
   // anything but the heartbeat can change what is routed: a seat placed,
-  // removed or moving, and a seat's load or its node's cap, which the
+  // removed or moving, and a seat's load or its concurrency, which the
   // route table's `free` is made of
   return true;
 }

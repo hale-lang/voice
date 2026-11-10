@@ -26,7 +26,9 @@ type AssignedRead {
 type AssignedReads { items: bounded[AssignedRead; 16]; }
 
 /// `Assignment`: the node's whole desired state, as the router and the
-/// nodes' messages carry it.
+/// nodes' messages carry it. `max_in_flight` is deprecated: the sum of its
+/// seats' concurrency, which a node from before reads as its cap; a node
+/// now serves each seat up to its own and reads none.
 type AssignmentRead {
     version: Int = 0;
     max_in_flight: Int = 1;
@@ -112,9 +114,10 @@ type NodeCabledPort {
 /// `Capabilities` (protocol.yaml): what the node can run, the machine it
 /// runs on when the node measured it, the nodes it is cabled to as its
 /// operator declared them, and its cabled ports as it found them.
+/// A node from before still declares `max_in_flight`, its own cap: it is
+/// read past, as no cap of a node's stands (its capacity is its seats').
 type NodeCapabilities {
     engines: bounded[NodeEngine; 16];
-    max_in_flight: Int;
     has_hardware: Bool = false;
     hardware: NodeHardware = NodeHardware { };
     // left out when it declares none
@@ -127,14 +130,14 @@ type NodeCapabilities {
 
 /// No capabilities: what a node that has not declared any holds.
 fn no_capabilities() -> NodeCapabilities {
-    return NodeCapabilities { max_in_flight: 0 };
+    return NodeCapabilities { };
 }
 
 /// `Registration`. `local` is the node's own controls.
 type Registration {
     protocol: Int = 0;
     version: String = "";
-    capabilities: NodeCapabilities = NodeCapabilities { max_in_flight: 0 };
+    capabilities: NodeCapabilities = NodeCapabilities { };
     local: LocalControls = LocalControls { paused: false };
 }
 
@@ -173,12 +176,11 @@ type SeatStates { assignment_version: Int = 0; seats: bounded[SeatState; 16]; }
 /// -1 when it does not say.
 type Heartbeat { in_flight: Int = 0; seats: bounded[SeatState; 16]; assignment_version: Int = -1; }
 
-/// `LocalControls`: what the node's operator set on the machine.
+/// `LocalControls`: what the node's operator set on the machine. A node
+/// from before may still send a local `max_in_flight`: it is read past.
 type LocalControls {
     paused: Bool;
     paused_seats: bounded[String; 32];
-    has_max_in_flight: Bool = false;
-    max_in_flight: Int = -1;
     has_reason: Bool = false;
     reason: String = "";
 }
@@ -207,7 +209,7 @@ type Draining { reason: String = ""; }
 /// `config_schema` requires.
 type DeclaredEngine { id: String = ""; kind: String = ""; required: st::Names = st::Names { }; }
 
-type DeclaredEngines { items: bounded[DeclaredEngine; 16]; max_in_flight: Int = 0; }
+type DeclaredEngines { items: bounded[DeclaredEngine; 16]; }
 
 // ---- the node plane --------------------------------------------------
 
@@ -264,7 +266,7 @@ locus NodePlane {
     fn register_read(r: Registration, ctx: std::api::Context) -> RegisteredRead fallible(ApiError) {
         if r.protocol != 2 { fail invalid("this coordinator speaks protocol 2", "protocol"); }
         let caps = NodeCapabilities::api_encode(r.capabilities);
-        let engines = declared_engines(caps) or raise;
+        declared_engines(caps) or raise;
         let n = self.own(ctx) or raise;
         let now = now_seconds();
         self.store.put_fleet(
@@ -278,16 +280,12 @@ locus NodePlane {
         ) or fail store_failed(err);
         self.store.put_beat(n.id, now, 0) or fail store_failed(err);
         let a = assignment_of(self.store, n) or fail store_failed(err);
-        let mut out = RegisteredRead {
+        return RegisteredRead {
             heartbeat_interval_ms: HEARTBEAT_MS,
             nats_url: self.link.place(),
             nats_subject: self.link.root() + ".node." + n.id,
             assignment: a,
         };
-        if engines.max_in_flight > 0 && out.assignment.max_in_flight > engines.max_in_flight {
-            out.assignment.max_in_flight = engines.max_in_flight;
-        }
-        return out;
     }
 
     /// `getAssignment`.
@@ -438,19 +436,12 @@ fn is_seat_status(s: String) -> Bool {
 
 // ---- the fleet, read ---------------------------------------------------
 
-/// The node's whole desired state: every seat configured on it, and its
-/// cap: the coordinator's, at most the node's declared one.
+/// The node's whole desired state: every seat configured on it, each with
+/// the requests it serves at once (`seat_concurrency`), and, for a node
+/// from before that reads one, their sum as its cap (at least 1).
 fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(st::StoreError) {
     let f = store.fleet(n.id) or raise;
-    let declared = if f.present {
-        (declared_engines(f.capabilities) or DeclaredEngines { }).max_in_flight
-    } else {
-        0
-    };
-    let mut cap = if n.max_in_flight > 0 { n.max_in_flight } else { declared };
-    if declared > 0 && cap > declared { cap = declared; }
-    if cap < 1 { cap = 1; }
-    let mut out = AssignmentRead { version: n.assignment_version, max_in_flight: cap };
+    let mut out = AssignmentRead { version: n.assignment_version };
     if n.revoked { return out; }
     out.link_checks = link_jobs(
         store.link_checks() or raise,
@@ -465,7 +456,7 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(st
                 id: s.id,
                 engine: s.engine,
                 account: s.account,
-                concurrency: s.concurrency,
+                concurrency: seat_concurrency(s),
                 enabled: s.enabled,
                 config: s.config,
             };
@@ -474,6 +465,7 @@ fn assignment_of(store: st::Store, n: st::NodeRow) -> AssignmentRead fallible(st
             push(out.seats, a) or discard;
         }
     }
+    out.max_in_flight = capacity_of(out.seats);
     return out;
 }
 
@@ -490,7 +482,7 @@ fn node_status(store: st::Store, n: st::NodeRow, now: Time) -> String fallible(s
     return "down";
 }
 
-/// The engines a `Capabilities` object declares, and its cap.
+/// The engines a `Capabilities` object declares.
 fn declared_engines(json: String) -> DeclaredEngines fallible(ApiError) {
     if !std::json::valid_object(json) {
         fail invalid("`capabilities` is an object", "capabilities");
@@ -498,9 +490,7 @@ fn declared_engines(json: String) -> DeclaredEngines fallible(ApiError) {
     if kind_of(json, "engines") != "array" {
         fail invalid("`capabilities.engines` is a list", "capabilities");
     }
-    let cap = count_or(json, "max_in_flight", 0) or raise;
-    if cap < 1 { fail invalid("`capabilities.max_in_flight` is at least 1", "capabilities"); }
-    let mut out = DeclaredEngines { max_in_flight: cap };
+    let mut out = DeclaredEngines { };
     let mut it = std::json::array_first(std::json::find_field_raw(json, "engines"));
     while !it.done {
         let e = std::str::trim(it.element);
@@ -531,16 +521,6 @@ fn check_local(json: String) -> Bool fallible(ApiError) {
         fail invalid("`local.paused_seats` is a list", "local");
     }
     names_of(std::json::find_field_raw(json, "paused_seats"), "local") or raise;
-    let cap = kind_of(json, "max_in_flight");
-    if cap != "missing" && cap != "null" {
-        let n = nullable_count(json, "max_in_flight") or fail invalid(
-            "`local.max_in_flight` is a whole number of at least 0, or null",
-            "local"
-        );
-        if n < 0 {
-            fail invalid("`local.max_in_flight` is a whole number of at least 0, or null", "local");
-        }
-    }
     return true;
 }
 
@@ -550,11 +530,6 @@ fn read_local(json: String) -> LocalControls fallible(ApiError) {
     let mut l = LocalControls { paused: std::json::find_bool_field(json, "paused") };
     let held = names_of(std::json::find_field_raw(json, "paused_seats"), "local") or raise;
     l.paused_seats = held.items;
-    let cap = kind_of(json, "max_in_flight");
-    if cap != "missing" && cap != "null" {
-        l.has_max_in_flight = true;
-        l.max_in_flight = nullable_count(json, "max_in_flight") or raise;
-    }
     if kind_of(json, "reason") == "string" {
         l.has_reason = true;
         l.reason = std::json::find_string_field(json, "reason");
@@ -569,7 +544,6 @@ fn local_of(json: String) -> LocalControls {
 
 fn local_json(l: LocalControls) -> String {
     return "{\"paused\": " + jbool(l.paused) + ", \"paused_seats\": " + st::jnames(l.paused_seats)
-        + ", \"max_in_flight\": " + jcount_or_null(l.has_max_in_flight, l.max_in_flight)
         + ", \"reason\": " + jstring_or_null(l.has_reason, l.reason) + "}";
 }
 
@@ -584,18 +558,22 @@ fn locally_paused(local: String, seat: String) -> Bool {
     return has_name(held.items, seat);
 }
 
-/// The node's effective cap: the smallest of its declared, the
-/// coordinator's and its local cap; -1 until it first registers.
-fn effective_cap(store: st::Store, n: st::NodeRow) -> Int fallible(st::StoreError) {
-    let f = store.fleet(n.id) or raise;
-    if !f.present { return -1; }
-    let mut cap = (declared_engines(f.capabilities) or DeclaredEngines { }).max_in_flight;
-    if n.max_in_flight > 0 && n.max_in_flight < cap { cap = n.max_in_flight; }
-    if kind_of(f.local, "max_in_flight") == "number" {
-        let local = std::json::find_int_field(f.local, "max_in_flight");
-        if local < cap { cap = local; }
+/// The requests seat `s` serves at once: a placement's, what its runtime
+/// is started with (lib/concurrency), whatever its row holds; any other's,
+/// its own `concurrency`.
+fn seat_concurrency(s: st::SeatRow) -> Int {
+    let placed = concurrency::placed(s.config);
+    return if placed >= 1 { placed } else { s.concurrency };
+}
+
+/// A node's capacity: the sum of its seats' concurrency, at least 1 (what
+/// a node from before reads as its cap, `Assignment.max_in_flight`).
+fn capacity_of(seats: bounded[AssignedRead; 16]) -> Int {
+    let mut sum = 0;
+    for a in seats {
+        sum = sum + a.concurrency;
     }
-    return cap;
+    return if sum < 1 { 1 } else { sum };
 }
 
 // ---- the wire ----------------------------------------------------------

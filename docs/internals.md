@@ -206,8 +206,7 @@ refuses so, the request waits for a slot on this instance, in arrival
 order among the requests that may go to the same seats, offered again when an attempt here ends or
 every 250 ms, its caller looked for meanwhile, until its `voice.deadline`
 (`504 deadline_exceeded`) or for 60 s (`429 no_capacity`, `Retry-After`).
-The annotator's requests wait for none: its queue backs off on its own. A seat whose node holds a
-local cap of 0 is not offered. Chat Completions messages are converted to
+The annotator's requests wait for none: its queue backs off on its own. Chat Completions messages are converted to
 the standard's input items (content parts, tool calls and tool results),
 and what has no standard form is refused `400 unsupported`. The api serves
 its callers one at a time, and opens a NATS connection for each attempt.
@@ -475,9 +474,19 @@ serves the request on its seat with the static engine, streaming the
 standard's events and the result to the reply subject the request named
 (`protocol.yaml`); a `cancel` stops it. It serves several at once: each
 accepted `serve` goes to a slot of its own ([`node/serve.hl`](../node/serve.hl),
-eight, each its own thread), up to the node's cap and up to each seat's
-`concurrency`, and a `serve` past either is refused, so the request goes to
-another seat. Core NATS delivers an `assign` at most once, so a node reads
+64, each its own thread), up to each seat's `concurrency`, and a `serve`
+past it is refused for capacity, so the request waits for a slot or goes to
+another seat. The node has no in-flight cap of its own: its capacity is its
+seats' concurrency. A placement's seat's concurrency is what its runtime is
+started with, derived from its config in one place
+([`lib/concurrency`](../lib/concurrency/concurrency.hl)), which the api
+assigns, the brain counts free slots against and the node starts the
+runtime with: TensorFold's `--parallel` (32); llama-server's slots
+(`--parallel`), as many requests of the context its placement promises
+(32k, or the model's own when it is made for less) as its prompt cache
+(`-c`, which llama-server divides among them) holds, one to four; vLLM's
+`--max-num-seqs` (32), its cache paged; the decision server's one. Any
+other seat's is what its operator set. Core NATS delivers an `assign` at most once, so a node reads
 its assignment each time it is on NATS again, and the api sends the
 assignment again to a node whose heartbeat says it is behind.
 
@@ -695,11 +704,11 @@ already exercised by the one. See [In Hale](#in-hale).
 
 Nothing is discovered. A node offers exactly the engines listed on it and
 runs exactly the seats assigned to it, and the coordinator admits only nodes
-it issued a token to. A node's operator can pause it or a seat, or lower its
-in-flight cap, on the machine; local controls only restrict.
+it issued a token to. A node's operator can pause it or a seat on the
+machine; local controls only restrict.
 
 **One admin UI.** The api serves the admin UI from its own origin, and every
-node is administered through it: seats, caps and state live on the
+node is administered through it: seats, limits and state live on the
 coordinator. A node's own API is only for the machine it runs on, and for
 when it cannot reach the coordinator.
 

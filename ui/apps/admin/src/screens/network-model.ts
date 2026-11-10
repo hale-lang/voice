@@ -1,4 +1,5 @@
 import type { Account, NodeSummary, Schemas, UsageRecordSummary } from '../api/client';
+import { capacityOf } from '../api/fleet-reads.ts';
 
 /**
  * A request as the graph draws it: as the ledger lists it, with the
@@ -78,7 +79,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   };
   for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: link('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });
   for (const n of fleet.nodes) {
-    add({ id: entityId('node', n.id), name: n.id, kind: 'node', state: n.status, active: n.in_flight ?? 0, href: link('nodes', n.id), details: [['Name', n.name ?? n.id], ['State', n.status], ['In flight / cap', `${n.in_flight ?? '—'} / ${n.effective_max_in_flight ?? '—'}`], ['Last heartbeat', n.last_heartbeat_at ?? 'not reported'], ['Assignment / applied', `${n.assignment_version ?? '—'} / ${n.applied_version ?? '—'}`]] });
+    add({ id: entityId('node', n.id), name: n.id, kind: 'node', state: n.status, active: n.in_flight ?? 0, href: link('nodes', n.id), details: [['Name', n.name ?? n.id], ['State', n.status], ['In flight / capacity', `${n.in_flight ?? '—'} / ${capacityOf(n)}`], ['Last heartbeat', n.last_heartbeat_at ?? 'not reported'], ['Assignment / applied', `${n.assignment_version ?? '—'} / ${n.applied_version ?? '—'}`]] });
     for (const s of n.seats) {
       add({ id: entityId('seat', s.ref), name: s.id, kind: 'seat', parent: entityId('node', n.id), state: s.status, active: s.in_flight, href: link('nodes', n.id, s.id), details: [['Seat', s.ref], ['Engine', s.engine], ['Account', s.account], ['State', s.status], ['In flight / cap', `${s.in_flight} / ${s.concurrency ?? 1}`], ['Reason', s.reason ?? (s.problems.join('; ') || 'none reported')]] });
       for (const m of s.serves) {

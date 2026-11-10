@@ -95,20 +95,62 @@ fn main() {
         "and still refuses what it cannot",
     );
 
+    // a placement's seat serves what its runtime is started with, whatever
+    // a coordinator from before assigned it (concurrency 1, and a cap it
+    // reads past); any other seat serves its assigned concurrency
+    let managed = "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"static\", \"kind\": \"static\"}]}";
+    let old = "{\"version\": 4, \"max_in_flight\": 1, \"seats\": ["
+        + "{\"id\": \"tf\", \"engine\": \"managed\", \"concurrency\": 1, \"config\": {\"placement\": \"tf\", \"model\": \"m\", \"variant\": {}, \"runtime\": {\"server\": \"tensorfold\"}}}, "
+        + "{\"id\": \"llama\", \"engine\": \"managed\", \"concurrency\": 1, \"config\": {\"placement\": \"llama\", \"model\": \"m\", \"context_length\": 131072, \"cache_tokens\": 65536, \"variant\": {}, \"runtime\": {\"server\": \"llama-server\"}}}, "
+        + "{\"id\": \"canned\", \"engine\": \"static\", \"concurrency\": 3, \"config\": {\"text\": \"hi\"}}]}";
+    let applied = node::apply_assignment(old, managed, node::LOCAL_DEFAULT);
+    std::test::assert_eq_int(node::seat_of(applied, "tf").concurrency, 32, "TensorFold's 32");
     std::test::assert_eq_int(
-        node::node_cap(CAPS, 2, node::LOCAL_DEFAULT),
+        node::seat_of(applied, "llama").concurrency,
         2,
-        "the coordinator's cap lowers the declared one",
+        "llama-server's two slots",
     );
     std::test::assert_eq_int(
-        node::node_cap(CAPS, 9, node::LOCAL_DEFAULT),
-        4,
-        "but never raises it",
+        node::seat_of(applied, "canned").concurrency,
+        3,
+        "a static seat's own",
     );
-    std::test::assert_eq_int(
-        node::node_cap(CAPS, 2, "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 1}"),
-        1,
-        "nor does a local cap",
+
+    // the node takes a TensorFold seat's 32 at once, beside its other seats,
+    // and refuses the 33rd for capacity; no cap of the node's narrows it
+    let tf = node::seat_of(applied, "tf");
+    let mut busy = "";
+    let mut taken = 0;
+    while taken < 40 {
+        if len(node::at_capacity(busy, tf, node::SLOTS)) > 0 { break; }
+        busy = busy + to_string(node::free_slot(busy, node::SLOTS)) + "\ttf\tr" + to_string(taken)
+            + "\n";
+        taken = taken + 1;
+    }
+    std::test::assert_eq_int(taken, 32, "32 at once on the TensorFold seat");
+    std::test::assert_eq_str(
+        node::at_capacity(busy, tf, node::SLOTS),
+        "seat tf is serving 32, its most at once",
+        "the 33rd is refused for the seat's capacity",
+    );
+    let canned = node::seat_of(applied, "canned");
+    std::test::assert_eq_str(
+        node::at_capacity(busy, canned, node::SLOTS),
+        "",
+        "another seat still takes one",
+    );
+    let mut full = "";
+    let mut i = 0;
+    while i < node::SLOTS {
+        full = full + to_string(i) + "\tx\tr" + to_string(i) + "\n";
+        i = i + 1;
+    }
+    std::test::assert(
+        std::str::starts_with(
+            node::at_capacity(full, canned, node::SLOTS),
+            "the node is serving 64",
+        ),
+        "only once every slot serves is the node full",
     );
 
     let shown = node::status_seats(a, seats, "");

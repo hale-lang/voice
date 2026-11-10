@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
 import { useGet, useNodes, type Node, type NodeSummary, type SeatSummary, type SeatView, type Schemas } from '../api/client';
+import { capacityOf } from '../api/fleet-reads';
 import { useHubState } from '../api/hub';
 import { useWrite } from '../api/mutate';
 import { Arrange } from './Arrange';
@@ -78,7 +79,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
             { key: 'name', header: 'Name', render: (n) => n.name ?? '' },
             { key: 'status', header: 'State', render: (n) => <Status tone={toneOf(n.status)} label={n.status} /> },
             { key: 'seats', header: 'Seats', num: true, render: (n) => n.seats.length },
-            { key: 'cap', header: 'In flight / cap', num: true, render: (n) => `${n.in_flight ?? 0} / ${n.effective_max_in_flight ?? '–'}` },
+            { key: 'cap', header: 'In flight / capacity', num: true, render: (n) => `${n.in_flight ?? 0} / ${capacityOf(n)}` },
             { key: 'assign', header: 'Assignment', num: true, render: (n) => <AssignmentCell node={n} /> },
             { key: 'disk', header: 'On disk', num: true, render: (n) => <OnDiskCell node={n} /> },
             { key: 'hb', header: 'Heartbeat', render: (n) => <Heartbeat at={n.last_heartbeat_at} /> },
@@ -357,7 +358,6 @@ function CreateNode() {
   const w = useWrite();
   const [id, setId] = useState('');
   const [name, setName] = useState('');
-  const [cap, setCap] = useState<number | null>(null);
   const [token, setToken] = useState<{ id: string; token: string } | null>(null);
   if (token) {
     return (
@@ -379,7 +379,7 @@ function CreateNode() {
       <Form
         error={w.error}
         onSubmit={async () => {
-          const r = await w.write('post', '/admin/v1/nodes', { body: { id, name: name || undefined, max_in_flight: cap } });
+          const r = await w.write('post', '/admin/v1/nodes', { body: { id, name: name || undefined } });
           if (r && 'enrollment_token' in r) setToken({ id: r.id, token: r.enrollment_token });
           else if (r) go('nodes');
         }}
@@ -396,9 +396,6 @@ function CreateNode() {
         <Field label="name">
           <TextInput value={name} onChange={setName} />
         </Field>
-        <Field label="in-flight cap" help="the coordinator's cap; empty leaves the node's declared cap in charge">
-          <NumberInput value={cap} onChange={setCap} min={1} />
-        </Field>
       </Form>
     </>
   );
@@ -408,12 +405,10 @@ function NodeInspector({ node }: { node: Node }) {
   const w = useWrite();
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(node.name ?? '');
-  const [cap, setCap] = useState<number | null>(node.max_in_flight ?? null);
   const [token, setToken] = useState<string | null>(null);
   useEffect(() => {
     setEditing(false);
     setName(node.name ?? '');
-    setCap(node.max_in_flight ?? null);
     setToken(null);
   }, [node]);
   const caps = node.capabilities;
@@ -430,7 +425,7 @@ function NodeInspector({ node }: { node: Node }) {
         <Form
           error={w.error}
           onSubmit={async () => {
-            const r = await w.write('patch', '/admin/v1/nodes/{node}', { params: { path: { node: node.id } }, body: { name: name || undefined, max_in_flight: cap } });
+            const r = await w.write('patch', '/admin/v1/nodes/{node}', { params: { path: { node: node.id } }, body: { name: name || undefined } });
             if (r) setEditing(false);
           }}
           actions={
@@ -441,9 +436,6 @@ function NodeInspector({ node }: { node: Node }) {
           }
         >
           <Field label="name"><TextInput value={name} onChange={setName} /></Field>
-          <Field label="in-flight cap" help={caps ? `at most the declared ${caps.max_in_flight}; empty for none` : 'empty for none'}>
-            <NumberInput value={cap} onChange={setCap} min={1} max={caps?.max_in_flight} />
-          </Field>
         </Form>
       ) : (
         <Kv
@@ -453,7 +445,7 @@ function NodeInspector({ node }: { node: Node }) {
             { k: 'version', v: node.version ?? '–' },
             { k: 'connected', v: node.connected_at ? `${ago(node.connected_at)} ago` : 'never' },
             { k: 'heartbeat', v: <Heartbeat at={node.last_heartbeat_at} /> },
-            { k: 'cap', v: <CapExplained node={node} /> },
+            { k: 'capacity', v: <Capacity node={node} /> },
             { k: 'assignment', v: <AssignmentCell node={node} /> },
           ]}
         />
@@ -476,7 +468,6 @@ function NodeInspector({ node }: { node: Node }) {
           rows={[
             { k: 'paused', v: local.paused ? <Status tone="wait" label="paused" /> : 'no' },
             { k: 'paused seats', v: local.paused_seats.length ? local.paused_seats.join(', ') : 'none' },
-            { k: 'local cap', v: local.max_in_flight ?? 'none' },
             { k: 'reason', v: local.reason ?? '–' },
           ]}
         />
@@ -664,18 +655,16 @@ function suggestionRow(s: Suggestion, place: () => void, disabled: boolean) {
   };
 }
 
-/** The effective cap and what bounds it: declared, coordinator, local. */
-function CapExplained({ node }: { node: Node }) {
-  const declared = node.capabilities?.max_in_flight;
-  const parts = [
-    declared != null ? `declared ${declared}` : null,
-    node.max_in_flight != null ? `coordinator ${node.max_in_flight}` : null,
-    node.local?.max_in_flight != null ? `local ${node.local.max_in_flight}` : null,
-  ].filter(Boolean);
+/**
+ * What the node serves now against its capacity: the sum of its seats'
+ * concurrency (a placement's seat's, what its runtime is started with).
+ * A node has no in-flight cap of its own.
+ */
+function Capacity({ node }: { node: Node }) {
   return (
     <>
-      <b>{node.effective_max_in_flight ?? '–'}</b>
-      {parts.length ? <span className="muted"> · {parts.join(' · ')}</span> : null}
+      <b>{node.in_flight ?? 0} / {capacityOf(node)}</b>
+      <span className="muted"> in flight · its seats' concurrency, summed</span>
     </>
   );
 }

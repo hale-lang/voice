@@ -15,8 +15,9 @@ other node implementations plug into; this document is only voice's own
 node, and a node written elsewhere need not serve it.
 
 What stays on the machine is what only the machine can decide: which
-engines it offers, with which logins, and its hard limits (the
-capabilities file), and local controls that pause it or lower its cap.
+engines it offers, with which logins (the capabilities file), and local
+controls that pause it or its seats. It has no in-flight cap of its
+own: it serves each seat up to the seat's concurrency.
 This API reads them, sets the local controls, and reports the node's
 state, including when it cannot reach the coordinator.
 
@@ -46,11 +47,11 @@ exactly the engines listed, each with the login it runs under. It is
 node never declares (where the login is kept, and similar). Each CLI
 keeps several logins apart in its own way (docs/internals.md, "One node,
 several logins"): a `claude-cli` engine's login is not in this file at
-all, it is a token in the node's vault that its seats name.
+all, it is a token in the node's vault that its seats name. A file from
+before that declares the node's own cap (`max_in_flight`) is read past.
 
 ```json
 {
-  "max_in_flight": 4,
   "engines": [
     { "id": "static", "kind": "static" },
     { "id": "ollama", "kind": "openai-compatible" },
@@ -169,13 +170,15 @@ Responses:
 
 ### PUT `/node/v1/local`
 
-**Pause the node or seats, or lower its cap** · `setLocalControls`
+**Pause the node or seats** · `setLocalControls`
 
 Authentication: nodeAdmin
 
 Replaces the local controls. They only restrict: pausing takes no
-new requests (in-flight ones finish), and a local cap only lowers the
-effective one. The node tells the coordinator at once.
+new requests (in-flight ones finish). The node tells the coordinator
+at once. A local cap is gone: a body that sets `max_in_flight` to a
+number is refused (400) naming its removal; `null`, as a body from
+before sent it, is taken and dropped.
 
 Request body
 
@@ -187,7 +190,6 @@ Schema: [LocalControls](#schema-localcontrols)
 |---|---|---|---|---|
 | `paused` | boolean | yes |  |  |
 | `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
 | `reason` | string \| null |  | Why, for the admin to read. |  |
 
 Responses:
@@ -239,8 +241,7 @@ Type: object
 | `coordinator.connected_at` | string \| null (date-time) |  |  |  |
 | `coordinator.last_error` | string \| null |  |  |  |
 | `assignment_version` | integer \| null | yes | The assignment applied, or null before the first one. |  |
-| `max_in_flight` | integer | yes | The effective cap, the smallest of the declared, assigned and local caps. |  |
-| `in_flight` | integer | yes |  |  |
+| `in_flight` | integer | yes | The requests it serves now, across its seats, each at most its seat's concurrency. |  |
 | `local` | [LocalControls](#schema-localcontrols) | yes |  |  |
 | `seats` | array of [Seat](#schema-seat) & [SeatState](#schema-seatstate) | yes | The assigned seats, each with its state on this node. |  |
 
@@ -261,8 +262,9 @@ Type: object
 ### LocalControls
 
 What the node's operator set on the machine. Each field only
-restricts: a paused node or seat takes no new requests, and a local
-cap only lowers the effective one.
+restricts: a paused node or seat takes no new requests. A node from
+before may send a local `max_in_flight`: the coordinator reads past
+it, as no cap of a node's stands.
 
 Type: object
 
@@ -270,7 +272,6 @@ Type: object
 |---|---|---|---|---|
 | `paused` | boolean | yes |  |  |
 | `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `max_in_flight` | integer \| null |  | A local cap on requests in flight, or null for none. | ≥ 0 |
 | `reason` | string \| null |  | Why, for the admin to read. |  |
 
 <a id="schema-slug"></a>
@@ -308,7 +309,7 @@ Type: object
 | `account` | string | yes | The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits. |  |
 | `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
 | `data_classes` | array of string |  | Data classes this seat may carry. Defaults to `[internal]`. |  |
-| `concurrency` | integer |  | Requests this seat serves at once. | default `1`; ≥ 1 |
+| `concurrency` | integer |  | Requests this seat serves at once. A placement's seat's is what its runtime is started with (TensorFold's `--parallel`, 32; llama-server's slots, as many requests of the context its placement promises as its prompt cache holds, one to four; vLLM's `--max-num-seqs`, 32; the decision server's 1), derived from its config, and the node holds it to that whatever this says. Any other seat's is what its operator set. | default `1`; ≥ 1 |
 | `enabled` | boolean |  |  | default `true` |
 | `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
 
@@ -566,7 +567,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `engines` | array of [Engine](#schema-engine) | yes |  | items ≤ 16 |
-| `max_in_flight` | integer | yes | The most requests the node will serve at once, across all its seats. | ≥ 1 |
+| `max_in_flight` | integer |  | Read past: a node has no cap of its own, its capacity is its seats' `concurrency`. A node declares the most it serves at once, its slots, for a coordinator from before, which requires it; a capabilities file that still says it is read past too. | ≥ 1; deprecated |
 | `hardware` | [Hardware](#schema-hardware) |  |  |  |
 | `links` | array of [Link](#schema-link) |  | The direct links to other nodes its operator declared on the machine, in the node's capabilities file beside its engines (each machine's own interfaces and addresses): for each peer, the local ports cabled to it. A link declared here wins over the one the coordinator finds from `ports` for the same peer. A model is placed across two nodes only when each has a link to the other, declared or found, and their link passed its check (openapi.yaml `checkNodeLink`). | items ≤ 4 |
 | `ports` | array of [CabledPort](#schema-cabledport) |  | The machine's cabled ports, as the node finds them: each network interface with an RDMA (RoCE) device and a carrier. The node looks at start and again whenever a carrier comes or goes, and reports its capabilities again when what it found changed (`reportCapabilities`). The coordinator pairs two nodes' ports by what each sees on its link (`neighbors`), and uses the link it finds as a declared one (`Link`): its first port the pair of ports that share an address family (and an IPv4 subnet), each port at the address it already has, IPv4 before IPv6 link-local, and the RoCE v2 GID that carries that address as its `gid_index`. Voice configures no host networking: a port with neither address is cabled but not addressed. | items ≤ 8 |

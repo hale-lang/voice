@@ -8,6 +8,15 @@ import type { NodeSummary } from './client';
  */
 export const ARRANGEMENTS = '/admin/v1/arrangements';
 
+/**
+ * A node's capacity: the sum of its seats' concurrency (a placement's
+ * seat's, what its runtime is started with, as the api says it). A node
+ * has no in-flight cap of its own.
+ */
+export function capacityOf(node: { seats: { concurrency?: number }[] }): number {
+  return node.seats.reduce((sum, s) => sum + (s.concurrency ?? 1), 0);
+}
+
 /** The node reads derived from the recipe set (`listNodeDownloads`, `suggestNodeModels`). */
 export const RECIPE_READS = ['/admin/v1/nodes/{node}/downloads', '/admin/v1/nodes/{node}/suggestions'];
 

@@ -7,8 +7,8 @@ import ".." as brain;
 fn row(extra: String, seat: String, account: String, serves: String) -> String {
     return "{" + extra + "\"seat\": \"laptop/" + seat + "\", \"node\": \"laptop\", \"id\": \""
         + seat + "\", \"account\": \"" + account + "\", \"serves\": " + serves
-        + ", \"data_classes\": [\"internal\"], \"concurrency\": 4, \"enabled\": true, \"node_cap\": null, \"assignment_version\": 3, \"capabilities\": {\"max_in_flight\": 8, \"engines\": []}"
-        + ", \"local\": {\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null}, \"node_in_flight\": 1, \"applied_version\": 3, \"draining\": false, \"beat_age\": 2"
+        + ", \"data_classes\": [\"internal\"], \"concurrency\": 4, \"placement\": null, \"server\": null, \"cache_tokens\": null, \"context_length\": null, \"enabled\": true, \"assignment_version\": 3"
+        + ", \"local\": {\"paused\": false, \"paused_seats\": []}, \"applied_version\": 3, \"draining\": false, \"beat_age\": 2"
         + ", \"seat_status\": \"up\", \"seat_in_flight\": 1, \"account_status\": \"active\", \"used\": null, \"exhausted_until\": null, \"exhausted\": false}";
 }
 
@@ -80,16 +80,50 @@ fn main() {
         !brain::judge(row("\"cluster_rank\": 1, ", "a", "static", ECHO), 0.0).routes,
         "and a follower never: it serves nothing itself",
     );
-    let capped = brain::judge(
+    // a node has no cap of its own: a cap a node from before still reports,
+    // declared or local, and the node's other requests narrow no seat
+    let uncapped = brain::judge(
         row(
-            "\"local\": {\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 2}, ",
+            "\"local\": {\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 1}, \"capabilities\": {\"max_in_flight\": 1, \"engines\": []}, \"node_cap\": 1, \"node_in_flight\": 9, ",
             "a",
             "static",
             ECHO,
         ),
         0.0,
     );
-    std::test::assert_eq_int(capped.free, 1, "a local cap leaves the node one slot");
+    std::test::assert_eq_int(uncapped.free, 3, "no node cap narrows a seat");
+    // a placement's seat serves what its runtime is started with, whatever
+    // its row's concurrency (1, as placements left it)
+    let tf = brain::judge(
+        row(
+            "\"concurrency\": 1, \"placement\": \"dsv4\", \"server\": \"tensorfold\", \"cache_tokens\": 7340032, \"context_length\": 1048576, ",
+            "a",
+            "static",
+            ECHO,
+        ),
+        0.0,
+    );
+    std::test::assert_eq_int(tf.free, 31, "TensorFold: 32 at once, one in flight");
+    let llama = brain::judge(
+        row(
+            "\"concurrency\": 1, \"placement\": \"q\", \"server\": \"llama-server\", \"cache_tokens\": 65536, \"context_length\": 131072, ",
+            "a",
+            "static",
+            ECHO,
+        ),
+        0.0,
+    );
+    std::test::assert_eq_int(llama.free, 1, "llama-server: two slots of 32k, one in flight");
+    let busy = brain::judge(
+        row(
+            "\"concurrency\": 1, \"placement\": \"v\", \"server\": \"vllm\", \"cache_tokens\": 65536, \"context_length\": 131072, \"seat_in_flight\": 32, ",
+            "a",
+            "static",
+            ECHO,
+        ),
+        0.0,
+    );
+    std::test::assert_eq_int(busy.free, 0, "vLLM at its 32");
     let full = brain::judge(
         row(
             "\"used\": 100, \"exhausted\": true, \"exhausted_until\": \"2026-10-17T20:00:00+00:00\", ",

@@ -43,12 +43,18 @@ info:
       the node as an `assignment`. The node runs exactly the assigned seats
       and refuses any seat outside its capabilities.
     - **Local controls only restrict.** The node's operator may pause the
-      node, pause a seat, or lower the node's in-flight cap on the machine.
-      Nothing local can widen what the coordinator assigned.
+      node or a seat on the machine. Nothing local can widen what the
+      coordinator assigned.
 
-    A node's effective in-flight cap is the smallest of its declared
-    `max_in_flight`, the cap the coordinator sets, and any local cap. Each
-    seat is further held to its own `concurrency`.
+    A node has no in-flight cap of its own: it serves each seat up to the
+    seat's `concurrency`, and its capacity is their sum. A placement's
+    seat's concurrency is what its runtime is started with (TensorFold's
+    `--parallel`, llama-server's slots, vLLM's `--max-num-seqs`), which the
+    coordinator assigns it and the node starts the runtime with; any other
+    seat's is what its operator set. A node from before, which declares
+    `max_in_flight` and reads `Assignment.max_in_flight` as its cap, keeps
+    working: the coordinator reads past the first and sends the second as
+    the sum of the node's seats' concurrency.
 
     ## Session
 
@@ -101,8 +107,8 @@ info:
       slot frees when one of those requests ends. That seat has not failed;
       when every seat that could take the request refuses so, the
       coordinator waits for a slot and offers the request again. It never
-      sends a seat more requests than its `concurrency`, or the node more
-      than its effective cap, by its own count; the node's is the truth.
+      sends a seat more requests than its `concurrency`, by its own count;
+      the node's is the truth.
     - The node then publishes the standard's streaming events, in order, to
       `<reply_to>.event`, and exactly one `result` to `<reply_to>.result`.
       It uses the `request_id` as the response's `id`. Events for one
@@ -289,7 +295,7 @@ components:
         What the node can run, as its operator configured it on the machine.
         The coordinator assigns seats only within it, and the node refuses
         any seat outside it.
-      required: [engines, max_in_flight]
+      required: [engines]
       properties:
         engines:
           type: array
@@ -298,7 +304,12 @@ components:
         max_in_flight:
           type: integer
           minimum: 1
-          description: The most requests the node will serve at once, across all its seats.
+          deprecated: true
+          description: |
+            Read past: a node has no cap of its own, its capacity is its
+            seats' `concurrency`. A node declares the most it serves at
+            once, its slots, for a coordinator from before, which requires
+            it; a capabilities file that still says it is read past too.
         hardware:
           $ref: '#/components/schemas/Hardware'
         links:
@@ -780,8 +791,9 @@ components:
       type: object
       description: |
         What the node's operator set on the machine. Each field only
-        restricts: a paused node or seat takes no new requests, and a local
-        cap only lowers the effective one.
+        restricts: a paused node or seat takes no new requests. A node from
+        before may send a local `max_in_flight`: the coordinator reads past
+        it, as no cap of a node's stands.
       required: [paused, paused_seats]
       properties:
         paused: { type: boolean }
@@ -789,10 +801,6 @@ components:
           type: array
           maxItems: 32
           items: { type: string }
-        max_in_flight:
-          type: [integer, 'null']
-          minimum: 0
-          description: A local cap on requests in flight, or null for none.
         reason:
           type: [string, 'null']
           description: Why, for the admin to read.
@@ -825,7 +833,14 @@ components:
           type: integer
           minimum: 1
           default: 1
-          description: Requests this seat serves at once.
+          description: |
+            Requests this seat serves at once. A placement's seat's is what
+            its runtime is started with (TensorFold's `--parallel`, 32;
+            llama-server's slots, as many requests of the context its
+            placement promises as its prompt cache holds, one to four;
+            vLLM's `--max-num-seqs`, 32; the decision server's 1), derived
+            from its config, and the node holds it to that whatever this
+            says. Any other seat's is what its operator set.
         enabled:
           type: boolean
           default: true
@@ -855,7 +870,11 @@ components:
         max_in_flight:
           type: integer
           minimum: 1
-          description: The coordinator's cap for this node, at most the node's declared `max_in_flight`.
+          deprecated: true
+          description: |
+            The sum of its seats' `concurrency` (at least 1), for a node
+            from before, which reads it as its cap. A node now reads past
+            it: it has no cap of its own.
         seats:
           type: array
           maxItems: 16
@@ -1172,10 +1191,10 @@ components:
           enum: [capacity, unavailable, null]
           description: |
             For `refused`, what kind of refusal: `capacity` when the seat
-            is serving its `concurrency`, or the node its effective cap, or
-            it has no free slot, so a slot frees when a request it serves
-            ends; `unavailable` for any other (no such seat, a seat not
-            `up`, one that cannot carry the request, a cap of 0). Null for
+            is serving its `concurrency`, or the node has no free slot, so
+            a slot frees when a request it serves ends; `unavailable` for
+            any other (no such seat, a seat not `up`, one that cannot carry
+            the request). Null for
             `accepted`, and left out by a node that does not say: read as
             `unavailable`.
 

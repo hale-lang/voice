@@ -1,0 +1,80 @@
+// How many requests a placed seat serves at once: what its runtime is
+// started with, never a setting. The api routes up to it (it is the seat's
+// `concurrency` in the assignment and in every view), the brain counts a
+// seat's free slots against it, and the node starts the runtime with it and
+// accepts up to it. A seat that is not a placement's (claude-cli,
+// openai-compatible, static) keeps the `concurrency` its operator set, since
+// voice cannot know what the other side takes.
+//
+// Per runtime (the managed config's `runtime.server`):
+//   - TensorFold: its `--parallel`, `TENSORFOLD_PARALLEL` (its recipe's
+//     served shape: 32 streams, 32 requests at once).
+//   - llama-server: its slots (`--parallel`), `llama_slots`: as many
+//     requests of the context the placement promises (`promised_context`)
+//     as its prompt cache (`cache_tokens`, its `-c`) holds, at most
+//     `LLAMA_SLOTS_MAX`, at least one. Given its slots, llama-server divides
+//     `-c` among them, so each holds at least the promised context.
+//   - vLLM: its `--max-num-seqs`, `VLLM_MAX_SEQS`. vLLM pages its cache,
+//     holding only the blocks a sequence's tokens fill, and preempts and
+//     resumes a sequence when the cache is full rather than failing it; the
+//     context it serves a request is fitted to the placement's budget
+//     (`--max-model-len auto`), so the count is its batch, not a share.
+//   - the decision server: one.
+
+/// TensorFold's requests at once: its `--parallel`, its streams.
+const TENSORFOLD_PARALLEL: Int = 32;
+
+/// vLLM's most sequences at once (`--max-num-seqs`).
+const VLLM_MAX_SEQS: Int = 32;
+
+/// The most slots a llama-server seat is started with: the conversations
+/// its placement sized the prompt cache for (api placements.hl, `CACHED`).
+const LLAMA_SLOTS_MAX: Int = 4;
+
+/// The context a placement promises a request, for a model made for at
+/// least so much: what a recipe's memory provides for
+/// (scripts/catalog-recipes.py, CONTEXT).
+const PROMISED_CONTEXT: Int = 32768;
+
+/// The context, in tokens, a placement promises each request of a model
+/// made for `native` (0 when its recipe does not say): `PROMISED_CONTEXT`,
+/// or the model's own when it is made for less.
+fn promised_context(native: Int) -> Int {
+    return if native > 0 && native < PROMISED_CONTEXT { native } else { PROMISED_CONTEXT };
+}
+
+/// A llama-server seat's prompt cache, in tokens (its `-c`): what its
+/// placement sized (`cache_tokens`), or, placed before voice sized it, the
+/// promised context.
+fn llama_cache(cache_tokens: Int, native: Int) -> Int {
+    return if cache_tokens > 0 { cache_tokens } else { promised_context(native) };
+}
+
+/// A llama-server seat's slots: the requests of the promised context its
+/// prompt cache holds, from one to `LLAMA_SLOTS_MAX`.
+fn llama_slots(cache_tokens: Int, native: Int) -> Int {
+    let n = llama_cache(cache_tokens, native) / promised_context(native);
+    if n < 1 { return 1; }
+    return if n > LLAMA_SLOTS_MAX { LLAMA_SLOTS_MAX } else { n };
+}
+
+/// The requests a runtime of `server` serves at once, started for a cache
+/// of `cache_tokens` and a model made for `native` tokens.
+fn of_runtime(server: String, cache_tokens: Int, native: Int) -> Int {
+    if server == "tensorfold" { return TENSORFOLD_PARALLEL; }
+    if server == "vllm" { return VLLM_MAX_SEQS; }
+    if server == "decision" { return 1; }
+    return llama_slots(cache_tokens, native);
+}
+
+/// The requests a placed seat serves at once, from its managed config
+/// (api placements.hl `managed_config`); -1 for a seat that is no
+/// placement's, whose own `concurrency` stands.
+fn placed(config: String) -> Int {
+    if std::json::string_field(config, "placement").kind != "string" { return -1; }
+    return of_runtime(
+        std::json::find_string_field(std::json::find_field_raw(config, "runtime"), "server"),
+        std::json::find_int_field(config, "cache_tokens"),
+        std::json::find_int_field(config, "context_length"),
+    );
+}

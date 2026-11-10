@@ -70,7 +70,7 @@ code conforms to them.
   ([`protocol.yaml`](./spec/protocol.yaml)). The node refuses a seat outside
   what it offers.
 - `axiom` **Local controls only restrict.** On the machine, an operator can pause the
-  node or a seat, or lower its in-flight cap, and nothing more
+  node or a seat, and nothing more
   ([`node.yaml`](./spec/node.yaml)).
 - `axiom` **The protocol is the seam.** Any program that speaks
   [`protocol.yaml`](./spec/protocol.yaml) and the api's node plane can be a

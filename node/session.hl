@@ -12,9 +12,10 @@
 /// It makes no call to the api: those wait on the api, which serves its
 /// callers one at a time, and a session waiting there could not answer a
 /// `serve`. It hands each `serve` it accepts to a slot of its own
-/// (serve.hl), so the node serves several at once: up to its cap, and up to
-/// each seat's concurrency. A `serve` past either is refused at once, so the
-/// coordinator offers the request elsewhere.
+/// (serve.hl), so the node serves several at once: each seat up to its
+/// concurrency (a placement's seat's, what its runtime is started with). A
+/// `serve` past it, or past the node's slots, is refused at once, so the
+/// coordinator offers the request elsewhere. The node has no cap of its own.
 ///
 /// What the admin API shows of it is in `<data>/session.json`.
 
@@ -304,8 +305,7 @@ locus Session {
         let id = std::json::find_string_field(msg, "request_id");
         let reply_to = std::json::find_string_field(msg, "reply_to");
         let seat = seat_of(self.seats, std::json::find_string_field(msg, "seat"));
-        let cap = node_cap(self.capabilities, self.seats.max_in_flight, read_local(self.data));
-        let slots = if cap < SLOTS { cap } else { SLOTS };
+        let slots = SLOTS;
         let mut refusal = "";
         // a seat or node at its most at once refuses for capacity: a slot
         // frees when a request it serves ends, so the coordinator waits for
@@ -321,15 +321,8 @@ locus Session {
             && !seat_carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
         {
             refusal = "seat " + seat.id + " does not carry tools: its engine answers text only";
-        } else if cap < 1 {
-            refusal = "the node takes no requests: its cap is 0";
-        } else if busy_count(self.busy) >= slots {
-            refusal = "the node is serving " + to_string(busy_count(self.busy))
-                + " requests, its most at once";
-            capacity = true;
-        } else if seat_busy(self.busy, seat.id) >= seat.concurrency {
-            refusal = "seat " + seat.id + " is serving " + to_string(seat_busy(self.busy, seat.id))
-                + ", its most at once";
+        } else if len(at_capacity(self.busy, seat, slots)) > 0 {
+            refusal = at_capacity(self.busy, seat, slots);
             capacity = true;
         }
         let slot = if len(refusal) == 0 { free_slot(self.busy, slots) } else { -1 };
@@ -394,10 +387,9 @@ locus Session {
         self.report();
     }
 
-    /// What the admin API shows: the connection, the assignment applied,
-    /// the effective cap and every seat with its state.
+    /// What the admin API shows: the connection, the assignment applied
+    /// and every seat with its state.
     fn report() {
-        let local = read_local(self.data);
         let state = if self.plane_state == "refused" {
             "refused"
         } else if self.plane_state == "registered" && self.nats_state == "connected" {
@@ -412,8 +404,6 @@ locus Session {
             + (if len(self.last_error) > 0 { q(self.last_error) } else { "null" }) + "}";
         let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": "
             + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
-            + ", \"max_in_flight\": "
-            + to_string(node_cap(self.capabilities, self.seats.max_in_flight, local))
             + ", \"in_flight\": " + to_string(busy_count(self.busy)) + ", \"seats\": "
             + status_seats(self.assignment, self.seats, self.busy) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
@@ -468,6 +458,8 @@ locus Session {
             let l = std::metrics::labels_two("seat", s.id, "engine", s.engine);
             seat_reading(self.readings, "seat_up", l, if s.status == "up" { 1 } else { 0 });
             seat_reading(self.readings, "seat_in_flight", l, seat_busy(self.busy, s.id));
+            // the most it serves at once: a placement's seat's, its runtime's
+            seat_reading(self.readings, "seat_concurrency", l, s.concurrency);
             if s.managed {
                 seat_reading(self.readings, "seat_fetch_done_bytes", l, s.done_bytes);
                 seat_reading(self.readings, "seat_fetch_total_bytes", l, s.total_bytes);
@@ -478,6 +470,7 @@ locus Session {
                 let l = std::metrics::labels_two("seat", gone.id, "engine", gone.engine);
                 seat_reading(self.readings, "seat_up", l, 0);
                 seat_reading(self.readings, "seat_in_flight", l, 0);
+                seat_reading(self.readings, "seat_concurrency", l, 0);
             }
         }
         self.read = now;

@@ -403,7 +403,20 @@ with the whole file, or with another range, is fetched from over one
 connection instead, as a smaller file is. The fetcher fetches one file at
 a time, for one seat at a time, so a node holds at most eight connections
 to the hub however many seats it fetches for. The whole file is verified
-against its sha256 either way. Then the runner (`run.hl`, its own thread too)
+against its sha256 either way. A container runtime's image is pulled by
+its digest, as the node's user. When the registry refuses the login that
+user's docker config holds (a stale `ghcr.io` token, say: docker sends it
+and never falls back), the node pulls once more anonymously, with a fresh
+`--config` directory, removed after: its config holds no login and names
+no credential helper (an empty one would have docker pick one, holding
+the same login), and keeps the user's docker context, its metadata linked
+from the saved config's directory, so the pull reaches the same daemon. By
+digest, that pull can fetch
+only the pinned image, from any registry. A seat whose image came that way
+says so as it starts, and the node logs a warning naming the registry; one
+whose anonymous pull failed too is down with docker's words and the fix
+(`docker logout <registry>` as the node's user). The saved config is never
+read or logged. Then the runner (`run.hl`, its own thread too)
 lays the weights out under their recipe's names in `models/<seat>`, as
 links into the store, and starts the runtime in voice's sandbox: a
 container under docker, the weights read-only, its port on loopback, the

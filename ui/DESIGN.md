@@ -132,6 +132,14 @@ right ones comparable.
 - **Catalog, projects and keys.** Budgets and limits with what is spent and
   remaining; a key's secret shown once.
 - **Changes.** The audit log, each entry with before and after.
+- **Chat.** The operator asks a model as a project's caller would: the
+  caller plane's own streamed `/v1/responses`, charged to the chat's
+  project as its operator key, so its limits, budget and usage records
+  are the real ones. Under each answer, a readout of what the api said
+  of it (tokens, price, the seat and node that served it, its request id)
+  and of its pace (time to first output, tokens a second, total); the
+  model's thinking folded beside it. Markdown is rendered as elements,
+  never as HTML. The conversations are kept in the browser alone.
 
 Live state comes from the admin event stream (`GET /admin/v1/events`); the
 UI never polls for what the stream carries.

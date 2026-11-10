@@ -249,6 +249,28 @@ fn compat_failed(c: CompatConfig, served: String, why: String) -> StaticRun {
     return StaticRun { outcome: "failed", failure: why, model: served };
 }
 
+/// One line of SSE text from a start: `found` when a line end closes it,
+/// `end` where its text stops and `next` where the line after it begins. A
+/// line ends at LF, CRLF or a lone CR. A CR that is the last byte held ends
+/// its line: when the LF of a CRLF split across reads follows, it reads as
+/// one more blank line, an event with no data, which is let go.
+type SseLine { found: Bool = false; end: Int = 0; next: Int = 0; }
+
+@unbounded
+fn sse_line(v: std::str::ByteView, start: Int) -> SseLine {
+    let mut i = start;
+    while i < v.n {
+        let c = std::str::byte_at(v, i);
+        if c == 10 { return SseLine { found: true, end: i, next: i + 1 }; }
+        if c == 13 {
+            let crlf = i + 1 < v.n && std::str::byte_at(v, i + 1) == 10;
+            return SseLine { found: true, end: i, next: if crlf { i + 2 } else { i + 1 } };
+        }
+        i = i + 1;
+    }
+    return SseLine { end: v.n, next: v.n };
+}
+
 /// The payload of one SSE event block: its `data:` lines joined by newlines.
 @unbounded
 fn sse_data(block: String) -> String {
@@ -256,10 +278,9 @@ fn sse_data(block: String) -> String {
     let mut out = "";
     let mut start = 0;
     while start < v.n {
-        let at = line_end(v, start);
-        let mut ln = std::str::slice(v, start, at);
-        if std::str::ends_with(ln, "\r") { ln = ln[0..(len(ln) - 1)]; }
-        start = at + 1;
+        let l = sse_line(v, start);
+        let ln = std::str::slice(v, start, l.end);
+        start = if l.found { l.next } else { v.n };
         if std::str::starts_with(ln, "data:") {
             let d = ln[5..len(ln)];
             out = out + (if len(out) > 0 { "\n" } else { "" })
@@ -295,7 +316,7 @@ const COMPAT_EVENT_MAX: Int = 16777216;
 /// The first event block of an SSE stream's text: `found` once a blank line
 /// ends one (`used` its bytes, the blank line's too), `data` its `data:`
 /// lines joined by newlines ("" for a comment or a block of other fields).
-/// Lines end at LF or CRLF.
+/// Lines end at LF, CRLF or CR, as SSE has them.
 type SseBlock { found: Bool = false; used: Int = 0; data: String = ""; }
 
 @unbounded
@@ -303,11 +324,10 @@ fn sse_block(text: String) -> SseBlock {
     let v = std::str::bytes_view(text);
     let mut start = 0;
     while start < v.n {
-        let at = line_end(v, start);
-        if at >= v.n { return SseBlock { }; }
-        let mut ln = std::str::slice(v, start, at);
-        if std::str::ends_with(ln, "\r") { ln = ln[0..(len(ln) - 1)]; }
-        start = at + 1;
+        let l = sse_line(v, start);
+        if !l.found { return SseBlock { }; }
+        let ln = std::str::slice(v, start, l.end);
+        start = l.next;
         if len(ln) == 0 {
             return SseBlock {
                 found: true,
@@ -364,7 +384,7 @@ locus HttpSse {
             let r = self.whole(parsed);
             self.canned = CannedSse {
                 status: r.status,
-                body: std::str::replace(std::str::from_bytes(r.body), "\r\n", "\n"),
+                body: sse_lf(std::str::from_bytes(r.body)),
             };
             if r.status == 0 {
                 self.canned = CannedSse { status: 0 };
@@ -486,6 +506,11 @@ fn error_datum(status: Int, body: String) -> Datum {
             + (if len(kind) > 0 { " (" + kind + ")" } else { "" })
             + (if len(err) > 0 { ": " + err } else { "" })
     };
+}
+
+/// SSE text with every line ending (CRLF, or a lone CR) made an LF.
+fn sse_lf(text: String) -> String {
+    return std::str::replace(std::str::replace(text, "\r\n", "\n"), "\r", "\n");
 }
 
 /// An answer already in hand: its status and its `text/event-stream` body.
@@ -960,7 +985,7 @@ fn upstream_for(
         id: id,
         model: model,
         req: body,
-        canned: CannedSse { status: status, body: std::str::replace(sse, "\r\n", "\n") },
+        canned: CannedSse { status: status, body: sse_lf(sse) },
     };
 }
 

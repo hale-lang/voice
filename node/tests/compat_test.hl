@@ -155,6 +155,30 @@ fn stub_conn(s: std::io::tcp::Stream) {
         ) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /lonecr/chat/completions ") {
+        // lines ended by a lone CR, as SSE allows; one event's CRLF end is
+        // cut between its CR and its LF across two writes
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                + chunk(
+                    "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\r\r",
+                ),
+        ) or discard;
+        std::time::sleep(100ms);
+        s.send(
+            chunk(
+                "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\r\n\r",
+            ),
+        ) or discard;
+        std::time::sleep(100ms);
+        s.send(
+            chunk(
+                "\ndata: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\r\rdata: [DONE]\r\r",
+            )
+                + "0\r\n\r\n",
+        ) or discard;
+        return;
+    }
     if std::str::starts_with(req, "POST /cut/chat/completions ") {
         // closes mid-stream: one event, no terminal chunk, no [DONE]
         s.send(
@@ -463,6 +487,44 @@ main locus App {
             std::str::contains(kept_said, "\"delta\":\"lo café\""),
             "a CRLF-framed event, its character cut across writes, read whole: " + kept_said,
         );
+        // lines ended by a lone CR are lines (the replacement reader once
+        // knew only LF): every event read, [DONE] the end
+        let lone = node::upstream_over_wire(
+            "resp_cr",
+            "voice-1",
+            ask,
+            node::compat_config(
+                "{\"base_url\": \"" + self.base + "/lonecr\", \"model\": \"stub-7b\"}",
+            ),
+        );
+        let mut lone_said = "";
+        while !lone.done {
+            let d = lone.next_data();
+            if len(d) > 0 { lone_said = lone_said + lone.feed(d); }
+        }
+        let lone_end = lone.finish();
+        std::test::assert_eq_str(
+            lone_end.outcome,
+            "served",
+            "a CR-framed stream is served: " + lone_end.failure,
+        );
+        std::test::assert(
+            std::str::contains(lone_said, "\"delta\":\"Hel\"")
+                && std::str::contains(lone_said, "\"delta\":\"lo\""),
+            "each CR-framed event read: " + lone_said,
+        );
+        // the same answer in hand (a keyed upstream's, read whole)
+        let canned = node::drain(
+            node::upstream_for(
+                "resp_cr2",
+                "voice-1",
+                ask,
+                node::compat_config("{\"model\": \"stub-7b\"}"),
+                200,
+                "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\r\rdata: [DONE]\r\r",
+            ),
+        );
+        std::test::assert_eq_str(canned.outcome, "served", "a CR-framed answer in hand is served");
         let cut = node::run_compat(
             "resp_k6",
             "voice-1",

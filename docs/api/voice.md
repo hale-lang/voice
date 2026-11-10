@@ -1824,8 +1824,12 @@ serves best comes first: MLX on Metal, GGUF on ROCm and Vulkan,
 safetensors on CUDA, except a small model's (its largest variant
 under 8 GiB, about 4B parameters at 16 bits), which on CUDA takes
 its GGUF on llama-server, up in seconds where vLLM warms up for a
-minute or two. Then the most faithful weights there is room for. It
-says why for each variant. A variant or runtime the operator names
+minute or two. Then the most faithful weights there is room for:
+what each node offers models (`model_memory_bytes`) less what its
+other placements hold, and for a runtime on a GPU with memory of its
+own (an accelerator not `unified`), no more than that GPU's
+`memory_bytes` less what they hold. It says why for each variant.
+A variant or runtime the operator names
 is taken only if it fits. Refused when none fits, with each
 variant's reason.
 
@@ -4982,7 +4986,7 @@ Type: [PlacementCreate](#schema-placementcreate) & object
 | `fit` | array of [VariantFit](#schema-variantfit) | yes | Each variant of the recipe, judged against the nodes as they declared their hardware when the placement was made. |  |
 | `cache_tokens` | integer |  | The prompt cache its seat keeps, in tokens, shared by the conversations it holds: room for four of the model's context (at most 128k each) from at most half the memory its variant leaves on the node, and no larger than the variant itself; never less than the 32k its variant's memory provides. Left out of a placement made before voice sized it. | ≥ 1 |
 | `reserved_bytes` | integer |  | What is reserved for it of its node's memory for models: its variant's need and its cache, all of it from when it is placed; across two nodes, what is reserved on each. Its seat holds that and its server's own, 2 GiB (the process, its GPU context and compute buffers; vLLM is given that sum as its share of the GPU). A later placement on the node fits in what the others leave. | ≥ 1 |
-| `held_bytes` | integer |  | What its seat holds of each of its nodes' memory for models once it runs: `reserved_bytes` and its server's own. A node's `model_memory_bytes` less what its placements hold is what a later placement fits in. Left out with `reserved_bytes`. | ≥ 1 |
+| `held_bytes` | integer |  | What its seat holds of each of its nodes' memory for models once it runs: `reserved_bytes` and its server's own. A node's `model_memory_bytes` less what its placements hold is what a later placement fits in; on a GPU with memory of its own (not `unified`), no more than that GPU's `memory_bytes` less what they hold. Left out with `reserved_bytes`. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 
 <a id="schema-peeksummary"></a>

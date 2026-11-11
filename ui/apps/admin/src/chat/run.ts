@@ -75,9 +75,10 @@ function fields(a: Answer): Partial<Message> {
 
 /**
  * Ask for the conversation's next answer: its turns so far are sent whole,
- * and the answer streams into a new message after them.
+ * and the answer streams into a new message after them. `webFetch` lists
+ * the hosted tool (the chat has it on, and it is offered).
  */
-export async function answer(id: string): Promise<void> {
+export async function answer(id: string, webFetch = false): Promise<void> {
   const c = chats.get(id);
   const token = operatorToken();
   if (!c || !token || running.has(id)) return;
@@ -101,7 +102,7 @@ export async function answer(id: string): Promise<void> {
       if (firstAt === undefined && isOutput(ev)) firstAt = performance.now();
       a = apply(a, ev);
       update(fields(a), false);
-    });
+    }, webFetch);
     update({ ...fields(a), pace: paceOf(a, sentAt, firstAt, performance.now()) }, true);
   } catch (e) {
     const pace = paceOf(a, sentAt, firstAt, performance.now());

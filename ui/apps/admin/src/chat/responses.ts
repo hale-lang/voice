@@ -28,10 +28,38 @@ export type Answer = {
   alive: number;
   /** the `[DONE]` line came */
   done: boolean;
+  /** the hosted fetches voice made for the model (`web_fetch_call` items), in order */
+  steps?: FetchStep[];
 };
 
+/**
+ * One hosted fetch, as its `web_fetch_call` item says: the URL the model
+ * asked for, how it went, and what the model was given (its `output`, read:
+ * the page's title and text, which are the web's words, shown as text).
+ */
+export type FetchStep = {
+  id: string;
+  url: string;
+  status: 'in_progress' | 'completed' | 'failed';
+  httpStatus?: number;
+  contentType?: string;
+  bytes?: number;
+  error?: string;
+  /** the URL that answered, after redirects */
+  finalUrl?: string;
+  title?: string;
+  /** the start of the text the model was given (`STEP_TEXT` characters), kept with the conversation */
+  text?: string;
+  /** how many characters the model was given */
+  chars?: number;
+  truncated?: boolean;
+};
+
+/** How much of a fetched page's text an answer keeps to show: the browser keeps every conversation. */
+export const STEP_TEXT = 4000;
+
 export function newAnswer(): Answer {
-  return { text: '', reasoning: '', status: 'started', attempts: [], alive: 0, done: false };
+  return { text: '', reasoning: '', status: 'started', attempts: [], alive: 0, done: false, steps: [] };
 }
 
 /** True for an event that is output reaching the caller: the first one is the time to first token. */
@@ -80,6 +108,14 @@ export function apply(a: Answer, ev: SseEvent): Answer {
     case 'response.reasoning_text.delta':
     case 'response.reasoning_summary_text.delta':
       return { ...a, status: 'streaming', reasoning: a.reasoning + str(d.delta) };
+    case 'response.output_item.added':
+    case 'response.output_item.done': {
+      const item = obj(d.item);
+      if (item.type === 'web_fetch_call') return { ...a, steps: withStep(a.steps ?? [], stepOf(item)) };
+      // a message after a fetch is the answer going on: a new paragraph
+      if (type === 'response.output_item.added' && item.type === 'message' && a.text && !a.text.endsWith('\n')) return { ...a, text: `${a.text}\n\n` };
+      return a;
+    }
     case 'voice:attempt': {
       const at = obj(d.attempt);
       return { ...a, attempts: [...a.attempts, { seat: str(at.seat), outcome: str(at.outcome), error: str(at.error) || undefined }] };
@@ -106,9 +142,10 @@ function requestIdOf(r: Json): string | undefined {
 function ended(a: Answer, status: Answer['status'], r: Json): Answer {
   const out: Answer = { ...a, status };
   // the output as the api has it, where the deltas missed some
-  const { text, reasoning } = outputOf(r.output);
+  const { text, reasoning, steps } = outputOf(r.output);
   if (text.length > out.text.length) out.text = text;
   if (reasoning.length > out.reasoning.length) out.reasoning = reasoning;
+  if (steps.length) out.steps = steps;
   const u = obj(r.usage);
   const input = num(u.input_tokens);
   const output = num(u.output_tokens);
@@ -136,22 +173,55 @@ function ended(a: Answer, status: Answer['status'], r: Json): Answer {
   return out;
 }
 
-function outputOf(output: unknown): { text: string; reasoning: string } {
-  let text = '';
+function outputOf(output: unknown): { text: string; reasoning: string; steps: FetchStep[] } {
+  const texts: string[] = [];
   let reasoning = '';
-  if (!Array.isArray(output)) return { text, reasoning };
+  const steps: FetchStep[] = [];
+  if (!Array.isArray(output)) return { text: '', reasoning, steps };
   for (const raw of output) {
     const item = obj(raw);
     if (item.type === 'message' && Array.isArray(item.content)) {
+      let text = '';
       for (const c of item.content) {
         const p = obj(c);
         if (p.type === 'output_text' || p.type === 'refusal') text += str(p.text) || str(p.refusal);
       }
+      if (text) texts.push(text);
     } else if (item.type === 'reasoning') {
       for (const part of [...(Array.isArray(item.content) ? item.content : []), ...(Array.isArray(item.summary) ? item.summary : [])]) reasoning += str(obj(part).text);
+    } else if (item.type === 'web_fetch_call') {
+      steps.push(stepOf(item));
     }
   }
-  return { text, reasoning };
+  // each message its own paragraph, as the stream builds them
+  return { text: texts.join('\n\n'), reasoning, steps };
+}
+
+/** A `web_fetch_call` item as a step: its `output` (JSON text) read for the page's title and text. */
+export function stepOf(item: Json): FetchStep {
+  const status = item.status === 'completed' || item.status === 'failed' ? item.status : 'in_progress';
+  const step: FetchStep = { id: str(item.id), url: str(item.url), status };
+  if (num(item.http_status) !== undefined) step.httpStatus = num(item.http_status);
+  if (str(item.content_type)) step.contentType = str(item.content_type);
+  if (num(item.bytes) !== undefined) step.bytes = num(item.bytes);
+  if (str(item.error)) step.error = str(item.error);
+  const out = typeof item.output === 'string' ? parse(item.output) : null;
+  if (out) {
+    if (str(out.url) && str(out.url) !== step.url) step.finalUrl = str(out.url);
+    if (str(out.title)) step.title = str(out.title);
+    if (typeof out.text === 'string') {
+      step.text = out.text.slice(0, STEP_TEXT);
+      step.chars = out.text.length;
+    }
+    if (typeof out.truncated === 'boolean') step.truncated = out.truncated;
+  }
+  return step;
+}
+
+/** `steps` with `s` in place of the one with its id, or after them. */
+function withStep(steps: FetchStep[], s: FetchStep): FetchStep[] {
+  const i = steps.findIndex((x) => x.id === s.id);
+  return i < 0 ? [...steps, s] : steps.map((x, k) => (k === i ? s : x));
 }
 
 /**

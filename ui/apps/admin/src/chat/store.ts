@@ -13,6 +13,8 @@ export type Options = {
   max_output_tokens: number | null;
   /** `reasoning.effort`, for a model that reasons; "" leaves it to the model */
   effort: '' | 'none' | 'low' | 'medium' | 'high';
+  /** the hosted `web_fetch` tool, where it is offered (chat/tools.ts) */
+  web_fetch?: boolean;
 };
 
 export type Message = {
@@ -42,7 +44,7 @@ export type Conversation = {
   updated: number;
 };
 
-export const DEFAULT_OPTIONS: Options = { temperature: null, top_p: null, max_output_tokens: null, effort: '' };
+export const DEFAULT_OPTIONS: Options = { temperature: null, top_p: null, max_output_tokens: null, effort: '', web_fetch: false };
 
 const KEY = 'voice.chat.conversations';
 const VERSION = 1;

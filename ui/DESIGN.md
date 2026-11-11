@@ -238,7 +238,7 @@ caller-supplied label; other keys are explicitly context, never trusted runtime
 identity. UsageRecord still lacks the API instance from `spec/store.md`'s ledger.
 Demo-only observation context supplies it until backend work exposes the field.
 The demo includes missing repositories, missing API identity and refusals without
-seats. It contacts no homelab hosts or providers.
+seats. It contacts no hosts or providers.
 
 Dragging or arrow keys pin entities; Escape releases a focused pin, Reset layout
 clears pins. Reduced motion keeps static evidence. Narrow screens scroll the

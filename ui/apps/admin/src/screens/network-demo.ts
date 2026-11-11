@@ -3,8 +3,8 @@ import type { Fleet, FleetRequest } from './network-model';
 
 // Repository is caller metadata on demo requests, not a field on Voice's Project.
 const PROJECTS = [
-  ['research', 'hale-lang/hale'], ['product', 'hale-lang/voice'], ['automation', 'homelab'],
-  ['compiler', 'hale-lang/hale'], ['admin', 'hale-lang/voice'], ['infrastructure', 'homelab'],
+  ['research', 'hale-lang/hale'], ['product', 'hale-lang/voice'], ['automation', 'example/infra'],
+  ['compiler', 'hale-lang/hale'], ['admin', 'hale-lang/voice'], ['infrastructure', 'example/infra'],
   ['evals', 'hale-lang/hale'],
 ] as const;
 // Names two projects give models: their requests for those models ask by the name.
@@ -20,17 +20,19 @@ export const demoProjectColor = (project: string) => PROJECT_COLORS[Math.max(0, 
 
 /** Explicitly synthetic, local-only fixture. Model names are illustrative catalog aliases. */
 export function demoFleet(tick: number, now: number): Fleet {
-  // Placement follows the homelab profile. Catalog entries are alternatives,
+  // Demo fleet: four Mac-like hosts of 64 to 512 GB serving MLX tiers, two
+  // hosts with the CLI accounts and small local models, and a cabled pair of
+  // GPU hosts (below). Catalog entries are alternatives,
   // not a claim that all weights are loaded at once; q4 names denote demo quantizations.
   const definitions = [
-    ['studio1', [['mlx', 'local', ['qwen-235b-q4', 'llama-70b']]]],
-    ['h2', [['claude-cli', 'claude-personal', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['agy', 'agy', ['gemini-pro', 'gemini-flash', 'gemini-flash-lite', 'gemini-thinking']], ['vibe', 'vibe', ['devstral', 'codestral', 'mistral-large', 'mistral-small']], ['llama-cpp', 'local', ['llama-8b', 'qwen-7b']]]],
-    ['m1', [['mlx', 'local', ['qwen-32b', 'qwen-coder-32b']]]],
-    ['h1', [['claude-cli', 'claude-work', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['codex-cli', 'openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['llama-cpp', 'local', ['llama-3b', 'qwen-7b']]]],
-    ['studio2', [['mlx', 'local', ['deepseek-r1-q4', 'qwen-235b-q4']], ['mlx', 'local', ['llama-70b']]]],
-    ['studio3', [['mlx', 'local', ['llama-70b', 'qwen-coder-32b']]]],
+    ['host-1', [['mlx', 'local', ['qwen-235b-q4', 'llama-70b']]]],
+    ['host-2', [['claude-cli', 'claude-personal', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['agy', 'agy', ['gemini-pro', 'gemini-flash', 'gemini-flash-lite', 'gemini-thinking']], ['vibe', 'vibe', ['devstral', 'codestral', 'mistral-large', 'mistral-small']], ['llama-cpp', 'local', ['llama-8b', 'qwen-7b']]]],
+    ['host-3', [['mlx', 'local', ['qwen-32b', 'qwen-coder-32b']]]],
+    ['host-4', [['claude-cli', 'claude-work', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['codex-cli', 'openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['llama-cpp', 'local', ['llama-3b', 'qwen-7b']]]],
+    ['host-5', [['mlx', 'local', ['deepseek-r1-q4', 'qwen-235b-q4']], ['mlx', 'local', ['llama-70b']]]],
+    ['host-6', [['mlx', 'local', ['llama-70b', 'qwen-coder-32b']]]],
   ] as const;
-  const names = { studio1: 'Studio 1 · 256 GB profile', studio2: 'Studio 2 · 512 GB profile', studio3: 'Studio 3 · 128 GB profile', m1: 'M1 Max · 64 GB profile', h1: 'H1 · small local models and CLIs', h2: 'H2 · small local models and CLIs' };
+  const names = { 'host-1': 'Host 1 · 256 GB unified memory', 'host-2': 'Host 2 · CLIs and small local models', 'host-3': 'Host 3 · 64 GB unified memory', 'host-4': 'Host 4 · CLIs and small local models', 'host-5': 'Host 5 · 512 GB unified memory', 'host-6': 'Host 6 · 128 GB unified memory' };
   const nodes: NodeSummary[] = definitions.map(([id, slots], index) => {
     const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
     return { id, name: names[id], status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };
@@ -109,5 +111,5 @@ export function demoCompletions(fleet: Fleet, tick: number, now: number): FleetR
 /** Only used for the synthetic fleet; never interpreted as backend telemetry. */
 export function demoContext(record: FleetRequest) {
   const sequence = Number(record.id.replace(/^demo-(?:seed-|live-)?/, ''));
-  return { apiInstance: sequence % 2 ? 'api-h1' : 'api-studio3' };
+  return { apiInstance: sequence % 2 ? 'api-1' : 'api-2' };
 }

@@ -7,7 +7,7 @@ test('graph relationships come from configuration or usage, never all-to-all gue
   const fleet = demoFleet(0, 1_800_000_000_000);
   const graph = buildGraph(fleet);
   const model = entityId('model', 'sonnet');
-  const account = entityId('account', fleet.nodes.find(n => n.id === 'h1').seats.find(s => s.ref === 'h1/seat-1').account);
+  const account = entityId('account', fleet.nodes.find(n => n.id === 'host-4').seats.find(s => s.ref === 'host-4/seat-1').account);
   assert(graph.edges.some((e) => e.id === edgeId(model, account) && e.kind === 'offers'));
   assert(!graph.edges.some((e) => e.id === edgeId(model, entityId('account', 'local'))));
   const noUsage = buildGraph({ ...fleet, usage: [] });
@@ -59,11 +59,11 @@ test('large fleets stay bounded and never retain dangling edges', () => {
 import { filterFleet } from './network-filters.ts';
 test('combined host and backend filters retain only matching seat neighborhoods', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
-  const result = filterFleet(fleet, { host: 'h1', engine: 'claude-cli', account: 'claude-work' });
-  assert.deepEqual(result.nodes.map(n => n.id), ['h1']);
+  const result = filterFleet(fleet, { host: 'host-4', engine: 'claude-cli', account: 'claude-work' });
+  assert.deepEqual(result.nodes.map(n => n.id), ['host-4']);
   assert.deepEqual(result.accounts.map(a => a.id), ['claude-work']);
-  assert(result.usage.every(r => !r.served || r.served.node === 'h1'));
-  assert.equal(filterFleet(fleet, { host: 'h1', engine: 'mlx' }).nodes.length, 0);
+  assert(result.usage.every(r => !r.served || r.served.node === 'host-4'));
+  assert.equal(filterFleet(fleet, { host: 'host-4', engine: 'mlx' }).nodes.length, 0);
 });
 test('policy defaults and idle filtering follow the seat contract', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
@@ -89,10 +89,10 @@ test('unified layout is independent of response ordering and supports newly repo
 test('drag pins are honored and bounded; reset restores the settled layout', () => {
   const graph = buildGraph(demoFleet(0, 1_800_000_000_000));
   const base = layoutGraph(graph, 940, 740);
-  const pins = new Map([['project:research', { x: 250, y: 200 }], ['node:h1', { x: -100, y: 900 }]]);
+  const pins = new Map([['project:research', { x: 250, y: 200 }], ['node:host-4', { x: -100, y: 900 }]]);
   const dragged = layoutGraph(graph, 940, 740, pins);
   assert.deepEqual(dragged.get('project:research'), { x: 250, y: 200 });
-  assert.deepEqual(dragged.get('node:h1'), { x: 65, y: 675 });
+  assert.deepEqual(dragged.get('node:host-4'), { x: 65, y: 675 });
   assert.deepEqual(layoutGraph(graph, 940, 740, new Map()), base);
 });
 
@@ -134,7 +134,7 @@ test('resource filters exclude unattributed requests; request facets preserve hi
   const fleet = demoFleet(0, 1_800_000_000_000);
   const record = { ...fleet.usage[0], served: null };
   fleet.usage = [record];
-  assert.equal(filterFleet(fleet, { host: 'studio1' }).usage.length, 0);
+  assert.equal(filterFleet(fleet, { host: 'host-1' }).usage.length, 0);
   assert.equal(filterFleet(fleet, { project: record.project }).usage.length, 1);
   fleet.usage = [{ ...record, served: { model: record.requested_model, node: 'retired', seat: 'retired/seat', account: 'old' } }];
   const filtered = filterFleet(fleet, { repository: record.metadata.repository });
@@ -247,13 +247,13 @@ test('a routed request follows one project-to-API-to-host-to-seat-to-account-to-
 });
 
 
-test('homelab demo places CLI accounts on h1/h2 and MLX capacity on Macs', () => {
+test('the demo fleet places CLI accounts on host-2/host-4 and MLX capacity on its Mac-like hosts', () => {
   const fleet = demoFleet(0,1_800_000_000_000);
   for (const node of fleet.nodes) for (const seat of node.seats) {
-    if (seat.account !== 'local') assert(['h1','h2'].includes(node.id));
-    if (['h1','h2'].includes(node.id) && seat.account === 'local') assert(seat.serves.every(s => ['llama-3b','llama-8b','qwen-7b'].includes(s.model)));
+    if (seat.account !== 'local') assert(['host-4','host-2'].includes(node.id));
+    if (['host-4','host-2'].includes(node.id) && seat.account === 'local') assert(seat.serves.every(s => ['llama-3b','llama-8b','qwen-7b'].includes(s.model)));
     if (node.id.startsWith('gpu-')) assert.equal(seat.engine,'managed');
-    else if (!['h1','h2'].includes(node.id)) assert.equal(seat.engine,'mlx');
+    else if (!['host-4','host-2'].includes(node.id)) assert.equal(seat.engine,'mlx');
   }
 });
 

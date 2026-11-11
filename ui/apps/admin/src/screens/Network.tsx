@@ -244,7 +244,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
           <p className="muted">The whole fleet shares one field. Directional forces spread execution toward the models, while related entities settle around each other. Models are execution targets; projects, repositories, accounts and other context stay attached to the same request.</p>
           <div className={s.key}><span className="c-active">●</span><span>Reported in-flight work or a newly completed request</span><span className="c-wait">◐</span><span>Paused, pending or waiting</span><span className="c-fail">✕</span><span>Failed, down or exhausted</span></div>
           <p className="muted">Click any combination of entities to find their shared requests. Search includes every reported dimension. Optional context appears when supplied; selecting it never rearranges the network.</p>
-          <p className={s.small}>{demo ? 'Homelab-inspired demo: studio1–3, h1, h2 and m1. Seats, models and activity are illustrative; no hosts are contacted.' : 'Links show configuration and sampled usage, not routing eligibility. No hardware telemetry is inferred.'}</p>
+          <p className={s.small}>{demo ? 'Demo fleet: host-1 to host-6, and gpu-a and gpu-b cabled as a pair. Seats, models and activity are illustrative; no hosts are contacted.' : 'Links show configuration and sampled usage, not routing eligibility. No hardware telemetry is inferred.'}</p>
         </>}
       </aside>
     </div>

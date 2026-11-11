@@ -3,7 +3,9 @@
 // reports it to its end; the result carries its evidence (its commits, the
 // harness's summary, its usage, and the sha256 of the stored transcript),
 // its bundle is fetched once, its usage is one record in the ledger, and an
-// attempt is cancelled, refused, or ended when its node restarts.
+// attempt is cancelled, refused, or ended when its node restarts. A failed
+// one names its kind of failure, whoever failed it: the node's report, or
+// the api for a deadline passed in the queue, a revoked key or a lost node.
 import ".." as api;
 import "../../store" as st;
 
@@ -46,6 +48,11 @@ fn expect(r: std::http::Response, status: Int, what: String) {
 
 fn str(body: String, name: String) -> String {
     return std::json::find_string_field(body, name);
+}
+
+/// A member's JSON as it is, trimmed: `null` for a null.
+fn raw(body: String, name: String) -> String {
+    return std::str::trim(std::json::find_field_raw(body, name));
 }
 
 fn fake_definition() -> String {
@@ -209,11 +216,9 @@ fn main() {
         200,
         "a queued one cancelled",
     );
-    std::test::assert_eq_str(
-        str(call(e, "GET", "/v1/attempts/" + str(anon.body, "id"), key, "").body, "state"),
-        "cancelled",
-        "it ends at once",
-    );
+    let cancelled = call(e, "GET", "/v1/attempts/" + str(anon.body, "id"), key, "").body;
+    std::test::assert_eq_str(str(cancelled, "state"), "cancelled", "it ends at once");
+    std::test::assert_eq_str(raw(cancelled, "failure_kind"), "null", "a cancel is no failure");
 
     // the node registers and says its seats are up: it claims the attempt
     let reg = "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
@@ -261,11 +266,9 @@ fn main() {
         204,
         "the seat is full at its concurrency",
     );
-    std::test::assert_eq_str(
-        str(call(e, "GET", "/v1/attempts/" + id, key, "").body, "state"),
-        "running",
-        "running",
-    );
+    let running = call(e, "GET", "/v1/attempts/" + id, key, "").body;
+    std::test::assert_eq_str(str(running, "state"), "running", "running");
+    std::test::assert_eq_str(raw(running, "failure_kind"), "null", "no failure while it runs");
 
     // the node reports it; another node cannot
     let other_token = (
@@ -308,6 +311,17 @@ fn main() {
     expect(
         call(
             e,
+            "POST",
+            "/node/v1/attempts/" + id + "/report",
+            token,
+            "{\"state\": \"done\", \"failure_kind\": \"internal\", \"events\": []}",
+        ),
+        400,
+        "a kind of failure on an end that is no failure",
+    );
+    expect(
+        call(
+            e,
             "PUT",
             "/node/v1/attempts/" + id + "/bundle",
             token,
@@ -330,6 +344,7 @@ fn main() {
     // the evidence
     let got = call(e, "GET", "/v1/attempts/" + id, key, "");
     std::test::assert_eq_str(str(got.body, "state"), "done", "done");
+    std::test::assert_eq_str(raw(got.body, "failure_kind"), "null", "done is no failure");
     std::test::assert_eq_str(str(got.body, "base_sha"), std::str::repeat("a", 40), "its base");
     std::test::assert_eq_str(str(got.body, "head_sha"), std::str::repeat("b", 40), "its head");
     std::test::assert_eq_str(str(got.body, "summary"), "Added FAKE.md", "the harness's summary");
@@ -419,6 +434,7 @@ fn main() {
     let lost = call(e, "GET", "/v1/attempts/" + third, key, "");
     std::test::assert_eq_str(str(lost.body, "state"), "failed", "failed when its node restarted");
     std::test::assert(std::str::contains(str(lost.body, "failure"), "restarted"), "and why");
+    std::test::assert_eq_str(str(lost.body, "failure_kind"), "node_lost", "its node lost");
 
     // the node, registered again, says its seats are up again
     let again = call(e, "POST", "/node/v1/register", token, reg);
@@ -464,6 +480,68 @@ fn main() {
         token,
         "{\"state\": \"failed\", \"failure\": \"a test\", \"events\": []}",
     );
+    std::test::assert_eq_str(
+        str(call(e, "GET", "/v1/attempts/" + runnable, key, "").body, "failure_kind"),
+        "internal",
+        "a failed end that names no kind is voice's own",
+    );
+
+    // the node names the kind of its failure
+    let over = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 200, "one to fail claimed");
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/attempts/" + over + "/report",
+            token,
+            "{\"state\": \"failed\", \"failure_kind\": \"bored\", \"events\": []}",
+        ),
+        400,
+        "a kind of failure voice has none of",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + over + "/report",
+        token,
+        "{\"state\": \"failed\", \"failure\": \"the harness used more than its budget of 10 tokens\", \"failure_kind\": \"over_budget\", \"events\": []}",
+    );
+    let failed = call(e, "GET", "/v1/attempts/" + over, key, "").body;
+    std::test::assert_eq_str(str(failed, "state"), "failed", "failed");
+    std::test::assert_eq_str(str(failed, "failure_kind"), "over_budget", "as the node named it");
+
+    // a running attempt whose node stopped reporting it: lost
+    let quiet = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let long_ago = std::time::time_from_unix(std::time::unix(std::time::current()) - 3600);
+    std::test::assert(
+        e.store.start_attempt(quiet, "node-a", "coder", "acct-a", "fake", 1, long_ago) or false,
+        "started an hour ago, and never reported",
+    );
+    expect(call(e, "GET", "/v1/attempts", key, ""), 200, "a list sweeps");
+    let gone = call(e, "GET", "/v1/attempts/" + quiet, key, "").body;
+    std::test::assert_eq_str(str(gone, "state"), "failed", "failed once its node is silent");
+    std::test::assert_eq_str(str(gone, "failure_kind"), "node_lost", "its node lost");
+
+    // an attempt whose deadline passed in the queue: failed at the next claim
+    let stale = e.store.insert_attempt(
+        st::AttemptRow {
+            id: "att_0000deadline",
+            project: "work",
+            key: "k",
+            state: "queued",
+            body: ASK,
+            harness: "fake",
+            branch: "voice/attempt-att_0000deadline",
+            created_at: long_ago,
+            deadline_at: std::time::time_from_unix(std::time::unix(long_ago) + 60),
+        },
+    ) or false;
+    std::test::assert(stale, "an attempt past its deadline, queued");
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 204, "nothing to start");
+    let late_one = call(e, "GET", "/v1/attempts/att_0000deadline", key, "").body;
+    std::test::assert_eq_str(str(late_one, "state"), "failed", "failed at the claim");
+    std::test::assert_eq_str(str(late_one, "failure_kind"), "past_deadline", "past its deadline");
 
     // a key revoked while its attempt waits: the attempt never starts
     let late = (
@@ -482,6 +560,7 @@ fn main() {
         "",
     );
     std::test::assert_eq_str(str(refused.body, "state"), "failed", "a revoked key's attempt fails");
+    std::test::assert_eq_str(str(refused.body, "failure_kind"), "key_revoked", "its key revoked");
     std::test::assert_eq_str(
         std::str::trim(std::json::find_field_raw(refused.body, "served")),
         "null",

@@ -33,6 +33,12 @@
 #     annotation, step, turn or title, a budget spent, a change, a child, an
 #     annotator naming it), it stays, archived, its key revoked.
 #
+# Then coding attempts that ended before migration 38: each failed one is
+# given the kind of failure its text names where voice wrote that text
+# itself (one of each, and a node's text before its exit's), `internal`
+# for a text voice did not write (a harness's own), and a done or
+# cancelled one none.
+#
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -238,3 +244,52 @@ migrate $((head - 33))
 test "$(q "SELECT p.status || ':' || p.internal || ':' || k.status FROM project p JOIN api_key k ON k.id = p.id WHERE p.id = 'voice-system'")" = "archived:true:revoked"
 test "$(q "SELECT count(*) FROM api_key WHERE internal AND id LIKE '%-system'")" = 2
 echo "where anything was recorded under it, it stays, archived, its key revoked"
+
+# coding attempts' failure kinds (migration 38), from the text of each
+# failure an api or a node from before wrote
+store_at 37
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+CREATE TEMP TABLE want (id text, state text, failure text, kind text);
+INSERT INTO want VALUES
+  ('a01', 'failed', 'its deadline passed before a seat took it', 'past_deadline'),
+  ('a02', 'failed', 'it passed its deadline', 'past_deadline'),
+  ('a03', 'failed', 'the harness used more than its budget of 1000 tokens', 'over_budget'),
+  ('a04', 'failed', 'its project or key is no longer active', 'key_revoked'),
+  ('a05', 'failed', 'its node stopped reporting it', 'node_lost'),
+  ('a06', 'failed', 'its node restarted while it ran', 'node_lost'),
+  ('a07', 'failed', 'the node stopped while it ran', 'node_lost'),
+  ('a08', 'failed', 'the harness made no change', 'no_changes'),
+  ('a09', 'failed', 'the repository could not be fetched at main: fatal: unable to access', 'repo_unavailable'),
+  ('a10', 'failed', 'the base is not a commit', 'repo_unavailable'),
+  ('a11', 'failed', 'login work holds no auth.json on this node: set it up as the harness says (codex login)', 'login_unavailable'),
+  ('a12', 'failed', 'login work''s auth.json could not be copied', 'login_unavailable'),
+  ('a13', 'failed', 'the node''s vault holds no login claude-work for this seat', 'login_unavailable'),
+  ('a14', 'failed', 'the login could not be written privately for the harness', 'login_unavailable'),
+  ('a15', 'failed', 'this node has no docker: attempts run in a container', 'sandbox_failed'),
+  ('a16', 'failed', 'the image voice-harness-fake:0123 could not be built: no space left', 'sandbox_failed'),
+  ('a17', 'failed', 'the attempt''s network could not be made: daemon down', 'sandbox_failed'),
+  ('a18', 'failed', 'the attempt''s egress proxy could not start: conflict', 'sandbox_failed'),
+  ('a19', 'failed', 'the attempt''s egress proxy could not join its network: gone', 'sandbox_failed'),
+  ('a20', 'failed', 'the harness exited with code 125: docker: invalid reference format', 'sandbox_failed'),
+  ('a21', 'failed', 'the harness exited with code 127: docker could not be started', 'sandbox_failed'),
+  ('a22', 'failed', 'the commits'' bundle is over 6 MiB, the most voice holds', 'bundle_too_large'),
+  ('a23', 'failed', 'the harness exited with code 1: Error: rate limited', 'harness_failed'),
+  ('a24', 'failed', 'the harness was silent for more than 900 s', 'harness_failed'),
+  ('a25', 'failed', 'the workspace''s commits could not be taken: fatal: bad object', 'harness_failed'),
+  ('a26', 'failed', 'the harness''s commits do not build on the base', 'harness_failed'),
+  ('a27', 'failed', 'what the harness left could not be committed: fatal: index.lock', 'harness_failed'),
+  ('a28', 'failed', 'the commits could not be bundled: fatal: bad revision', 'internal'),
+  ('a29', 'failed', 'the api did not take the bundle (500)', 'internal'),
+  ('a30', 'failed', 'its harness is not one this node runs: no image', 'internal'),
+  ('a31', 'failed', 'I could not finish: the tests fail', 'internal'),
+  ('a32', 'done', '', ''),
+  ('a33', 'cancelled', 'cancelled before it started', '');
+INSERT INTO attempt (id, project, key, state, body, branch, failure, created_at, deadline_at)
+  SELECT id, 'work', 'k_work', state, '{}', 'voice/attempt-' || id, failure, now(), now() FROM want;
+CREATE TABLE wanted_kinds AS SELECT * FROM want;
+SQL
+migrate $((head - 37))
+bad=$(q "SELECT string_agg(w.id || ': ' || a.failure_kind || ' for ' || w.kind, '; ' ORDER BY w.id) FROM wanted_kinds w JOIN attempt a ON a.id = w.id WHERE a.failure_kind <> w.kind")
+[ -z "$bad" ] || { echo "a failed attempt from before has the wrong kind: $bad" >&2; exit 1; }
+test "$(q "SELECT count(*) FROM attempt")" = 33
+echo "attempts that failed before migration 38 have the kind their failure names, internal when voice did not write it; none when they did not fail"

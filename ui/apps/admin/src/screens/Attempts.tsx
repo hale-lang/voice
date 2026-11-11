@@ -7,7 +7,7 @@ import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go, href } from '../route';
 import { readout } from '../readout';
-import { attemptEnded, attemptTone, parseTranscript, shortSha, wall, type AttemptEvent } from './attempt-view';
+import { attemptEnded, attemptLabel, attemptTone, parseTranscript, shortSha, wall, type AttemptEvent } from './attempt-view';
 
 type Attempt = Schemas['CodingAttempt'];
 
@@ -40,7 +40,7 @@ export function Attempts({ route, setInspector }: ScreenProps) {
           selectedKey={selected}
           onSelect={(a) => go('attempts', a.id)}
           columns={[
-            { key: 'state', header: 'State', render: (a) => <Status tone={attemptTone(a.state)} label={a.phase ? `${a.state} · ${a.phase}` : a.state} /> },
+            { key: 'state', header: 'State', render: (a) => <Status tone={attemptTone(a.state)} label={attemptLabel(a)} /> },
             { key: 'id', header: 'Attempt', render: (a) => <Mono>{a.id}</Mono> },
             { key: 'project', header: 'Project', render: (a) => <Mono>{a.project}</Mono> },
             { key: 'harness', header: 'Harness', render: (a) => a.harness ?? <span className="faint">any</span> },
@@ -103,7 +103,7 @@ function AttemptInspector({ id }: { id: string }) {
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-3)' }}>
-        <Mono>{a.id}</Mono> <Status tone={attemptTone(a.state)} label={a.phase ? `${a.state} · ${a.phase}` : a.state} />
+        <Mono>{a.id}</Mono> <Status tone={attemptTone(a.state)} label={attemptLabel(a)} />
       </h2>
       {w.error && <p className="c-fail">{w.error}</p>}
       <Kv
@@ -116,6 +116,7 @@ function AttemptInspector({ id }: { id: string }) {
           { k: 'branch', v: <Mono>{a.branch}</Mono> },
           { k: 'commits', v: a.head_sha ? <Mono>{`${shortSha(a.base_sha)}..${shortSha(a.head_sha)}`}</Mono> : <span className="faint">none yet</span> },
           { k: 'summary', v: a.summary ?? <span className="faint">–</span> },
+          ...(a.failure_kind ? [{ k: 'failure kind', v: <Mono>{a.failure_kind}</Mono> }] : []),
           ...(a.failure ? [{ k: 'failure', v: <span className="c-fail">{a.failure}</span> }] : []),
           { k: 'usage', v: <>{usage} · <a href={href('usage', 'c', a.id)}>in Usage</a></> },
           { k: 'wall time', v: a.wall_ms ? wall(a.wall_ms) : '–' },

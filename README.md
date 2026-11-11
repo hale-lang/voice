@@ -76,6 +76,42 @@ docker compose exec api voice-api admin-token
 
 The UI asks for it once and keeps it in the browser.
 
+## On one Mac
+
+[`scripts/voice-local`](./scripts/voice-local) puts all of it on one Mac on
+Apple silicon, with only [hale](https://github.com/hale-lang/hale) installed
+(`curl -fsSL https://hale-lang.org/install.sh | sh`) and Docker running: a
+hale habitat, voice grafted into it at its latest release, voice's api on
+`127.0.0.1:8080`, a node on the same Mac serving a model, and a project key
+in a file. It reads no other file of this repository, so it runs without a
+checkout:
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/hale-lang/voice/main/scripts/voice-local)
+scripts/voice-local          # the same, from a checkout
+```
+
+The habitat lives in a data dir of its own, `~/.local/share/hale-local`
+(`--data`), handed to every hale call as `XDG_DATA_HOME`, so another habitat
+on the machine is never touched; `export XDG_DATA_HOME=~/.local/share/hale-local`
+reaches it with `hale habitat` afterwards. The node serves
+`granite-4.0-350m` (`--model` names another recipe, and more than one), the
+catalog's pick for a small Mac (0.4 GB of weights), as `general` and
+`coding` on the habitat's project, `<habitat>-habitat`; the key is on that
+project, in `~/.local/share/hale-local/voice-local/project-key` (mode 600,
+`Authorization: Bearer vk-…`, never printed), which `curl -H @<file>` sends.
+
+It goes one named step at a time (`--list`): `check`, `up`, `nursery`,
+`graft` (answer y), `apply`, `secrets`, `place` (your sudo password: the node
+is a LaunchDaemon), `voice` (the admin plane: the `local` account, the
+placements, the seats waited on while the weights download, the habitat's
+grant, its aliases and the key), `models`, `ask` and `status`. A step that
+fails stops there and says how to go on (`--from <step>`, or `--only
+<step>`); `-n` prints every command and admin call instead of running it.
+`--forget` undoes it: the node through voice's own uninstall (`hale habitat
+organism unplace voice node`), then the habitat (`hale habitat down
+--forget`), then the key file. The weights stay in `~/.voice/node-data`.
+
 ## End to end
 
 Set up a model, the account that pays for it, a project with a key, and a

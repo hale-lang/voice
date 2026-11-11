@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# voice-local: voice on one Mac. A hale habitat with voice grafted into it,
+# voice's api in the habitat's compose (http://127.0.0.1:8080), one voice
+# node on this same Mac serving a model, and a project key a person asks
+# with. Everything lives in a data dir of its own, so another habitat on
+# this machine is never touched. One named step at a time; a step that fails
+# stops there and says how to pick up from it. `--help` says the rest.
+#
+# It reads no other file of this repository, so it runs without a checkout:
+#
+#   bash <(curl -fsSL https://raw.githubusercontent.com/hale-lang/voice/main/scripts/voice-local)
+#
+# Written for the bash macOS ships (3.2).
+set -uo pipefail
+
+me=voice-local
+REPO=https://github.com/hale-lang/voice
+ONE_LINER='bash <(curl -fsSL https://raw.githubusercontent.com/hale-lang/voice/main/scripts/voice-local)'
+API=http://127.0.0.1:8080          # voice's api, as its compose publishes it
+ORGANISM=voice
+ACCOUNT=local                      # the voice account the node's seats spend: billing none
+DEFAULT_MODEL=granite-4.0-350m     # voice's catalog pick for a small Mac (catalog/picks.json)
+# the host ports voice's compose binds (compose.yaml: the api, its live hub,
+# NATS for the node) and the node's readings (hale.toml [dna.host.node])
+PORTS="8080 8085 4222 9476"
+
+usage() {
+  cat <<EOF
+$me: voice on one Mac, end to end, in a data dir of its own.
+
+  a hale habitat (its face in your browser), voice grafted into it, voice's
+  api at $API, one voice node on this Mac serving a model, and a
+  project key in a file (mode 600) that a person asks with.
+
+Run it from a checkout of voice, or straight from GitHub with no checkout:
+
+  scripts/voice-local [options]
+  $ONE_LINER [options]
+
+Options:
+  --data DIR        its data dir (default ~/.local/share/hale-local, or
+                    VOICE_LOCAL_DATA): XDG_DATA_HOME for every hale call,
+                    so your other habitats are never touched
+  --name NAME       the habitat's name (default local)
+  --voice REF       the voice revision the habitat grafts: a tag, or main
+                    (default voice's latest release tag)
+  --node ID         the node's id (default local; its service is
+                    voice-node-ID, a LaunchDaemon)
+  --model RECIPE    a recipe voice ships, placed on the node (default
+                    $DEFAULT_MODEL); give it again for more
+  --alias NAME=MODEL
+                    a name callers ask for (default general and coding,
+                    both the first model); give it again for more
+  --key-file FILE   where the project key goes (default DATA/voice-local/project-key,
+                    mode 600); it is never printed
+  --key-name NAME   the key's name in voice's Usage (default voice-local)
+  -n, --dry-run     print each command and admin call instead of running it
+  --list            the steps
+  --from STEP       start at a step
+  --only STEP       run one step
+  -p, --pause       pause before each step (Enter runs it, s skips, q quits)
+  --forget          undo it: the node's service through voice's own
+                    uninstall, then the habitat (hale habitat down --forget),
+                    then the key file
+  -h, --help        this
+
+The settings a run used are kept in DATA/voice-local/settings, so --from,
+--only and --forget need none of them again (only --data, if you gave one).
+Some steps ask you things: \`graft\` a y, \`place\` your sudo password (the
+node is a system service), \`--forget\` the habitat's name typed back.
+EOF
+}
+
+# ---- options ----------------------------------------------------------------
+opt_data="" opt_name="" opt_voice="" opt_node="" opt_models="" opt_aliases=""
+opt_key_file="" opt_key_name=""
+DRY=0 LIST=0 FROM="" ONLY="" PAUSE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --data|--name|--voice|--node|--model|--alias|--key-file|--key-name|--from|--only)
+      [ $# -ge 2 ] || { echo "$me: $1 needs a value (--help)" >&2; exit 2; }
+      case "$1" in
+        --data) opt_data=$2 ;;
+        --name) opt_name=$2 ;;
+        --voice) opt_voice=$2 ;;
+        --node) opt_node=$2 ;;
+        --model) opt_models="$opt_models${opt_models:+ }$2" ;;
+        --alias) opt_aliases="$opt_aliases${opt_aliases:+ }$2" ;;
+        --key-file) opt_key_file=$2 ;;
+        --key-name) opt_key_name=$2 ;;
+        --from) FROM=$2 ;;
+        --only) ONLY=$2 ;;
+      esac
+      shift 2 ;;
+    -n|--dry-run) DRY=1; shift ;;
+    -l|--list) LIST=1; shift ;;
+    -p|--pause) PAUSE=1; shift ;;
+    --forget) ONLY=forget; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "$me: unknown argument $1 (--help)" >&2; exit 2 ;;
+  esac
+done
+
+DATA=${opt_data:-${VOICE_LOCAL_DATA:-$HOME/.local/share/hale-local}}
+case "$DATA" in /*) ;; *) DATA="$PWD/$DATA" ;; esac
+STATE="$DATA/voice-local"
+
+# this script names its own habitat: a shell that names another (a test's,
+# or a head elsewhere) would send hale there instead
+unset HALE_DNA_HABITAT HALE_DNA_HEAD_URL
+export XDG_DATA_HOME="$DATA"
+
+# what a run started from is kept; an option given now wins over it
+NAME=local NODE_ID=local MODELS=$DEFAULT_MODEL ALIASES="" VOICE_REF=""
+KEY_FILE="$STATE/project-key" KEY_NAME=voice-local
+# shellcheck disable=SC1091
+[ -f "$STATE/settings" ] && . "$STATE/settings"
+[ -n "$opt_name" ] && NAME=$opt_name
+[ -n "$opt_node" ] && NODE_ID=$opt_node
+[ -n "$opt_models" ] && MODELS=$opt_models
+[ -n "$opt_aliases" ] && ALIASES=$opt_aliases
+[ -n "$opt_voice" ] && VOICE_REF=$opt_voice
+[ -n "$opt_key_file" ] && KEY_FILE=$opt_key_file
+[ -n "$opt_key_name" ] && KEY_NAME=$opt_key_name
+case "$KEY_FILE" in /*) ;; *) KEY_FILE="$PWD/$KEY_FILE" ;; esac
+FIRST_MODEL=${MODELS%% *}
+# the aliases set: those given, and general and coding for the first model
+# unless one given names them (only those given are kept in the settings)
+ALIAS_SET=$ALIASES
+for a in general coding; do
+  case " $ALIAS_SET" in *" $a="*) ;; *) ALIAS_SET="$ALIAS_SET${ALIAS_SET:+ }$a=$FIRST_MODEL" ;; esac
+done
+
+# every value that goes into a JSON body or a path is checked here, so the
+# bodies below can be written with printf
+slug='^[a-z0-9][a-z0-9-]{0,62}$'
+[[ "$NAME" =~ $slug ]] || { echo "$me: --name $NAME: lowercase letters, digits and -, at most 63" >&2; exit 2; }
+[[ "$NODE_ID" =~ $slug ]] || { echo "$me: --node $NODE_ID: lowercase letters, digits and -, at most 63" >&2; exit 2; }
+for m in $MODELS; do
+  [[ "$m" =~ ^[a-z0-9][a-z0-9.-]{0,62}$ ]] || { echo "$me: --model $m: a recipe id, e.g. $DEFAULT_MODEL" >&2; exit 2; }
+done
+for a in $ALIAS_SET; do
+  [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,62}=[a-z0-9][a-z0-9.-]*$ ]] || { echo "$me: --alias $a: NAME=MODEL, e.g. general=$FIRST_MODEL" >&2; exit 2; }
+  case " $MODELS " in *" ${a#*=} "*) ;; *) echo "$me: --alias $a: ${a#*=} is not a --model this run places" >&2; exit 2 ;; esac
+done
+[[ "$KEY_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || { echo "$me: --key-name $KEY_NAME: letters, digits, . _ -" >&2; exit 2; }
+
+HP="$NAME-habitat"                 # the habitat's own project in voice (its grant)
+
+# how to run this again, for the messages: the path it was run by, or the
+# one-liner when it came through bash <(curl …)
+if [ -f "$0" ]; then SELF=$0; else SELF=$ONE_LINER; fi
+[ -n "$opt_data" ] && SELF="$SELF --data $(printf '%q' "$DATA")"
+
+if [ -t 1 ]; then B=$'\033[1m' R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' N=$'\033[0m'; else B="" R="" G="" Y="" N=""; fi
+
+# ---- the steps --------------------------------------------------------------
+STEPS="check up nursery graft apply secrets place voice models ask status"
+what() {
+  case "$1" in
+    check)   echo "what this Mac needs: macOS on Apple silicon, hale, Docker, python3, free ports $PORTS" ;;
+    up)      echo "the habitat \`$NAME\` on this Mac (hale habitat up), in $DATA" ;;
+    nursery) if [ -n "$VOICE_REF" ]; then echo "trust voice's repository as a nursery, at $VOICE_REF"; else echo "trust voice's repository as a nursery, at its latest release tag"; fi ;;
+    graft)   echo "graft voice into the habitat, on this Mac (answer y)" ;;
+    apply)   echo "bring up voice's services: its api, Postgres, NATS and brain" ;;
+    secrets) echo "the secrets voice declares, and whether the vault holds them" ;;
+    place)   echo "place voice's node on this Mac as \`$NODE_ID\` (a LaunchDaemon; your sudo password)" ;;
+    voice)   echo "voice's admin API: account $ACCOUNT, node $NODE_ID up, $(echo "$MODELS" | sed 's/ /, /g') placed and up, $HP's grant and aliases, the project key" ;;
+    models)  echo "point every organism's models at voice (hale habitat models --all)" ;;
+    ask)     echo "one question to each model, with the project key" ;;
+    status)  echo "where everything stands, and the addresses" ;;
+    forget)  echo "undo it: the node's service (voice's uninstall), the habitat (down --forget), the key file" ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$LIST" = 1 ]; then
+  for s in $STEPS; do printf '  %-8s %s\n' "$s" "$(what "$s")"; done
+  printf '  %-8s %s\n' forget "$(what forget) (only with --forget)"
+  exit 0
+fi
+for s in $FROM $ONLY; do what "$s" >/dev/null || { echo "$me: no step '$s' (--list)" >&2; exit 2; }; done
+[ "$FROM" = forget ] && { echo "$me: forget runs alone: --forget" >&2; exit 2; }
+
+# run CMD…: the command, or in a dry run the line that would run
+run() {
+  if [ "$DRY" = 1 ]; then printf '  + %s\n' "$(printf '%q ' "$@" | sed 's/ $//')"; return 0; fi
+  "$@"
+}
+
+save_settings() {
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$STATE" || return 1
+  {
+    echo "# $me's settings for the habitat in $DATA: a later run starts from these"
+    printf 'NAME=%q\nNODE_ID=%q\nMODELS=%q\nALIASES=%q\nVOICE_REF=%q\nKEY_FILE=%q\nKEY_NAME=%q\n' \
+      "$NAME" "$NODE_ID" "$MODELS" "$ALIASES" "$VOICE_REF" "$KEY_FILE" "$KEY_NAME"
+  } > "$STATE/settings"
+}
+
+# pj EXPR: a Python expression over the JSON on stdin (`d`), printed plain
+# (nothing for None, true/false for a bool, JSON for a list or object)
+pj() {
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    r = eval(sys.argv[1], {"d": d})
+except Exception:
+    sys.exit(1)
+if r is None:
+    sys.exit(0)
+if isinstance(r, bool):
+    print("true" if r else "false")
+elif isinstance(r, (str, int, float)):
+    print(r)
+else:
+    print(json.dumps(r))
+' "$1"
+}
+
+habitat_dir() { printf '%s' "$DATA/hale/habitat/local"; }
+
+# ---- check ------------------------------------------------------------------
+step_check() {
+  local bad=0 p who
+  no() { echo "  ${R}no${N}   $1"; shift; for l in "$@"; do echo "       $l"; done; bad=1; }
+  ok() { echo "  ok   $1"; }
+  if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then ok "macOS on Apple silicon"
+  else no "this is $(uname -s) on $(uname -m)" "voice's node on a Mac runs its models on Metal: it needs Apple silicon (arm64)"; fi
+  if command -v hale >/dev/null 2>&1; then ok "hale: $(hale --version 2>/dev/null | head -1)"
+  else no "hale is not on PATH" "install it:  curl -fsSL https://hale-lang.org/install.sh | sh" "then open a new shell (or add its bin directory to PATH) and run this again"; fi
+  if ! command -v docker >/dev/null 2>&1; then no "docker is not on PATH" "the habitat and voice's api run under Docker: install Docker Desktop (or another Docker engine) and start it"
+  elif ! docker info >/dev/null 2>&1; then no "Docker is not running" "start Docker Desktop (or your Docker engine), wait until \`docker info\` answers, and run this again"
+  elif ! docker compose version >/dev/null 2>&1; then no "docker compose is missing" "the habitat and voice run their services with Docker Compose (\`docker compose\`), 2.20 or later"
+  else
+    # voice's compose needs Compose 2.20 or later (its README)
+    local cv cmaj cmin
+    cv=$(docker compose version --short 2>/dev/null | sed 's/^v//')
+    cmaj=${cv%%.*}; cmin=${cv#*.}; cmin=${cmin%%.*}
+    if [[ "$cmaj" =~ ^[0-9]+$ ]] && [[ "$cmin" =~ ^[0-9]+$ ]] && { [ "$cmaj" -gt 2 ] || { [ "$cmaj" = 2 ] && [ "$cmin" -ge 20 ]; }; }; then
+      ok "Docker, compose $cv"
+    else
+      no "Docker Compose is ${cv:-of an unknown version}" "voice's compose needs 2.20 or later: update Docker Desktop (or the compose plugin)"
+    fi
+  fi
+  if command -v curl >/dev/null 2>&1; then ok "curl"; else no "curl is not on PATH" "it talks to voice's api"; fi
+  if python3 -c 'import json' >/dev/null 2>&1; then ok "python3"
+  else no "python3 does not run" "this script reads voice's JSON answers with it: \`xcode-select --install\` installs it"; fi
+  if [ -d "$(habitat_dir)/genome" ]; then
+    ok "ports $PORTS: not checked, this data dir has a habitat already (its voice holds them)"
+  else
+    local taken=0
+    for p in $PORTS; do
+      who=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { print $1 " (pid " $2 ")" }')
+      [ -z "$who" ] && nc -z -G 1 127.0.0.1 "$p" >/dev/null 2>&1 && who="a process of another user"
+      if [ -n "$who" ]; then
+        taken=1
+        no "port $p is taken by $who" "voice binds 8080 (its api), 8085 (its live hub) and 4222 (NATS) on 127.0.0.1, and its node 9476 (readings)" \
+          "stop what holds it (another voice or habitat? \`docker ps\`), then run this again"
+      fi
+    done
+    [ $taken = 0 ] && ok "ports $PORTS free"
+  fi
+  local plist others=""
+  for plist in /Library/LaunchDaemons/voice-node-*.plist; do
+    [ -e "$plist" ] || continue
+    [ "$plist" = "/Library/LaunchDaemons/voice-node-$NODE_ID.plist" ] && [ -d "$(habitat_dir)/genome" ] && continue
+    others="$others $(basename "$plist" .plist)"
+  done
+  if [ -n "$others" ]; then
+    no "this Mac runs a voice node already:$others" "a Mac holds one voice node (its data is ~/.voice/node-data); take it off where it was placed from" \
+      "(\`hale habitat organism unplace voice node --host … --id …\`, or voice's node/install.sh uninstall), then run this again"
+  else ok "no other voice node on this Mac"; fi
+  if [ $bad = 1 ] && [ "$DRY" = 1 ]; then echo "  ${Y}(a dry run goes on regardless)${N}"; return 0; fi
+  return $bad
+}
+
+# ---- the habitat ------------------------------------------------------------
+step_up()     { run hale habitat up --name "$NAME"; }
+latest_voice_tag() {
+  # voice's newest vX.Y.Z tag: git when there is one, else GitHub's API
+  local tags
+  if command -v git >/dev/null 2>&1 && git --version >/dev/null 2>&1; then
+    tags=$(git ls-remote --tags --refs "$REPO" 'v*' 2>/dev/null | sed 's|.*refs/tags/||')
+  else
+    tags=$(curl -fsSL "https://api.github.com/repos/hale-lang/voice/tags?per_page=100" 2>/dev/null | pj '"\n".join(t["name"] for t in d)')
+  fi
+  printf '%s\n' "$tags" | python3 -c '
+import re, sys
+v = [l.strip() for l in sys.stdin if re.fullmatch(r"v\d+\.\d+\.\d+", l.strip())]
+v.sort(key=lambda t: tuple(int(x) for x in t[1:].split(".")))
+print(v[-1] if v else "")'
+}
+step_nursery() {
+  if [ -z "$VOICE_REF" ]; then
+    VOICE_REF=$(latest_voice_tag)
+    [ -n "$VOICE_REF" ] || { echo "  could not find voice's latest release tag at $REPO: --voice <tag> names one"; return 1; }
+    echo "  voice $VOICE_REF, its latest release"
+    save_settings
+  fi
+  if [ "$VOICE_REF" = main ]; then run hale habitat nursery add "$REPO"
+  else run hale habitat nursery add "$REPO#$VOICE_REF"; fi
+}
+step_graft()  { run hale habitat graft "$ORGANISM"; }
+step_apply()  { run hale habitat apply; }
+step_secrets() {
+  # only what voice declares ([dna.secrets] in its hale.toml): the operator
+  # token and the tenant keys the habitat draws itself; a Claude account's
+  # token (claude-token) is optional, for a claude seat, and set later
+  if [ "$DRY" = 1 ]; then
+    run hale habitat organism "$ORGANISM" dna declared-secrets
+    run hale habitat organism "$ORGANISM" dna secrets
+    return 0
+  fi
+  local declared missing name kind family optional
+  declared=$(hale habitat organism "$ORGANISM" dna declared-secrets) || return 1
+  missing=$(hale habitat organism "$ORGANISM" dna secrets 2>&1 | grep MISSING)
+  [ -n "$declared" ] || { echo "  $ORGANISM declares no secrets"; return 0; }
+  local need=0
+  # tabs to `|` first: bash merges a run of tabs, and a column can be empty
+  while IFS='|' read -r name kind _ _ _ family optional; do
+    [ -n "$name" ] || continue
+    if [ "$kind" = drawn ]; then
+      echo "  $name: drawn by the habitat"
+    elif [ "$family" = family ]; then
+      echo "  $name: a family${optional:+ (optional)}, one value per member; none needed to serve local models"
+      [ "$name" = claude-token ] && echo "         a Claude account later: hale habitat organism $ORGANISM dna secret set claude-token --member <account>, then --only place"
+    elif printf '%s\n' "$missing" | grep -qw "$name"; then
+      if [ -n "$optional" ]; then echo "  $name: not set (optional)"
+      else
+        echo "  ${R}$name: missing${N}: hale habitat organism $ORGANISM dna secret set $name (it reads the value from your terminal)"
+        need=1
+      fi
+    else
+      echo "  $name: set"
+    fi
+  done <<< "$(printf '%s\n' "$declared" | tr '\t' '|')"
+  return $need
+}
+step_place()  { run hale habitat organism place "$ORGANISM" node --host local --id "$NODE_ID"; }
+step_models() { run hale habitat models --all; }
+
+# ---- voice's admin API (the operator token in a header file, never argv) ----
+vh=""
+voice_auth() {
+  [ -n "$vh" ] && return 0
+  vh=$(mktemp) && chmod 600 "$vh" || return 1
+  trap 'rm -f "$vh"' EXIT
+  hale habitat organism "$ORGANISM" dna secret show operator-token | sed 's/^/Authorization: Bearer /' > "$vh"
+  grep -q "Bearer ." "$vh" || { echo "  no operator token from the habitat's vault"; return 1; }
+}
+# vapi METHOD PATH [JSON]: the body in $vbody, the HTTP code in $vcode (set
+# here, never in a $(…) subshell, so the caller sees them)
+vbody="" vcode=""
+vapi() {
+  local out
+  if [ $# -ge 3 ]; then
+    out=$(curl -sS -m 30 -X "$1" -H @"$vh" -H 'content-type: application/json' -d "$3" "$API$2" -w $'\n%{http_code}')
+  else
+    out=$(curl -sS -m 30 -X "$1" -H @"$vh" "$API$2" -w $'\n%{http_code}')
+  fi
+  vcode=${out##*$'\n'}; vbody=${out%$'\n'*}
+}
+# say METHOD PATH [JSON]: a dry run's line for one call
+say() { printf '  + %-5s %s%s%s\n' "$1" "$API" "$2" "${3:+ $3}"; }
+# ensure PATH COLLECTION JSON WHAT: there already, or created
+ensure() {
+  local path=$1 coll=$2 body=$3 what=$4
+  if [ "$DRY" = 1 ]; then say GET "$path"; echo "      404: $what made with"; say POST "$coll" "$body"; return 0; fi
+  vapi GET "$path"
+  case "$vcode" in
+    200) echo "  $what: there" ;;
+    404) vapi POST "$coll" "$body"
+         case "$vcode" in 200|201|409) echo "  $what: made" ;; *) echo "  $what: $vcode $vbody"; return 1 ;; esac ;;
+    *) echo "  $what: $vcode $vbody"; return 1 ;;
+  esac
+}
+# a placement's id: lowercase letters, digits and dashes (granite-4.0-350m on
+# node local places as granite-4-0-350m-on-local)
+placement_id() { printf '%s-on-%s' "$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9-' '-')" "$NODE_ID" | cut -c1-63; }
+
+step_voice() {
+  [ "$DRY" = 1 ] || voice_auth || return 1
+  local i st b m pl
+  # 1. the node the habitat placed reports in, with its hardware
+  if [ "$DRY" = 1 ]; then say GET "/admin/v1/nodes/$NODE_ID"; echo "      until its status is up and it declared its hardware"
+  else
+    printf "  node %s: " "$NODE_ID"
+    st=""
+    for i in $(seq 1 60); do
+      vapi GET "/admin/v1/nodes/$NODE_ID"; b=$vbody
+      st=$(printf '%s' "$b" | pj 'd.get("status")' 2>/dev/null)
+      [ "$vcode" = 200 ] && [ "$st" = up ] && [ "$(printf '%s' "$b" | pj 'bool((d.get("capabilities") or {}).get("hardware"))' 2>/dev/null)" = true ] && break
+      printf "."; sleep 5
+    done
+    [ "$st" = up ] || { echo " not up ($vcode ${st:-?}): its log is ~/.voice/node-$NODE_ID.log"; return 1; }
+    echo " up"
+  fi
+  # 2. the account its seats spend: a local one that bills nothing
+  ensure "/admin/v1/accounts/$ACCOUNT" /admin/v1/accounts "{\"id\":\"$ACCOUNT\",\"name\":\"Local\",\"billing\":\"none\"}" "account $ACCOUNT" || return 1
+  # 3. each model in the catalog from its recipe, placed on the node: voice
+  # picks the variant and runtime that fit the node and makes the seat
+  # (`<placement>` on the node), which fetches and checks the weights
+  local seats=""
+  for m in $MODELS; do
+    pl=$(placement_id "$m")
+    ensure "/admin/v1/models/$m" /admin/v1/models "{\"id\":\"$m\",\"recipe\":\"$m\"}" "model $m" || return 1
+    ensure "/admin/v1/placements/$pl" /admin/v1/placements "{\"id\":\"$pl\",\"model\":\"$m\",\"nodes\":[\"$NODE_ID\"],\"account\":\"$ACCOUNT\"}" "placement $pl" || return 1
+    seats="$seats $pl"
+  done
+  # 4. every seat waited on together (the first time, its weights download)
+  if [ "$DRY" = 1 ]; then
+    for pl in $seats; do say GET "/admin/v1/nodes/$NODE_ID/seats/$pl"; done
+    echo "      until each seat's status is up (down or refused stops here, with its reason)"
+  else
+    echo "  waiting on$seats (a first start downloads the weights)…"
+    local left="$seats" t0 still; t0=$(date +%s)
+    while [ -n "$left" ]; do
+      [ $(( $(date +%s) - t0 )) -gt 3600 ] && { echo "  not up after an hour:$left (voice's admin UI, Nodes, says where each stands)"; return 1; }
+      still=""
+      for pl in $left; do
+        vapi GET "/admin/v1/nodes/$NODE_ID/seats/$pl"; b=$vbody
+        st=$(printf '%s' "$b" | pj 'd.get("status")' 2>/dev/null)
+        case "$st" in
+          up) echo "  seat $NODE_ID/$pl: up after $(( $(date +%s) - t0 ))s" ;;
+          down|refused) echo "  seat $NODE_ID/$pl: $st: $(printf '%s' "$b" | pj 'd.get("reason") or "?"')"; return 1 ;;
+          *) still="$still $pl" ;;
+        esac
+      done
+      left=${still# }
+      [ -n "$left" ] && sleep 5
+    done
+  fi
+  # 5. the habitat's own project in voice (<habitat>-habitat): it may spend
+  # the local account, and every organism's project, its child, inherits it
+  local grant='{"accounts":["'"$ACCOUNT"'"]}'
+  if [ "$DRY" = 1 ]; then
+    say GET "/admin/v1/projects/$HP"
+    echo "      404: made with"; say POST /admin/v1/projects "{\"id\":\"$HP\",\"name\":\"$NAME habitat\",\"accounts\":[\"$ACCOUNT\"]}"
+    echo "      else:"; say PATCH "/admin/v1/projects/$HP" "$grant"
+  else
+    vapi GET "/admin/v1/projects/$HP"
+    if [ "$vcode" = 404 ]; then
+      vapi POST /admin/v1/projects "{\"id\":\"$HP\",\"name\":\"$NAME habitat\",\"accounts\":[\"$ACCOUNT\"]}"
+      [ "$vcode" = 409 ] && vapi PATCH "/admin/v1/projects/$HP" "$grant"
+    else
+      vapi PATCH "/admin/v1/projects/$HP" "$grant"
+    fi
+    case "$vcode" in 200|201) echo "  $HP: spends $ACCOUNT (every organism's project inherits it)" ;; *) echo "  $HP: $vcode $vbody"; return 1 ;; esac
+  fi
+  # 6. the names callers ask for, on the habitat's project (its callers
+  # inherit them): general and coding unless --alias said otherwise
+  local json a
+  json="{\"aliases\":[$(for a in $ALIAS_SET; do printf '{"name":"%s","model":"%s"},' "${a%%=*}" "${a#*=}"; done | sed 's/,$//')]}"
+  if [ "$DRY" = 1 ]; then say PATCH "/admin/v1/projects/$HP" "$json"
+  else
+    vapi PATCH "/admin/v1/projects/$HP" "$json"
+    case "$vcode" in 200) echo "  aliases on $HP: $ALIAS_SET" ;; *) echo "  aliases on $HP: $vcode $vbody"; return 1 ;; esac
+  fi
+  # 7. the person's key, on the habitat's project: kept when the key file
+  # still works, else the old one of that name revoked and a new one minted
+  # into the key file (mode 600); the secret is never printed
+  local kp="/admin/v1/projects/$HP/keys" have sec k
+  if [ "$DRY" = 1 ]; then
+    say GET "$kp"; echo "      an active key named $KEY_NAME whose file still works is kept; else each of that name revoked:"
+    say DELETE "$kp/<id>"; echo "      and a new one minted:"; say POST "$kp" "{\"name\":\"$KEY_NAME\"}"
+    echo "      its secret written to $KEY_FILE (mode 600), never printed"
+    return 0
+  fi
+  vapi GET "$kp"; b=$vbody
+  have=$(printf '%s' "$b" | pj "next((k['id'] for k in d.get('data', []) if k.get('name') == '$KEY_NAME' and k.get('status') == 'active'), None)" 2>/dev/null)
+  if [ -n "$have" ] && [ -s "$KEY_FILE" ] && [ "$(curl -s -o /dev/null -w '%{http_code}' -m 10 -H @"$KEY_FILE" "$API/v1/models")" = 200 ]; then
+    echo "  key $KEY_NAME on $HP: there, and $KEY_FILE works"
+    return 0
+  fi
+  for k in $(printf '%s' "$b" | pj "' '.join(k['id'] for k in d.get('data', []) if k.get('name') == '$KEY_NAME' and k.get('status') == 'active')" 2>/dev/null); do
+    vapi DELETE "$kp/$k"
+  done
+  vapi POST "$kp" "{\"name\":\"$KEY_NAME\"}"
+  sec=$(printf '%s' "$vbody" | pj 'd.get("secret")' 2>/dev/null)
+  [ -n "$sec" ] || { echo "  key: $vcode, no secret in the answer"; return 1; }
+  mkdir -p "$(dirname "$KEY_FILE")" || return 1
+  ( umask 077; printf 'Authorization: Bearer %s\n' "$sec" > "$KEY_FILE" ) || return 1
+  chmod 600 "$KEY_FILE"
+  echo "  key $KEY_NAME on $HP: minted, written to $KEY_FILE (mode 600)"
+}
+
+# ---- ask, status ------------------------------------------------------------
+step_ask() {
+  local m body code out
+  for m in $MODELS; do
+    body="{\"model\":\"$m\",\"messages\":[{\"role\":\"user\",\"content\":\"In one sentence: why is the sky blue?\"}],\"max_tokens\":200}"
+    # a decision model answers only a structured question: not asked here
+    case "$m" in *decision*) echo "  $m: a decision model, not asked a plain question"; continue ;; esac
+    if [ "$DRY" = 1 ]; then printf '  + POST  %s/v1/chat/completions %s  (the key from %s)\n' "$API" "$body" "$KEY_FILE"; continue; fi
+    [ -s "$KEY_FILE" ] || { echo "  no key at $KEY_FILE: $SELF --only voice mints it"; return 1; }
+    out=$(curl -sS -m 600 -H @"$KEY_FILE" -H 'content-type: application/json' -d "$body" "$API/v1/chat/completions" -w $'\n%{http_code}')
+    code=${out##*$'\n'}; out=${out%$'\n'*}
+    printf '  %-20s %s  %s\n' "$m" "$code" "$(printf '%s' "$out" | pj '((d.get("choices") or [{}])[0].get("message") or {}).get("content") or (d.get("error") or {}).get("message") or "(no answer)"' 2>/dev/null | tr '\n' ' ' | cut -c1-100)"
+    [ "$code" = 200 ] || return 1
+  done
+}
+FACE=""
+step_status() {
+  local out
+  if [ "$DRY" = 1 ]; then run hale habitat status; return 0; fi
+  out=$(hale habitat status 2>&1); local rc=$?
+  printf '%s\n' "$out"
+  FACE=$(printf '%s\n' "$out" | awk '$1 == "face" { print $2; exit }')
+  return $rc
+}
+
+# ---- forget -----------------------------------------------------------------
+step_forget() {
+  local plist="/Library/LaunchDaemons/voice-node-$NODE_ID.plist"
+  if [ "$DRY" = 1 ] || [ -d "$(habitat_dir)/genome" ]; then
+    # the node first, while the habitat that placed it answers for it: its
+    # own uninstall (voice's node/install.sh) stops and removes the
+    # LaunchDaemon and the model servers it started, and revokes it on voice
+    if [ "$DRY" = 1 ] || [ -e "$plist" ]; then
+      run hale habitat organism unplace "$ORGANISM" node --host local --id "$NODE_ID" || return 1
+    else
+      echo "  node $NODE_ID: no service on this Mac"
+    fi
+    # then the habitat whole: its record, voice, the compose projects and
+    # their volumes, its vault slots (it asks for the name typed back)
+    run hale habitat down --forget || return 1
+  else
+    echo "  no habitat in $DATA"
+    if [ -e "$plist" ]; then
+      echo "  ${Y}the node's service is still installed${N} ($plist), with no habitat to take it off:"
+      echo "  from a checkout of voice, its own uninstall removes it: sudo sh node/install.sh uninstall --id $NODE_ID"
+      return 1
+    fi
+  fi
+  if [ "$DRY" = 1 ]; then
+    echo "  + rm -f $KEY_FILE $STATE/settings"
+  else
+    local f
+    for f in "$KEY_FILE" "$STATE/settings"; do [ -e "$f" ] && rm -f "$f" && echo "  removed $f"; done
+    rmdir "$STATE" "$DATA" 2>/dev/null
+    [ -d "$DATA" ] && echo "  $DATA is left, not empty: $(du -sh "$DATA" 2>/dev/null | cut -f1), what hale left there"
+  fi
+  echo "  the weights the node fetched stay in ~/.voice/node-data (voice's uninstall keeps them for a node placed again)"
+}
+
+# ---- run --------------------------------------------------------------------
+summary() {
+  local a names=""
+  for a in $ALIAS_SET; do names="$names${names:+, }${a%%=*}"; done
+  printf '\n%sdone.%s  On this Mac:\n' "$G" "$N"
+  printf '  habitat  %s, its face at %s\n' "$NAME" "${FACE:-(hale habitat status says)}"
+  printf '  voice    %s (its admin UI at /, signed in with the operator token:\n' "$API"
+  printf '           hale habitat organism voice dna secret show operator-token)\n'
+  printf '  models   %s, asked as %s too\n' "$(echo "$MODELS" | sed 's/ /, /g')" "$names"
+  printf '  key      %s (mode 600; project %s, key %s)\n' "$KEY_FILE" "$HP" "$KEY_NAME"
+  printf '\nThe habitat lives in its own data dir; in your shell, before any hale habitat command:\n'
+  printf '  export XDG_DATA_HOME=%q\n' "$DATA"
+  printf '\nAsk it:\n'
+  printf '  curl %s/v1/chat/completions -H @%q -H '"'"'content-type: application/json'"'"' \\\n' "$API" "$KEY_FILE"
+  printf '    -d '"'"'{"model": "general", "messages": [{"role": "user", "content": "Why is the sky blue?"}]}'"'"'\n'
+  printf '\nvoice'"'"'s shell tools (scripts/voice-ask, voice-codex, voice-saturate in a checkout that has them)\n'
+  printf 'take the same two things:\n'
+  printf '  VOICE_API=%s VOICE_KEY_FILE=%q scripts/voice-ask "Why is the sky blue?"\n' "$API" "$KEY_FILE"
+  printf '  VOICE_KEY_FILE=%q scripts/voice-ask --local "Why is the sky blue?"\n' "$KEY_FILE"
+  printf '\nUndo all of it:  %s --forget\n' "$SELF"
+}
+
+[ "$DRY" = 1 ] && printf '%sdry run%s: nothing runs; every hale command below runs with XDG_DATA_HOME=%s\n' "$Y" "$N" "$DATA"
+echo "$me: habitat \`$NAME\`, node \`$NODE_ID\`, models $MODELS, data $DATA"
+
+started=0; [ -z "$FROM" ] && [ -z "$ONLY" ] && started=1
+ran_last=""
+for s in $STEPS forget; do
+  [ "$s" = "$FROM" ] && started=1
+  if [ -n "$ONLY" ]; then [ "$s" = "$ONLY" ] || continue
+  elif [ "$s" = forget ] || [ $started = 0 ]; then continue; fi
+  printf '\n%s== %s%s  %s\n' "$B" "$s" "$N" "$(what "$s")"
+  if [ $PAUSE = 1 ]; then
+    read -rp "   [Enter] run · s skip · q quit " a </dev/tty
+    case "$a" in s) continue ;; q) exit 0 ;; esac
+  fi
+  # every step but `check` uses hale; the settings are kept from the
+  # first step that changes anything
+  if [ "$s" != check ] && [ "$DRY" = 0 ]; then
+    command -v hale >/dev/null 2>&1 || { echo "  hale is not on PATH: curl -fsSL https://hale-lang.org/install.sh | sh"; printf '\n%sstopped at %s.%s Fix it, then:  %s --from %s\n' "$R" "$s" "$N" "$SELF" "$s"; exit 1; }
+    [ "$s" = forget ] || save_settings
+  fi
+  if ! "step_$s"; then
+    if [ "$s" = forget ]; then printf '\n%sstopped at forget.%s Fix it, then:  %s --forget\n' "$R" "$N" "$SELF"
+    elif [ "$s" = check ]; then printf '\n%sstopped at check.%s Fix it, then run it again:  %s\n' "$R" "$N" "$SELF"
+    else printf '\n%sstopped at %s.%s Fix it, then:  %s --from %s\n' "$R" "$s" "$N" "$SELF" "$s"; fi
+    exit 1
+  fi
+  ran_last=$s
+done
+if [ "$ran_last" = status ]; then summary
+elif [ -n "$ONLY" ]; then printf '\n%sdone: %s.%s\n' "$G" "$ONLY" "$N"
+fi

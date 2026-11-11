@@ -110,6 +110,47 @@ curl $api/v1/chat/completions -H 'Authorization: Bearer vk-...' -H "$json" \
 Add `"stream": true` to get server-sent events. `GET /admin/v1/changes`
 lists every configuration change you just made.
 
+## From a shell
+
+Three tools in [`scripts/`](./scripts/) work with a running voice as a
+caller does, with a project key. Each takes `--help`.
+
+- `voice-ask "a question"` streams the answer's text. With no `-m` it asks
+  the `general` alias, else the first chat model the key may use. A
+  decision model (`-m jev-style-2b-decision-v3 "blue or green?"`) answers
+  the text as one question, a choice (`X or Y?`, or `-c a,b,c`) or yes or
+  no, with its probabilities.
+- `voice-codex` runs the [Codex CLI](https://github.com/openai/codex) on
+  voice's coder model (`coder`, else `coding`, `coder-big`, `coder-med`;
+  `VOICE_MODEL` names another), with the model's context window from
+  voice so Codex compacts before it overflows. Its other arguments go to
+  `codex`; nothing in `~/.codex` changes.
+- `voice-saturate` loads voice and reports, per model, requests ok and
+  failed (by status and error code), latency and time to first token,
+  tokens per second, and answers cut at max tokens. `model:RATE` sends a
+  fixed rate whether or not voice keeps up (capped by `--max-inflight`);
+  `-c N` or `-c MIN-MAX` keeps that many in flight; `--sweep 1,2,4,8
+  --csv curve.csv` measures one model at a time at each concurrency.
+
+```sh
+export VOICE_API=http://voice.example:8080   # or pass --local for http://127.0.0.1:8080
+export VOICE_KEY_FILE=~/.config/voice/key    # the key alone, or `Authorization: Bearer vk-...`
+scripts/voice-ask "Explain what a GPU does, in three sentences."
+scripts/voice-saturate -c 8 -d 30 general
+```
+
+| Variable | What |
+|---|---|
+| `VOICE_API` | voice's address; required unless `--local` (given first) |
+| `VOICE_API_KEY` | a project key (`vk-...`) |
+| `VOICE_KEY_FILE` | without `VOICE_API_KEY`, a file holding the key |
+| `VOICE_MODEL` | `voice-ask`'s default model, `voice-codex`'s model |
+| `VOICE_CONTEXT_WINDOW`, `VOICE_COMPACT_AT` | `voice-codex`: the window, and where Codex compacts (four fifths of it) |
+
+The key is never printed or passed on a command line. `voice-ask` and
+`voice-codex` need curl and jq (and `codex`); `voice-saturate` needs only
+python3.
+
 ## Local models
 
 The operator decides which weights and which servers may run:
@@ -194,7 +235,7 @@ need their own of each.
 | [`spec/`](./spec/) | the contract: OpenAPI, the node and internal protocols, the store's schema |
 | [`docs/api/`](./docs/api/) | the API reference, generated from the contract: [the caller and admin API](./docs/api/voice.md), [the node's](./docs/api/node.md) (`spec/tools/apidocs.sh`) |
 | [`recipes/`](./recipes/), [`runtimes/`](./runtimes/) | the models and servers voice ships |
-| [`scripts/`](./scripts/) | end-to-end, race and catalog scripts |
+| [`scripts/`](./scripts/) | end-to-end, race and catalog scripts; [the shell tools](#from-a-shell) |
 
 CI checks format and `hale verify`, the tests (the store's over Postgres too),
 the api's export against the contract, the UI's build, a node on macOS, an

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# The Codex CLI on a running voice's coder model, through voice's
+# OpenAI-compatible API. Nothing in ~/.codex is changed: the provider is
+# passed as config overrides. `voice-codex --help` says how.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: voice-codex [--local] [CODEX ARGS...]
+
+Run the Codex CLI against voice's coder model. Everything after the
+options below goes to codex unchanged (`codex --help` for its own).
+Nothing in ~/.codex is changed: voice is passed to codex as a model
+provider in config overrides, and codex runs with --approve-for-me (its
+automatic review of approval requests, in the workspace-write sandbox).
+
+  --local      use the voice on this machine, http://127.0.0.1:8080
+               (otherwise VOICE_API names it)
+  -h, --help   this help (only as the first argument; later ones are codex's)
+
+The model: VOICE_MODEL, else the first of these voice serves the key:
+`coder`, `coding` (the alias an arrangement's coder role points),
+`coder-big`, `coder-med`. When it serves none of them, voice-codex says
+what it does serve and stops; it never picks another model silently.
+
+Codex compacts the conversation before it reaches the model's context
+window: voice-codex takes the window from voice (`voice.context_length` in
+/v1/models), else 32768, and compacts at four fifths of it.
+
+  voice-codex                           # interactive, in this directory
+  voice-codex exec "add a test for ..." # one task, non-interactive
+  VOICE_MODEL=deepseek-v4-flash-0731 voice-codex
+
+Environment:
+  VOICE_API              voice's address, e.g. http://voice.example:8080
+                         (required unless --local)
+  VOICE_API_KEY          a project key (vk-...)
+  VOICE_KEY_FILE         else, a file holding the key: the key alone, or a
+                         curl header line `Authorization: Bearer vk-...`
+  VOICE_MODEL            the model, instead of the coder aliases
+  VOICE_CONTEXT_WINDOW   the context window, instead of voice's
+  VOICE_COMPACT_AT       the token count codex compacts at
+
+Needs codex, curl and jq. The key reaches codex in its environment
+(VOICE_API_KEY), never on a command line.
+EOF
+}
+
+me=voice-codex
+die() { echo "$me: $*" >&2; exit 1; }
+
+local_api=0
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+esac
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) local_api=1; shift ;;
+    *) break ;;
+  esac
+done
+
+# where voice is: --local, else VOICE_API; never a default of our own
+if [ "$local_api" = 1 ]; then
+  API=http://127.0.0.1:8080
+elif [ -n "${VOICE_API:-}" ]; then
+  API=$VOICE_API
+else
+  echo "$me: set VOICE_API to voice's address (e.g. VOICE_API=http://voice.example:8080), or pass --local for http://127.0.0.1:8080" >&2
+  exit 2
+fi
+API=${API%/}
+command -v codex >/dev/null || die "needs codex on PATH"
+command -v curl >/dev/null || die "needs curl"
+command -v jq >/dev/null || die "needs jq"
+
+# the key: VOICE_API_KEY, else the file VOICE_KEY_FILE names (the key alone,
+# or a header line `Authorization: Bearer vk-...`). It is never printed and
+# never on a command line: curl reads its header from a config on stdin.
+key="${VOICE_API_KEY:-}"
+if [ -z "$key" ] && [ -n "${VOICE_KEY_FILE:-}" ]; then
+  [ -r "$VOICE_KEY_FILE" ] || die "cannot read VOICE_KEY_FILE ($VOICE_KEY_FILE)"
+  key=$( { grep -m1 -v '^[[:space:]]*$' "$VOICE_KEY_FILE" || true; } \
+    | sed -E 's/^[[:space:]]*[Aa]uthorization:[[:space:]]*//; s/^[Bb]earer[[:space:]]+//; s/[[:space:]]+$//')
+  [ -n "$key" ] || die "VOICE_KEY_FILE ($VOICE_KEY_FILE) holds no key"
+fi
+[ -n "$key" ] || die "no key: set VOICE_API_KEY, or VOICE_KEY_FILE to a file holding it"
+[[ "$key" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || die "the key holds characters a key does not"
+vcurl() { printf 'header = "Authorization: Bearer %s"\n' "$key" | curl -K - "$@"; }
+
+models_json=$(vcurl -sS -m 10 "$API/v1/models" 2>/dev/null) || models_json=""
+
+# the model: VOICE_MODEL, else the first coder alias voice serves. Never
+# another model silently: when voice serves none, say so and stop
+MODEL="${VOICE_MODEL:-coder}"
+if [ -z "${VOICE_MODEL:-}" ]; then
+  served=$(printf '%s' "$models_json" | jq -r '.data[].id' 2>/dev/null) || served=""
+  for c in coder coding coder-big coder-med; do
+    if printf '%s\n' "$served" | grep -qx "$c"; then MODEL=$c; break; fi
+  done
+  if ! printf '%s\n' "$served" | grep -qx "$MODEL"; then
+    list=$(printf '%s' "$served" | tr '\n' ' ' | sed 's/ $//'); list="${list:-nothing, or it did not answer}"
+    echo "$me: voice at $API serves no \`coder\` (it serves: $list)" >&2
+    echo "  point the alias in voice's UI (Projects, aliases: coder -> a model), or VOICE_MODEL=<id> voice-codex" >&2
+    exit 1
+  fi
+fi
+
+# the context window voice gives the model per request, and where Codex
+# compacts before reaching it: Codex has no metadata for voice's models, so
+# without these it never compacts and a long session overflows (voice
+# answers 502: the request exceeds the window). Voice reports it as each
+# model's `voice.context_length` in /v1/models
+if [ -z "${VOICE_CONTEXT_WINDOW:-}" ]; then
+  VOICE_CONTEXT_WINDOW=$(printf '%s' "$models_json" \
+    | jq -r --arg m "$MODEL" '.data[] | select(.id == $m) | .voice.context_length // empty' 2>/dev/null) || VOICE_CONTEXT_WINDOW=""
+fi
+WINDOW="${VOICE_CONTEXT_WINDOW:-32768}"
+COMPACT_AT="${VOICE_COMPACT_AT:-$((WINDOW * 4 / 5))}"
+
+# the key travels in the environment Codex reads it from, never on argv
+VOICE_API_KEY="$key"
+export VOICE_API_KEY
+exec codex --approve-for-me \
+  -c 'model_providers.voice.name="voice"' \
+  -c "model_providers.voice.base_url=\"$API/v1\"" \
+  -c 'model_providers.voice.env_key="VOICE_API_KEY"' \
+  -c 'model_providers.voice.wire_api="responses"' \
+  -c 'model_provider="voice"' \
+  -c "model_context_window=$WINDOW" \
+  -c "model_auto_compact_token_limit=$COMPACT_AT" \
+  -m "$MODEL" \
+  "$@"

@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Ask a running voice a question and stream the answer's text as it arrives.
+# `voice-ask --help` says how; the README's "From a shell" says how to set it up.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: voice-ask [--local] [-m MODEL] [-t] [-c A,B,...] QUESTION...
+
+Ask voice a question and stream the answer's text as it arrives.
+
+  --local      ask the voice on this machine, http://127.0.0.1:8080
+               (otherwise VOICE_API names it)
+  -m MODEL     the model to ask (default: VOICE_MODEL, else the `general`
+               alias when voice serves it, else the first chat model the
+               key may use; never a decision model)
+  -t           keep the model's thinking (otherwise `/no_think` is added to
+               the question and any <think> block is left out)
+  -c A,B,...   with a decision model: the choices to pick from
+  -h, --help   this help
+
+A decision model (one whose contract is `decision`) answers the text as one
+question, whole, with its probabilities: a choice when the text reads
+`X or Y?` or -c names the choices, else yes or no.
+
+  voice-ask "Explain what a GPU does, in three sentences."
+  voice-ask -m qwen3-0.6b -t "Why is the sky blue?"
+  voice-ask -m jev-style-2b-decision-v3 "blue or green?"
+  voice-ask -m jev-style-2b-decision-v3 -c low,medium,high "How risky is a Friday deploy?"
+
+Environment:
+  VOICE_API        voice's address, e.g. http://voice.example:8080
+                   (required unless --local)
+  VOICE_API_KEY    a project key (vk-...)
+  VOICE_KEY_FILE   else, a file holding the key: the key alone, or a curl
+                   header line `Authorization: Bearer vk-...`
+  VOICE_MODEL      the default model
+
+Needs curl and jq.
+EOF
+}
+
+me=voice-ask
+die() { echo "$me: $*" >&2; exit 1; }
+
+local_api=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --local) local_api=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+# where voice is: --local, else VOICE_API; never a default of our own
+if [ "$local_api" = 1 ]; then
+  API=http://127.0.0.1:8080
+elif [ -n "${VOICE_API:-}" ]; then
+  API=$VOICE_API
+else
+  echo "$me: set VOICE_API to voice's address (e.g. VOICE_API=http://voice.example:8080), or pass --local for http://127.0.0.1:8080" >&2
+  exit 2
+fi
+API=${API%/}
+
+model="${VOICE_MODEL:-}"
+think=0
+choices=""
+while getopts "m:tc:h" o; do
+  case "$o" in
+    m) model="$OPTARG" ;;
+    t) think=1 ;;
+    c) choices="$OPTARG" ;;
+    h) usage; exit 0 ;;
+    *) echo "usage: voice-ask [--local] [-m MODEL] [-t] [-c A,B,...] QUESTION... (--help for more)" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || { echo "usage: voice-ask [--local] [-m MODEL] [-t] [-c A,B,...] QUESTION... (--help for more)" >&2; exit 2; }
+command -v curl >/dev/null || die "needs curl"
+command -v jq >/dev/null || die "needs jq"
+
+# the key: VOICE_API_KEY, else the file VOICE_KEY_FILE names (the key alone,
+# or a header line `Authorization: Bearer vk-...`). It is never printed and
+# never on a command line: curl reads its header from a config on stdin.
+key="${VOICE_API_KEY:-}"
+if [ -z "$key" ] && [ -n "${VOICE_KEY_FILE:-}" ]; then
+  [ -r "$VOICE_KEY_FILE" ] || die "cannot read VOICE_KEY_FILE ($VOICE_KEY_FILE)"
+  key=$( { grep -m1 -v '^[[:space:]]*$' "$VOICE_KEY_FILE" || true; } \
+    | sed -E 's/^[[:space:]]*[Aa]uthorization:[[:space:]]*//; s/^[Bb]earer[[:space:]]+//; s/[[:space:]]+$//')
+  [ -n "$key" ] || die "VOICE_KEY_FILE ($VOICE_KEY_FILE) holds no key"
+fi
+[ -n "$key" ] || die "no key: set VOICE_API_KEY, or VOICE_KEY_FILE to a file holding it"
+[[ "$key" =~ ^[A-Za-z0-9._~+/=-]+$ ]] || die "the key holds characters a key does not"
+vcurl() { printf 'header = "Authorization: Bearer %s"\n' "$key" | curl -K - "$@"; }
+
+# a refused key, or no model the key may use, answers JSON, not a stream:
+# say what voice said instead of printing nothing
+check=$(vcurl -sS -m 10 "$API/v1/models" -w '\n%{http_code}') || die "$API did not answer"
+code=${check##*$'\n'}
+models_json=${check%$'\n'*}
+if [ "$code" != 200 ]; then
+  echo "$me: $API answered $code: $(echo "$models_json" | jq -r '.error.message // .' 2>/dev/null)" >&2
+  [ "$code" = 401 ] && echo "  (a new key: voice's admin UI, Projects; then set VOICE_API_KEY or write it to VOICE_KEY_FILE)" >&2
+  exit 1
+fi
+
+if [ -z "$model" ]; then
+  # the `general` alias when voice serves it, else the first model that
+  # chats (a decision model answers a schema's questions, not a chat)
+  models=$(echo "$models_json" | jq -r '.data[] | select(.voice.contract != "decision") | .id' 2>/dev/null)
+  if printf '%s\n' "$models" | grep -qx general; then model=general; else model=$(printf '%s\n' "$models" | head -1); fi
+  [ -n "$model" ] || die "$API serves this key no chat model yet (place one in voice's UI)"
+fi
+
+# a decision model: the text as one question, answered whole
+contract=$(echo "$models_json" | jq -r --arg m "$model" '.data[] | select(.id == $m) | .voice.contract // empty' 2>/dev/null)
+if [ "$contract" = decision ]; then
+  text="$*"
+  if [ -z "$choices" ] && [[ "$text" =~ ^[[:space:]]*(.+)[[:space:]]+or[[:space:]]+([^?]+)\?*[[:space:]]*$ ]]; then
+    choices="${BASH_REMATCH[1]},${BASH_REMATCH[2]}"
+  fi
+  if [ -n "$choices" ]; then
+    question=$(jq -nc --arg q "$text" --arg c "$choices" '{type: "string", enum: ($c | split(",") | map(gsub("^\\s+|\\s+$"; ""))), description: $q}')
+  else
+    question=$(jq -nc --arg q "$text" '{type: "boolean", description: $q}')
+  fi
+  body=$(jq -nc --arg m "$model" --arg t "$text" --argjson q "$question" \
+    '{model: $m, messages: [{role: "user", content: $t}],
+      response_format: {type: "json_schema", json_schema: {name: "ask", schema: {type: "object", properties: {answer: $q}, required: ["answer"]}}}}')
+  reply=$(vcurl -sS -m 120 "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "$body")
+  if ! echo "$reply" | jq -e '.voice.decision.answer' >/dev/null 2>&1; then
+    die "$model: $(echo "$reply" | jq -r '.error.message // .' 2>/dev/null)"
+  fi
+  echo "$reply" | jq -r '.voice.decision.answer as $a
+    | if $a.type == "noul" then (if $a.noul >= 0.5 then "yes" else "no" end) + "  (yes \(($a.noul * 100) | round)%)"
+      elif $a.type == "choice" then $a.choice + "  (" + ([$a.probabilities | to_entries | sort_by(-.value)[] | "\(.key) \((.value * 100) | round)%"] | join(", ")) + ")"
+      else ($a | tostring) end'
+  exit 0
+fi
+
+question="$*"
+[ "$think" = 1 ] || question="$question /no_think"
+body=$(jq -n --arg m "$model" --arg q "$question" \
+  '{model: $m, stream: true, messages: [{role: "user", content: $q}]}')
+
+vcurl -sSN "$API/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" \
+  | {
+      # a refused request (an unknown model, no seat for it) answers JSON,
+      # not a stream: say what voice said; otherwise pass the stream on
+      IFS= read -r line || [ -n "$line" ] || exit 0
+      case "$line" in
+        data:*|"") printf '%s\n' "$line"; cat ;;
+        *) rest=$(cat)
+           echo "$me: $model: $(printf '%s%s' "$line" "$rest" | jq -r '.error.message // .' 2>/dev/null)" >&2
+           echo "  models this key may use: $(echo "$models_json" | jq -r '[.data[] | select(.voice.available != false) | .id] | join(", ")')" >&2
+           exit 1 ;;
+      esac
+    } \
+  | sed -un 's/^data: //p' \
+  | grep --line-buffered -v '^\[DONE\]' \
+  | jq --unbuffered -j 'if .error then "\nerror: \(.error.message // .error)\n" else (.choices[0].delta.content // empty) end' \
+  | if [ "$think" = 1 ]; then cat; else
+      # the model's (empty) thinking block, and the blank lines before the answer
+      awk 'BEGIN { skip = 0; started = 0 }
+           /^<think>/ { skip = 1; next }
+           skip && /<\/think>/ { skip = 0; next }
+           skip { next }
+           !started && /^[[:space:]]*$/ { next }
+           { started = 1; print; fflush() }'
+    fi
+echo

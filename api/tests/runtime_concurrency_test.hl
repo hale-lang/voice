@@ -1,0 +1,158 @@
+// A placement's seat serves what its runtime is started with, never a
+// setting: TensorFold's `--parallel`, llama-server's slots from its prompt
+// cache, vLLM's `--max-num-seqs`, the decision server's one
+// (lib/concurrency). Seats as a store from before holds them (their row's
+// `concurrency` 1, migration 33 leaves it) are served at their runtime's,
+// with no placement made again; a node from before reads their sum as its
+// cap. Any other seat keeps the concurrency its operator set.
+import ".." as api;
+import "../../store" as st;
+
+/// A placement's seat's config (placements.hl, `managed_config`), its
+/// variant cut short; `cache` 0 is a placement from before voice sized it.
+fn placed(placement: String, server: String, cache: Int, native: Int) -> String {
+    return "{\"placement\": \"" + placement + "\", \"model\": \"m\""
+        + (if native > 0 { ", \"context_length\": " + to_string(native) } else { "" })
+        + (if cache > 0 { ", \"cache_tokens\": " + to_string(cache) } else { "" })
+        + ", \"reserved_bytes\": 1, \"variant\": {\"id\": \"v\"}, \"runtime\": {\"id\": \"r\", \"server\": \""
+        + server + "\"}}";
+}
+
+/// A placement's seat, written into the store as a store from before holds
+/// it: its row's concurrency 1.
+fn old_seat(store: st::Store, id: String, config: String) {
+    let mut row = st::SeatRow {
+        ref: "spark/" + id,
+        node: "spark",
+        id: id,
+        engine: "managed",
+        account: "local",
+        concurrency: 1,
+        config: config,
+    };
+    push(row.serves.items, st::SeatModel { model: "m" }) or discard;
+    push(row.data_classes.items, "internal") or discard;
+    store.insert_seat(row, api::change("create", "nodes/spark/seats/" + id, "", "{}")) or discard;
+}
+
+fn assigned(a: api::AssignmentRead, id: String) -> Int {
+    for s in a.seats {
+        if s.id == id { return s.concurrency; }
+    }
+    return -1;
+}
+
+fn why(err: api::CtlError) -> String {
+    let p = api::ctl_problem(err);
+    return api::ctl_class(err) + " " + p.param + ": " + p.message;
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let accounts = api::Accounts { store: store };
+    let catalog = api::Catalog { store: store };
+    let nodes = api::Nodes { store: store, link: api::NatsLink { } };
+    let seats = api::Seats { store: store, link: api::NatsLink { } };
+    catalog.create(api::CatalogModelCreate { id: "m" }) or discard;
+    accounts.create(api::AccountCreate { id: "local", name: "Local" }) or discard;
+    nodes.create(api::NodeCreate { id: "spark" }) or discard;
+
+    old_seat(store, "tf", placed("tf", "tensorfold", 7340032, 1048576));
+    old_seat(store, "vllm", placed("vllm", "vllm", 65536, 131072));
+    // llama-server: its cache's room for the promised context (32k, or the
+    // model's own when it is made for less), from one to four
+    old_seat(store, "llama-two", placed("llama-two", "llama-server", 65536, 131072));
+    old_seat(store, "llama-many", placed("llama-many", "llama-server", 524288, 131072));
+    old_seat(store, "llama-small", placed("llama-small", "llama-server", 32768, 8192));
+    old_seat(store, "llama-unsized", placed("llama-unsized", "llama-server", 0, 131072));
+    old_seat(store, "decide", placed("decide", "decision", 32768, 32768));
+    let mut operator = api::SeatCreate {
+        node: "spark",
+        id: "relay",
+        engine: "openai-compatible",
+        account: "local",
+        has_concurrency: true,
+        concurrency: 3,
+        config: std::json::Value::parse("{\"base_url\": \"http://x\", \"model\": \"m\"}")
+        or std::json::Value::null(),
+    };
+    push(operator.serves, st::SeatModel { model: "m" }) or discard;
+    let mut refused = "";
+    seats.create(operator) or { refused = why(err); };
+    std::test::assert_eq_str(refused, "", "an operator's seat, with its concurrency");
+
+    let node = store.node("spark") or st::NodeRow { };
+    let a = api::assignment_of(store, node) or api::AssignmentRead { };
+    std::test::assert_eq_int(assigned(a, "tf"), 32, "TensorFold: its --parallel");
+    std::test::assert_eq_int(assigned(a, "vllm"), 32, "vLLM: its --max-num-seqs");
+    std::test::assert_eq_int(assigned(a, "llama-two"), 2, "llama-server: two 32k slots in 64k");
+    std::test::assert_eq_int(assigned(a, "llama-many"), 4, "at most four slots");
+    std::test::assert_eq_int(assigned(a, "llama-small"), 4, "a model made for 8k: 8k slots");
+    std::test::assert_eq_int(assigned(a, "llama-unsized"), 1, "a cache voice never sized: one");
+    std::test::assert_eq_int(assigned(a, "decide"), 1, "the decision server: one");
+    std::test::assert_eq_int(assigned(a, "relay"), 3, "an operator's seat: its own");
+    std::test::assert_eq_int(
+        a.max_in_flight,
+        32 + 32 + 2 + 4 + 4 + 1 + 1 + 3,
+        "what a node from before reads as its cap: the sum",
+    );
+    std::test::assert(
+        std::str::contains(api::assignment_json(a), "\"max_in_flight\": 79"),
+        "and is sent it: " + api::assignment_json(a),
+    );
+
+    // every view says the runtime's, not the row's
+    let tf = seats.get(api::SeatRef { node: "spark", seat: "tf" }) or api::SeatView {
+        status: api::SeatStatus::offline,
+    };
+    std::test::assert_eq_int(tf.concurrency, 32, "the seat's view");
+    let n = nodes.get(api::NodeRef { node: "spark" }) or api::Node {
+        status: api::NodeStatus::revoked,
+    };
+    let mut sum = 0;
+    for s in n.seats {
+        sum = sum + s.concurrency;
+    }
+    std::test::assert_eq_int(sum, 79, "the node's seats, its capacity");
+
+    // an operator cannot set a placement's seat's concurrency
+    let mut failed = "";
+    seats.update(
+        api::SeatUpdate { node: "spark", seat: "tf", has_concurrency: true, concurrency: 4 },
+    ) or { failed = why(err); };
+    std::test::assert(
+        std::str::starts_with(failed, "invalid concurrency: seat tf is placement tf's: ")
+            && std::str::contains(failed, "32 at once"),
+        "refused on update, naming the runtime's: " + failed,
+    );
+    let off = seats.update(
+        api::SeatUpdate { node: "spark", seat: "tf", has_enabled: true, enabled: false },
+    ) or api::SeatView { status: api::SeatStatus::offline };
+    std::test::assert(!off.enabled && off.concurrency == 32, "its other fields still change");
+    failed = "";
+    let mut made = api::SeatCreate {
+        node: "spark",
+        id: "by-hand",
+        engine: "managed",
+        account: "local",
+        has_concurrency: true,
+        concurrency: 2,
+        config: std::json::Value::parse(placed("by-hand", "llama-server", 65536, 131072))
+        or std::json::Value::null(),
+    };
+    push(made.serves, st::SeatModel { model: "m" }) or discard;
+    seats.create(made) or { failed = why(err); };
+    std::test::assert(
+        std::str::starts_with(failed, "invalid concurrency: seat by-hand is placement by-hand's"),
+        "and on create: " + failed,
+    );
+    made.has_concurrency = false;
+    let kept = seats.create(made) or api::SeatView { status: api::SeatStatus::offline };
+    std::test::assert_eq_int(kept.concurrency, 2, "made without one, it serves its runtime's");
+
+    // an operator's seat's stays editable
+    let relay = seats.update(
+        api::SeatUpdate { node: "spark", seat: "relay", has_concurrency: true, concurrency: 5 },
+    ) or api::SeatView { status: api::SeatStatus::offline };
+    std::test::assert_eq_int(relay.concurrency, 5, "an operator's seat's concurrency is set");
+}

@@ -78,6 +78,8 @@ fn str(body: String, name: String) -> String {
     return std::json::find_string_field(body, name);
 }
 
+// a node from before declares a cap of its own, and a local one: both are
+// read past (registering still works)
 const CAPS: String = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
 const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": null, \"reason\": null}";
 
@@ -90,9 +92,9 @@ fn main() {
     let seats = api::Seats { store: e.store, link: link };
     catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
     accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
-    let made = nodes.create(
-        api::NodeCreate { id: "laptop", has_max_in_flight: true, max_in_flight: 2 },
-    ) or { api::Node { status: api::NodeStatus::down } };
+    let made = nodes.create(api::NodeCreate { id: "laptop" }) or {
+        api::Node { status: api::NodeStatus::down }
+    };
     std::test::assert(made.has_enrollment_token, "a node's token");
     let token = made.enrollment_token;
     let mut hello = api::SeatCreate {
@@ -141,18 +143,6 @@ fn main() {
         400,
         "another protocol",
     );
-    expect(
-        plane(
-            e,
-            "POST",
-            "/node/v1/register",
-            token,
-            "{\"protocol\": 2, \"version\": \"x\", \"capabilities\": {\"engines\": []}, \"local\": "
-                + LOCAL + "}",
-        ),
-        400,
-        "capabilities need a cap",
-    );
 
     // registering
     let registered = plane(e, "POST", "/node/v1/register", token, reg);
@@ -166,10 +156,11 @@ fn main() {
     std::test::assert_eq_str(str(nats, "url"), "nats://nats.test:4222", "where NATS is");
     std::test::assert_eq_str(str(nats, "subject"), "voice.node.laptop", "its subject");
     let a = std::json::find_field_raw(registered.body, "assignment");
+    // what a node from before reads as its cap: its seats' concurrency, summed
     std::test::assert_eq_int(
         std::json::find_int_field(a, "max_in_flight"),
         2,
-        "the coordinator's cap",
+        "its seats' concurrency, summed",
     );
     std::test::assert(
         std::str::contains(a, "\"hello from voice\"") && std::str::contains(a, "\"claude-work\""),
@@ -179,7 +170,10 @@ fn main() {
     let node = node_of(nodes, "laptop");
     std::test::assert(node.status == api::NodeStatus::up, "a node that registered is up");
     std::test::assert_eq_str(node.version, "0.1.0", "its software's version");
-    std::test::assert_eq_int(node.effective_max_in_flight, 2, "its effective cap");
+    std::test::assert(
+        !std::str::contains(api::Node::api_encode(node), "max_in_flight"),
+        "no cap of the node's own, declared or the coordinator's",
+    );
     std::test::assert(
         seat_of(seats, "laptop", "static").status == api::SeatStatus::pending,
         "a seat waits for its node's report",
@@ -265,14 +259,13 @@ fn main() {
         "local controls",
     );
     let held = node_of(nodes, "laptop");
-    std::test::assert_eq_int(
-        held.effective_max_in_flight,
-        1,
-        "a local cap lowers the effective one",
+    std::test::assert(
+        !std::str::contains(api::LocalControls::api_encode(held.local), "max_in_flight"),
+        "a local cap from a node from before is read past",
     );
     std::test::assert_eq_str(held.local.reason, "on battery", "the controls as reported");
     expect(
-        plane(e, "PUT", "/node/v1/capabilities", token, "{\"max_in_flight\": 8, \"engines\": []}"),
+        plane(e, "PUT", "/node/v1/capabilities", token, "{\"engines\": []}"),
         204,
         "capabilities",
     );
@@ -338,28 +331,6 @@ fn main() {
         plane(e, "POST", "/node/v1/quota", token, "{\"seat\": \"nope\", \"windows\": []}"),
         404,
         "for a seat the node holds",
-    );
-    expect(
-        plane(
-            e,
-            "PUT",
-            "/node/v1/local",
-            token,
-            "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": -1}",
-        ),
-        400,
-        "a local cap is at least 0",
-    );
-    expect(
-        plane(
-            e,
-            "PUT",
-            "/node/v1/local",
-            token,
-            "{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 99999999999999999999}",
-        ),
-        400,
-        "and in range",
     );
     expect(
         plane(e, "PUT", "/node/v1/local", token, "{\"paused\": false, \"paused_seats\": [1]}"),

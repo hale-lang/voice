@@ -2,11 +2,25 @@
 import ".." as node;
 
 fn main() {
-    let good = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"local\": {\"x\": 1}}]}";
+    let good = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"local\": {\"x\": 1}}]}";
     std::test::assert_eq_str(node::capabilities_problem(good), "", "a valid capabilities file");
+    // a file from before declares the node's own cap: it is read past, so
+    // the node starts on it, and never one it cannot read
+    for old in [
+        "{\"max_in_flight\": 4, \"engines\": []}",
+        "{\"max_in_flight\": 0, \"engines\": []}",
+        "{\"max_in_flight\": \"lots\", \"engines\": []}",
+    ] {
+        std::test::assert_eq_str(node::capabilities_problem(old), "", "an old file: " + old);
+    }
+    // it declares its slots as `max_in_flight` (deprecated), which a
+    // coordinator from before requires, whatever the file said
     std::test::assert(
-        len(node::capabilities_problem("{\"engines\": []}")) > 0,
-        "max_in_flight is required",
+        std::str::starts_with(
+            node::declared_capabilities("{\"max_in_flight\": 4, \"engines\": []}"),
+            "{\"max_in_flight\": 40, ",
+        ),
+        "the node's slots, for a coordinator from before",
     );
     std::test::assert(
         len(
@@ -48,36 +62,39 @@ fn main() {
     );
 
     std::test::assert_eq_str(
-        node::local_problem(
-            "{\"paused\": true, \"paused_seats\": [\"static\"], \"max_in_flight\": 0}",
-        ),
+        node::local_problem("{\"paused\": true, \"paused_seats\": [\"static\"]}"),
         "",
         "valid local controls",
+    );
+    std::test::assert_eq_str(
+        node::local_problem("{\"paused\": true, \"paused_seats\": [], \"max_in_flight\": null}"),
+        "",
+        "a body from before that sets no local cap",
     );
     std::test::assert(
         len(node::local_problem("{\"paused\": true, \"paused_seats\": [1]}")) > 0,
         "seat ids are strings",
     );
     std::test::assert(
-        len(
-            node::local_problem("{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": -1}"),
-        ) > 0,
-        "a cap is not negative",
+        std::str::starts_with(
+            node::local_problem("{\"paused\": false, \"paused_seats\": [], \"max_in_flight\": 2}"),
+            "max_in_flight was removed",
+        ),
+        "a local cap is refused, naming the removal",
     );
-    std::test::assert_eq_int(
-        node::effective_cap(declared, "{\"max_in_flight\": 2}"),
-        2,
-        "a local cap lowers the effective cap",
-    );
-    std::test::assert_eq_int(
-        node::effective_cap(declared, "{\"max_in_flight\": 9}"),
-        4,
-        "a local cap never raises it",
-    );
-    std::test::assert_eq_int(node::effective_cap(declared, node::LOCAL_DEFAULT), 4, "no local cap");
 
     let dir = "/tmp/voice-node-test-" + to_string(std::process::pid());
     std::io::fs::mkdir(dir) or discard;
+    // local controls a node from before kept, with a cap: read without it
+    std::io::fs::write_file(
+        dir + "/local.json",
+        "{\"paused\": false, \"paused_seats\": [\"a\"], \"max_in_flight\": 1, \"reason\": \"x\"}",
+    ) or discard;
+    std::test::assert_eq_str(
+        node::read_local(dir),
+        "{\"paused\": false, \"paused_seats\": [\"a\"], \"reason\": \"x\"}",
+        "an old local cap is read past",
+    );
     let api = node::AdminApi { id: "laptop", data: dir, capabilities: declared };
     std::test::assert_eq_int(
         api.handle(std::http::Request { method: "GET", path: "/node/v1/capabilities" }).status,
@@ -98,7 +115,8 @@ fn main() {
     let local = api.handle(std::http::Request { method: "GET", path: "/node/v1/local" });
     std::test::assert(std::str::contains(local.body, "\"paused\": true"), "local controls persist");
     std::test::assert(
-        std::str::contains(local.body, "\"max_in_flight\": null"),
+        std::str::contains(local.body, "\"reason\": null")
+            && !std::str::contains(local.body, "max_in_flight"),
         "missing fields are filled with null",
     );
     std::test::assert_eq_int(

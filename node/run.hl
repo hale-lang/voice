@@ -383,6 +383,7 @@ locus Runner {
                         "127.0.0.1",
                         std::json::find_string_field(config, "model"), share,
                         served_tokens(config),
+                        concurrency::placed(config),
                         load_format(runtime),
                         std::json::find_field_raw(config, "variant"),
                     ) + span_args(cluster),
@@ -410,6 +411,7 @@ locus Runner {
                         "0.0.0.0",
                         std::json::find_string_field(config, "model"), share,
                         served_tokens(config),
+                        concurrency::placed(config),
                         load_format(runtime),
                         std::json::find_field_raw(config, "variant"),
                     ),
@@ -445,6 +447,7 @@ locus Runner {
                     "127.0.0.1",
                     std::json::find_string_field(config, "model"), share,
                     served_tokens(config),
+                    concurrency::placed(config),
                     load_format(runtime),
                     std::json::find_field_raw(config, "variant"),
                 );
@@ -816,8 +819,9 @@ fn archive_program(dir: String, server: String) -> String {
 
 /// A server's arguments, one a line: the model it serves (a GGUF's first
 /// file, or the directory of a model of several), where it listens, the
-/// catalog model it goes by, how it reads the weights (`load`, the
-/// runtime's `load_format`; "" for the server's default), and what its
+/// catalog model it goes by, the requests it serves at once (`slots`, its
+/// seat's concurrency, lib/concurrency), how it reads the weights (`load`,
+/// the runtime's `load_format`; "" for the server's default), and what its
 /// `variant` says vLLM must serve the weights with (`kv_cache_dtype`,
 /// `reasoning_parser`, `tool_call_parser`).
 fn server_args(
@@ -829,6 +833,7 @@ fn server_args(
     name: String,
     share: String,
     tokens: Int,
+    slots: Int,
     load: String,
     variant: String
 ) -> String {
@@ -847,6 +852,9 @@ fn server_args(
         // alone may not fit the share
         return "vllm\nserve\n" + dir + "\n--host\n" + host + "\n--port\n" + to_string(port)
             + "\n--served-model-name\n" + name
+        // the sequences it batches at once, the seat's concurrency: its
+        // cache is paged, so a sequence holds only what its tokens fill
+            + "\n--max-num-seqs\n" + to_string(if slots >= 1 { slots } else { 1 })
             + (
                 if len(share) > 0 {
                     "\n--gpu-memory-utilization\n" + share + "\n--max-model-len\nauto"
@@ -864,12 +872,14 @@ fn server_args(
             + vllm_flag("--reasoning-parser", reasoning_parser(variant))
             + tool_flags(tool_call_parser(variant));
     }
-    // llama-server keeps one prompt cache of `tokens` (served_tokens), which
-    // its slots share: a conversation that comes back is restored from it
-    // rather than read again, while there is room for it. Left to itself it
-    // would size the cache for the model's whole context
+    // llama-server keeps one prompt cache of `tokens` (served_tokens): left
+    // to itself it would size it for the model's whole context. Its slots,
+    // the seat's concurrency, are given (`--parallel`), so it divides the
+    // cache among them, and each holds at least the context the placement
+    // promises a request (lib/concurrency `llama_slots`)
     return "-m\n" + first + "\n--host\n" + host + "\n--port\n" + to_string(port) + "\n--alias\n"
-        + name + "\n-c\n" + to_string(tokens);
+        + name + "\n-c\n" + to_string(tokens) + "\n--parallel\n"
+        + to_string(if slots >= 1 { slots } else { 1 });
 }
 
 /// How a runtime's server reads the weights, as its runtime says
@@ -934,15 +944,16 @@ fn vllm_flag(flag: String, value: String) -> String {
     return if len(value) > 0 { "\n" + flag + "\n" + value } else { "" };
 }
 
-/// The prompt cache, in tokens, a llama-server seat keeps, shared by the
-/// conversations it holds: what its placement sized (`cache_tokens`), or,
-/// placed before voice sized it, `SERVED_CONTEXT`, less for a model made for
-/// less. One conversation is never given more than the model is made for.
+/// The prompt cache, in tokens, a llama-server seat keeps, divided among
+/// its slots: what its placement sized (`cache_tokens`), or, placed before
+/// voice sized it, the context a placement promises a request
+/// (lib/concurrency `promised_context`: 32768, less for a model made for
+/// less), in one slot.
 fn served_tokens(config: String) -> Int {
-    let cache = std::json::find_int_field(config, "cache_tokens");
-    if cache > 0 { return cache; }
-    let native = std::json::find_int_field(config, "context_length");
-    return if native > 0 && native < SERVED_CONTEXT { native } else { SERVED_CONTEXT };
+    return concurrency::llama_cache(
+        std::json::find_int_field(config, "cache_tokens"),
+        std::json::find_int_field(config, "context_length"),
+    );
 }
 
 /// The context, in tokens, a server that answers took: llama-server's
@@ -966,11 +977,6 @@ fn served_context(server: String, port: Int) -> Int {
     let n = std::json::find_int_field(settings, "n_ctx");
     return if n > 0 { n } else { std::json::find_int_field(body, "n_ctx") };
 }
-
-/// The most context, in tokens, a llama-server seat serves: what a recipe's
-/// memory_bytes provides KV cache for (scripts/catalog-recipes.py, CONTEXT);
-/// less for a model made for less (the recipe's `context_length`).
-const SERVED_CONTEXT: Int = 32768;
 
 /// How many turns (half a second each) a server that answered is asked for
 /// its context before the seat goes without one.

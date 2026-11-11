@@ -38,8 +38,6 @@ function spark(id: string, name: string): NodeSummary {
       disk_free_bytes: 3.5e12,
     },
     local: null,
-    max_in_flight: 4,
-    effective_max_in_flight: 4,
     in_flight: 0,
     seats: [],
     created_at: AT,
@@ -61,8 +59,6 @@ function mac(id: string, name: string): NodeSummary {
       accelerators: [{ kind: 'metal', name: 'Apple M4 Pro', memory_bytes: MAC, unified: true }],
       disk_free_bytes: 0.4e12,
     },
-    max_in_flight: 2,
-    effective_max_in_flight: 2,
   } as NodeSummary;
 }
 

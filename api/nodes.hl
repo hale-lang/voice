@@ -10,10 +10,12 @@
 
 type NodeRef { node: String; }
 
-/// `NodeCreate`. No `max_in_flight` (or `null`) is no cap of its own.
+/// `NodeCreate`.
 type NodeCreate {
     id: String;
     name: String = "";
+    // refused by name, not ignored: a node has no cap of its own, its
+    // capacity is its seats' (`cap_removed`)
     has_max_in_flight: Bool = false;
     max_in_flight: Int = -1;
 }
@@ -26,8 +28,8 @@ type NodeUpdate {
     id: String = "";
     has_name: Bool = false;
     name: String = "";
-    // a three-way field: left out (kept), null (no cap of the node's own,
-    // -1) or a value
+    // refused by name, not ignored, as a value or null: a node has no cap
+    // of its own, its capacity is its seats' (`cap_removed`)
     has_max_in_flight: Bool = false;
     max_in_flight: Int = -1;
     clear_max_in_flight: Bool = false;
@@ -48,6 +50,9 @@ type SeatCreate {
     serves: bounded[st::SeatModel; 16];
     // empty is the default, `[internal]`
     data_classes: bounded[String; 32];
+    // a placement's seat takes none: it serves what its runtime is started
+    // with (`seat_concurrency`, `placed_concurrency`)
+    has_concurrency: Bool = false;
     concurrency: Int = 1;
     enabled: Bool = true;
     config: std::json::Value = std::json::Value::null();
@@ -185,11 +190,6 @@ type NodeRead {
     capabilities: String = "";
     has_local: Bool = false;
     local: LocalControls = LocalControls { paused: false };
-    has_max_in_flight: Bool = false;
-    max_in_flight: Int = -1;
-    // until it first registers
-    has_effective_max_in_flight: Bool = false;
-    effective_max_in_flight: Int = -1;
     in_flight: Int = 0;
     assignment_version: Int = 0;
     has_applied_version: Bool = false;
@@ -226,10 +226,6 @@ type NodeSummary {
     hardware: NodeHardware = NodeHardware { };
     has_local: Bool = false;
     local: LocalControls = LocalControls { paused: false };
-    has_max_in_flight: Bool = false;
-    max_in_flight: Int = -1;
-    has_effective_max_in_flight: Bool = false;
-    effective_max_in_flight: Int = -1;
     in_flight: Int = 0;
     assignment_version: Int = 0;
     has_applied_version: Bool = false;
@@ -276,14 +272,9 @@ type Node {
     has_hardware: Bool = false;
     hardware: NodeHardware = NodeHardware { };
     has_capabilities: Bool = false;
-    capabilities: NodeCapabilities = NodeCapabilities { max_in_flight: 0 };
+    capabilities: NodeCapabilities = NodeCapabilities { };
     has_local: Bool = false;
     local: LocalControls = LocalControls { paused: false };
-    has_max_in_flight: Bool = false;
-    max_in_flight: Int = -1;
-    // until it first registers
-    has_effective_max_in_flight: Bool = false;
-    effective_max_in_flight: Int = -1;
     in_flight: Int = 0;
     assignment_version: Int = 0;
     has_applied_version: Bool = false;
@@ -480,15 +471,13 @@ locus Nodes {
             );
         }
         if len(c.name) > 128 { fail bad("`name` is at most 128 characters", "name"); }
-        let cap = if c.has_max_in_flight { c.max_in_flight } else { -1 };
-        check_cap(cap) or raise;
+        if c.has_max_in_flight { fail cap_removed(); }
         let token_hex = random_hex(20) or fail entropy_down(err.message);
         let token = "vn-" + token_hex;
         let mut row = st::NodeRow {
             id: c.id,
             name: c.name,
             token_digest: secret_digest(token),
-            max_in_flight: cap,
             created_at: now_seconds(),
         };
         row.assignment_version = 1;
@@ -521,16 +510,12 @@ locus Nodes {
 
     /// `update`, holding the resource from its read to its write.
     fn update_held(u: NodeUpdate) -> NodeRead fallible(CtlError) {
+        if u.has_max_in_flight || u.clear_max_in_flight { fail cap_removed(); }
         let mut row = self.known(u.node) or raise;
         let before = self.view(row) or raise;
         if u.has_name {
             if len(u.name) > 128 { fail bad("`name` is at most 128 characters", "name"); }
             row.name = u.name;
-        }
-        if u.has_max_in_flight || u.clear_max_in_flight {
-            let cap = if u.has_max_in_flight { u.max_in_flight } else { -1 };
-            check_cap(cap) or raise;
-            row.max_in_flight = cap;
         }
         row.assignment_version = row.assignment_version + 1;
         let after = self.view(row) or raise;
@@ -631,7 +616,6 @@ locus Nodes {
         let f = self.store.fleet(r.id) or fail store_down(err);
         let b = self.store.beat(r.id) or fail store_down(err);
         let inv = self.store.inventory_summary(r.id) or fail store_down(err);
-        let effective = effective_cap(self.store, r) or fail store_down(err);
         let mut v = NodeRead {
             id: r.id,
             name: r.name,
@@ -644,10 +628,6 @@ locus Nodes {
             capabilities: f.capabilities,
             has_local: len(f.local) > 0,
             local: local_of(f.local),
-            has_max_in_flight: r.max_in_flight >= 0,
-            max_in_flight: r.max_in_flight,
-            has_effective_max_in_flight: effective >= 0,
-            effective_max_in_flight: effective,
             in_flight: b.in_flight,
             assignment_version: r.assignment_version,
             has_applied_version: f.applied_version >= 0,
@@ -825,6 +805,7 @@ locus Seats {
         }
         self.check(row) or raise;
         check_placed(row) or raise;
+        if c.has_concurrency { placed_concurrency(row) or raise; }
         let held = self.store.seats() or fail store_down(err);
         let mut on_node = 0;
         for s in held.rows {
@@ -874,6 +855,7 @@ locus Seats {
         if u.has_config { row.config = config_text(u.config, false) or raise; }
         self.check(row) or raise;
         if u.has_serves || u.has_config { check_placed(row) or raise; }
+        if u.has_concurrency { placed_concurrency(row) or raise; }
         let after = seat_view(self.store, row, n) or raise;
         self.store.update_seat(
             row,
@@ -957,6 +939,22 @@ fn check_placed(s: st::SeatRow) -> Bool fallible(CtlError) {
                 "serves",
             );
         }
+    }
+    return true;
+}
+
+/// A placement's seat serves what its runtime is started with
+/// (`seat_concurrency`): an operator's `concurrency` for it is refused, so
+/// no setting seems to change what cannot change. Any other seat's stands.
+fn placed_concurrency(s: st::SeatRow) -> Bool fallible(CtlError) {
+    let placed = concurrency::placed(s.config);
+    if placed >= 1 {
+        fail bad(
+            "seat " + s.id + " is placement " + std::json::find_string_field(s.config, "placement")
+                + "'s: it serves what its runtime is started with, " + to_string(placed)
+                + " at once, so `concurrency` is set only on a seat that is no placement's",
+            "concurrency",
+        );
     }
     return true;
 }
@@ -1081,10 +1079,6 @@ fn node_summary_of(r: NodeRead) -> NodeSummary fallible(CtlError) {
         hardware: if hw { hardware_of(r) or raise } else { NodeHardware { } },
         has_local: r.has_local,
         local: r.local,
-        has_max_in_flight: r.has_max_in_flight,
-        max_in_flight: r.max_in_flight,
-        has_effective_max_in_flight: r.has_effective_max_in_flight,
-        effective_max_in_flight: r.effective_max_in_flight,
         in_flight: r.in_flight,
         assignment_version: r.assignment_version,
         has_applied_version: r.has_applied_version,
@@ -1136,10 +1130,6 @@ fn node_of_read(r: NodeRead) -> Node fallible(CtlError) {
         capabilities: caps,
         has_local: r.has_local,
         local: r.local,
-        has_max_in_flight: r.has_max_in_flight,
-        max_in_flight: r.max_in_flight,
-        has_effective_max_in_flight: r.has_effective_max_in_flight,
-        effective_max_in_flight: r.effective_max_in_flight,
         in_flight: r.in_flight,
         assignment_version: r.assignment_version,
         has_applied_version: r.has_applied_version,
@@ -1174,7 +1164,7 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatRead falli
         id: s.id,
         engine: s.engine,
         account: s.account,
-        concurrency: s.concurrency,
+        concurrency: seat_concurrency(s),
         enabled: s.enabled,
         config: s.config
     };
@@ -1312,9 +1302,13 @@ fn seat_serves(s: st::SeatRow, model: String) -> Bool {
     return false;
 }
 
-fn check_cap(n: Int) -> Bool fallible(CtlError) {
-    if n != -1 && n < 1 { fail bad("`max_in_flight` is at least 1, or null", "max_in_flight"); }
-    return true;
+/// A node's own cap, asked for: there is none. A node serves each seat up
+/// to the seat's concurrency, and its capacity is their sum.
+fn cap_removed() -> CtlError {
+    return bad(
+        "`max_in_flight` was removed: a node serves each seat up to the seat's `concurrency` (a placement's seat, what its runtime is started with), and its capacity is their sum",
+        "max_in_flight",
+    );
 }
 
 // ---- JSON as stored: the change log's and the event stream's -----------
@@ -1396,10 +1390,7 @@ fn node_json(n: NodeRead) -> String {
         + ", \"version\": " + jstring_or_null(n.has_version, n.version) + hardware
         + ", \"capabilities\": "
         + jraw_if(n.has_capabilities, n.capabilities)
-        + ", \"local\": " + jraw_if(n.has_local, local_json(n.local)) + ", \"max_in_flight\": "
-        + jcount_or_null(n.has_max_in_flight, n.max_in_flight)
-        + ", \"effective_max_in_flight\": "
-        + jcount_or_null(n.has_effective_max_in_flight, n.effective_max_in_flight)
+        + ", \"local\": " + jraw_if(n.has_local, local_json(n.local))
         + ", \"in_flight\": " + to_string(n.in_flight) + ", \"assignment_version\": "
         + to_string(n.assignment_version)
         + ", \"applied_version\": " + jcount_or_null(n.has_applied_version, n.applied_version)
@@ -1423,7 +1414,6 @@ fn node_json(n: NodeRead) -> String {
 fn node_change_json(n: NodeRead) -> String {
     return "{\"id\": " + jq(n.id) + ", \"name\": " + jq(n.name) + ", \"status\": "
         + jq(node_state_name(n.status))
-        + ", \"max_in_flight\": " + jcount_or_null(n.has_max_in_flight, n.max_in_flight)
         + ", \"assignment_version\": " + to_string(n.assignment_version)
         + ", \"created_at\": " + jtime(n.created_at) + ", \"revoked_at\": "
         + jtime_or_null(n.has_revoked_at, n.revoked_at) + "}";

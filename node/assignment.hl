@@ -1,7 +1,7 @@
 // An assignment, applied (protocol.yaml): the node runs exactly the seats
 // the coordinator assigned, and refuses any outside what it offers. Local
-// controls only restrict: a paused node or seat is `paused`, and a local
-// cap only lowers the effective one.
+// controls only restrict: a paused node or seat is `paused`. The node has no
+// cap of its own: it serves each seat up to the seat's concurrency.
 
 /// One assigned seat as the node holds it.
 type NodeSeat {
@@ -27,15 +27,15 @@ type NodeSeat {
     managed: Bool = false;
 }
 
-/// The assignment as applied: its seats, its version and its cap.
-type NodeSeats { items: bounded[NodeSeat; 16]; version: Int = -1; max_in_flight: Int = 0; }
+/// The assignment as applied: its seats and its version. A coordinator's
+/// `max_in_flight` (deprecated, their sum) is read past.
+type NodeSeats { items: bounded[NodeSeat; 16]; version: Int = -1; }
 
 /// Apply `assignment` (its JSON) within `capabilities` and `local`.
 @bounded_by(assignment)
 fn apply_assignment(assignment: String, capabilities: String, local: String) -> NodeSeats {
     let mut out = NodeSeats {
         version: std::json::find_int_field(assignment, "version"),
-        max_in_flight: std::json::find_int_field(assignment, "max_in_flight"),
     };
     let paused = std::json::find_bool_field(local, "paused");
     let held = std::json::find_field_raw(local, "paused_seats");
@@ -53,6 +53,11 @@ fn apply_assignment(assignment: String, capabilities: String, local: String) -> 
             }
         };
         let kind = engine_kind(capabilities, seat.engine);
+        // a placement's seat serves what its runtime is started with
+        // (lib/concurrency, run.hl), whatever a coordinator from before
+        // assigned it
+        let placed = concurrency::placed(seat.config);
+        if kind == "managed" && placed >= 1 { seat.concurrency = placed; }
         let enabled = std::json::string_field(s, "enabled").kind != "bool"
             || std::json::find_bool_field(s, "enabled");
         if len(kind) == 0 {
@@ -117,14 +122,6 @@ fn seat_of(seats: NodeSeats, id: String) -> NodeSeat {
     return NodeSeat { };
 }
 
-/// The node's effective cap: the smallest of its declared cap, the
-/// coordinator's and its local one.
-fn node_cap(capabilities: String, assigned: Int, local: String) -> Int {
-    let mut cap = effective_cap(capabilities, local);
-    if assigned > 0 && assigned < cap { cap = assigned; }
-    return cap;
-}
-
 /// The seats' states, as the node plane takes them (`SeatState`s); `busy`
 /// is the requests being served (session.hl), each on its seat.
 fn states_json(seats: NodeSeats, busy: String) -> String {
@@ -174,6 +171,23 @@ fn busy_count(busy: String) -> Int {
         i = i + 1;
     }
     return n;
+}
+
+/// Why a `serve` on `seat` is refused for capacity, "" when one of the
+/// node's `slots` takes it: the seat is serving its concurrency (a
+/// placement's seat's, what its runtime is started with), or the node is
+/// serving on every slot. `busy` is the requests being served (session.hl).
+/// The node has no cap of its own.
+fn at_capacity(busy: String, seat: NodeSeat, slots: Int) -> String {
+    let all = busy_count(busy);
+    if all >= slots {
+        return "the node is serving " + to_string(all) + " requests, on every one of its slots";
+    }
+    let mine = seat_busy(busy, seat.id);
+    if mine >= seat.concurrency {
+        return "seat " + seat.id + " is serving " + to_string(mine) + ", its most at once";
+    }
+    return "";
 }
 
 /// How many are being served on seat `seat`.

@@ -302,7 +302,7 @@ echo "every project has its system key, internal"
 if [ "${E2E_BROKER:-}" = grafted ]; then
   ptoken=$(post /admin/v1/nodes '{"id": "probe"}' | field enrollment_token)
   curl -fsS -D "$work/reg.headers" -o "$work/reg.json" -X POST "$api/node/v1/register" -H "Authorization: Bearer $ptoken" -H 'content-type: application/json' \
-    -d "{\"protocol\": 2, \"version\": \"e2e\", \"capabilities\": {\"max_in_flight\": 1, \"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}, \"local\": {\"paused\": false, \"paused_seats\": []}}"
+    -d "{\"protocol\": 2, \"version\": \"e2e\", \"capabilities\": {\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\"}}]}, \"local\": {\"paused\": false, \"paused_seats\": []}}"
   python3 - "$work/reg.json" <<'PY' || { echo "the registration did not hand over the nodes' account: $(cat "$work/reg.json")"; exit 1; }
 import json, sys
 n = json.load(open(sys.argv[1]))["nats"]
@@ -526,7 +526,7 @@ quiet_cancel() { # <name> <upstream mode> <upstream port> <node port>
   local qtoken
   qtoken=$(post /admin/v1/nodes '{"id": "'"$name"'"}' | field enrollment_token)
   post /admin/v1/nodes/$name/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "'"$name"'-1"}], "config": {"base_url": "http://127.0.0.1:'"$uport"'/v1", "model": "stub-7b"}}' >/dev/null
-  echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/$name-caps.json"
+  echo '{"engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/$name-caps.json"
   node/node --id "$name" --api "$api" --token "$qtoken" --data "$work/$name-data" --capabilities "$work/$name-caps.json" --port "$nport" --readings-port "$((nport + 1000))" >"$work/$name.log" 2>&1 &
   pids+=($!)
   for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/$name/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
@@ -563,7 +563,7 @@ for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$KEPT_PORT") 2>/dev/null &&
 post /admin/v1/models '{"id": "kept-1"}' >/dev/null
 ktoken=$(post /admin/v1/nodes '{"id": "kept"}' | field enrollment_token)
 post /admin/v1/nodes/kept/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "kept-1"}], "config": {"base_url": "http://127.0.0.1:'"$KEPT_PORT"'/v1", "model": "stub-7b"}}' >/dev/null
-echo '{"max_in_flight": 2, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/kept-caps.json"
+echo '{"engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/kept-caps.json"
 node/node --id kept --api "$api" --token "$ktoken" --data "$work/kept-data" --capabilities "$work/kept-caps.json" --port "$((QUIET_PORT + 3))" --readings-port "$((QUIET_PORT + 1003))" >"$work/kept.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/kept/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
@@ -591,7 +591,7 @@ for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$DECIDE_PORT") 2>/dev/null 
 post /admin/v1/models '{"id": "jev-2b", "contract": "decision"}' >/dev/null
 dtoken=$(post /admin/v1/nodes '{"id": "decider"}' | field enrollment_token)
 post /admin/v1/nodes/decider/seats '{"id": "decide", "engine": "openai-compatible", "account": "static", "serves": [{"model": "jev-2b"}], "config": {"base_url": "http://127.0.0.1:'"$DECIDE_PORT"'", "model": "jev-2b"}}' >/dev/null
-echo '{"max_in_flight": 1, "engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/decider-caps.json"
+echo '{"engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/decider-caps.json"
 node/node --id decider --api "$api" --token "$dtoken" --data "$work/decider-data" --capabilities "$work/decider-caps.json" --port "$((QUIET_PORT + 2))" --readings-port "$((QUIET_PORT + 1002))" >"$work/decider.log" 2>&1 &
 pids+=($!)
 for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/decider/seats/decide" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
@@ -660,11 +660,11 @@ assert steps[0] == "queued" and steps[-1] == "kept" and "done" in steps, steps
 echo "four annotations queued at once on a one-at-a-time decision seat, all annotated, their steps kept; a project that does not annotate wrote none"
 
 # a local pause only restricts: the seat is held, and nothing serves
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "max_in_flight": null, "reason": "e2e"}' >/dev/null
+curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "reason": "e2e"}' >/dev/null
 wait_for paused
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}')
 [ "$code" = "503" ] || { echo "a paused seat served: $code"; exit 1; }
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "max_in_flight": null, "reason": null}' >/dev/null
+curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
 wait_for up
 
 # with a database: the brain's route table, and a standby that takes over
@@ -881,7 +881,7 @@ wait_for up
 
 # a node killed mid-stream: the stream ends with the evidence, never as a
 # complete answer (laptop for a response, then mini for a chat completion)
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "max_in_flight": null, "reason": null}' >/dev/null
+curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
 slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
 wait_for up

@@ -89,9 +89,9 @@ info:
       sends every node its seats as an assignment; the node runs them,
       refuses any outside what it offers, and reports their state. A node
       that is offline gets its seats when it returns.
-    - A node's operator can **pause** the node or a seat, or lower its
-      in-flight cap, on the machine. Local controls only restrict, and the
-      node reports them.
+    - A node's operator can **pause** the node or a seat on the machine.
+      Local controls only restrict, and the node reports them. A node has
+      no in-flight cap of its own: its capacity is its seats' concurrency.
     - An **account** is what pays and what has limits: a subscription, a
       metered API key, or nothing for a local engine. Several seats may share
       one account (the same login on two machines), and they share its
@@ -104,9 +104,10 @@ info:
     model, are up on a connected node, carry the request's data class, and
     spend an account the key permits (narrowed by `voice.account` when the
     request names one). Accounts with no headroom left are skipped, and
-    seats at their concurrency, or on a node at its in-flight cap, are
-    skipped; when every one is, the request waits for a slot (see "Rate
-    limits, budgets and quota"). Voice picks the account with the
+    seats at their concurrency are skipped; when every one is, the request
+    waits for a slot (see "Rate limits, budgets and quota"). A placement's
+    seat's concurrency is what its runtime is started with (`Seat.concurrency`
+    in the node protocol); any other seat's is what its operator set. Voice picks the account with the
     most headroom, then the least loaded of its seats.
 
     The coordinator reaches nodes over NATS on the private network, and nodes
@@ -2875,11 +2876,12 @@ paths:
     patch:
       tags: [nodes]
       operationId: updateNode
-      summary: Rename a node or set its in-flight cap
+      summary: Rename a node
       description: |
-        The cap cannot exceed the node's declared `max_in_flight`; the node's
-        effective cap is the smallest of the declared, this, and any local
-        cap. The change reaches the node as a new assignment.
+        The change reaches the node as a new assignment. A node has no
+        in-flight cap of its own (its capacity is its seats' concurrency):
+        a body that sets `max_in_flight`, to a number or null, is refused
+        (422) naming its removal.
       security:
         - operatorToken: []
       requestBody:
@@ -2889,9 +2891,9 @@ paths:
             schema:
               $ref: '#/components/schemas/NodeUpdate'
             examples:
-              cap:
+              rename:
                 value:
-                  max_in_flight: 4
+                  name: Spark
       responses:
         '200':
           description: The node, changed.
@@ -2983,6 +2985,8 @@ paths:
         not connected yet has declared nothing; the seat is accepted and
         reported with a problem until the node connects and takes it or
         refuses it. The seat reaches the node as a new assignment.
+        A seat whose `config` is a placement's serves what its runtime is
+        started with, so a `concurrency` for it is refused (422).
       security:
         - operatorToken: []
       requestBody:
@@ -7026,7 +7030,10 @@ components:
                 (at most 128k each) from at most half the memory its variant
                 leaves on the node, and no larger than the variant itself;
                 never less than the 32k its variant's memory provides. Left out
-                of a placement made before voice sized it.
+                of a placement made before voice sized it. A llama-server seat
+                is started with as many slots as it holds requests of that
+                context (32k, or the model's own when it is made for less), one
+                to four, and divides it among them: its concurrency.
             reserved_bytes:
               type: integer
               minimum: 1
@@ -7858,19 +7865,12 @@ components:
         id:
           $ref: '#/components/schemas/NodeIdValue'
         name: { type: string, maxLength: 128 }
-        max_in_flight:
-          type: [integer, 'null']
-          minimum: 1
-          description: The coordinator's cap for the node. Null leaves the node's declared cap in charge.
 
     NodeUpdate:
       type: object
       description: Only the fields present change.
       properties:
         name: { type: string, maxLength: 128 }
-        max_in_flight:
-          type: [integer, 'null']
-          minimum: 1
 
     NodeSummary:
       type: object
@@ -7898,13 +7898,9 @@ components:
           oneOf:
             - $ref: './protocol.yaml#/components/schemas/LocalControls'
             - type: 'null'
-        max_in_flight:
-          type: [integer, 'null']
-          description: The coordinator's cap for the node, or null for none.
-        effective_max_in_flight:
-          type: [integer, 'null']
-          description: The smallest of the declared, coordinator and local caps. Null until it first connects.
-        in_flight: { type: integer }
+        in_flight:
+          type: integer
+          description: The requests it serves now, against its capacity, the sum of its seats' `concurrency`.
         assignment_version:
           type: integer
           description: The latest assignment for this node.
@@ -8052,7 +8048,10 @@ components:
         data_classes:
           type: array
           items: { type: string }
-        concurrency: { type: integer, minimum: 1 }
+        concurrency:
+          type: integer
+          minimum: 1
+          description: A seat that is no placement's. A placement's seat serves what its runtime is started with, and a value for it is refused (422).
         enabled: { type: boolean }
         config: { type: object }
 
@@ -8076,7 +8075,10 @@ components:
         data_classes:
           type: array
           items: { type: string }
-        concurrency: { type: integer, minimum: 1 }
+        concurrency:
+          type: integer
+          minimum: 1
+          description: The requests it serves at once. A placement's seat's is what its runtime is started with (`Seat.concurrency` in the node protocol).
         enabled: { type: boolean }
         ref:
           type: string
@@ -8143,8 +8145,10 @@ components:
               description: |
                 A managed seat's: the context, in tokens, its server took, as
                 its node last reported (`SeatState.context`). Left out until
-                it says. It is never more than the recipe's `context_length`,
-                and a llama.cpp seat's is at most 32768.
+                it says. A llama.cpp seat's is what each of its slots holds:
+                its prompt cache divided among its slots, never less than
+                the context its placement promises (32768, or the model's own
+                when it is made for less).
             in_flight: { type: integer }
             problems:
               type: array

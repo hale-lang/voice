@@ -214,8 +214,9 @@ curl -sS http://127.0.0.1:8081/node/v1/status         # on the machine
 
 The node also serves its readings at `http://<machine>:9476/metrics`, on
 every interface, for a habitat's senses to scrape: its own runtime's series,
-and each seat's `voice_node_seat_up`, `voice_node_seat_in_flight` and a
-managed seat's fetch bytes. They carry no secrets. A host running several
+and each seat's `voice_node_seat_up`, `voice_node_seat_in_flight`,
+`voice_node_seat_concurrency` (the most it serves at once) and a managed
+seat's fetch bytes. They carry no secrets. A host running several
 nodes gives each one its own port with `--readings-port`.
 
 ## Remove it

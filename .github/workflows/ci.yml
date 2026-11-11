@@ -151,6 +151,15 @@ jobs:
           handed secret-dna_ci-claude-token--work install --id ci-linux --api http://127.0.0.1:8080 --port 8083
           sudo test -e "$HOME/.voice/vault/claude-token--work"
           sudo test ! -e "$HOME/.voice/vault/claude-token--personal-1"
+          # the node the install started is up before it is stopped: its
+          # admin API and its readings answer. A stop that comes before one
+          # of them is listening leaves it blocked in accept, holding the
+          # drain to its grace
+          for i in $(seq 1 100); do
+            curl -fsS -o /dev/null http://127.0.0.1:8083/node/v1/status 2>/dev/null \
+              && curl -fsS -o /dev/null http://127.0.0.1:9476/metrics 2>/dev/null && break
+            sleep 0.2
+          done
           # stopped, the node drains: systemd signals it alone, it tells the
           # api it is stopping and its drain stops the servers it started (a
           # server that holds SIGTERM, as a seat's first process may, is
@@ -170,9 +179,10 @@ jobs:
           printf '%s\t%s\n' "$held" "$(ps -o lstart= -p "$held" | sed 's/^ *//;s/ *$//')" > "$HOME/.voice/node-data/run/held.pid"
           t0=$(date +%s); sudo systemctl stop voice-node-ci-linux; took=$(( $(date +%s) - t0 ))
           echo "the node's unit stopped in ${took}s"
+          # what the stop logged, read before it is judged
+          sudo journalctl -u voice-node-ci-linux --since "$since" --no-pager | tee "$RUNNER_TEMP/stop.log" | tail -20
           test "$took" -lt 10
           # it drained: its runner stopped the servers, and it left cleanly
-          sudo journalctl -u voice-node-ci-linux --since "$since" --no-pager | tee "$RUNNER_TEMP/stop.log" | tail -20
           grep -q "stopped the seats' servers" "$RUNNER_TEMP/stop.log"
           if grep -q "status=1/FAILURE\|code=killed" "$RUNNER_TEMP/stop.log"; then echo "the node did not stop cleanly"; exit 1; fi
           # ended: gone, or a zombie this shell has yet to reap
@@ -311,6 +321,10 @@ jobs:
         env:
           DATABASE_URL: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
         run: scripts/race.sh
+      - name: A store from before migration 33, with nodes and seats, upgrades, and an api now serves its placed seats at their runtime's concurrency and a node from before as it did
+        env:
+          DATABASE_URL: postgres://voice:voice@127.0.0.1:5432/voice?sslmode=disable
+        run: scripts/upgrade.sh
 
   ui:
     name: ui

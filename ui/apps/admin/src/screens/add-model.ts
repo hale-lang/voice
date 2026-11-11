@@ -5,17 +5,22 @@
  * is placed instead (Placements), which makes its own seat.
  */
 
-/** The Claude models the CLI takes by alias (`claude --model`), or its default. */
-export const CLAUDE_MODELS: { value: string; label: string }[] = [
-  { value: 'opus', label: 'opus' },
-  { value: 'sonnet', label: 'sonnet' },
-  { value: 'haiku', label: 'haiku' },
-  { value: '', label: "the CLI's default" },
-];
+/**
+ * A harness definition as the add form reads it (`HarnessDefinition`): its
+ * id and name, and how a login of it is made and named. Every CLI is the same
+ * form; what differs is the definition's data.
+ */
+export type HarnessInfo = { id: string; name: string; login: { kind: string; entry?: string; setup?: string; describe?: string } };
 
-/** The vault entry the node's install keeps an account's Claude token in. */
-export function tokenEntry(account: string): string {
-  return `claude-token--${account}`;
+/** The login a seat of `h` names for `account`: the definition's suggested entry, filled in. */
+export function loginEntry(h: HarnessInfo, account: string): string {
+  if (!account) return '';
+  return (h.login.entry ?? `${h.id}-{account}`).replaceAll('{account}', account);
+}
+
+/** The engine kinds that run harness `id`: any harness engine, and claude-cli, the claude harness's older name. */
+export function harnessKinds(id: string): string[] {
+  return id === 'claude' ? ['harness', 'claude-cli'] : ['harness'];
 }
 
 /** A node as far as the add form reads it: its id, state and declared engines. */
@@ -24,21 +29,21 @@ export type NodeEngines = { id: string; status: string; capabilities?: { engines
 /** One node's engine of a kind, which a seat names. */
 export type Offer = { node: string; engine: string };
 
-/** Every node (not revoked) that declares an engine of `kind`, each with its first such engine. */
-export function nodesOffering(nodes: NodeEngines[], kind: string): Offer[] {
+/** Every node (not revoked) that declares an engine of one of `kinds`, each with its first such engine. */
+export function nodesOffering(nodes: NodeEngines[], ...kinds: string[]): Offer[] {
   const out: Offer[] = [];
   for (const n of nodes) {
     if (n.status === 'revoked') continue;
-    const e = n.capabilities?.engines.find((x) => x.kind === kind);
+    const e = kinds.map((k) => n.capabilities?.engines.find((x) => x.kind === k)).find((x) => x);
     if (e) out.push({ node: n.id, engine: e.id });
   }
   return out;
 }
 
 /** What to do when no node offers an engine of `kind`, in plain words. */
-export function noNodeOffers(kind: 'claude-cli' | 'openai-compatible'): string {
-  return kind === 'claude-cli'
-    ? 'no node offers claude-cli: install the claude CLI and place the node again'
+export function noNodeOffers(kind: 'harness' | 'openai-compatible'): string {
+  return kind === 'harness'
+    ? "no node offers a harness engine: declare one in a node's capabilities file: { \"id\": \"coding\", \"kind\": \"harness\" } on a node with docker"
     : "no node offers openai-compatible: declare an engine of that kind in a node's capabilities file";
 }
 
@@ -75,13 +80,15 @@ export type AddWrites = {
 };
 
 /**
- * A Claude subscription's model: the claude-cli seat runs the CLI under the
- * account's token (its vault entry), with `--model` set to the alias chosen
- * (none for its default). Flat-rate: no price.
+ * A coding CLI's model, on a harness seat: the seat runs the CLI the
+ * definition names under the login (a vault entry, or a login directory on
+ * the node, as the definition says), with the CLI's own name for its model
+ * (none for its default). It answers coding attempts; the claude harness
+ * answers requests too. Flat-rate: no price.
  */
-export function claudeWrites(a: { model: string; offer: Offer; account: string; vault: string; cliModel: string }): AddWrites {
+export function harnessWrites(a: { model: string; offer: Offer; account: string; harness: string; login: string; cliModel: string }): AddWrites {
   return {
-    model: { id: a.model, owned_by: 'anthropic', kind: 'hosted', price: null },
+    model: { id: a.model, owned_by: a.harness, kind: 'hosted', price: null },
     node: a.offer.node,
     seat: {
       id: seatIdFor(a.model),
@@ -90,7 +97,7 @@ export function claudeWrites(a: { model: string; offer: Offer; account: string; 
       serves: [{ model: a.model }],
       concurrency: 1,
       enabled: true,
-      config: { token_vault: a.vault, ...(a.cliModel ? { model: a.cliModel } : {}) },
+      config: { harness: a.harness, login: a.login.trim(), ...(a.cliModel.trim() ? { model: a.cliModel.trim() } : {}) },
     },
   };
 }

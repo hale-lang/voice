@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apiWrites, claudeWrites, freshSeatId, nodesOffering, noNodeOffers, priceOf, seatIdFor, tokenEntry } from './add-model.ts';
+import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, nodesOffering, noNodeOffers, priceOf, seatIdFor } from './add-model.ts';
 
 const nodes = [
   { id: 'mac', status: 'up', capabilities: { engines: [{ id: 'managed', kind: 'managed' }, { id: 'claude', kind: 'claude-cli' }] } },
@@ -15,24 +15,33 @@ test('the nodes that offer an engine of a kind, each with its engine', () => {
   assert.deepEqual(nodesOffering(nodes, 'static'), []);
 });
 
+test('the claude harness runs on a claude-cli engine too; any other harness on a harness engine', () => {
+  const both = [...nodes, { id: 'gpu', status: 'up', capabilities: { engines: [{ id: 'coding', kind: 'harness' }] } }];
+  assert.deepEqual(nodesOffering(both, ...harnessKinds('claude')), [{ node: 'mac', engine: 'claude' }, { node: 'gpu', engine: 'coding' }]);
+  assert.deepEqual(nodesOffering(both, ...harnessKinds('codex')), [{ node: 'gpu', engine: 'coding' }]);
+});
+
 test('no node offering an engine says what to do', () => {
-  assert.equal(noNodeOffers('claude-cli'), 'no node offers claude-cli: install the claude CLI and place the node again');
+  assert.match(noNodeOffers('harness'), /^no node offers a harness engine: /);
   assert.match(noNodeOffers('openai-compatible'), /^no node offers openai-compatible: /);
 });
 
-test('the token entry is the one the install keeps', () => {
-  assert.equal(tokenEntry('work'), 'claude-token--work');
+test("a login is named as the definition suggests", () => {
+  assert.equal(loginEntry({ id: 'claude', name: 'Claude Code', login: { kind: 'env', entry: 'claude-token--{account}' } }, 'work'), 'claude-token--work');
+  assert.equal(loginEntry({ id: 'codex', name: 'Codex', login: { kind: 'home', entry: 'codex-{account}' } }, 'work'), 'codex-work');
+  assert.equal(loginEntry({ id: 'x', name: 'X', login: { kind: 'env' } }, 'work'), 'x-work');
+  assert.equal(loginEntry({ id: 'x', name: 'X', login: { kind: 'env' } }, ''), '');
 });
 
-test('a Claude subscription: a hosted model with no price, and a claude-cli seat under the token', () => {
-  const w = claudeWrites({ model: 'claude-opus', offer: { node: 'mac', engine: 'claude' }, account: 'work', vault: 'claude-token--work', cliModel: 'opus' });
+test("a coding CLI's model: a hosted model with no price, and a harness seat under the login", () => {
+  const w = harnessWrites({ model: 'codex-default', offer: { node: 'gpu', engine: 'coding' }, account: 'work', harness: 'codex', login: ' codex-work ', cliModel: '' });
   assert.deepEqual(w, {
-    model: { id: 'claude-opus', owned_by: 'anthropic', kind: 'hosted', price: null },
-    node: 'mac',
-    seat: { id: 'claude-opus', engine: 'claude', account: 'work', serves: [{ model: 'claude-opus' }], concurrency: 1, enabled: true, config: { token_vault: 'claude-token--work', model: 'opus' } },
+    model: { id: 'codex-default', owned_by: 'codex', kind: 'hosted', price: null },
+    node: 'gpu',
+    seat: { id: 'codex-default', engine: 'coding', account: 'work', serves: [{ model: 'codex-default' }], concurrency: 1, enabled: true, config: { harness: 'codex', login: 'codex-work' } },
   });
-  const dflt = claudeWrites({ model: 'claude', offer: { node: 'mac', engine: 'claude' }, account: 'work', vault: 'claude-token--work', cliModel: '' });
-  assert.deepEqual(dflt.seat.config, { token_vault: 'claude-token--work' }, "the CLI's default names no model");
+  const named = harnessWrites({ model: 'claude-opus', offer: { node: 'mac', engine: 'claude' }, account: 'work', harness: 'claude', login: 'claude-token--work', cliModel: 'opus' });
+  assert.deepEqual(named.seat.config, { harness: 'claude', login: 'claude-token--work', model: 'opus' }, "the CLI's own name for its model");
 });
 
 test('an api model: priced, its endpoint and upstream name on an openai-compatible seat', () => {

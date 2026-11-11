@@ -1756,6 +1756,7 @@ fn main() {
     links(st::MemoryStore { }, "memory");
     inventories(st::MemoryStore { }, "memory");
     flights(st::MemoryStore { }, "memory");
+    attempts(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1793,6 +1794,192 @@ fn main() {
     inventories(pg, "postgres");
     pg.conn.exec("TRUNCATE in_flight RESTART IDENTITY");
     flights(pg, "postgres");
+    pg.conn.exec("TRUNCATE attempt CASCADE");
+    attempts(pg, "postgres");
+}
+
+fn attempt_row(id: String, project: String, when: Time) -> st::AttemptRow {
+    return st::AttemptRow {
+        id: id,
+        project: project,
+        key: project + "-ci",
+        state: "queued",
+        body: "{\"repo\": \"https://forge.example.com/a.git\"}",
+        harness: "fake",
+        branch: "voice/attempt-" + id,
+        created_at: when,
+        deadline_at: std::time::time_from_unix(std::time::unix(when) + 3600),
+    };
+}
+
+fn len_rows(r: st::AttemptRows) -> Int {
+    let mut n = 0;
+    for x in r.rows {
+        n = n + 1;
+    }
+    return n;
+}
+
+fn report(events: Int, state: String) -> st::AttemptReport {
+    let mut r = st::AttemptReport { state: state, phase: "running", head_sha: "b" };
+    let mut i = 0;
+    while i < events {
+        push(
+            r.events.rows,
+            st::AttemptEvent { kind: "text", text: "line " + to_string(i) },
+        ) or discard;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// Coding attempts (attempts.hl): queued, started on a seat no further
+/// than its concurrency, reported with a transcript kept bounded, ended,
+/// cancelled and failed, and a bundle held and let go.
+fn attempts(s: st::Store, label: String) {
+    let now = t("2026-10-17T12:00:00Z");
+    std::test::assert(
+        s.insert_attempt(attempt_row("att_1", "work", now)) or false,
+        label + ": an attempt",
+    );
+    std::test::assert(
+        !(s.insert_attempt(attempt_row("att_1", "work", now)) or true),
+        label + ": its id is its own",
+    );
+    s.insert_attempt(
+        attempt_row("att_2", "work", std::time::time_from_unix(std::time::unix(now) + 1)),
+    ) or discard;
+    s.insert_attempt(
+        attempt_row("att_3", "home", std::time::time_from_unix(std::time::unix(now) + 2)),
+    ) or discard;
+    let work = s.attempts("work", 10) or st::AttemptRows { };
+    std::test::assert_eq_int(len_rows(work), 2, label + ": a project's attempts");
+    std::test::assert_eq_str(
+        (at(work.rows, 0) or st::AttemptRow { }).id,
+        "att_2",
+        label + ": newest first",
+    );
+    std::test::assert_eq_int(
+        len_rows(s.attempts("", 10) or st::AttemptRows { }),
+        3,
+        label + ": every project's",
+    );
+    let q = s.queued_attempts(0, 10) or st::AttemptRows { };
+    let past = s.queued_attempts(1, 10) or st::AttemptRows { };
+    std::test::assert_eq_str(
+        (at(past.rows, 0) or st::AttemptRow { }).id,
+        "att_2",
+        label + ": past an offset",
+    );
+    std::test::assert_eq_str(
+        (at(q.rows, 0) or st::AttemptRow { }).id,
+        "att_1",
+        label + ": the oldest queued first",
+    );
+
+    // a seat of concurrency 1 starts one
+    std::test::assert(
+        s.start_attempt("att_1", "node-a", "coder", "acct", "fake", 1, now) or false,
+        label + ": started",
+    );
+    std::test::assert(
+        !(s.start_attempt("att_2", "node-a", "coder", "acct", "fake", 1, now) or true),
+        label + ": the seat is full",
+    );
+    std::test::assert(
+        !(s.start_attempt("att_1", "node-a", "other", "acct", "fake", 1, now) or true),
+        label + ": started once",
+    );
+    let one = s.attempt("att_1") or st::AttemptRow { };
+    std::test::assert(
+        one.state == "running"
+            && one.node == "node-a"
+            && one.account == "acct"
+            && one.ran == "fake",
+        label + ": running where it started",
+    );
+
+    // reports: another node's is not written; the transcript kept bounded
+    let foreign = s.report_attempt("att_1", "node-b", report(3, ""), now) or st::AttemptRow { };
+    std::test::assert_eq_int(foreign.events, 0, label + ": another node's report is not written");
+    let mut sent = 0;
+    while sent < 2100 {
+        s.report_attempt("att_1", "node-a", report(300, ""), now) or discard;
+        sent = sent + 300;
+    }
+    let r = s.attempt("att_1") or st::AttemptRow { };
+    std::test::assert_eq_int(r.events, 2100, label + ": every event numbered");
+    std::test::assert_eq_int(r.dropped, 100, label + ": the oldest dropped past the bound");
+    let first = s.attempt_events("att_1", 0, 2) or st::AttemptEvents { };
+    std::test::assert_eq_int(
+        (at(first.rows, 0) or st::AttemptEvent { }).seq,
+        101,
+        label + ": the transcript starts after them",
+    );
+    let mut kept = 0;
+    let mut after = 0;
+    while true {
+        let page = s.attempt_events("att_1", after, 500) or st::AttemptEvents { };
+        if count(page.rows) == 0 { break; }
+        kept = kept + count(page.rows);
+        after = (at(page.rows, count(page.rows) - 1) or st::AttemptEvent { }).seq;
+    }
+    std::test::assert_eq_int(kept, 2000, label + ": 2000 kept");
+    let mut done = report(1, "done");
+    done.has_usage = true;
+    done.input_tokens = 7;
+    let ended = s.report_attempt("att_1", "node-a", done, now) or st::AttemptRow { };
+    std::test::assert(
+        ended.state == "done"
+            && ended.has_ended
+            && ended.tokens_reported
+            && ended.input_tokens == 7,
+        label + ": ended with its usage",
+    );
+    let after_end = s.report_attempt("att_1", "node-a", report(1, ""), now) or st::AttemptRow { };
+    std::test::assert_eq_int(after_end.events, 2101, label + ": nothing written once it ended");
+    s.seal_attempt("att_1", "sha256:x") or discard;
+    std::test::assert_eq_str(
+        (s.attempt("att_1") or st::AttemptRow { }).transcript_digest,
+        "sha256:x",
+        label + ": sealed",
+    );
+
+    // a bundle, held and let go
+    s.put_attempt_bundle("att_1", "UEFDSw==", 4, now) or discard;
+    let held = s.attempt("att_1") or st::AttemptRow { };
+    std::test::assert(held.has_bundle && held.bundle_bytes == 4, label + ": a bundle held");
+    std::test::assert_eq_str(s.attempt_bundle("att_1") or "", "UEFDSw==", label + ": as it was");
+    s.drop_attempt_bundles("", now) or discard;
+    std::test::assert_eq_str(
+        s.attempt_bundle("att_1") or "",
+        "UEFDSw==",
+        label + ": kept until it expires",
+    );
+    s.drop_attempt_bundles("att_1", std::time::time_from_unix(0)) or discard;
+    std::test::assert_eq_str(s.attempt_bundle("att_1") or "x", "", label + ": let go once fetched");
+
+    // cancels, and a node's attempts failed
+    let c = s.cancel_attempt("att_3", now) or st::AttemptRow { };
+    std::test::assert_eq_str(c.state, "cancelled", label + ": a queued one ends at once");
+    s.start_attempt("att_2", "node-a", "coder", "acct", "fake", 1, now) or discard;
+    let asked = s.cancel_attempt("att_2", now) or st::AttemptRow { };
+    std::test::assert(
+        asked.state == "running" && asked.cancel,
+        label + ": a running one is asked to stop",
+    );
+    let lost = s.fail_running("node-a", now, "its node restarted", now) or st::AttemptRows { };
+    std::test::assert_eq_int(len_rows(lost), 1, label + ": the node's running attempt");
+    let gone = s.attempt("att_2") or st::AttemptRow { };
+    std::test::assert(
+        gone.state == "failed" && gone.failure == "its node restarted",
+        label + ": failed, and why",
+    );
+    std::test::assert_eq_str(
+        (s.end_attempt("att_2", "done", "", now) or st::AttemptRow { }).state,
+        "failed",
+        label + ": an end is final",
+    );
 }
 
 /// `h` hours after `base` (Unix seconds).

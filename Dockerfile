@@ -56,6 +56,10 @@ COPY runtimes runtimes
 # and suggest from (pair_placement_test)
 COPY recipes recipes
 COPY catalog catalog
+# the harness definitions voice ships, and the test's fake (attempts_test,
+# harness_test)
+COPY harnesses harnesses
+COPY scripts/e2e-harnesses scripts/e2e-harnesses
 RUN hale test api && hale test node && hale test store && hale test brain \
     && hale build --target-cpu baseline api && hale build --target-cpu baseline brain && hale build --target-cpu baseline node
 
@@ -71,3 +75,4 @@ COPY --from=ui /ui/apps/admin/dist /usr/share/voice/ui
 COPY recipes /usr/share/voice/recipes
 COPY catalog /usr/share/voice/catalog
 COPY runtimes /usr/share/voice/runtimes
+COPY harnesses /usr/share/voice/harnesses

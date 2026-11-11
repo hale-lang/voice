@@ -1,0 +1,342 @@
+// A harness definition (../../harnesses/, spec/openapi.yaml
+// `HarnessDefinition`): an agentic coding CLI as data. The api reads voice's
+// own at start and refuses one these rules refuse; it hands the one a seat
+// runs to the node with each attempt, and the node holds it to the same
+// rules before it runs anything. The node's wrapper is the same for every
+// harness (node/attempt.hl); only this changes from one to the next.
+//
+// The rules a definition is held to:
+//   - its image is a base image pinned by digest (`<name>@sha256:<64 hex>`)
+//     and the one shell command that installs the CLI on it, pinned to a
+//     version where the vendor publishes one;
+//   - its command is a list of plain arguments: none empty, none holding a
+//     newline, and none a flag that skips the CLI's own permissions
+//     (`BYPASS`), which voice never passes (DIRECTION.md, "No bypass flags");
+//   - the instruction goes in on stdin, as the last argument, or in a file
+//     of /voice, which voice mounts read-only (the CLI's machine output it
+//     writes to a file goes in /voice/out, which voice reads after the run);
+//   - a model is named by a flag or an environment variable;
+//   - the login reaches a run only through its environment (`env`, from a
+//     vault entry) or a per-login directory (`home`), never its argv;
+//   - its output is read by a reader voice knows (`READERS`);
+//   - its egress is a list of host names (a leading dot: any under it).
+
+/// The readers voice has for a harness's output.
+const READERS: String = "text claude-stream-json codex-jsonl agy-stream-json vibe-streaming";
+
+/// Flags and values that skip a CLI's own permissions. A definition whose
+/// command holds one is refused, whatever the CLI.
+const BYPASS: String = "--dangerously-skip-permissions\n--dangerously-bypass-approvals-and-sandbox\n--yolo\n--auto-approve\nauto-approve\nbypassPermissions\ndanger-full-access\n--allow-dangerously-skip-permissions\n";
+
+/// A definition, read. Lists are one item a line; `env` is `NAME=value`
+/// lines.
+type HarnessDef {
+    id: String = "";
+    name: String = "";
+    version: String = "";
+    base: String = "";
+    install: String = "";
+    command: String = "";
+    // stdin | argument | file
+    via: String = "stdin";
+    instruction_path: String = "";
+    model_flag: String = "";
+    model_env: String = "";
+    // env | home
+    login_kind: String = "env";
+    login_env: String = "";
+    login_mount: String = "";
+    login_from: String = "";
+    login_files: String = "";
+    env: String = "";
+    reader: String = "text";
+    usage_file: String = "";
+    commits: Bool = false;
+    // the CLI sandboxes its own commands with user namespaces (bubblewrap),
+    // which docker's default seccomp profile refuses a container
+    nested_sandbox: Bool = false;
+    preamble: String = "";
+    egress: String = "";
+    idle_seconds: Int = 1800;
+}
+
+/// A JSON string member, "" when it is not one.
+fn text_of(json: String, name: String) -> String {
+    let f = std::json::string_field(json, name);
+    return if f.kind == "string" { f.text } else { "" };
+}
+
+/// The strings of a JSON list, one a line; "!" first when it is not a list
+/// of strings, or one of them is empty or holds a newline.
+@bounded_by(raw)
+fn lines_of(raw: String) -> String {
+    let list = std::str::trim(raw);
+    if !std::str::starts_with(list, "[") { return "!"; }
+    let out = std::bytes::BytesBuilder { initial_cap: 256 };
+    let mut it = std::json::array_first(list);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if !std::str::starts_with(e, "\"") { return "!"; }
+        let s = std::json::unescape_string(e[1..(len(e) - 1)]);
+        if len(s) == 0 || std::str::contains(s, "\n") { return "!"; }
+        out.append_str(s + "\n");
+        it = std::json::array_next(it);
+    }
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// ^[a-z0-9][a-z0-9-]{0,62}$
+fn slug(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    let n = len(s);
+    if n == 0 || n > 63 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || (b == 45 && i > 0);
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An environment variable's name: ^[A-Z_][A-Z0-9_]*$, at most 64.
+fn env_name(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    let n = len(s);
+    if n == 0 || n > 64 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 65 && b <= 90) || b == 95 || (b >= 48 && b <= 57 && i > 0);
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// An absolute path in the container, of plain parts: no `..`, no space.
+fn container_path(s: String) -> Bool {
+    if !std::str::starts_with(s, "/") || len(s) > 200 { return false; }
+    if std::str::contains(s, "..") || std::str::contains(s, " ") || std::str::contains(s, "\n") {
+        return false;
+    }
+    return !std::str::contains(s, ":") && !std::str::contains(s, ",");
+}
+
+/// A file directly in `dir` (which ends in `/`), of a plain name.
+fn in_dir(path: String, dir: String) -> Bool {
+    if !std::str::starts_with(path, dir) || !container_path(path) { return false; }
+    let name = path[len(dir)..len(path)];
+    return len(name) > 0 && !std::str::contains(name, "/");
+}
+
+/// A host name, or `.` and a domain for any under it: letters, digits,
+/// dots and dashes.
+fn host_pattern(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    let n = len(s);
+    if n == 0 || n > 253 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        let ok = (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 46;
+        if !ok { return false; }
+        i = i + 1;
+    }
+    return std::str::contains(s, ".") && !std::str::ends_with(s, ".");
+}
+
+/// An image pinned by its digest: `<name>@sha256:<64 lowercase hex>`.
+fn pinned_image(s: String) -> Bool {
+    let at = std::str::index_of(s, "@sha256:");
+    if at < 1 || len(s) != at + 8 + 64 { return false; }
+    let v = std::str::bytes_view(s);
+    let mut i = at + 8;
+    while i < len(s) {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) { return false; }
+        i = i + 1;
+    }
+    return !std::str::contains(s, " ") && !std::str::contains(s, "\n");
+}
+
+/// True when `word` is one of `list`'s lines.
+@bounded_by(list)
+fn listed(list: String, word: String) -> Bool {
+    return std::str::starts_with(list, word + "\n") || std::str::contains(list, "\n" + word + "\n");
+}
+
+/// The first of `lines` (one a line) that skips a CLI's permissions, ""
+/// for none: a bypass flag, or a value naming one.
+@bounded_by(lines)
+fn bypass_in(lines: String) -> String {
+    let mut rest = lines;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let a = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        let flag = if std::str::index_of(a, "=") > 0 {
+            a[0..std::str::index_of(a, "=")]
+        } else {
+            a
+        };
+        if listed(BYPASS, flag) || listed(BYPASS, a) { return a; }
+        if std::str::contains(a, "bypass_tool_permissions")
+            || std::str::contains(a, "bypassPermissions")
+        {
+            return a;
+        }
+    }
+    return "";
+}
+
+/// Why `json` is not a harness definition voice runs, "" when it is.
+@unbounded
+fn harness_problem(json: String) -> String {
+    if !std::json::valid_object(json) { return "a definition is a JSON object"; }
+    if !slug(text_of(json, "id")) { return "its id is a slug"; }
+    if len(text_of(json, "name")) == 0 { return "it names the harness (`name`)"; }
+    let image = std::json::find_field_raw(json, "image");
+    if !pinned_image(text_of(image, "base")) {
+        return "its image's base is pinned by digest (`<image>@sha256:<64 hex>`)";
+    }
+    if len(text_of(image, "install")) == 0 || std::str::contains(text_of(image, "install"), "\n") {
+        return "its image's install is one shell command";
+    }
+    let command = lines_of(std::json::find_field_raw(json, "command"));
+    if std::str::starts_with(command, "!") || len(command) == 0 {
+        return "its command is a list of plain arguments, none empty and none holding a newline";
+    }
+    let bypass = bypass_in(command);
+    if len(bypass) > 0 {
+        return "its command skips the CLI's permissions (" + bypass
+            + "): voice never passes a bypass flag";
+    }
+    let instruction = std::json::find_field_raw(json, "instruction");
+    let via = text_of(instruction, "via");
+    if via != "stdin" && via != "argument" && via != "file" {
+        return "its instruction goes in on stdin, as an argument, or in a file";
+    }
+    if via == "file" && !in_dir(text_of(instruction, "path"), "/voice/") {
+        return "an instruction in a file is a file of /voice, which voice mounts read-only";
+    }
+    let model = std::json::find_field_raw(json, "model");
+    let flag = text_of(model, "flag");
+    let menv = text_of(model, "env");
+    if (len(flag) == 0) == (len(menv) == 0) {
+        return "a model is named by a flag or by an environment variable, one of them";
+    }
+    if len(flag) > 0 && !std::str::starts_with(flag, "-") { return "the model's flag is a flag"; }
+    if len(menv) > 0 && !env_name(menv) { return "the model's variable is a variable's name"; }
+    let login = std::json::find_field_raw(json, "login");
+    let kind = text_of(login, "kind");
+    if kind == "env" {
+        if !env_name(text_of(login, "env")) {
+            return "a login from the vault names the variable it is handed in";
+        }
+    } else if kind == "home" {
+        if !container_path(text_of(login, "mount")) {
+            return "a login directory names where it is mounted in the container";
+        }
+        let lenv = text_of(login, "env");
+        if len(lenv) > 0 && !env_name(lenv) { return "the login's variable is a variable's name"; }
+        let files = lines_of(std::json::find_field_raw(login, "files"));
+        if std::str::starts_with(files, "!") || len(files) == 0 {
+            return "a login directory lists the files of it a run is given";
+        }
+        if std::str::contains(files, "/") || std::str::contains(text_of(login, "from"), "..") {
+            return "a login's files are names in its directory";
+        }
+    } else {
+        return "its login is `env` (a vault entry, handed in a variable) or `home` (a directory per login)";
+    }
+    let env = std::str::trim(std::json::find_field_raw(json, "env"));
+    if len(env) > 0 && !std::json::valid_object(env) { return "its env is an object of strings"; }
+    let reader = text_of(json, "reader");
+    if !listed(std::str::replace(READERS, " ", "\n") + "\n", reader) {
+        return "its reader is one voice has (" + READERS + ")";
+    }
+    let usage = text_of(json, "usage_file");
+    if len(usage) > 0 && !in_dir(usage, "/voice/out/") {
+        return "its usage file is a file of /voice/out, which voice reads after the run";
+    }
+    let egress = lines_of(std::json::find_field_raw(json, "egress"));
+    if std::str::starts_with(egress, "!") { return "its egress is a list of host names"; }
+    let mut rest = egress;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let h = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        let host = if std::str::starts_with(h, ".") { h[1..len(h)] } else { h };
+        if !host_pattern(host) { return "egress " + h + " is not a host name"; }
+    }
+    return "";
+}
+
+/// `json`, a definition `harness_problem` passed, read.
+@unbounded
+fn harness_def(json: String) -> HarnessDef {
+    let image = std::json::find_field_raw(json, "image");
+    let instruction = std::json::find_field_raw(json, "instruction");
+    let model = std::json::find_field_raw(json, "model");
+    let login = std::json::find_field_raw(json, "login");
+    let mut env = "";
+    let raw = std::str::trim(std::json::find_field_raw(json, "env"));
+    if std::json::valid_object(raw) {
+        let mut it = std::json::object_first(raw);
+        while !it.done {
+            let key = std::json::obj_key_string(it, raw);
+            let v = std::str::trim(std::json::obj_value_raw(it, raw));
+            if std::str::starts_with(v, "\"") && env_name(key) {
+                let s = std::json::obj_value_string(it, raw);
+                if !std::str::contains(s, "\n") { env = env + key + "=" + s + "\n"; }
+            }
+            it = std::json::object_next(it, raw);
+        }
+    }
+    let idle = std::json::string_field(json, "idle_seconds");
+    return HarnessDef {
+        id: text_of(json, "id"),
+        name: text_of(json, "name"),
+        version: text_of(json, "version"),
+        base: text_of(image, "base"),
+        install: text_of(image, "install"),
+        command: lines_of(std::json::find_field_raw(json, "command")),
+        via: text_of(instruction, "via"),
+        instruction_path: text_of(instruction, "path"),
+        model_flag: text_of(model, "flag"),
+        model_env: text_of(model, "env"),
+        login_kind: text_of(login, "kind"),
+        login_env: text_of(login, "env"),
+        login_mount: text_of(login, "mount"),
+        login_from: text_of(login, "from"),
+        login_files: lines_of(std::json::find_field_raw(login, "files")),
+        env: env,
+        reader: text_of(json, "reader"),
+        usage_file: text_of(json, "usage_file"),
+        commits: std::json::find_bool_field(json, "commits"),
+        nested_sandbox: std::json::find_bool_field(json, "nested_sandbox"),
+        preamble: text_of(json, "preamble"),
+        egress: lines_of(std::json::find_field_raw(json, "egress")),
+        idle_seconds: if idle.kind == "number"
+            && std::json::find_int_field(json, "idle_seconds") > 0
+        {
+            std::json::find_int_field(json, "idle_seconds")
+        } else {
+            1800
+        }
+    };
+}
+
+/// `s` cut to at most `n` bytes, never inside a UTF-8 character.
+fn clip_utf8(s: String, n: Int) -> String {
+    if len(s) <= n { return s; }
+    let v = std::str::bytes_view(s);
+    let mut end = n;
+    while end > 0 && std::str::byte_at(v, end) >= 128 && std::str::byte_at(v, end) < 192 {
+        end = end - 1;
+    }
+    return s[0..end];
+}

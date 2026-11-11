@@ -136,6 +136,16 @@ start, because the MVP exists to prove them.
 - `axiom` **Logins stay with the official binaries.** Voice never extracts a
   token or calls a provider's backend on a subscription's behalf; the CLI
   holds its login on its node ([`node/`](./node/)).
+- `derived` **A harness is data; the wrapper is one.** An agentic coding
+  CLI is a harness definition ([`harnesses/`](./harnesses/README.md)), and
+  every one runs in the same wrapper: a container per attempt with only the
+  workspace mounted, its egress allowlisted, its login by environment or a
+  per-login directory, everything it made removed when it ends
+  ([`docs/coding-attempts.md`](./docs/coding-attempts.md)).
+- `derived` **A coding attempt ends at commits.** Voice runs the harness once
+  and commits what it produced as the caller's identity; the caller fetches
+  the commits as a git bundle, and pushing them and asking for a review are
+  its own ([`openapi.yaml`](./spec/openapi.yaml), tag `attempts`).
 
 ## Process model
 
@@ -225,7 +235,9 @@ tooling through voice and see how many tokens each project uses.
   forwards to a hosted provider must be allowed to carry `internal`, or the
   default must change.
 - **Several logins per CLI on one node.** How each CLI keeps them apart:
-  [hale-lang/voice#2](https://github.com/hale-lang/voice/issues/2).
+  [hale-lang/voice#2](https://github.com/hale-lang/voice/issues/2); what is
+  settled and checked is in
+  [`docs/coding-attempts.md`](./docs/coding-attempts.md), "Logins".
 - **Caller-defined tools.** A backend that cannot return tool calls should
   refuse caller tools with a clear error.
 - **License.** Not chosen yet.

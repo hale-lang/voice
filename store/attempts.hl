@@ -1,0 +1,140 @@
+// Coding attempts (../spec/store.md, migration 37): an `attempt` row per
+// attempt a caller asked for, the bounded transcript a node reported for it
+// (`attempt_event`), and the git bundle of its commits until the caller
+// fetches it or it expires (`attempt_bundle`). The api writes them
+// (api/attempts.hl); the node reports through the api's node plane.
+
+/// The most transcript events a store keeps of one attempt: the oldest go
+/// first once it has more (`AttemptRow.dropped` counts them).
+const ATTEMPT_EVENTS_KEPT: Int = 2000;
+
+/// The most attempts a list answers.
+const ATTEMPT_LIST_MAX: Int = 200;
+
+/// One `attempt` row. `state` is `queued`, `running`, `done`, `failed` or
+/// `cancelled`; the last three are its end, `ended_at` when it ended. Its
+/// usage is the harness's, when the harness's output reports it
+/// (`tokens_reported`); `wall_ms` is how long the harness ran.
+type AttemptRow {
+    id: String = "";
+    project: String = "";
+    key: String = "";
+    state: String = "queued";
+    // the request as the api checked it (`AttemptCreate`)
+    body: String = "{}";
+    // what it asked for: a harness definition and a catalog model, "" for any
+    harness: String = "";
+    model: String = "";
+    // where it runs, once started
+    node: String = "";
+    seat: String = "";
+    account: String = "";
+    // the harness that ran it, and what the node is doing now
+    ran: String = "";
+    phase: String = "";
+    branch: String = "";
+    base_sha: String = "";
+    head_sha: String = "";
+    summary: String = "";
+    failure: String = "";
+    tokens_reported: Bool = false;
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    wall_ms: Int = 0;
+    // sha256 of the stored transcript, once it ended
+    transcript_digest: String = "";
+    // the transcript's next sequence number, and how many of its oldest
+    // events were dropped
+    events: Int = 0;
+    dropped: Int = 0;
+    // a bundle of its commits is held, and how large
+    bundle_bytes: Int = 0;
+    has_bundle: Bool = false;
+    // a cancel was asked for: the node stops it at its next report
+    cancel: Bool = false;
+    created_at: Time = `1970-01-01T00:00:00Z`;
+    has_started: Bool = false;
+    started_at: Time = `1970-01-01T00:00:00Z`;
+    has_ended: Bool = false;
+    ended_at: Time = `1970-01-01T00:00:00Z`;
+    reported_at: Time = `1970-01-01T00:00:00Z`;
+    deadline_at: Time = `1970-01-01T00:00:00Z`;
+    present: Bool = false;
+}
+
+type AttemptRows { rows: bounded[AttemptRow; 200]; }
+
+/// One transcript event: `kind` is `text` (what the harness wrote), `tool`
+/// (a tool it used), `note` (what voice did) or `error`.
+type AttemptEvent {
+    seq: Int = 0;
+    at: Time = `1970-01-01T00:00:00Z`;
+    kind: String = "note";
+    text: String = "";
+}
+
+type AttemptEvents { rows: bounded[AttemptEvent; 500]; }
+
+/// What a node reports of an attempt it runs: events to append, and the
+/// fields it now knows ("" or `has_*` false leaves one as it was). `state`
+/// "" while it runs; `done`, `failed` or `cancelled` ends it.
+type AttemptReport {
+    state: String = "";
+    phase: String = "";
+    ran: String = "";
+    base_sha: String = "";
+    head_sha: String = "";
+    summary: String = "";
+    failure: String = "";
+    has_usage: Bool = false;
+    input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    wall_ms: Int = 0;
+    events: AttemptEvents = AttemptEvents { };
+}
+
+/// True for a state an attempt ends in.
+fn attempt_ended(state: String) -> Bool {
+    return state == "done" || state == "failed" || state == "cancelled";
+}
+
+/// One attempt's held bundle, in the memory store.
+type BundleRow {
+    attempt: String = "";
+    base64: String = "";
+    bytes: Int = 0;
+    at: Time = `1970-01-01T00:00:00Z`;
+}
+
+type BundleRows { rows: bounded[BundleRow; 32]; }
+
+/// One transcript event of some attempt, in the memory store.
+type HeldEvent { attempt: String = ""; e: AttemptEvent = AttemptEvent { }; }
+
+type HeldEvents { rows: bounded[HeldEvent; 4000]; }
+
+/// `row` with what a node reported written into it, and its end when the
+/// report says one.
+fn apply_report(row: AttemptRow, r: AttemptReport, at: Time) -> AttemptRow {
+    let mut next = row;
+    next.reported_at = at;
+    if len(r.phase) > 0 { next.phase = r.phase; }
+    if len(r.ran) > 0 { next.ran = r.ran; }
+    if len(r.base_sha) > 0 { next.base_sha = r.base_sha; }
+    if len(r.head_sha) > 0 { next.head_sha = r.head_sha; }
+    if len(r.summary) > 0 { next.summary = r.summary; }
+    if len(r.failure) > 0 { next.failure = r.failure; }
+    if r.has_usage {
+        next.tokens_reported = true;
+        next.input_tokens = r.input_tokens;
+        next.output_tokens = r.output_tokens;
+    }
+    if r.wall_ms > 0 { next.wall_ms = r.wall_ms; }
+    if attempt_ended(r.state) {
+        next.state = r.state;
+        next.phase = "";
+        next.has_ended = true;
+        next.ended_at = at;
+    }
+    return next;
+}

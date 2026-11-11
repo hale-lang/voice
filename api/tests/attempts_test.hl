@@ -1,0 +1,506 @@
+// Coding attempts (attempts.hl): a caller creates one and is answered at
+// once, queued; a node with a harness seat that can run it claims it and
+// reports it to its end; the result carries its evidence (its commits, the
+// harness's summary, its usage, and the sha256 of the stored transcript),
+// its bundle is fetched once, its usage is one record in the ledger, and an
+// attempt is cancelled, refused, or ended when its node restarts.
+import ".." as api;
+import "../../store" as st;
+
+/// A link that publishes nothing: no node listens.
+locus Quiet {
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    fn offer(node: String, request_id: String, reply_to: String, msg: Bytes) -> api::Offer {
+        return Lost { };
+    }
+}
+
+locus Lost {
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "lost" }; }
+    fn next(wait: Duration) -> api::LinkMsg { return api::LinkMsg { kind: "lost" }; }
+    fn finish() { }
+}
+
+fn call(
+    e: api::DataPlane,
+    method: String,
+    path: String,
+    auth: String,
+    body: String
+) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: method,
+            path: path,
+            headers: "Authorization: Bearer " + auth + "\r\nContent-Type: application/json",
+            body: body,
+        },
+    );
+}
+
+fn expect(r: std::http::Response, status: Int, what: String) {
+    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+}
+
+fn str(body: String, name: String) -> String {
+    return std::json::find_string_field(body, name);
+}
+
+fn fake_definition() -> String {
+    let here = "scripts/e2e-harnesses";
+    return api::shipped_harnesses(if std::io::fs::file_exists(here) { here } else { "../" + here });
+}
+
+const CAPS: String = "{\"engines\": [{\"id\": \"fake\", \"kind\": \"harness\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"harness\", \"login\"]}}, {\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": []}";
+
+const ASK: String = "{\"repo\": \"https://forge.example.com/team/app.git\", \"base\": \"main\", \"instruction\": \"add a FAKE.md\", \"harness\": \"fake\", \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}}";
+
+fn main() {
+    let e = api::DataPlane { link: Quiet { }, harnesses: fake_definition() };
+    std::test::assert(
+        std::str::contains(e.harnesses, "\"id\": \"fake\""),
+        "the fake is read: " + e.harnesses,
+    );
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: Quiet { } };
+    let seats = api::Seats { store: e.store, link: Quiet { } };
+    catalog.create(api::CatalogModelCreate { id: "fake-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "acct-a", name: "A" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    projects.create(api::ProjectCreate { id: "home", name: "Home" }) or discard;
+    let key = (
+        keys.create(
+            api::KeyCreate { project: "work", name: "ci" },
+        ) or api::Key { status: api::KeyStatus::revoked }
+    ).secret;
+    let other = (
+        keys.create(
+            api::KeyCreate { project: "home", name: "ci" },
+        ) or api::Key { status: api::KeyStatus::revoked }
+    ).secret;
+    let token = (
+        nodes.create(
+            api::NodeCreate { id: "node-a" },
+        ) or api::Node { status: api::NodeStatus::down }
+    ).enrollment_token;
+    let mut coder = api::SeatCreate {
+        node: "node-a",
+        id: "coder",
+        engine: "fake",
+        account: "acct-a",
+        config: std::json::Value::parse(
+            "{\"harness\": \"fake\", \"login\": \"fake-login\", \"egress\": [\"mirror.example.net\"]}",
+        )
+        or std::json::Value::null(),
+    };
+    push(coder.serves, st::SeatModel { model: "fake-1" }) or discard;
+    seats.create(coder) or discard;
+    let mut answer = api::SeatCreate {
+        node: "node-a",
+        id: "answer",
+        engine: "static",
+        account: "acct-a",
+        config: std::json::Value::parse("{\"text\": \"hi\"}") or std::json::Value::null(),
+    };
+    push(answer.serves, st::SeatModel { model: "fake-1" }) or discard;
+    seats.create(answer) or discard;
+
+    // refused at once: what voice does not run, or cannot fetch
+    expect(call(e, "POST", "/v1/attempts", "vk-nope", ASK), 401, "no key");
+    expect(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(
+                ASK,
+                "https://forge.example.com/team/app.git",
+                "file:///home/op/node-data",
+            ),
+        ),
+        400,
+        "a local repository",
+    );
+    expect(
+        call(e, "POST", "/v1/attempts", key, std::str::replace(ASK, "\"fake\"", "\"nope\"")),
+        400,
+        "a harness voice has none of",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"main\"", "\"--upload-pack=x\""),
+        ),
+        400,
+        "a base that is a flag",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "author@example.com", "a\\nb@example.com"),
+        ),
+        400,
+        "an identity with a newline",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"harness\": \"fake\"", "\"model\": \"nope\""),
+        ),
+        404,
+        "a model not in the catalog",
+    );
+
+    // created at once, queued: no node has asked for work
+    let made = call(e, "POST", "/v1/attempts", key, ASK);
+    expect(made, 202, "created");
+    let id = str(made.body, "id");
+    std::test::assert(std::str::starts_with(id, "att_"), "an attempt's id");
+    std::test::assert_eq_str(str(made.body, "state"), "queued", "queued");
+    std::test::assert_eq_str(str(made.body, "branch"), "voice/attempt-" + id, "its branch");
+    std::test::assert_eq_str(
+        str(std::json::find_field_raw(made.body, "as"), "email"),
+        "author@example.com",
+        "the identity passed through",
+    );
+    expect(call(e, "GET", "/v1/attempts/" + id, other, ""), 404, "another project's");
+    let listed = call(e, "GET", "/v1/attempts", key, "");
+    expect(listed, 200, "listed");
+    std::test::assert(std::str::contains(listed.body, id), "the project's attempt listed");
+    std::test::assert(
+        !std::str::contains(call(e, "GET", "/v1/attempts", other, "").body, id),
+        "not another's",
+    );
+    let anon = call(
+        e,
+        "POST",
+        "/v1/attempts",
+        key,
+        std::str::replace(
+            ASK,
+            ", \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}",
+            "",
+        ),
+    );
+    expect(anon, 202, "with no identity");
+    std::test::assert_eq_str(
+        str(std::json::find_field_raw(anon.body, "as"), "name"),
+        "voice attempt " + str(anon.body, "id"),
+        "voice's default identity",
+    );
+    expect(
+        call(e, "POST", "/v1/attempts/" + str(anon.body, "id") + "/cancel", key, ""),
+        200,
+        "a queued one cancelled",
+    );
+    std::test::assert_eq_str(
+        str(call(e, "GET", "/v1/attempts/" + str(anon.body, "id"), key, "").body, "state"),
+        "cancelled",
+        "it ends at once",
+    );
+
+    // the node registers and says its seats are up: it claims the attempt
+    let reg = "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+        + ", \"local\": " + LOCAL + "}";
+    let registered = call(e, "POST", "/node/v1/register", token, reg);
+    expect(registered, 200, "registered");
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(registered.body, "assignment"),
+        "version",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/seats",
+            token,
+            "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"coder\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"answer\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}]}",
+        ),
+        204,
+        "its seats are up",
+    );
+    let claimed = call(e, "POST", "/node/v1/attempts/claim", token, "{}");
+    expect(claimed, 200, "claimed");
+    let start = std::json::find_field_raw(claimed.body, "attempt");
+    std::test::assert_eq_str(str(start, "id"), id, "the oldest queued");
+    std::test::assert_eq_str(
+        str(start, "seat"),
+        "coder",
+        "on the harness seat, not the static one",
+    );
+    std::test::assert_eq_str(str(start, "login"), "fake-login", "its login, by name");
+    std::test::assert_eq_str(
+        str(std::json::find_field_raw(start, "harness"), "id"),
+        "fake",
+        "with its definition",
+    );
+    let egress = std::json::find_field_raw(start, "egress");
+    std::test::assert(std::str::contains(egress, "\"example.com\""), "the definition's hosts");
+    std::test::assert(std::str::contains(egress, "\"pypi.org\""), "the registries");
+    std::test::assert(std::str::contains(egress, "\"mirror.example.net\""), "the seat's own");
+    std::test::assert(!std::str::contains(claimed.body, "vn-"), "no token in the start");
+    expect(
+        call(e, "POST", "/node/v1/attempts/claim", token, "{}"),
+        204,
+        "the seat is full at its concurrency",
+    );
+    std::test::assert_eq_str(
+        str(call(e, "GET", "/v1/attempts/" + id, key, "").body, "state"),
+        "running",
+        "running",
+    );
+
+    // the node reports it; another node cannot
+    let other_token = (
+        nodes.create(
+            api::NodeCreate { id: "node-b" },
+        ) or api::Node { status: api::NodeStatus::down }
+    ).enrollment_token;
+    call(e, "POST", "/node/v1/register", other_token, reg);
+    let foreign = call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + id + "/report",
+        other_token,
+        "{\"events\": [{\"kind\": \"text\", \"text\": \"nope\"}]}",
+    );
+    expect(foreign, 200, "another node's report is answered");
+    std::test::assert(std::json::find_bool_field(foreign.body, "cancel"), "and told to stop");
+    let r1 = call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + id + "/report",
+        token,
+        "{\"phase\": \"running\", \"harness\": \"fake\", \"base_sha\": \""
+            + std::str::repeat("a", 40)
+            + "\", \"events\": [{\"kind\": \"note\", \"text\": \"fetching main\"}, {\"kind\": \"text\", \"text\": \"working\"}]}",
+    );
+    expect(r1, 200, "reported");
+    std::test::assert(!std::json::find_bool_field(r1.body, "cancel"), "it goes on");
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/attempts/" + id + "/report",
+            token,
+            "{\"events\": [{\"kind\": \"shout\", \"text\": \"x\"}]}",
+        ),
+        400,
+        "an event of no kind voice knows",
+    );
+    expect(
+        call(
+            e,
+            "PUT",
+            "/node/v1/attempts/" + id + "/bundle",
+            token,
+            "{\"bytes\": 4, \"bundle\": \"" + std::text::base64::encode(b"PACK") + "\"}",
+        ),
+        204,
+        "its bundle held",
+    );
+    let end = call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + id + "/report",
+        token,
+        "{\"state\": \"done\", \"head_sha\": \"" + std::str::repeat("b", 40)
+            + "\", \"summary\": \"Added FAKE.md\", \"usage\": {\"input_tokens\": 120, \"output_tokens\": 30}, \"wall_ms\": 4200, \"events\": [{\"kind\": \"text\", \"text\": \"Added FAKE.md\"}]}",
+    );
+    expect(end, 200, "ended");
+    std::test::assert(std::json::find_bool_field(end.body, "cancel"), "nothing more to run");
+
+    // the evidence
+    let got = call(e, "GET", "/v1/attempts/" + id, key, "");
+    std::test::assert_eq_str(str(got.body, "state"), "done", "done");
+    std::test::assert_eq_str(str(got.body, "base_sha"), std::str::repeat("a", 40), "its base");
+    std::test::assert_eq_str(str(got.body, "head_sha"), std::str::repeat("b", 40), "its head");
+    std::test::assert_eq_str(str(got.body, "summary"), "Added FAKE.md", "the harness's summary");
+    std::test::assert_eq_str(str(got.body, "harness"), "fake", "what ran it");
+    let usage = std::json::find_field_raw(got.body, "usage");
+    std::test::assert_eq_int(
+        std::json::find_int_field(usage, "input_tokens"),
+        120,
+        "its usage, as reported",
+    );
+    std::test::assert_eq_int(std::json::find_int_field(got.body, "wall_ms"), 4200, "its wall time");
+    let transcript = call(e, "GET", "/v1/attempts/" + id + "/transcript", key, "");
+    expect(transcript, 200, "its transcript");
+    std::test::assert(
+        std::str::contains(transcript.body, "\"text\": \"working\""),
+        "what the node reported",
+    );
+    std::test::assert(!std::str::contains(transcript.body, "nope"), "nothing another node said");
+    std::test::assert_eq_str(
+        str(got.body, "transcript_digest"),
+        "sha256:" + std::hex::encode(std::crypto::sha256(std::bytes::from_string(transcript.body))),
+        "the digest is the stored transcript's",
+    );
+    let bundle = call(e, "GET", "/v1/attempts/" + id + "/bundle", key, "");
+    expect(bundle, 200, "its bundle");
+    std::test::assert_eq_str(bundle.body, std::text::base64::encode(b"PACK"), "as it was held");
+    expect(call(e, "GET", "/v1/attempts/" + id + "/bundle", key, ""), 404, "fetched once, let go");
+    let ledger = e.store.usage(id) or st::UsageRow { };
+    std::test::assert(ledger.present, "one usage record, under the attempt's id");
+    std::test::assert_eq_str(ledger.account, "acct-a", "against the seat's account");
+    std::test::assert_eq_int(ledger.input_tokens, 120, "its tokens");
+    std::test::assert(
+        std::str::contains(ledger.record, "\"conversation\": \"" + id + "\""),
+        "the attempt its conversation",
+    );
+    std::test::assert(
+        std::str::contains(ledger.record, "\"endpoint\": \"attempt\""),
+        "an attempt's record",
+    );
+    // the event stream, in process: one look, the events and the attempt
+    let stream = call(e, "GET", "/v1/attempts/" + id + "/events", key, "");
+    std::test::assert(
+        std::str::contains(stream.body, "event: event"),
+        "its events: " + stream.body,
+    );
+    std::test::assert(std::str::contains(stream.body, "event: attempt"), "and the attempt");
+
+    // cancelled while running: the node is told at its next report
+    let second = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 200, "the second claimed");
+    expect(
+        call(
+            e,
+            "POST",
+            "/admin/v1/attempts/" + second + "/cancel",
+            e.store.operator_token("va-test") or "",
+            "",
+        ),
+        200,
+        "the operator cancels it",
+    );
+    let told = call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + second + "/report",
+        token,
+        "{\"events\": []}",
+    );
+    std::test::assert(std::json::find_bool_field(told.body, "cancel"), "the node told to stop");
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + second + "/report",
+        token,
+        "{\"state\": \"cancelled\", \"events\": [{\"kind\": \"note\", \"text\": \"stopped\"}]}",
+    );
+    std::test::assert_eq_str(
+        str(call(e, "GET", "/v1/attempts/" + second, key, "").body, "state"),
+        "cancelled",
+        "cancelled",
+    );
+
+    // a node that registers again ran nothing: what it ran is failed
+    let third = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 200, "the third claimed");
+    call(e, "POST", "/node/v1/register", token, reg);
+    let lost = call(e, "GET", "/v1/attempts/" + third, key, "");
+    std::test::assert_eq_str(str(lost.body, "state"), "failed", "failed when its node restarted");
+    std::test::assert(std::str::contains(str(lost.body, "failure"), "restarted"), "and why");
+
+    // the node, registered again, says its seats are up again
+    let again = call(e, "POST", "/node/v1/register", token, reg);
+    let v2 = std::json::find_int_field(
+        std::json::find_field_raw(again.body, "assignment"),
+        "version",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/seats",
+        token,
+        "{\"assignment_version\": " + to_string(v2)
+            + ", \"seats\": [{\"id\": \"coder\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"answer\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}]}",
+    );
+
+    // a queue whose oldest attempts no seat here can run: a claim reads past
+    // them to the first one it can, oldest first among those
+    catalog.create(api::CatalogModelCreate { id: "elsewhere-1" }) or discard;
+    let mut blocked = 0;
+    while blocked < 70 {
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"harness\": \"fake\"", "\"model\": \"elsewhere-1\""),
+        );
+        blocked = blocked + 1;
+    }
+    let runnable = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let deep = call(e, "POST", "/node/v1/attempts/claim", token, "{}");
+    expect(deep, 200, "claimed past the queue's first page");
+    std::test::assert_eq_str(
+        str(std::json::find_field_raw(deep.body, "attempt"), "id"),
+        runnable,
+        "the first it can run",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + runnable + "/report",
+        token,
+        "{\"state\": \"failed\", \"failure\": \"a test\", \"events\": []}",
+    );
+
+    // a key revoked while its attempt waits: the attempt never starts
+    let late = (
+        keys.create(
+            api::KeyCreate { project: "work", name: "late" },
+        ) or api::Key { status: api::KeyStatus::revoked }
+    );
+    let waiting = str(call(e, "POST", "/v1/attempts", late.secret, ASK).body, "id");
+    keys.revoke(api::KeyRef { project: "work", key: late.id }) or discard;
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 204, "nothing it may start");
+    let refused = call(
+        e,
+        "GET",
+        "/admin/v1/attempts/" + waiting,
+        e.store.operator_token("va-test") or "",
+        "",
+    );
+    std::test::assert_eq_str(str(refused.body, "state"), "failed", "a revoked key's attempt fails");
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(refused.body, "served")),
+        "null",
+        "and never ran",
+    );
+
+    // the operator sees every project's, and the harnesses voice has
+    let op = e.store.operator_token("va-test") or "";
+    let all = call(e, "GET", "/admin/v1/attempts", op, "");
+    expect(all, 200, "the operator's list");
+    std::test::assert(std::str::contains(all.body, third), "every attempt");
+    expect(call(e, "GET", "/admin/v1/attempts", key, ""), 401, "not a project key's");
+    let defs = call(e, "GET", "/admin/v1/harnesses", op, "");
+    std::test::assert(std::str::contains(defs.body, "\"id\": \"fake\""), "the definitions");
+
+    // a seat that runs only attempts is never offered a request
+    let asked = call(e, "POST", "/v1/responses", key, "{\"model\": \"fake-1\", \"input\": \"hi\"}");
+    std::test::assert(
+        !std::str::contains(asked.body, "node-a/coder"),
+        "the harness seat is not tried: " + asked.body,
+    );
+}

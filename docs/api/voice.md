@@ -217,7 +217,8 @@ client can pace itself instead of discovering the wall by failing.
 - [events](#tag-events) (1)
 - [routes](#tag-routes) (2)
 - [tools](#tag-tools) (2)
-- [node](#tag-node) (10)
+- [attempts](#tag-attempts) (14)
+- [node](#tag-node) (13)
 - [health](#tag-health) (2)
 - [annotations](#tag-annotations) (12)
 - [Schemas](#schemas)
@@ -3185,6 +3186,378 @@ Responses:
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+<a id="tag-attempts"></a>
+
+## attempts
+
+Caller plane. Coding attempts: an agentic coding harness run once on a repository, its commits fetched as a git bundle.
+
+### GET `/v1/attempts`
+
+**The project's attempts** · `listAttempts`
+
+Authentication: projectKey, or operatorToken
+
+The project's attempts, newest first, at most 200.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempts. | `application/json` [CodingAttemptList](#schema-codingattemptlist) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/v1/attempts`
+
+**Ask for a coding attempt** · `createAttempt`
+
+Authentication: projectKey, or operatorToken
+
+Asks voice to run an agentic coding harness once on a repository:
+check out `repo` at `base` in a workspace on a node, run the harness
+with `instruction`, and commit what it produced as `as`. It runs for
+minutes or hours, so it is answered at once, `queued` (`202`), and
+read afterwards (`getAttempt`, `streamAttemptEvents`). An attempt is
+never refused for capacity: it waits until a harness seat that can
+run it has room, as a request is routed (the seat's account one the
+key may spend, its data class `internal`, its harness and model the
+ones asked for), or until its `deadline`.
+
+The attempt ends at commits. Pushing them and asking for a review
+are the caller's: it fetches the commits as a git bundle
+(`getAttemptBundle`) and cites the attempt's evidence (`branch`,
+`base_sha`, `head_sha`, `summary`, `usage`, `wall_ms`,
+`transcript_digest`).
+
+`repo` is fetched by the node over https, http or git with no
+credential at all, neither the caller's nor the node's (no ssh key,
+credential helper or netrc): a repository anyone on the node's
+network can read. ssh, a local path or `file://` is refused.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Request body
+
+`application/json`
+
+Schema: [CodingAttemptCreate](#schema-codingattemptcreate)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `repo` | string | yes | The repository's clone URL, over https, http or git. | length ≤ 2048 |
+| `base` | string | yes | The branch, tag or commit to start from. | length ≤ 256 |
+| `instruction` | string | yes | What the harness is asked to do. Voice puts its definition's short preamble before it (it commits for the harness when it does not, and pushes nothing). | length ≤ 262144 |
+| `harness` | string |  | The harness definition to run (`listHarnesses`); any a seat can run when left out. |  |
+| `model` | string |  | A catalog model; it runs on a seat that serves it, under the seat's own name for it. Left out, the seat's own model, or its CLI's default. |  |
+| `budget` | [AttemptBudget](#schema-attemptbudget) |  |  |  |
+| `deadline` | string (date-time) |  | When it fails if it has not ended, queued or running; within 24 hours. Four hours from now when left out. |  |
+| `as` | [CommitIdentity](#schema-commitidentity) |  |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 202 | Created and queued. | `application/json` [CodingAttempt](#schema-codingattempt) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/v1/attempts/{attempt}`
+
+**An attempt, and its evidence once it ended** · `getAttempt`
+
+Authentication: projectKey, or operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempt. | `application/json` [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/v1/attempts/{attempt}/cancel`
+
+**Stop an attempt** · `cancelAttempt`
+
+Authentication: projectKey, or operatorToken
+
+A queued attempt ends `cancelled` at once. A running one is stopped
+by its node at its next report, within a few seconds: its container
+is removed and it ends `cancelled`, its workspace removed with it.
+An attempt that has ended is answered as it is.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempt, as it now is. | `application/json` [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/v1/attempts/{attempt}/transcript`
+
+**The attempt's stored transcript** · `getAttemptTranscript`
+
+Authentication: projectKey, or operatorToken
+
+Every event voice keeps of the attempt, one `CodingAttemptEvent` a
+line (JSON Lines), oldest first: what the harness wrote, the tools
+it used, and what voice did. Voice keeps the last 2000 events of an
+attempt (`transcript.dropped` counts those it let go). Once the
+attempt ended, the sha256 of exactly these bytes is its
+`transcript_digest`.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The transcript. | `application/jsonl` [CodingAttemptEvent](#schema-codingattemptevent) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | Nothing can serve the request now. `no_eligible_seat`: no enabled seat on a connected node serves this model for this data class and these accounts; the message names the first condition unmet, in this order: the key's project may spend no account (its `accounts` are `[]`), the key may spend none, no seat serving the model spends an account the key may spend, none takes the data class, none of those is up (its node not up, draining, or the seat not `up`). `no_capacity`: seats exist, but every account they spend is out of headroom; `Retry-After` is the earliest reset. `metering_unavailable`: the ledger cannot record usage, so nothing is served until it can. Seat saturation alone never produces this: the request waits for a slot, and is `429 no_capacity` if none frees. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/v1/attempts/{attempt}/events`
+
+**Follow an attempt live** · `streamAttemptEvents`
+
+Authentication: projectKey, or operatorToken
+
+A server-sent event stream: each transcript event past the
+subscriber's place as an `event` (`data:` a `CodingAttemptEvent`,
+`id:` its `seq`), and the attempt as it stands as an `attempt`
+(`data:` a `CodingAttempt`) whenever it changes. A client that
+reconnects sends its last `id` in `Last-Event-ID` (or `?after=`).
+The stream ends once the attempt has ended and every event was sent.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+| `after` | query | integer |  | The `seq` to follow from, when no `Last-Event-ID` is sent. |
+| `Last-Event-ID` | header | string |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The stream: `event` (a `CodingAttemptEvent`) and `attempt` (a `CodingAttempt`) events. | `text/event-stream` [CodingAttemptEvent](#schema-codingattemptevent) \| [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/v1/attempts/{attempt}/bundle`
+
+**The attempt's commits, as a git bundle** · `getAttemptBundle`
+
+Authentication: projectKey, or operatorToken
+
+The commits from `base_sha` to `head_sha` on `branch`, as a git
+bundle (`git bundle create <bundle> <base_sha>..<branch>`): in a
+clone holding `base_sha`, `git fetch <bundle> <branch>` brings them
+in, and the fetched head is `head_sha`. Voice holds it once: fetched,
+or a day after the attempt ended, it is let go (`404`).
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+| `Voice-Project` | header | [ProjectIdValue](#schema-projectidvalue) |  | With the operator token, the project the request is charged to, as that project's operator key (see "The operator, charged to a project"). Refused with a project key (`401 invalid_key`). |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The bundle. `X-Voice-Head-Sha` names the head it carries. | `application/x-git-bundle` string (binary) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/attempts`
+
+**Every project's attempts** · `listAllAttempts`
+
+Authentication: operatorToken
+
+Every project's attempts, newest first, at most 200; or one project's, with `project`. The admin UI's Attempts screen.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `project` | query | string |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempts. | `application/json` [CodingAttemptList](#schema-codingattemptlist) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/attempts/{attempt}`
+
+**Any project's attempt, as `getAttempt`** · `getAnyAttempt`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempt. | `application/json` [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/attempts/{attempt}/cancel`
+
+**Stop any project's attempt, as `cancelAttempt`** · `cancelAnyAttempt`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The attempt. | `application/json` [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/attempts/{attempt}/transcript`
+
+**Any project's attempt's transcript, as `getAttemptTranscript`** · `getAnyAttemptTranscript`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The transcript. | `application/jsonl` [CodingAttemptEvent](#schema-codingattemptevent) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/attempts/{attempt}/events`
+
+**Follow any project's attempt, as `streamAttemptEvents`** · `streamAnyAttemptEvents`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The stream. | `text/event-stream` [CodingAttemptEvent](#schema-codingattemptevent) \| [CodingAttempt](#schema-codingattempt) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/attempts/{attempt}/bundle`
+
+**Any project's attempt's bundle, as `getAttemptBundle`** · `getAnyAttemptBundle`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The bundle. | `application/x-git-bundle` string (binary) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/harnesses`
+
+**The harness definitions voice has** · `listHarnesses`
+
+Authentication: operatorToken
+
+The agentic coding CLIs voice runs, each as data
+(`HarnessDefinition`): voice's own, in its `harnesses` directory,
+read at start and held to the rules (no bypass flag, a base image by
+digest, a login only by environment or a per-login directory). A
+harness seat names one by its id; the admin UI's seat form reads how
+each one's login is set up from here.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The definitions. | `application/json` [HarnessList](#schema-harnesslist) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 <a id="tag-node"></a>
 
 ## node
@@ -3481,6 +3854,129 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The node is revoked: its token is known but no longer admits it. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/node/v1/attempts/claim`
+
+**Take a coding attempt to run** · `claimAttempt`
+
+Authentication: enrollmentToken
+
+A node with a free attempt slot asks for work, every few seconds
+while it has one. The coordinator starts the oldest queued attempt
+one of the node's harness seats can run (up, enabled, its account
+one the attempt's project and key may spend and not archived, its
+data class `internal`, its harness and model the ones asked for, and
+fewer attempts running on it than its concurrency, checked in the
+store so two api instances never start more), and answers with what
+the node runs it with: the harness's definition, the login the seat
+runs under (a vault entry's or a login directory's name, never a
+credential), and the hosts its egress allows. `204` when there is
+none. Attempts ride the node plane rather than NATS: they outlive any
+api instance, and every step of theirs lands in the store.
+
+Request body (optional)
+
+`application/json`
+
+Schema: object
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | An attempt, started on one of the node's seats. | `application/json` [AttemptStart](#schema-attemptstart) |
+| 204 | None to run. |  |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The node is revoked: its token is known but no longer admits it. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/node/v1/attempts/{attempt}/report`
+
+**How an attempt the node runs stands** · `reportAttempt`
+
+Authentication: enrollmentToken
+
+Every couple of seconds while it runs, and once at its end: the
+transcript events since the last report, and what the node now
+knows (its phase, its base and head commits, the harness's summary,
+its usage as the harness reported it, its wall time). A report with
+`state` ends the attempt. The answer says to stop when the attempt
+was cancelled or is no longer this node's: the node then removes its
+container and its workspace and reports its end.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [AttemptReport](#schema-attemptreport)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `state` | string, one of `done`, `failed`, `cancelled` |  | Its end; left out while it runs. |  |
+| `phase` | string |  |  |  |
+| `harness` | string |  |  |  |
+| `base_sha` | string |  |  |  |
+| `head_sha` | string |  |  |  |
+| `summary` | string |  |  |  |
+| `failure` | string |  |  |  |
+| `usage` | object |  | As the harness's output reported it; left out when it reports none. |  |
+| `usage.input_tokens` | integer |  |  |  |
+| `usage.output_tokens` | integer |  |  |  |
+| `wall_ms` | integer |  |  |  |
+| `events` | array of object |  |  | items ≤ 500 |
+| `events[].kind` | string, one of `text`, `tool`, `note`, `error` | yes |  |  |
+| `events[].text` | string | yes |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | Received. | `application/json` [AttemptReportAnswer](#schema-attemptreportanswer) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PUT `/node/v1/attempts/{attempt}/bundle`
+
+**The commits of an attempt the node runs, as a git bundle** · `putAttemptBundle`
+
+Authentication: enrollmentToken
+
+Before it reports the attempt's end, the node hands over the bundle
+of the branch's commits from the base, which the coordinator holds
+for the caller (`getAttemptBundle`). At most 6 MiB.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `attempt` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [AttemptBundleUpload](#schema-attemptbundleupload)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `bundle` | string | yes | The git bundle, base64. |  |
+| `bytes` | integer | yes |  | ≥ 1; ≤ 6291456 |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 204 | Held. |  |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-health"></a>
 
@@ -4564,6 +5060,276 @@ Type: [Key](#schema-key) & object
 | … | all of [Key](#schema-key) |  |  |  |
 | `secret` | string | yes | Shown once. Voice stores only a digest. |  |
 
+<a id="schema-commitidentity"></a>
+
+### CommitIdentity
+
+Who the attempt's commits are by: their author and committer. Voice
+takes it from the caller as it is and passes it to git unchanged; a
+caller such as an organization's leg passes its position's identity
+through. Left out, an attempt commits as `voice attempt <id>`.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `name` | string | yes |  | length ≥ 1; length ≤ 200 |
+| `email` | string | yes |  | length ≥ 3; length ≤ 254 |
+
+<a id="schema-attemptbudget"></a>
+
+### AttemptBudget
+
+The most tokens the harness may use, input and output together, as
+its own output reports them; the attempt is stopped and fails past
+it. A harness whose output reports no usage cannot be held to one.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `tokens` | integer | yes |  | ≥ 1 |
+
+<a id="schema-codingattemptcreate"></a>
+
+### CodingAttemptCreate
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `repo` | string | yes | The repository's clone URL, over https, http or git. | length ≤ 2048 |
+| `base` | string | yes | The branch, tag or commit to start from. | length ≤ 256 |
+| `instruction` | string | yes | What the harness is asked to do. Voice puts its definition's short preamble before it (it commits for the harness when it does not, and pushes nothing). | length ≤ 262144 |
+| `harness` | string |  | The harness definition to run (`listHarnesses`); any a seat can run when left out. |  |
+| `model` | string |  | A catalog model; it runs on a seat that serves it, under the seat's own name for it. Left out, the seat's own model, or its CLI's default. |  |
+| `budget` | [AttemptBudget](#schema-attemptbudget) |  |  |  |
+| `deadline` | string (date-time) |  | When it fails if it has not ended, queued or running; within 24 hours. Four hours from now when left out. |  |
+| `as` | [CommitIdentity](#schema-commitidentity) |  |  |  |
+
+<a id="schema-codingattempt"></a>
+
+### CodingAttempt
+
+An attempt as it stands, and, once it ended, the evidence a caller
+cites: `branch`, `base_sha` and `head_sha` (the commits it made),
+`summary` (the harness's final message), `usage`, `wall_ms`, and
+`transcript_digest`; and how to fetch the result: `bundle` and
+`transcript`.
+
+`done`: the harness ran to its end and its work is committed on
+`branch`, `head_sha` past `base_sha`. `failed`: it did not, `failure`
+says why (the harness failed or changed nothing, its budget or
+deadline ran out, its node stopped); commits it made are in the
+bundle all the same. `cancelled`: it was stopped. When an attempt
+ends, its node removes its container and its workspace: what remains
+is this record, its bounded transcript, and its bundle until it is
+fetched or a day passes.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `object` | `"attempt"` | yes |  |  |
+| `state` | string, one of `queued`, `running`, `done`, `failed`, `cancelled` | yes |  |  |
+| `phase` | string \| null |  | What its node is doing while it runs (`starting`, `fetching`, `building`, `running`, `committing`); `null` otherwise. |  |
+| `project` | string | yes |  |  |
+| `key` | string | yes |  |  |
+| `harness` | string \| null |  | The harness that ran it, or the one asked for before it started. |  |
+| `model` | string \| null |  |  |  |
+| `repo` | string | yes |  |  |
+| `base` | string | yes |  |  |
+| `instruction` | string | yes |  |  |
+| `as` | [CommitIdentity](#schema-commitidentity) | yes |  |  |
+| `branch` | string | yes | The branch its commits are on, in its bundle. |  |
+| `base_sha` | string \| null |  | The commit `base` named when it was fetched. |  |
+| `head_sha` | string \| null |  | The branch's head once the harness's work was committed. |  |
+| `summary` | string \| null |  | The harness's final message, as its output gave it. |  |
+| `failure` | string \| null |  |  |  |
+| `served` | object \| null |  | Where it ran, once started. |  |
+| `served.node` | string | yes |  |  |
+| `served.seat` | string | yes |  |  |
+| `served.account` | string | yes |  |  |
+| `usage` | object | yes | Its token usage as the harness's own output reported it; `reported` false, and the counts `null`, when it reports none. Voice invents no count. |  |
+| `usage.reported` | boolean | yes |  |  |
+| `usage.input_tokens` | integer \| null | yes |  |  |
+| `usage.output_tokens` | integer \| null | yes |  |  |
+| `wall_ms` | integer | yes | How long its node worked on it, from its start to its end. |  |
+| `budget` | [AttemptBudget](#schema-attemptbudget) \| null |  |  |  |
+| `deadline` | string (date-time) | yes |  |  |
+| `cancel_requested` | boolean | yes |  |  |
+| `transcript` | object | yes |  |  |
+| `transcript.url` | string | yes | The stored transcript (`getAttemptTranscript`). |  |
+| `transcript.events_url` | string | yes | The live stream (`streamAttemptEvents`). |  |
+| `transcript.events` | integer | yes | Events kept. |  |
+| `transcript.dropped` | integer | yes | The oldest events let go past the bound. |  |
+| `transcript_digest` | string \| null |  | The sha256 of the stored transcript, as `getAttemptTranscript` answers it, once the attempt ended; stable from then on. |  |
+| `bundle` | object \| null |  | The git bundle of its commits, while voice holds it. |  |
+| `bundle.url` | string | yes |  |  |
+| `bundle.bytes` | integer | yes |  |  |
+| `created_at` | string (date-time) | yes |  |  |
+| `started_at` | string \| null (date-time) |  |  |  |
+| `ended_at` | string \| null (date-time) |  |  |  |
+
+<a id="schema-codingattemptlist"></a>
+
+### CodingAttemptList
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `object` | `"list"` | yes |  |  |
+| `data` | array of [CodingAttempt](#schema-codingattempt) | yes |  | items ≤ 200 |
+
+<a id="schema-codingattemptevent"></a>
+
+### CodingAttemptEvent
+
+One transcript event. `text`: what the harness wrote; `tool`: a tool
+it used, or one its policy refused; `note`: what voice did; `error`:
+why it failed. Its text is at most 16 KiB.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `seq` | integer | yes |  | ≥ 1 |
+| `at` | string (date-time) | yes |  |  |
+| `kind` | string, one of `text`, `tool`, `note`, `error` | yes |  |  |
+| `text` | string | yes |  |  |
+
+<a id="schema-harnessdefinition"></a>
+
+### HarnessDefinition
+
+An agentic coding CLI as data, which voice's one wrapper runs: in a
+container of the attempt's own, with only the workspace mounted, its
+egress through a proxy that lets through only `egress`, the
+registries, and the seat's own hosts. Nothing in it skips the CLI's
+own permissions: a definition whose command holds a bypass flag is
+refused.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
+| `name` | string | yes |  |  |
+| `version` | string |  | The CLI's version the image installs. |  |
+| `image` | object | yes | What it runs in, built once on a node. |  |
+| `image.base` | string | yes | A base image by digest: `<image>@sha256:<64 hex>`. |  |
+| `image.install` | string | yes | The one shell command that installs the CLI on it, pinned to a version where the vendor publishes one. |  |
+| `command` | array of string | yes | The CLI's argv, its permission policy among it. |  |
+| `instruction` | object | yes |  |  |
+| `instruction.via` | string, one of `stdin`, `argument`, `file` | yes |  |  |
+| `instruction.path` | string |  | For `file`: a file of `/voice`, mounted read-only. |  |
+| `model` | object | yes | How a model is named, by a flag or an environment variable. |  |
+| `model.flag` | string |  |  |  |
+| `model.env` | string |  |  |  |
+| `login` | object | yes | How a login reaches a run. `env`: a vault entry's value, in the variable `env`, read into the container's environment and never its argv. `home`: a directory per login on the node (`<data>/logins/<login>`), of which only `files` are copied into the attempt's scratch copy, mounted at `mount` (and copied back when the CLI refreshes them). |  |
+| `login.kind` | string, one of `env`, `home` | yes |  |  |
+| `login.env` | string |  |  |  |
+| `login.mount` | string |  |  |  |
+| `login.from` | string |  |  |  |
+| `login.files` | array of string |  |  |  |
+| `login.entry` | string |  | The name voice suggests for a login of `{account}`: the vault entry or login directory a seat names. |  |
+| `login.setup` | string |  | How the operator makes a login, on the node. |  |
+| `login.describe` | string |  |  |  |
+| `env` | object |  |  |  |
+| `reader` | string, one of `text`, `claude-stream-json`, `codex-jsonl`, `agy-stream-json`, `vibe-streaming` | yes | How its output is read into the transcript, its summary and its usage. |  |
+| `usage_file` | string |  | A file of `/voice/out` the CLI writes its usage to, read after the run. |  |
+| `commits` | boolean | yes | The CLI commits its work itself; voice commits what is left either way. |  |
+| `nested_sandbox` | boolean |  | The CLI sandboxes its own commands with user namespaces (bubblewrap), which the container then allows. |  |
+| `preamble` | string | yes |  |  |
+| `egress` | array of string | yes | The vendor's hosts; a leading dot allows any host under it. |  |
+| `idle_seconds` | integer |  | How long it may write nothing before it has failed. |  |
+| `base_url_env` | string \| null |  | The variable the CLI reads its API's address from. Not used yet; routing the CLI's own model calls through voice will set it. |  |
+| `protocol` | string \| null |  | The wire its model calls speak. Not used yet, as `base_url_env`. |  |
+| `mcp` | object \| null |  | An MCP configuration to inject. Not used yet. |  |
+
+<a id="schema-harnesslist"></a>
+
+### HarnessList
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `object` | `"list"` | yes |  |  |
+| `data` | array of [HarnessDefinition](#schema-harnessdefinition) | yes |  |  |
+
+<a id="schema-attemptstart"></a>
+
+### AttemptStart
+
+What a node runs an attempt with (`claimAttempt`).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `attempt` | object | yes |  |  |
+| `attempt.id` | string | yes |  |  |
+| `attempt.seat` | string | yes |  |  |
+| `attempt.repo` | string | yes |  |  |
+| `attempt.base` | string | yes |  |  |
+| `attempt.branch` | string | yes |  |  |
+| `attempt.instruction` | string | yes |  |  |
+| `attempt.model` | string | yes | The CLI's own name for the model, "" for its default. |  |
+| `attempt.login` | string | yes | The vault entry or login directory the seat runs under, by name. |  |
+| `attempt.budget_tokens` | integer | yes | 0 for none. |  |
+| `attempt.deadline` | integer | yes | Unix seconds. |  |
+| `attempt.as` | [CommitIdentity](#schema-commitidentity) | yes |  |  |
+| `attempt.egress` | array of string | yes |  |  |
+| `attempt.harness` | [HarnessDefinition](#schema-harnessdefinition) | yes |  |  |
+
+<a id="schema-attemptreport"></a>
+
+### AttemptReport
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `state` | string, one of `done`, `failed`, `cancelled` |  | Its end; left out while it runs. |  |
+| `phase` | string |  |  |  |
+| `harness` | string |  |  |  |
+| `base_sha` | string |  |  |  |
+| `head_sha` | string |  |  |  |
+| `summary` | string |  |  |  |
+| `failure` | string |  |  |  |
+| `usage` | object |  | As the harness's output reported it; left out when it reports none. |  |
+| `usage.input_tokens` | integer |  |  |  |
+| `usage.output_tokens` | integer |  |  |  |
+| `wall_ms` | integer |  |  |  |
+| `events` | array of object |  |  | items ≤ 500 |
+| `events[].kind` | string, one of `text`, `tool`, `note`, `error` | yes |  |  |
+| `events[].text` | string | yes |  |  |
+
+<a id="schema-attemptreportanswer"></a>
+
+### AttemptReportAnswer
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `cancel` | boolean | yes | Stop it now. |  |
+| `state` | string | yes |  |  |
+
+<a id="schema-attemptbundleupload"></a>
+
+### AttemptBundleUpload
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `bundle` | string | yes | The git bundle, base64. |  |
+| `bytes` | integer | yes |  | ≥ 1; ≤ 6291456 |
+
 <a id="schema-usagerecord"></a>
 
 ### UsageRecord
@@ -4584,7 +5350,7 @@ Type: object
 | `requested_model` | string | yes | The model the caller named: a catalog model's id, or a name its project gives one (`ModelAlias`). |  |
 | `resolved_model` | string |  | The catalog model the request was routed and served as: `requested_model` itself when the caller named a model, the model it named when it is a name the project gives one, read when the request was admitted. Absent from a record written before it was kept, and from an abandoned one (its instance stopped before it settled). |  |
 | `requested_account` | string \| null |  | The account the request named in `voice.account`, if any. |  |
-| `endpoint` | string, one of `responses`, `chat.completions` | yes |  |  |
+| `endpoint` | string, one of `responses`, `chat.completions`, `attempt` | yes | `attempt`: a coding attempt's one record, under the attempt's id, its `conversation` the attempt's id, its `timing.engine_ms` the harness's wall time, and its tokens as the harness's output reported them (`metadata.tokens` is `unreported`, and the counts 0, when it reports none). |  |
 | `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
@@ -4623,7 +5389,7 @@ Type: object
 | `requested_model` | string | yes |  |  |
 | `resolved_model` | string |  | As `UsageRecord.resolved_model`. |  |
 | `requested_account` | string \| null |  |  |  |
-| `endpoint` | string, one of `responses`, `chat.completions` | yes |  |  |
+| `endpoint` | string, one of `responses`, `chat.completions`, `attempt` | yes | `attempt`: a coding attempt's one record, under the attempt's id, its `conversation` the attempt's id, its `timing.engine_ms` the harness's wall time, and its tokens as the harness's output reported them (`metadata.tokens` is `unreported`, and the counts 0, when it reports none). |  |
 | `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes |  |  |
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
@@ -7834,10 +8600,10 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
-| `kind` | string | yes | What runs, e.g. `static`, `claude-cli`, `codex-cli`, `agy`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
+| `kind` | string | yes | What runs: `static`, `openai-compatible`, `harness` (an agentic coding CLI, as a harness definition says, `HarnessConfig`), `claude-cli` (the claude harness under an older name, kept so configs from before keep working), or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
 | `description` | string |  |  |  |
 | `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
-| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
+| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the harness engine's `HarnessConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
 
 <a id="schema-linkport"></a>
 

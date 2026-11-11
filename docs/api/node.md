@@ -45,21 +45,28 @@ machine besides local controls. Nothing is discovered: the node offers
 exactly the engines listed, each with the login it runs under. It is
 `Capabilities` from the protocol plus, per engine, a `local` object the
 node never declares (where the login is kept, and similar). Each CLI
-keeps several logins apart in its own way (docs/internals.md, "One node,
-several logins"): a `claude-cli` engine's login is not in this file at
-all, it is a token in the node's vault that its seats name. A file from
-before that declares the node's own cap (`max_in_flight`) is read past.
+keeps several logins apart in its own way (docs/coding-attempts.md,
+"Logins"): a `harness` engine's logins are not in this file at all, they
+are tokens in the node's vault or directories under `logins/` in its
+data directory, which its seats name. A file from before that declares
+the node's own cap (`max_in_flight`) is read past.
 
 ```json
 {
   "engines": [
     { "id": "static", "kind": "static" },
     { "id": "ollama", "kind": "openai-compatible" },
-    { "id": "claude-work", "kind": "claude-cli" },
-    { "id": "claude-personal", "kind": "claude-cli" }
+    { "id": "coding", "kind": "harness" }
   ]
 }
 ```
+
+A `harness` engine runs agentic coding CLIs for coding attempts, each
+as a harness definition says (`HarnessConfig` in the protocol): it
+needs docker on the machine, and runs each attempt in a container of
+its own. One engine serves every CLI and login: each seat names its
+harness and its login. `claude-cli` is the claude harness under its
+older name, and an engine of it keeps working.
 
 A `managed` engine takes the models the coordinator places on the
 node (openapi.yaml `Placement`): the node fetches each one's weights
@@ -83,7 +90,8 @@ accelerators and free disk under the data directory) and declares it
 with the engines.
 
 The node fills in each engine's `config_schema` and `models` from its
-kind. The kinds this build runs are `static`, `claude-cli` (a seat that runs
+kind. The kinds this build runs are `static`, `harness` (coding
+attempts; see `HarnessConfig` in the protocol), `claude-cli` (a seat that runs
 `claude -p` under a token the vault holds; see `ClaudeCliConfig` in the
 protocol) and `openai-compatible`
 (a seat that proxies to a chat-completions server: its seat config names
@@ -93,7 +101,7 @@ protocol). The `openai-compatible` kind carries tools (a request's
 `tools` go upstream, its tool calls come back); `managed` does under
 llama-server or TensorFold, and under vLLM when the seat's variant names a
 `tool_call_parser`; `static` does only as
-its `tool_call` drill and `claude-cli` never, and a request with `tools`
+its `tool_call` drill and `claude-cli` and `harness` never, and a request with `tools`
 is refused there so the coordinator tries another seat. When the file changes, the node declares its capabilities again,
 and the coordinator re-checks the assignment against them.
 
@@ -465,10 +473,10 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
-| `kind` | string | yes | What runs, e.g. `static`, `claude-cli`, `codex-cli`, `agy`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
+| `kind` | string | yes | What runs: `static`, `openai-compatible`, `harness` (an agentic coding CLI, as a harness definition says, `HarnessConfig`), `claude-cli` (the claude harness under an older name, kept so configs from before keep working), or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). |  |
 | `description` | string |  |  |  |
 | `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
-| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
+| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the harness engine's `HarnessConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
 
 <a id="schema-accelerator"></a>
 

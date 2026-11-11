@@ -104,6 +104,7 @@ const bodies = {
   // a request no ledger holds: the run answers it refused, by why
   runAnnotations: { request_ids: ['resp_01j8z3q4v7m2k9x0'] },
   runAnnotation: {},
+  createAttempt: { repo: 'https://forge.example.com/team/app.git', base: 'main', instruction: 'Add a test.', as: { name: 'Live', email: 'live@example.com' } },
   setToolSettings: { web_fetch: { enabled: true, max_calls: 4, denylist: ['192.0.2.0/24', 'admin.example.com'] } },
 };
 
@@ -123,6 +124,9 @@ const nodeBodies = {
   reportInventory: { blobs: [{ sha256: 'a'.repeat(64), bytes: 4920000000 }, { sha256: 'b'.repeat(64), bytes: 1000 }] },
   // no check holds a rank of this node's: what it reports is dropped
   reportLinkCheck: { id: 'lc-live', ok: true, bus_bytes_per_second: 0 },
+  // no attempt runs on this node: a report of one is answered, and it is told to stop
+  reportAttempt: { events: [] },
+  putAttemptBundle: { bytes: 4, bundle: 'UEFDSw==' },
   nodeDraining: { reason: 'live check' },
 };
 
@@ -144,6 +148,11 @@ const refusals = {
   runAnnotation: { json: [404, 'not_found'] },
   // no two nodes here are cabled to each other: a node's link to itself is refused
   checkNodeLink: { json: [422, 'invalid_request', 'Invalid'] },
+  // the attempt created here is cancelled before it runs: it made no commits
+  getAttemptBundle: { json: [404, 'not_found'] },
+  getAnyAttemptBundle: { json: [404, 'not_found'] },
+  // nor does this node run it, so it holds no bundle of it
+  putAttemptBundle: { json: [404, 'not_found'] },
 };
 
 // the query an operation needs to be answered at all
@@ -155,7 +164,10 @@ for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object
   (m === 'delete' ? last : calls).push([p, m, op]);
 }
 for (const [p, m, op] of [...calls, ...last]) {
-  const code = Object.keys(op.responses).find(c => c.startsWith('2'));
+  // what answers with nothing here, where nothing waits for it: no attempt
+  // is queued for this node's seats when it asks for one
+  const empty = { claimAttempt: '204' };
+  const code = empty[op.operationId] ?? Object.keys(op.responses).find(c => c.startsWith('2'));
   const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]) + (queries[op.operationId] ?? '');
   const content = op.responses[code].content;
   // each plane's credential; an operation that takes none (the probes) is sent none
@@ -205,7 +217,29 @@ for (const [p, m, op] of [...calls, ...last]) {
     n++;
     const body = ['post', 'put'].includes(m) ? JSON.stringify(nodeBodies[op.operationId] ?? {}) : undefined;
     const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...who } : who });
-    if (String(r.status) !== code) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${code}`);
+    const expected = String(refusals[op.operationId]?.json?.[0] ?? code);
+    if (String(r.status) !== expected) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${expected}`);
+    continue;
+  }
+  // a transcript is JSON Lines, a bundle binary: neither JSON nor a stream
+  const other = Object.keys(content).find((t) => t !== 'application/json' && t !== 'text/event-stream');
+  if (other) {
+    n++;
+    const label = `${op.operationId} ${m.toUpperCase()} ${url.slice(base.length)}`;
+    const r = await fetch(url, { headers: who });
+    const text = await r.text();
+    const refusal = refusals[op.operationId]?.json;
+    if (refusal) {
+      if (r.status !== refusal[0] || JSON.parse(text)?.error?.code !== refusal[1]) fail(label, `${r.status} ${text.slice(0, 120)}`);
+      continue;
+    }
+    if (String(r.status) !== code) { fail(label, `status ${r.status} != ${code}: ${text.slice(0, 120)}`); continue; }
+    if (!(r.headers.get('content-type') || '').startsWith(other)) fail(label, `content-type ${r.headers.get('content-type')} != ${other}`);
+    if (p.startsWith('/v1/') && !r.headers.get('x-request-id')) fail(label, 'no X-Request-Id');
+    if (other === 'application/jsonl') {
+      const f = ajv.compile(strip(content[other].schema));
+      for (const l of text.split('\n').filter(Boolean)) if (!f(JSON.parse(l))) fail(label, JSON.stringify(f.errors.slice(0, 3)));
+    }
     continue;
   }
   const variants = content['application/json'] ? (content['text/event-stream'] ? [false, true] : [false]) : [true];
@@ -242,6 +276,8 @@ for (const [p, m, op] of [...calls, ...last]) {
       if (!f(j)) fail(label, JSON.stringify(f.errors.slice(0, 3)));
       // a rotation retires the token the node plane presents
       if (op.operationId === 'rotateNodeToken') nodeAuth = { authorization: `Bearer ${j.enrollment_token}` };
+      // the attempt the attempts' reads, cancel and bundle name
+      if (op.operationId === 'createAttempt') sample.attempt = j.id;
     } else {
       const f = ajv.compile(strip(content[want].schema));
       const datas = text.split('\n\n').map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(Boolean).map(l => l.slice(6));

@@ -103,8 +103,12 @@ fi
 # measures, not what glibc's heap kept of earlier requests (its threshold
 # otherwise rises to the largest block freed, up to 32 MiB, and freed
 # blocks stay resident to be reused, or not, as they fit)
+# the harness definitions voice ships, and the fake harness the attempts
+# case runs (scripts/e2e-harnesses)
+mkdir "$work/harnesses"
+cp harnesses/*.json scripts/e2e-harnesses/fake.json "$work/harnesses/"
 GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1048576 HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
-  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
+  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 --harnesses "$work/harnesses" "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -875,6 +879,94 @@ PY
 echo "a request to a seat at capacity waited $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["voice"]["timing"]["queue_ms"])' "$work/busy-2.json") ms for its slot and was served"
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
+
+# coding attempts (api/attempts.hl, node/attempt.hl): a node with a harness
+# engine runs the fake harness (scripts/e2e-harnesses/fake.json) on a
+# repository served by git daemon. The attempt ends with a bundle that
+# applies on its base and reproduces its head, committed as the caller's
+# identity, its transcript's digest the stored transcript's, its usage in
+# the ledger; a slow one is cancelled; and nothing is left on the node:
+# no container, no network, no workspace. A node that starts removes what
+# an attempt of its own left before.
+GITD_PORT=${GITD_PORT:-14303}
+CODER_PORT=${CODER_PORT:-18110}
+mkdir -p "$work/repos" "$work/seed"
+git -C "$work/seed" init -q -b main
+echo "# demo" >"$work/seed/README.md"
+git -C "$work/seed" add README.md
+git -C "$work/seed" -c user.name=seed -c user.email=seed@example.com commit -qm init
+git clone -q --bare "$work/seed" "$work/repos/demo.git"
+git daemon --reuseaddr --base-path="$work/repos" --export-all --listen=127.0.0.1 --port="$GITD_PORT" "$work/repos" >"$work/gitd.log" 2>&1 &
+pids+=($!)
+printf 'e2e-fake-login-%s' "$RANDOM$RANDOM" >"$work/vault/e2e-fake-login"
+chmod 600 "$work/vault/e2e-fake-login"
+post /admin/v1/models '{"id": "fake-1"}' >/dev/null
+post /admin/v1/accounts '{"id": "coder", "name": "Coder"}' >/dev/null
+coder_token=$(post /admin/v1/nodes '{"id": "coder"}' | field enrollment_token)
+post /admin/v1/nodes/coder/seats '{"id": "fake", "engine": "fake", "account": "coder", "serves": [{"model": "fake-1"}], "config": {"harness": "fake", "login": "e2e-fake-login"}}' >/dev/null
+echo '{"engines": [{"id": "fake", "kind": "harness"}]}' >"$work/coder-caps.json"
+start_coder() {
+  HALE_VAULT_DIR="$work/vault" node/node --id coder --api "$api" --token "$coder_token" --data "$work/coder-data" --capabilities "$work/coder-caps.json" --port "$CODER_PORT" --readings-port "$((CODER_PORT + 1000))" >>"$work/coder.log" 2>&1 &
+  coder_pid=$!
+  pids+=($coder_pid)
+  # its own API answers once it started (and removed what attempts left)
+  for i in $(seq 1 100); do curl -fsS "http://127.0.0.1:${CODER_PORT}/node/v1/status" >/dev/null 2>&1 && break; sleep 0.2; done
+  for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/coder/seats/fake" | field status)" = "up" ] && break; sleep 0.2; done
+}
+start_coder
+printf '%s' "$key" >"$work/key"
+attempt() { curl -fsS -X POST "$api/v1/attempts" -H "authorization: Bearer $key" -H 'content-type: application/json' -d "$1" | field id; }
+attempt_state() { curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key" | field state; }
+until_ended() { for i in $(seq 1 600); do case $(attempt_state "$1") in done|failed|cancelled) return 0;; esac; sleep 0.5; done; echo "attempt $1 did not end"; tail -20 "$work/coder.log"; exit 1; }
+left_on_coder() {
+  docker ps -aq --filter label=net.hale-lang.voice.attempt.node=coder
+  docker network ls -q --filter label=net.hale-lang.voice.attempt.node=coder
+  ls -A "$work/coder-data/attempts"
+}
+done_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"leave-uncommitted: add FAKE.md\", \"as\": {\"name\": \"E2E Author\", \"email\": \"e2e@example.com\"}}")
+until_ended "$done_id"
+curl -fsS "$api/v1/attempts/$done_id" -H "authorization: Bearer $key" >"$work/attempt.json"
+curl -fsS "$api/v1/attempts/$done_id/transcript" -H "authorization: Bearer $key" >"$work/transcript.jsonl"
+curl -fsS "$api/v1/attempts/$done_id/bundle" -H "authorization: Bearer $key" -o "$work/attempt.bundle"
+(cd spec/validate && node attempt.mjs ../../build/openapi.bundled.json "$api" "$work/key" "$done_id")
+git -C "$work/seed" bundle verify -q "$work/attempt.bundle"
+git -C "$work/seed" fetch -q "$work/attempt.bundle" "voice/attempt-$done_id:refs/heads/attempt"
+python3 - "$work/attempt.json" "$work/transcript.jsonl" "$(git -C "$work/seed" rev-parse main)" "$(git -C "$work/seed" rev-parse attempt)" "$(git -C "$work/seed" log -1 --format='%an <%ae>' attempt)" <<'PY'
+import hashlib, json, sys
+a = json.load(open(sys.argv[1]))
+transcript = open(sys.argv[2], 'rb').read()
+base, head, author = sys.argv[3], sys.argv[4], sys.argv[5]
+assert a["state"] == "done", a
+assert a["base_sha"] == base, (a["base_sha"], base)
+assert a["head_sha"] == head, ("the bundle reproduces head_sha", a["head_sha"], head)
+assert author == "E2E Author <e2e@example.com>", author
+assert a["summary"] == "Added FAKE.md", a["summary"]
+assert a["transcript_digest"] == "sha256:" + hashlib.sha256(transcript).hexdigest(), "the digest is the stored transcript's"
+assert a["served"]["seat"] == "fake" and a["served"]["account"] == "coder", a["served"]
+assert a["usage"]["reported"] is False and a["usage"]["input_tokens"] is None, "nothing invented for a harness that reports none"
+PY
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage/$done_id" | python3 -c 'import json,sys; u=json.load(sys.stdin); assert u["endpoint"] == "attempt" and u["conversation"] == u["id"], u'
+[ "$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/attempts/$done_id/bundle" -H "authorization: Bearer $key")" = 404 ] || { echo "a bundle is fetched once"; exit 1; }
+[ -z "$(left_on_coder)" ] || { echo "an attempt left something on its node: $(left_on_coder)"; exit 1; }
+echo "an attempt ran the fake harness: its bundle applies on its base and reproduces $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"][:12])' "$work/attempt.json"), committed as the caller; nothing is left on the node"
+slow_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"slow: add FAKE.md\"}")
+for i in $(seq 1 600); do curl -fsS "$api/v1/attempts/$slow_id/transcript" -H "authorization: Bearer $key" | grep -q 'taking my time' && break; sleep 0.5; done
+curl -fsS -X POST "$api/v1/attempts/$slow_id/cancel" -H "authorization: Bearer $key" >/dev/null
+until_ended "$slow_id"
+[ "$(attempt_state "$slow_id")" = cancelled ] || { echo "a cancelled attempt is cancelled"; exit 1; }
+[ -z "$(left_on_coder)" ] || { echo "a cancelled attempt left something on its node: $(left_on_coder)"; exit 1; }
+echo "a running attempt is cancelled: its container is removed, and nothing is left on the node"
+# a node that starts removes what its attempts left: a container and a
+# network with its label, and a workspace
+kill "$coder_pid"
+wait "$coder_pid" 2>/dev/null || true
+docker network create --internal --label net.hale-lang.voice.attempt.node=coder "voice-e2e-stray-$$" >/dev/null
+docker create --label net.hale-lang.voice.attempt.node=coder --name "voice-e2e-stray-$$" docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc true >/dev/null
+mkdir -p "$work/coder-data/attempts/att_0000stray/work"
+[ -n "$(left_on_coder)" ] || { echo "the strays were not made"; exit 1; }
+start_coder
+[ -z "$(left_on_coder)" ] || { echo "a starting node left an attempt's leftovers: $(left_on_coder)"; exit 1; }
+echo "a starting node removes its attempts' leftovers: containers and networks by label, workspaces by path"
 
 # the node's own API, with its seat, against node.yaml
 (cd spec/validate && node node-live.mjs ../../build/node.bundled.json "http://127.0.0.1:${NODE_PORT}")

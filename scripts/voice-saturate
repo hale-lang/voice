@@ -24,6 +24,13 @@ is measured. With no models named, every chat model the key may use (never
 a decision model: those answer schemas). Each request asks one of a set of
 coding prompts (or --prompt), with `/no_think` added.
 
+A decision model (one whose contract is `decision`) is loaded only when
+named, alone or beside chat models, in either mode: each request is one
+coding question with a choice or yes/no answer schema (--prompt asks a
+yes/no question instead), answered whole, so its row reports decisions a
+second and how many answers came back without a decision, in place of
+tokens.
+
 Per round and per model it prints: requests ok and failed (by status and
 voice's error code: 429 no_capacity, 502, 413, ...), latency and time to
 first token (p50 / p95 / max), output tokens per second, per request and in
@@ -50,6 +57,19 @@ import urllib.request
 from collections import defaultdict
 
 LOCAL_API = "http://127.0.0.1:8080"
+
+# questions a decision model answers: the text and its choices ("" asks
+# yes or no)
+DECISIONS = [
+    ("How risky is merging a schema migration on a Friday afternoon?", "low,medium,high"),
+    ("Is a mutex or a channel the better fit for a counter several goroutines bump?", "mutex,channel"),
+    ("Should a 400-line function that parses, validates and writes a file be split?", ""),
+    ("Which review comment matters most: a missing test, a typo, or a slow loop?", "missing test,typo,slow loop"),
+    ("Does an unbounded retry loop on a 500 need a backoff?", ""),
+    ("Which belongs in a commit message: what changed, why, or the ticket number?", "what changed,why,ticket number"),
+]
+# decision models among those served, by id (main fills it)
+DECIDES = set()
 
 PROMPTS = [
     "Write a Python function that parses an ISO 8601 duration like 'PT1H30M5S' into seconds, with tests.",
@@ -145,16 +165,63 @@ def concurrency_range(spec):
 
 
 class Result:
-    __slots__ = ("model", "ok", "status", "code", "ttft", "latency", "tokens", "finish")
+    __slots__ = ("model", "ok", "status", "code", "ttft", "latency", "tokens", "finish", "undecided")
 
     def __init__(self, model):
         self.model, self.ok, self.status, self.code = model, False, 0, ""
         self.ttft = self.latency = None
         self.tokens = 0
         self.finish = ""
+        self.undecided = False
+
+
+def one_decision(api, auth, model, prompt, timeout):
+    res = Result(model)
+    text, choices = (prompt, "") if prompt else random.choice(DECISIONS)
+    if choices:
+        answer = {"type": "string", "enum": choices.split(","), "description": text}
+    else:
+        answer = {"type": "boolean", "description": text}
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": text}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "decide",
+            "schema": {"type": "object", "properties": {"answer": answer}, "required": ["answer"]},
+        }},
+    }).encode()
+    req = urllib.request.Request(
+        api + "/v1/chat/completions", data=body, method="POST",
+        headers={"Authorization": auth, "Content-Type": "application/json"},
+    )
+    start = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            res.status = r.status
+            reply = json.loads(r.read().decode("utf-8", "replace"))
+        res.ttft = time.monotonic() - start  # answered whole: its first byte is its last
+        res.ok = True
+        # an answer without voice's decision is a reply, not a decision
+        res.undecided = not ((reply.get("voice") or {}).get("decision") or {}).get("answer")
+        res.tokens = (reply.get("usage") or {}).get("completion_tokens") or 0
+    except urllib.error.HTTPError as e:
+        res.status = e.code
+        try:
+            err = json.loads(e.read().decode("utf-8", "replace"))
+            err = err.get("error") or err.get("refusal") or {}
+            res.code = str(err.get("code") or err.get("kind") or err.get("type") or "")
+        except Exception:
+            pass
+    except Exception as e:  # a reset, a timeout, voice gone
+        res.code = type(e).__name__
+    res.latency = time.monotonic() - start
+    return res
 
 
 def one_request(api, auth, model, prompt, max_tokens, timeout):
+    if model in DECIDES:
+        # a coding prompt is the chat models'; --prompt is asked yes or no
+        return one_decision(api, auth, model, "" if prompt in PROMPTS else prompt, timeout)
     res = Result(model)
     body = json.dumps({
         "model": model,
@@ -376,6 +443,22 @@ def report(results, wall, models):
         ttft = [r.ttft for r in ok if r.ttft is not None]
         per_req = [r.tokens / (r.latency - (r.ttft or 0)) for r in ok if r.tokens and r.latency > (r.ttft or 0)]
         agg = sum(r.tokens for r in ok) / wall if wall else 0
+        if m in DECIDES:
+            print(
+                f"  {m:<34} {len(ok):>5} {len(rs) - len(ok):>5}  "
+                f"{fmt_s(pct(lat, 50)) + '/' + fmt_s(pct(lat, 95)) + '/' + fmt_s(max(lat) if lat else None):<24} "
+                f"{'(answered whole)':<16}{len(ok) / wall if wall else 0:>9.1f} decisions/s"
+            )
+            undecided = sum(1 for r in ok if r.undecided)
+            if undecided:
+                print(f"      {undecided} of {len(ok)} ok came back without a decision (no voice.decision.answer)")
+            fails = defaultdict(int)
+            for r in rs:
+                if not r.ok:
+                    fails[f"{r.status or '-'} {r.code or 'error'}"] += 1
+            for why, k in sorted(fails.items(), key=lambda kv: -kv[1]):
+                print(f"      {k} × {why}")
+            continue
         print(
             f"  {m:<34} {len(ok):>5} {len(rs) - len(ok):>5}  "
             f"{fmt_s(pct(lat, 50)) + '/' + fmt_s(pct(lat, 95)) + '/' + fmt_s(max(lat) if lat else None):<24} "
@@ -405,6 +488,7 @@ def main():
     except Exception as e:
         sys.exit(f"voice-saturate: {api}/v1/models did not answer: {e}")
     chat = [m["id"] for m in served if (m.get("voice") or {}).get("contract") != "decision"]
+    DECIDES.update(m["id"] for m in served if (m.get("voice") or {}).get("contract") == "decision")
     rates = []
     for spec in args.models:
         name, sep, rate = spec.rpartition(":")

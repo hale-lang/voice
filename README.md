@@ -130,7 +130,10 @@ caller does, with a project key. Each takes `--help`.
   tokens per second, and answers cut at max tokens. `model:RATE` sends a
   fixed rate whether or not voice keeps up (capped by `--max-inflight`);
   `-c N` or `-c MIN-MAX` keeps that many in flight; `--sweep 1,2,4,8
-  --csv curve.csv` measures one model at a time at each concurrency.
+  --csv curve.csv` measures one model at a time at each concurrency. A
+  decision model is loaded only when named: it is asked coding questions
+  with a choice or yes/no schema, and its row reports decisions a second
+  and any answer that came back without a decision.
 
 ```sh
 export VOICE_API=http://voice.example:8080   # or pass --local for http://127.0.0.1:8080

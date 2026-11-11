@@ -1,0 +1,1120 @@
+// A coding attempt, run (../spec/openapi.yaml, tag `attempts`): one run of
+// an agentic coding harness on a repository, the same wrapper for every
+// harness, which is data (lib/harness, ../harnesses/). The plane asks the
+// api for an attempt when a slot is free (plane.hl, `claim`), and hands it
+// to a slot of its own, each its own thread (`ATTEMPT_SLOTS`), which:
+//
+//   1. checks out `repo` at `base` into the attempt's directory on the
+//      node, `attempts/<id>`: a bare repository voice keeps (`push.git`),
+//      and a clone of it on the attempt's branch, the workspace (`work`);
+//   2. builds the harness's image once per definition (its base, pinned
+//      by digest, with the CLI installed as the definition says), and
+//      starts the attempt's egress: a network of its own with no route
+//      out, and a proxy on it that lets through only the hosts the
+//      definition, the common package registries and the seat allow;
+//   3. runs the harness in a container of its own: the workspace mounted
+//      and nothing else of the machine (no home, no other credential), as
+//      the node's user, every capability dropped, its login in its
+//      environment (from the vault, read into the container's environment
+//      by a shell, never an argv) or a scratch copy of the login's
+//      directory, under the CLI's own permission policy (no bypass flag),
+//      its output read as it comes (readers.hl), within its idle and total
+//      limits;
+//   4. commits what the harness left uncommitted, as the caller's identity,
+//      in a container too, with no network, since the workspace's git
+//      configuration is the harness's to have written;
+//   5. takes the branch's commits into the bare repository (a fetch from
+//      the workspace, run by voice outside the container under no
+//      configuration of the workspace's), and exports them from the
+//      base as a git bundle, which the api holds for the caller;
+//   6. removes everything it made, whatever happened: the containers, the
+//      network, and the attempt's directory with the workspace and the
+//      login's scratch copy, after copying back a login file the CLI
+//      refreshed.
+//
+// It reports to the api every couple of seconds (`reportAttempt`), which
+// answers whether to stop: a cancel, or the attempt no longer the node's.
+
+/// The attempts a node runs at once: its threads (main.hl's `attempters`
+/// replicas, which must match). Each seat runs at most its concurrency.
+const ATTEMPT_SLOTS: Int = 4;
+
+/// How often a running attempt reports, at most, in ns.
+const REPORT_EVERY_NS: Int = 2000000000;
+
+/// The most events a report carries.
+const REPORT_EVENTS: Int = 400;
+
+/// The label every container and network of an attempt carries, its node
+/// the value: what a starting node removes (`clean_attempts`).
+const ATTEMPT_LABEL: String = "net.hale-lang.voice.attempt.node";
+
+/// Where the attempt's egress proxy listens on its network.
+const EGRESS_PORT: Int = 8888;
+
+/// The proxy every attempt's egress runs: tinyproxy on Alpine 3.20, pinned
+/// by digest, built once per node.
+const EGRESS_BASE: String = "docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc";
+const EGRESS_INSTALL: String = "apk add --no-cache tinyproxy";
+
+/// The environment every git command voice runs itself has: no system or
+/// user configuration, no prompt, and no ssh; with its home the attempt's
+/// own empty directory (`git`), no credential of the node's user (a netrc,
+/// a credential helper) is offered to the repository's host.
+const GIT_ENV: String = "GIT_CONFIG_NOSYSTEM=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_TERMINAL_PROMPT=0\nGIT_ASKPASS=/bin/false\nSSH_ASKPASS=/bin/false\nGIT_SSH_COMMAND=/bin/false\nGIT_ALLOW_PROTOCOL=http:https:git:file";
+
+/// The workspace is the container's own to commit in, whoever the
+/// container's mount says owns it (Docker Desktop shows a bind mount's root
+/// as root's): git's `safe.directory`, given as git's environment.
+const SAFE_WORK: String = "-e\nGIT_CONFIG_COUNT=1\n-e\nGIT_CONFIG_KEY_0=safe.directory\n-e\nGIT_CONFIG_VALUE_0=/work\n";
+
+/// An attempt handed to a slot: its start, as the api answered the claim.
+type AttemptWork { slot: Int = 0; start: String = ""; }
+
+topic AttemptJob { payload: AttemptWork; keyed_by slot; }
+
+/// A slot is free again.
+type AttemptFreed { slot: Int = 0; id: String = ""; }
+
+topic AttemptDone { payload: AttemptFreed; }
+
+/// An attempt's start (`AttemptStart` in the contract), read.
+type AttemptStart {
+    id: String = "";
+    seat: String = "";
+    repo: String = "";
+    base: String = "";
+    branch: String = "";
+    instruction: String = "";
+    model: String = "";
+    login: String = "";
+    budget_tokens: Int = 0;
+    // unix seconds
+    deadline: Int = 0;
+    name: String = "";
+    email: String = "";
+    egress: String = "";
+    definition: String = "";
+    problem: String = "";
+}
+
+/// The attempt `start` (the claim's answer) names, read and checked: a
+/// problem when it is not one this node runs.
+@unbounded
+fn attempt_start(start: String) -> AttemptStart {
+    let a = std::json::find_field_raw(start, "attempt");
+    let as_ = std::json::find_field_raw(a, "as");
+    let def = std::str::trim(std::json::find_field_raw(a, "harness"));
+    let mut s = AttemptStart {
+        id: harness::text_of(a, "id"),
+        seat: harness::text_of(a, "seat"),
+        repo: harness::text_of(a, "repo"),
+        base: harness::text_of(a, "base"),
+        branch: harness::text_of(a, "branch"),
+        instruction: harness::text_of(a, "instruction"),
+        model: harness::text_of(a, "model"),
+        login: harness::text_of(a, "login"),
+        budget_tokens: std::json::find_int_field(a, "budget_tokens"),
+        deadline: std::json::find_int_field(a, "deadline"),
+        name: harness::text_of(as_, "name"),
+        email: harness::text_of(as_, "email"),
+        egress: harness::lines_of(std::json::find_field_raw(a, "egress")),
+        definition: def,
+    };
+    if !attempt_id(s.id) {
+        s.problem = "the attempt's id is not one voice makes";
+        return s;
+    }
+    s.problem = harness::harness_problem(def);
+    if len(s.problem) > 0 {
+        s.problem = "its harness is not one this node runs: " + s.problem;
+        return s;
+    }
+    if std::str::starts_with(s.egress, "!") { s.problem = "its egress is not a list of hosts"; }
+    let lower = std::str::lower(s.repo);
+    if std::str::contains(s.repo, "\n")
+        || !(std::str::starts_with(lower, "https://") || std::str::starts_with(lower, "http://")
+                || std::str::starts_with(lower, "git://"))
+    {
+        s.problem = "its repository is not one voice fetches (https, http or git)";
+    }
+    if len(s.base) == 0 || std::str::starts_with(s.base, "-") || std::str::contains(s.base, "\n") {
+        s.problem = "its base is not a ref";
+    }
+    if !std::str::starts_with(s.branch, "voice/attempt-") || std::str::contains(s.branch, "..") {
+        s.problem = "its branch is not voice's";
+    }
+    if len(s.name) == 0 || len(s.email) == 0 || std::str::contains(s.name + s.email, "\n") {
+        s.problem = "it names no identity to commit as";
+    }
+    let d = harness::harness_def(def);
+    if d.login_kind == "home" && !harness::slug(s.login) {
+        s.problem = "its login is not the name of a login directory";
+    } else if d.login_kind == "env" && !std::secret::vault_name_is_safe(s.login) {
+        s.problem = "its login is not a vault entry's name";
+    }
+    if std::str::contains(s.model, "\n") { s.problem = "its model is not a name"; }
+    return s;
+}
+
+/// `att_` and hex, as the api makes them: safe in a path and a name.
+fn attempt_id(id: String) -> Bool {
+    if !std::str::starts_with(id, "att_") || len(id) < 8 || len(id) > 64 { return false; }
+    let v = std::str::bytes_view(id);
+    let mut i = 4;
+    while i < len(id) {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 122)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The image a definition runs in, built once on the node from its base
+/// and its install: named for both, so a changed definition builds anew.
+fn image_tag(prefix: String, base: String, install: String) -> String {
+    let digest = std::hex::encode(
+        std::crypto::sha256(std::bytes::from_string(base + "\n" + install)),
+    );
+    return prefix + ":" + digest[0..16];
+}
+
+/// The Dockerfile of an image built from `base` with `install` run on it.
+fn dockerfile(base: String, install: String) -> String {
+    return "FROM " + base + "\nRUN " + install + "\n";
+}
+
+/// The egress proxy's filter: one extended regular expression a line, a
+/// host whole or (`.example.com`) any host under a domain.
+@bounded_by(hosts)
+fn egress_filter(hosts: String) -> String {
+    let mut out = "";
+    let mut rest = hosts;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let h = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if len(h) == 0 { continue; }
+        let under = std::str::starts_with(h, ".");
+        let host = std::str::replace(if under { h[1..len(h)] } else { h }, ".", "\\.");
+        out = out + (if under { "^(.+\\.)?" + host + "$" } else { "^" + host + "$" }) + "\n";
+    }
+    return out;
+}
+
+/// The egress proxy's configuration: it denies every host its filter does
+/// not name, and tunnels only to the web's ports.
+fn egress_config() -> String {
+    return "Port " + to_string(EGRESS_PORT)
+        + "\nListen 0.0.0.0\nTimeout 600\nMaxClients 64\nLogLevel Notice\nFilter \"/etc/voice-egress/filter\"\nFilterType ere\nFilterDefaultDeny Yes\nFilterURLs No\nConnectPort 443\nConnectPort 80\n";
+}
+
+/// The container names an attempt runs under.
+fn harness_name(id: String) -> String { return "voice-attempt-" + id; }
+fn commit_name(id: String) -> String { return "voice-attempt-" + id + "-commit"; }
+fn egress_name(id: String) -> String { return "voice-attempt-" + id + "-egress"; }
+
+/// The harness's `docker run`, newline-separated, from `def` for attempt
+/// `a`, in `dir`, under the node's `owner` label, as `user` (uid:gid),
+/// in `image`. Credentials are never here: a login from the vault is
+/// passed by name (`-e NAME`), its value in the docker client's own
+/// environment (`harness_argv`); a login directory is a mount of the
+/// attempt's scratch copy.
+@unbounded
+fn docker_run_argv(
+    def: harness::HarnessDef,
+    a: AttemptStart,
+    dir: String,
+    owner: String,
+    user: String,
+    image: String
+) -> String {
+    let proxy = "http://" + egress_name(a.id) + ":" + to_string(EGRESS_PORT);
+    let mut argv = "docker\nrun\n--rm\n-i\n--name\n" + harness_name(a.id) + "\n--label\n"
+        + OWNER_LABEL
+        + "=" + owner + "\n--label\n" + ATTEMPT_LABEL + "=" + owner + "\n--network\n"
+        + harness_name(a.id) + "\n--user\n" + user
+        + "\n--cap-drop\nALL\n--security-opt\nno-new-privileges\n--pids-limit\n4096\n--tmpfs\n/home/voice:rw,exec,mode=1777\n--tmpfs\n/tmp:rw,exec,mode=1777\n-e\nHOME=/home/voice\n-w\n/work\n-v\n"
+        + dir + "/work:/work:rw\n-v\n" + dir + "/voice:/voice:ro\n-v\n" + dir
+        + "/out:/voice/out:rw\n-e\nHTTPS_PROXY=" + proxy + "\n-e\nHTTP_PROXY=" + proxy
+        + "\n-e\nhttps_proxy=" + proxy + "\n-e\nhttp_proxy=" + proxy
+        + "\n-e\nNO_PROXY=localhost,127.0.0.1\n-e\nno_proxy=localhost,127.0.0.1\n-e\nGIT_AUTHOR_NAME="
+        + a.name + "\n-e\nGIT_AUTHOR_EMAIL=" + a.email + "\n-e\nGIT_COMMITTER_NAME=" + a.name
+        + "\n-e\nGIT_COMMITTER_EMAIL=" + a.email + "\n" + SAFE_WORK;
+    // a CLI that sandboxes its own commands (codex's workspace-write, under
+    // bubblewrap) makes a user namespace, which docker's default seccomp
+    // profile refuses: the container keeps every other bound
+    if def.nested_sandbox { argv = argv + "--security-opt\nseccomp=unconfined\n"; }
+    if def.login_kind == "home" {
+        argv = argv + "-v\n" + dir + "/login:" + def.login_mount + ":rw\n";
+        if len(def.login_env) > 0 {
+            argv = argv + "-e\n" + def.login_env + "=" + def.login_mount + "\n";
+        }
+    } else {
+        argv = argv + "-e\n" + def.login_env + "\n";
+    }
+    let mut env = def.env;
+    while len(env) > 0 {
+        let nl = std::str::index_of(env, "\n");
+        argv = argv + "-e\n" + env[0..nl] + "\n";
+        env = env[(nl + 1)..len(env)];
+    }
+    if len(a.model) > 0 && len(def.model_env) > 0 {
+        argv = argv + "-e\n" + def.model_env + "=" + a.model + "\n";
+    }
+    argv = argv + image + "\n" + def.command;
+    if len(a.model) > 0 && len(def.model_flag) > 0 {
+        argv = argv + def.model_flag + "\n" + a.model + "\n";
+    }
+    if def.via == "argument" { argv = argv + instruction_of(def, a) + "\n"; }
+    return argv;
+}
+
+/// What the harness is told: its definition's preamble, then the caller's
+/// instruction. As an argument it is one line.
+fn instruction_of(def: harness::HarnessDef, a: AttemptStart) -> String {
+    let text = def.preamble + "\n\n" + a.instruction;
+    return if def.via == "argument" { std::str::replace(text, "\n", " ") } else { text };
+}
+
+/// The whole argv of the harness's run: for a login from the vault, a
+/// shell that reads the login from `secret` (a private file the sealed
+/// credential wrote) into the variable the definition names, removes the
+/// file, and starts `docker run`, which passes the variable on by name.
+fn harness_argv(def: harness::HarnessDef, run: String, secret: String) -> String {
+    if def.login_kind != "env" { return run; }
+    return "sh\n-c\n" + def.login_env + "=\"$(cat \"$1\")\"; rm -f \"$1\"; export " + def.login_env
+        + "; shift; exec \"$@\"\nsh\n" + secret + "\n" + run;
+}
+
+/// How one command went.
+type Ran {
+    code: Int = -1;
+    out: String = "";
+    err: String = "";
+    // it was stopped: cancelled, past its deadline or limit, or the node stopping
+    stopped: Bool = false;
+}
+
+/// A slot attempts run on, one at a time, each in an `AttemptRun` of its
+/// own, which goes with all it held when the attempt ends.
+locus Attempter {
+    params {
+        // the node's id, its data directory, and the api's node plane
+        node: String = "";
+        data: String = "node-data";
+        api: String = "";
+        token: String = "";
+        credential: std::secret::Credential = std::secret::Credential { };
+        work: AttemptWork = AttemptWork { };
+        waiting: Bool = false;
+    }
+
+    bus {
+        subscribe AttemptJob as on_job where key == replica;
+        publish AttemptDone;
+    }
+
+    run() {
+        while !self.draining {
+            if self.waiting {
+                self.waiting = false;
+                self.go(self.work);
+            } else {
+                std::time::sleep(200ms);
+            }
+        }
+    }
+
+    fn on_job(w: AttemptWork) {
+        self.work = w;
+        self.waiting = true;
+    }
+
+    /// Run the attempt `w` hands this slot, and free the slot.
+    fn go(w: AttemptWork) {
+        let r = AttemptRun {
+            node: self.node,
+            data: self.data,
+            api: self.api,
+            token: self.token,
+            credential: self.credential,
+        };
+        let id = r.go(w.start, self);
+        AttemptDone <- AttemptFreed { slot: w.slot, id: id };
+    }
+}
+
+/// One attempt, run end to end: what it holds goes with it.
+locus AttemptRun {
+    params {
+        node: String = "";
+        data: String = "node-data";
+        api: String = "";
+        token: String = "";
+        credential: std::secret::Credential = std::secret::Credential { };
+        // the attempt, its directory, and how it stands
+        a: AttemptStart = AttemptStart { };
+        dir: String = "";
+        phase: String = "";
+        pending: String = "";
+        pending_n: Int = 0;
+        reported_ns: Int = 0;
+        // why it stops early, "" while it runs
+        stop: String = "";
+        // whether the stop was a cancel
+        cancelled: Bool = false;
+        reader: HarnessReader = HarnessReader { };
+        started_ns: Int = 0;
+    }
+
+    /// Run the attempt `start` names, end to end; its id. `slot` is the
+    /// slot it runs on, whose stop stops it.
+    @unbounded
+    fn go(start: String, slot: Attempter) -> String {
+        self.a = attempt_start(start);
+        self.dir = self.data + "/attempts/" + self.a.id;
+        self.phase = "preparing";
+        self.started_ns = std::time::monotonic_ns();
+        log_info(
+            "attempt started",
+            fields2(std::log::kv("attempt", self.a.id), std::log::kv("seat", self.a.seat)),
+        );
+        if len(self.a.problem) > 0 || !attempt_id(self.a.id) {
+            if attempt_id(self.a.id) { self.finish("failed", self.a.problem, "", "", ""); }
+            return self.a.id;
+        }
+        let def = harness::harness_def(self.a.definition);
+        self.reader = HarnessReader { reader: def.reader };
+        let outcome = self.attempt(def, slot);
+        // whatever happened, nothing of it is left
+        self.clean_up(def);
+        log_info(
+            "attempt ended",
+            fields2(std::log::kv("attempt", self.a.id), std::log::kv("outcome", outcome)),
+        );
+        return self.a.id;
+    }
+
+    /// The attempt's steps; its outcome, reported.
+    @unbounded
+    fn attempt(def: harness::HarnessDef, slot: Attempter) -> String {
+        let made = run_out(
+            "mkdir\n-m\n700\n-p\n" + self.dir + "/voice/out\n" + self.dir + "/out\n" + self.dir
+                + "/egress\n" + self.dir + "/secret\n" + self.dir + "/home",
+        );
+        if !std::io::fs::file_exists(self.dir + "/secret") {
+            return self.finish(
+                "failed",
+                "the attempt's directory could not be made" + made,
+                "",
+                "",
+                "",
+            );
+        }
+        // 1. the repository, at its base
+        self.note("fetching " + self.a.base + " from " + self.a.repo);
+        self.phase = "fetching";
+        let push = self.dir + "/push.git";
+        let init = self.git("init\n--bare\n-q\n" + push, 60, slot);
+        if init.code != 0 {
+            return self.finish(
+                "failed",
+                "git could not start a repository: " + clip(init.err),
+                "",
+                "",
+                "",
+            );
+        }
+        let fetched = self.git(
+            "--git-dir\n" + push + "\nfetch\n--no-tags\n-q\n" + self.a.repo + "\n" + self.a.base,
+            1800,
+            slot,
+        );
+        if self.stopping(slot) { return self.stopped("", ""); }
+        if fetched.code != 0 {
+            return self.finish(
+                "failed",
+                "the repository could not be fetched at " + self.a.base + ": " + clip(fetched.err),
+                "",
+                "",
+                "",
+            );
+        }
+        let base_sha = std::str::trim(
+            self.git("--git-dir\n" + push + "\nrev-parse\nFETCH_HEAD^{commit}", 60, slot).out,
+        );
+        if len(base_sha) < 40 {
+            return self.finish("failed", "the base is not a commit", "", "", "");
+        }
+        self.git(
+            "--git-dir\n" + push + "\nupdate-ref\nrefs/heads/" + self.a.branch + "\n" + base_sha,
+            60,
+            slot,
+        );
+        let cloned = self.git(
+            "clone\n-q\n--no-hardlinks\n--branch\n" + self.a.branch + "\n" + push + "\n" + self.dir
+                + "/work",
+            1800,
+            slot,
+        );
+        if cloned.code != 0 {
+            return self.finish(
+                "failed",
+                "the workspace could not be made: " + clip(cloned.err),
+                base_sha,
+                "",
+                "",
+            );
+        }
+        self.git("-C\n" + self.dir + "/work\nremote\nremove\norigin", 60, slot);
+        self.git("-C\n" + self.dir + "/work\nconfig\nuser.name\n" + self.a.name, 60, slot);
+        self.git("-C\n" + self.dir + "/work\nconfig\nuser.email\n" + self.a.email, 60, slot);
+        self.report_now("", base_sha, "", "");
+        // 2. the images, and the attempt's egress
+        self.phase = "building";
+        let image = image_tag(
+            "voice-harness-" + harness::text_of(self.a.definition, "id"),
+            def.base,
+            def.install,
+        );
+        let built = self.ensure_image(image, def.base, def.install, slot);
+        if len(built) > 0 { return self.finish("failed", built, base_sha, "", ""); }
+        let proxy = image_tag("voice-egress", EGRESS_BASE, EGRESS_INSTALL);
+        let pbuilt = self.ensure_image(proxy, EGRESS_BASE, EGRESS_INSTALL, slot);
+        if len(pbuilt) > 0 { return self.finish("failed", pbuilt, base_sha, "", ""); }
+        if self.stopping(slot) { return self.stopped(base_sha, ""); }
+        let egress = self.start_egress(proxy, slot);
+        if len(egress) > 0 { return self.finish("failed", egress, base_sha, "", ""); }
+        // 3. the harness
+        let login = self.login_ready(def);
+        if len(login) > 0 { return self.finish("failed", login, base_sha, "", ""); }
+        std::io::fs::write_file(
+            self.dir + "/voice/instruction.md",
+            instruction_of(def, self.a),
+        ) or discard;
+        let user = to_string(std::process::uid()) + ":" + std::str::trim(run_out("id\n-g"));
+        let run = docker_run_argv(def, self.a, self.dir, self.node, user, image);
+        let mut argv = run;
+        if def.login_kind == "env" {
+            let c = std::secret::Credential { vault: self.a.login };
+            if !c.ready() {
+                return self.finish(
+                    "failed",
+                    "the node's vault holds no login " + self.a.login + " for this seat",
+                    base_sha,
+                    "",
+                    "",
+                );
+            }
+            if !c.write_private(self.dir + "/secret/login") {
+                return self.finish(
+                    "failed",
+                    "the login could not be written privately for the harness",
+                    base_sha,
+                    "",
+                    "",
+                );
+            }
+            argv = harness_argv(def, run, self.dir + "/secret/login");
+        }
+        self.phase = "running";
+        self.note(
+            "running " + def.name + (if len(def.version) > 0 { " " + def.version } else { "" }),
+        );
+        let ran = self.harness_run(
+            argv,
+            if def.via == "stdin" { instruction_of(def, self.a) } else { "" },
+            def.idle_seconds,
+            slot,
+        );
+        run_out("rm\n-f\n" + self.dir + "/secret/login");
+        if len(def.usage_file) > 0 {
+            let name = def.usage_file[len("/voice/out/")..len(def.usage_file)];
+            self.reader.read_usage_file(std::io::fs::read_file(self.dir + "/out/" + name) or "");
+        }
+        self.copy_login_back(def);
+        if ran.stopped && self.cancelled { return self.stopped(base_sha, ""); }
+        // 4. what it left uncommitted, committed as the caller
+        self.phase = "committing";
+        let summary = self.reader.final_summary();
+        let title = first_line(if len(summary) > 0 { summary } else { self.a.instruction });
+        std::io::fs::write_file(
+            self.dir + "/voice/message",
+            title + "\n\n" + clip_lines(summary),
+        ) or discard;
+        let commit = self.commit_left(image, user, slot);
+        // 5. the branch's commits, taken and bundled
+        let taken = self.git(
+            "--git-dir\n" + push + "\nfetch\n--no-tags\n-q\n" + self.dir + "/work\nHEAD",
+            600,
+            slot,
+        );
+        if taken.code != 0 {
+            return self.finish(
+                "failed",
+                "the workspace's commits could not be taken: " + clip(taken.err),
+                base_sha,
+                "",
+                summary,
+            );
+        }
+        let head = std::str::trim(
+            self.git("--git-dir\n" + push + "\nrev-parse\nFETCH_HEAD^{commit}", 60, slot).out,
+        );
+        let ancestor = self.git(
+            "--git-dir\n" + push + "\nmerge-base\n--is-ancestor\n" + base_sha + "\n" + head,
+            60,
+            slot,
+        );
+        if ancestor.code != 0 {
+            return self.finish(
+                "failed",
+                "the harness's commits do not build on the base",
+                base_sha,
+                "",
+                summary,
+            );
+        }
+        self.git(
+            "--git-dir\n" + push + "\nupdate-ref\nrefs/heads/" + self.a.branch + "\n" + head,
+            60,
+            slot,
+        );
+        let why = if ran.stopped {
+            self.stop
+        } else if ran.code != 0 {
+            "the harness exited with code " + to_string(ran.code) + tail_of(ran.err)
+        } else if len(self.reader.failure) > 0 {
+            self.reader.failure
+        } else if len(commit) > 0 {
+            commit
+        } else if head == base_sha {
+            "the harness made no change"
+        } else {
+            ""
+        };
+        if head != base_sha {
+            let bundled = self.bundle(push, base_sha, slot);
+            if len(bundled) > 0 { return self.finish("failed", bundled, base_sha, head, summary); }
+        }
+        return self.finish(
+            if len(why) > 0 { "failed" } else { "done" },
+            why,
+            base_sha,
+            head,
+            summary,
+        );
+    }
+
+    /// Run git as voice, under no configuration but the command's.
+    fn git(args: String, timeout_s: Int, slot: Attempter) -> Ran {
+        return self.exec(
+            "git\n-c\ncore.hooksPath=/dev/null\n-c\ncore.fsmonitor=false\n" + args,
+            "",
+            timeout_s,
+            GIT_ENV + "\nHOME=" + self.dir + "/home\nXDG_CONFIG_HOME=" + self.dir + "/home",
+            slot,
+        );
+    }
+
+    /// Run `argv` to its end, or until the attempt stops or `timeout_s`
+    /// passes, reporting meanwhile; its stdout and the tail of its stderr.
+    @unbounded
+    fn exec(argv: String, input: String, timeout_s: Int, env: String, slot: Attempter) -> Ran {
+        let child = std::process::spawn_with(argv, std::process::SpawnOptions { env: env }) or {
+            return Ran { code: 127, err: "could not start " + first_line(argv) };
+        };
+        if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
+        std::process::close_stdin(child);
+        let until = std::time::monotonic_ns() + timeout_s * 1000000000;
+        let mut out = "";
+        let mut err = "";
+        while true {
+            let o = std::process::read_stdout(child) or "";
+            if len(o) > 0 && len(out) < 1048576 { out = out + o; }
+            let e = std::process::read_stderr(child) or "";
+            if len(e) > 0 { err = keep_tail(err + e, 8192); }
+            let c = std::process::try_wait(child) or - 1;
+            if c != -2 {
+                out = out + (std::process::read_stdout(child) or "");
+                err = keep_tail(err + (std::process::read_stderr(child) or ""), 8192);
+                return Ran { code: c, out: out, err: err };
+            }
+            if self.stopping(slot) || std::time::monotonic_ns() > until {
+                std::process::kill(child) or discard;
+                return Ran { code: -1, out: out, err: err, stopped: true };
+            }
+            std::time::sleep(50ms);
+        }
+        return Ran { };
+    }
+
+    /// The harness's run: its output read line by line as it comes, the
+    /// container removed when the attempt stops, falls silent past its
+    /// idle limit, or passes its budget.
+    @unbounded
+    fn harness_run(argv: String, input: String, idle_s: Int, slot: Attempter) -> Ran {
+        let child = std::process::spawn_with(argv, std::process::SpawnOptions { }) or {
+            return Ran { code: 127, err: "docker could not be started" };
+        };
+        if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
+        std::process::close_stdin(child);
+        let mut heard = std::time::monotonic_ns();
+        let mut raw = "";
+        let mut err = "";
+        while true {
+            let o = std::process::read_stdout(child) or "";
+            if len(o) > 0 {
+                heard = std::time::monotonic_ns();
+                raw = raw + o;
+                let mut nl = std::str::index_of(raw, "\n");
+                while nl >= 0 {
+                    self.add(self.reader.feed(raw[0..nl]));
+                    raw = raw[(nl + 1)..len(raw)];
+                    nl = std::str::index_of(raw, "\n");
+                }
+            }
+            let e = std::process::read_stderr(child) or "";
+            if len(e) > 0 { err = keep_tail(err + e, 8192); }
+            let c = std::process::try_wait(child) or - 1;
+            if c != -2 {
+                raw = raw + (std::process::read_stdout(child) or "");
+                self.feed_rest(raw);
+                err = keep_tail(err + (std::process::read_stderr(child) or ""), 8192);
+                return Ran { code: c, err: err };
+            }
+            if self.a.budget_tokens > 0 && self.reader.has_usage
+                && self.reader.input_tokens + self.reader.output_tokens > self.a.budget_tokens
+                && len(self.stop) == 0
+            {
+                self.stop = "the harness used more than its budget of "
+                    + to_string(self.a.budget_tokens) + " tokens";
+            }
+            if len(self.stop) == 0 && (std::time::monotonic_ns() - heard) / 1000000000 > idle_s {
+                self.stop = "the harness was silent for more than " + to_string(idle_s) + " s";
+            }
+            if self.stopping(slot) {
+                run_out("docker\nrm\n-f\n" + harness_name(self.a.id));
+                std::process::kill(child) or discard;
+                return Ran { code: -1, err: err, stopped: true };
+            }
+            std::time::sleep(20ms);
+        }
+        return Ran { };
+    }
+
+    /// Every line left in `raw`, read.
+    @unbounded
+    fn feed_rest(raw: String) {
+        let mut rest = raw;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+            self.add(self.reader.feed(line));
+        }
+    }
+
+    /// Whether the attempt is to stop now: cancelled, past its deadline,
+    /// stopped by a limit, or the node stopping. Reports when it is time.
+    fn stopping(slot: Attempter) -> Bool {
+        if std::time::monotonic_ns() - self.reported_ns >= REPORT_EVERY_NS
+            || self.pending_n >= REPORT_EVENTS
+        {
+            self.report_now("", "", "", "");
+        }
+        if len(self.stop) > 0 { return true; }
+        if slot.draining {
+            self.stop = "the node stopped while it ran";
+        } else if std::time::unix(std::time::current()) >= self.a.deadline {
+            self.stop = "it passed its deadline";
+        }
+        return len(self.stop) > 0;
+    }
+
+    /// Events to report.
+    @unbounded
+    fn add(lines: String) {
+        if len(lines) == 0 { return; }
+        self.pending = self.pending + lines;
+        self.pending_n = self.pending_n + count_lines(lines);
+    }
+
+    /// One of voice's own lines in the transcript.
+    fn note(text: String) { self.add(event_line("note", text)); }
+
+    /// `POST /node/v1/attempts/{id}/report`: the events waiting, and the
+    /// fields given; a cancel in the answer stops the attempt.
+    @unbounded
+    fn report_now(state: String, base_sha: String, head_sha: String, extra: String) {
+        self.reported_ns = std::time::monotonic_ns();
+        let events = std::str::replace(std::str::trim(self.pending), "\n", ", ");
+        self.pending = "";
+        self.pending_n = 0;
+        let body = "{\"phase\": " + q(self.phase) + ", \"harness\": "
+            + q(harness::text_of(self.a.definition, "id")) + ", \"events\": [" + events + "]"
+            + (if len(state) > 0 { ", \"state\": " + q(state) } else { "" })
+            + (if len(base_sha) > 0 { ", \"base_sha\": " + q(base_sha) } else { "" })
+            + (if len(head_sha) > 0 { ", \"head_sha\": " + q(head_sha) } else { "" })
+            + (if self.reader.has_usage {
+                ", \"usage\": {\"input_tokens\": " + to_string(self.reader.input_tokens)
+                    + ", \"output_tokens\": " + to_string(self.reader.output_tokens) + "}"
+            } else {
+                ""
+            }) + ", \"wall_ms\": "
+            + to_string((std::time::monotonic_ns() - self.started_ns) / 1000000)
+            + extra + "}";
+        let resp = self.call("POST", "/node/v1/attempts/" + self.a.id + "/report", body);
+        if resp.status == 200
+            && std::json::find_bool_field(std::str::from_bytes(resp.body), "cancel")
+        {
+            if len(self.stop) == 0 && len(state) == 0 {
+                self.cancelled = true;
+                self.stop = "it was cancelled";
+            }
+        }
+    }
+
+    /// The attempt's end, reported (state, failure, commits, summary), and
+    /// told back as the outcome.
+    fn finish(
+        state: String,
+        failure: String,
+        base_sha: String,
+        head_sha: String,
+        summary: String
+    ) -> String {
+        if len(failure) > 0 { self.add(event_line("error", failure)); }
+        self.phase = "";
+        self.report_now(
+            state,
+            base_sha,
+            head_sha,
+            (if len(failure) > 0 { ", \"failure\": " + q(failure) } else { "" })
+                + (if len(summary) > 0 { ", \"summary\": " + q(summary) } else { "" }),
+        );
+        return state;
+    }
+
+    /// An attempt stopped before its harness's commits were taken.
+    fn stopped(base_sha: String, head_sha: String) -> String {
+        if self.cancelled { return self.finish("cancelled", "", base_sha, head_sha, ""); }
+        return self.finish("failed", self.stop, base_sha, head_sha, "");
+    }
+
+    /// The image `tag`, built from `base` with `install` when the node has
+    /// none of that name; "" when it is there, else why not.
+    fn ensure_image(tag: String, base: String, install: String, slot: Attempter) -> String {
+        let has = std::process::run(
+            "docker\nimage\ninspect\n--format\n{{.Id}}\n" + tag,
+        ) or std::process::ProcessOutput {
+            code: 127,
+            signal: 0,
+            stdout: "",
+            stderr: "",
+        };
+        if has.code == 0 { return ""; }
+        if has.code == 127 { return "this node has no docker: attempts run in a container"; }
+        self.note("building " + tag);
+        let b = self.exec(
+            "docker\nbuild\n-q\n-t\n" + tag + "\n--label\nnet.hale-lang.voice.image=harness\n-",
+            dockerfile(base, install),
+            2400,
+            "",
+            slot,
+        );
+        if b.code != 0 {
+            return if b.stopped {
+                self.stop
+            } else {
+                "the image " + tag + " could not be built: " + clip(b.err)
+            };
+        }
+        return "";
+    }
+
+    /// The attempt's network, with no route out, and its egress proxy on
+    /// it and on docker's own bridge: "" when they run, else why not.
+    @unbounded
+    fn start_egress(proxy: String, slot: Attempter) -> String {
+        // the api's list holds the definition's hosts, the registries and the
+        // seat's
+        let hosts = self.a.egress;
+        std::io::fs::write_file(self.dir + "/egress/filter", egress_filter(hosts)) or discard;
+        std::io::fs::write_file(self.dir + "/egress/tinyproxy.conf", egress_config()) or discard;
+        run_out("chmod\n755\n" + self.dir + "/egress");
+        run_out(
+            "chmod\n644\n" + self.dir + "/egress/filter\n" + self.dir + "/egress/tinyproxy.conf",
+        );
+        let net = self.exec(
+            "docker\nnetwork\ncreate\n--internal\n--label\n" + ATTEMPT_LABEL + "=" + self.node
+                + "\n"
+                + harness_name(self.a.id),
+            "",
+            60,
+            "",
+            slot,
+        );
+        if net.code != 0 { return "the attempt's network could not be made: " + clip(net.err); }
+        let p = self.exec(
+            "docker\nrun\n-d\n--name\n" + egress_name(self.a.id) + "\n--label\n" + OWNER_LABEL + "="
+                + self.node + "\n--label\n" + ATTEMPT_LABEL + "=" + self.node
+                + "\n--user\n65534:65534\n--cap-drop\nALL\n--security-opt\nno-new-privileges\n-v\n"
+                + self.dir + "/egress:/etc/voice-egress:ro\n" + proxy
+                + "\ntinyproxy\n-d\n-c\n/etc/voice-egress/tinyproxy.conf",
+            "",
+            120,
+            "",
+            slot,
+        );
+        if p.code != 0 { return "the attempt's egress proxy could not start: " + clip(p.err); }
+        let c = self.exec(
+            "docker\nnetwork\nconnect\n" + harness_name(self.a.id) + "\n" + egress_name(self.a.id),
+            "",
+            60,
+            "",
+            slot,
+        );
+        if c.code != 0 {
+            return "the attempt's egress proxy could not join its network: " + clip(c.err);
+        }
+        self.note("egress: " + std::str::replace(std::str::trim(hosts), "\n", ", "));
+        return "";
+    }
+
+    /// The login a run needs, ready: a vault entry is read later, into the
+    /// run alone; a login directory's files are copied into the attempt's
+    /// scratch copy. "" when it is ready, else why not.
+    @unbounded
+    fn login_ready(def: harness::HarnessDef) -> String {
+        if def.login_kind != "home" { return ""; }
+        let from = self.data + "/logins/" + self.a.login
+            + (if len(def.login_from) > 0 { "/" + def.login_from } else { "" });
+        run_out("mkdir\n-m\n700\n" + self.dir + "/login");
+        let mut files = def.login_files;
+        while len(files) > 0 {
+            let nl = std::str::index_of(files, "\n");
+            let f = files[0..nl];
+            files = files[(nl + 1)..len(files)];
+            if !std::io::fs::file_exists(from + "/" + f) {
+                return "login " + self.a.login + " holds no " + f
+                    + " on this node: set it up as the harness says ("
+                    + harness::text_of(
+                        std::json::find_field_raw(self.a.definition, "login"),
+                        "setup",
+                    )
+                    + ")";
+            }
+            let c = std::process::run(
+                "cp\n-p\n" + from + "/" + f + "\n" + self.dir + "/login/" + f,
+            ) or std::process::ProcessOutput {
+                code: 1,
+                signal: 0,
+                stdout: "",
+                stderr: "",
+            };
+            if c.code != 0 { return "login " + self.a.login + "'s " + f + " could not be copied"; }
+        }
+        return "";
+    }
+
+    /// A login file the CLI refreshed in its scratch copy, put back in the
+    /// login's directory (a new file, renamed over the old one).
+    @unbounded
+    fn copy_login_back(def: harness::HarnessDef) {
+        if def.login_kind != "home" { return; }
+        let to = self.data + "/logins/" + self.a.login
+            + (if len(def.login_from) > 0 { "/" + def.login_from } else { "" });
+        let mut files = def.login_files;
+        while len(files) > 0 {
+            let nl = std::str::index_of(files, "\n");
+            let f = files[0..nl];
+            files = files[(nl + 1)..len(files)];
+            let mine = self.dir + "/login/" + f;
+            if std::io::fs::file_exists(mine) {
+                let same = std::process::run(
+                    "cmp\n-s\n" + mine + "\n" + to + "/" + f,
+                ) or std::process::ProcessOutput {
+                    code: 1,
+                    signal: 0,
+                    stdout: "",
+                    stderr: "",
+                };
+                if same.code != 0 {
+                    run_out("cp\n-p\n" + mine + "\n" + to + "/." + f + ".voice-new");
+                    run_out("mv\n-f\n" + to + "/." + f + ".voice-new\n" + to + "/" + f);
+                }
+            }
+        }
+    }
+
+    /// Commit what the harness left in the workspace, as the caller, in a
+    /// container with no network: "" when it went, or there was nothing.
+    fn commit_left(image: String, user: String, slot: Attempter) -> String {
+        let r = self.exec(
+            "docker\nrun\n--rm\n--name\n" + commit_name(self.a.id) + "\n--label\n" + OWNER_LABEL
+                + "="
+                + self.node + "\n--label\n" + ATTEMPT_LABEL + "=" + self.node
+                + "\n--network\nnone\n--user\n"
+                + user
+                + "\n--cap-drop\nALL\n--security-opt\nno-new-privileges\n--tmpfs\n/home/voice:rw,mode=1777\n-e\nHOME=/home/voice\n-w\n/work\n-v\n"
+                + self.dir + "/work:/work:rw\n-v\n" + self.dir
+                + "/voice:/voice:ro\n-e\nGIT_AUTHOR_NAME="
+                + self.a.name + "\n-e\nGIT_AUTHOR_EMAIL=" + self.a.email
+                + "\n-e\nGIT_COMMITTER_NAME="
+                + self.a.name + "\n-e\nGIT_COMMITTER_EMAIL=" + self.a.email + "\n" + SAFE_WORK
+                + image
+                + "\nsh\n-c\nif [ -n \"$(git status --porcelain)\" ]; then git add -A && git -c core.hooksPath=/dev/null commit -q --no-verify -F /voice/message; fi",
+            "",
+            600,
+            "",
+            slot,
+        );
+        if r.stopped { return self.stop; }
+        if r.code != 0 { return "what the harness left could not be committed: " + clip(r.err); }
+        return "";
+    }
+
+    /// The branch's commits from `base_sha`, as a bundle the api holds
+    /// for the caller: "" when it is held, else why not.
+    fn bundle(push: String, base_sha: String, slot: Attempter) -> String {
+        let file = self.dir + "/attempt.bundle";
+        let b = self.git(
+            "--git-dir\n" + push + "\nbundle\ncreate\n-q\n" + file + "\n" + base_sha
+                + "..refs/heads/" + self.a.branch,
+            600,
+            slot,
+        );
+        if b.code != 0 { return "the commits could not be bundled: " + clip(b.err); }
+        let bytes = std::io::fs::read_bytes(file) or b"";
+        if len(bytes) == 0 { return "the bundle could not be read"; }
+        if len(bytes) > 6291456 {
+            return "the commits' bundle is over 6 MiB, the most voice holds";
+        }
+        let body = "{\"bytes\": " + to_string(len(bytes)) + ", \"bundle\": \""
+            + std::text::base64::encode(bytes) + "\"}";
+        let resp = self.call("PUT", "/node/v1/attempts/" + self.a.id + "/bundle", body);
+        if resp.status != 204 {
+            return "the api did not take the bundle (" + to_string(resp.status) + ")";
+        }
+        self.note("bundled the commits from " + base_sha[0..12]);
+        return "";
+    }
+
+    /// Everything the attempt made, removed: its containers (the harness's
+    /// is gone with `--rm` unless it was stopped), its network, and its
+    /// directory with the workspace, the login's scratch copy and the
+    /// bundle.
+    fn clean_up(def: harness::HarnessDef) {
+        run_out(
+            "docker\nrm\n-f\n" + harness_name(self.a.id) + "\n" + commit_name(self.a.id) + "\n"
+                + egress_name(self.a.id),
+        );
+        run_out("docker\nnetwork\nrm\n" + harness_name(self.a.id));
+        if attempt_id(self.a.id) && std::str::ends_with(self.dir, "/attempts/" + self.a.id) {
+            run_out("rm\n-rf\n" + self.dir);
+        }
+    }
+
+    /// One node-plane call; a status of 0 when the api cannot be reached.
+    fn call(method: String, path: String, body: String) -> std::http::ClientResponse {
+        let url = std::http::parse_url(self.api + path) or std::http::Url { };
+        if len(url.host) == 0 { return std::http::ClientResponse { status: 0, body: b"" }; }
+        let client = std::http::Client { timeout_ms: 30000, max_retries: 0 };
+        // the token goes on the wire as it is held (spec/semantics.md, "@sealed")
+        if len(self.token) > 0 {
+            return client.request(
+                std::http::ClientRequest {
+                    method: method,
+                    url: url,
+                    headers: "Authorization: Bearer " + self.token
+                        + "\r\nContent-Type: application/json",
+                    body: std::bytes::from_string(body),
+                },
+            ) or std::http::ClientResponse { status: 0, body: b"" };
+        }
+        return client.request(
+            std::http::ClientRequest {
+                method: method,
+                url: url,
+                headers: "Authorization: Bearer " + self.credential.reveal_text()
+                    + "\r\nContent-Type: application/json",
+                body: std::bytes::from_string(body),
+            },
+        ) or std::http::ClientResponse { status: 0, body: b"" };
+    }
+}
+
+/// The node's attempts left from before it started, removed: every
+/// container and network an attempt of this node made (by its label), and
+/// the directory attempts are run in. No attempt is running yet, so none
+/// of them is held.
+fn clean_attempts(node: String, data: String) {
+    let containers = run_out("docker\nps\n-aq\n--filter\nlabel=" + ATTEMPT_LABEL + "=" + node);
+    remove_each("docker\nrm\n-f\n", containers);
+    let nets = run_out("docker\nnetwork\nls\n-q\n--filter\nlabel=" + ATTEMPT_LABEL + "=" + node);
+    remove_each("docker\nnetwork\nrm\n", nets);
+    if std::io::fs::file_exists(data + "/attempts") { run_out("rm\n-rf\n" + data + "/attempts"); }
+    run_out("mkdir\n-m\n700\n-p\n" + data + "/attempts");
+}
+
+/// `command` run for each id, a line each, in `ids`.
+@bounded_by(ids)
+fn remove_each(command: String, ids: String) {
+    let mut rest = ids;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let id = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if len(id) > 0 { run_out(command + id); }
+    }
+}
+
+/// The last `n` bytes of `s`.
+fn keep_tail(s: String, n: Int) -> String {
+    if len(s) <= n { return s; }
+    let v = std::str::bytes_view(s);
+    let mut from = len(s) - n;
+    while from < len(s) && std::str::byte_at(v, from) >= 128 && std::str::byte_at(v, from) < 192 {
+        from = from + 1;
+    }
+    return s[from..len(s)];
+}
+
+/// A command's stderr, short, for a failure.
+fn clip(s: String) -> String {
+    return harness::clip_utf8(std::str::trim(s), 300);
+}
+
+/// ": " and the end of a harness's stderr, for its failure; "" for none.
+fn tail_of(err: String) -> String {
+    let t = std::str::trim(keep_tail(err, 300));
+    return if len(t) > 0 { ": " + t } else { "" };
+}
+
+/// The first line of `s`, at most 72 bytes.
+fn first_line(s: String) -> String {
+    let t = std::str::trim(s);
+    let nl = std::str::index_of(t, "\n");
+    let line = std::str::trim(if nl < 0 { t } else { t[0..nl] });
+    return harness::clip_utf8(line, 72);
+}
+
+/// `s` with at most 16 KiB of it.
+fn clip_lines(s: String) -> String {
+    return harness::clip_utf8(s, 16384);
+}
+
+/// How many lines `s` holds.
+@bounded_by(s)
+fn count_lines(s: String) -> Int {
+    let v = std::str::bytes_view(s);
+    let mut n = 0;
+    let mut i = 0;
+    while i < v.n {
+        if std::str::byte_at(v, i) == 10 { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}

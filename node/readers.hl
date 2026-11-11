@@ -1,0 +1,290 @@
+// The readers of a harness's output (lib/harness `READERS`): each line the
+// CLI writes, read into transcript events, and what its machine output
+// says of the run: its final summary, its token usage when it reports it,
+// and whether it says the run failed. `text` reads any CLI; the others read
+// the CLI's own JSON lines. Nothing here is invented: a CLI that reports no
+// usage leaves `has_usage` false.
+
+/// The most text an event carries, in bytes.
+const EVENT_TEXT_MAX: Int = 4096;
+
+/// One event as the node plane takes it (`AttemptReport.events`), a line.
+fn event_line(kind: String, text: String) -> String {
+    let t = std::str::trim(text);
+    if len(t) == 0 { return ""; }
+    return "{\"kind\": " + q(kind) + ", \"text\": " + q(harness::clip_utf8(t, EVENT_TEXT_MAX))
+        + "}\n";
+}
+
+/// A JSON value, made short to show in a tool event.
+fn brief(raw: String) -> String {
+    let t = std::str::trim(raw);
+    return if len(t) > 300 { harness::clip_utf8(t, 300) + "…" } else { t };
+}
+
+locus HarnessReader {
+    params {
+        reader: String = "text";
+        // the summary, the last thing the harness said, and agy's text so far
+        summary: String = "";
+        said: String = "";
+        partial: String = "";
+        has_usage: Bool = false;
+        input_tokens: Int = 0;
+        output_tokens: Int = 0;
+        failure: String = "";
+    }
+
+    /// The events for one line of the CLI's output, as `event_line`s.
+    @unbounded
+    fn feed(line: String) -> String {
+        let l = std::str::trim(line);
+        if len(l) == 0 { return ""; }
+        if self.reader == "text" || !std::json::valid_object(l) {
+            self.said = l;
+            return event_line("text", l);
+        }
+        if self.reader == "claude-stream-json" { return self.claude(l); }
+        if self.reader == "codex-jsonl" { return self.codex(l); }
+        if self.reader == "agy-stream-json" { return self.agy(l); }
+        if self.reader == "vibe-streaming" { return self.vibe(l); }
+        return event_line("text", l);
+    }
+
+    /// Text the harness wrote: an event, and the last of it kept.
+    fn text(t: String) -> String {
+        if len(std::str::trim(t)) > 0 { self.said = std::str::trim(t); }
+        return event_line("text", t);
+    }
+
+    /// Claude Code's `--output-format stream-json`.
+    @unbounded
+    fn claude(l: String) -> String {
+        let kind = std::json::find_string_field(l, "type");
+        if kind == "assistant" {
+            let msg = std::json::find_field_raw(l, "message");
+            let mut out = "";
+            let mut it = std::json::array_first(
+                std::str::trim(std::json::find_field_raw(msg, "content")),
+            );
+            while !it.done {
+                let part = std::json::find_string_field(it.element, "type");
+                if part == "text" {
+                    out = out + self.text(std::json::find_string_field(it.element, "text"));
+                } else if part == "tool_use" {
+                    out = out
+                        + event_line(
+                            "tool",
+                            std::json::find_string_field(it.element, "name") + " "
+                                + brief(std::json::find_field_raw(it.element, "input")),
+                        );
+                }
+                it = std::json::array_next(it);
+            }
+            return out;
+        }
+        if kind == "result" {
+            let result = std::json::string_field(l, "result");
+            if result.kind == "string" { self.summary = result.text; }
+            if std::json::find_bool_field(l, "is_error") {
+                self.failure = "claude reported an error: " + harness::clip_utf8(self.summary, 300);
+            }
+            let usage = std::str::trim(std::json::find_field_raw(l, "usage"));
+            if std::str::starts_with(usage, "{") {
+                self.has_usage = true;
+                self.input_tokens = std::json::find_int_field(usage, "input_tokens")
+                    + std::json::find_int_field(usage, "cache_creation_input_tokens")
+                    + std::json::find_int_field(usage, "cache_read_input_tokens");
+                self.output_tokens = std::json::find_int_field(usage, "output_tokens");
+            }
+            return "";
+        }
+        if kind == "system" && std::json::find_string_field(l, "subtype") == "init" {
+            return event_line(
+                "note",
+                "claude started, model " + std::json::find_string_field(l, "model"),
+            );
+        }
+        return "";
+    }
+
+    /// Codex's `exec --json`.
+    @unbounded
+    fn codex(l: String) -> String {
+        let kind = std::json::find_string_field(l, "type");
+        let item = std::json::find_field_raw(l, "item");
+        let what = std::json::find_string_field(item, "type");
+        if kind == "item.completed" && what == "agent_message" {
+            let t = std::json::find_string_field(item, "text");
+            self.summary = t;
+            return self.text(t);
+        }
+        if kind == "item.started" && what == "command_execution" {
+            return event_line("tool", "$ " + std::json::find_string_field(item, "command"));
+        }
+        if kind == "item.completed" && what == "command_execution" {
+            let code = std::json::string_field(item, "exit_code");
+            if code.kind == "number" && std::json::find_int_field(item, "exit_code") != 0 {
+                return event_line(
+                    "tool",
+                    "exit " + to_string(std::json::find_int_field(item, "exit_code")) + ": "
+                        + brief(std::json::find_string_field(item, "aggregated_output")),
+                );
+            }
+            return "";
+        }
+        if kind == "item.completed" && what == "file_change" {
+            let mut paths = "";
+            let mut it = std::json::array_first(
+                std::str::trim(std::json::find_field_raw(item, "changes")),
+            );
+            while !it.done {
+                paths = paths + " " + std::json::find_string_field(it.element, "path");
+                it = std::json::array_next(it);
+            }
+            return event_line("tool", "edited" + paths);
+        }
+        if kind == "turn.completed" {
+            let usage = std::str::trim(std::json::find_field_raw(l, "usage"));
+            if std::str::starts_with(usage, "{") {
+                // each turn's own: the run's is their sum; input counts cached input
+                self.has_usage = true;
+                self.input_tokens = self.input_tokens
+                    + std::json::find_int_field(usage, "input_tokens");
+                self.output_tokens = self.output_tokens
+                    + std::json::find_int_field(usage, "output_tokens");
+            }
+            return "";
+        }
+        if kind == "turn.failed" || kind == "error" {
+            let e = std::json::find_field_raw(l, "error");
+            let m = std::json::find_string_field(
+                if len(std::str::trim(e)) > 0 { e } else { l },
+                "message",
+            );
+            self.failure = "codex reported an error: " + harness::clip_utf8(m, 300);
+            return event_line("error", m);
+        }
+        return "";
+    }
+
+    /// The Antigravity CLI's `--output-format stream-json`.
+    @unbounded
+    fn agy(l: String) -> String {
+        let ev = std::json::find_string_field(l, "event");
+        if ev == "step_update" {
+            let s = std::json::find_field_raw(l, "step_update");
+            let step = std::json::find_string_field(s, "step_type");
+            let state = std::json::find_string_field(s, "state");
+            if step == "tool" && state == "ACTIVE" {
+                let info = std::json::find_field_raw(s, "tool_info");
+                return event_line(
+                    "tool",
+                    std::json::find_string_field(s, "tool_name") + " "
+                        + brief(std::json::find_field_raw(info, "parameters")),
+                );
+            }
+            if step == "agent_response" {
+                let d = std::json::string_field(s, "text_delta");
+                if d.kind == "string" { self.partial = self.partial + d.text; }
+                if state == "DONE" {
+                    let t = self.partial;
+                    self.partial = "";
+                    return self.text(t);
+                }
+            }
+            return "";
+        }
+        if ev == "result" {
+            let r = std::json::find_field_raw(l, "result");
+            self.summary = std::json::find_string_field(r, "response");
+            let status = std::json::find_string_field(r, "status");
+            if len(status) > 0 && status != "SUCCESS" {
+                self.failure = "agy ended " + status;
+            }
+            let usage = std::str::trim(std::json::find_field_raw(r, "usage"));
+            if std::str::starts_with(usage, "{") {
+                self.has_usage = true;
+                self.input_tokens = std::json::find_int_field(usage, "input_tokens")
+                    + std::json::find_int_field(usage, "cache_read_tokens");
+                self.output_tokens = std::json::find_int_field(usage, "output_tokens");
+            }
+            return "";
+        }
+        return "";
+    }
+
+    /// Mistral Vibe's `--output streaming`: its usage is in the export it
+    /// writes on exit (`usage_file`, `read_usage_file`).
+    @unbounded
+    fn vibe(l: String) -> String {
+        let kind = std::json::find_string_field(l, "type");
+        if kind == "message" && std::json::find_string_field(l, "role") == "assistant" {
+            let mut out = "";
+            let mut said = "";
+            let mut it = std::json::array_first(
+                std::str::trim(std::json::find_field_raw(l, "content")),
+            );
+            while !it.done {
+                if std::json::find_string_field(it.element, "type") == "text" {
+                    let t = std::json::find_string_field(it.element, "text");
+                    said = said + t;
+                    out = out + self.text(t);
+                }
+                it = std::json::array_next(it);
+            }
+            if len(std::str::trim(said)) > 0 { self.summary = said; }
+            return out;
+        }
+        if kind == "effect" {
+            let detail = std::json::find_field_raw(l, "detail");
+            return event_line(
+                "tool",
+                std::json::find_string_field(l, "title") + ": "
+                    + std::json::find_string_field(
+                        std::json::find_field_raw(detail, "display"),
+                        "summary",
+                    ),
+            );
+        }
+        if kind == "callback" {
+            let out = std::json::find_field_raw(std::json::find_field_raw(l, "state"), "output");
+            let decision = std::json::find_string_field(
+                std::json::find_field_raw(out, "decision"),
+                "type",
+            );
+            if decision == "deny" {
+                return event_line(
+                    "tool",
+                    "refused by its policy: " + std::json::find_string_field(l, "title"),
+                );
+            }
+        }
+        return "";
+    }
+
+    /// What the CLI wrote of its run to a file (`usage_file`): Vibe's
+    /// export, its usage and how it ended.
+    @unbounded
+    fn read_usage_file(text: String) {
+        if !std::json::valid_object(text) { return; }
+        let usage = std::str::trim(std::json::find_field_raw(text, "usage"));
+        if std::str::starts_with(usage, "{") {
+            self.has_usage = true;
+            self.input_tokens = std::json::find_int_field(usage, "input_tokens");
+            self.output_tokens = std::json::find_int_field(usage, "output_tokens");
+        }
+        let e = std::json::string_field(text, "error");
+        if e.kind == "string" && len(e.text) > 0 {
+            self.failure = "vibe reported an error: " + harness::clip_utf8(e.text, 300);
+        }
+    }
+
+    /// The run's summary: what the CLI gave as its result, or the last
+    /// thing it said.
+    fn final_summary() -> String {
+        if len(self.partial) > 0 { self.said = std::str::trim(self.partial); }
+        let s = if len(std::str::trim(self.summary)) > 0 { self.summary } else { self.said };
+        return harness::clip_utf8(std::str::trim(s), EVENT_TEXT_MAX);
+    }
+}

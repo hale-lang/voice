@@ -116,6 +116,11 @@ locus Plane {
         // monotonic ns
         next_beat: Int = 0;
         retry_at: Int = 0;
+        // coding attempts (attempt.hl): the node offers an engine that runs
+        // them, the slots running one (a bit each), and when to ask next
+        offers_attempts: Bool = offers_harness(self.capabilities);
+        attempt_busy: Int = 0;
+        next_claim: Int = 0;
     }
 
     bus {
@@ -125,7 +130,9 @@ locus Plane {
         subscribe LinkCheckDone as on_checked;
         subscribe BlobKept as on_kept;
         subscribe PortsFound as on_ports;
+        subscribe AttemptDone as on_attempt_done;
         publish PlaneJoined;
+        publish AttemptJob;
         publish AssignmentRead;
         publish LocalApplied;
         publish PlaneReport;
@@ -182,7 +189,42 @@ locus Plane {
         self.check_local();
         if len(self.checked) > 0 { self.report_checked(); }
         if std::time::monotonic_ns() >= self.next_beat { self.heartbeat(); }
+        if self.offers_attempts && std::time::monotonic_ns() >= self.next_claim { self.claim(); }
         std::time::sleep(100ms);
+    }
+
+    /// A slot's attempt ended: the slot is free.
+    fn on_attempt_done(d: AttemptFreed) {
+        if (self.attempt_busy / pow2(d.slot)) % 2 == 1 {
+            self.attempt_busy = self.attempt_busy - pow2(d.slot);
+        }
+        self.next_claim = 0;
+    }
+
+    /// `POST /node/v1/attempts/claim` when a slot is free: an attempt the
+    /// api started on one of this node's harness seats, handed to it.
+    fn claim() {
+        let mut slot = -1;
+        let mut i = 0;
+        while i < ATTEMPT_SLOTS && slot < 0 {
+            if (self.attempt_busy / pow2(i)) % 2 == 0 { slot = i; }
+            i = i + 1;
+        }
+        if slot < 0 {
+            self.next_claim = std::time::monotonic_ns() + 3000000000;
+            return;
+        }
+        let resp = self.call("POST", "/node/v1/attempts/claim", "{}");
+        if resp.status == 401 || resp.status == 403 { self.registered = false; }
+        if resp.status != 200 {
+            // none waits, or the api is away: ask again in a while
+            self.next_claim = std::time::monotonic_ns()
+                + (if resp.status == 204 { 3000000000 } else { 10000000000 });
+            return;
+        }
+        self.attempt_busy = self.attempt_busy + pow2(slot);
+        AttemptJob <- AttemptWork { slot: slot, start: std::str::from_bytes(resp.body) };
+        self.next_claim = std::time::monotonic_ns() + 500000000;
     }
 
     fn on_seats(s: AppliedSeats) {
@@ -450,4 +492,28 @@ locus Plane {
         };
         return std::http::ClientResponse { status: 0, body: b"" };
     }
+}
+
+/// True when the node offers an engine that runs coding attempts: a
+/// harness, or claude-cli, which is the claude harness.
+@bounded_by(capabilities)
+fn offers_harness(capabilities: String) -> Bool {
+    let mut it = std::json::array_first(std::json::find_field_raw(capabilities, "engines"));
+    while !it.done {
+        let kind = std::json::find_string_field(it.element, "kind");
+        if kind == "harness" || kind == "claude-cli" { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
+}
+
+/// 2 to the `n`.
+fn pow2(n: Int) -> Int {
+    let mut p = 1;
+    let mut i = 0;
+    while i < n && i < 30 {
+        p = p * 2;
+        i = i + 1;
+    }
+    return p;
 }

@@ -1,0 +1,781 @@
+// Coding attempts (../spec/openapi.yaml, tag `attempts`): a caller asks
+// voice to run an agentic coding harness (a harness definition,
+// ../harnesses/) once on a repository: check out `repo` at `base`, run the
+// harness with the instruction, and commit what it produced as the caller's
+// identity. It runs for minutes or hours, so it is asynchronous: created at
+// once and queued, started on a harness seat with room, reported by the
+// seat's node through the node plane until it ends, and kept in the store,
+// so an api restart loses nothing. What a caller cites afterwards is the
+// attempt's evidence: its branch, base and head commits, the harness's
+// summary, its usage, and the sha256 of its stored transcript; its commits
+// are fetched as a git bundle. Pushing them and asking for a review are the
+// caller's.
+//
+// An attempt waits for a seat and is never refused for capacity: a node
+// asks for work when it has a free attempt slot (`claim`), and the api
+// starts the oldest queued attempt one of the node's harness seats can run,
+// as a request is routed: the seat up and enabled, its account one the
+// caller's project and key may spend and not archived, its data class
+// `internal`, its harness and model the ones asked for, and fewer attempts
+// running on it than its concurrency (checked in the store, so two api
+// instances never start more).
+
+/// A running attempt whose node has not reported for this long is lost:
+/// its node is gone, or lost the api. The node reports every few seconds.
+const ATTEMPT_LOST_S: Int = 600;
+
+/// How long an attempt may wait and run unless it names its deadline, and
+/// the latest it may name.
+const ATTEMPT_DEADLINE_S: Int = 14400;
+const ATTEMPT_DEADLINE_MAX_S: Int = 86400;
+
+/// How long a bundle is held for its caller when nobody fetches it.
+const BUNDLE_TTL_S: Int = 86400;
+
+/// The largest bundle voice holds, in bytes (base64 is a third more).
+const BUNDLE_MAX: Int = 6291456;
+
+/// The longest instruction, in bytes.
+const INSTRUCTION_MAX: Int = 262144;
+
+/// Where an attempt may reach besides its harness's vendor: the common
+/// package registries, and GitHub's hosts for releases and downloads,
+/// which toolchains fetch from. A seat's config adds more (`egress`).
+const COMMON_EGRESS: String = "registry.npmjs.org\nregistry.yarnpkg.com\npypi.org\nfiles.pythonhosted.org\ncrates.io\nstatic.crates.io\nindex.crates.io\nproxy.golang.org\nsum.golang.org\nstorage.googleapis.com\ngithub.com\ncodeload.github.com\nobjects.githubusercontent.com\nrelease-assets.githubusercontent.com\nraw.githubusercontent.com\n";
+
+/// Voice's harness definitions in `dir` (`--harnesses`), each `<id>.json`
+/// held to the rules (lib/harness), as one JSON list. A file the rules
+/// refuse is left out, and said.
+@unbounded
+fn shipped_harnesses(dir: String) -> String {
+    let n = std::io::fs::list_dir_count(dir) or 0;
+    let out = st::JsonList { };
+    let mut i = 0;
+    while i < n {
+        let name = std::io::fs::list_dir_at(dir, i) or "";
+        i = i + 1;
+        if !std::str::ends_with(name, ".json") { continue; }
+        let file = std::str::trim(std::io::fs::read_file(dir + "/" + name) or "");
+        let mut problem = harness::harness_problem(file);
+        if len(problem) == 0 && harness::text_of(file, "id") + ".json" != name {
+            problem = "its id is " + harness::text_of(file, "id");
+        }
+        if len(problem) > 0 {
+            log_error(
+                "a shipped harness is refused",
+                std::log::kv("file", name) + std::log::kv("problem", problem),
+            );
+            continue;
+        }
+        out.add(file);
+    }
+    return "[" + out.text() + "]";
+}
+
+/// The definition `id` among `defs` (a JSON list), "" when there is none.
+fn definition_of(defs: String, id: String) -> String {
+    let mut it = std::json::array_first(defs);
+    while !it.done {
+        if harness::text_of(it.element, "id") == id { return std::str::trim(it.element); }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// The harness a seat of engine kind `kind` runs: its config's `harness`,
+/// or `claude` for the claude-cli engine, which is the claude harness.
+fn seat_harness(kind: String, config: String) -> String {
+    if kind == "claude-cli" { return "claude"; }
+    if kind != "harness" { return ""; }
+    return harness::text_of(config, "harness");
+}
+
+/// True when seat `s` answers inference requests: every seat but a
+/// harness seat whose harness is not claude, which runs attempts alone.
+fn answers_requests(store: st::Store, s: st::SeatRow) -> Bool fallible(st::StoreError) {
+    let f = store.fleet(s.node) or raise;
+    let kind = engine_kind_of(f.capabilities, s.engine);
+    return kind != "harness" || seat_harness(kind, s.config) == "claude";
+}
+
+/// The vault entry or login directory a harness seat runs under: its
+/// config's `login`, or a claude-cli seat's `token_vault`.
+fn seat_login(config: String) -> String {
+    let login = harness::text_of(config, "login");
+    return if len(login) > 0 { login } else { harness::text_of(config, "token_vault") };
+}
+
+/// The attempt's evidence and how it stands, as `CodingAttempt`.
+fn attempt_json(a: st::AttemptRow) -> String {
+    let body = a.body;
+    let as_ = std::json::find_field_raw(body, "as");
+    let budget = std::str::trim(std::json::find_field_raw(body, "budget"));
+    let ended = st::attempt_ended(a.state);
+    let shown = if len(a.ran) > 0 { a.ran } else { a.harness };
+    let base = "/v1/attempts/" + a.id;
+    return "{\"id\": " + jq(a.id) + ", \"object\": \"attempt\", \"state\": " + jq(a.state)
+        + ", \"phase\": " + jstring_or_null(len(a.phase) > 0, a.phase) + ", \"project\": "
+        + jq(a.project) + ", \"key\": " + jq(a.key) + ", \"harness\": "
+        + jstring_or_null(len(shown) > 0, shown) + ", \"model\": "
+        + jstring_or_null(len(a.model) > 0, a.model) + ", \"repo\": "
+        + jq(harness::text_of(body, "repo")) + ", \"base\": " + jq(harness::text_of(body, "base"))
+        + ", \"instruction\": " + jq(harness::text_of(body, "instruction"))
+        + ", \"as\": {\"name\": "
+        + jq(harness::text_of(as_, "name")) + ", \"email\": " + jq(harness::text_of(as_, "email"))
+        + "}, \"branch\": " + jq(a.branch) + ", \"base_sha\": "
+        + jstring_or_null(len(a.base_sha) > 0, a.base_sha) + ", \"head_sha\": "
+        + jstring_or_null(len(a.head_sha) > 0, a.head_sha) + ", \"summary\": "
+        + jstring_or_null(len(a.summary) > 0, a.summary) + ", \"failure\": "
+        + jstring_or_null(len(a.failure) > 0, a.failure) + ", \"served\": "
+        + (
+            if a.has_started {
+                "{\"node\": " + jq(a.node) + ", \"seat\": " + jq(a.seat) + ", \"account\": "
+                    + jq(a.account) + "}"
+            } else {
+                "null"
+            }
+        ) + ", \"usage\": {\"reported\": " + jbool(a.tokens_reported) + ", \"input_tokens\": "
+        + (if a.tokens_reported { to_string(a.input_tokens) } else { "null" })
+        + ", \"output_tokens\": "
+        + (if a.tokens_reported { to_string(a.output_tokens) } else { "null" }) + "}, \"wall_ms\": "
+        + to_string(a.wall_ms) + ", \"budget\": "
+        + (if std::str::starts_with(budget, "{") { budget } else { "null" }) + ", \"deadline\": "
+        + jtime(a.deadline_at) + ", \"cancel_requested\": " + jbool(a.cancel)
+        + ", \"transcript\": {\"url\": " + jq(base + "/transcript") + ", \"events_url\": "
+        + jq(base + "/events") + ", \"events\": " + to_string(a.events - a.dropped)
+        + ", \"dropped\": " + to_string(a.dropped) + "}, \"transcript_digest\": "
+        + jstring_or_null(ended && len(a.transcript_digest) > 0, a.transcript_digest)
+        + ", \"bundle\": "
+        + (
+            if a.has_bundle {
+                "{\"url\": " + jq(base + "/bundle") + ", \"bytes\": " + to_string(a.bundle_bytes)
+                    + "}"
+            } else {
+                "null"
+            }
+        ) + ", \"created_at\": " + jtime(a.created_at) + ", \"started_at\": "
+        + jtime_or_null(a.has_started, a.started_at) + ", \"ended_at\": "
+        + jtime_or_null(a.has_ended, a.ended_at) + "}";
+}
+
+/// One transcript event, as `CodingAttemptEvent`: the line a transcript
+/// holds, and the data of an `event` on the live stream.
+fn attempt_event_json(e: st::AttemptEvent) -> String {
+    return "{\"seq\": " + to_string(e.seq) + ", \"at\": " + jtime(e.at) + ", \"kind\": "
+        + jq(e.kind)
+        + ", \"text\": " + jq(e.text) + "}";
+}
+
+/// The caller's address: git over https, http or git, which the node
+/// fetches with no credential at all (no ssh key, credential helper or
+/// netrc of the node's user), so a caller reads only what anyone on the
+/// node's network could. A local path or `file://` is refused, so a caller
+/// cannot read the node's own disk.
+fn repo_problem(repo: String) -> String {
+    if len(repo) == 0 || len(repo) > 2048 { return "`repo` is a git clone URL"; }
+    if std::str::contains(repo, "\n")
+        || std::str::contains(repo, " ")
+        || std::str::starts_with(repo, "-")
+    {
+        return "`repo` is a git clone URL";
+    }
+    let lower = std::str::lower(repo);
+    if std::str::starts_with(lower, "https://") || std::str::starts_with(lower, "http://")
+        || std::str::starts_with(lower, "git://")
+    {
+        return "";
+    }
+    return "`repo` is fetched over https, http or git, with no credential (ssh, a local path or file:// is refused)";
+}
+
+/// A git ref or commit to check out: no space, no leading `-`, no `..`.
+fn ref_problem(r: String) -> String {
+    if len(r) == 0 || len(r) > 256 { return "`base` names a branch, tag or commit"; }
+    if std::str::starts_with(r, "-") || std::str::contains(r, "..") || std::str::contains(r, " ")
+        || std::str::contains(r, "\n") || std::str::contains(r, ":")
+    {
+        return "`base` names a branch, tag or commit";
+    }
+    return "";
+}
+
+/// A commit identity's part: no newline or angle bracket.
+fn identity_part(s: String, max: Int) -> Bool {
+    return len(s) > 0
+        && len(s) <= max
+        && !std::str::contains(s, "\n")
+        && !std::str::contains(s, "<")
+        && !std::str::contains(s, ">");
+}
+
+/// The text of a JSON string member, failing the request when it is there
+/// but not a string.
+fn optional_string(body: String, name: String) -> String fallible(ApiError) {
+    let k = kind_of(body, name);
+    if k == "missing" || k == "null" { return ""; }
+    if k != "string" { fail invalid("`" + name + "` is a string", name); }
+    return std::json::find_string_field(body, name);
+}
+
+locus CodingAttempts {
+    params {
+        store: st::Store = st::MemoryStore { };
+        // voice's harness definitions, a JSON list (`shipped_harnesses`)
+        harnesses: String = "[]";
+    }
+
+    /// The project a caller-plane request is scoped to: its key's.
+    fn project_of(ctx: std::api::Context) -> String fallible(ApiError) {
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        if !k.present { fail invalid_key(); }
+        return k.project;
+    }
+
+    /// `createAttempt`: checked, written queued, and answered at once (202).
+    @unbounded
+    fn create(ctx: std::api::Context, body: String) -> std::http::Response fallible(ApiError) {
+        object_body(body) or raise;
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        if !k.present { fail invalid_key(); }
+        let repo = optional_string(body, "repo") or raise;
+        let rp = repo_problem(repo);
+        if len(rp) > 0 { fail invalid(rp, "repo"); }
+        let base = optional_string(body, "base") or raise;
+        let bp = ref_problem(base);
+        if len(bp) > 0 { fail invalid(bp, "base"); }
+        let instruction = optional_string(body, "instruction") or raise;
+        if len(std::str::trim(instruction)) == 0 || len(instruction) > INSTRUCTION_MAX {
+            fail invalid(
+                "`instruction` is what the harness is asked to do, up to 256 KiB",
+                "instruction"
+            );
+        }
+        let wanted = optional_string(body, "harness") or raise;
+        if len(wanted) > 0 && len(definition_of(self.harnesses, wanted)) == 0 {
+            fail invalid("voice has no harness " + wanted, "harness");
+        }
+        let model = optional_string(body, "model") or raise;
+        if len(model) > 0 {
+            let m = self.store.model(model) or fail metering_failed(err);
+            if !m.present || m.removed {
+                fail ApiError {
+                    status: 404,
+                    kind: "invalid_request",
+                    code: ErrorCode::model_not_found,
+                    message: "no model " + model,
+                    has_param: true,
+                    param: "model",
+                };
+            }
+        }
+        let mut budget = "null";
+        let bk = kind_of(body, "budget");
+        if bk != "missing" && bk != "null" {
+            let b = std::str::trim(std::json::find_field_raw(body, "budget"));
+            if bk != "object"
+                || kind_of(b, "tokens") != "number"
+                || std::json::find_int_field(b, "tokens") < 1
+            {
+                fail invalid(
+                    "`budget` is `{\"tokens\": n}`, the most tokens the harness may use",
+                    "budget"
+                );
+            }
+            budget = "{\"tokens\": " + to_string(std::json::find_int_field(b, "tokens")) + "}";
+        }
+        let now = now_seconds();
+        let mut deadline = std::time::time_from_unix(std::time::unix(now) + ATTEMPT_DEADLINE_S);
+        let d = optional_string(body, "deadline") or raise;
+        if len(d) > 0 {
+            deadline = rfc3339(d) or fail invalid("`deadline` is an RFC 3339 time", "deadline");
+            let ahead = std::time::unix(deadline) - std::time::unix(now);
+            if ahead <= 0 || ahead > ATTEMPT_DEADLINE_MAX_S {
+                fail invalid("`deadline` is in the next 24 hours", "deadline");
+            }
+        }
+        let id = "att_"
+            + (random_hex(12) or fail metering_failed(st::StoreError { message: "no entropy" }));
+        let mut name = "voice attempt " + id;
+        let mut email = "attempt-" + id + "@voice.invalid";
+        let ak = kind_of(body, "as");
+        if ak != "missing" && ak != "null" {
+            let as_ = std::str::trim(std::json::find_field_raw(body, "as"));
+            if ak != "object" {
+                fail invalid("`as` is `{\"name\", \"email\"}`, the commits' identity", "as");
+            }
+            name = optional_string(as_, "name") or fail invalid("`as.name` is a string", "as");
+            email = optional_string(as_, "email") or fail invalid("`as.email` is a string", "as");
+            if !identity_part(name, 200)
+                || !identity_part(email, 254)
+                || !std::str::contains(email, "@")
+            {
+                fail invalid(
+                    "`as` names the commits' author: a name and an email, neither holding a newline or angle brackets",
+                    "as"
+                );
+            }
+        }
+        let kept = "{\"repo\": " + jq(repo) + ", \"base\": " + jq(base) + ", \"instruction\": "
+            + jq(instruction) + ", \"harness\": " + jstring_or_null(len(wanted) > 0, wanted)
+            + ", \"model\": " + jstring_or_null(len(model) > 0, model) + ", \"budget\": " + budget
+            + ", \"deadline\": " + jtime(deadline) + ", \"as\": {\"name\": " + jq(name)
+            + ", \"email\": " + jq(email) + "}}";
+        let row = st::AttemptRow {
+            id: id,
+            project: k.project,
+            key: k.id,
+            state: "queued",
+            body: kept,
+            harness: wanted,
+            model: model,
+            branch: "voice/attempt-" + id,
+            created_at: now,
+            deadline_at: deadline,
+        };
+        self.store.insert_attempt(row) or fail store_failed(err);
+        let made = self.store.attempt(id) or fail metering_failed(err);
+        return json_answer(202, attempt_json(made));
+    }
+
+    /// The attempt `id` as `project` ("" for the operator) may see it.
+    fn visible(project: String, id: String) -> st::AttemptRow fallible(ApiError) {
+        let a = self.store.attempt(id) or fail metering_failed(err);
+        if !a.present || (len(project) > 0 && a.project != project) {
+            fail not_found("no attempt " + id);
+        }
+        return a;
+    }
+
+    fn get(project: String, id: String) -> std::http::Response fallible(ApiError) {
+        let a = self.visible(project, id) or raise;
+        return json_answer(200, attempt_json(a));
+    }
+
+    /// `listAttempts`: newest first, of `project` ("" for every project, the
+    /// operator's view), or of the one `?project=` names.
+    fn list(project: String, path: String) -> std::http::Response fallible(ApiError) {
+        self.sweep(now_seconds());
+        let asked = query_all(path, "project");
+        let scope = if len(project) > 0 { project } else { at(asked.items, 0) or "" };
+        let rows = self.store.attempts(scope, st::ATTEMPT_LIST_MAX) or fail metering_failed(err);
+        let out = st::JsonList { };
+        for a in rows.rows {
+            out.add(attempt_json(a));
+        }
+        return json_answer(200, "{\"object\": \"list\", \"data\": [" + out.text() + "]}");
+    }
+
+    /// `cancelAttempt`: a queued attempt ends now; a running one is
+    /// stopped by its node at its next report, its container removed.
+    fn cancel(project: String, id: String) -> std::http::Response fallible(ApiError) {
+        self.visible(project, id) or raise;
+        let a = self.store.cancel_attempt(id, now_seconds()) or fail metering_failed(err);
+        if a.state == "cancelled" && len(a.transcript_digest) == 0 { self.settle(a); }
+        let now = self.store.attempt(id) or fail metering_failed(err);
+        return json_answer(200, attempt_json(now));
+    }
+
+    /// The stored transcript, whole: one `CodingAttemptEvent` a line
+    /// (JSON Lines). Once the attempt ended, its sha256 is the attempt's
+    /// `transcript_digest`.
+    fn transcript(project: String, id: String) -> std::http::Response fallible(ApiError) {
+        self.visible(project, id) or raise;
+        let text = self.transcript_text(id) or fail metering_failed(err);
+        return std::http::Response {
+            status: 200,
+            content_type: "application/jsonl",
+            body: text,
+        };
+    }
+
+    /// Every stored event of `id`, a line each.
+    @unbounded
+    fn transcript_text(id: String) -> String fallible(st::StoreError) {
+        let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+        let mut after = 0;
+        while true {
+            let page = self.store.attempt_events(id, after, 500) or raise;
+            if count(page.rows) == 0 { break; }
+            for e in page.rows {
+                out.append_str(attempt_event_json(e) + "\n");
+                after = e.seq;
+            }
+        }
+        let b = out.snapshot() or b"";
+        return std::str::from_bytes(b);
+    }
+
+    /// The live transcript (`streamAttemptEvents`): each event past the
+    /// subscriber's place (`Last-Event-ID`, or `?after=`) as an `event`,
+    /// then the attempt as it stands as an `attempt` whenever it changes,
+    /// until it ends. Answered in process (a test), it is one look.
+    @unbounded
+    fn follow(
+        project: String,
+        id: String,
+        out: EventStream,
+        last: String
+    ) -> std::http::Response fallible(ApiError) {
+        let first = self.visible(project, id) or raise;
+        let mut after = std::str::parse_int(last) or 0;
+        out.raw("retry: 2000\n\n");
+        let mut told = "";
+        let mut ended = false;
+        while !out.gone && !ended {
+            let page = self.store.attempt_events(id, after, 500) or fail metering_failed(err);
+            for e in page.rows {
+                out.send_with("event", to_string(e.seq), attempt_event_json(e));
+                after = e.seq;
+            }
+            let a = self.store.attempt(id) or first;
+            let now = attempt_json(a);
+            if now != told {
+                out.send_with("attempt", to_string(after), now);
+                told = now;
+            }
+            ended = st::attempt_ended(a.state) && count(page.rows) < 500;
+            if out.conn_fd < 0 { break; }
+            if !ended {
+                std::time::sleep(1s);
+                out.keep_alive(15s, "", "");
+            }
+        }
+        return out.end();
+    }
+
+    /// `getAttemptBundle`: the attempt's commits, from `base_sha` to
+    /// `head_sha` on its branch, as a git bundle, once. Fetched, voice lets
+    /// it go.
+    fn bundle(project: String, id: String, conn_fd: Int) -> std::http::Response fallible(ApiError) {
+        let a = self.visible(project, id) or raise;
+        let b64 = self.store.attempt_bundle(id) or fail metering_failed(err);
+        if len(b64) == 0 {
+            fail not_found(
+                "attempt " + id + " holds no bundle: "
+                    + (
+                        if st::attempt_ended(a.state) {
+                            "it made none, or it was fetched or expired"
+                        } else {
+                            "it has not ended"
+                        }
+                    ),
+            );
+        }
+        let bytes = std::text::base64::decode(b64);
+        self.store.drop_attempt_bundles(id, std::time::time_from_unix(0)) or discard;
+        let head = "Content-Type: application/x-git-bundle\r\nContent-Disposition: attachment; filename=\""
+            + id + ".bundle\"\r\nX-Voice-Head-Sha: " + a.head_sha;
+        if conn_fd < 0 {
+            // in process (a test): the bundle as base64, which a String holds
+            return std::http::Response {
+                status: 200,
+                content_type: "text/plain",
+                headers: "X-Voice-Bundle: base64",
+                body: b64,
+            };
+        }
+        // a bundle is binary, which a String body cannot carry whole: it is
+        // written on the connection as the bytes it is
+        std::io::tcp::send_fd(
+            conn_fd,
+            std::bytes::from_string(
+                "HTTP/1.1 200 OK\r\n" + head + "\r\nCache-Control: no-store\r\nContent-Length: "
+                    + to_string(len(bytes)) + "\r\nConnection: close\r\n\r\n",
+            ),
+        ) or discard;
+        std::io::tcp::send_fd(conn_fd, bytes) or discard;
+        std::io::tcp::close_fd(conn_fd);
+        return taken_over();
+    }
+
+    /// `listHarnesses`: the definitions voice has, as they are.
+    fn definitions() -> std::http::Response {
+        return json_answer(200, "{\"object\": \"list\", \"data\": " + self.harnesses + "}");
+    }
+
+    // ---- the node plane
+
+    /// Attempts that can no longer end on their own, ended: a running one
+    /// whose node stopped reporting, and bundles past their time.
+    fn sweep(now: Time) {
+        let lost = self.store.fail_running(
+            "",
+            std::time::time_from_unix(std::time::unix(now) - ATTEMPT_LOST_S),
+            "its node stopped reporting it",
+            now,
+        ) or st::AttemptRows { };
+        for a in lost.rows {
+            self.settle(a);
+        }
+        self.store.drop_attempt_bundles(
+            "",
+            std::time::time_from_unix(std::time::unix(now) - BUNDLE_TTL_S),
+        ) or discard;
+    }
+
+    /// The node registered again: what it was running is gone with it.
+    fn node_restarted(node: String) {
+        let gone = self.store.fail_running(
+            node,
+            now_seconds(),
+            "its node restarted while it ran",
+            now_seconds(),
+        ) or st::AttemptRows { };
+        for a in gone.rows {
+            self.settle(a);
+        }
+    }
+
+    /// `claimAttempt`: the oldest queued attempt one of `node`'s harness
+    /// seats can run, started there and handed to the node; 204 when
+    /// there is none.
+    @unbounded
+    fn claim(node: String) -> std::http::Response fallible(ApiError) {
+        let now = now_seconds();
+        self.sweep(now);
+        let f = self.store.fleet(node) or fail metering_failed(err);
+        let all = self.store.seats() or fail metering_failed(err);
+        let queued = self.store.queued_attempts(64) or fail metering_failed(err);
+        for a in queued.rows {
+            if std::time::unix(a.deadline_at) <= std::time::unix(now) {
+                self.store.end_attempt(
+                    a.id,
+                    "failed",
+                    "its deadline passed before a seat took it",
+                    now,
+                ) or discard;
+                continue;
+            }
+            let k = self.store.key(a.key) or fail metering_failed(err);
+            let p = as_in_force(
+                self.store,
+                self.store.project(k.project) or fail metering_failed(err),
+            ) or fail metering_failed(err);
+            if !k.present || !p.present || p.archived {
+                self.store.end_attempt(
+                    a.id,
+                    "failed",
+                    "its project or key is no longer active",
+                    now,
+                ) or discard;
+                continue;
+            }
+            for s in all.rows {
+                if s.node != node || !s.enabled || !has_name(s.data_classes.items, "internal") {
+                    continue;
+                }
+                let kind = engine_kind_of(f.capabilities, s.engine);
+                let h = seat_harness(kind, s.config);
+                if len(h) == 0 || (len(a.harness) > 0 && a.harness != h) { continue; }
+                let def = definition_of(self.harnesses, h);
+                if len(def) == 0 { continue; }
+                if len(a.model) > 0 && !seat_serves(s, a.model) { continue; }
+                if !(allows(p.accounts, s.account) && allows(k.accounts, s.account)) { continue; }
+                if !(seat_ready(self.store, s) or false) { continue; }
+                let started = self.store.start_attempt(
+                    a.id,
+                    node,
+                    s.id,
+                    s.account,
+                    h,
+                    seat_concurrency(s),
+                    now,
+                ) or fail metering_failed(err);
+                if started { return json_answer(200, self.start_json(a, s, def)); }
+            }
+        }
+        return no_content();
+    }
+
+    /// What the node runs `a` with, on seat `s`, under definition `def`.
+    @unbounded
+    fn start_json(a: st::AttemptRow, s: st::SeatRow, def: String) -> String {
+        // the CLI's own name for the model: the seat's for the one asked
+        // for, or its config's
+        let mut model = harness::text_of(s.config, "model");
+        if len(a.model) > 0 {
+            model = a.model;
+            for m in s.serves.items {
+                if m.model == a.model && m.has_engine_name && len(m.engine_name) > 0 {
+                    model = m.engine_name;
+                }
+            }
+        }
+        let egress = st::JsonList { };
+        let d = harness::harness_def(def);
+        let mut all = d.egress + COMMON_EGRESS;
+        let extra = std::str::trim(std::json::find_field_raw(s.config, "egress"));
+        let more = harness::lines_of(extra);
+        if std::str::starts_with(extra, "[") && !std::str::starts_with(more, "!") {
+            all = all + more;
+        }
+        while len(all) > 0 {
+            let nl = std::str::index_of(all, "\n");
+            egress.add(jq(all[0..nl]));
+            all = all[(nl + 1)..len(all)];
+        }
+        let budget = std::json::find_field_raw(a.body, "budget");
+        return "{\"attempt\": {\"id\": " + jq(a.id) + ", \"seat\": " + jq(s.id) + ", \"repo\": "
+            + jq(harness::text_of(a.body, "repo")) + ", \"base\": "
+            + jq(harness::text_of(a.body, "base")) + ", \"branch\": " + jq(a.branch)
+            + ", \"instruction\": " + jq(harness::text_of(a.body, "instruction")) + ", \"model\": "
+            + jq(model) + ", \"login\": " + jq(seat_login(s.config)) + ", \"budget_tokens\": "
+            + (
+                if kind_of(budget, "tokens") == "number" {
+                    to_string(std::json::find_int_field(budget, "tokens"))
+                } else {
+                    "0"
+                }
+            )
+            + ", \"deadline\": " + to_string(std::time::unix(a.deadline_at)) + ", \"as\": "
+            + std::str::trim(std::json::find_field_raw(a.body, "as")) + ", \"egress\": ["
+            + egress.text() + "], \"harness\": " + def + "}}";
+    }
+
+    /// `reportAttempt`: what the node that runs attempt `id` says of it.
+    /// The answer tells it to stop when the attempt was cancelled, or is no
+    /// longer its own.
+    @unbounded
+    fn report(node: String, id: String, body: String) -> std::http::Response fallible(ApiError) {
+        object_body(body) or raise;
+        let before = self.store.attempt(id) or fail metering_failed(err);
+        if !before.present { fail not_found("no attempt " + id); }
+        let r = read_attempt_report(body) or raise;
+        let a = self.store.report_attempt(id, node, r, now_seconds()) or fail metering_failed(err);
+        if !st::attempt_ended(before.state) && st::attempt_ended(a.state) { self.settle(a); }
+        let stop = a.cancel || a.node != node || a.state != "running";
+        return json_answer(
+            200,
+            "{\"cancel\": " + jbool(stop) + ", \"state\": " + jq(a.state) + "}",
+        );
+    }
+
+    /// `putAttemptBundle`: the bundle of the commits of attempt `id`, which
+    /// `node` runs, held for its caller.
+    fn put_bundle(
+        node: String,
+        id: String,
+        body: String
+    ) -> std::http::Response fallible(ApiError) {
+        object_body(body) or raise;
+        let a = self.store.attempt(id) or fail metering_failed(err);
+        if !a.present || a.node != node || a.state != "running" {
+            fail not_found("node " + node + " runs no attempt " + id);
+        }
+        let b64 = std::json::find_string_field(body, "bundle");
+        let bytes = std::json::find_int_field(body, "bytes");
+        if len(b64) == 0 || bytes < 1 || bytes > BUNDLE_MAX || len(b64) > (BUNDLE_MAX / 3 + 1) * 4 {
+            fail invalid("`bundle` is a git bundle, base64, of at most 6 MiB", "bundle");
+        }
+        self.store.put_attempt_bundle(id, b64, bytes, now_seconds()) or fail metering_failed(err);
+        return no_content();
+    }
+
+    /// An attempt that ended: its transcript's digest kept, and, when it
+    /// ran, its usage in the ledger against the seat's account, one
+    /// record under the attempt's id, the conversation the attempt is.
+    fn settle(a: st::AttemptRow) {
+        let text = self.transcript_text(a.id) or "";
+        let digest = "sha256:"
+            + std::hex::encode(std::crypto::sha256(std::bytes::from_string(text)));
+        self.store.seal_attempt(a.id, digest) or discard;
+        if !a.has_started { return; }
+        let status = if a.state == "done" {
+            "served"
+        } else if a.state == "cancelled" {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let at = if a.has_ended { a.ended_at } else { now_seconds() };
+        let wall = (std::time::unix(at) - std::time::unix(a.created_at)) * 1000;
+        let queue = (std::time::unix(a.started_at) - std::time::unix(a.created_at)) * 1000;
+        let model = if len(a.model) > 0 { a.model } else { a.ran };
+        let served = "{\"model\": " + jq(model) + ", \"quantization\": null, \"node\": "
+            + jq(a.node)
+            + ", \"seat\": " + jq(a.seat) + ", \"account\": " + jq(a.account) + ", \"engine\": "
+            + jq(a.ran) + ", \"provider\": null}";
+        let record = "{\"id\": " + jq(a.id) + ", \"created_at\": " + jtime(at) + ", \"project\": "
+            + jq(a.project) + ", \"key\": " + jq(a.key) + ", \"requested_model\": " + jq(a.model)
+            + ", \"requested_account\": null, \"endpoint\": \"attempt\", \"status\": " + jq(status)
+            + ", \"served\": " + served + ", \"data_class\": \"internal\", \"input_tokens\": "
+            + to_string(a.input_tokens)
+            + ", \"cached_input_tokens\": 0, \"cache_write_input_tokens\": 0, \"output_tokens\": "
+            + to_string(a.output_tokens)
+            + ", \"reasoning_tokens\": 0, \"price_micros\": 0, \"currency\": \"USD\", \"timing\": {\"wall_ms\": "
+            + to_string(wall) + ", \"queue_ms\": " + to_string(queue)
+            + ", \"load_ms\": 0, \"engine_ms\": " + to_string(a.wall_ms)
+            + "}, \"attempts\": [], \"conversation\": " + jq(a.id)
+            + ", \"instance\": null, \"internal\": false, \"metadata\": {\"attempt\": " + jq(a.id)
+            + ", \"harness\": " + jq(a.ran) + ", \"tokens\": "
+            + jq(if a.tokens_reported { "reported" } else { "unreported" }) + "}}";
+        self.store.insert_usage(
+            st::UsageRow {
+                id: a.id,
+                created_at: at,
+                project: a.project,
+                key: a.key,
+                account: a.account,
+                requested_model: a.model,
+                served_model: model,
+                node: a.node,
+                seat: a.seat,
+                status: status,
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+                price_micros: 0,
+                currency: "USD",
+                served: served,
+                record: record
+            },
+        ) or {
+            log_error(
+                "an attempt's usage was not recorded",
+                fields2(std::log::kv("attempt", a.id), std::log::kv("error", err.message)),
+            );
+        };
+    }
+}
+
+/// A node's report (`AttemptReport` in the contract), checked: at most 500
+/// events, each a kind voice knows and at most 16 KiB of text.
+@unbounded
+fn read_attempt_report(body: String) -> st::AttemptReport fallible(ApiError) {
+    let state = optional_string(body, "state") or raise;
+    if len(state) > 0 && !st::attempt_ended(state) {
+        fail invalid("`state` is done, failed or cancelled, the attempt's end", "state");
+    }
+    let mut r = st::AttemptReport {
+        state: state,
+        phase: optional_string(body, "phase") or raise,
+        ran: optional_string(body, "harness") or raise,
+        base_sha: optional_string(body, "base_sha") or raise,
+        head_sha: optional_string(body, "head_sha") or raise,
+        summary: optional_string(body, "summary") or raise,
+        failure: optional_string(body, "failure") or raise,
+        wall_ms: std::json::find_int_field(body, "wall_ms"),
+    };
+    let usage = std::str::trim(std::json::find_field_raw(body, "usage"));
+    if std::str::starts_with(usage, "{") {
+        r.has_usage = true;
+        r.input_tokens = std::json::find_int_field(usage, "input_tokens");
+        r.output_tokens = std::json::find_int_field(usage, "output_tokens");
+    }
+    let events = std::str::trim(std::json::find_field_raw(body, "events"));
+    if std::str::starts_with(events, "[") {
+        let mut it = std::json::array_first(events);
+        while !it.done {
+            let kind = std::json::find_string_field(it.element, "kind");
+            if kind != "text" && kind != "tool" && kind != "note" && kind != "error" {
+                fail invalid("an event's kind is text, tool, note or error", "events");
+            }
+            let text = std::json::find_string_field(it.element, "text");
+            push(
+                r.events.rows,
+                st::AttemptEvent { kind: kind, text: harness::clip_utf8(text, 16384) },
+            ) or fail invalid("a report carries at most 500 events", "events");
+            it = std::json::array_next(it);
+        }
+    }
+    return r;
+}

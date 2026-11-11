@@ -5,7 +5,7 @@
  * the placements of it.
  *
  * - a placement's seat (a managed engine): `local`, weights on voice's nodes;
- * - a `claude-cli` seat: `subscription`, a CLI under an account's login;
+ * - a `harness` or `claude-cli` seat: `subscription`, a CLI under an account's login;
  * - an `openai-compatible` seat: `api`, a remote endpoint with a key;
  * - a `static` seat: `static`, voice's test engine.
  */
@@ -37,7 +37,7 @@ export function seatSource(s: SeatInfo, kindOf: EngineKindOf): Source | undefine
   if (s.placement) return 'local';
   const kind = kindOf(s.node, s.engine);
   if (kind === 'managed') return 'local';
-  if (kind === 'claude-cli') return 'subscription';
+  if (kind === 'harness' || kind === 'claude-cli') return 'subscription';
   if (kind === 'openai-compatible') return 'api';
   if (kind === 'static') return 'static';
   return undefined;

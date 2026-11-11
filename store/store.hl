@@ -917,6 +917,73 @@ interface Store {
         basis: String
     ) -> Bool fallible(StoreError);
 
+    // ---- coding attempts (attempts.hl)
+
+    /// Add an attempt; false, and nothing written, when its id is taken.
+    fn insert_attempt(row: AttemptRow) -> Bool fallible(StoreError);
+    /// The attempt `id`; `present` is false when there is none.
+    fn attempt(id: String) -> AttemptRow fallible(StoreError);
+    /// Attempts newest first, of `project` ("" for every project), at most
+    /// `limit` (`ATTEMPT_LIST_MAX`).
+    fn attempts(project: String, limit: Int) -> AttemptRows fallible(StoreError);
+    /// Queued attempts, oldest first, at most `limit`.
+    fn queued_attempts(limit: Int) -> AttemptRows fallible(StoreError);
+    /// Start queued attempt `id` on `node`'s seat `seat`, spending
+    /// `account`, as harness `ran`, when the seat runs fewer than
+    /// `concurrency` attempts: checked and written as one, so two api
+    /// instances never start more than that. False when it is no longer
+    /// queued or the seat is full.
+    fn start_attempt(
+        id: String,
+        node: String,
+        seat: String,
+        account: String,
+        ran: String,
+        concurrency: Int,
+        at: Time
+    ) -> Bool fallible(StoreError);
+    /// What `node` reports of attempt `id`, which it runs: its events
+    /// appended (the oldest dropped past `ATTEMPT_EVENTS_KEPT`), its fields
+    /// written, and its end when `r.state` is one. The row as it now is;
+    /// one the node does not run (another's, or ended) is answered as it
+    /// is, nothing written.
+    fn report_attempt(
+        id: String,
+        node: String,
+        r: AttemptReport,
+        at: Time
+    ) -> AttemptRow fallible(StoreError);
+    /// End attempt `id` as `state` with `failure`, unless it has ended.
+    fn end_attempt(
+        id: String,
+        state: String,
+        failure: String,
+        at: Time
+    ) -> AttemptRow fallible(StoreError);
+    /// Ask for attempt `id` to be cancelled: one still queued ends
+    /// `cancelled` now; a running one is stopped by its node.
+    fn cancel_attempt(id: String, at: Time) -> AttemptRow fallible(StoreError);
+    /// The digest of attempt `id`'s transcript, once it ended.
+    fn seal_attempt(id: String, digest: String) fallible(StoreError);
+    /// Attempt `id`'s transcript events after `after`, oldest first, at most `limit`.
+    fn attempt_events(id: String, after: Int, limit: Int) -> AttemptEvents fallible(StoreError);
+    /// The running attempts whose node last reported before `before`, or
+    /// that run on `node` when it is not "": ended `failed` with `why`,
+    /// and answered as they now are.
+    fn fail_running(
+        node: String,
+        before: Time,
+        why: String,
+        at: Time
+    ) -> AttemptRows fallible(StoreError);
+    /// Hold attempt `id`'s bundle (base64), `bytes` long.
+    fn put_attempt_bundle(id: String, base64: String, bytes: Int, at: Time) fallible(StoreError);
+    /// Attempt `id`'s bundle (base64), "" when none is held.
+    fn attempt_bundle(id: String) -> String fallible(StoreError);
+    /// Let go of attempt `id`'s bundle ("" for none), and of every bundle
+    /// held since before `expired`.
+    fn drop_attempt_bundles(id: String, expired: Time) fallible(StoreError);
+
     /// The runtime row for `id`; `present` is false when there is none.
     fn runtime(id: String) -> RuntimeRow fallible(StoreError);
     fn runtimes() -> RuntimeRows fallible(StoreError);
@@ -1277,6 +1344,11 @@ locus MemoryStore {
         // link checks, newest first, the last 64
         link_check_rows: LinkCheckRows = LinkCheckRows { };
         arrangement_rows: ArrangementRows = ArrangementRows { };
+        // coding attempts, the newest last, the last 200; their transcripts'
+        // events, the last 4000 of all of them; their bundles held
+        attempt_rows: AttemptRows = AttemptRows { };
+        attempt_log: HeldEvents = HeldEvents { };
+        bundle_rows: BundleRows = BundleRows { };
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
@@ -2014,6 +2086,262 @@ locus MemoryStore {
         let mut r = row;
         r.present = true;
         self.inventory_rows.set(r);
+    }
+
+    // ---- coding attempts
+
+    fn insert_attempt(row: AttemptRow) -> Bool fallible(StoreError) {
+        for r in self.attempt_rows.rows {
+            if r.id == row.id { return false; }
+        }
+        let mut next = AttemptRows { };
+        let mut skip = count(self.attempt_rows.rows) >= ATTEMPT_LIST_MAX;
+        for r in self.attempt_rows.rows {
+            // full: the oldest that has ended goes
+            if skip && attempt_ended(r.state) {
+                skip = false;
+            } else {
+                push(next.rows, r) or discard;
+            }
+        }
+        if skip {
+            fail StoreError { kind: "full", message: "voice holds at most 200 attempts in memory" };
+        }
+        let mut kept = row;
+        kept.present = true;
+        push(next.rows, kept) or discard;
+        self.attempt_rows = next;
+        return true;
+    }
+
+    fn attempt(id: String) -> AttemptRow fallible(StoreError) {
+        for r in self.attempt_rows.rows {
+            if r.id == id { return self.with_bundle(r); }
+        }
+        return AttemptRow { };
+    }
+
+    fn with_bundle(r: AttemptRow) -> AttemptRow {
+        let mut out = r;
+        for b in self.bundle_rows.rows {
+            if b.attempt == r.id {
+                out.has_bundle = true;
+                out.bundle_bytes = b.bytes;
+            }
+        }
+        return out;
+    }
+
+    @unbounded
+    fn attempts(project: String, limit: Int) -> AttemptRows fallible(StoreError) {
+        let mut out = AttemptRows { };
+        let n = count(self.attempt_rows.rows);
+        let mut i = n - 1;
+        while i >= 0 && count(out.rows) < limit {
+            let r = at(self.attempt_rows.rows, i) or AttemptRow { };
+            if len(project) == 0 || r.project == project {
+                push(out.rows, self.with_bundle(r)) or discard;
+            }
+            i = i - 1;
+        }
+        return out;
+    }
+
+    fn queued_attempts(limit: Int) -> AttemptRows fallible(StoreError) {
+        let mut out = AttemptRows { };
+        for r in self.attempt_rows.rows {
+            if r.state == "queued" && count(out.rows) < limit { push(out.rows, r) or discard; }
+        }
+        return out;
+    }
+
+    /// Attempt `id` replaced by `row`.
+    fn put_attempt(row: AttemptRow) {
+        let mut next = AttemptRows { };
+        for r in self.attempt_rows.rows {
+            if r.id == row.id {
+                push(next.rows, row) or discard;
+            } else {
+                push(next.rows, r) or discard;
+            }
+        }
+        self.attempt_rows = next;
+    }
+
+    fn start_attempt(
+        id: String,
+        node: String,
+        seat: String,
+        account: String,
+        ran: String,
+        concurrency: Int,
+        at: Time
+    ) -> Bool fallible(StoreError) {
+        let mut running = 0;
+        let mut found = AttemptRow { };
+        for r in self.attempt_rows.rows {
+            if r.state == "running" && r.node == node && r.seat == seat { running = running + 1; }
+            if r.id == id { found = r; }
+        }
+        if !found.present || found.state != "queued" || running >= concurrency { return false; }
+        found.state = "running";
+        found.node = node;
+        found.seat = seat;
+        found.account = account;
+        found.ran = ran;
+        found.phase = "starting";
+        found.has_started = true;
+        found.started_at = at;
+        found.reported_at = at;
+        self.put_attempt(found);
+        return true;
+    }
+
+    @unbounded
+    fn report_attempt(
+        id: String,
+        node: String,
+        r: AttemptReport,
+        at: Time
+    ) -> AttemptRow fallible(StoreError) {
+        let row = self.attempt(id) or raise;
+        if !row.present || row.state != "running" || row.node != node { return row; }
+        let mut next = row;
+        for e in r.events.rows {
+            let mut kept = e;
+            kept.seq = next.events + 1;
+            kept.at = at;
+            next.events = kept.seq;
+            if count(self.attempt_log.rows) >= 4000 {
+                let mut trimmed = HeldEvents { };
+                let mut first = true;
+                for h in self.attempt_log.rows {
+                    if first { first = false; } else { push(trimmed.rows, h) or discard; }
+                }
+                self.attempt_log = trimmed;
+            }
+            push(self.attempt_log.rows, HeldEvent { attempt: id, e: kept }) or discard;
+        }
+        // past the bound, the oldest of this attempt's events go
+        let mut held = 0;
+        for h in self.attempt_log.rows {
+            if h.attempt == id { held = held + 1; }
+        }
+        if held > ATTEMPT_EVENTS_KEPT {
+            let mut over = held - ATTEMPT_EVENTS_KEPT;
+            let mut trimmed = HeldEvents { };
+            for h in self.attempt_log.rows {
+                if over > 0 && h.attempt == id {
+                    over = over - 1;
+                    next.dropped = next.dropped + 1;
+                } else {
+                    push(trimmed.rows, h) or discard;
+                }
+            }
+            self.attempt_log = trimmed;
+        }
+        next = apply_report(next, r, at);
+        self.put_attempt(next);
+        return self.with_bundle(next);
+    }
+
+    fn end_attempt(
+        id: String,
+        state: String,
+        failure: String,
+        at: Time
+    ) -> AttemptRow fallible(StoreError) {
+        let row = self.attempt(id) or raise;
+        if !row.present || attempt_ended(row.state) { return row; }
+        let mut next = row;
+        next.state = state;
+        next.failure = failure;
+        next.phase = "";
+        next.has_ended = true;
+        next.ended_at = at;
+        self.put_attempt(next);
+        return next;
+    }
+
+    fn cancel_attempt(id: String, at: Time) -> AttemptRow fallible(StoreError) {
+        let row = self.attempt(id) or raise;
+        if !row.present || attempt_ended(row.state) { return row; }
+        if row.state == "queued" {
+            return self.end_attempt(id, "cancelled", "cancelled before it started", at) or raise;
+        }
+        let mut next = row;
+        next.cancel = true;
+        self.put_attempt(next);
+        return next;
+    }
+
+    fn seal_attempt(id: String, digest: String) fallible(StoreError) {
+        let row = self.attempt(id) or raise;
+        if !row.present { return; }
+        let mut next = row;
+        next.transcript_digest = digest;
+        self.put_attempt(next);
+    }
+
+    fn attempt_events(id: String, after: Int, limit: Int) -> AttemptEvents fallible(StoreError) {
+        let mut out = AttemptEvents { };
+        for h in self.attempt_log.rows {
+            if h.attempt == id && h.e.seq > after && count(out.rows) < limit {
+                push(out.rows, h.e) or discard;
+            }
+        }
+        return out;
+    }
+
+    @unbounded
+    fn fail_running(
+        node: String,
+        before: Time,
+        why: String,
+        at: Time
+    ) -> AttemptRows fallible(StoreError) {
+        let mut ids = Names { };
+        for r in self.attempt_rows.rows {
+            let lost = if len(node) > 0 {
+                r.node == node
+            } else {
+                std::time::unix(r.reported_at) < std::time::unix(before)
+            };
+            if r.state == "running" && lost { push(ids.items, r.id) or discard; }
+        }
+        let mut out = AttemptRows { };
+        for id in ids.items {
+            push(out.rows, self.end_attempt(id, "failed", why, at) or raise) or discard;
+        }
+        return out;
+    }
+
+    fn put_attempt_bundle(id: String, base64: String, bytes: Int, at: Time) fallible(StoreError) {
+        let mut next = BundleRows { };
+        for b in self.bundle_rows.rows {
+            if b.attempt != id { push(next.rows, b) or discard; }
+        }
+        push(next.rows, BundleRow { attempt: id, base64: base64, bytes: bytes, at: at }) or {
+            fail StoreError { kind: "full", message: "voice holds at most 32 bundles in memory" };
+        };
+        self.bundle_rows = next;
+    }
+
+    fn attempt_bundle(id: String) -> String fallible(StoreError) {
+        for b in self.bundle_rows.rows {
+            if b.attempt == id { return b.base64; }
+        }
+        return "";
+    }
+
+    fn drop_attempt_bundles(id: String, expired: Time) fallible(StoreError) {
+        let mut next = BundleRows { };
+        for b in self.bundle_rows.rows {
+            if b.attempt != id && std::time::unix(b.at) >= std::time::unix(expired) {
+                push(next.rows, b) or discard;
+            }
+        }
+        self.bundle_rows = next;
     }
 
     // ---- arrangements

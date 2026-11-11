@@ -75,6 +75,7 @@ id"}}`. The rows are the contract: `hale api export` of the surface is
 | nodes and seats | `/admin/v1/nodes`, `.../{node}`, `.../{node}/token`, `.../{node}/seats`, `.../{node}/seats/{seat}` |
 | the change log | `GET /admin/v1/changes`, written by every admin write above |
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
+| coding attempts | `POST`, `GET /v1/attempts`, `GET .../{attempt}`, `.../cancel`, `.../transcript`, `.../events`, `.../bundle`; the operator's `/admin/v1/attempts` and `/admin/v1/harnesses`; the node's `/node/v1/attempts/claim`, `.../{attempt}/report`, `.../{attempt}/bundle` ([`api/attempts.hl`](../api/attempts.hl), [docs/coding-attempts.md](coding-attempts.md)) |
 
 Everything above reaches the configuration and the fleet's reports through
 the `Store` interface ([`store/store.hl`](../store/store.hl)). Given
@@ -1100,6 +1101,15 @@ already there.
   absolute path in the engine: an npm-installed CLI is a `#!/usr/bin/env
   node` script whose `node` sits beside it, and the capability format needs
   nothing new. Other CLI engines follow that shape.
+
+  **Coding attempts.** A `harness` engine runs agentic coding CLIs as data
+  (a harness definition, [`harnesses/`](../harnesses/README.md)) for coding
+  attempts: the node's plane claims one when one of its attempt slots
+  (`node/attempt.hl`, four threads) is free, and the slot runs it in a
+  container of its own, behind an egress proxy on a network of its own,
+  reports it to the api every couple of seconds, and removes everything it
+  made when it ends ([docs/coding-attempts.md](coding-attempts.md)). A
+  `claude-cli` engine is the claude harness under its older name.
 
   **One node, several logins (hale-lang/voice#2).** Two accounts on one CLI
   are two seats of one `claude-cli` engine (or two engines), each naming its

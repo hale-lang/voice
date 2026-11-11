@@ -72,6 +72,10 @@ locus DataPlane {
         };
         nodes: Nodes = Nodes { store: self.store, link: self.link };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
+        // voice's harness definitions, a JSON list (attempts.hl), and the
+        // coding attempts run with them
+        harnesses: String = "[]";
+        attempts: CodingAttempts = CodingAttempts { store: self.store, harnesses: self.harnesses };
         // grafted, the nodes' account on the habitat's broker (lib/broker),
         // handed to a node in its registration's answer; "" standalone
         node_user: String = "";
@@ -177,6 +181,91 @@ locus DataPlane {
             return caller_json(capabilities_json(caps));
         }
 
+        // coding attempts (attempts.hl), the caller's project's
+        if std::http::is_route(c, "POST", "/v1/attempts") {
+            let ctx = self.caller(req) or raise;
+            return self.attempts.create(ctx, req.body) or raise;
+        }
+        if std::http::is_route(c, "GET", "/v1/attempts") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.list(p, req.path) or raise;
+        }
+        if std::http::is_route(c, "GET", "/v1/attempts/:id") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.get(p, std::http::path_param(c.params, "id")) or raise;
+        }
+        if std::http::is_route(c, "POST", "/v1/attempts/:id/cancel") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.cancel(p, std::http::path_param(c.params, "id")) or raise;
+        }
+        if std::http::is_route(c, "GET", "/v1/attempts/:id/transcript") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.transcript(p, std::http::path_param(c.params, "id")) or raise;
+        }
+        if std::http::is_route(c, "GET", "/v1/attempts/:id/events") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.follow(
+                p,
+                std::http::path_param(c.params, "id"),
+                EventStream { conn_fd: req.conn_fd },
+                last_event(req),
+            ) or raise;
+        }
+        if std::http::is_route(c, "GET", "/v1/attempts/:id/bundle") {
+            let ctx = self.caller(req) or raise;
+            let p = self.attempts.project_of(ctx) or raise;
+            return self.attempts.bundle(
+                p,
+                std::http::path_param(c.params, "id"),
+                req.conn_fd,
+            ) or raise;
+        }
+
+        // the operator's view of every project's attempts, and the
+        // harnesses voice has
+        if std::str::starts_with(req.path, "/admin/v1/attempts")
+            || std::str::starts_with(req.path, "/admin/v1/harnesses")
+        {
+            if !self.operator.admits(std::http::header(req, "Authorization")) {
+                return operator_refusal();
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/harnesses") {
+                return self.attempts.definitions();
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/attempts") {
+                return self.attempts.list("", req.path) or raise;
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/attempts/:id") {
+                return self.attempts.get("", std::http::path_param(c.params, "id")) or raise;
+            }
+            if std::http::is_route(c, "POST", "/admin/v1/attempts/:id/cancel") {
+                return self.attempts.cancel("", std::http::path_param(c.params, "id")) or raise;
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/attempts/:id/transcript") {
+                return self.attempts.transcript("", std::http::path_param(c.params, "id")) or raise;
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/attempts/:id/events") {
+                return self.attempts.follow(
+                    "",
+                    std::http::path_param(c.params, "id"),
+                    EventStream { conn_fd: req.conn_fd },
+                    last_event(req),
+                ) or raise;
+            }
+            if std::http::is_route(c, "GET", "/admin/v1/attempts/:id/bundle") {
+                return self.attempts.bundle(
+                    "",
+                    std::http::path_param(c.params, "id"),
+                    req.conn_fd,
+                ) or raise;
+            }
+        }
+
         // the hub: what the admin UI follows live (hub.hl), the admin events
         // among it when this api has a database (`AdminFeed`)
         if std::http::is_route(c, "GET", "/admin/v1/hub") {
@@ -220,6 +309,8 @@ locus DataPlane {
             let ctx = self.node_ctx(req) or raise;
             let r = read_registration(req.body) or raise;
             let answer = self.node_plane.register_read(r, ctx) or raise;
+            // a node registers when it starts: what it ran is gone
+            self.attempts.node_restarted(ctx.caller.name);
             self.observed(ctx, "register");
             if len(self.node_user) > 0 { return self.registered_with_account(req, answer); }
             return json_answer(200, registered_json(answer));
@@ -276,6 +367,26 @@ locus DataPlane {
             let r = read_link_check(req.body) or raise;
             self.node_plane.link_check(r, ctx) or raise;
             return no_content();
+        }
+        if std::http::is_route(c, "POST", "/node/v1/attempts/claim") {
+            let ctx = self.node_ctx(req) or raise;
+            return self.attempts.claim(ctx.caller.name) or raise;
+        }
+        if std::http::is_route(c, "POST", "/node/v1/attempts/:id/report") {
+            let ctx = self.node_ctx(req) or raise;
+            return self.attempts.report(
+                ctx.caller.name,
+                std::http::path_param(c.params, "id"),
+                req.body,
+            ) or raise;
+        }
+        if std::http::is_route(c, "PUT", "/node/v1/attempts/:id/bundle") {
+            let ctx = self.node_ctx(req) or raise;
+            return self.attempts.put_bundle(
+                ctx.caller.name,
+                std::http::path_param(c.params, "id"),
+                req.body,
+            ) or raise;
         }
         if std::http::is_route(c, "POST", "/node/v1/draining") {
             let ctx = self.node_ctx(req) or raise;
@@ -735,6 +846,14 @@ locus DataPlane {
     fn node_ctx(req: std::http::Request) -> std::api::Context fallible(ApiError) {
         return self.node_bearer.context(std::http::header(req, "Authorization")) or raise;
     }
+}
+
+/// Where a stream's subscriber has got to: its `Last-Event-ID`, or `?after=`.
+fn last_event(req: std::http::Request) -> String {
+    let id = std::http::header(req, "Last-Event-ID");
+    if len(id) > 0 { return id; }
+    let after = query_all(req.path, "after");
+    return at(after.items, 0) or "";
 }
 
 /// What a handler returns when it has answered on its connection itself.

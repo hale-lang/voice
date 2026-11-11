@@ -20,7 +20,7 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
 
 ```
  caller ──HTTP──▶ api ──NATS──▶ node ──▶ seat (an engine under an account)
-                   │  ▲                   managed, openai-compatible, claude-cli, static
+                   │  ▲                   managed, openai-compatible, harness, claude-cli, static
                    ▼  │
                  Postgres ◀── brain (ranks seats into the route table)
 ```
@@ -33,7 +33,11 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
   - `managed`: a local model voice fetches, verifies and runs (llama.cpp on
     Metal, vLLM or llama.cpp on CUDA), as the operator places it;
   - `openai-compatible`: an endpoint that speaks the OpenAI API;
-  - `claude-cli`: Claude Code, logged in as one account per seat;
+  - `harness`: an agentic coding CLI (Claude Code, Codex, Antigravity,
+    Vibe) under one login per seat, running coding attempts in a container
+    of their own ([`docs/coding-attempts.md`](./docs/coding-attempts.md));
+    `claude-cli` is the claude harness under its older name, and also
+    answers requests;
   - `static`: a canned answer, for trying voice and for tests.
 - **brain** turns the state of the fleet into a ranked route table.
 
@@ -203,8 +207,8 @@ end-to-end run over Postgres and NATS, a fresh clone as a graft takes it, and th
 ## Status
 
 Running: configuration, the caller's endpoints (streamed and not, many at
-once), the node plane, the brain, agent-CLI, OpenAI-compatible and managed
-local seats, usage metering and the ledger, peek recordings, the admin event
+once), coding attempts on four agentic coding CLIs, the node plane, the
+brain, agent-CLI, OpenAI-compatible and managed local seats, usage metering and the ledger, peek recordings, the admin event
 stream and the live hub, and voice as a habitat organism (a provider of
 models to the habitat's other organisms, each a project under the habitat's).
 
@@ -214,5 +218,7 @@ models to the habitat's other organisms, each a project under the habitat's).
   request path, state, security, failure and deployment.
 - [`docs/adding-a-node.md`](./docs/adding-a-node.md): a Mac or a Linux
   machine joining as a node, in one command.
+- [`docs/coding-attempts.md`](./docs/coding-attempts.md): running agentic
+  coding CLIs on repositories, their logins, the sandbox and cleanup.
 - [`DIRECTION.md`](./DIRECTION.md): where voice is going.
 - [`FRICTION.md`](./FRICTION.md): what writing voice in Hale has run into.

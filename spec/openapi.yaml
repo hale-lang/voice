@@ -235,6 +235,8 @@ tags:
     description: Admin plane. What changes as it happens, for the admin UI.
   - name: routes
     description: Admin plane. The route table as this api instance holds it.
+  - name: attempts
+    description: "Caller plane. Coding attempts: an agentic coding harness run once on a repository, its commits fetched as a git bundle."
   - name: node
     description: Node plane. A node registers, reads its assignment and reports its state.
   - name: health
@@ -571,6 +573,251 @@ paths:
           $ref: '#/components/responses/NotFound'
         '503':
           $ref: '#/components/responses/Unavailable'
+
+  /v1/attempts:
+    post:
+      tags: [attempts]
+      operationId: createAttempt
+      summary: Ask for a coding attempt
+      description: |
+        Asks voice to run an agentic coding harness once on a repository:
+        check out `repo` at `base` in a workspace on a node, run the harness
+        with `instruction`, and commit what it produced as `as`. It runs for
+        minutes or hours, so it is answered at once, `queued` (`202`), and
+        read afterwards (`getAttempt`, `streamAttemptEvents`). An attempt is
+        never refused for capacity: it waits until a harness seat that can
+        run it has room, as a request is routed (the seat's account one the
+        key may spend, its data class `internal`, its harness and model the
+        ones asked for), or until its `deadline`.
+
+        The attempt ends at commits. Pushing them and asking for a review
+        are the caller's: it fetches the commits as a git bundle
+        (`getAttemptBundle`) and cites the attempt's evidence (`branch`,
+        `base_sha`, `head_sha`, `summary`, `usage`, `wall_ms`,
+        `transcript_digest`).
+
+        `repo` is fetched by the node over https, http or git with no
+        credential at all, neither the caller's nor the node's (no ssh key,
+        credential helper or netrc): a repository anyone on the node's
+        network can read. ssh, a local path or `file://` is refused.
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/VoiceProject'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CodingAttemptCreate'
+            examples:
+              feature:
+                value:
+                  repo: https://forge.example.com/team/app.git
+                  base: main
+                  instruction: Add a /healthz endpoint that answers 200, with a test for it, and make the test suite pass.
+                  harness: claude
+                  budget: { tokens: 2000000 }
+                  deadline: '2026-11-12T06:00:00Z'
+                  as: { name: Builder, email: builder@example.com }
+      responses:
+        '202':
+          description: Created and queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttempt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+    get:
+      tags: [attempts]
+      operationId: listAttempts
+      summary: The project's attempts
+      description: The project's attempts, newest first, at most 200.
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/VoiceProject'
+      responses:
+        '200':
+          description: The attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttemptList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/attempts/{attempt}:
+    get:
+      tags: [attempts]
+      operationId: getAttempt
+      summary: An attempt, and its evidence once it ended
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - $ref: '#/components/parameters/VoiceProject'
+      responses:
+        '200':
+          description: The attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/attempts/{attempt}/cancel:
+    post:
+      tags: [attempts]
+      operationId: cancelAttempt
+      summary: Stop an attempt
+      description: |
+        A queued attempt ends `cancelled` at once. A running one is stopped
+        by its node at its next report, within a few seconds: its container
+        is removed and it ends `cancelled`, its workspace removed with it.
+        An attempt that has ended is answered as it is.
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - $ref: '#/components/parameters/VoiceProject'
+      responses:
+        '200':
+          description: The attempt, as it now is.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/attempts/{attempt}/transcript:
+    get:
+      tags: [attempts]
+      operationId: getAttemptTranscript
+      summary: The attempt's stored transcript
+      description: |
+        Every event voice keeps of the attempt, one `CodingAttemptEvent` a
+        line (JSON Lines), oldest first: what the harness wrote, the tools
+        it used, and what voice did. Voice keeps the last 2000 events of an
+        attempt (`transcript.dropped` counts those it let go). Once the
+        attempt ended, the sha256 of exactly these bytes is its
+        `transcript_digest`.
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - $ref: '#/components/parameters/VoiceProject'
+      responses:
+        '200':
+          description: The transcript.
+          content:
+            application/jsonl:
+              schema:
+                $ref: '#/components/schemas/CodingAttemptEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+
+  /v1/attempts/{attempt}/events:
+    get:
+      tags: [attempts]
+      operationId: streamAttemptEvents
+      summary: Follow an attempt live
+      description: |
+        A server-sent event stream: each transcript event past the
+        subscriber's place as an `event` (`data:` a `CodingAttemptEvent`,
+        `id:` its `seq`), and the attempt as it stands as an `attempt`
+        (`data:` a `CodingAttempt`) whenever it changes. A client that
+        reconnects sends its last `id` in `Last-Event-ID` (or `?after=`).
+        The stream ends once the attempt has ended and every event was sent.
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - $ref: '#/components/parameters/VoiceProject'
+        - name: after
+          in: query
+          required: false
+          description: The `seq` to follow from, when no `Last-Event-ID` is sent.
+          schema: { type: integer, minimum: 0 }
+        - name: Last-Event-ID
+          in: header
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: 'The stream: `event` (a `CodingAttemptEvent`) and `attempt` (a `CodingAttempt`) events.'
+          content:
+            text/event-stream:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CodingAttemptEvent'
+                  - $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/attempts/{attempt}/bundle:
+    get:
+      tags: [attempts]
+      operationId: getAttemptBundle
+      summary: The attempt's commits, as a git bundle
+      description: |
+        The commits from `base_sha` to `head_sha` on `branch`, as a git
+        bundle (`git bundle create <bundle> <base_sha>..<branch>`): in a
+        clone holding `base_sha`, `git fetch <bundle> <branch>` brings them
+        in, and the fetched head is `head_sha`. Voice holds it once: fetched,
+        or a day after the attempt ended, it is let go (`404`).
+      security:
+        - projectKey: []
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+        - $ref: '#/components/parameters/VoiceProject'
+      responses:
+        '200':
+          description: The bundle. `X-Voice-Head-Sha` names the head it carries.
+          headers:
+            X-Voice-Head-Sha:
+              schema: { type: string }
+          content:
+            application/x-git-bundle:
+              schema: { type: string, format: binary }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /admin/v1/projects:
     get:
@@ -3728,6 +3975,173 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  /admin/v1/attempts:
+    get:
+      tags: [attempts]
+      operationId: listAllAttempts
+      summary: Every project's attempts
+      description: Every project's attempts, newest first, at most 200; or one project's, with `project`. The admin UI's Attempts screen.
+      security:
+        - operatorToken: []
+      parameters:
+        - name: project
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: The attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttemptList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/v1/attempts/{attempt}:
+    get:
+      tags: [attempts]
+      operationId: getAnyAttempt
+      summary: "Any project's attempt, as `getAttempt`"
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: The attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/attempts/{attempt}/cancel:
+    post:
+      tags: [attempts]
+      operationId: cancelAnyAttempt
+      summary: "Stop any project's attempt, as `cancelAttempt`"
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: The attempt.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/attempts/{attempt}/transcript:
+    get:
+      tags: [attempts]
+      operationId: getAnyAttemptTranscript
+      summary: "Any project's attempt's transcript, as `getAttemptTranscript`"
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: The transcript.
+          content:
+            application/jsonl:
+              schema:
+                $ref: '#/components/schemas/CodingAttemptEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/attempts/{attempt}/events:
+    get:
+      tags: [attempts]
+      operationId: streamAnyAttemptEvents
+      summary: "Follow any project's attempt, as `streamAttemptEvents`"
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: The stream.
+          content:
+            text/event-stream:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/CodingAttemptEvent'
+                  - $ref: '#/components/schemas/CodingAttempt'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/attempts/{attempt}/bundle:
+    get:
+      tags: [attempts]
+      operationId: getAnyAttemptBundle
+      summary: "Any project's attempt's bundle, as `getAttemptBundle`"
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      responses:
+        '200':
+          description: The bundle.
+          content:
+            application/x-git-bundle:
+              schema: { type: string, format: binary }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /admin/v1/harnesses:
+    get:
+      tags: [attempts]
+      operationId: listHarnesses
+      summary: The harness definitions voice has
+      description: |
+        The agentic coding CLIs voice runs, each as data
+        (`HarnessDefinition`): voice's own, in its `harnesses` directory,
+        read at start and held to the rules (no bypass flag, a base image by
+        digest, a login only by environment or a per-login directory). A
+        harness seat names one by its id; the admin UI's seat form reads how
+        each one's login is set up from here.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The definitions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HarnessList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
   /node/v1/register:
     post:
       tags: [node]
@@ -3998,6 +4412,113 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
 
+  /node/v1/attempts/claim:
+    post:
+      tags: [node]
+      operationId: claimAttempt
+      summary: Take a coding attempt to run
+      description: |
+        A node with a free attempt slot asks for work, every few seconds
+        while it has one. The coordinator starts the oldest queued attempt
+        one of the node's harness seats can run (up, enabled, its account
+        one the attempt's project and key may spend and not archived, its
+        data class `internal`, its harness and model the ones asked for, and
+        fewer attempts running on it than its concurrency, checked in the
+        store so two api instances never start more), and answers with what
+        the node runs it with: the harness's definition, the login the seat
+        runs under (a vault entry's or a login directory's name, never a
+        credential), and the hosts its egress allows. `204` when there is
+        none. Attempts ride the node plane rather than NATS: they outlive any
+        api instance, and every step of theirs lands in the store.
+      security:
+        - enrollmentToken: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200':
+          description: An attempt, started on one of the node's seats.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttemptStart'
+        '204':
+          description: None to run.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NodeRevoked'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /node/v1/attempts/{attempt}/report:
+    post:
+      tags: [node]
+      operationId: reportAttempt
+      summary: How an attempt the node runs stands
+      description: |
+        Every couple of seconds while it runs, and once at its end: the
+        transcript events since the last report, and what the node now
+        knows (its phase, its base and head commits, the harness's summary,
+        its usage as the harness reported it, its wall time). A report with
+        `state` ends the attempt. The answer says to stop when the attempt
+        was cancelled or is no longer this node's: the node then removes its
+        container and its workspace and reports its end.
+      security:
+        - enrollmentToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttemptReport'
+      responses:
+        '200':
+          description: Received.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttemptReportAnswer'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /node/v1/attempts/{attempt}/bundle:
+    put:
+      tags: [node]
+      operationId: putAttemptBundle
+      summary: The commits of an attempt the node runs, as a git bundle
+      description: |
+        Before it reports the attempt's end, the node hands over the bundle
+        of the branch's commits from the base, which the coordinator holds
+        for the caller (`getAttemptBundle`). At most 6 MiB.
+      security:
+        - enrollmentToken: []
+      parameters:
+        - $ref: '#/components/parameters/AttemptId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AttemptBundleUpload'
+      responses:
+        '204':
+          description: Held.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /admin/v1/changes:
     get:
       tags: [changes]
@@ -4094,6 +4615,11 @@ components:
       description: "The operator token, presented as `Authorization: Bearer va-...` on the admin plane, and on the caller plane with `Voice-Project` naming the project the request is charged to. The api mints it on its first start and keeps it in its store; `voice-api admin-token` prints it."
 
   parameters:
+    AttemptId:
+      name: attempt
+      in: path
+      required: true
+      schema: { type: string }
     ModelId:
       name: model
       in: path
@@ -5460,6 +5986,379 @@ components:
               type: string
               description: Shown once. Voice stores only a digest.
 
+    # ---- coding attempts -------------------------------------------------
+
+    CommitIdentity:
+      type: object
+      description: |
+        Who the attempt's commits are by: their author and committer. Voice
+        takes it from the caller as it is and passes it to git unchanged; a
+        caller such as an organization's leg passes its position's identity
+        through. Left out, an attempt commits as `voice attempt <id>`.
+      required: [name, email]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        email: { type: string, minLength: 3, maxLength: 254 }
+
+    AttemptBudget:
+      type: object
+      description: |
+        The most tokens the harness may use, input and output together, as
+        its own output reports them; the attempt is stopped and fails past
+        it. A harness whose output reports no usage cannot be held to one.
+      required: [tokens]
+      properties:
+        tokens: { type: integer, minimum: 1 }
+
+    CodingAttemptCreate:
+      type: object
+      required: [repo, base, instruction]
+      properties:
+        repo:
+          type: string
+          maxLength: 2048
+          description: The repository's clone URL, over https, http or git.
+          examples: ['https://forge.example.com/team/app.git']
+        base:
+          type: string
+          maxLength: 256
+          description: The branch, tag or commit to start from.
+          examples: [main]
+        instruction:
+          type: string
+          maxLength: 262144
+          description: What the harness is asked to do. Voice puts its definition's short preamble before it (it commits for the harness when it does not, and pushes nothing).
+        harness:
+          type: string
+          description: The harness definition to run (`listHarnesses`); any a seat can run when left out.
+          examples: [claude, codex, agy, vibe]
+        model:
+          type: string
+          description: A catalog model; it runs on a seat that serves it, under the seat's own name for it. Left out, the seat's own model, or its CLI's default.
+        budget:
+          $ref: '#/components/schemas/AttemptBudget'
+        deadline:
+          type: string
+          format: date-time
+          description: When it fails if it has not ended, queued or running; within 24 hours. Four hours from now when left out.
+        as:
+          $ref: '#/components/schemas/CommitIdentity'
+
+    CodingAttempt:
+      type: object
+      description: |
+        An attempt as it stands, and, once it ended, the evidence a caller
+        cites: `branch`, `base_sha` and `head_sha` (the commits it made),
+        `summary` (the harness's final message), `usage`, `wall_ms`, and
+        `transcript_digest`; and how to fetch the result: `bundle` and
+        `transcript`.
+
+        `done`: the harness ran to its end and its work is committed on
+        `branch`, `head_sha` past `base_sha`. `failed`: it did not, `failure`
+        says why (the harness failed or changed nothing, its budget or
+        deadline ran out, its node stopped); commits it made are in the
+        bundle all the same. `cancelled`: it was stopped. When an attempt
+        ends, its node removes its container and its workspace: what remains
+        is this record, its bounded transcript, and its bundle until it is
+        fetched or a day passes.
+      required: [id, object, state, project, key, repo, base, instruction, as, branch, usage, wall_ms, deadline, cancel_requested, transcript, created_at]
+      properties:
+        id: { type: string, examples: [att_5f0c2a9e8d1b4c3a7e6f1d2c] }
+        object: { type: string, const: attempt }
+        state:
+          type: string
+          enum: [queued, running, done, failed, cancelled]
+        phase:
+          type: [string, 'null']
+          description: What its node is doing while it runs (`starting`, `fetching`, `building`, `running`, `committing`); `null` otherwise.
+        project: { type: string }
+        key: { type: string }
+        harness:
+          type: [string, 'null']
+          description: The harness that ran it, or the one asked for before it started.
+        model: { type: [string, 'null'] }
+        repo: { type: string }
+        base: { type: string }
+        instruction: { type: string }
+        as:
+          $ref: '#/components/schemas/CommitIdentity'
+        branch:
+          type: string
+          description: The branch its commits are on, in its bundle.
+          examples: [voice/attempt-att_5f0c2a9e8d1b4c3a7e6f1d2c]
+        base_sha:
+          type: [string, 'null']
+          description: The commit `base` named when it was fetched.
+        head_sha:
+          type: [string, 'null']
+          description: The branch's head once the harness's work was committed.
+        summary:
+          type: [string, 'null']
+          description: The harness's final message, as its output gave it.
+        failure: { type: [string, 'null'] }
+        served:
+          type: [object, 'null']
+          description: Where it ran, once started.
+          required: [node, seat, account]
+          properties:
+            node: { type: string }
+            seat: { type: string }
+            account: { type: string }
+        usage:
+          type: object
+          description: Its token usage as the harness's own output reported it; `reported` false, and the counts `null`, when it reports none. Voice invents no count.
+          required: [reported, input_tokens, output_tokens]
+          properties:
+            reported: { type: boolean }
+            input_tokens: { type: [integer, 'null'] }
+            output_tokens: { type: [integer, 'null'] }
+        wall_ms:
+          type: integer
+          description: How long its node worked on it, from its start to its end.
+        budget:
+          oneOf:
+            - $ref: '#/components/schemas/AttemptBudget'
+            - type: 'null'
+        deadline: { type: string, format: date-time }
+        cancel_requested: { type: boolean }
+        transcript:
+          type: object
+          required: [url, events_url, events, dropped]
+          properties:
+            url: { type: string, description: 'The stored transcript (`getAttemptTranscript`).' }
+            events_url: { type: string, description: 'The live stream (`streamAttemptEvents`).' }
+            events: { type: integer, description: "Events kept." }
+            dropped: { type: integer, description: "The oldest events let go past the bound." }
+        transcript_digest:
+          type: [string, 'null']
+          description: The sha256 of the stored transcript, as `getAttemptTranscript` answers it, once the attempt ended; stable from then on.
+          examples: ['sha256:9199ae215966f7272145dc9c2c5062ea9169968079c8238db5ab7b8720685c7a']
+        bundle:
+          type: [object, 'null']
+          description: The git bundle of its commits, while voice holds it.
+          required: [url, bytes]
+          properties:
+            url: { type: string }
+            bytes: { type: integer }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, 'null'], format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+      examples:
+        - id: att_5f0c2a9e8d1b4c3a7e6f1d2c
+          object: attempt
+          state: done
+          phase: null
+          project: work
+          key: work-ci
+          harness: claude
+          model: null
+          repo: https://forge.example.com/team/app.git
+          base: main
+          instruction: Add a /healthz endpoint that answers 200, with a test for it.
+          as: { name: Builder, email: builder@example.com }
+          branch: voice/attempt-att_5f0c2a9e8d1b4c3a7e6f1d2c
+          base_sha: 58bec97f15f4881815b1cec3cd9b1548d4cc7823
+          head_sha: 26148255548842d039c635933c91aa26e7b597f4
+          summary: Added GET /healthz, answering 200, and a test for it; the suite passes.
+          failure: null
+          served: { node: node-a, seat: claude-work, account: claude-work }
+          usage: { reported: true, input_tokens: 182340, output_tokens: 4120 }
+          wall_ms: 412000
+          budget: null
+          deadline: '2026-11-12T06:00:00Z'
+          cancel_requested: false
+          transcript:
+            url: /v1/attempts/att_5f0c2a9e8d1b4c3a7e6f1d2c/transcript
+            events_url: /v1/attempts/att_5f0c2a9e8d1b4c3a7e6f1d2c/events
+            events: 84
+            dropped: 0
+          transcript_digest: 'sha256:9199ae215966f7272145dc9c2c5062ea9169968079c8238db5ab7b8720685c7a'
+          bundle: { url: /v1/attempts/att_5f0c2a9e8d1b4c3a7e6f1d2c/bundle, bytes: 2841 }
+          created_at: '2026-11-12T02:00:00Z'
+          started_at: '2026-11-12T02:00:03Z'
+          ended_at: '2026-11-12T02:06:55Z'
+
+    CodingAttemptList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          maxItems: 200
+          items: { $ref: '#/components/schemas/CodingAttempt' }
+
+    CodingAttemptEvent:
+      type: object
+      description: |
+        One transcript event. `text`: what the harness wrote; `tool`: a tool
+        it used, or one its policy refused; `note`: what voice did; `error`:
+        why it failed. Its text is at most 16 KiB.
+      required: [seq, at, kind, text]
+      properties:
+        seq: { type: integer, minimum: 1 }
+        at: { type: string, format: date-time }
+        kind: { type: string, enum: [text, tool, note, error] }
+        text: { type: string }
+
+    HarnessDefinition:
+      type: object
+      description: |
+        An agentic coding CLI as data, which voice's one wrapper runs: in a
+        container of the attempt's own, with only the workspace mounted, its
+        egress through a proxy that lets through only `egress`, the
+        registries, and the seat's own hosts. Nothing in it skips the CLI's
+        own permissions: a definition whose command holds a bypass flag is
+        refused.
+      required: [id, name, image, command, instruction, model, login, reader, commits, preamble, egress]
+      properties:
+        id: { type: string, pattern: '^[a-z0-9][a-z0-9-]{0,62}$' }
+        name: { type: string }
+        version: { type: string, description: The CLI's version the image installs. }
+        image:
+          type: object
+          description: What it runs in, built once on a node.
+          required: [base, install]
+          properties:
+            base: { type: string, description: 'A base image by digest: `<image>@sha256:<64 hex>`.' }
+            install: { type: string, description: "The one shell command that installs the CLI on it, pinned to a version where the vendor publishes one." }
+        command:
+          type: array
+          description: The CLI's argv, its permission policy among it.
+          items: { type: string }
+        instruction:
+          type: object
+          required: [via]
+          properties:
+            via: { type: string, enum: [stdin, argument, file] }
+            path: { type: string, description: 'For `file`: a file of `/voice`, mounted read-only.' }
+        model:
+          type: object
+          description: How a model is named, by a flag or an environment variable.
+          properties:
+            flag: { type: string }
+            env: { type: string }
+        login:
+          type: object
+          description: |
+            How a login reaches a run. `env`: a vault entry's value, in the
+            variable `env`, read into the container's environment and never
+            its argv. `home`: a directory per login on the node
+            (`<data>/logins/<login>`), of which only `files` are copied into
+            the attempt's scratch copy, mounted at `mount` (and copied back
+            when the CLI refreshes them).
+          required: [kind]
+          properties:
+            kind: { type: string, enum: [env, home] }
+            env: { type: string }
+            mount: { type: string }
+            from: { type: string }
+            files: { type: array, items: { type: string } }
+            entry: { type: string, description: "The name voice suggests for a login of `{account}`: the vault entry or login directory a seat names." }
+            setup: { type: string, description: "How the operator makes a login, on the node." }
+            describe: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        reader:
+          type: string
+          enum: [text, claude-stream-json, codex-jsonl, agy-stream-json, vibe-streaming]
+          description: How its output is read into the transcript, its summary and its usage.
+        usage_file: { type: string, description: 'A file of `/voice/out` the CLI writes its usage to, read after the run.' }
+        commits: { type: boolean, description: "The CLI commits its work itself; voice commits what is left either way." }
+        nested_sandbox: { type: boolean, description: 'The CLI sandboxes its own commands with user namespaces (bubblewrap), which the container then allows.' }
+        preamble: { type: string }
+        egress:
+          type: array
+          description: The vendor's hosts; a leading dot allows any host under it.
+          items: { type: string }
+        idle_seconds: { type: integer, description: "How long it may write nothing before it has failed." }
+        base_url_env:
+          type: [string, 'null']
+          description: The variable the CLI reads its API's address from. Not used yet; routing the CLI's own model calls through voice will set it.
+        protocol:
+          type: [string, 'null']
+          description: The wire its model calls speak. Not used yet, as `base_url_env`.
+        mcp:
+          type: [object, 'null']
+          description: An MCP configuration to inject. Not used yet.
+
+    HarnessList:
+      type: object
+      required: [object, data]
+      properties:
+        object: { type: string, const: list }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/HarnessDefinition' }
+
+    AttemptStart:
+      type: object
+      description: What a node runs an attempt with (`claimAttempt`).
+      required: [attempt]
+      properties:
+        attempt:
+          type: object
+          required: [id, seat, repo, base, branch, instruction, model, login, budget_tokens, deadline, as, egress, harness]
+          properties:
+            id: { type: string }
+            seat: { type: string }
+            repo: { type: string }
+            base: { type: string }
+            branch: { type: string }
+            instruction: { type: string }
+            model: { type: string, description: 'The CLI''s own name for the model, "" for its default.' }
+            login: { type: string, description: "The vault entry or login directory the seat runs under, by name." }
+            budget_tokens: { type: integer, description: "0 for none." }
+            deadline: { type: integer, description: "Unix seconds." }
+            as: { $ref: '#/components/schemas/CommitIdentity' }
+            egress: { type: array, items: { type: string } }
+            harness: { $ref: '#/components/schemas/HarnessDefinition' }
+
+    AttemptReport:
+      type: object
+      properties:
+        state:
+          type: string
+          enum: [done, failed, cancelled]
+          description: Its end; left out while it runs.
+        phase: { type: string }
+        harness: { type: string }
+        base_sha: { type: string }
+        head_sha: { type: string }
+        summary: { type: string }
+        failure: { type: string }
+        usage:
+          type: object
+          description: As the harness's output reported it; left out when it reports none.
+          properties:
+            input_tokens: { type: integer }
+            output_tokens: { type: integer }
+        wall_ms: { type: integer }
+        events:
+          type: array
+          maxItems: 500
+          items:
+            type: object
+            required: [kind, text]
+            properties:
+              kind: { type: string, enum: [text, tool, note, error] }
+              text: { type: string }
+
+    AttemptReportAnswer:
+      type: object
+      required: [cancel, state]
+      properties:
+        cancel: { type: boolean, description: "Stop it now." }
+        state: { type: string }
+
+    AttemptBundleUpload:
+      type: object
+      required: [bundle, bytes]
+      properties:
+        bundle: { type: string, description: "The git bundle, base64." }
+        bytes: { type: integer, minimum: 1, maximum: 6291456 }
+
     # ---- admin plane: usage ---------------------------------------------
 
     UsageRecord:
@@ -5508,7 +6407,13 @@ components:
           description: The account the request named in `voice.account`, if any.
         endpoint:
           type: string
-          enum: [responses, chat.completions]
+          enum: [responses, chat.completions, attempt]
+          description: |
+            `attempt`: a coding attempt's one record, under the attempt's id,
+            its `conversation` the attempt's id, its `timing.engine_ms` the
+            harness's wall time, and its tokens as the harness's output
+            reported them (`metadata.tokens` is `unreported`, and the counts
+            0, when it reports none).
         status:
           type: string
           enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]
@@ -5602,7 +6507,13 @@ components:
         requested_account: { type: [string, 'null'] }
         endpoint:
           type: string
-          enum: [responses, chat.completions]
+          enum: [responses, chat.completions, attempt]
+          description: |
+            `attempt`: a coding attempt's one record, under the attempt's id,
+            its `conversation` the attempt's id, its `timing.engine_ms` the
+            harness's wall time, and its tokens as the harness's output
+            reported them (`metadata.tokens` is `unreported`, and the counts
+            0, when it reports none).
         status:
           type: string
           enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]

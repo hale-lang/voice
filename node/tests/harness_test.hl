@@ -1,0 +1,273 @@
+// Harness definitions and the wrapper's argv (attempt.hl, lib/harness):
+// voice's four definitions and the test's fake are held to the rules, a
+// definition with a bypass flag is refused, and each renders the container
+// it runs in: the workspace mounted and nothing else of the machine, every
+// capability dropped, the attempt's own network, its model, and its login
+// only by name (a vault entry) or as the attempt's scratch copy (a login
+// directory), never its value.
+import ".." as node;
+import "../../lib/harness" as harness;
+
+fn path(rel: String) -> String {
+    return if std::io::fs::file_exists(rel) { rel } else { "../" + rel };
+}
+
+fn definition(id: String) -> String {
+    let here = if id == "fake" { "scripts/e2e-harnesses/" } else { "harnesses/" };
+    return std::str::trim(std::io::fs::read_file(path(here + id + ".json")) or "");
+}
+
+/// An attempt's start, as the api answers a claim, for definition `def`.
+fn start(def: String, login: String, model: String) -> String {
+    return "{\"attempt\": {\"id\": \"att_0123456789ab\", \"seat\": \"coder\", \"repo\": \"https://forge.example.com/team/app.git\", \"base\": \"main\", \"branch\": \"voice/attempt-att_0123456789ab\", \"instruction\": \"add a test\", \"model\": "
+        + node::q(model) + ", \"login\": " + node::q(login)
+        + ", \"budget_tokens\": 0, \"deadline\": 4102444800, \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}, \"egress\": [\"api.example.com\", \".example.org\"], \"harness\": "
+        + def + "}}";
+}
+
+/// The argv `def` renders for an attempt in /home/op/node-data, its
+/// login `login`, its model `model`.
+fn argv_of(def: String, login: String, model: String) -> String {
+    let a = node::attempt_start(start(def, login, model));
+    std::test::assert_eq_str(a.problem, "", "the start is one the node runs");
+    return node::docker_run_argv(
+        harness::harness_def(def),
+        a,
+        "/home/op/node-data/attempts/att_0123456789ab",
+        "node-a",
+        "1000:1000",
+        "voice-harness-x:0123456789abcdef",
+    );
+}
+
+/// True when `argv` (newline-separated) holds `a` then `b`, adjacent.
+fn pair(argv: String, a: String, b: String) -> Bool {
+    return std::str::contains("\n" + argv, "\n" + a + "\n" + b + "\n");
+}
+
+/// Every `-v` source the argv mounts, a line each.
+@unbounded
+fn mounts(argv: String) -> String {
+    let mut out = "";
+    let mut rest = argv;
+    let mut prev = "";
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let a = if nl < 0 { rest } else { rest[0..nl] };
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        if prev == "-v" { out = out + a[0..std::str::index_of(a, ":")] + "\n"; }
+        prev = a;
+    }
+    return out;
+}
+
+/// The common checks of every harness's container.
+fn contained(id: String, argv: String) {
+    std::test::assert(pair(argv, "--cap-drop", "ALL"), id + ": every capability dropped");
+    std::test::assert(
+        pair(argv, "--security-opt", "no-new-privileges"),
+        id + ": no new privileges",
+    );
+    std::test::assert(
+        pair(argv, "--network", "voice-attempt-att_0123456789ab"),
+        id + ": its own network",
+    );
+    std::test::assert(pair(argv, "--user", "1000:1000"), id + ": as the node's user");
+    std::test::assert(
+        pair(argv, "-v", "/home/op/node-data/attempts/att_0123456789ab/work:/work:rw"),
+        id + ": the workspace mounted",
+    );
+    std::test::assert(
+        std::str::contains(argv, "HTTPS_PROXY=http://voice-attempt-att_0123456789ab-egress:8888"),
+        id + ": through its egress proxy",
+    );
+    std::test::assert(
+        std::str::contains(argv, "GIT_AUTHOR_NAME=Test Author"),
+        id + ": the caller's identity",
+    );
+    // nothing of the machine but the attempt's own directory
+    let m = mounts(argv);
+    let mut rest = m;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let src = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        std::test::assert(
+            std::str::starts_with(src, "/home/op/node-data/attempts/att_0123456789ab/"),
+            id + ": mounts only the attempt's directory, not " + src,
+        );
+    }
+    std::test::assert_eq_str(harness::bypass_in(argv), "", id + ": no bypass flag");
+    std::test::assert(!std::str::contains(argv, "/var/run/docker.sock"), id + ": no docker socket");
+}
+
+fn main() {
+    // the definitions voice ships, and the e2e's fake, pass
+    let ids = "claude\ncodex\nagy\nvibe\nfake\n";
+    let mut rest = ids;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let id = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        let def = definition(id);
+        std::test::assert(len(def) > 0, id + "'s definition is there");
+        std::test::assert_eq_str(
+            harness::harness_problem(def),
+            "",
+            id + " is a definition voice runs",
+        );
+    }
+
+    // claude: its login from the vault, by name only; its model by flag;
+    // its own permission mode and allow list
+    let claude = argv_of(definition("claude"), "claude-token--work", "sonnet");
+    contained("claude", claude);
+    std::test::assert(
+        std::str::contains(claude, "\n-e\nCLAUDE_CODE_OAUTH_TOKEN\n"),
+        "claude's login passed by name",
+    );
+    std::test::assert(!std::str::contains(claude, "CLAUDE_CODE_OAUTH_TOKEN="), "never by value");
+    std::test::assert(pair(claude, "--model", "sonnet"), "claude's model");
+    std::test::assert(pair(claude, "--permission-mode", "acceptEdits"), "claude's permission mode");
+    std::test::assert(std::str::contains(claude, "Bash(git push:*)"), "claude may not push");
+    std::test::assert(
+        !std::str::contains(claude, "seccomp=unconfined"),
+        "claude's container keeps docker's seccomp",
+    );
+    // the shell reads the login from the private file into the variable,
+    // then runs docker: the argv names the file, never the login
+    let wrapped = node::harness_argv(
+        harness::harness_def(definition("claude")),
+        claude,
+        "/home/op/node-data/attempts/att_0123456789ab/secret/login",
+    );
+    std::test::assert(
+        std::str::starts_with(
+            wrapped,
+            "sh\n-c\nCLAUDE_CODE_OAUTH_TOKEN=\"$(cat \"$1\")\"; rm -f \"$1\"; export CLAUDE_CODE_OAUTH_TOKEN; shift; exec \"$@\"\nsh\n/home/op/node-data/attempts/att_0123456789ab/secret/login\ndocker\nrun\n",
+        ),
+        "the login read from its file by a shell: " + wrapped[0..160],
+    );
+
+    // codex: a per-login directory, as the attempt's scratch copy; its own
+    // workspace-write sandbox, which needs a user namespace
+    let codex = argv_of(definition("codex"), "codex-work", "");
+    contained("codex", codex);
+    std::test::assert(
+        pair(
+            codex,
+            "-v",
+            "/home/op/node-data/attempts/att_0123456789ab/login:/home/voice/.codex:rw",
+        ),
+        "codex's login is the attempt's scratch copy",
+    );
+    std::test::assert(pair(codex, "-e", "CODEX_HOME=/home/voice/.codex"), "CODEX_HOME names it");
+    std::test::assert(pair(codex, "--sandbox", "workspace-write"), "codex's own sandbox");
+    std::test::assert(pair(codex, "-c", "approval_policy=\"never\""), "codex's approval policy");
+    std::test::assert(
+        pair(codex, "--security-opt", "seccomp=unconfined"),
+        "bubblewrap's user namespace",
+    );
+    std::test::assert(!std::str::contains(codex, "\n-m\n"), "no model: the CLI's own default");
+    let codex_m = argv_of(definition("codex"), "codex-work", "gpt-test");
+    std::test::assert(pair(codex_m, "-m", "gpt-test"), "codex's model");
+    // a run with a login directory is not wrapped in a shell
+    std::test::assert_eq_str(
+        node::harness_argv(harness::harness_def(definition("codex")), codex, "/x"),
+        codex,
+        "no secret to read",
+    );
+
+    // agy: a per-login directory, its allow rules and its sandbox
+    let agy = argv_of(definition("agy"), "agy-work", "");
+    contained("agy", agy);
+    std::test::assert(
+        pair(
+            agy,
+            "-v",
+            "/home/op/node-data/attempts/att_0123456789ab/login:/home/voice/.gemini:rw",
+        ),
+        "agy's login is the attempt's scratch copy",
+    );
+    std::test::assert(std::str::contains(agy, "\n--sandbox\n"), "agy's sandbox");
+    std::test::assert(std::str::contains(agy, "command(git push)"), "agy may not push");
+
+    // vibe: a key from the vault, by name; its model by variable; its
+    // instruction in /voice, read-only, and its export in /voice/out
+    let vibe = argv_of(definition("vibe"), "mistral-key--work", "devstral-test");
+    contained("vibe", vibe);
+    std::test::assert(
+        std::str::contains(vibe, "\n-e\nMISTRAL_API_KEY\n"),
+        "vibe's key passed by name",
+    );
+    std::test::assert(pair(vibe, "-e", "VIBE_ACTIVE_MODEL=devstral-test"), "vibe's model");
+    std::test::assert(pair(vibe, "--agent", "accept-edits"), "vibe's own scoped approval");
+    std::test::assert(
+        pair(vibe, "-v", "/home/op/node-data/attempts/att_0123456789ab/voice:/voice:ro"),
+        "the instruction read-only",
+    );
+
+    // a definition that skips the CLI's permissions is refused, whatever its form
+    let claude_def = definition("claude");
+    let bad = std::str::replace(claude_def, "\"acceptEdits\"", "\"bypassPermissions\"");
+    std::test::assert(
+        std::str::contains(harness::harness_problem(bad), "bypass"),
+        "bypassPermissions refused",
+    );
+    let yolo = std::str::replace(
+        claude_def,
+        "\"--no-session-persistence\",",
+        "\"--no-session-persistence\", \"--dangerously-skip-permissions\",",
+    );
+    std::test::assert(
+        std::str::contains(harness::harness_problem(yolo), "bypass"),
+        "--dangerously-skip-permissions refused",
+    );
+    let codex_def = definition("codex");
+    let full = std::str::replace(codex_def, "\"workspace-write\"", "\"danger-full-access\"");
+    std::test::assert(
+        std::str::contains(harness::harness_problem(full), "bypass"),
+        "danger-full-access refused",
+    );
+    let vibe_def = definition("vibe");
+    let auto = std::str::replace(vibe_def, "\"accept-edits\"", "\"auto-approve\"");
+    std::test::assert(
+        std::str::contains(harness::harness_problem(auto), "bypass"),
+        "auto-approve refused",
+    );
+    let tag = std::str::replace(claude_def, "node@sha256:", "node:22@sha256:x");
+    std::test::assert(len(harness::harness_problem(tag)) > 0, "an image by tag is refused");
+
+    // what a node refuses of an attempt it is handed
+    let bad_repo = node::attempt_start(
+        std::str::replace(
+            start(claude_def, "claude-token--work", ""),
+            "https://forge.example.com/team/app.git",
+            "file:///home/op/node-data",
+        ),
+    );
+    std::test::assert(len(bad_repo.problem) > 0, "a local repository is refused");
+    let bad_login = node::attempt_start(start(codex_def, "../other", ""));
+    std::test::assert(len(bad_login.problem) > 0, "a login directory outside logins/ is refused");
+
+    // the egress filter: a host whole, or any under a domain
+    std::test::assert_eq_str(
+        node::egress_filter("api.example.com\n.example.org\n"),
+        "^api\\.example\\.com$\n^(.+\\.)?example\\.org$\n",
+        "the proxy's filter",
+    );
+    std::test::assert(
+        std::str::contains(node::egress_config(), "FilterDefaultDeny Yes"),
+        "everything else denied",
+    );
+
+    // an image is named for what it is built from
+    std::test::assert(
+        node::image_tag("voice-harness-claude", "b", "i") != node::image_tag(
+            "voice-harness-claude",
+            "b",
+            "j",
+        ),
+        "a changed install is a new image",
+    );
+}

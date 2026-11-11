@@ -1219,3 +1219,20 @@ that named a model itself, has none.
 ```sql
 alter table in_flight add column alias text not null default '';
 ```
+
+### Migration 36: hosted tools' settings
+
+The operator's settings for the hosted tools voice runs itself for the
+admin UI's Chat (api/web_fetch.hl): whether `web_fetch` is on, the most
+fetches one request makes, a fetch's timeout and size caps, and the
+denylist (`PUT /admin/v1/tools`). One row, its body the `ToolSettings`
+last set; no row means none was set, and voice's defaults hold (on, 8
+fetches, 15 s, 2 MiB read, 40,000 characters returned, nothing denied).
+Each request reads it, so a change takes the next request.
+
+```sql
+create table tool_settings (
+  id    boolean primary key default true check (id),
+  body  jsonb not null
+);
+```

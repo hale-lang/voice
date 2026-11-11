@@ -155,6 +155,9 @@ Served by the api at `/`, under the operator token:
 - **Usage**: a live board of conversations, the ledger with filters, and a
   request's recording (for a project or key that **peeks**: kept seven days)
   read as a conversation, its context beside the back and forth;
+- **Chat**: talk to a model as a project's caller, with the hosted **web
+  fetch** where its model takes tool calls; **Tools**: web fetch on or off,
+  its limits and its denylist ([docs/internals.md](docs/internals.md));
 - **Nodes**, **Accounts**, **Catalog**, **Placements**, **Arrange**, **Recipes**,
   **Runtimes**, **Projects** (subprojects, keys, limits, budgets, peek),
   **Changes** (every admin change, field by field), **API** (the contract);

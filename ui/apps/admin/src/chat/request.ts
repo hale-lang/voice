@@ -1,5 +1,6 @@
 import { SseReader, type SseEvent } from './sse.ts';
 import type { Conversation } from './store.ts';
+import { WEB_FETCH_TOOLS } from './tools.ts';
 
 /**
  * How Chat reaches inference: the caller plane's own `/v1/responses`,
@@ -15,8 +16,12 @@ export function chargedTo(token: string, project: string): Record<string, string
   return { authorization: `Bearer ${token}`, [VOICE_PROJECT]: project };
 }
 
-/** The `/v1/responses` body for the conversation's next answer: every turn so far, then the stream. */
-export function bodyOf(c: Conversation): Record<string, unknown> {
+/**
+ * The `/v1/responses` body for the conversation's next answer: every turn
+ * so far, then the stream. With `webFetch` (the chat turned it on, where it
+ * is offered) it lists the hosted `web_fetch` tool.
+ */
+export function bodyOf(c: Conversation, webFetch = false): Record<string, unknown> {
   const o = c.options;
   const body: Record<string, unknown> = {
     model: c.model,
@@ -30,6 +35,7 @@ export function bodyOf(c: Conversation): Record<string, unknown> {
   if (o.top_p !== null) body.top_p = o.top_p;
   if (o.max_output_tokens !== null) body.max_output_tokens = o.max_output_tokens;
   if (o.effort) body.reasoning = { effort: o.effort };
+  if (webFetch) body.tools = WEB_FETCH_TOOLS;
   return body;
 }
 
@@ -65,11 +71,11 @@ export function refusedLine(r: Refused): string {
  * comes. Resolves when the stream ends (or `signal` stops it); a refusal
  * before the stream is thrown as `Refused`.
  */
-export async function stream(c: Conversation, token: string, signal: AbortSignal, onEvent: (ev: SseEvent) => void): Promise<void> {
+export async function stream(c: Conversation, token: string, signal: AbortSignal, onEvent: (ev: SseEvent) => void, webFetch = false): Promise<void> {
   const r = await fetch('/v1/responses', {
     method: 'POST',
     headers: { ...chargedTo(token, c.project), 'content-type': 'application/json', accept: 'text/event-stream' },
-    body: JSON.stringify(bodyOf(c)),
+    body: JSON.stringify(bodyOf(c, webFetch)),
     signal,
   });
   if (!r.ok || !r.body) {

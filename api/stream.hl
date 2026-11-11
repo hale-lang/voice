@@ -201,6 +201,14 @@ type StreamState {
     tools: Int = 0;
     // output reached the caller from the seat serving now
     output: Bool = false;
+    // a request with the hosted tool (web_fetch.hl): the model's own calls
+    // of it are not sent, and each item's `output_index` is its place in
+    // the whole response, past the items of the calls before (`base`)
+    hosted: Bool = false;
+    base: Int = 0;
+    // this call's items not sent so far, and their ids, a line each
+    hidden: Int = 0;
+    hidden_ids: String = "\n";
 }
 
 /// `event`, renumbered: its members but `sequence_number`, then ours.
@@ -216,6 +224,49 @@ fn renumbered(event: String, seq: Int) -> String {
     }
     out.add("\"sequence_number\": " + to_string(seq));
     return "{" + out.text() + "}";
+}
+
+/// Whether a hosted request's event is of the model's own call of the
+/// hosted tool, which the caller is shown as the hosted call voice makes
+/// (`hosted_event`), never as the call.
+fn hidden(st: StreamState, event: String, kind: String) -> Bool {
+    let item = std::json::find_field_raw(event, "item");
+    if len(item) > 0 && is_web_fetch_call(item) { return true; }
+    let id = std::json::find_string_field(event, "item_id");
+    return len(id) > 0 && std::str::contains(st.hidden_ids, "\n" + id + "\n");
+}
+
+/// `event`, renumbered, its `output_index` moved on by `shift` (a hosted
+/// request's items before it in the whole response, less the calls of this
+/// one not sent).
+fn reindexed(event: String, seq: Int, shift: Int) -> String {
+    let out = st::JsonList { };
+    let mut it = std::json::object_first(event);
+    while !it.done {
+        let key = std::json::obj_key_string(it, event);
+        if key == "output_index" {
+            out.add("\"output_index\": " + to_string(std::json::obj_value_int(it, event) + shift));
+        } else if key != "sequence_number" {
+            out.add(jq(key) + ": " + std::str::trim(std::json::obj_value_raw(it, event)));
+        }
+        it = std::json::object_next(it, event);
+    }
+    out.add("\"sequence_number\": " + to_string(seq));
+    return "{" + out.text() + "}";
+}
+
+/// A hosted call voice makes, as an output item of the response: `kind` is
+/// `response.output_item.added` (in progress) or `.done`, at `st.base`.
+fn hosted_event(out: EventStream, s: StreamState, kind: String, item: String) -> StreamState {
+    let mut st = s;
+    out.send(
+        kind,
+        "{\"type\": " + jq(kind) + ", \"output_index\": " + to_string(st.base) + ", \"item\": "
+            + item
+            + ", \"sequence_number\": " + to_string(st.seq) + "}",
+    );
+    st.seq = st.seq + 1;
+    return st;
 }
 
 /// True for the events that end a response.
@@ -247,11 +298,27 @@ fn chat_chunk(s: StreamState, delta: String, finish: String, extra: String) -> S
 fn forward(out: EventStream, s: StreamState, event: String) -> StreamState {
     let mut st = s;
     let kind = std::json::find_string_field(event, "type");
+    if st.hosted && hidden(st, event, kind) {
+        if kind == "response.output_item.added" {
+            st.hidden = st.hidden + 1;
+            st.hidden_ids = st.hidden_ids
+                + std::json::find_string_field(std::json::find_field_raw(event, "item"), "id")
+                + "\n";
+        }
+        return st;
+    }
     if output_event(kind) { st.output = true; }
     out.note(event);
     if st.begun && (kind == "response.created" || kind == "response.in_progress") { return st; }
     if st.endpoint == "responses" {
-        out.send(kind, renumbered(event, st.seq));
+        out.send(
+            kind,
+            if st.hosted {
+                reindexed(event, st.seq, st.base - st.hidden)
+            } else {
+                renumbered(event, st.seq)
+            },
+        );
         st.seq = st.seq + 1;
         return st;
     }

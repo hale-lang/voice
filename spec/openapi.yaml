@@ -235,6 +235,8 @@ tags:
     description: Admin plane. What changes as it happens, for the admin UI.
   - name: routes
     description: Admin plane. The route table as this api instance holds it.
+  - name: tools
+    description: Admin plane. The hosted tools voice runs for the operator's own requests.
   - name: node
     description: Node plane. A node registers, reads its assignment and reports its state.
   - name: health
@@ -337,6 +339,40 @@ paths:
         **State (MVP).** Voice does not store responses in the MVP. `store` is
         accepted and treated as false; a request with `previous_response_id`
         fails with `previous_response_not_found`. `background` is not supported.
+
+        **Hosted tools.** A request of the operator charged to a project
+        (`Voice-Project`, as the admin UI's Chat sends it) may list
+        `{"type": "web_fetch"}` (`WebFetchTool`) in `tools`, beside its own
+        function tools. Voice gives the model a function, `web_fetch(url)`;
+        each time the model calls it, the api fetches the page itself (a GET
+        with no credential, cookie or authorization; at most 5 redirects;
+        within the operator's timeout and size cap; text, HTML reduced to its
+        readable text, Markdown, JSON or XML), hands the model the result as
+        the call's `function_call_output` and asks the model again. The
+        result is JSON text: `{url, status, content_type, title, text,
+        truncated}`, or `{url, error}` for a fetch that failed (a host that
+        cannot be reached, the timeout, an HTTP error, a body over the cap,
+        a content type it does not take, a host on the operator's
+        denylist), which is the model's to read, never the request's
+        failure. A page's text is data from the web: it reaches the model
+        only as the call's output, never as instructions. The loop ends when
+        the model answers without calling `web_fetch`, or calls one of the
+        caller's own tools (those calls are the caller's, as ever, and a
+        `web_fetch` call of the same turn is not run); once the request has
+        made the most fetches it may (`WebFetchSettings.max_calls`), the
+        tool is no longer offered and the model answers from what it has.
+        Each call to the model is routed, limited and recorded as a request
+        is: the first under the request's id, the next under
+        `<request_id>_2`, and so on, all in the request's conversation (its
+        `prompt_cache_key`, else its own id); the response's `usage`,
+        `voice.price_micros` and `voice.attempts` are theirs together. Each
+        hosted call is an output item of its own, a `WebFetchCall`; streamed,
+        it is `response.output_item.added` (`in_progress`) and
+        `response.output_item.done` (`completed` or `failed`) between the
+        model's output, and the model's own calls of the function are never
+        sent. A project key's request listing it is refused `400
+        unsupported`, and so is the operator's while the operator has turned
+        it off (`PUT /admin/v1/tools`). Only `/v1/responses` takes it.
       security:
         - projectKey: []
         - operatorToken: []
@@ -396,6 +432,7 @@ paths:
                 oneOf:
                   - $ref: './vendor/open-responses/openapi.json#/paths/~1responses/post/responses/200/content/text~1event-stream/schema'
                   - $ref: '#/components/schemas/VoiceAttemptEvent'
+                  - $ref: '#/components/schemas/WebFetchCallEvent'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -3728,6 +3765,71 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
 
+  /admin/v1/tools:
+    get:
+      tags: [tools]
+      operationId: getToolSettings
+      summary: The hosted tools' settings
+      description: |
+        Whether the hosted tool `web_fetch` is on for the operator's own
+        requests (see `createResponse`, "Hosted tools"), and its limits:
+        what was last set, voice's defaults for what never was.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The settings in force.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolSettings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    put:
+      tags: [tools]
+      operationId: setToolSettings
+      summary: Set the hosted tools' settings
+      description: |
+        Replaces the settings whole: a member left out takes voice's
+        default. Each request reads them, so the next request is held to
+        them, with no restart. The change is in the change log (target
+        `tools`).
+      security:
+        - operatorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ToolSettings'
+            examples:
+              lan_denied:
+                summary: Fewer fetches, and a range and a host denied
+                value:
+                  web_fetch:
+                    enabled: true
+                    max_calls: 4
+                    denylist: ['192.0.2.0/24', 'admin.example.com', '198.51.100.7:8443']
+      responses:
+        '200':
+          description: The settings now in force.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ToolSettings'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
   /node/v1/register:
     post:
       tags: [node]
@@ -4584,7 +4686,10 @@ components:
       properties:
         request_id:
           type: string
-          description: Equals the `X-Request-Id` header and the usage record's id.
+          description: |
+            Equals the `X-Request-Id` header and the usage record's id (a
+            request with hosted tool calls: its first model call's, the
+            others' `<request_id>_2` and on).
         project:
           type: string
           description: The project the request was attributed to.
@@ -4633,7 +4738,10 @@ components:
               $ref: '#/components/schemas/VoiceRequestExtension'
 
     Response:
-      description: The standard `ResponseResource` plus the required `voice` object.
+      description: |
+        The standard `ResponseResource` plus the required `voice` object. A
+        request with hosted tool calls has a `WebFetchCall` item in its
+        `output` for each.
       allOf:
         - $ref: './vendor/open-responses/openapi.json#/components/schemas/ResponseResource'
         - type: object
@@ -4641,6 +4749,132 @@ components:
           properties:
             voice:
               $ref: '#/components/schemas/VoiceResponseExtension'
+
+    WebFetchTool:
+      type: object
+      description: |
+        The hosted tool `web_fetch`, in a Responses request's `tools`: the
+        operator's alone (see `createResponse`, "Hosted tools").
+      required: [type]
+      properties:
+        type:
+          type: string
+          const: web_fetch
+
+    WebFetchCall:
+      type: object
+      description: |
+        A hosted call of `web_fetch` voice made for the model: an output
+        item of the response, where the model's own `function_call` of it
+        is never shown.
+      required: [type, id, call_id, url, status]
+      properties:
+        type:
+          type: string
+          const: web_fetch_call
+        id:
+          type: string
+        call_id:
+          type: string
+          description: The model's call it answers.
+        url:
+          type: string
+          description: The URL the model asked for.
+        status:
+          type: string
+          enum: [in_progress, completed, failed]
+          description: '`failed` for a fetch that failed, or a call not run (its `error` says why).'
+        http_status:
+          type: integer
+          description: The HTTP status of the answer read (after redirects).
+        content_type:
+          type: string
+        bytes:
+          type: integer
+          description: The bytes of the body read.
+        error:
+          type: string
+        output:
+          type: string
+          description: |
+            What the model was given, as JSON text: `{url, status,
+            content_type, title, text, truncated}`, or with `error`. The
+            text is the page's, which is data, not instructions.
+
+    WebFetchCallEvent:
+      type: object
+      description: |
+        A hosted call as the stream tells it: the standard
+        `response.output_item.added` (its item `in_progress`) and
+        `response.output_item.done` (`completed` or `failed`, with its
+        `output`), at its place in the whole response.
+      required: [type, output_index, item, sequence_number]
+      properties:
+        type:
+          type: string
+          enum: [response.output_item.added, response.output_item.done]
+        output_index:
+          type: integer
+        item:
+          $ref: '#/components/schemas/WebFetchCall'
+        sequence_number:
+          type: integer
+
+    ToolSettings:
+      type: object
+      description: The hosted tools' settings.
+      required: [web_fetch]
+      properties:
+        web_fetch:
+          $ref: '#/components/schemas/WebFetchSettings'
+
+    WebFetchSettings:
+      type: object
+      description: |
+        `web_fetch`, for the operator's own requests. The operator and the
+        network voice runs on are trusted: hosts on the LAN are fetched
+        like any other, unless the denylist names them.
+      properties:
+        enabled:
+          type: boolean
+          default: true
+        max_calls:
+          type: integer
+          minimum: 1
+          maximum: 32
+          default: 8
+          description: The most fetches one request makes; then the model answers from them.
+        timeout_ms:
+          type: integer
+          minimum: 1000
+          maximum: 120000
+          default: 15000
+          description: A fetch's whole time, its redirects included.
+        max_bytes:
+          type: integer
+          minimum: 1024
+          maximum: 16777216
+          default: 2097152
+          description: The most of a body a fetch reads; a larger one is an error the model is told.
+        max_chars:
+          type: integer
+          minimum: 1000
+          maximum: 100000
+          default: 40000
+          description: The most characters of text the model is given; more is cut, `truncated` true.
+        denylist:
+          type: array
+          maxItems: 64
+          default: []
+          description: |
+            What is never fetched, at the URL asked for and at every
+            redirect's: a host name (and every name under it), an IPv4 or
+            IPv6 address, a CIDR range, or any of them with `:port` (an IPv6
+            address bracketed, `[2001:db8::1]:8080`). An address or a range
+            matches a URL whose host is that address: the fetch resolves a
+            name only as it connects, so a name is denied by its name.
+          items:
+            type: string
 
     VoiceAttemptEvent:
       type: object

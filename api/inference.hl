@@ -61,6 +61,9 @@ type InferenceRequest {
     // the caller's connection, watched while the request waits for a slot
     // (`caller_gone`); -1 for none, as in process
     conn_fd: Int = -1;
+    // its `tools` lists the hosted `web_fetch` (web_fetch.hl): the
+    // operator's alone
+    web_fetch: Bool = false;
 }
 
 /// `Served`: what actually served a request.
@@ -143,6 +146,16 @@ type Resolution {
     served_body: String = "";
 }
 
+/// How a streamed offer ended (`Inference.stream_held`): `over` once the
+/// stream is (answered, failed, or its caller gone); else a hosted request's
+/// call served, its answer and terminal event, the stream left open.
+type Streamed {
+    over: Bool = true;
+    st: StreamState = StreamState { };
+    served: Served = Served { };
+    ending: String = "";
+}
+
 /// One seat a request could be offered, and its own name for the model.
 type Candidate { seat: st::SeatRow = st::SeatRow { }; engine_name: String = ""; }
 
@@ -215,9 +228,17 @@ locus Inference {
             r.served_body = res.served_body;
             r.seat_endpoint = "decision";
         }
+        // the hosted tool as the operator set it, its function the model's
+        let tools = self.hosted_tools(r) or raise;
+        if r.web_fetch { r.body = hosted_body(r.body) or raise; }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         let request_id = "resp_" + (random_hex(12) or fail entropy_failed(err.message));
+        if r.web_fetch {
+            let mut answered = self.serve_hosted(r, ctx, candidates, request_id, tools) or raise;
+            answered.headers = held.headers;
+            return answered;
+        }
         // out of the queue for a slot however it ends (`await_turn`)
         let mut s = self.serve_held(r, ctx, candidates, request_id) or {
             self.leave(request_id);
@@ -401,39 +422,51 @@ locus Inference {
             r.served_body = res.served_body;
             r.seat_endpoint = "decision";
         }
+        let tools = self.hosted_tools(r) or raise;
+        if r.web_fetch { r.body = hosted_body(r.body) or raise; }
         let held = self.hold(r, ctx) or raise;
         let candidates = self.admit(r, ctx) or raise;
         let request_id = "resp_" + (random_hex(12) or fail entropy_failed(err.message));
-        // out of the queue for a slot however it ends (`await_turn`)
-        let answer = self.stream_held(r, ctx, out, candidates, held, request_id) or {
-            self.leave(request_id);
-            fail err;
-        };
-        self.leave(request_id);
-        return answer;
-    }
-
-    fn stream_held(
-        r: InferenceRequest,
-        ctx: std::api::Context,
-        out: EventStream,
-        candidates: Candidates,
-        held: Held,
-        request_id: String
-    ) -> std::http::Response fallible(ApiError) {
-        let started = std::time::monotonic_ns();
-        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
-        let m = self.store.model(r.model) or fail metering_failed(err);
         out.headers = "X-Request-Id: " + request_id
             + (if len(held.headers) > 0 { "\r\n" + held.headers } else { "" });
         // the keep-alive span runs from here until something is sent
         out.sent_ns = std::time::monotonic_ns();
-        let mut st = StreamState {
+        let st = StreamState {
             endpoint: r.endpoint,
             request_id: request_id,
             model: r.model,
             created: std::time::unix(now_seconds()),
         };
+        if r.web_fetch {
+            return self.stream_hosted(r, ctx, out, candidates, request_id, tools, st) or raise;
+        }
+        // out of the queue for a slot however it ends (`await_turn`)
+        self.stream_held(r, ctx, out, candidates, st, false, request_id) or {
+            self.leave(request_id);
+            fail err;
+        };
+        self.leave(request_id);
+        return out.end();
+    }
+
+    /// Offer `r` to its seats in turn, streaming the seat's events to `out`
+    /// as they come, until one serves it. The stream is over once it is
+    /// answered, failed or its caller gone; for a hosted request's call
+    /// (`hosted`) a served answer is not finished but handed back, its
+    /// terminal event with it, for the loop to go on (`stream_hosted`).
+    fn stream_held(
+        r: InferenceRequest,
+        ctx: std::api::Context,
+        out: EventStream,
+        candidates: Candidates,
+        begun: StreamState,
+        hosted: Bool,
+        request_id: String
+    ) -> Streamed fallible(ApiError) {
+        let started = std::time::monotonic_ns();
+        let k = self.store.key(ctx.caller.name) or fail metering_failed(err);
+        let m = self.store.model(r.model) or fail metering_failed(err);
+        let mut st = begun;
         let mut attempts = Attempts { };
         // attempts already told the caller (`voice:attempt`)
         let mut told = 0;
@@ -474,7 +507,7 @@ locus Inference {
                             ),
                         );
                     }
-                    return out.end();
+                    return Streamed { st: st };
                 }
             }
             let mut busy = 0;
@@ -577,7 +610,7 @@ locus Inference {
                                 );
                             }
                             self.landed(request_id);
-                            return out.end();
+                            return Streamed { st: st };
                         }
                     }
                     offer.finish();
@@ -619,10 +652,15 @@ locus Inference {
                     if len(o.decision) > 0 {
                         s.response = decision_resource(o.response, request_id, r);
                     }
+                    if hosted {
+                        // a hosted request's call: the loop goes on from here
+                        self.settled(r, s, candidates.peek);
+                        return Streamed { over: false, st: st, served: s, ending: ending };
+                    }
                     finish_stream(out, st, ending, s);
                     self.settled(r, s, candidates.peek);
                     if candidates.annotate { out.job = annotation_job(r, s); }
-                    return out.end();
+                    return Streamed { st: st };
                 }
                 let reason = failure_of(o);
                 why = c.seat.ref + ": " + reason;
@@ -680,7 +718,7 @@ locus Inference {
                                 (std::time::monotonic_ns() - started) / 1000000,
                             ),
                         );
-                        return out.end();
+                        return Streamed { st: st };
                     }
                     fail ApiError {
                         status: 502,
@@ -716,7 +754,7 @@ locus Inference {
                     (std::time::monotonic_ns() - started) / 1000000,
                 ),
             );
-            return out.end();
+            return Streamed { st: st };
         }
         if all_overflow && count(attempts.items) > 0 {
             fail too_long(why, attempts_voice(request_id, attempts.items));
@@ -729,6 +767,193 @@ locus Inference {
             has_voice: true,
             voice: attempts_voice(request_id, attempts.items),
         };
+    }
+
+    /// The hosted tool's settings for `r` (web_fetch.hl), read for each
+    /// request so a change takes the next; refused when the request lists
+    /// it and the operator turned it off, or asks it of a decision model.
+    fn hosted_tools(r: InferenceRequest) -> WebFetchSettings fallible(ApiError) {
+        if !r.web_fetch { return WebFetchSettings { enabled: false }; }
+        let t = tool_settings_of(self.store.tool_settings() or fail metering_failed(err));
+        if !t.enabled {
+            fail unsupported(
+                "the hosted tool `web_fetch` is turned off (the admin UI's Tools)",
+                "tools",
+            );
+        }
+        if r.seat_endpoint == "decision" {
+            fail unsupported("a decision model answers whole, with no tools", "tools");
+        }
+        return t;
+    }
+
+    /// A request with the hosted tool (web_fetch.hl), answered whole: the
+    /// model asked; each time it calls `web_fetch`, the page fetched, the
+    /// call and its output added to the input and the model asked again,
+    /// until it answers without calling it, calls a tool of the caller's
+    /// (the request is the caller's again), or the request has made every
+    /// fetch it may, when the tool is no longer offered and the model asked
+    /// once more. Each call is offered to the request's seats as any request
+    /// is, and recorded as one: the first under `request_id`, the next under
+    /// `<request_id>_2`, and so on, all in the request's conversation (its
+    /// own id when it names none).
+    @unbounded
+    fn serve_hosted(
+        r: InferenceRequest,
+        ctx: std::api::Context,
+        candidates: Candidates,
+        request_id: String,
+        t: WebFetchSettings
+    ) -> Served fallible(ApiError) {
+        let started = std::time::monotonic_ns();
+        let mut c = candidates;
+        if len(r.conversation) == 0 {
+            r.conversation = request_id;
+            if count(c.items) > 1 { c = first_for(c, request_id); }
+        }
+        let mut h = Hosted { request_id: request_id };
+        let mut offered = true;
+        while true {
+            h.calls = h.calls + 1;
+            let id = call_id(request_id, h.calls);
+            let s = self.serve_held(r, ctx, c, id) or {
+                self.leave(id);
+                fail err;
+            };
+            self.leave(id);
+            let turn = hosted_turn(s.response);
+            h = took(h, s, turn);
+            let why = not_run(turn, offered, h.fetched, t);
+            let mut outputs = "";
+            let mut it = std::json::array_first("[" + turn.fetches + "]");
+            while !it.done {
+                h.answered = h.answered + 1;
+                let a = answer_call(
+                    std::str::trim(it.element),
+                    fetch_item_id(request_id, h.answered),
+                    t,
+                    if len(why) > 0 { why } else { not_run(turn, offered, h.fetched, t) },
+                );
+                if a.fetched { h.fetched = h.fetched + 1; }
+                h.shown = joined_items(h.shown, a.item);
+                outputs = joined_items(outputs, a.output);
+                it = std::json::array_next(it);
+            }
+            if turn.fetch_count == 0 || turn.caller_calls || !offered {
+                let mut answer = hosted_answer(
+                    h,
+                    s,
+                    (std::time::monotonic_ns() - started) / 1000000,
+                );
+                answer.job = if c.annotate { annotation_job(r, answer) } else { AnnotationJob { } };
+                return answer;
+            }
+            r.body = continued(r.body, joined_items(turn.kept, outputs));
+            if h.fetched >= t.max_calls {
+                // every fetch it may made: the model answers from them
+                r.body = without_web_fetch(r.body);
+                offered = false;
+            }
+        }
+        fail ApiError {
+            code: ErrorCode::internal_error,
+            message: "the hosted tool's loop ended without an answer",
+        };
+    }
+
+    /// A request with the hosted tool, streamed: as `serve_hosted`, each
+    /// model call's events sent as they come but its own calls of the tool,
+    /// each hosted call an output item of its own (`web_fetch_call`, added
+    /// in progress and done with its outcome) between them, and the whole
+    /// response once the last call ends.
+    @unbounded
+    fn stream_hosted(
+        r: InferenceRequest,
+        ctx: std::api::Context,
+        out: EventStream,
+        candidates: Candidates,
+        request_id: String,
+        t: WebFetchSettings,
+        begun: StreamState
+    ) -> std::http::Response fallible(ApiError) {
+        let started = std::time::monotonic_ns();
+        let mut c = candidates;
+        if len(r.conversation) == 0 {
+            r.conversation = request_id;
+            if count(c.items) > 1 { c = first_for(c, request_id); }
+        }
+        let mut st = begun;
+        st.hosted = true;
+        let mut h = Hosted { request_id: request_id };
+        let mut offered = true;
+        while true {
+            h.calls = h.calls + 1;
+            let id = call_id(request_id, h.calls);
+            let got = self.stream_held(r, ctx, out, c, st, true, id) or {
+                self.leave(id);
+                fail err;
+            };
+            self.leave(id);
+            if got.over { return out.end(); }
+            st = got.st;
+            let s = got.served;
+            let turn = hosted_turn(s.response);
+            h = took(h, s, turn);
+            // the next item's place: past this call's own
+            st.base = st.base + turn.shown_count;
+            st.hidden = 0;
+            st.hidden_ids = "\n";
+            let why = not_run(turn, offered, h.fetched, t);
+            let mut outputs = "";
+            let mut it = std::json::array_first("[" + turn.fetches + "]");
+            while !it.done {
+                h.answered = h.answered + 1;
+                let call = std::str::trim(it.element);
+                let item = fetch_item_id(request_id, h.answered);
+                let asked = std::json::string_field(
+                    std::json::find_string_field(call, "arguments"),
+                    "url",
+                );
+                st = hosted_event(
+                    out,
+                    st,
+                    "response.output_item.added",
+                    web_fetch_item(
+                        item,
+                        std::json::find_string_field(call, "call_id"),
+                        if asked.kind == "string" { std::str::trim(asked.text) } else { "" },
+                        Fetched { },
+                        "in_progress",
+                    ),
+                );
+                let a = answer_call(
+                    call,
+                    item,
+                    t,
+                    if len(why) > 0 { why } else { not_run(turn, offered, h.fetched, t) },
+                );
+                if a.fetched { h.fetched = h.fetched + 1; }
+                st = hosted_event(out, st, "response.output_item.done", a.item);
+                st.base = st.base + 1;
+                h.shown = joined_items(h.shown, a.item);
+                outputs = joined_items(outputs, a.output);
+                // a caller gone while it fetched: nothing more is asked
+                if out.gone { return out.end(); }
+                it = std::json::array_next(it);
+            }
+            if turn.fetch_count == 0 || turn.caller_calls || !offered {
+                let answer = hosted_answer(h, s, (std::time::monotonic_ns() - started) / 1000000);
+                finish_stream(out, st, got.ending, answer);
+                if c.annotate { out.job = annotation_job(r, answer); }
+                return out.end();
+            }
+            r.body = continued(r.body, joined_items(turn.kept, outputs));
+            if h.fetched >= t.max_calls {
+                r.body = without_web_fetch(r.body);
+                offered = false;
+            }
+        }
+        return out.end();
     }
 
     /// A request that seat `c` began and did not finish: its row written, its usage told,
@@ -2244,6 +2469,7 @@ fn read_inference(raw: String, endpoint: String) -> InferenceRequest fallible(Ap
         deadline: if has_voice { nullable_string(voice, "deadline") or raise } else { "" },
         body: standard,
         conversation: conversation_in(body),
+        web_fetch: endpoint == "responses" && asks_web_fetch(body),
     };
 }
 

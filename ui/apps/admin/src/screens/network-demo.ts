@@ -35,14 +35,14 @@ export function demoFleet(tick: number, now: number): Fleet {
     const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
     return { id, name: names[id], status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };
   });
-  // two Spark-like hosts cabled together: one model placed across both (its
+  // two GPU hosts cabled together: one model placed across both (its
   // leader's seat takes the requests, its follower's computes half of each),
   // and a model of its own beside it on the first
-  const placements = sparkPlacements(now);
+  const placements = pairPlacements(now);
   const seatOf = (p: Placement, node: string, ref: string): SeatSummary => ({ id: p.id, ref, node, engine: 'managed', account: p.account, data_classes: ['internal'], serves: [{ model: p.model }], status: 'up', in_flight: 0, concurrency: 4, enabled: true, problems: [], reason: null, placement: p.id, runtime: p.runtime, variant: p.variant });
   const [pair, alone] = placements as [Placement, Placement];
-  for (const [id, name] of [['spark1', 'Spark 1 · 128 GB, cabled to Spark 2'], ['spark2', 'Spark 2 · 128 GB, cabled to Spark 1']] as const) {
-    const seats = id === 'spark1' ? [seatOf(pair, id, pair.seat), seatOf(alone, id, alone.seat)] : [seatOf(pair, id, pair.follower_seat!)];
+  for (const [id, name] of [['gpu-a', 'GPU A · 128 GB unified, cabled to GPU B'], ['gpu-b', 'GPU B · 128 GB unified, cabled to GPU A']] as const) {
+    const seats = id === 'gpu-a' ? [seatOf(pair, id, pair.seat), seatOf(alone, id, alone.seat)] : [seatOf(pair, id, pair.follower_seat!)];
     nodes.push({ id, name, status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() });
   }
   const projects = PROJECTS.map(([id]) => ({ id, name: id, status: 'active' as const, owners: [], data_classes: ['internal' as const], created_at: new Date(now - 86400000).toISOString(), aliases: ALIASES[id] ?? [], resolved_aliases: (ALIASES[id] ?? []).map(a => ({ ...a, from: id })) }));
@@ -57,12 +57,12 @@ export function demoFleet(tick: number, now: number): Fleet {
   return fleet;
 }
 
-/** The demo's placements on its Spark pair: one across both, one on the first alone. */
-function sparkPlacements(now: number): Placement[] {
+/** The demo's placements on its cabled pair of GPU hosts: one across both, one on the first alone. */
+function pairPlacements(now: number): Placement[] {
   const at = new Date(now - 3600000).toISOString();
   return [
-    { id: 'deepseek-v4', model: 'deepseek-v4', nodes: ['spark1', 'spark2'], account: 'local', recipe: 'deepseek-v4', variant: 'fp8', runtime: 'tensorfold-0.7', chosen_by: 'coordinator', leader: 'spark1', seat: 'spark1/deepseek-v4', follower_seat: 'spark2/deepseek-v4', fit: [], created_at: at },
-    { id: 'gpt-oss-20b', model: 'gpt-oss-20b', nodes: ['spark1'], account: 'local', recipe: 'gpt-oss-20b', variant: 'mxfp4', runtime: 'vllm-26.09', chosen_by: 'coordinator', leader: 'spark1', seat: 'spark1/gpt-oss-20b', fit: [], created_at: at },
+    { id: 'deepseek-v4', model: 'deepseek-v4', nodes: ['gpu-a', 'gpu-b'], account: 'local', recipe: 'deepseek-v4', variant: 'fp8', runtime: 'tensorfold-0.7', chosen_by: 'coordinator', leader: 'gpu-a', seat: 'gpu-a/deepseek-v4', follower_seat: 'gpu-b/deepseek-v4', fit: [], created_at: at },
+    { id: 'gpt-oss-20b', model: 'gpt-oss-20b', nodes: ['gpu-a'], account: 'local', recipe: 'gpt-oss-20b', variant: 'mxfp4', runtime: 'vllm-26.09', chosen_by: 'coordinator', leader: 'gpu-a', seat: 'gpu-a/gpt-oss-20b', fit: [], created_at: at },
   ];
 }
 

@@ -252,7 +252,7 @@ test('homelab demo places CLI accounts on h1/h2 and MLX capacity on Macs', () =>
   for (const node of fleet.nodes) for (const seat of node.seats) {
     if (seat.account !== 'local') assert(['h1','h2'].includes(node.id));
     if (['h1','h2'].includes(node.id) && seat.account === 'local') assert(seat.serves.every(s => ['llama-3b','llama-8b','qwen-7b'].includes(s.model)));
-    if (node.id.startsWith('spark')) assert.equal(seat.engine,'managed');
+    if (node.id.startsWith('gpu-')) assert.equal(seat.engine,'managed');
     else if (!['h1','h2'].includes(node.id)) assert.equal(seat.engine,'mlx');
   }
 });
@@ -361,14 +361,14 @@ test('a request whose record names no api instance still flows from its project,
   assert(requestFlowEdges(record, graph).has(edgeId(entityId('project', record.project), entityId('node', record.served.node))), 'project → host, so the project is never apart from its flow');
 });
 
-// The lab's shape: a model placed across spark (leader) and flare, cabled;
-// a model of its own beside it on spark; another alone on ember.
+// A model placed across host-a (leader) and host-b, cabled; a model of its
+// own beside it on host-a; another alone on host-c.
 const AT = '2026-11-01T00:00:00Z';
 const labSeat = (node, id, extra = {}) => ({ id, ref: `${node}/${id}`, node, engine: 'managed', account: 'local', serves: [{ model: id }], status: 'up', in_flight: 0, concurrency: 4, enabled: true, problems: [], reason: null, placement: id, runtime: 'tensorfold-0.7.5', ...extra });
 const labNode = (id, seats) => ({ id, name: id, status: 'up', seats, in_flight: seats.reduce((n, s) => n + s.in_flight, 0), created_at: AT });
 const placed = (id, nodes) => ({ id, model: id, nodes, account: 'local', recipe: id, variant: 'v', runtime: 'tensorfold-0.7.5', chosen_by: 'coordinator', leader: nodes[0], seat: `${nodes[0]}/${id}`, ...(nodes[1] ? { follower_seat: `${nodes[1]}/${id}` } : {}), fit: [], created_at: AT });
-function lab({ leaderInFlight = 0, follower = {}, pairs = [['coder-big', 'spark', 'flare']] } = {}) {
-  const seats = new Map([['spark', [labSeat('spark', 'coder-small')]], ['ember', [labSeat('ember', 'coder-med')]]]);
+function lab({ leaderInFlight = 0, follower = {}, pairs = [['big-model', 'host-a', 'host-b']] } = {}) {
+  const seats = new Map([['host-a', [labSeat('host-a', 'small-model')]], ['host-c', [labSeat('host-c', 'mid-model')]]]);
   for (const [id, a, b] of pairs) {
     seats.set(a, [labSeat(a, id, { in_flight: leaderInFlight }), ...(seats.get(a) ?? [])]);
     seats.set(b, [...(seats.get(b) ?? []), labSeat(b, id, follower)]);
@@ -376,67 +376,67 @@ function lab({ leaderInFlight = 0, follower = {}, pairs = [['coder-big', 'spark'
   return {
     nodes: [...seats].map(([id, s]) => labNode(id, s)),
     accounts: [{ id: 'local', name: 'local', provider: null, billing: 'none', status: 'active', seats: [], windows: [], created_at: AT }],
-    projects: [{ id: 'work', name: 'work', status: 'active', owners: [], data_classes: ['internal'], created_at: AT, aliases: [{ name: 'coder', model: 'coder-big' }], resolved_aliases: [{ name: 'coder', model: 'coder-big', from: 'work' }] }],
-    placements: [...pairs.map(([id, a, b]) => placed(id, [a, b])), placed('coder-small', ['spark']), placed('coder-med', ['ember'])],
+    projects: [{ id: 'work', name: 'work', status: 'active', owners: [], data_classes: ['internal'], created_at: AT, aliases: [{ name: 'big', model: 'big-model' }], resolved_aliases: [{ name: 'big', model: 'big-model', from: 'work' }] }],
+    placements: [...pairs.map(([id, a, b]) => placed(id, [a, b])), placed('small-model', ['host-a']), placed('mid-model', ['host-c'])],
     usage: [],
     instances: [{ id: 'api-1', at: AT, up: true }],
   };
 }
 const served = (id, seat, extra = {}) => ({ id, created_at: AT, project: 'work', key: 'k1', requested_model: seat.split('/')[1], resolved_model: seat.split('/')[1], status: 'served', served: { seat, node: seat.split('/')[0], account: 'local', model: seat.split('/')[1], engine: 'managed' }, input_tokens: 10, output_tokens: 5, price_micros: 0, currency: 'USD', timing: { wall_ms: 900, queue_ms: 0, load_ms: 0 }, instance: 'api-1', ...extra });
-const LEADER = entityId('seat', 'spark/coder-big'), FOLLOWER = entityId('seat', 'flare/coder-big');
+const LEADER = entityId('seat', 'host-a/big-model'), FOLLOWER = entityId('seat', 'host-b/big-model');
 
 test('a placement across two hosts is one unit: its seats bonded, its hosts cabled, and the follower offers nothing of its own', () => {
   const graph = buildGraph(lab());
   const bond = graph.edges.find((e) => e.id === edgeId(LEADER, FOLLOWER));
   assert.equal(bond?.kind, 'bond');
-  assert.equal(graph.edges.find((e) => e.id === edgeId(entityId('node', 'spark'), entityId('node', 'flare')))?.kind, 'cable');
+  assert.equal(graph.edges.find((e) => e.id === edgeId(entityId('node', 'host-a'), entityId('node', 'host-b')))?.kind, 'cable');
   // the follower reaches its model only through the bond: its host's link and the bond, nothing else
   assert.deepEqual(graph.edges.filter((e) => e.source === FOLLOWER || e.target === FOLLOWER).map((e) => e.kind).sort(), ['bond', 'hosts']);
-  assert(graph.edges.some((e) => e.id === edgeId(entityId('account', 'local'), entityId('model', 'coder-big')) && e.kind === 'offers'), 'the leader offers it');
+  assert(graph.edges.some((e) => e.id === edgeId(entityId('account', 'local'), entityId('model', 'big-model')) && e.kind === 'offers'), 'the leader offers it');
   const [pair] = graph.pairs;
   assert.equal(graph.pairs.length, 1);
-  assert.deepEqual({ id: pair.id, leader: pair.leader, follower: pair.follower, hosts: pair.hosts, state: pair.state }, { id: 'coder-big', leader: LEADER, follower: FOLLOWER, hosts: ['node:spark', 'node:flare'], state: 'up' });
+  assert.deepEqual({ id: pair.id, leader: pair.leader, follower: pair.follower, hosts: pair.hosts, state: pair.state }, { id: 'big-model', leader: LEADER, follower: FOLLOWER, hosts: ['node:host-a', 'node:host-b'], state: 'up' });
   const leader = graph.vertices.find((v) => v.id === LEADER), follower = graph.vertices.find((v) => v.id === FOLLOWER);
-  assert.deepEqual(leader.part, { placement: 'coder-big', role: 'leader', partner: FOLLOWER });
-  assert.deepEqual(follower.part, { placement: 'coder-big', role: 'follower', partner: LEADER });
+  assert.deepEqual(leader.part, { placement: 'big-model', role: 'leader', partner: FOLLOWER });
+  assert.deepEqual(follower.part, { placement: 'big-model', role: 'follower', partner: LEADER });
   const detail = (v, k) => v.details.find(([name]) => name === k)?.[1];
-  assert.equal(detail(leader, 'Partner seat'), 'flare/coder-big');
+  assert.equal(detail(leader, 'Partner seat'), 'host-b/big-model');
   assert.equal(detail(leader, 'Runtime'), 'tensorfold-0.7.5');
-  assert.match(detail(leader, 'Placement'), /coder-big across spark \+ flare/);
-  assert.match(detail(follower, 'Role'), /serves through its leader, spark\/coder-big/);
-  assert.equal(detail(follower, 'Partner seat'), 'spark/coder-big');
+  assert.match(detail(leader, 'Placement'), /big-model across host-a \+ host-b/);
+  assert.match(detail(follower, 'Role'), /serves through its leader, host-a\/big-model/);
+  assert.equal(detail(follower, 'Partner seat'), 'host-a/big-model');
   // the follower's seat is no capacity of its host's own
-  assert.equal(detail(graph.vertices.find((v) => v.id === 'node:flare'), 'In flight / capacity'), '0 / 0');
-  assert.equal(detail(graph.vertices.find((v) => v.id === 'node:spark'), 'In flight / capacity'), '0 / 8');
-  assert.deepEqual(pairsOf([FOLLOWER], graph).map((p) => p.id), ['coder-big'], 'either seat names the whole placement');
-  assert.deepEqual(pairsOf([pair.bond], graph).map((p) => p.id), ['coder-big'], 'and so does its bond');
+  assert.equal(detail(graph.vertices.find((v) => v.id === 'node:host-b'), 'In flight / capacity'), '0 / 0');
+  assert.equal(detail(graph.vertices.find((v) => v.id === 'node:host-a'), 'In flight / capacity'), '0 / 8');
+  assert.deepEqual(pairsOf([FOLLOWER], graph).map((p) => p.id), ['big-model'], 'either seat names the whole placement');
+  assert.deepEqual(pairsOf([pair.bond], graph).map((p) => p.id), ['big-model'], 'and so does its bond');
 });
 
 test("a request to the leader is computed by both hosts: its path holds the follower's seat and host, the bond and the cable", () => {
   const fleet = lab();
-  const record = served('r1', 'spark/coder-big');
-  const alone = served('r2', 'spark/coder-small');
+  const record = served('r1', 'host-a/big-model');
+  const alone = served('r2', 'host-a/small-model');
   const graph = buildGraph({ ...fleet, usage: [record, alone] });
   const vs = requestVertices(record, graph);
-  for (const id of ['node:spark', 'node:flare', LEADER, FOLLOWER, 'account:local', 'model:coder-big', 'api:api-1', 'project:work']) assert(vs.has(id), id);
+  for (const id of ['node:host-a', 'node:host-b', LEADER, FOLLOWER, 'account:local', 'model:big-model', 'api:api-1', 'project:work']) assert(vs.has(id), id);
   const flow = requestFlowEdges(record, graph);
-  for (const id of [edgeId(LEADER, FOLLOWER), edgeId('node:spark', 'node:flare'), edgeId('node:flare', FOLLOWER), edgeId('node:spark', LEADER)]) assert(flow.has(id), id);
+  for (const id of [edgeId(LEADER, FOLLOWER), edgeId('node:host-a', 'node:host-b'), edgeId('node:host-b', FOLLOWER), edgeId('node:host-a', LEADER)]) assert(flow.has(id), id);
   assert.equal(graph.edges.find((e) => e.id === edgeId(LEADER, FOLLOWER)).kind, 'bond', 'lit, it stays a bond');
   // a model of its own on the same host lights neither the follower nor the bond
   const own = requestVertices(alone, graph);
-  assert(!own.has('node:flare') && !own.has(FOLLOWER));
+  assert(!own.has('node:host-b') && !own.has(FOLLOWER));
   assert(!requestFlowEdges(alone, graph).has(edgeId(LEADER, FOLLOWER)));
 });
 
 test("a follower's host and seat are active while its leader's seat works, its own numbers its own", () => {
   const graph = buildGraph(lab({ leaderInFlight: 2 }));
-  const flare = graph.vertices.find((v) => v.id === 'node:flare'), follower = graph.vertices.find((v) => v.id === FOLLOWER);
-  assert.equal(flare.active, 0, 'the follower node reports none of its own');
-  assert.equal(flare.partnerActive, 2);
+  const followerHost = graph.vertices.find((v) => v.id === 'node:host-b'), follower = graph.vertices.find((v) => v.id === FOLLOWER);
+  assert.equal(followerHost.active, 0, 'the follower node reports none of its own');
+  assert.equal(followerHost.partnerActive, 2);
   assert.equal(follower.active, 0);
   assert.equal(follower.partnerActive, 2);
   assert.equal(graph.pairs[0].active, 2);
-  assert.equal(graph.vertices.find((v) => v.id === 'node:ember').partnerActive, undefined, 'a host with no follower derives nothing');
+  assert.equal(graph.vertices.find((v) => v.id === 'node:host-c').partnerActive, undefined, 'a host with no follower derives nothing');
 });
 
 test('a placement on one node is drawn as it was: no bond, no cable, its own offer', () => {
@@ -445,16 +445,16 @@ test('a placement on one node is drawn as it was: no bond, no cable, its own off
   assert(!graph.edges.some((e) => e.kind === 'bond' || e.kind === 'cable'));
   assert.equal(graph.pairs.length, 0);
   assert.deepEqual(graph.edges, buildGraph({ ...fleet, placements: [] }).edges, 'its placement changes no edge');
-  const seat = graph.vertices.find((v) => v.id === 'seat:ember/coder-med');
+  const seat = graph.vertices.find((v) => v.id === 'seat:host-c/mid-model');
   assert.equal(seat.part, undefined);
-  assert.equal(seat.placement, 'coder-med');
+  assert.equal(seat.placement, 'mid-model');
 });
 
 test("a follower down while its leader is up marks the pair down, with the follower's reason", () => {
   const graph = buildGraph(lab({ follower: { status: 'down', reason: 'tensorfold exited: NCCL timeout' } }));
   const [pair] = graph.pairs;
   assert.equal(pair.state, 'down');
-  assert.match(pair.reason, /flare\/coder-big is down: tensorfold exited: NCCL timeout/);
+  assert.match(pair.reason, /host-b\/big-model is down: tensorfold exited: NCCL timeout/);
   assert(graph.edges.some((e) => e.id === pair.bond), 'the bond stays, to show it');
   const starting = buildGraph(lab({ follower: { status: 'starting' } })).pairs[0];
   assert.equal(starting.state, 'waiting');
@@ -462,32 +462,32 @@ test("a follower down while its leader is up marks the pair down, with the follo
 
 test('a request in flight by an alias lights the model it is routed as: no phantom model, the alias kept as asked', () => {
   const fleet = lab();
-  const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'coder', resolved_model: 'coder-big', seat: 'spark/coder-big', account: 'local', started_at: AT, instance: 'api-1', conversation: null };
+  const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'big', resolved_model: 'big-model', seat: 'host-a/big-model', account: 'local', started_at: AT, instance: 'api-1', conversation: null };
   const before = buildGraph(fleet);
   const graph = buildGraph({ ...fleet, usage: [provisional(flight)] });
-  assert(!graph.vertices.some((v) => v.id === 'model:coder'), 'no model named after the alias');
-  assert.equal(graph.requests.get('f1').askedAs, 'coder');
+  assert(!graph.vertices.some((v) => v.id === 'model:big'), 'no model named after the alias');
+  assert.equal(graph.requests.get('f1').askedAs, 'big');
   const vs = requestVertices(provisional(flight), graph);
-  assert(vs.has('model:coder-big') && vs.has(FOLLOWER) && vs.has('node:flare'));
+  assert(vs.has('model:big-model') && vs.has(FOLLOWER) && vs.has('node:host-b'));
   assert.equal(topologyKey(graph), topologyKey(before), 'and the map does not move');
   // an api from before `resolved_model` told the routed model as `requested_model`
-  const { resolved_model: _, ...legacy } = { ...flight, requested_model: 'coder-big' };
+  const { resolved_model: _, ...legacy } = { ...flight, requested_model: 'big-model' };
   const old = buildGraph({ ...fleet, usage: [provisional(legacy)] });
-  assert(!old.vertices.some((v) => v.id === 'model:coder'));
-  assert(requestVertices(provisional(legacy), old).has('model:coder-big'));
+  assert(!old.vertices.some((v) => v.id === 'model:big'));
+  assert(requestVertices(provisional(legacy), old).has('model:big-model'));
 });
 
 test('a request starting, running or ending never re-runs the layout; a new host does', () => {
   const fleet = lab();
-  const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'coder-big', resolved_model: 'coder-big', seat: 'spark/coder-big', account: 'local', started_at: AT, instance: 'api-1', conversation: null };
+  const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'big-model', resolved_model: 'big-model', seat: 'host-a/big-model', account: 'local', started_at: AT, instance: 'api-1', conversation: null };
   const idle = buildGraph(fleet);
   const running = buildGraph({ ...fleet, usage: [provisional(flight)] });
-  const done = buildGraph({ ...fleet, usage: [served('f1', 'spark/coder-big')] });
+  const done = buildGraph({ ...fleet, usage: [served('f1', 'host-a/big-model')] });
   assert(running.edges.some((e) => e.flow), 'the request flows');
   assert.equal(topologyKey(running), topologyKey(idle));
   assert.equal(topologyKey(done), topologyKey(idle));
   assert.deepEqual(layoutGraph(running, 1040, 740), layoutGraph(idle, 1040, 740), 'its flow never moves the map');
-  const grown = { ...fleet, nodes: [...fleet.nodes, labNode('glow', [labSeat('glow', 'tiny')])] };
+  const grown = { ...fleet, nodes: [...fleet.nodes, labNode('host-d', [labSeat('host-d', 'tiny')])] };
   assert.notEqual(topologyKey(buildGraph(grown)), topologyKey(idle));
   // the demo's traffic, tick by tick: work starting and ending, the key fixed
   const seed = demoFleet(0, 1_800_000_000_000);
@@ -501,7 +501,7 @@ test('a request starting, running or ending never re-runs the layout; a new host
 });
 
 test("a pair's hosts sit side by side and its seats face each other, beside other seats and other pairs", () => {
-  const fleet = lab({ pairs: [['coder-big', 'spark', 'flare'], ['chat-big', 'ember', 'glow']] });
+  const fleet = lab({ pairs: [['big-model', 'host-a', 'host-b'], ['chat-model', 'host-c', 'host-d']] });
   const graph = buildGraph(fleet);
   assert.equal(graph.pairs.length, 2);
   for (const height of [740, 900]) {
@@ -520,6 +520,6 @@ test("a pair's hosts sit side by side and its seats face each other, beside othe
 test('a filter that keeps one seat of a pair keeps its partner, so the pair stays one unit', () => {
   const fleet = lab({ leaderInFlight: 1 });
   const kept = filterFleet(fleet, { activity: 'in flight' });
-  assert.deepEqual(kept.nodes.flatMap((n) => n.seats.map((s) => s.ref)).sort(), ['flare/coder-big', 'spark/coder-big']);
+  assert.deepEqual(kept.nodes.flatMap((n) => n.seats.map((s) => s.ref)).sort(), ['host-a/big-model', 'host-b/big-model']);
   assert.equal(buildGraph(kept).pairs.length, 1);
 });

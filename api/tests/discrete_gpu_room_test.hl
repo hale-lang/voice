@@ -1,5 +1,5 @@
 // A node whose GPU has memory of its own: the room a model served on it
-// has is that GPU's, not the machine's. The case of lin1, an AMD Radeon
+// has is that GPU's, not the machine's. The case of gpu-box, an AMD Radeon
 // RX 9070 (17.1 GB of its own, listed as `rocm` and as `vulkan`) in a
 // machine of 32.7 GB that also hosts the habitat, so it offers models
 // 28.5 GB. granite-4.0-h-tiny's Q8_0 held 12.1 GB of it, and a decision
@@ -16,13 +16,13 @@ fn shipped(dir: String) -> String {
     return if std::io::fs::file_exists(dir) { dir } else { "../" + dir };
 }
 
-/// lin1's hardware, as its node reports it.
-const LIN1: String = "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 32700000000, \"model_memory_bytes\": 28500000000, \"accelerators\": [{\"kind\": \"rocm\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}, {\"kind\": \"vulkan\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}";
+/// gpu-box's hardware, as its node reports it.
+const GPU_BOX: String = "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 32700000000, \"model_memory_bytes\": 28500000000, \"accelerators\": [{\"kind\": \"rocm\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}, {\"kind\": \"vulkan\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}";
 
 /// A DGX Spark's: its GB10 shares the machine's memory.
 const SPARK: String = "{\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": 130661072896, \"model_memory_bytes\": 122494755840, \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA GB10\", \"memory_bytes\": 130661072896, \"unified\": true, \"compute_capability\": \"12.1\"}], \"disk_free_bytes\": 3500000000000}";
 
-/// What granite-4.0-h-tiny's Q8_0 reserved on lin1.
+/// What granite-4.0-h-tiny's Q8_0 reserved on gpu-box.
 const GRANITE_RESERVED: Int = 12100000000;
 
 fn add_node(store: st::Store, id: String, hardware: String) {
@@ -82,17 +82,17 @@ fn main() {
 
     // ---- the rule --------------------------------------------------------
     std::test::assert_eq_int(
-        api::models_memory(LIN1, "rocm"),
+        api::models_memory(GPU_BOX, "rocm"),
         17100000000,
-        "on lin1's card, ROCm has the card's memory",
+        "on gpu-box's card, ROCm has the card's memory",
     );
     std::test::assert_eq_int(
-        api::models_memory(LIN1, "vulkan"),
+        api::models_memory(GPU_BOX, "vulkan"),
         17100000000,
         "Vulkan the same card's",
     );
     std::test::assert_eq_int(
-        api::models_memory(LIN1, "cpu"),
+        api::models_memory(GPU_BOX, "cpu"),
         28500000000,
         "the processors the machine's",
     );
@@ -110,10 +110,10 @@ fn main() {
         "a card bigger than what the machine offers models: the less of the two",
     );
 
-    // ---- judged: lin1 with granite held ----------------------------------
+    // ---- judged: gpu-box with granite held ----------------------------------
     let held = api::footprint(GRANITE_RESERVED);
-    let lin1 = api::judging_add(api::Judging { }, "lin1", LIN1, held);
-    let on_gpu = api::judge_on(f16, lin1, usable, true);
+    let gpu_box = api::judging_add(api::Judging { }, "gpu-box", GPU_BOX, held);
+    let on_gpu = api::judge_on(f16, gpu_box, usable, true);
     let refused = at(on_gpu.fit, 0) or api::VariantFit { };
     std::test::assert(
         on_gpu.best < 0 && refused.runtime == "decision-0.1.2-rocm",
@@ -126,32 +126,32 @@ fn main() {
         ),
         "and says the GPU's numbers: " + refused.reason,
     );
-    let on_cpu = api::judge_on(f16, lin1, only(usable, ",decision-0.1.2-cpu,"), true);
+    let on_cpu = api::judge_on(f16, gpu_box, only(usable, ",decision-0.1.2-cpu,"), true);
     let cpu = at(on_cpu.fit, 0) or api::VariantFit { };
     std::test::assert(
         on_cpu.best == 0 && cpu.runtime == "decision-0.1.2-cpu"
             && std::str::contains(cpu.reason, "7.0 GB of 14.3 GB free for models"),
         "on the processors it has the machine's memory: " + cpu.reason,
     );
-    let spark = api::judging_add(api::Judging { }, "spark", SPARK, held);
-    let unified = at(api::judge_on(f16, spark, usable, true).fit, 0) or api::VariantFit { };
+    let node_a = api::judging_add(api::Judging { }, "node-a", SPARK, held);
+    let unified = at(api::judge_on(f16, node_a, usable, true).fit, 0) or api::VariantFit { };
     std::test::assert(
         unified.fits && std::str::contains(unified.reason, "7.0 GB of 108.2 GB free for models"),
         "a GB10 is judged on the machine's, as before: " + unified.reason,
     );
     // the prompt cache a placement reserves comes from the same room
     let tiny = recipes.get_in_gate("granite-4.0-h-tiny") or api::Recipe { };
-    let fresh = api::judging_add(api::Judging { }, "lin1", LIN1, 0);
+    let fresh = api::judging_add(api::Judging { }, "gpu-box", GPU_BOX, 0);
     let sized = api::fit_recipe(tiny, fresh, usable, false);
     std::test::assert(
         sized.runtime == "llama-server-b11913-rocm"
             && api::footprint(sized.reserved_bytes) <= 17100000000,
-        "granite sized afresh on lin1 is held to the card: "
+        "granite sized afresh on gpu-box is held to the card: "
             + to_string(sized.reserved_bytes) + " on " + sized.runtime,
     );
 
-    // ---- placed: lin1 refuses it, and says why ---------------------------
-    add_node(store, "lin1", LIN1);
+    // ---- placed: gpu-box refuses it, and says why ---------------------------
+    add_node(store, "gpu-box", GPU_BOX);
     catalog.create(
         api::CatalogModelCreate {
             id: "granite-4.0-h-tiny",
@@ -173,13 +173,13 @@ fn main() {
         recipe: "granite-4.0-h-tiny",
         variant: "gguf-q8_0",
         runtime: "llama-server-b11913-rocm",
-        leader: "lin1",
-        seat: "lin1/granite",
+        leader: "gpu-box",
+        seat: "gpu-box/granite",
         has_reserved_bytes: true,
         reserved_bytes: GRANITE_RESERVED,
         created_at: api::now_seconds()
     };
-    push(granite.nodes, "lin1") or discard;
+    push(granite.nodes, "gpu-box") or discard;
     let body = api::placement_json(granite);
     store.insert_placement(
         st::PlacementRow {
@@ -197,26 +197,28 @@ fn main() {
         has_variant: true,
         variant: "gguf-f16",
     };
-    push(c.nodes, "lin1") or discard;
+    push(c.nodes, "gpu-box") or discard;
     let mut why = "";
     placements.create(c) or {
         why = api::ctl_message(err);
     };
     std::test::assert(
-        std::str::starts_with(why, "variant gguf-f16 does not fit node lin1: ")
+        std::str::starts_with(why, "variant gguf-f16 does not fit node gpu-box: ")
             && std::str::contains(why, "free of its GPU's 17.1 GB"),
-        "placing it on lin1 is refused, saying the GPU's memory: " + why,
+        "placing it on gpu-box is refused, saying the GPU's memory: " + why,
     );
 
     // ---- suggested: the node's suggestions agree --------------------------
-    let suggested = placements.suggest(api::NodeRef { node: "lin1" }) or api::NodeSuggestions { };
+    let suggested = placements.suggest(
+        api::NodeRef { node: "gpu-box" },
+    ) or api::NodeSuggestions { };
     let mut decide = api::NodeSuggestion { };
     for s in suggested.data {
         if s.category == "decide" { decide = s; }
     }
     std::test::assert(
         !decide.has_recipe && std::str::contains(decide.reason, "free of its GPU's 17.1 GB"),
-        "nothing to decide with is suggested for lin1, for the card's memory: " + decide.reason,
+        "nothing to decide with is suggested for gpu-box, for the card's memory: " + decide.reason,
     );
 
     // ---- arranged: the arranger agrees ------------------------------------

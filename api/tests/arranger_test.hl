@@ -1,9 +1,9 @@
 // The arranger (arranger.hl): a plan for the whole fleet from what the
 // operator wants, a diff against what is placed now, judged by the fit a
 // placement is (placements.hl), from voice's own recipes, runtimes and role
-// data. Three DGX Sparks: spark and flare cabled to each other, their link
-// checked, and spark3. DeepSeek-V4.1-Flash-1017 pinned across a pair takes
-// both of its nodes whole on TensorFold; the roles go on spark3; a model
+// data. Three DGX Sparks: node-a and node-b cabled to each other, their link
+// checked, and node-f. DeepSeek-V4.1-Flash-1017 pinned across a pair takes
+// both of its nodes whole on TensorFold; the roles go on node-f; a model
 // placed already is kept, one a node holds is preferred, and what does not
 // fit is said.
 import ".." as api;
@@ -23,7 +23,7 @@ fn link_to(peer: String, a: String, b: String) -> String {
 
 /// A DGX Spark's capabilities: a managed engine, its GB10 (compute
 /// capability 12.1, as TensorFold's kernels are built for), and its links.
-fn spark(links: String) -> String {
+fn gb10(links: String) -> String {
     let memory = 130661072896;
     return "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\", \"config_schema\": {}}], \"hardware\": {\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": "
         + to_string(memory) + ", \"model_memory_bytes\": "
@@ -44,11 +44,11 @@ fn add_node(store: st::Store, id: String, capabilities: String) {
     store.put_beat(id, api::now_seconds(), 0) or discard;
 }
 
-/// The link between spark and flare, checked and passed.
+/// The link between node-a and node-b, checked and passed.
 fn checked(store: st::Store, link: api::Link) {
     let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
     let usable = rts.usable_in_gate() or api::RuntimeList { };
-    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let c = api::check_link_in(store, link, usable, "node-a", "node-b") or api::no_check();
     let said = api::link_result_json(
         api::LinkCheckResult {
             id: c.id,
@@ -58,8 +58,8 @@ fn checked(store: st::Store, link: api::Link) {
         },
         api::now_seconds(),
     );
-    store.put_link_result(c.id, "spark", said) or discard;
-    store.put_link_result(c.id, "flare", said) or discard;
+    store.put_link_result(c.id, "node-a", said) or discard;
+    store.put_link_result(c.id, "node-b", said) or discard;
 }
 
 /// What a node reports its store holds: every file variant `v` pins (its
@@ -163,12 +163,12 @@ fn main() {
     api::Accounts { store: store }.create(
         api::AccountCreate { id: "local", name: "Local" },
     ) or discard;
-    add_node(store, "spark", spark(link_to("flare", "192.168.100.1", "192.168.101.1")));
-    add_node(store, "flare", spark(link_to("spark", "192.168.100.2", "192.168.101.2")));
-    add_node(store, "spark3", spark(""));
+    add_node(store, "node-a", gb10(link_to("node-b", "198.51.100.1", "203.0.113.1")));
+    add_node(store, "node-b", gb10(link_to("node-a", "198.51.100.2", "203.0.113.2")));
+    add_node(store, "node-f", gb10(""));
     checked(store, link);
 
-    // ---- the worked example: DeepSeek on a pair, three roles on spark3 ---
+    // ---- the worked example: DeepSeek on a pair, three roles on node-f ---
     let mut w = api::ArrangementWants { };
     push(w.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
     push(w.roles, role("coder", 1)) or discard;
@@ -180,7 +180,7 @@ fn main() {
     };
     std::test::assert_eq_str(
         added_on(plan, "deepseek-v4.1-flash-1017"),
-        "flare+spark",
+        "node-a+node-b",
         "the pin takes the checked pair",
     );
     let ds = at(plan.add, 0) or api::PlanAdd { };
@@ -188,11 +188,11 @@ fn main() {
         ds.runtime == "tensorfold-0.7.5" && std::str::contains(ds.reason, "link"),
         "on TensorFold, needing the link: " + ds.reason,
     );
-    std::test::assert_eq_str(added_on(plan, "qwen3-coder-next"), "spark3", "the coder on spark3");
+    std::test::assert_eq_str(added_on(plan, "qwen3-coder-next"), "node-f", "the coder on node-f");
     std::test::assert_eq_str(
         added_on(plan, "jev-style-2b-decision-v3"),
-        "spark3",
-        "the decider on spark3, the pair being whole: " + api::plan_text(plan),
+        "node-f",
+        "the decider on node-f, the pair being whole: " + api::plan_text(plan),
     );
     std::test::assert(count(plan.aliases) >= 2, "each filled role points its alias");
     let first = at(plan.aliases, 0) or api::PlanAlias { };
@@ -203,19 +203,19 @@ fn main() {
 
     // ---- what each add holds of its nodes' memory for models ---------------
     // its reservation and its server's own, as placing it would count them;
-    // across the pair, on each; and spark3's together within its budget
+    // across the pair, on each; and node-f's together within its budget
     let budget = node::model_memory("{}", 130661072896);
-    let mut on_spark3 = 0;
+    let mut on_node_f = 0;
     for a in plan.add {
         std::test::assert(
             a.reserved_bytes > 0 && a.held_bytes == a.reserved_bytes + 2147483648,
             "an add holds its reservation and its server's: " + a.recipe,
         );
-        if nodes_of(a.nodes) == "spark3" { on_spark3 = on_spark3 + a.held_bytes; }
+        if nodes_of(a.nodes) == "node-f" { on_node_f = on_node_f + a.held_bytes; }
     }
     std::test::assert(
-        on_spark3 > 0 && on_spark3 <= budget,
-        "spark3's adds fit its budget: " + to_string(on_spark3) + " of " + to_string(budget),
+        on_node_f > 0 && on_node_f <= budget,
+        "node-f's adds fit its budget: " + to_string(on_node_f) + " of " + to_string(budget),
     );
     std::test::assert(ds.held_bytes <= budget, "the pair's model holds each node's share");
 
@@ -231,7 +231,7 @@ fn main() {
     for a in plan.add {
         if a.recipe != "deepseek-v4.1-flash-1017" {
             std::test::assert(
-                nodes_of(a.nodes) == "spark3",
+                nodes_of(a.nodes) == "node-f",
                 "nothing beside DeepSeek on the pair: " + a.recipe + " on " + nodes_of(a.nodes),
             );
         }
@@ -266,13 +266,13 @@ fn main() {
         api::CatalogModelCreate { id: "granite", has_recipe: true, recipe: "granite-4.0-h-tiny" },
     ) or discard;
     let mut c = api::PlacementCreate { id: "tiny-now", model: "tiny", account: "local" };
-    push(c.nodes, "spark3") or discard;
+    push(c.nodes, "node-f") or discard;
     placements.create(c) or {
         std::test::assert(false, "placed: " + api::ctl_message(err));
         return;
     };
     let mut g = api::PlacementCreate { id: "granite-now", model: "granite", account: "local" };
-    push(g.nodes, "spark") or discard;
+    push(g.nodes, "node-a") or discard;
     placements.create(g) or {
         std::test::assert(false, "placed: " + api::ctl_message(err));
         return;
@@ -319,16 +319,16 @@ fn main() {
     f.placed = api::ArrangePlacedList { };
     let plain = api::plan_fleet(f, small, read.roles);
     let p0 = at(plain.add, 0) or api::PlanAdd { };
-    std::test::assert_eq_str(nodes_of(p0.nodes), "flare", "with nothing held, the first node");
+    std::test::assert_eq_str(nodes_of(p0.nodes), "node-a", "with nothing held, the first node");
     std::test::assert(p0.download_bytes > 0, "which fetches it");
-    // spark3 reports its store holds that variant whole
-    store.put_inventory(holding("spark3", shipped_variant(p0.recipe, p0.variant))) or discard;
+    // node-f reports its store holds that variant whole
+    store.put_inventory(holding("node-f", shipped_variant(p0.recipe, p0.variant))) or discard;
     let mut g2 = placements.arrangement_fleet_in_gate(small) or api::ArrangeFleet { };
     g2.placed = api::ArrangePlacedList { };
     let held = api::plan_fleet(g2, small, read.roles);
     let p1 = at(held.add, 0) or api::PlanAdd { };
     std::test::assert(
-        nodes_of(p1.nodes) == "spark3" && p1.download_bytes == 0
+        nodes_of(p1.nodes) == "node-f" && p1.download_bytes == 0
             && std::str::contains(p1.reason, "already on disk"),
         "the node that holds it: " + api::plan_text(held),
     );
@@ -337,15 +337,15 @@ fn main() {
     let mut ds_only = api::ArrangementWants { };
     push(ds_only.pins, pin("deepseek-v4.1-flash-1017", 2)) or discard;
     let exl3 = shipped_variant("deepseek-v4.1-flash-1017", "exl3-2.5bpw");
-    store.put_inventory(holding("flare", exl3)) or discard;
+    store.put_inventory(holding("node-b", exl3)) or discard;
     let half = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
     let h0 = at(half.add, 0) or api::PlanAdd { };
     std::test::assert(
         h0.download_bytes == api::fetched_bytes(exl3)
             && !std::str::contains(h0.reason, "already on disk"),
-        "held on flare alone: spark fetches its part: " + api::plan_text(half),
+        "held on node-b alone: node-a fetches its part: " + api::plan_text(half),
     );
-    store.put_inventory(holding("spark", exl3)) or discard;
+    store.put_inventory(holding("node-a", exl3)) or discard;
     let both = placements.plan_arrangement(ds_only) or api::ArrangementPlan { };
     let h1 = at(both.add, 0) or api::PlanAdd { };
     std::test::assert(
@@ -378,26 +378,26 @@ fn main() {
     // a pin on nodes it does not fit is unmet, with the fit's reason
     let mut lone = api::ArrangementWants { };
     let mut lp = pin("deepseek-v4.1-flash-1017", 0);
-    push(lp.nodes, "spark3") or discard;
+    push(lp.nodes, "node-f") or discard;
     push(lone.pins, lp) or discard;
     let alone = placements.plan_arrangement(lone) or api::ArrangementPlan { };
     let u = at(alone.unmet, 0) or api::PlanUnmet { };
     std::test::assert(
-        count(alone.unmet) == 1 && std::str::contains(u.reason, "spark3")
+        count(alone.unmet) == 1 && std::str::contains(u.reason, "node-f")
             && std::str::contains(u.reason, "no runtime"),
-        "DeepSeek alone on spark3 does not fit: " + u.reason,
+        "DeepSeek alone on node-f does not fit: " + u.reason,
     );
     std::test::assert(u.has_need_bytes && u.need_bytes > 0, "and says what it would hold");
 
     // ---- a pin naming a catalog model is filled by that model -------------
-    // `tiny` (qwen3-0.6b) is placed on spark3; `wanted` is another catalog
+    // `tiny` (qwen3-0.6b) is placed on node-f; `wanted` is another catalog
     // model of the same recipe, which requests are routed to by its id
     api::Catalog { store: store, recipes: recipes }.create(
         api::CatalogModelCreate { id: "wanted", has_recipe: true, recipe: "qwen3-0.6b" },
     ) or discard;
     let mut exact = api::ArrangementWants { };
     let mut ep = pin("wanted", 0);
-    push(ep.nodes, "spark3") or discard;
+    push(ep.nodes, "node-f") or discard;
     push(exact.pins, ep) or discard;
     let named = placements.plan_arrangement(exact) or api::ArrangementPlan { };
     let na = at(named.add, 0) or api::PlanAdd { };
@@ -419,7 +419,7 @@ fn main() {
     // a Spark with a gigabyte of disk: qwen3-0.6b's GGUF (639 MB) fits, and
     // then granite-4.0-350m's (378 MB) does not
     let small_disk = std::str::replace(
-        spark(""),
+        gb10(""),
         "\"disk_free_bytes\": 3500000000000",
         "\"disk_free_bytes\": 1000000000",
     );
@@ -446,9 +446,9 @@ fn main() {
     ) or discard;
     let mut both_ids = api::ArrangementWants { };
     let mut b1 = pin("wanted", 0);
-    push(b1.nodes, "flare") or discard;
+    push(b1.nodes, "node-b") or discard;
     let mut b2 = pin("qwen3-0.6b", 0);
-    push(b2.nodes, "spark") or discard;
+    push(b2.nodes, "node-a") or discard;
     push(both_ids.pins, b1) or discard;
     push(both_ids.pins, b2) or discard;
     let ids = placements.plan_arrangement(both_ids) or api::ArrangementPlan { };

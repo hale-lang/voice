@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { changeReads, fleetMoved, fitsMoved, ARRANGEMENTS, FITS } from './fleet-reads.ts';
 
-const node = (over = {}) => ({ id: 'spark3', status: 'up', seats: [{ id: 'a' }], in_flight: 0, last_heartbeat_at: '2026-11-08T00:00:00Z', ...over });
+const node = (over = {}) => ({ id: 'node-f', status: 'up', seats: [{ id: 'a' }], in_flight: 0, last_heartbeat_at: '2026-11-08T00:00:00Z', ...over });
 
 test('a placement or a node changed reads the saved arrangements again; others do not', () => {
-  assert.deepEqual(changeReads('placements/qwen-spark3'), ['/admin/v1/placements', ARRANGEMENTS, FITS]);
-  assert.ok(changeReads('nodes/spark3').includes(ARRANGEMENTS));
+  assert.deepEqual(changeReads('placements/qwen-node-f'), ['/admin/v1/placements', ARRANGEMENTS, FITS]);
+  assert.ok(changeReads('nodes/node-f').includes(ARRANGEMENTS));
   assert.ok(!changeReads('projects/work/budget').includes(ARRANGEMENTS));
   assert.ok(changeReads('recipes/x').includes('/admin/v1/nodes/{node}/downloads'));
   assert.deepEqual(changeReads(''), []);
@@ -20,7 +20,7 @@ test('a node joining, its state or its seats moving is a fleet change; a heartbe
 });
 
 test('how every recipe fits is read again when a recipe, runtime, placement or node changes', () => {
-  for (const t of ['recipes/x', 'runtimes/vllm-26.09', 'placements/qwen-spark3', 'nodes/spark3']) assert.ok(changeReads(t).includes(FITS), t);
+  for (const t of ['recipes/x', 'runtimes/vllm-26.09', 'placements/qwen-node-f', 'nodes/node-f']) assert.ok(changeReads(t).includes(FITS), t);
   assert.ok(!changeReads('projects/work/budget').includes(FITS));
   assert.ok(!changeReads('accounts/work').includes(FITS));
 });

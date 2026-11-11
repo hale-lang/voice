@@ -47,7 +47,7 @@ the coordinator runs on included.
 ## Install
 
 ```sh
-sudo HALE_DNA_REVISION=<commit> sh node/install.sh install --id spark --api http://10.73.20.5:8080 --operator-token-file admin.token
+sudo HALE_DNA_REVISION=<commit> sh node/install.sh install --id node-a --api http://192.0.2.5:8080 --operator-token-file admin.token
 ```
 
 from voice's source at that commit; without `HALE_DNA_REVISION` it builds
@@ -56,7 +56,7 @@ the node here (`hale run node install …`, the same arguments).
 A habitat runs the same command for you, without the token file:
 
 ```sh
-hale habitat organism place voice node --host spark
+hale habitat organism place voice node --host node-a
 ```
 
 It:
@@ -105,7 +105,7 @@ labelled with the voice account it bills:
 ```sh
 claude setup-token                                   # once per subscription, as that account
 hale dna secret set claude-token --member work       # the token, for voice's account `work`
-hale habitat organism place voice node --host spark  # hands the node every member
+hale habitat organism place voice node --host node-a  # hands the node every member
 ```
 
 The seat names its account's token: `{"engine": "claude", "account": "work",
@@ -148,8 +148,8 @@ address (3 for IPv4 on a Spark, 1 for link-local). Voice changes no host
 networking: a pair with neither address shows as cabled, not addressed.
 
 The node's page says where its links stand: `2 ports cabled (200 Gb/s), no
-peer found`; `cabled to flare, not addressed`; `cabled to flare · not
-checked`; `cabled to flare · link check passed 22.9 GB/s`; `degraded:
+peer found`; `cabled to node-b, not addressed`; `cabled to node-b · not
+checked`; `cabled to node-b · link check passed 22.9 GB/s`; `degraded:
 <why>`.
 
 An operator may still declare a link in the node's capabilities file, beside
@@ -160,9 +160,9 @@ RoCE GID index. A DGX Spark's one cabled port is two ports here, one per
 half of its ConnectX-7:
 
 ```json
-"links": [{"peer": "flare", "gid_index": 3, "ports": [
-  {"ifname": "enp1s0f0np0", "address": "192.168.100.1", "hca": "rocep1s0f0"},
-  {"ifname": "enP2p1s0f0np0", "address": "192.168.101.1", "hca": "roceP2p1s0f0"}]}]
+"links": [{"peer": "node-b", "gid_index": 3, "ports": [
+  {"ifname": "enp1s0f0np0", "address": "198.51.100.1", "hca": "rocep1s0f0"},
+  {"ifname": "enP2p1s0f0np0", "address": "203.0.113.1", "hca": "roceP2p1s0f0"}]}]
 ```
 
 Once both nodes have the link and are up, check it (or press `check` on the
@@ -170,13 +170,13 @@ node's page): each runs a rank of an NCCL all-reduce over it, in the image a
 model across the two would run in, and says what it measured.
 
 ```sh
-curl -X POST $api/admin/v1/nodes/spark/links/flare/check -H @admin.h   # running
-curl -sS $api/admin/v1/nodes/spark -H @admin.h                          # links[].check: passed
+curl -X POST $api/admin/v1/nodes/node-a/links/node-b/check -H @admin.h   # running
+curl -sS $api/admin/v1/nodes/node-a -H @admin.h                          # links[].check: passed
 ```
 
 A check whose sum is right passes; one under 10 GB/s passes `degraded`, with
 the figure. Then a placement naming both nodes, the leader first, splits the
-model across them (`"nodes": ["spark", "flare"]`): vLLM's own multi-node
+model across them (`"nodes": ["node-a", "node-b"]`): vLLM's own multi-node
 executor, tensor parallel across the two GPUs, as NVIDIA's guide to serving
 vLLM across two DGX Sparks runs it. The leader's seat serves it; the
 follower's, of the same id, runs the other half and serves nothing itself;
@@ -192,7 +192,7 @@ catalog model naming it, an account that bills nothing, and the placement.
 curl -X POST $api/admin/v1/models   -H @admin.h -H "$json" -d '{"id": "qwen3-0.6b", "recipe": "qwen3-0.6b"}'
 curl -X POST $api/admin/v1/accounts -H @admin.h -H "$json" -d '{"id": "local", "name": "Local"}'
 curl -X POST $api/admin/v1/placements -H @admin.h -H "$json" \
-  -d '{"id": "qwen-on-spark", "model": "qwen3-0.6b", "nodes": ["spark"], "account": "local"}'
+  -d '{"id": "qwen-on-node-a", "model": "qwen3-0.6b", "nodes": ["node-a"], "account": "local"}'
 ```
 
 On the Spark it is served by NVIDIA's vLLM (`vllm-26.09`), given the share
@@ -203,12 +203,12 @@ then asks it as any model (`POST /v1/chat/completions`).
 The coordinator picks the form of the weights and the runtime that fit the
 node, the node fetches and verifies them, starts the runtime in voice's
 sandbox, and the seat goes `fetching`, `starting`, `up`
-(`GET /admin/v1/nodes/spark/seats/qwen-on-spark`).
+(`GET /admin/v1/nodes/node-a/seats/qwen-on-node-a`).
 
 ## Check it
 
 ```sh
-curl -sS $api/admin/v1/nodes/spark -H @admin.h        # up, its hardware, its engines
+curl -sS $api/admin/v1/nodes/node-a -H @admin.h        # up, its hardware, its engines
 curl -sS http://127.0.0.1:8081/node/v1/status         # on the machine
 ```
 
@@ -222,8 +222,8 @@ nodes gives each one its own port with `--readings-port`.
 ## Remove it
 
 ```sh
-sudo HALE_DNA_REVISION=<commit> sh node/install.sh uninstall --id spark --api $api --operator-token-file admin.token [--purge]
-hale habitat organism unplace voice node --host spark      # or, in a habitat
+sudo HALE_DNA_REVISION=<commit> sh node/install.sh uninstall --id node-a --api $api --operator-token-file admin.token [--purge]
+hale habitat organism unplace voice node --host node-a      # or, in a habitat
 ```
 
 stops and removes the service and the model servers the node started; with

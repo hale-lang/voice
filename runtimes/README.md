@@ -100,12 +100,12 @@ The kit's own kernels are the variant's, fetched as pinned data.
 
 Two patches of voice's are applied ([`tensorfold/patches`](tensorfold/patches)):
 the RDMA ring opens the GID index the link declares (`TF_RDMA_GID_INDEX`;
-the engine line hard-wired 5, and the lab's Sparks have their RoCE v2
+the engine line hard-wired 5, and the Sparks measured below have their RoCE v2
 address at 3), and rank 1 waits for rank 0 as long as its seat is assigned
 (`TF_TP_CONNECT_SECONDS`; it gave up after 300 s), since each node starts its
 rank when its own inputs are ready. Unset, each behaves as before.
 
-Measured on spark and flare (DGX Spark, GB10, ConnectX-7 link at GID index
+Measured on node-a and node-b (DGX Spark, GB10, ConnectX-7 link at GID index
 3) on 2026-11-07, each rank started with the arguments and environment the
 node gives it, with this archive (`80fc12b8…`) and the recipe's served shape
 (32 streams, rounds of 64 rows, a window of 7,340,032 positions,

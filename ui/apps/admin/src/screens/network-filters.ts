@@ -28,7 +28,7 @@ export function filterFleet(fleet: Fleet, f: Filters): Fleet {
   const scopedUsage = fleet.usage.filter(r => matches('project', r.project) && matches('model', r.requested_model) && matches('repository', requestContext(r, fleet.contexts).repository ?? '') && matches('api', requestContext(r, fleet.contexts).apiInstance ?? ''));
   const requestScoped = !!(f.project || f.repository || f.api);
   const observedSeats = new Set(scopedUsage.flatMap(r => r.served ? [r.served.seat] : []));
-  const nodes = fleet.nodes.map(n => ({ ...n, seats: n.seats.filter(s => {
+  const kept = (n: Fleet['nodes'][number], s: Fleet['nodes'][number]['seats'][number]) => {
     const a = fleet.accounts.find(a => a.id === s.account);
     return matches('host', n.id) && matches('hostState', n.status) && matches('seat', s.ref) && matches('engine', s.engine)
       && matches('account', s.account) && matches('seatState', s.status) && matches('provider', a?.provider ?? 'local')
@@ -39,11 +39,16 @@ export function filterFleet(fleet: Fleet, f: Filters): Fleet {
       && (!f.model || s.serves.some(m => m.model === f.model))
       && (!requestScoped || observedSeats.has(s.ref))
       && (!f.search || [n.id, n.name, s.ref, s.engine, s.account, a?.name, ...s.serves.flatMap(m => [m.model, m.as])].join(' ').toLowerCase().includes(f.search.toLowerCase()));
-  }) })).filter(n => n.seats.length);
+  };
+  // a placement across two hosts stays one unit: a seat of it kept keeps its partner
+  const partner = new Map((fleet.placements ?? []).flatMap(p => p.follower_seat ? [[p.seat, p.follower_seat], [p.follower_seat, p.seat]] as const : []));
+  const matched = new Set(fleet.nodes.flatMap(n => n.seats.filter(s => kept(n, s)).map(s => s.ref)));
+  for (const ref of [...matched]) { const other = partner.get(ref); if (other) matched.add(other); }
+  const nodes = fleet.nodes.map(n => ({ ...n, seats: n.seats.filter(s => matched.has(s.ref)) })).filter(n => n.seats.length);
   const refs = new Set(nodes.flatMap(n => n.seats.map(s => s.ref)));
   const accounts = new Set(nodes.flatMap(n => n.seats.map(s => s.account)));
   const resourceScoped = Object.entries(f).some(([key,value]) => value && !['project','repository','api','model'].includes(key));
   const usage = scopedUsage.filter(r => !resourceScoped || !!r.served && refs.has(r.served.seat));
   const projects = new Set(usage.map(r => r.project));
-  return { contexts: fleet.contexts, nodes, accounts: fleet.accounts.filter(a => accounts.has(a.id)), projects: fleet.projects.filter(p => projects.has(p.id)), usage };
+  return { contexts: fleet.contexts, placements: fleet.placements, nodes, accounts: fleet.accounts.filter(a => accounts.has(a.id)), projects: fleet.projects.filter(p => projects.has(p.id)), usage };
 }

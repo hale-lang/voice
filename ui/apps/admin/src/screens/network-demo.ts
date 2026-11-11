@@ -1,4 +1,4 @@
-import type { NodeSummary, SeatSummary } from '../api/client';
+import type { NodeSummary, Placement, SeatSummary } from '../api/client';
 import type { Fleet, FleetRequest } from './network-model';
 
 // Repository is caller metadata on demo requests, not a field on Voice's Project.
@@ -11,6 +11,7 @@ const PROJECTS = [
 const ALIASES: Record<string, { name: string; model: string }[]> = {
   product: [{ name: 'coding', model: 'qwen-coder-32b' }],
   research: [{ name: 'reasoning', model: 'deepseek-r1-q4' }],
+  infrastructure: [{ name: 'big', model: 'deepseek-v4' }],
 };
 export const DEMO_TICK_MS = 1800;
 // each project's path colour: the theme's vivid tokens, so the paths follow the theme
@@ -34,9 +35,19 @@ export function demoFleet(tick: number, now: number): Fleet {
     const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
     return { id, name: names[id], status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };
   });
+  // two Spark-like hosts cabled together: one model placed across both (its
+  // leader's seat takes the requests, its follower's computes half of each),
+  // and a model of its own beside it on the first
+  const placements = sparkPlacements(now);
+  const seatOf = (p: Placement, node: string, ref: string): SeatSummary => ({ id: p.id, ref, node, engine: 'managed', account: p.account, data_classes: ['internal'], serves: [{ model: p.model }], status: 'up', in_flight: 0, concurrency: 4, enabled: true, problems: [], reason: null, placement: p.id, runtime: p.runtime, variant: p.variant });
+  const [pair, alone] = placements as [Placement, Placement];
+  for (const [id, name] of [['spark1', 'Spark 1 · 128 GB, cabled to Spark 2'], ['spark2', 'Spark 2 · 128 GB, cabled to Spark 1']] as const) {
+    const seats = id === 'spark1' ? [seatOf(pair, id, pair.seat), seatOf(alone, id, alone.seat)] : [seatOf(pair, id, pair.follower_seat!)];
+    nodes.push({ id, name, status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() });
+  }
   const projects = PROJECTS.map(([id]) => ({ id, name: id, status: 'active' as const, owners: [], data_classes: ['internal' as const], created_at: new Date(now - 86400000).toISOString(), aliases: ALIASES[id] ?? [], resolved_aliases: (ALIASES[id] ?? []).map(a => ({ ...a, from: id })) }));
   const accounts = ['claude-personal', 'claude-work', 'openai', 'agy', 'vibe', 'local'].map((id, index) => ({ id, name: id, provider: id.startsWith('claude-') ? 'anthropic' : id === 'openai' ? 'openai' : null, billing: id === 'local' ? 'none' as const : 'subscription' as const, status: 'active' as const, seats: nodes.flatMap((n) => n.seats.filter((s) => s.account === id).map((s) => s.ref)), windows: id === 'local' ? [] : [{ name: 'five_hour', used_percent: [34, 62, 29, 47, 18][index]!, observed_at: new Date(now).toISOString() }], created_at: new Date(now - 86400000).toISOString() }));
-  const fleet: Fleet = { nodes, accounts, projects, usage: [] };
+  const fleet: Fleet = { nodes, accounts, projects, placements, usage: [] };
   fleet.usage = Array.from({ length: 77 }, (_, i) => ({ ...demoRequest(fleet, i, now - (77 - i) * 1000), id: `demo-seed-${i}` }));
   for (const { record } of demoInFlight(fleet, tick, now)) {
     const node = nodes.find(n => n.id === record.served!.node)!;
@@ -46,9 +57,22 @@ export function demoFleet(tick: number, now: number): Fleet {
   return fleet;
 }
 
+/** The demo's placements on its Spark pair: one across both, one on the first alone. */
+function sparkPlacements(now: number): Placement[] {
+  const at = new Date(now - 3600000).toISOString();
+  return [
+    { id: 'deepseek-v4', model: 'deepseek-v4', nodes: ['spark1', 'spark2'], account: 'local', recipe: 'deepseek-v4', variant: 'fp8', runtime: 'tensorfold-0.7', chosen_by: 'coordinator', leader: 'spark1', seat: 'spark1/deepseek-v4', follower_seat: 'spark2/deepseek-v4', fit: [], created_at: at },
+    { id: 'gpt-oss-20b', model: 'gpt-oss-20b', nodes: ['spark1'], account: 'local', recipe: 'gpt-oss-20b', variant: 'mxfp4', runtime: 'vllm-26.09', chosen_by: 'coordinator', leader: 'spark1', seat: 'spark1/gpt-oss-20b', fit: [], created_at: at },
+  ];
+}
+
 export function demoRequest(fleet: Fleet, sequence: number, now: number): FleetRequest {
-  const seats = fleet.nodes.flatMap(n => n.seats).filter(s => s.status === 'up');
-  const seat = seats[(sequence * 7) % seats.length]!;
+  // a follower's seat takes no request of its own
+  const followers = new Set((fleet.placements ?? []).flatMap(p => p.follower_seat ? [p.follower_seat] : []));
+  const seats = fleet.nodes.flatMap(n => n.seats).filter(s => s.status === 'up' && !followers.has(s.ref));
+  // every fourth request is the pair's, so its coordination is seen often
+  const leader = (fleet.placements ?? []).find(p => p.follower_seat)?.seat;
+  const seat = (sequence % 4 === 3 && seats.find(s => s.ref === leader)) || seats[(sequence * 7) % seats.length]!;
   const model = seat.serves[Math.floor(sequence / seats.length) % seat.serves.length]!.model;
   const project = fleet.projects[sequence % fleet.projects.length]!.id;
   const repository = PROJECTS.find(([id]) => id === project)?.[1];

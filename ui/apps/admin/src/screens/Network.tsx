@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState, useId } from 'react';
 import { useInstances, INSTANCE_LAPSE_MS } from '../api/hub';
 import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/components';
 import { useGet, useNodes, useUsageRecords, USAGE_PAGE } from '../api/client';
-import { subscribeAdminEvents, subscribeFlights, type Flight } from '../api/events';
+import { subscribeAdminEvents, subscribeFlights } from '../api/events';
 import type { ScreenProps } from '../App';
-import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, type Fleet, type Graph, type Kind, type Point } from './network-model';
+import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, pairsOf, provisional, hullOf, topologyKey, BAD_STATES, WAITING_STATES, type Fleet, type Graph, type Kind, type Pair, type Point } from './network-model';
 import { demoFleet, demoInFlight, demoCompletions, demoContext, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
@@ -16,6 +16,9 @@ export function Network(_: ScreenProps) {
   const nodes = useNodes();
   const accounts = useGet('/admin/v1/accounts');
   const projects = useGet('/admin/v1/projects');
+  // what is placed: a placement across two hosts is drawn as one unit; read
+  // again as a node, a seat or a placement changes (events.ts)
+  const placements = useGet('/admin/v1/placements');
   // voice's own requests for the projects (their system keys'): a layer of
   // their own, off until asked for
   const [internal, setInternal] = useState(false);
@@ -43,7 +46,7 @@ export function Network(_: ScreenProps) {
   };
   const stub = health.data?.version?.includes('stub') ?? false;
   const source = choice ?? (stub ? 'demo' : 'api');
-  const queries = [nodes, accounts, projects, usage];
+  const queries = [nodes, accounts, projects, usage, placements];
   const failure = queries.find((q) => q.isError);
   const pending = queries.some((q) => q.isPending);
   const beats = useInstances();
@@ -54,13 +57,14 @@ export function Network(_: ScreenProps) {
     nodes: nodes.data?.data ?? [],
     accounts: accounts.data?.data ?? [],
     projects: projects.data?.data ?? [],
+    placements: placements.data?.data ?? [],
     usage: (usage.data?.data ?? []).map((r, i): FleetRequest => {
       const whole = wholes[i]?.data;
       return whole && whole.id === r.id ? { ...r, metadata: whole.metadata } : r;
     }),
     instances: beats.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [nodes.data, accounts.data, projects.data, usage.data, beats, now, wholeKey]);
+  }), [nodes.data, accounts.data, projects.data, placements.data, usage.data, beats, now, wholeKey]);
 
   return <div className={s.screen}>
     <header className={s.header}>
@@ -102,7 +106,9 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
   const data = useMemo(() => demo ? { ...demoFleet(clock.tick, clock.now), usage: initialDemo.usage } : fleet, [demo, clock, fleet, initialDemo]);
   const trace = traceSelection ? arrivals.find(r => r.id === traceSelection.id) ?? traceSelection : null;
   const running = useMemo(() => demo ? demoInFlight(data, clock.tick, clock.now) : [], [demo,data,clock]);
-  const activeIds = new Set(running.map(job => job.record.id));
+  // the requests running now: the demo's, or those the stream says are in
+  // flight; never listed as recent usage, nor traced as recorded
+  const activeIds = useMemo(() => new Set(demo ? running.map(job => job.record.id) : [...flying.keys()]), [demo, running, flying]);
   const traceInFlight = !!trace && activeIds.has(trace.id);
   const motion: Pulse[] = demo
     ? running.map(job => ({ record: job.record, at: clock.now, inFlight: true, color: job.color }))
@@ -118,7 +124,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
     const g = buildGraph(filtered, { context });
     const vertices = g.vertices.filter(v => !hidden.includes(v.kind));
     const ids = new Set(vertices.map(v => v.id));
-    return { ...g, vertices, edges: g.edges.filter(e => ids.has(e.source) && ids.has(e.target)) };
+    return { ...g, vertices, edges: g.edges.filter(e => ids.has(e.source) && ids.has(e.target)), pairs: g.pairs.filter(p => ids.has(p.leader) && ids.has(p.follower)) };
   }, [filtered, hidden, context]);
   const changeFilter = (key: keyof Filters, value: string) => { setFilters(old => ({ ...old, [key]: value })); setSelectedIds([]); setTrace(null); setHovered(null); };
   const filterCount = Object.values(filters).filter(Boolean).length;
@@ -174,7 +180,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
     });
   }, [demo]);
 
-  const records = useMemo(() => filtered.usage.filter(r => !activeIds.has(r.id)).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)).slice(0, 6), [filtered.usage]);
+  const records = useMemo(() => filtered.usage.filter(r => !activeIds.has(r.id)).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at)).slice(0, 6), [filtered.usage, activeIds]);
   const vertex = graph.vertices.find((v) => v.id === selected);
   const criteria = selectedIds.length ? selectedIds : hovered ? [hovered] : [];
   const focus = criteria.at(-1);
@@ -183,6 +189,8 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
   const focusedEdges = new Set(cohort.length ? cohort.flatMap(r => [...requestEdges(r, graph)]) : adjacent ? graph.edges.filter(e => e.source === focus || e.target === focus).map(e => e.id) : []);
   const focusedIds = new Set(cohort.length ? cohort.flatMap(r => [...requestVertices(r, graph)]) : graph.edges.filter(e => focusedEdges.has(e.id)).flatMap(e => [e.source, e.target]));
   if (!trace) for (const id of criteria) focusedIds.add(id);
+  // a seat of a placement across two hosts focuses the whole placement
+  if (!trace) for (const p of pairsOf(criteria, graph)) { for (const id of [p.leader, p.follower, ...p.hosts]) focusedIds.add(id); for (const id of p.edges) focusedEdges.add(id); }
   const visibleRecords = selectedIds.length ? matchingRequests(selectedIds, filtered.usage.filter(r => !activeIds.has(r.id)).sort((a,b) => Date.parse(b.created_at)-Date.parse(a.created_at)), graph, matchMode).slice(0,6) : records;
   const kinds = graphKinds(fullGraph);
   const searchResults = query.trim() ? fullGraph.vertices.filter(v => `${v.name} ${v.id} ${kindName(v.kind)}`.toLowerCase().includes(query.trim().toLowerCase())).slice(0,8) : [];
@@ -214,8 +222,8 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
         </div>
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
-        <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}</div>
-        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project.</div>
+        <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}{fullGraph.pairs.length > 0 && <><span className={`${s.legendLine} ${s.legendBond}`} title="a placement's leader seat and its follower's: the two halves of one model"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Bond</span><span className={`${s.legendLine} ${s.legendCable}`} title="the link between the hosts of a placement across two"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Cable</span></>}</div>
+        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project. A model placed across two hosts is one outlined unit: a bond joins its leader seat, which takes its requests, to its follower's, which computes half of each and serves nothing alone; a cable joins their hosts, the link between them. A request to the leader lights both hosts, both seats, the bond and the cable; a part down marks the bond, the cable and the outline, with its reason.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">
@@ -226,17 +234,17 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
           <h3>Connected to</h3><div className={s.connections}>{graph.edges.filter((e) => e.source === vertex.id || e.target === vertex.id).map((e) => { const other = graph.vertices.find((v) => v.id === (e.source === vertex.id ? e.target : e.source))!; return <button key={e.id} onClick={() => choose(other.id)}><span className="muted">{other.kind}</span> <Mono>{other.name}</Mono></button>; })}</div>
           {vertex.href && !demo && <a href={vertex.href}>Open {kindName(vertex.kind).toLowerCase()} →</a>}
         </> : trace ? <>
-          <h3>{demo ? traceInFlight ? 'Simulated request · in flight' : 'Simulated request' : 'Recorded request'}</h3><h2 className="mono">{trace.project}</h2>
+          <h3>{demo ? traceInFlight ? 'Simulated request · in flight' : 'Simulated request' : traceInFlight ? 'Request in flight' : 'Recorded request'}</h3><h2 className="mono">{trace.project}</h2>
           <div className={s.participants}>{[...requestVertices(trace, fullGraph)].map(id => { const v = fullGraph.vertices.find(v => v.id === id)!; return <button key={id} onClick={() => choose(id)}><span>{kindName(v.kind)}</span>{v.name}</button>; })}</div>
           <dl>{[['Request ID',trace.id], ['Requested model',trace.requested_model], ...(fullGraph.requests.get(trace.id)?.askedAs ? [['Asked as', `alias ${trace.requested_model} → ${trace.resolved_model ?? resolvedModel(trace, data.projects)?.model ?? 'its model'}`]] : []), ['Served model',trace.served?.model ?? 'not attributed'], ['Outcome',traceInFlight ? 'in flight' : trace.status], ['Input / output',traceInFlight ? 'available on completion' : `${count(trace.input_tokens)} / ${count(trace.output_tokens)} tokens`], ['Wall / queue / load',traceInFlight ? 'available on completion' : `${trace.timing.wall_ms} / ${trace.timing.queue_ms} / ${trace.timing.load_ms} ms`], ['Price',traceInFlight ? 'available on completion' : micros(trace.price_micros,trace.currency)], ['Recorded',trace.created_at]].map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
-          {!demo && <a href={`#/usage/${encodeURIComponent(trace.id)}`}>Open usage record →</a>}
+          {!demo && !traceInFlight && <a href={`#/usage/${encodeURIComponent(trace.id)}`}>Open usage record →</a>}
         </> : <>
           <h3>One connected system</h3><h2>Follow the work.</h2>
           {!demo && <p className={s.small}>Only reported participants appear. A request's api instance is the one its usage record names; repository and other metadata are caller-supplied labels.</p>}
           <p className="muted">The whole fleet shares one field. Directional forces spread execution toward the models, while related entities settle around each other. Models are execution targets; projects, repositories, accounts and other context stay attached to the same request.</p>
           <div className={s.key}><span className="c-active">●</span><span>Reported in-flight work or a newly completed request</span><span className="c-wait">◐</span><span>Paused, pending or waiting</span><span className="c-fail">✕</span><span>Failed, down or exhausted</span></div>
           <p className="muted">Click any combination of entities to find their shared requests. Search includes every reported dimension. Optional context appears when supplied; selecting it never rearranges the network.</p>
-          <p className={s.small}>{demo ? 'Homelab-inspired demo: studio1–3, h1, h2 and m1. Seats, models and activity are illustrative; no hosts are contacted.' : 'Links show configuration and sampled usage, not routing eligibility. No hardware telemetry is inferred.'}</p>
+          <p className={s.small}>{demo ? 'Demo fleet: host-1 to host-6, and gpu-a and gpu-b cabled as a pair. Seats, models and activity are illustrative; no hosts are contacted.' : 'Links show configuration and sampled usage, not routing eligibility. No hardware telemetry is inferred.'}</p>
         </>}
       </aside>
     </div>
@@ -253,17 +261,13 @@ function Marker({ kind }: { kind: Kind }) {
   return <svg viewBox="0 0 40 40" aria-hidden="true">{kind.startsWith('context:') ? <path d="M20 7L33 30H7Z" /> : kind === 'repository' ? <path d="M8 12H18L22 16H33V30H8Z" /> : kind === 'api' ? <path d="M20 5L34 13V27L20 35L6 27V13Z" /> : kind === 'node' ? <rect x="8" y="8" width="24" height="24" /> : kind === 'account' ? <path d="M20 7L33 20L20 33L7 20Z" /> : kind === 'project' ? <rect x="12" y="12" width="16" height="16" /> : kind === 'system' ? <path d="M12 9H28V31H12Z M16 15H24 M16 20H24 M16 25H21" fill="none" strokeDasharray="3 2" /> : <circle cx="20" cy="20" r={kind === 'seat' ? 6 : 11} />}</svg>;
 }
 
-/** A request in flight as a record the graph can light: what it is, and the seat it is on. */
-function provisional(f: Flight): FleetRequest {
-  return { id: f.id, created_at: f.started_at, project: f.project, key: f.key, requested_model: f.requested_model, status: 'served', served: { seat: f.seat, node: f.seat.split('/')[0], account: f.account, model: f.requested_model, engine: '' }, input_tokens: 0, output_tokens: 0, price_micros: 0, currency: 'USD', timing: { wall_ms: 0, queue_ms: 0, load_ms: 0 }, attempts: [], metadata: {}, instance: (f as { instance?: string | null }).instance ?? null } as unknown as FleetRequest;
-}
-
 function Constellation({ layout, graph, selected, focusedIds, focusedEdges, pulses, paused, onSelect, onHover }: { layout: Graph; graph: Graph; selected: string[]; focusedIds: Set<string>; focusedEdges: Set<string>; pulses: Pulse[]; paused: boolean; onSelect: (id: string) => void; onHover: (id: string | null) => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState({ width: 700, height: 610 });
   useEffect(() => { const el = ref.current!; const observer = new ResizeObserver(([entry]) => { if (entry) setSize({ width: Math.max(280, entry.contentRect.width), height: entry.contentRect.height }); }); observer.observe(el); return () => observer.disconnect(); }, []);
-  // State/occupancy changes do not rerun layout. Only topology and viewport do.
-  const topology = layout.vertices.map((v) => `${v.id}/${v.parent ?? ''}`).join(',') + layout.edges.map((e) => `${e.id}/${e.source}/${e.kind}/${e.flow}`).sort().join(',');
+  // State/occupancy changes do not rerun layout, nor does a request starting,
+  // running or ending: only topology and viewport do.
+  const topology = topologyKey(layout);
   const [pins, setPins] = useState<Map<string, Point>>(() => new Map());
   const drag = useRef<{ id: string; startX: number; startY: number; offsetX: number; offsetY: number; moved: boolean } | null>(null);
   const skipClick = useRef(false);
@@ -281,6 +285,13 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
   const litIds = new Set(pulses.flatMap(p => [...requestVertices(p.record, graph)]));
   const failedIds = new Set(graph.edges.filter((e) => activeEdges.get(e.id) === true).flatMap((e) => [e.source, e.target]));
   const focused = focusedIds.size > 0;
+  // a placement across two hosts: its pulses run across the bond both ways
+  const pairOfBond = new Map(graph.pairs.map(p => [p.bond, p]));
+  const bonded = new Set(pulses.flatMap(p => [...requestEdges(p.record, graph)].filter(id => pairOfBond.has(id))));
+  const line = (e: { source: string; target: string }, reverse = false) => { const a = points.get(e.source)!, b = points.get(e.target)!; return reverse ? `M${b.x},${b.y} L${a.x},${a.y}` : `M${a.x},${a.y} L${b.x},${b.y}`; };
+  const pathOf = (e: Graph['edges'][number]) => e.kind === 'bond' || e.kind === 'cable' ? line(e) : edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts');
+  const pairState = (p: Pair | undefined) => p?.state === 'down' ? s.pairDown : p?.state === 'waiting' ? s.pairWaiting : '';
+  const cableState = new Map(graph.pairs.map(p => [p.cable, p]));
   return <>
     <div className={s.layoutTools}><span>NEURAL LAYERS <span className="muted">/ drag to arrange · select to inspect</span></span><button onClick={() => { settled.current = undefined; setPins(new Map()); }}>Reset layout{pins.size ? ` · ${pins.size} pinned` : ''}</button></div>
     <p className={s.dragHint}>Flow moves toward models → · drag to pin · arrow keys to move · Escape to release</p>
@@ -288,14 +299,18 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
     <div className={s.flowGuides} aria-hidden="true">{layout.vertices.some((v) => v.kind === 'repository' || v.kind.startsWith('context:')) ? <><span>CONTEXT</span><span>PROJECT → API → HOST → SEAT</span></> : <><span>PROJECTS</span><span>API → HOST → SEAT</span></>}<span>MODELS / INFERENCE</span></div>
     <svg className={s.wires} width="100%" height="100%" viewBox={`0 0 ${size.width} ${size.height}`} aria-hidden="true">
       <defs><marker id={arrowId} markerWidth="8" markerHeight="8" refX="25" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0L8 4L0 8Z" className={s.arrow} /></marker></defs>
-      {graph.edges.map((e) => <path markerEnd={e.flow ? `url(#${arrowId})` : undefined} key={e.id} className={`${s.wire} ${e.flow ? s.flowWire : e.kind === 'standing' ? s.standing : s.observed} ${focused && !focusedEdges.has(e.id) ? s.dim : ''} ${focusedEdges.has(e.id) ? s.focusWire : ''}`} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} />)}
-      {pulses.flatMap((p) => graph.edges.filter((e) => requestEdges(p.record, graph).has(e.id)).map((e) => <path key={`${p.record.id}:${e.id}`} style={{ stroke: p.color, color: p.color, animationPlayState: paused ? 'paused' : 'running' }} d={edgePath(points.get(e.source)!, points.get(e.target)!, e.id, e.kind === 'hosts')} className={`${requestFlowEdges(p.record, graph).has(e.id) ? s.signal : s.contextSignal} ${p.inFlight ? s.inFlightSignal : p.record.status !== 'served' ? s.failedSignal : ''} ${focused && !focusedEdges.has(e.id) ? s.dim : ''}`} />))}
+      {graph.pairs.map((p) => <PairHull key={p.id} pair={p} points={points} className={`${s.hull} ${pairState(p)} ${p.active > 0 || bonded.has(p.bond) ? s.hullServing : ''} ${focused && !focusedIds.has(p.leader) ? s.dim : ''} ${focusedIds.has(p.leader) && focusedIds.has(p.follower) ? s.hullFocus : ''}`} onSelect={() => onSelect(p.leader)} />)}
+      {graph.edges.map((e) => <path markerEnd={e.flow && e.kind !== 'bond' && e.kind !== 'cable' ? `url(#${arrowId})` : undefined} key={e.id} className={`${s.wire} ${e.kind === 'bond' ? `${s.bond} ${pairState(pairOfBond.get(e.id))}` : e.kind === 'cable' ? `${s.cable} ${pairState(cableState.get(e.id))} ${e.flow ? s.cableFlow : ''}` : e.flow ? s.flowWire : e.kind === 'standing' ? s.standing : s.observed} ${focused && !focusedEdges.has(e.id) ? s.dim : ''} ${focusedEdges.has(e.id) ? s.focusWire : ''}`} d={pathOf(e)} />)}
+      {/* a pair serving with nothing told in flight (its leader's seat reports work): the bond glows, both ways */}
+      {graph.pairs.filter(p => p.active > 0 && !bonded.has(p.bond)).flatMap(p => [false, true].map(reverse => <path key={`${p.id}:${reverse}`} d={line({ source: p.leader, target: p.follower }, reverse)} style={{ animationPlayState: paused ? 'paused' : 'running' }} className={`${s.signal} ${s.inFlightSignal} ${s.bondSignal} ${focused && !focusedIds.has(p.leader) ? s.dim : ''}`} />))}
+      {pulses.flatMap((p) => graph.edges.filter((e) => requestEdges(p.record, graph).has(e.id)).flatMap((e) => (e.kind === 'bond' ? [false, true] : [false]).map((reverse) => <path key={`${p.record.id}:${e.id}:${reverse}`} style={{ stroke: p.color, color: p.color, animationPlayState: paused ? 'paused' : 'running' }} d={e.kind === 'bond' ? line(e, reverse) : pathOf(e)} className={`${requestFlowEdges(p.record, graph).has(e.id) ? s.signal : s.contextSignal} ${e.kind === 'bond' ? s.bondSignal : ''} ${p.inFlight ? s.inFlightSignal : p.record.status !== 'served' ? s.failedSignal : ''} ${focused && !focusedEdges.has(e.id) ? s.dim : ''}`} />)))}
     </svg>
     {graph.vertices.map((v) => {
       const p = points.get(v.id)!;
-      const bad = ['down', 'failed', 'exhausted', 'refused', 'revoked'].includes(v.state);
-      const waiting = ['paused', 'pending', 'starting', 'offline', 'disabled'].includes(v.state);
-      const active = v.active > 0 || litIds.has(v.id);
+      const bad = BAD_STATES.includes(v.state);
+      const waiting = WAITING_STATES.includes(v.state);
+      // a follower's seat and host are active while its leader's seat has work
+      const active = v.active > 0 || (v.partnerActive ?? 0) > 0 || litIds.has(v.id);
       return <button key={v.id} className={`${s.entity} ${s[v.kind] ?? s.context} ${bad || failedIds.has(v.id) ? s.bad : waiting ? s.waiting : active ? s.active : ''} ${selected.includes(v.id) ? s.selected : ''} ${focusedIds.has(v.id) ? s.fused : ''} ${focused && !focusedIds.has(v.id) ? s.dim : ''}`} style={{ left: p.x, top: p.y }} onClick={() => { if (skipClick.current) { skipClick.current = false; return; } onSelect(v.id); }}
         onPointerDown={e => {
           if (e.button !== 0) return;
@@ -320,10 +335,24 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
           if (move) { e.preventDefault(); pin(v.id, { x: p.x + move.x, y: p.y + move.y }); }
           if (e.key === 'Escape') setPins(old => { const next = new Map(old); next.delete(v.id); return next; });
         }}
-        onMouseEnter={() => onHover(v.id)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(v.id)} onBlur={() => onHover(null)} aria-label={`${v.kind} ${v.kind === 'seat' ? v.id.slice(5) : v.name}, ${v.state}${v.active ? `, ${v.active} in flight` : ''}`} aria-pressed={selected.includes(v.id)}>
+        onMouseEnter={() => onHover(v.id)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(v.id)} onBlur={() => onHover(null)} aria-label={`${v.kind} ${v.kind === 'seat' ? v.id.slice(5) : v.name}, ${v.state}${v.part ? `, ${v.part.role} of ${v.part.placement} with ${v.part.partner.slice(5)}` : ''}${v.active ? `, ${v.active} in flight` : ''}${v.partnerActive ? `, computing for its leader's ${v.partnerActive} in flight` : ''}`} aria-pressed={selected.includes(v.id)}>
         <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}
       </button>;
     })}
     </div></div>
   </>;
+}
+
+/** A placement across two hosts, outlined as one unit around its hosts and seats, and labelled with what it is and its worst part's state. */
+function PairHull({ pair, points, className, onSelect }: { pair: Pair; points: ReadonlyMap<string, Point>; className: string; onSelect: () => void }) {
+  const at = [...pair.hosts, pair.leader, pair.follower].flatMap(id => points.get(id) ? [points.get(id)!] : []);
+  const { path, centre, bottom } = hullOf(at, 30);
+  const [leader, follower] = pair.hosts.map(id => id.slice(5));
+  const name = pair.id === pair.model ? pair.id : `${pair.id} · ${pair.model}`;
+  return <g className={className}>
+    <path d={path} onClick={onSelect}><title>{`${pair.id}: ${pair.model} across ${leader} + ${follower}, under ${pair.runtime}${pair.reason ? ` · ${pair.reason}` : ''}`}</title></path>
+    <text x={centre.x} y={centre.y - 2}>{name.length > 26 ? `${name.slice(0, 25)}…` : name}</text>
+    <text className={s.pairAcross} x={centre.x} y={centre.y + 11}>across {leader} + {follower}</text>
+    {pair.reason && <text className={s.pairReason} x={bottom.x} y={bottom.y + 13}>{pair.state === 'down' ? '✕' : '◐'} {pair.reason.length > 64 ? `${pair.reason.slice(0, 62)}…` : pair.reason}</text>}
+  </g>;
 }

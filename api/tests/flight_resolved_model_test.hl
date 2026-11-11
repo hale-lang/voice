@@ -1,0 +1,76 @@
+// A request in flight tells the model it asked for and the catalog model it
+// is routed as, as its usage record will (`requested_model`,
+// `resolved_model`): asked by a name its project gives a model, the name
+// and that model; asked for a model itself, that model twice. The row keeps
+// the name through the store (here the memory store; the Postgres store's
+// column is migration 35's).
+import ".." as api;
+import "../../store" as st;
+
+fn flight(plane: api::DataPlane, id: String) -> st::FlightRow {
+    let all = plane.store.flights_after(0, 100) or st::FlightRows { };
+    for f in all.rows {
+        if f.request_id == id { return f; }
+    }
+    return st::FlightRow { request_id: "missing" };
+}
+
+main locus App {
+    params {
+        plane: api::DataPlane = api::DataPlane { };
+    }
+
+    run() {
+        let k = st::KeyRow { id: "k1", project: "work" };
+        let c = api::Candidate { seat: st::SeatRow { ref: "host-a/big-model", account: "local" } };
+        // as `serve` sets it once the alias is resolved: the catalog model,
+        // and the name it was asked for by
+        let mut aliased = api::read_inference(
+            "{\"model\": \"big\", \"input\": \"hi\"}",
+            "responses",
+        ) or api::InferenceRequest { };
+        aliased.model = "big-model";
+        aliased.alias = "big";
+        self.plane.inference.flying("req_alias", k, aliased, c);
+        self.plane.inference.flying(
+            "req_direct",
+            k,
+            (
+                api::read_inference(
+                    "{\"model\": \"big-model\", \"input\": \"hi\"}",
+                    "responses",
+                ) or api::InferenceRequest { }
+            ),
+            c,
+        );
+
+        let by_alias = flight(self.plane, "req_alias");
+        std::test::assert_eq_str(
+            by_alias.model,
+            "big-model",
+            "the row keeps the model it is routed as",
+        );
+        std::test::assert_eq_str(by_alias.alias, "big", "and the name it asked for it by");
+        let told = api::flight_json(by_alias);
+        std::test::assert(
+            std::str::contains(told, "\"requested_model\": \"big\""),
+            "the request event tells what it asked for: " + told,
+        );
+        std::test::assert(
+            std::str::contains(told, "\"resolved_model\": \"big-model\""),
+            "and the model it is routed as: " + told,
+        );
+        std::test::assert(std::json::valid_object(told), "as JSON: " + told);
+
+        let direct = api::flight_json(flight(self.plane, "req_direct"));
+        std::test::assert(
+            std::str::contains(direct, "\"requested_model\": \"big-model\"")
+                && std::str::contains(direct, "\"resolved_model\": \"big-model\""),
+            "a model asked for itself is both: " + direct,
+        );
+    }
+}
+
+fn main() {
+    App { };
+}

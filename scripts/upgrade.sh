@@ -192,7 +192,7 @@ INSERT INTO "limit" (scope, key, window_seconds, requests) VALUES ('key', 'voice
 SQL
 keys="SELECT string_agg(k::text, ';' ORDER BY k.id) FROM api_key k WHERE project <> 'voice-system'"
 before=$(q "$keys")
-migrate 1
+migrate $((head - 33))
 test "$(q "SELECT count(*) FROM project WHERE id = 'voice-system'")" = 0
 test "$(q "SELECT count(*) FROM api_key WHERE id = 'voice-system' OR project = 'voice-system'")" = 0
 test "$(q "SELECT count(*) FROM budget")" = 0
@@ -234,7 +234,7 @@ psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
 INSERT INTO usage (id, created_at, project, key, requested_model, status, record) VALUES ('u_vs', now(), 'voice-system', 'voice-system', 'decide', 'served', '{}');
 INSERT INTO annotation (request_id, project, key, created_at, status) VALUES ('u_vs', 'voice-system', 'voice-system', now(), 'annotated');
 SQL
-migrate 1
+migrate $((head - 33))
 test "$(q "SELECT p.status || ':' || p.internal || ':' || k.status FROM project p JOIN api_key k ON k.id = p.id WHERE p.id = 'voice-system'")" = "archived:true:revoked"
 test "$(q "SELECT count(*) FROM api_key WHERE internal AND id LIKE '%-system'")" = 2
 echo "where anything was recorded under it, it stays, archived, its key revoked"

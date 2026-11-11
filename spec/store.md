@@ -1207,3 +1207,15 @@ retired_keys as (
 )
 delete from project p where p.id in (select id from retired);
 ```
+
+### Migration 35: the name a request in flight asked for its model by
+
+A request in flight keeps the name it asked for its model by, when that is
+a name its project gives one (`alias`), beside the catalog model it is
+routed as (`model`), so the `request` event tells both as its usage record
+will (`requested_model`, `resolved_model`). A row from before, or a request
+that named a model itself, has none.
+
+```sql
+alter table in_flight add column alias text not null default '';
+```

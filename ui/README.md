@@ -97,11 +97,12 @@ repository, project and other context light alongside execution. Requests
 without a serving seat do not acquire downstream execution arrows. Metadata beyond repository
 becomes labeled context automatically, without pretending it is infrastructure.
 
-The labeled homelab-inspired demo runs seven projects over three repository labels,
-24 illustrative model aliases, and claude-personal, claude-work, openai, agy, vibe
-plus local accounts. h1/h2 carry the CLI accounts and small local models; Macs
-carry MLX model tiers shaped by the 64/128/256/512 GB homelab profiles. These
-are illustrative serving alternatives, not simultaneous loaded-weight claims.
+The labeled demo fleet runs seven projects over three repository labels,
+illustrative model aliases, and claude-personal, claude-work, openai, agy, vibe
+plus local accounts. host-2 and host-4 carry the CLI accounts and small local
+models; host-1, host-3, host-5 and host-6 carry MLX model tiers of 64 to 512 GB;
+gpu-a and gpu-b, cabled, serve one model placed across both. These are
+illustrative serving alternatives, not simultaneous loaded-weight claims.
 Three staggered workers simulate up to three distinct projects
 in flight. Their colored paths stay lit until completion; occupancy is derived
 from those same requests. In-flight records appear separately from completed usage.

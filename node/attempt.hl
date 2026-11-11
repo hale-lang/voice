@@ -759,16 +759,34 @@ locus AttemptRun {
     /// One of voice's own lines in the transcript.
     fn note(text: String) { self.add(event_line("note", text)); }
 
-    /// `POST /node/v1/attempts/{id}/report`: the events waiting, and the
-    /// fields given; a cancel in the answer stops the attempt.
+    /// Report the attempt: every event waiting, and the fields given; a
+    /// cancel in an answer stops the attempt. True when the api took it all.
     @unbounded
     fn report_now(state: String, base_sha: String, head_sha: String, extra: String) -> Bool {
         self.reported_ns = std::time::monotonic_ns();
-        let held = self.pending;
-        let held_n = self.pending_n;
-        let events = std::str::replace(std::str::trim(held), "\n", ", ");
-        self.pending = "";
-        self.pending_n = 0;
+        // what waits goes `REPORT_EVENTS` at a time, each taken before the
+        // next is sent, the fields and the end with the last
+        while self.pending_n > REPORT_EVENTS {
+            if !self.send_report("", "", "", "") { return false; }
+        }
+        return self.send_report(state, base_sha, head_sha, extra);
+    }
+
+    /// `POST /node/v1/attempts/{id}/report` with the first `REPORT_EVENTS`
+    /// events waiting and the fields given; true when the api took it.
+    /// Events it did not take wait for the next, in order.
+    @unbounded
+    fn send_report(state: String, base_sha: String, head_sha: String, extra: String) -> Bool {
+        let mut cut = 0;
+        let mut taken = 0;
+        let v = std::str::bytes_view(self.pending);
+        while cut < v.n && taken < REPORT_EVENTS {
+            if std::str::byte_at(v, cut) == 10 { taken = taken + 1; }
+            cut = cut + 1;
+        }
+        let sent = self.pending[0..cut];
+        let rest = self.pending[cut..len(self.pending)];
+        let events = std::str::replace(std::str::trim(sent), "\n", ", ");
         let body = "{\"phase\": " + q(self.phase) + ", \"harness\": "
             + q(harness::text_of(self.a.definition, "id")) + ", \"events\": [" + events + "]"
             + (if len(state) > 0 { ", \"state\": " + q(state) } else { "" })
@@ -783,12 +801,9 @@ locus AttemptRun {
             + to_string((std::time::monotonic_ns() - self.started_ns) / 1000000)
             + extra + "}";
         let resp = self.call("POST", "/node/v1/attempts/" + self.a.id + "/report", body);
-        if resp.status != 200 {
-            // not taken: its events go with the next report, in order
-            self.pending = held + self.pending;
-            self.pending_n = held_n + self.pending_n;
-            return false;
-        }
+        if resp.status != 200 { return false; }
+        self.pending = rest;
+        self.pending_n = self.pending_n - taken;
         if std::json::find_bool_field(std::str::from_bytes(resp.body), "cancel") {
             if len(self.stop) == 0 && len(state) == 0 {
                 self.cancelled = true;

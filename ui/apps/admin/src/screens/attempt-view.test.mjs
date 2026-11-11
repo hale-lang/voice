@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { attemptEnded, attemptTone, parseTranscript, shortSha, wall } from './attempt-view.ts';
+import { FAILURE_WORDS, attemptEnded, attemptLabel, attemptTone, parseTranscript, shortSha, wall } from './attempt-view.ts';
 
 test('a state as the screen shows it', () => {
   assert.equal(attemptTone('done'), 'ok');
@@ -10,6 +10,15 @@ test('a state as the screen shows it', () => {
   assert.equal(attemptTone('cancelled'), 'quiet');
   assert.equal(attemptEnded('cancelled'), true);
   assert.equal(attemptEnded('running'), false);
+});
+
+test('a label: the phase while it runs, why once it failed', () => {
+  assert.equal(attemptLabel({ state: 'running', phase: 'fetching', failure_kind: null }), 'running · fetching');
+  assert.equal(attemptLabel({ state: 'failed', phase: null, failure_kind: 'over_budget' }), 'failed · over its budget');
+  assert.equal(attemptLabel({ state: 'failed', phase: null, failure_kind: 'node_lost' }), 'failed · node lost');
+  assert.equal(attemptLabel({ state: 'failed', phase: null, failure_kind: null }), 'failed');
+  assert.equal(attemptLabel({ state: 'done', phase: null, failure_kind: null }), 'done');
+  assert.equal(Object.keys(FAILURE_WORDS).length, 11, 'a word for every kind the contract names');
 });
 
 test('a transcript, a line an event; a line cut short is passed over', () => {

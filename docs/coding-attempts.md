@@ -114,6 +114,15 @@ once the attempt ended. Its usage is one record in the ledger under the
 attempt's id, against the seat's account, the attempt its conversation
 (`endpoint: attempt`), which the Attempts screen links to in Usage.
 
+`done`, `failed` and `cancelled` are an attempt's end, and it never leaves
+one: its evidence is final then, and the bundle is the result only after
+`done`. A failed attempt names why twice: `failure`, in words, and
+`failure_kind`, one of a fixed set a program maps onto its own disposition
+(`over_budget`, `past_deadline`, `harness_failed`, `no_changes`,
+`repo_unavailable`, `login_unavailable`, `sandbox_failed`,
+`bundle_too_large`, `node_lost`, `key_revoked`, `internal`; the contract's
+`AttemptFailureKind` says what each means).
+
 ## The run
 
 The node asks the api for an attempt when it has a free slot

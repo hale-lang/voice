@@ -1835,7 +1835,8 @@ fn report(events: Int, state: String) -> st::AttemptReport {
 
 /// Coding attempts (attempts.hl): queued, started on a seat no further
 /// than its concurrency, reported with a transcript kept bounded, ended,
-/// cancelled and failed, and a bundle held and let go.
+/// cancelled and failed (a failure with its kind, an end that is none
+/// without one), and a bundle held and let go.
 fn attempts(s: st::Store, label: String) {
     let now = t("2026-10-17T12:00:00Z");
     std::test::assert(
@@ -1933,8 +1934,9 @@ fn attempts(s: st::Store, label: String) {
         ended.state == "done"
             && ended.has_ended
             && ended.tokens_reported
-            && ended.input_tokens == 7,
-        label + ": ended with its usage",
+            && ended.input_tokens == 7
+            && ended.failure_kind == "",
+        label + ": ended with its usage, no failure",
     );
     let after_end = s.report_attempt("att_1", "node-a", report(1, ""), now) or st::AttemptRow { };
     std::test::assert_eq_int(after_end.events, 2101, label + ": nothing written once it ended");
@@ -1961,24 +1963,69 @@ fn attempts(s: st::Store, label: String) {
 
     // cancels, and a node's attempts failed
     let c = s.cancel_attempt("att_3", now) or st::AttemptRow { };
-    std::test::assert_eq_str(c.state, "cancelled", label + ": a queued one ends at once");
+    std::test::assert(
+        c.state == "cancelled" && c.failure_kind == "",
+        label + ": a queued one ends at once, no failure",
+    );
     s.start_attempt("att_2", "node-a", "coder", "acct", "fake", 1, now) or discard;
     let asked = s.cancel_attempt("att_2", now) or st::AttemptRow { };
     std::test::assert(
         asked.state == "running" && asked.cancel,
         label + ": a running one is asked to stop",
     );
-    let lost = s.fail_running("node-a", now, "its node restarted", now) or st::AttemptRows { };
+    let lost = s.fail_running(
+        "node-a",
+        now,
+        "its node restarted",
+        "node_lost",
+        now,
+    ) or st::AttemptRows { };
     std::test::assert_eq_int(len_rows(lost), 1, label + ": the node's running attempt");
     let gone = s.attempt("att_2") or st::AttemptRow { };
     std::test::assert(
-        gone.state == "failed" && gone.failure == "its node restarted",
-        label + ": failed, and why",
+        gone.state == "failed"
+            && gone.failure == "its node restarted"
+            && gone.failure_kind == "node_lost",
+        label + ": failed, why, and its kind",
     );
-    std::test::assert_eq_str(
-        (s.end_attempt("att_2", "done", "", now) or st::AttemptRow { }).state,
-        "failed",
+    let again = s.end_attempt("att_2", "done", "", "", now) or st::AttemptRow { };
+    std::test::assert(
+        again.state == "failed" && again.failure_kind == "node_lost",
         label + ": an end is final",
+    );
+
+    // a failure's kind, as the api ends one and as a node reports one
+    s.insert_attempt(attempt_row("att_4", "work", now)) or discard;
+    let late = s.end_attempt(
+        "att_4",
+        "failed",
+        "its deadline passed",
+        "past_deadline",
+        now,
+    ) or st::AttemptRow { };
+    std::test::assert_eq_str(late.failure_kind, "past_deadline", label + ": ended with its kind");
+    std::test::assert_eq_str(
+        (s.attempt("att_4") or st::AttemptRow { }).failure_kind,
+        "past_deadline",
+        label + ": and read back",
+    );
+    s.insert_attempt(attempt_row("att_5", "work", now)) or discard;
+    s.start_attempt("att_5", "node-a", "coder", "acct", "fake", 1, now) or discard;
+    let mut over = report(0, "failed");
+    over.failure = "over its budget";
+    over.failure_kind = "over_budget";
+    s.report_attempt("att_5", "node-a", over, now) or discard;
+    let reported = s.attempt("att_5") or st::AttemptRow { };
+    std::test::assert(
+        reported.state == "failed" && reported.failure_kind == "over_budget",
+        label + ": a node's failed end, with its kind",
+    );
+    std::test::assert(
+        st::failure_kind_known("over_budget") && st::failure_kind_known("internal")
+            && !st::failure_kind_known("bored")
+            && !st::failure_kind_known("")
+            && !st::failure_kind_known("internal\nnode_lost"),
+        label + ": the kinds voice names, and no other",
     );
 }
 

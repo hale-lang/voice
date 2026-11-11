@@ -300,6 +300,44 @@ type Ran {
     err: String = "";
     // it was stopped: cancelled, past its deadline or limit, or the node stopping
     stopped: Bool = false;
+    // it never started
+    unstarted: Bool = false;
+}
+
+/// Why an attempt failed (its `failure`), and the kind of failure that is
+/// (`CodingAttempt.failure_kind`); "" for both when it did not.
+type Failure { why: String = ""; kind: String = ""; }
+
+/// The kind of failure of a container's run `r` that exited non-zero:
+/// docker's own (it never started, or docker answered 125) is the
+/// sandbox's, anything else what ran in it.
+fn exit_kind(r: Ran) -> String {
+    return if r.unstarted || r.code == 125 { "sandbox_failed" } else { "harness_failed" };
+}
+
+/// How the harness's run `ran` ended the attempt, once its work was taken:
+/// its stop (`stop`) when one cut it short, else its exit, a failure it
+/// reported (`reported`), a failure to commit what it left (`commit`), or
+/// no change at all; no failure when it ran to its end and changed the
+/// branch.
+fn run_failure(
+    ran: Ran,
+    stop: Failure,
+    reported: String,
+    commit: Failure,
+    changed: Bool
+) -> Failure {
+    if ran.stopped || len(stop.why) > 0 { return stop; }
+    if ran.code != 0 {
+        return Failure {
+            why: "the harness exited with code " + to_string(ran.code) + tail_of(ran.err),
+            kind: exit_kind(ran),
+        };
+    }
+    if len(reported) > 0 { return Failure { why: reported, kind: "harness_failed" }; }
+    if len(commit.why) > 0 { return commit; }
+    if !changed { return Failure { why: "the harness made no change", kind: "no_changes" }; }
+    return Failure { };
 }
 
 /// A slot attempts run on, one at a time, each in an `AttemptRun` of its
@@ -366,8 +404,10 @@ locus AttemptRun {
         pending: String = "";
         pending_n: Int = 0;
         reported_ns: Int = 0;
-        // why it stops early, "" while it runs
+        // why it stops early, "" while it runs, and the kind of failure
+        // that is
         stop: String = "";
+        stop_kind: String = "";
         // whether the stop was a cancel
         cancelled: Bool = false;
         reader: HarnessReader = HarnessReader { };
@@ -387,7 +427,9 @@ locus AttemptRun {
             fields2(std::log::kv("attempt", self.a.id), std::log::kv("seat", self.a.seat)),
         );
         if len(self.a.problem) > 0 || !attempt_id(self.a.id) {
-            if attempt_id(self.a.id) { self.finish("failed", self.a.problem, "", "", ""); }
+            if attempt_id(self.a.id) {
+                self.finish("failed", self.a.problem, "internal", "", "", "");
+            }
             return self.a.id;
         }
         let def = harness::harness_def(self.a.definition);
@@ -410,9 +452,9 @@ locus AttemptRun {
                 + "/egress\n" + self.dir + "/secret\n" + self.dir + "/home",
         );
         if !std::io::fs::file_exists(self.dir + "/secret") {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "the attempt's directory could not be made" + made,
+                "internal",
                 "",
                 "",
                 "",
@@ -424,9 +466,9 @@ locus AttemptRun {
         let push = self.dir + "/push.git";
         let init = self.git("init\n--bare\n-q\n" + push, 60, slot);
         if init.code != 0 {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "git could not start a repository: " + clip(init.err),
+                "internal",
                 "",
                 "",
                 "",
@@ -439,9 +481,9 @@ locus AttemptRun {
         );
         if self.stopping(slot) { return self.stopped("", ""); }
         if fetched.code != 0 {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "the repository could not be fetched at " + self.a.base + ": " + clip(fetched.err),
+                "repo_unavailable",
                 "",
                 "",
                 "",
@@ -451,7 +493,7 @@ locus AttemptRun {
             self.git("--git-dir\n" + push + "\nrev-parse\nFETCH_HEAD^{commit}", 60, slot).out,
         );
         if len(base_sha) < 40 {
-            return self.finish("failed", "the base is not a commit", "", "", "");
+            return self.failed("the base is not a commit", "repo_unavailable", "", "", "");
         }
         self.git(
             "--git-dir\n" + push + "\nupdate-ref\nrefs/heads/" + self.a.branch + "\n" + base_sha,
@@ -465,9 +507,9 @@ locus AttemptRun {
             slot,
         );
         if cloned.code != 0 {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "the workspace could not be made: " + clip(cloned.err),
+                "internal",
                 base_sha,
                 "",
                 "",
@@ -485,16 +527,16 @@ locus AttemptRun {
             def.install,
         );
         let built = self.ensure_image(image, def.base, def.install, slot);
-        if len(built) > 0 { return self.finish("failed", built, base_sha, "", ""); }
+        if len(built) > 0 { return self.failed(built, "sandbox_failed", base_sha, "", ""); }
         let proxy = image_tag("voice-egress", EGRESS_BASE, EGRESS_INSTALL);
         let pbuilt = self.ensure_image(proxy, EGRESS_BASE, EGRESS_INSTALL, slot);
-        if len(pbuilt) > 0 { return self.finish("failed", pbuilt, base_sha, "", ""); }
+        if len(pbuilt) > 0 { return self.failed(pbuilt, "sandbox_failed", base_sha, "", ""); }
         if self.stopping(slot) { return self.stopped(base_sha, ""); }
         let egress = self.start_egress(proxy, slot);
-        if len(egress) > 0 { return self.finish("failed", egress, base_sha, "", ""); }
+        if len(egress) > 0 { return self.failed(egress, "sandbox_failed", base_sha, "", ""); }
         // 3. the harness
         let login = self.login_ready(def);
-        if len(login) > 0 { return self.finish("failed", login, base_sha, "", ""); }
+        if len(login) > 0 { return self.failed(login, "login_unavailable", base_sha, "", ""); }
         std::io::fs::write_file(
             self.dir + "/voice/instruction.md",
             instruction_of(def, self.a),
@@ -505,18 +547,18 @@ locus AttemptRun {
         if def.login_kind == "env" {
             let c = std::secret::Credential { vault: self.a.login };
             if !c.ready() {
-                return self.finish(
-                    "failed",
+                return self.failed(
                     "the node's vault holds no login " + self.a.login + " for this seat",
+                    "login_unavailable",
                     base_sha,
                     "",
                     "",
                 );
             }
             if !c.write_private(self.dir + "/secret/login") {
-                return self.finish(
-                    "failed",
+                return self.failed(
                     "the login could not be written privately for the harness",
+                    "login_unavailable",
                     base_sha,
                     "",
                     "",
@@ -549,6 +591,7 @@ locus AttemptRun {
             self.stop = "the harness used more than its budget of "
                 + to_string(self.a.budget_tokens)
                 + " tokens";
+            self.stop_kind = "over_budget";
         }
         // 4. what it left uncommitted, committed as the caller
         self.phase = "committing";
@@ -566,9 +609,9 @@ locus AttemptRun {
             slot,
         );
         if taken.code != 0 {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "the workspace's commits could not be taken: " + clip(taken.err),
+                "harness_failed",
                 base_sha,
                 "",
                 summary,
@@ -583,9 +626,9 @@ locus AttemptRun {
             slot,
         );
         if ancestor.code != 0 {
-            return self.finish(
-                "failed",
+            return self.failed(
                 "the harness's commits do not build on the base",
+                "harness_failed",
                 base_sha,
                 "",
                 summary,
@@ -596,26 +639,23 @@ locus AttemptRun {
             60,
             slot,
         );
-        let why = if ran.stopped || len(self.stop) > 0 {
-            self.stop
-        } else if ran.code != 0 {
-            "the harness exited with code " + to_string(ran.code) + tail_of(ran.err)
-        } else if len(self.reader.failure) > 0 {
-            self.reader.failure
-        } else if len(commit) > 0 {
-            commit
-        } else if head == base_sha {
-            "the harness made no change"
-        } else {
-            ""
-        };
+        let end = run_failure(
+            ran,
+            Failure { why: self.stop, kind: self.stop_kind },
+            self.reader.failure,
+            commit,
+            head != base_sha,
+        );
         if head != base_sha {
             let bundled = self.bundle(push, base_sha, slot);
-            if len(bundled) > 0 { return self.finish("failed", bundled, base_sha, head, summary); }
+            if len(bundled.why) > 0 {
+                return self.failed(bundled.why, bundled.kind, base_sha, head, summary);
+            }
         }
         return self.finish(
-            if len(why) > 0 { "failed" } else { "done" },
-            why,
+            if len(end.why) > 0 { "failed" } else { "done" },
+            end.why,
+            end.kind,
             base_sha,
             head,
             summary,
@@ -638,7 +678,7 @@ locus AttemptRun {
     @unbounded
     fn exec(argv: String, input: String, timeout_s: Int, env: String, slot: Attempter) -> Ran {
         let child = std::process::spawn_with(argv, std::process::SpawnOptions { env: env }) or {
-            return Ran { code: 127, err: "could not start " + first_line(argv) };
+            return Ran { code: 127, err: "could not start " + first_line(argv), unstarted: true };
         };
         if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
         std::process::close_stdin(child);
@@ -671,7 +711,7 @@ locus AttemptRun {
     @unbounded
     fn harness_run(argv: String, input: String, idle_s: Int, slot: Attempter) -> Ran {
         let child = std::process::spawn_with(argv, std::process::SpawnOptions { }) or {
-            return Ran { code: 127, err: "docker could not be started" };
+            return Ran { code: 127, err: "docker could not be started", unstarted: true };
         };
         if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
         std::process::close_stdin(child);
@@ -705,9 +745,11 @@ locus AttemptRun {
             {
                 self.stop = "the harness used more than its budget of "
                     + to_string(self.a.budget_tokens) + " tokens";
+                self.stop_kind = "over_budget";
             }
             if len(self.stop) == 0 && (std::time::monotonic_ns() - heard) / 1000000000 > idle_s {
                 self.stop = "the harness was silent for more than " + to_string(idle_s) + " s";
+                self.stop_kind = "harness_failed";
             }
             if self.stopping(slot) {
                 run_out("docker\nrm\n-f\n" + harness_name(self.a.id));
@@ -742,8 +784,10 @@ locus AttemptRun {
         if len(self.stop) > 0 { return true; }
         if slot.draining {
             self.stop = "the node stopped while it ran";
+            self.stop_kind = "node_lost";
         } else if std::time::unix(std::time::current()) >= self.a.deadline {
             self.stop = "it passed its deadline";
+            self.stop_kind = "past_deadline";
         }
         return len(self.stop) > 0;
     }
@@ -813,11 +857,12 @@ locus AttemptRun {
         return true;
     }
 
-    /// The attempt's end, reported (state, failure, commits, summary), and
-    /// told back as the outcome.
+    /// The attempt's end, reported (state, failure and its kind, commits,
+    /// summary), and told back as the outcome.
     fn finish(
         state: String,
         failure: String,
+        kind: String,
         base_sha: String,
         head_sha: String,
         summary: String
@@ -829,6 +874,7 @@ locus AttemptRun {
         // attempt made removed; past `FINAL_REPORT_S` the api has failed it
         // as lost
         let extra = (if len(failure) > 0 { ", \"failure\": " + q(failure) } else { "" })
+            + (if state == "failed" { ", \"failure_kind\": " + q(kind) } else { "" })
             + (if len(summary) > 0 { ", \"summary\": " + q(summary) } else { "" });
         let until = std::time::monotonic_ns() + FINAL_REPORT_S * 1000000000;
         let mut wait_ms = 1000;
@@ -848,8 +894,21 @@ locus AttemptRun {
 
     /// An attempt stopped before its harness's commits were taken.
     fn stopped(base_sha: String, head_sha: String) -> String {
-        if self.cancelled { return self.finish("cancelled", "", base_sha, head_sha, ""); }
-        return self.finish("failed", self.stop, base_sha, head_sha, "");
+        if self.cancelled { return self.finish("cancelled", "", "", base_sha, head_sha, ""); }
+        return self.finish("failed", self.stop, self.stop_kind, base_sha, head_sha, "");
+    }
+
+    /// A step failed, `why`, of kind `kind`: once the attempt was stopped
+    /// (the stop cuts every step after it short), it ends as its stop.
+    fn failed(
+        why: String,
+        kind: String,
+        base_sha: String,
+        head_sha: String,
+        summary: String
+    ) -> String {
+        if len(self.stop) > 0 { return self.stopped(base_sha, head_sha); }
+        return self.finish("failed", why, kind, base_sha, head_sha, summary);
     }
 
     /// The image `tag`, built from `base` with `install` when the node has
@@ -874,7 +933,7 @@ locus AttemptRun {
             slot,
         );
         if b.code != 0 {
-            return if b.stopped {
+            return if b.stopped && len(self.stop) > 0 {
                 self.stop
             } else {
                 "the image " + tag + " could not be built: " + clip(b.err)
@@ -999,8 +1058,9 @@ locus AttemptRun {
     }
 
     /// Commit what the harness left in the workspace, as the caller, in a
-    /// container with no network: "" when it went, or there was nothing.
-    fn commit_left(image: String, user: String, slot: Attempter) -> String {
+    /// container with no network: no failure when it went, or there was
+    /// nothing.
+    fn commit_left(image: String, user: String, slot: Attempter) -> Failure {
         let r = self.exec(
             "docker\nrun\n--rm\n--name\n" + commit_name(self.a.id) + "\n--label\n" + OWNER_LABEL
                 + "="
@@ -1020,14 +1080,21 @@ locus AttemptRun {
             "",
             slot,
         );
-        if r.stopped { return self.stop; }
-        if r.code != 0 { return "what the harness left could not be committed: " + clip(r.err); }
-        return "";
+        if r.stopped && len(self.stop) > 0 {
+            return Failure { why: self.stop, kind: self.stop_kind };
+        }
+        if r.code != 0 {
+            return Failure {
+                why: "what the harness left could not be committed: " + clip(r.err),
+                kind: exit_kind(r),
+            };
+        }
+        return Failure { };
     }
 
     /// The branch's commits from `base_sha`, as a bundle the api holds
-    /// for the caller: "" when it is held, else why not.
-    fn bundle(push: String, base_sha: String, slot: Attempter) -> String {
+    /// for the caller: no failure when it is held.
+    fn bundle(push: String, base_sha: String, slot: Attempter) -> Failure {
         let file = self.dir + "/attempt.bundle";
         let b = self.git(
             "--git-dir\n" + push + "\nbundle\ncreate\n-q\n" + file + "\n" + base_sha
@@ -1035,11 +1102,21 @@ locus AttemptRun {
             600,
             slot,
         );
-        if b.code != 0 { return "the commits could not be bundled: " + clip(b.err); }
+        if b.code != 0 {
+            return Failure {
+                why: "the commits could not be bundled: " + clip(b.err),
+                kind: "internal",
+            };
+        }
         let bytes = std::io::fs::read_bytes(file) or b"";
-        if len(bytes) == 0 { return "the bundle could not be read"; }
+        if len(bytes) == 0 {
+            return Failure { why: "the bundle could not be read", kind: "internal" };
+        }
         if len(bytes) > 6291456 {
-            return "the commits' bundle is over 6 MiB, the most voice holds";
+            return Failure {
+                why: "the commits' bundle is over 6 MiB, the most voice holds",
+                kind: "bundle_too_large",
+            };
         }
         let body = "{\"bytes\": " + to_string(len(bytes)) + ", \"bundle\": \""
             + std::text::base64::encode(bytes) + "\"}";
@@ -1053,10 +1130,13 @@ locus AttemptRun {
             resp = self.call("PUT", "/node/v1/attempts/" + self.a.id + "/bundle", body);
         }
         if resp.status != 204 {
-            return "the api did not take the bundle (" + to_string(resp.status) + ")";
+            return Failure {
+                why: "the api did not take the bundle (" + to_string(resp.status) + ")",
+                kind: "internal",
+            };
         }
         self.note("bundled the commits from " + base_sha[0..12]);
-        return "";
+        return Failure { };
     }
 
     /// Everything the attempt made, removed: its containers (the harness's

@@ -1,0 +1,229 @@
+// An attempt's failure, as the node reports it (attempt.hl): each way an
+// attempt fails names its kind (`CodingAttempt.failure_kind`) beside its
+// text. How the harness's run ends one is read on its own (`run_failure`):
+// its stop, its exit (docker's own a sandbox's), a failure it reported, a
+// failure to commit what it left, or no change at all. Then attempts of the
+// fake harness (scripts/e2e-harnesses/fake.json) run against an api in
+// process, which keeps each one's end: a start the node cannot run is
+// voice's own failure, a repository that cannot be fetched (nothing
+// listens where it is) is the repository's, and a deadline passed is the
+// deadline's, whatever step it cut short. The last two fetch with git, so
+// a machine with none (the image's build) runs only the first. None of
+// these reach docker.
+import ".." as node;
+
+fn path(rel: String) -> String {
+    return if std::io::fs::file_exists(rel) { rel } else { "../" + rel };
+}
+
+/// An attempt's start, as the api answers a claim: attempt `id` of the
+/// fake harness on `repo`, due by `deadline` (Unix seconds).
+fn start(id: String, repo: String, deadline: Int, problem: Bool) -> String {
+    let def = std::str::trim(
+        std::io::fs::read_file(path("scripts/e2e-harnesses/fake.json")) or "",
+    );
+    return "{\"attempt\": {\"id\": " + node::q(id) + ", \"seat\": \"coder\", \"repo\": "
+        + node::q(repo) + ", \"base\": \"main\", \"branch\": "
+        + node::q(if problem { "elsewhere" } else { "voice/attempt-" + id })
+        + ", \"instruction\": \"add a test\", \"model\": \"\", \"login\": \"fake-login\", \"budget_tokens\": 0, \"deadline\": "
+        + to_string(deadline)
+        + ", \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}, \"egress\": [\"example.com\"], \"harness\": "
+        + def + "}}";
+}
+
+/// The node plane, as far as an attempt's reports: each taken, the attempt
+/// still to run, and its end kept in `<ends>/<id>`. Anything else is 404.
+locus Plane {
+    params { ends: String = ""; }
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let pre = "/node/v1/attempts/";
+        if req.method == "POST" && std::str::starts_with(req.path, pre)
+            && std::str::ends_with(req.path, "/report")
+        {
+            let id = req.path[len(pre)..(len(req.path) - len("/report"))];
+            if len(std::json::find_string_field(req.body, "state")) > 0 {
+                std::io::fs::write_file(self.ends + "/" + id, req.body) or discard;
+            }
+            return std::http::Response {
+                status: 200,
+                body: "{\"cancel\": false, \"state\": \"running\"}",
+            };
+        }
+        return std::http::Response { status: 404, body: "no" };
+    }
+}
+
+fn fails(code: Int) -> node::Ran { return node::Ran { code: code, err: "boom" }; }
+
+main locus App {
+    params {
+        data: String = "/tmp/voice-attempt-failure-test-" + to_string(std::process::pid());
+        srv: std::http::Server = std::http::Server {
+            port: 0,
+            handler: Plane { ends: self.data + "/ends" },
+        };
+        slot: node::Attempter = node::Attempter { };
+    }
+    placement {
+        srv: cooperative(pool = io) where async_io;
+        slot: pinned;
+    }
+
+    /// Run attempt `id` from `start` to its end; the end it reported.
+    fn run_one(id: String, start: String, api: String) -> String {
+        let r = node::AttemptRun { node: "node-a", data: self.data, api: api, token: "vn-test" };
+        r.go(start, self.slot);
+        return std::io::fs::read_file(self.data + "/ends/" + id) or "";
+    }
+
+    run() {
+        // how the harness's run ends an attempt
+        let none = node::Failure { };
+        let ok = node::Ran { code: 0 };
+        let stop = node::Failure { why: "it passed its deadline", kind: "past_deadline" };
+        let stopped = node::run_failure(
+            node::Ran { code: -1, stopped: true },
+            stop,
+            "",
+            none,
+            true,
+        );
+        std::test::assert_eq_str(stopped.kind, "past_deadline", "a stop is the stop's");
+        std::test::assert_eq_str(
+            node::run_failure(
+                ok,
+                node::Failure { why: "over", kind: "over_budget" },
+                "",
+                none,
+                true,
+            ).kind,
+            "over_budget",
+            "a limit passed as the harness ended is the limit's",
+        );
+        let exited = node::run_failure(fails(2), none, "", none, true);
+        std::test::assert(
+            exited.kind == "harness_failed"
+                && std::str::starts_with(exited.why, "the harness exited with code 2: boom"),
+            "an exit is the harness's: " + exited.why,
+        );
+        std::test::assert_eq_str(
+            node::run_failure(fails(125), none, "", none, true).kind,
+            "sandbox_failed",
+            "docker's own exit is the sandbox's",
+        );
+        std::test::assert_eq_str(
+            node::run_failure(
+                node::Ran { code: 127, err: "docker could not be started", unstarted: true },
+                none,
+                "",
+                none,
+                true,
+            ).kind,
+            "sandbox_failed",
+            "a container that never started is the sandbox's",
+        );
+        std::test::assert_eq_str(
+            node::run_failure(ok, none, "the model refused", none, true).kind,
+            "harness_failed",
+            "a failure the harness reported is the harness's",
+        );
+        std::test::assert_eq_str(
+            node::run_failure(
+                ok,
+                none,
+                "",
+                node::Failure {
+                    why: "what the harness left could not be committed",
+                    kind: "harness_failed",
+                },
+                true,
+            ).why,
+            "what the harness left could not be committed",
+            "a failure to commit what it left",
+        );
+        let unchanged = node::run_failure(ok, none, "", none, false);
+        std::test::assert(
+            unchanged.kind == "no_changes" && unchanged.why == "the harness made no change",
+            "no change is a failure of its own",
+        );
+        let fine = node::run_failure(ok, none, "", none, true);
+        std::test::assert(len(fine.why) == 0 && len(fine.kind) == 0, "a change, and no failure");
+        std::test::assert_eq_str(node::exit_kind(fails(1)), "harness_failed", "an exit");
+        std::test::assert_eq_str(node::exit_kind(fails(125)), "sandbox_failed", "docker's");
+
+        // attempts run against the api in process
+        std::io::fs::mkdir(self.data) or discard;
+        std::io::fs::mkdir(self.data + "/ends") or discard;
+        let api = "http://127.0.0.1:" + to_string(std::io::tcp::__local_port(self.srv.listen_fd));
+        let later = std::time::unix(std::time::current()) + 3600;
+
+        let odd = self.run_one(
+            "att_0000problem",
+            start("att_0000problem", "http://127.0.0.1:1/r.git", later, true),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(odd, "state"),
+            "failed",
+            "a start the node cannot run fails: " + odd,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(odd, "failure_kind"),
+            "internal",
+            "as voice's own",
+        );
+
+        // the rest fetch with git, which a machine with none (the image's
+        // build) fails as voice's own
+        let git = std::process::run("git\n--version") or std::process::ProcessOutput {
+            code: 127,
+            signal: 0,
+            stdout: "",
+            stderr: "",
+        };
+        if git.code != 0 {
+            node::run_out("rm\n-rf\n" + self.data);
+            return;
+        }
+        let gone = self.run_one(
+            "att_0000norepo",
+            start("att_0000norepo", "http://127.0.0.1:1/r.git", later, false),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(gone, "failure_kind"),
+            "repo_unavailable",
+            "a repository that cannot be fetched is the repository's: " + gone,
+        );
+        std::test::assert(
+            std::str::starts_with(
+                std::json::find_string_field(gone, "failure"),
+                "the repository could not be fetched at main",
+            ),
+            "and says so",
+        );
+
+        let late = self.run_one(
+            "att_0000late",
+            start("att_0000late", "http://127.0.0.1:1/r.git", 1, false),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(late, "failure_kind"),
+            "past_deadline",
+            "a deadline passed is the deadline's: " + late,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(late, "failure"),
+            "it passed its deadline",
+            "whatever step it cut short",
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(self.data + "/attempts/att_0000late"),
+            "nothing of it left",
+        );
+        node::run_out("rm\n-rf\n" + self.data);
+    }
+}
+
+fn main() { App { }; }

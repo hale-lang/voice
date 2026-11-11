@@ -147,7 +147,8 @@ fn attempt_json(a: st::AttemptRow) -> String {
         + jstring_or_null(len(a.base_sha) > 0, a.base_sha) + ", \"head_sha\": "
         + jstring_or_null(len(a.head_sha) > 0, a.head_sha) + ", \"summary\": "
         + jstring_or_null(len(a.summary) > 0, a.summary) + ", \"failure\": "
-        + jstring_or_null(len(a.failure) > 0, a.failure) + ", \"served\": "
+        + jstring_or_null(len(a.failure) > 0, a.failure) + ", \"failure_kind\": "
+        + jstring_or_null(a.state == "failed", failure_kind_of(a)) + ", \"served\": "
         + (
             if a.has_started {
                 "{\"node\": " + jq(a.node) + ", \"seat\": " + jq(a.seat) + ", \"account\": "
@@ -177,6 +178,12 @@ fn attempt_json(a: st::AttemptRow) -> String {
         ) + ", \"created_at\": " + jtime(a.created_at) + ", \"started_at\": "
         + jtime_or_null(a.has_started, a.started_at) + ", \"ended_at\": "
         + jtime_or_null(a.has_ended, a.ended_at) + "}";
+}
+
+/// The kind of failed attempt `a`'s failure: `internal` when it names none
+/// voice knows.
+fn failure_kind_of(a: st::AttemptRow) -> String {
+    return if st::failure_kind_known(a.failure_kind) { a.failure_kind } else { "internal" };
 }
 
 /// One transcript event, as `CodingAttemptEvent`: the line a transcript
@@ -525,6 +532,7 @@ locus CodingAttempts {
             "",
             std::time::time_from_unix(std::time::unix(now) - ATTEMPT_LOST_S),
             "its node stopped reporting it",
+            "node_lost",
             now,
         ) or st::AttemptRows { };
         for a in lost.rows {
@@ -542,6 +550,7 @@ locus CodingAttempts {
             node,
             now_seconds(),
             "its node restarted while it ran",
+            "node_lost",
             now_seconds(),
         ) or st::AttemptRows { };
         for a in gone.rows {
@@ -575,6 +584,7 @@ locus CodingAttempts {
                         a.id,
                         "failed",
                         "its deadline passed before a seat took it",
+                        "past_deadline",
                         now,
                     ) or discard;
                     ended = ended + 1;
@@ -594,6 +604,7 @@ locus CodingAttempts {
                         a.id,
                         "failed",
                         "its project or key is no longer active",
+                        "key_revoked",
                         now,
                     ) or discard;
                     ended = ended + 1;
@@ -784,13 +795,22 @@ locus CodingAttempts {
 }
 
 /// A node's report (`AttemptReport` in the contract), checked: at most 500
-/// events, each a kind voice knows and at most 16 KiB of text.
+/// events, each a kind voice knows and at most 16 KiB of text, and a
+/// failed end's kind one voice knows (`internal` when it names none).
 @unbounded
 fn read_attempt_report(body: String) -> st::AttemptReport fallible(ApiError) {
     let state = optional_string(body, "state") or raise;
     if len(state) > 0 && !st::attempt_ended(state) {
         fail invalid("`state` is done, failed or cancelled, the attempt's end", "state");
     }
+    let mut kind = optional_string(body, "failure_kind") or raise;
+    if len(kind) > 0 && (state != "failed" || !st::failure_kind_known(kind)) {
+        fail invalid(
+            "`failure_kind` names why a failed end failed, one of CodingAttempt's",
+            "failure_kind",
+        );
+    }
+    if state == "failed" && len(kind) == 0 { kind = "internal"; }
     let mut r = st::AttemptReport {
         state: state,
         phase: optional_string(body, "phase") or raise,
@@ -799,6 +819,7 @@ fn read_attempt_report(body: String) -> st::AttemptReport fallible(ApiError) {
         head_sha: optional_string(body, "head_sha") or raise,
         summary: optional_string(body, "summary") or raise,
         failure: optional_string(body, "failure") or raise,
+        failure_kind: kind,
         wall_ms: std::json::find_int_field(body, "wall_ms"),
     };
     let usage = std::str::trim(std::json::find_field_raw(body, "usage"));

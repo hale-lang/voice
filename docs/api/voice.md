@@ -3925,6 +3925,7 @@ Schema: [AttemptReport](#schema-attemptreport)
 | `head_sha` | string |  |  |  |
 | `summary` | string |  |  |  |
 | `failure` | string |  |  |  |
+| `failure_kind` | [AttemptFailureKind](#schema-attemptfailurekind) |  | Why a `failed` end failed; only with `state` `failed`, and `internal` when left out. |  |
 | `usage` | object |  | As the harness's output reported it; left out when it reports none. |  |
 | `usage.input_tokens` | integer |  |  |  |
 | `usage.output_tokens` | integer |  |  |  |
@@ -5117,14 +5118,28 @@ cites: `branch`, `base_sha` and `head_sha` (the commits it made),
 `transcript_digest`; and how to fetch the result: `bundle` and
 `transcript`.
 
-`done`: the harness ran to its end and its work is committed on
-`branch`, `head_sha` past `base_sha`. `failed`: it did not, `failure`
-says why (the harness failed or changed nothing, its budget or
-deadline ran out, its node stopped); commits it made are in the
-bundle all the same. `cancelled`: it was stopped. When an attempt
-ends, its node removes its container and its workspace: what remains
-is this record, its bounded transcript, and its bundle until it is
-fetched or a day passes.
+Its `state`, of which `done`, `failed` and `cancelled` are terminal:
+an attempt that reaches one never leaves it.
+
+- `queued`: waiting for a harness seat with room; nothing has run.
+- `running`: a node has it (`served`, `phase`); every field but its
+  request may still change.
+- `done` (terminal): the harness ran to its end and its work is
+  committed on `branch`, `head_sha` past `base_sha`. Its `bundle` is
+  the result, fetched once.
+- `failed` (terminal): it did not; `failure_kind` says why for a
+  program, `failure` in words. Commits it made before it failed may
+  be in a `bundle` all the same, as evidence, not a result.
+- `cancelled` (terminal): a cancel stopped it.
+
+Once terminal, the evidence (`base_sha`, `head_sha`, `summary`,
+`failure`, `failure_kind`, `usage`, `wall_ms`, `served`,
+`ended_at`) is final, and so is `transcript_digest` once it is set,
+which is at the end or a moment after it; `bundle` turns `null` once
+it is fetched or a day passes, and nothing else changes. When an
+attempt ends, its node removes its container and its workspace: what
+remains is this record, its bounded transcript, and its bundle until
+it is fetched or a day passes.
 
 Type: object
 
@@ -5146,7 +5161,8 @@ Type: object
 | `base_sha` | string \| null |  | The commit `base` named when it was fetched. |  |
 | `head_sha` | string \| null |  | The branch's head once the harness's work was committed. |  |
 | `summary` | string \| null |  | The harness's final message, as its output gave it. |  |
-| `failure` | string \| null |  |  |  |
+| `failure` | string \| null |  | Why it failed, in words, for a person (a cancel before it started is noted here too); a program reads `failure_kind`. |  |
+| `failure_kind` | [AttemptFailureKind](#schema-attemptfailurekind) \| null |  | Why it failed, for a program; `null` unless `state` is `failed`. |  |
 | `served` | object \| null |  | Where it ran, once started. |  |
 | `served.node` | string | yes |  |  |
 | `served.seat` | string | yes |  |  |
@@ -5171,6 +5187,26 @@ Type: object
 | `created_at` | string (date-time) | yes |  |  |
 | `started_at` | string \| null (date-time) |  |  |  |
 | `ended_at` | string \| null (date-time) |  |  |  |
+
+<a id="schema-attemptfailurekind"></a>
+
+### AttemptFailureKind
+
+Why an attempt failed, one value for each way voice fails one:
+
+- `over_budget`: the harness's reported usage passed the attempt's `budget`, and it was stopped.
+- `past_deadline`: its `deadline` passed, while it waited for a seat or while it ran.
+- `harness_failed`: the harness failed: it exited non-zero, reported a failure, fell silent past its idle limit, or left a workspace whose commits voice cannot take onto the base.
+- `no_changes`: the harness ran to its end and changed nothing on the branch.
+- `repo_unavailable`: `repo` could not be fetched, or `base` named no commit in it.
+- `login_unavailable`: the seat's login for its harness is missing on its node, or could not be handed to the harness.
+- `sandbox_failed`: the attempt's container could not be made or run: no docker, an image that would not build, or its network or egress proxy that would not start.
+- `bundle_too_large`: its commits' bundle is over 6 MiB, the most voice holds.
+- `node_lost`: its node stopped reporting it, registered again, or stopped while it ran.
+- `key_revoked`: its key was revoked, or its project archived, before a seat took it.
+- `internal`: voice itself failed (a step of its own, such as bundling the commits or making the workspace).
+
+Type: string, one of `over_budget`, `past_deadline`, `harness_failed`, `no_changes`, `repo_unavailable`, `login_unavailable`, `sandbox_failed`, `bundle_too_large`, `node_lost`, `key_revoked`, `internal`
 
 <a id="schema-codingattemptlist"></a>
 
@@ -5300,6 +5336,7 @@ Type: object
 | `head_sha` | string |  |  |  |
 | `summary` | string |  |  |  |
 | `failure` | string |  |  |  |
+| `failure_kind` | [AttemptFailureKind](#schema-attemptfailurekind) |  | Why a `failed` end failed; only with `state` `failed`, and `internal` when left out. |  |
 | `usage` | object |  | As the harness's output reported it; left out when it reports none. |  |
 | `usage.input_tokens` | integer |  |  |  |
 | `usage.output_tokens` | integer |  |  |  |

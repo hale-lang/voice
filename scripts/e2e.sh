@@ -923,6 +923,13 @@ left_on_coder() {
   docker network ls -q --filter label=net.hale-lang.voice.attempt.node=coder
   ls -A "$work/coder-data/attempts"
 }
+# the node reports an attempt's end before it removes what the attempt
+# made (node/attempt.hl, `finish`): what is left once it ended, after the
+# node has had its time to remove it
+left_after_end() {
+  for i in $(seq 1 40); do [ -z "$(left_on_coder)" ] && return 0; sleep 0.5; done
+  left_on_coder
+}
 done_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"leave-uncommitted: add FAKE.md\", \"as\": {\"name\": \"E2E Author\", \"email\": \"e2e@example.com\"}}")
 until_ended "$done_id"
 curl -fsS "$api/v1/attempts/$done_id" -H "authorization: Bearer $key" >"$work/attempt.json"
@@ -937,6 +944,7 @@ a = json.load(open(sys.argv[1]))
 transcript = open(sys.argv[2], 'rb').read()
 base, head, author = sys.argv[3], sys.argv[4], sys.argv[5]
 assert a["state"] == "done", a
+assert a["failure_kind"] is None and a["failure"] is None, "done is no failure"
 assert a["base_sha"] == base, (a["base_sha"], base)
 assert a["head_sha"] == head, ("the bundle reproduces head_sha", a["head_sha"], head)
 assert author == "E2E Author <e2e@example.com>", author
@@ -947,15 +955,31 @@ assert a["usage"]["reported"] is False and a["usage"]["input_tokens"] is None, "
 PY
 curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage/$done_id" | python3 -c 'import json,sys; u=json.load(sys.stdin); assert u["endpoint"] == "attempt" and u["conversation"] == u["id"], u'
 [ "$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/attempts/$done_id/bundle" -H "authorization: Bearer $key")" = 404 ] || { echo "a bundle is fetched once"; exit 1; }
-[ -z "$(left_on_coder)" ] || { echo "an attempt left something on its node: $(left_on_coder)"; exit 1; }
+left=$(left_after_end); [ -z "$left" ] || { echo "an attempt left something on its node: $left"; exit 1; }
 echo "an attempt ran the fake harness: its bundle applies on its base and reproduces $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"][:12])' "$work/attempt.json"), committed as the caller; nothing is left on the node"
 slow_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"slow: add FAKE.md\"}")
 for i in $(seq 1 600); do curl -fsS "$api/v1/attempts/$slow_id/transcript" -H "authorization: Bearer $key" | grep -q 'taking my time' && break; sleep 0.5; done
 curl -fsS -X POST "$api/v1/attempts/$slow_id/cancel" -H "authorization: Bearer $key" >/dev/null
 until_ended "$slow_id"
 [ "$(attempt_state "$slow_id")" = cancelled ] || { echo "a cancelled attempt is cancelled"; exit 1; }
-[ -z "$(left_on_coder)" ] || { echo "a cancelled attempt left something on its node: $(left_on_coder)"; exit 1; }
+[ "$(curl -fsS "$api/v1/attempts/$slow_id" -H "authorization: Bearer $key" | field failure_kind)" = None ] || { echo "a cancel is no failure"; exit 1; }
+left=$(left_after_end); [ -z "$left" ] || { echo "a cancelled attempt left something on its node: $left"; exit 1; }
 echo "a running attempt is cancelled: its container is removed, and nothing is left on the node"
+# each way an attempt fails names its kind: a repository that cannot be
+# fetched, a harness that fails or changes nothing, and a deadline passed
+# while it runs
+failure_kind() { curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key" | field failure_kind; }
+failed_as() {
+  until_ended "$1"
+  [ "$(attempt_state "$1")" = failed ] && [ "$(failure_kind "$1")" = "$2" ] || { echo "attempt $1 is not failed as $2: $(curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key")"; exit 1; }
+  left=$(left_after_end); [ -z "$left" ] || { echo "a failed attempt left something on its node: $left"; exit 1; }
+}
+failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/missing.git\", \"base\": \"main\", \"instruction\": \"add FAKE.md\"}")" repo_unavailable
+failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"give-up: add FAKE.md\"}")" harness_failed
+failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"no-change: add FAKE.md\"}")" no_changes
+soon=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"slow: add FAKE.md\", \"deadline\": \"$soon\"}")" past_deadline
+echo "a failed attempt names its kind: repo_unavailable, harness_failed, no_changes and past_deadline, each as it happened"
 # a node that starts removes what its attempts left: a container and a
 # network with its label, and a workspace
 kill "$coder_pid"

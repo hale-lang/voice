@@ -3,6 +3,9 @@
  * transcript, kept apart from the screen so it is tested on its own.
  */
 import type { Tone } from '@hale/components';
+import type { Schemas } from '../api/client';
+
+type FailureKind = Schemas['AttemptFailureKind'];
 
 /** A state as the screen shows it. */
 export function attemptTone(state: string): Tone {
@@ -16,6 +19,27 @@ export function attemptTone(state: string): Tone {
 /** True once an attempt has ended: nothing of it changes after. */
 export function attemptEnded(state: string): boolean {
   return state === 'done' || state === 'failed' || state === 'cancelled';
+}
+
+/** Why an attempt failed (`failure_kind`), in a few words. */
+export const FAILURE_WORDS: Record<FailureKind, string> = {
+  over_budget: 'over its budget',
+  past_deadline: 'past its deadline',
+  harness_failed: 'the harness failed',
+  no_changes: 'no changes',
+  repo_unavailable: 'repository unavailable',
+  login_unavailable: 'login unavailable',
+  sandbox_failed: 'sandbox failed',
+  bundle_too_large: 'bundle too large',
+  node_lost: 'node lost',
+  key_revoked: 'key revoked',
+  internal: 'voice failed',
+};
+
+/** An attempt's state as a label: what its node is doing while it runs, why it failed once it failed. */
+export function attemptLabel(a: { state: string; phase?: string | null; failure_kind?: FailureKind | null }): string {
+  if (a.state === 'failed' && a.failure_kind) return `failed · ${FAILURE_WORDS[a.failure_kind] ?? a.failure_kind}`;
+  return a.phase ? `${a.state} · ${a.phase}` : a.state;
 }
 
 /** One transcript event (`CodingAttemptEvent`). */

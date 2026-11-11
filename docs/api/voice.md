@@ -4117,7 +4117,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `enabled` | boolean |  |  | default `true` |
-| `max_calls` | integer |  | The most fetches one request makes; then the model answers from them. | default `8`; ≥ 1; ≤ 32 |
+| `max_calls` | integer |  | The most hosted calls one request runs (each fetch, and each call that names no URL); then the model answers from what it has. | default `8`; ≥ 1; ≤ 32 |
 | `timeout_ms` | integer |  | A fetch's whole time, its redirects included. | default `15000`; ≥ 1000; ≤ 120000 |
 | `max_bytes` | integer |  | The most of a body a fetch reads; a larger one is an error the model is told. | default `2097152`; ≥ 1024; ≤ 16777216 |
 | `max_chars` | integer |  | The most characters of text the model is given; more is cut, `truncated` true. | default `40000`; ≥ 1000; ≤ 100000 |

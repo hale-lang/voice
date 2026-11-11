@@ -512,7 +512,9 @@ Responses:
 Authentication: operatorToken
 
 A project is the unit usage is tracked and budgeted by. The caller
-becomes an owner. Budget and limits may be set here or later.
+becomes an owner. Budget and limits may be set here or later. A
+project id is never reused (`409`), the retired `voice-system`'s
+included, on a store that no longer holds it too.
 
 Request body
 
@@ -4277,7 +4279,7 @@ Type: object
 | `peeks` | boolean |  | Whether its requests are recorded whole now (`listPeeks`): its own `peek`, else its parent's. |  |
 | `annotate` | boolean \| null |  | Its own setting; `null` when it follows its parent's. |  |
 | `annotates` | boolean |  | Whether its requests are annotated now (`getAnnotation`): its own `annotate`, else its parent's. |  |
-| `internal` | boolean |  | The retired `voice-system` project, where voice once made its own requests: archived, its key revoked, never a caller's. Each project's own system key makes them now (`Key.internal`). |  |
+| `internal` | boolean |  | The retired `voice-system` project, where voice once made its own requests: archived, its key revoked, never a caller's. Each project's own system key makes them now (`Key.internal`). A store holds it only where something was recorded under it; one made since has none. |  |
 | `aliases` | array of [ModelAlias](#schema-modelalias) |  | Its own model aliases. |  |
 | `resolved_aliases` | array of object |  | The aliases in force for it: its own, then its parent's it gives none of. `from` is the project each is set on. |  |
 | `resolved_aliases[].name` | string | yes |  |  |

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Button, Confirm, Secret, micros, when, ago } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Button, Confirm, Secret, Checkbox, micros, when, ago } from '@hale/components';
 import { useGet, type Project, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -10,6 +10,7 @@ import { LimitsEditor, limitsForWrite, type Limit } from '../LimitsEditor';
 import { describeLimit } from './Accounts';
 import { Aliases } from './Aliases';
 import { AnnotateRoutes } from '../readiness';
+import { isRetiredSystem, listedProjects } from '../projects-listed';
 
 type Key = Schemas['Key'];
 
@@ -19,6 +20,8 @@ export function Projects({ route, setInspector }: ScreenProps) {
   const q = useGet('/admin/v1/projects', { params: { query: { include_archived: true } } });
   const project = q.data?.data.find((p) => p.id === selected);
   const creating = selected === 'new';
+  // voice's retired system project, kept where it has history: shown on asking
+  const [showRetired, setShowRetired] = useState(false);
 
   useEffect(() => {
     setInspector(creating ? <CreateProject /> : project ? <ProjectInspector project={project} /> : null);
@@ -27,13 +30,15 @@ export function Projects({ route, setInspector }: ScreenProps) {
   if (q.isPending) return <Loading what="projects" />;
   if (q.isError) return <Unavailable what="Projects" detail={q.error.message} />;
   if (selected && !creating && !project) return <Missing what={`project ${selected}`} />;
+  const listed = listedProjects(q.data.data, { showRetired, keep: selected });
+  const retired = q.data.data.filter(isRetiredSystem);
 
   return (
     <>
       <h1>Projects</h1>
-      <Panel title="Projects" readout={readout(q, `${q.data.data.length} projects`)}>
+      <Panel title="Projects" readout={readout(q, `${listed.length} projects`)}>
         <Table<Project>
-          rows={inTree(q.data.data)}
+          rows={inTree(listed)}
           rowKey={(p) => p.id}
           selectedKey={selected}
           onSelect={(p) => go('projects', p.id)}
@@ -48,8 +53,9 @@ export function Projects({ route, setInspector }: ScreenProps) {
           ]}
           empty="No projects. Create one, then keys under it."
         />
-        <p style={{ marginBottom: 0 }}>
+        <p style={{ marginBottom: 0, display: 'flex', gap: 'var(--space-3)', alignItems: 'center' }}>
           <Button onClick={() => go('projects', 'new')} tone="primary">new project</Button>
+          {retired.length > 0 && <Checkbox checked={showRetired} onChange={setShowRetired} label={`show voice's retired project (${retired.map((p) => p.id).join(', ')})`} />}
         </p>
       </Panel>
       {project && <Keys project={project} />}

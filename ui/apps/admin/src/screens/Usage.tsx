@@ -10,6 +10,7 @@ import { readout } from '../readout';
 import { PeekSection } from '../peek';
 import { AnnotationSection, AnnotationsPanel, RefusedSummary } from '../annotation';
 import { refusalLine } from '../refusal';
+import { listedProjects } from '../projects-listed';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
@@ -421,7 +422,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)', alignItems: 'end', marginBottom: 'var(--space-3)' }}>
       <label>
         <div className="faint">project</div>
-        <Select value={f.project} onChange={set('project')} empty="any" options={(projects.data?.data ?? []).map((p) => ({ value: p.id }))} />
+        <Select value={f.project} onChange={set('project')} empty="any" options={listedProjects(projects.data?.data ?? [], { keep: f.project }).map((p) => ({ value: p.id }))} />
       </label>
       <label>
         <div className="faint">model</div>

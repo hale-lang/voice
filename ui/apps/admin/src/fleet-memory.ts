@@ -109,7 +109,7 @@ export function fleetNodes(nodes: NodeSummary[]): FleetNode[] {
 
 /**
  * A node's name as its card says it beside its id: without the parts of it
- * that only repeat the id (`Spark 2 · flare` on `flare` is `Spark 2`), and
+ * that only repeat the id (`Spark 2 · node-b` on `node-b` is `Spark 2`), and
  * nothing when it is the id.
  */
 export function nameBeside(n: { id: string; name?: string }): string {

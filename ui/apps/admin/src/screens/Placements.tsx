@@ -147,7 +147,7 @@ function PlacementForm() {
         }
       >
         <Field label="id" required help="the seat's name on the node, too">
-          <TextInput mono value={id} onChange={setId} required pattern="^[a-z0-9][a-z0-9-]{0,62}$" placeholder="qwen-on-spark" />
+          <TextInput mono value={id} onChange={setId} required pattern="^[a-z0-9][a-z0-9-]{0,62}$" placeholder="qwen-on-node-a" />
         </Field>
         <Field label="model" required help="a catalog model that names a recipe">
           <Select value={model} onChange={(v) => { setModel(v); setVariant(''); }} options={placeable.map((m) => ({ value: m.id, label: `${m.id} · ${m.recipe}` }))} required empty="" />

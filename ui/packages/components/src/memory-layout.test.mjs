@@ -99,10 +99,10 @@ test('a plan keeps what it keeps in place, its additions take the freed cells, a
 
 test('a block spanning two machines of different sizes: the same key and hue on each, its share on each card\'s own scale', () => {
   const half = ['ds-pair', 20];
-  const spark = layoutMemory(model(121.7, 114, [half]));
+  const gb10 = layoutMemory(model(121.7, 114, [half]));
   const mac = layoutMemory(model(24, 20, [half]));
-  assert.equal(spark.length, mac.length, 'the same grid on both');
-  assert.equal(of(spark, 'ds-pair').length, 17, '20 of 121.7 GiB: 16.4 cells, and the largest remainder');
+  assert.equal(gb10.length, mac.length, 'the same grid on both');
+  assert.equal(of(gb10, 'ds-pair').length, 17, '20 of 121.7 GiB: 16.4 cells, and the largest remainder');
   assert.equal(of(mac, 'ds-pair').length, 83, '20 of 24 GiB');
   assert.equal(memoryUnit(model(121.7, 114, [half])) / memoryUnit(model(24, 20, [half])), 121.7 / 24, 'each card its own cell');
   assert.equal(hueOf('ds-pair'), hueOf('ds-pair'));
@@ -114,7 +114,7 @@ test('a block spanning two machines of different sizes: the same key and hue on 
 });
 
 test('blocks shown together each get a hue apart from the others, the same every time', () => {
-  const keys = ['coder', 'tiny', 'granite', 'oss', 'deepseek-v4-1-flash-1017-flare', 'jev-style-2b-decision-v3-spark3'];
+  const keys = ['coder', 'tiny', 'granite', 'oss', 'deepseek-v4-1-flash-1017-node-a', 'jev-style-2b-decision-v3-node-f'];
   const hues = huesFor(keys);
   assert.equal(new Set(hues.values()).size, keys.length, 'no two alike');
   assert.deepEqual([...huesFor([...keys].reverse())], [...hues], 'whatever order they come in');

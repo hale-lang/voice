@@ -52,7 +52,7 @@ export function placementState(p: PlacementSeats, seatAt: (ref: string) => SeatR
   return { state: 'starting', label: 'starting', detail: `${ups}${coming.join(', ')}` };
 }
 
-/** A seat on its way up, in words: "spark fetching 42 of 167 GiB", "spark loading the model". */
+/** A seat on its way up, in words: "node-a fetching 42 of 167 GiB", "node-a loading the model". */
 function comingUp(s: SeatReport): string {
   if (s.status === 'fetching') {
     const p = s.progress;

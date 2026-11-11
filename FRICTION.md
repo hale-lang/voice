@@ -531,3 +531,11 @@ Still there on hale 0.32.6: with the copy reverted, `hale test api/tests/nodes_t
 **hale 0.32.7.** The `Voice` surface's rows had sixteen receivers (Probes, Catalog, Recipes, …). Adding a row on a seventeenth locus (`Arranger::plan`, a field of `Front` like the others) passes `hale verify` and then fails every build and test of the api with `codegen error: unsupported in codegen v0: path call `api::serve` in expression position`. The receiver's own code does not matter: a locus with one method returning a constant fails the same way, and the same rows on an existing receiver build.
 
 **Working shape:** the arranger's two rows are methods of `Placements` (`arrangement_roles`, `plan_arrangement`), what a plan proposes being placements; the planning itself stays in api/arranger.hl as free functions.
+
+## A record holding a `bounded` list, stored whole into a locus field, keeps the Strings it replaced
+
+**hale 0.32.8** (still on 0.32.11). `self.f = v`, where `f`'s type is a record with a `bounded[T; N]` field whose elements hold Strings, leaves every String of the replaced value in the locus's arena for the locus's life. `let same = self.f; self.f = same;` keeps a copy of each String per store: a record holding one 8 KB String grew a process by about 400 MB over 50 000 stores, `bounded[String; 4]` and `bounded[Item; 4]` alike. A whole store of a record with plain String fields, a nested record or a fixed array is flat. `set(self.f.items, i, x)` with `x` read by `at` and its Strings unchanged is flat too; a `set` of an element with fresh Strings keeps the replaced ones.
+
+The node's runner stored its `Runs` whole on every look, twice a second, so a node kept each seat's serving identity (its variant's whole file list, about 9.6 KB for a model across two nodes) twice a second: about 1 MB a minute, idle, on both nodes of such a placement.
+
+**Working shape:** a loop that runs for a locus's life changes a `bounded` field in place: `at`, then `set` only an element that changed or moved, and `truncate` past the last kept (`Runner.look`, node/tests/look_memory_test.hl). A whole store left on a path that runs once per event (an assignment, a fetch's progress) keeps one copy per event.

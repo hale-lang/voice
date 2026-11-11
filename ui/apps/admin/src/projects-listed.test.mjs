@@ -28,7 +28,7 @@ test('where it is kept, it is listed on asking', () => {
 });
 
 test('a choice already made of it stays', () => {
-  assert.deepEqual(ids(listedProjects([work, retired], { keep: 'voice-system' })), ['work', 'voice-system']);
-  assert.deepEqual(ids(listedProjects([work, retired], { keep: '' })), ['work']);
-  assert.deepEqual(ids(listedProjects([work, retired], { keep: 'work' })), ['work']);
+  assert.deepEqual(ids(listedProjects([work, retired], { chosen: 'voice-system' })), ['work', 'voice-system']);
+  assert.deepEqual(ids(listedProjects([work, retired], { chosen: '' })), ['work']);
+  assert.deepEqual(ids(listedProjects([work, retired], { chosen: 'work' })), ['work']);
 });

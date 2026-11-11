@@ -30,7 +30,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
   if (q.isPending) return <Loading what="projects" />;
   if (q.isError) return <Unavailable what="Projects" detail={q.error.message} />;
   if (selected && !creating && !project) return <Missing what={`project ${selected}`} />;
-  const listed = listedProjects(q.data.data, { showRetired, keep: selected });
+  const listed = listedProjects(q.data.data, { showRetired, chosen: selected });
   const retired = q.data.data.filter(isRetiredSystem);
 
   return (

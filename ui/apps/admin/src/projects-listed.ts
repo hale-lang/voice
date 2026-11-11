@@ -11,6 +11,6 @@ type Listed = { id: string; status: string; internal?: boolean };
 /** Voice's retired system project: internal and archived. */
 export const isRetiredSystem = (p: Listed): boolean => p.internal === true && p.status === 'archived';
 
-export function listedProjects<P extends Listed>(all: P[], opts: { showRetired?: boolean; keep?: string } = {}): P[] {
-  return all.filter((p) => !isRetiredSystem(p) || opts.showRetired || (opts.keep !== undefined && opts.keep !== '' && p.id === opts.keep));
+export function listedProjects<P extends Listed>(all: P[], opts: { showRetired?: boolean; chosen?: string } = {}): P[] {
+  return all.filter((p) => !isRetiredSystem(p) || opts.showRetired || (opts.chosen !== undefined && opts.chosen !== '' && p.id === opts.chosen));
 }

@@ -422,7 +422,7 @@ function Filters({ value: f, onChange }: { value: Filter; onChange: (f: Filter) 
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-3)', alignItems: 'end', marginBottom: 'var(--space-3)' }}>
       <label>
         <div className="faint">project</div>
-        <Select value={f.project} onChange={set('project')} empty="any" options={listedProjects(projects.data?.data ?? [], { keep: f.project }).map((p) => ({ value: p.id }))} />
+        <Select value={f.project} onChange={set('project')} empty="any" options={listedProjects(projects.data?.data ?? [], { chosen: f.project }).map((p) => ({ value: p.id }))} />
       </label>
       <label>
         <div className="faint">model</div>

@@ -10,8 +10,8 @@
 #
 # The database is emptied first (its public schema dropped), so it must be
 # one kept for testing. Checks:
-#   - the migration applies on the store as it was: one migration, the
-#     coordinator's cap gone, every node and seat kept;
+#   - the migrations from 33 on apply on the store as it was, each once,
+#     the coordinator's cap gone, every node and seat kept;
 #   - the placed seats are served at their runtime's concurrency with no
 #     placement made again (TensorFold 32, llama-server 2 from its cache),
 #     and the operator's seat at its own, in the admin plane's view and in
@@ -72,11 +72,11 @@ INSERT INTO node_state (node, version, capabilities, local, registered_at, last_
 SQL
 
 api/api migrate --database "$DATABASE_URL" --migrations store/migrations >"$work/migrate.log" 2>&1 || { cat "$work/migrate.log"; exit 1; }
-grep -q "applied=1 version=$head" "$work/migrate.log" || { cat "$work/migrate.log"; exit 1; }
+grep -q "applied=$((head - 32)) version=$head" "$work/migrate.log" || { cat "$work/migrate.log"; exit 1; }
 test "$(psql -tA "$DATABASE_URL" -c "SELECT count(*) FROM information_schema.columns WHERE table_name = 'node' AND column_name = 'max_in_flight'")" = 0
 test "$(psql -tA "$DATABASE_URL" -c "SELECT count(*) FROM node")" = 2
 test "$(psql -tA "$DATABASE_URL" -c "SELECT string_agg(id || ':' || concurrency, ',' ORDER BY id) FROM seat")" = "dsv4:1,qwen:1,relay:3"
-echo "migration $head applied on a store with nodes and seats: $(tail -1 "$work/migrate.log")"
+echo "migrations 33 to $head applied on a store with nodes and seats: $(tail -1 "$work/migrate.log")"
 
 VOICE_PROBE_PORT="$PROBE_PORT" VOICE_HUB_PORT="$HUB_PORT" api/api --port "$PORT" --nats "" --database "$DATABASE_URL" >"$work/api.log" 2>&1 &
 pid=$!

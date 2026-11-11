@@ -254,7 +254,7 @@ export function sortRows(rows: FitRow[], v: Pick<FitView, 'sort' | 'desc' | 'on'
   return [...groups.values()].flat();
 }
 
-/** `rows` with each best fit among the view's targets only: what fits on lin1 is placed on lin1. */
+/** `rows` with each best fit among the view's targets only: what fits on gpu-box is placed on gpu-box. */
 export function bestIn(rows: FitRow[], on: string[]): FitRow[] {
   if (!on.length) return rows;
   const scope = new Set(on);

@@ -20,11 +20,11 @@ const voice = {
   request_id: 'resp_abc',
   project: 'work',
   key: 'work-operator',
-  served: { model: 'qwen3-8b', node: 'spark', seat: 'spark/llama', account: 'local', engine: 'llama.cpp' },
+  served: { model: 'qwen3-8b', node: 'node-a', seat: 'node-a/llama', account: 'local', engine: 'llama.cpp' },
   price_micros: 1234,
   currency: 'USD',
   timing: { wall_ms: 900, queue_ms: 0, load_ms: 0, first_output_ms: 120, engine_ms: 850 },
-  attempts: [{ seat: 'flare/llama', account: 'local', outcome: 'failed', error: 'the engine exited' }, { seat: 'spark/llama', account: 'local', outcome: 'served' }],
+  attempts: [{ seat: 'node-b/llama', account: 'local', outcome: 'failed', error: 'the engine exited' }, { seat: 'node-a/llama', account: 'local', outcome: 'served' }],
 };
 
 const STREAM =
@@ -33,7 +33,7 @@ const STREAM =
   ': keep-alive\n\n' +
   ':\n\n' +
   ev('response.in_progress', { response: { id: 'resp_abc' } }) +
-  ev('voice:attempt', { attempt: { seat: 'flare/llama', account: 'local', outcome: 'failed', error: 'the engine exited' }, next_seat: 'spark/llama' }) +
+  ev('voice:attempt', { attempt: { seat: 'node-b/llama', account: 'local', outcome: 'failed', error: 'the engine exited' }, next_seat: 'node-a/llama' }) +
   ev('response.reasoning.delta', { delta: 'Think ' }) +
   ev('response.reasoning.delta', { delta: 'first.' }) +
   ev('response.output_text.delta', { delta: 'Hello, ' }) +
@@ -81,8 +81,8 @@ test('text and reasoning deltas, keep-alives, attempts and the completion with u
   assert.equal(a.requestId, 'resp_abc');
   assert.deepEqual(a.usage, { input: 11, output: 7, reasoning: 3 });
   assert.equal(a.priceMicros, 1234);
-  assert.equal(a.served.seat, 'spark/llama');
-  assert.equal(a.served.node, 'spark');
+  assert.equal(a.served.seat, 'node-a/llama');
+  assert.equal(a.served.node, 'node-a');
   assert.equal(a.attempts.length, 2, 'the api\'s attempts, whole, at the end');
   assert.equal(a.timing.first_output_ms, 120);
   assert.equal(seen.length, 4, 'four output events');

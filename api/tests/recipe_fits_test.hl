@@ -1,5 +1,5 @@
 // How every recipe fits the fleet now (`listRecipeFits`, fits.hl): a node
-// whose GPU has memory of its own (lin1, an AMD Radeon RX 9070 of 17.1 GB
+// whose GPU has memory of its own (gpu-box, an AMD Radeon RX 9070 of 17.1 GB
 // in a machine that offers models 28.5 GB), two DGX Sparks whose GB10s
 // share the machine's memory, cabled to each other with their link
 // checked, and a node with no managed engine. Each variant is judged on
@@ -17,10 +17,10 @@ fn shipped(dir: String) -> String {
 
 const GIB: Int = 1073741824;
 
-/// lin1's hardware, as its node reports it.
-const LIN1: String = "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 32700000000, \"model_memory_bytes\": 28500000000, \"accelerators\": [{\"kind\": \"rocm\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}, {\"kind\": \"vulkan\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}";
+/// gpu-box's hardware, as its node reports it.
+const GPU_BOX: String = "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 32700000000, \"model_memory_bytes\": 28500000000, \"accelerators\": [{\"kind\": \"rocm\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}, {\"kind\": \"vulkan\", \"name\": \"AMD Radeon RX 9070\", \"memory_bytes\": 17100000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}";
 
-/// What granite-4.0-h-tiny's Q8_0 reserved on lin1.
+/// What granite-4.0-h-tiny's Q8_0 reserved on gpu-box.
 const GRANITE_RESERVED: Int = 12100000000;
 
 /// A DGX Spark's two ports on its one cabled QSFP port, to `peer`.
@@ -46,7 +46,7 @@ fn caps(managed: Bool, hardware: String, links: String) -> String {
 }
 
 /// A DGX Spark's hardware: 121 GiB, its GB10 sharing it.
-fn spark_hw() -> String {
+fn gb10_hw() -> String {
     let memory = 121 * GIB;
     return "{\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": " + to_string(memory)
         + ", \"model_memory_bytes\": " + to_string(node::model_memory("{}", memory))
@@ -64,11 +64,11 @@ fn add_node(store: st::Store, id: String, capabilities: String) {
     store.put_beat(id, api::now_seconds(), 0) or discard;
 }
 
-/// A passed check of the link between spark and flare.
+/// A passed check of the link between node-a and node-b.
 fn checked(store: st::Store, link: api::Link) {
     let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
     let usable = rts.usable_in_gate() or api::RuntimeList { };
-    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let c = api::check_link_in(store, link, usable, "node-a", "node-b") or api::no_check();
     let said = api::link_result_json(
         api::LinkCheckResult {
             id: c.id,
@@ -78,8 +78,8 @@ fn checked(store: st::Store, link: api::Link) {
         },
         api::now_seconds(),
     );
-    store.put_link_result(c.id, "spark", said) or discard;
-    store.put_link_result(c.id, "flare", said) or discard;
+    store.put_link_result(c.id, "node-a", said) or discard;
+    store.put_link_result(c.id, "node-b", said) or discard;
 }
 
 /// A variant's files as the store keeps a node's report.
@@ -144,18 +144,18 @@ fn main() {
         api::AccountCreate { id: "local", name: "Local" },
     ) or discard;
 
-    add_node(store, "lin1", caps(true, LIN1, ""));
+    add_node(store, "gpu-box", caps(true, GPU_BOX, ""));
     add_node(
         store,
-        "spark",
-        caps(true, spark_hw(), link_to("flare", "192.168.100.1", "192.168.101.1")),
+        "node-a",
+        caps(true, gb10_hw(), link_to("node-b", "198.51.100.1", "203.0.113.1")),
     );
     add_node(
         store,
-        "flare",
-        caps(true, spark_hw(), link_to("spark", "192.168.100.2", "192.168.101.2")),
+        "node-b",
+        caps(true, gb10_hw(), link_to("node-a", "198.51.100.2", "203.0.113.2")),
     );
-    add_node(store, "static", caps(false, LIN1, ""));
+    add_node(store, "static", caps(false, GPU_BOX, ""));
 
     // ---- the pair is listed, but judged on only once its link is checked --
     let before = placements.fits(api::RecipeAsk { }) or {
@@ -164,18 +164,18 @@ fn main() {
     };
     let pair = at(before.pairs, 0) or api::FitPair { };
     std::test::assert(
-        count(before.pairs) == 1 && (at(pair.nodes, 0) or "") == "flare"
-            && (at(pair.nodes, 1) or "") == "spark" && pair.has_problem
+        count(before.pairs) == 1 && (at(pair.nodes, 0) or "") == "node-a"
+            && (at(pair.nodes, 1) or "") == "node-b" && pair.has_problem
             && std::str::contains(pair.problem, "has not been checked"),
-        "flare and spark are a pair, in the fleet's order, not checked yet: " + pair.problem,
+        "node-a and node-b are a pair, in the fleet's order, not checked yet: " + pair.problem,
     );
     std::test::assert(
-        cell(before, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark").reason == "",
+        cell(before, "deepseek-v4-flash-0731", "safetensors-fp8", "node-a,node-b").reason == "",
         "an unchecked pair is not judged on",
     );
     checked(store, link);
 
-    // lin1 holds granite on its card
+    // gpu-box holds granite on its card
     catalog.create(
         api::CatalogModelCreate {
             id: "granite-4.0-h-tiny",
@@ -190,13 +190,13 @@ fn main() {
         recipe: "granite-4.0-h-tiny",
         variant: "gguf-q8_0",
         runtime: "llama-server-b11913-rocm",
-        leader: "lin1",
-        seat: "lin1/granite",
+        leader: "gpu-box",
+        seat: "gpu-box/granite",
         has_reserved_bytes: true,
         reserved_bytes: GRANITE_RESERVED,
         created_at: api::now_seconds()
     };
-    push(granite.nodes, "lin1") or discard;
+    push(granite.nodes, "gpu-box") or discard;
     let body = api::placement_json(granite);
     store.insert_placement(
         st::PlacementRow {
@@ -208,9 +208,9 @@ fn main() {
         api::change("create", "placements/granite", "", body),
     ) or discard;
 
-    // spark holds qwen3-0.6b's GGUF whole
+    // node-a holds qwen3-0.6b's GGUF whole
     let qwen = recipes.get_in_gate("qwen3-0.6b") or api::Recipe { };
-    store.put_inventory(held_whole("spark", api::variant_body_of(qwen.variants.text, "gguf-q8_0")))
+    store.put_inventory(held_whole("node-a", api::variant_body_of(qwen.variants.text, "gguf-q8_0")))
     or discard;
 
     let f = placements.fits(api::RecipeAsk { }) or {
@@ -219,19 +219,22 @@ fn main() {
     };
 
     // ---- the nodes, as the fit is judged against them --------------------
-    let lin1 = fit_node(f, "lin1");
+    let gpu_box = fit_node(f, "gpu-box");
     std::test::assert(
-        lin1.gpu && lin1.memory_bytes == 17100000000 && lin1.model_memory_bytes == 17100000000
-            && lin1.held_bytes == api::footprint(GRANITE_RESERVED)
-            && lin1.free_bytes == 17100000000 - api::footprint(GRANITE_RESERVED)
-            && lin1.accelerator == "AMD Radeon RX 9070" && lin1.disk_free_bytes == 500000000000,
-        "lin1's models are served from its card: 17.1 GB, granite's held of it",
+        gpu_box.gpu
+            && gpu_box.memory_bytes == 17100000000
+            && gpu_box.model_memory_bytes == 17100000000
+            && gpu_box.held_bytes == api::footprint(GRANITE_RESERVED)
+            && gpu_box.free_bytes == 17100000000 - api::footprint(GRANITE_RESERVED)
+            && gpu_box.accelerator == "AMD Radeon RX 9070"
+            && gpu_box.disk_free_bytes == 500000000000,
+        "gpu-box's models are served from its card: 17.1 GB, granite's held of it",
     );
-    let spark = fit_node(f, "spark");
+    let node_a = fit_node(f, "node-a");
     std::test::assert(
-        !spark.gpu && spark.memory_bytes == 121 * GIB
-            && spark.model_memory_bytes == node::model_memory("{}", 121 * GIB)
-            && spark.free_bytes == spark.model_memory_bytes && !spark.has_problem,
+        !node_a.gpu && node_a.memory_bytes == 121 * GIB
+            && node_a.model_memory_bytes == node::model_memory("{}", 121 * GIB)
+            && node_a.free_bytes == node_a.model_memory_bytes && !node_a.has_problem,
         "a Spark's are the machine's, its GB10 sharing them, none held",
     );
     let lone = fit_node(f, "static");
@@ -247,42 +250,42 @@ fn main() {
     std::test::assert(!checked_pair.has_problem, "the pair, checked, can take a model");
 
     // ---- a discrete GPU: fits now, fits once freed, never -----------------
-    let small = cell(f, "granite-4.0-h-tiny", "gguf-q4_k_m", "lin1");
+    let small = cell(f, "granite-4.0-h-tiny", "gguf-q4_k_m", "gpu-box");
     std::test::assert(
         !small.fits && small.fits_empty && small.has_placed && small.placed == "granite",
-        "granite is placed on lin1, named there: " + small.reason,
+        "granite is placed on gpu-box, named there: " + small.reason,
     );
-    let decider = cell(f, "jev-style-2b-decision-v3", "gguf-f16", "lin1");
+    let decider = cell(f, "jev-style-2b-decision-v3", "gguf-f16", "gpu-box");
     std::test::assert(
         !decider.fits && decider.fits_empty && decider.runtime == "decision-0.1.2-rocm"
             && decider.gpu && decider.room_bytes == 17100000000 - api::footprint(GRANITE_RESERVED)
             && decider.room_empty_bytes == 17100000000 && !decider.has_held_bytes
             && std::str::contains(decider.reason, "free of its GPU's 17.1 GB")
             && !decider.has_empty_reason && !decider.tools,
-        "the decider's f16 fits lin1's card once granite is freed, not beside it: "
+        "the decider's f16 fits gpu-box's card once granite is freed, not beside it: "
             + decider.reason,
     );
-    let q4 = cell(f, "jev-style-2b-decision-v3", "gguf-q4_k_m", "spark");
+    let q4 = cell(f, "jev-style-2b-decision-v3", "gguf-q4_k_m", "node-a");
     std::test::assert(
         q4.fits && q4.has_held_bytes && q4.held_bytes >= q4.need_bytes
             && q4.held_bytes <= q4.room_bytes,
         "its Q4_K_M fits a Spark, holding what it needs and no more than the room: " + q4.reason,
     );
-    let flash = cell(f, "deepseek-v4-flash-0731", "gguf-q2_k_s", "lin1");
+    let flash = cell(f, "deepseek-v4-flash-0731", "gguf-q2_k_s", "gpu-box");
     std::test::assert(
         !flash.fits && !flash.fits_empty && flash.has_empty_reason
             && std::str::contains(flash.empty_reason, "of 17.1 GB free of its GPU's 17.1 GB"),
-        "DeepSeek-V4-Flash never fits lin1's card: " + flash.empty_reason,
+        "DeepSeek-V4-Flash never fits gpu-box's card: " + flash.empty_reason,
     );
 
     // ---- unified memory, and tools and reasoning under the runtime --------
-    let gpt = cell(f, "gpt-oss-20b", "safetensors-mxfp4", "spark");
+    let gpt = cell(f, "gpt-oss-20b", "safetensors-mxfp4", "node-a");
     std::test::assert(
         gpt.fits && !gpt.gpu && gpt.runtime == "vllm-26.09" && gpt.tools && !gpt.reasoning
-            && gpt.room_bytes == spark.model_memory_bytes && gpt.disk_free_bytes == 3500000000000,
+            && gpt.room_bytes == node_a.model_memory_bytes && gpt.disk_free_bytes == 3500000000000,
         "gpt-oss-20b fits a Spark's shared memory under vLLM, carrying tools: " + gpt.reason,
     );
-    let gguf = cell(f, "gpt-oss-20b", "gguf-mxfp4", "spark");
+    let gguf = cell(f, "gpt-oss-20b", "gguf-mxfp4", "node-a");
     std::test::assert(
         gguf.fits && gguf.runtime == "llama-server-b11913-cuda" && gguf.tools && gguf.reasoning,
         "its GGUF under llama-server carries tools and reasoning: " + gguf.runtime,
@@ -290,30 +293,30 @@ fn main() {
 
     // ---- downloaded ------------------------------------------------------
     std::test::assert(
-        cell(f, "qwen3-0.6b", "gguf-q8_0", "spark").downloaded
-            && !cell(f, "qwen3-0.6b", "gguf-q8_0", "flare").downloaded
-            && !cell(f, "qwen3-0.6b", "safetensors-bf16", "spark").downloaded,
-        "spark holds qwen3-0.6b's GGUF whole; flare does not, nor spark its safetensors",
+        cell(f, "qwen3-0.6b", "gguf-q8_0", "node-a").downloaded
+            && !cell(f, "qwen3-0.6b", "gguf-q8_0", "node-b").downloaded
+            && !cell(f, "qwen3-0.6b", "safetensors-bf16", "node-a").downloaded,
+        "node-a holds qwen3-0.6b's GGUF whole; node-b does not, nor node-a its safetensors",
     );
     std::test::assert(
-        !cell(f, "qwen3-0.6b", "gguf-q8_0", "flare,spark").downloaded,
+        !cell(f, "qwen3-0.6b", "gguf-q8_0", "node-a,node-b").downloaded,
         "across the pair, only when both hold it",
     );
 
     // ---- a linked pair ---------------------------------------------------
-    let alone = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "spark");
+    let alone = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "node-a");
     std::test::assert(
         !alone.fits && !alone.fits_empty,
         "DeepSeek-V4-Flash's fp8 never fits one Spark: " + alone.reason,
     );
-    let across = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark");
+    let across = cell(f, "deepseek-v4-flash-0731", "safetensors-fp8", "node-a,node-b");
     std::test::assert(
         across.fits && across.runtime == "vllm-26.09" && across.need_bytes < alone.need_bytes
             && across.tools && across.reasoning
             && std::str::contains(across.reason, "across 2 nodes"),
         "across the pair it fits, each node holding its share: " + across.reason,
     );
-    let small_pair = cell(f, "qwen3-0.6b", "gguf-q8_0", "flare,spark");
+    let small_pair = cell(f, "qwen3-0.6b", "gguf-q8_0", "node-a,node-b");
     std::test::assert(
         !small_pair.fits && !small_pair.fits_empty
             && std::str::contains(small_pair.reason, "no runtime that spans nodes"),
@@ -328,14 +331,14 @@ fn main() {
         recipe: "deepseek-v4-flash-0731",
         variant: "safetensors-fp8",
         runtime: "vllm-26.09",
-        leader: "flare",
-        seat: "flare/ds",
+        leader: "node-b",
+        seat: "node-b/ds",
         has_reserved_bytes: true,
         reserved_bytes: 10 * GIB,
         created_at: api::now_seconds()
     };
-    push(ds.nodes, "flare") or discard;
-    push(ds.nodes, "spark") or discard;
+    push(ds.nodes, "node-b") or discard;
+    push(ds.nodes, "node-a") or discard;
     let ds_body = api::placement_json(ds);
     store.insert_placement(
         st::PlacementRow { id: "ds", model: "deepseek", body: ds_body, created_at: ds.created_at },
@@ -343,10 +346,10 @@ fn main() {
     ) or discard;
     let g = placements.fits(api::RecipeAsk { }) or api::RecipeFits { };
     std::test::assert(
-        cell(g, "deepseek-v4-flash-0731", "safetensors-fp8", "flare,spark").placed == "ds",
+        cell(g, "deepseek-v4-flash-0731", "safetensors-fp8", "node-a,node-b").placed == "ds",
         "the pair's placement is named on it",
     );
-    let rival = cell(g, "gpt-oss-120b", "safetensors-mxfp4", "flare,spark");
+    let rival = cell(g, "gpt-oss-120b", "safetensors-mxfp4", "node-a,node-b");
     std::test::assert(
         !rival.fits && rival.fits_empty
             && std::str::contains(rival.reason, "takes part in placement ds across nodes already"),

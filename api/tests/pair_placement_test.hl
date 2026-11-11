@@ -1,7 +1,7 @@
 // A model placed across two nodes cabled to each other: DeepSeek-V4-Flash
 // (155.4 GiB of fp8 weights) across two DGX Sparks of 121 GiB, from voice's
 // own recipe and runtimes. Each node declares its end of the link (its two
-// ports, a fixture of the lab's addresses); the link is checked first; the
+// ports, a fixture of a pair's addresses); the link is checked first; the
 // fit is judged on each node, each holding half the weights and the whole
 // cache; the leader's seat serves, the follower's runs the other half and
 // takes no request, and the model is served only while both are up.
@@ -57,12 +57,12 @@ fn place(placements: api::Placements, id: String, model: String, nodes: String) 
     return p.variant + " on " + p.runtime;
 }
 
-/// A check of the link between spark and flare, both ranks reporting
+/// A check of the link between node-a and node-b, both ranks reporting
 /// `bus`, right or not.
 fn checked(store: st::Store, link: api::Link, ok: Bool, bus: Int) {
     let rts = api::Runtimes { store: store, shipped: api::shipped_runtimes(shipped("runtimes")) };
     let usable = rts.usable_in_gate() or api::RuntimeList { };
-    let c = api::check_link_in(store, link, usable, "spark", "flare") or api::no_check();
+    let c = api::check_link_in(store, link, usable, "node-a", "node-b") or api::no_check();
     let said = api::link_result_json(
         api::LinkCheckResult {
             id: c.id,
@@ -73,9 +73,9 @@ fn checked(store: st::Store, link: api::Link, ok: Bool, bus: Int) {
         api::now_seconds(),
     );
     // each rank writes its own, the second never undoing the first's
-    store.put_link_result(c.id, "spark", said) or discard;
-    store.put_link_result(c.id, "flare", said) or discard;
-    let written = store.put_link_result(c.id, "flare", said) or true;
+    store.put_link_result(c.id, "node-a", said) or discard;
+    store.put_link_result(c.id, "node-b", said) or discard;
+    let written = store.put_link_result(c.id, "node-b", said) or true;
     std::test::assert(!written, "a rank reports once: its first result stands");
 }
 
@@ -141,50 +141,50 @@ fn main() {
     std::test::assert(!llama.has_multi_node, "llama-server does not");
 
     let memory = 121 * GIB;
-    // spark declares its link to flare; flare declares none yet
+    // node-a declares its link to node-b; node-b declares none yet
     add_node(
         store,
-        "spark",
-        caps(memory, "linux", "arm64", "cuda", link_to("flare", "192.168.100.1", "192.168.101.1")),
+        "node-a",
+        caps(memory, "linux", "arm64", "cuda", link_to("node-b", "198.51.100.1", "203.0.113.1")),
     );
-    add_node(store, "flare", caps(memory, "linux", "arm64", "cuda", ""));
+    add_node(store, "node-b", caps(memory, "linux", "arm64", "cuda", ""));
     add_node(
         store,
         "mac",
-        caps(memory, "darwin", "arm64", "metal", link_to("spark", "10.0.0.2", "10.0.1.2")),
+        caps(memory, "darwin", "arm64", "metal", link_to("node-a", "10.0.0.2", "10.0.1.2")),
     );
 
     // ---- refusals --------------------------------------------------------
-    let lone = place(placements, "ds", "deepseek", "spark,flare");
+    let lone = place(placements, "ds", "deepseek", "node-a,node-b");
     std::test::assert(
-        std::str::contains(lone, "node flare has no link to spark"),
+        std::str::contains(lone, "node node-b has no link to node-a"),
         "a pair whose follower has no link back is refused: " + lone,
     );
-    let unlike = place(placements, "ds", "deepseek", "spark,mac");
+    let unlike = place(placements, "ds", "deepseek", "node-a,mac");
     std::test::assert(
-        std::str::contains(unlike, "node spark is linux/arm64 and node mac is darwin/arm64"),
+        std::str::contains(unlike, "node node-a is linux/arm64 and node mac is darwin/arm64"),
         "a pair of two platforms is refused: " + unlike,
     );
     store.put_fleet(
         st::FleetRow {
-            node: "flare",
+            node: "node-b",
             capabilities: caps(
                 memory,
                 "linux",
                 "arm64",
                 "cuda",
-                link_to("spark", "192.168.100.2", "192.168.101.2"),
+                link_to("node-a", "198.51.100.2", "203.0.113.2"),
             ),
             present: true,
         },
     ) or discard;
-    let unchecked = place(placements, "ds", "deepseek", "spark,flare");
+    let unchecked = place(placements, "ds", "deepseek", "node-a,node-b");
     std::test::assert(
-        std::str::contains(unchecked, "the link between spark and flare has not been checked"),
+        std::str::contains(unchecked, "the link between node-a and node-b has not been checked"),
         "a pair whose link was never checked is refused: " + unchecked,
     );
     checked(store, link, false, 0);
-    let failed = place(placements, "ds", "deepseek", "spark,flare");
+    let failed = place(placements, "ds", "deepseek", "node-a,node-b");
     std::test::assert(
         std::str::contains(failed, "failed its latest check"),
         "a pair whose link failed its check is refused: " + failed,
@@ -192,22 +192,25 @@ fn main() {
 
     // the node's view: each link, whether its peer declares it back, its check
     let nodes = api::Nodes { store: store, link: link };
-    let spark = nodes.get(api::NodeRef { node: "spark" }) or api::Node {
+    let node_a = nodes.get(api::NodeRef { node: "node-a" }) or api::Node {
         status: api::NodeStatus::down,
     };
-    let l = at(spark.links, 0) or api::NodeLink { peer: "", paired: false };
+    let l = at(node_a.links, 0) or api::NodeLink { peer: "", paired: false };
     std::test::assert(
-        l.peer == "flare"
+        l.peer == "node-b"
             && l.paired
             && l.has_check
             && l.check.status == api::LinkCheckStatus::failed,
-        "spark's link to flare is paired, its check failed",
+        "node-a's link to node-b is paired, its check failed",
     );
 
     // a sum that is right over a link at 2.6 GB/s passes, degraded
     checked(store, link, true, 2600000000);
     let rows = store.link_checks() or st::LinkCheckRows { };
-    let latest = api::link_check_of(api::latest_check(rows, "flare", "spark"), api::now_seconds());
+    let latest = api::link_check_of(
+        api::latest_check(rows, "node-b", "node-a"),
+        api::now_seconds(),
+    );
     std::test::assert(
         latest.status == api::LinkCheckStatus::passed && latest.degraded
             && std::str::contains(latest.reason, "degraded: 2.6 GB/s measured"),
@@ -216,15 +219,15 @@ fn main() {
 
     // a slow link behind a translating IOMMU says so, with how to boot it
     let rows2 = store.link_checks() or st::LinkCheckRows { };
-    let mut slow = api::latest_check(rows2, "spark", "flare");
+    let mut slow = api::latest_check(rows2, "node-a", "node-b");
     slow.result_b = "{\"ok\": true, \"bus_bytes_per_second\": 2600000000, \"iommu\": [{\"hca\": \"rocep1s0f0\", \"domain\": \"DMA-FQ\"}, {\"hca\": \"roceP2p1s0f0\", \"domain\": \"DMA-FQ\"}], \"reported_at\": \"2026-11-03T00:00:00Z\"}";
     slow.result_a = "{\"ok\": true, \"bus_bytes_per_second\": 2600000000, \"iommu\": [{\"hca\": \"rocep1s0f0\", \"domain\": \"identity\"}], \"reported_at\": \"2026-11-03T00:00:00Z\"}";
     let told = api::link_check_of(slow, api::now_seconds());
     std::test::assert(
         std::str::ends_with(
             told.reason,
-            "; node flare's RDMA devices (rocep1s0f0, roceP2p1s0f0) are behind a translating IOMMU (DMA-FQ): boot it with iommu.passthrough=1",
-        ) && !std::str::contains(told.reason, "node spark's RDMA"),
+            "; node node-b's RDMA devices (rocep1s0f0, roceP2p1s0f0) are behind a translating IOMMU (DMA-FQ): boot it with iommu.passthrough=1",
+        ) && !std::str::contains(told.reason, "node node-a's RDMA"),
         "a degraded link names the node whose IOMMU translates: " + told.reason,
     );
     slow.result_a = "{\"ok\": true, \"bus_bytes_per_second\": 23900000000, \"reported_at\": \"2026-11-03T00:00:00Z\"}";
@@ -245,17 +248,17 @@ fn main() {
         "a rank's IOMMU domains are kept: " + kept,
     );
 
-    // one node too small: flare holds back all but 60 GiB
+    // one node too small: node-b holds back all but 60 GiB
     store.put_fleet(
         st::FleetRow {
-            node: "flare",
+            node: "node-b",
             capabilities: std::str::replace(
                 caps(
                     memory,
                     "linux",
                     "arm64",
                     "cuda",
-                    link_to("spark", "192.168.100.2", "192.168.101.2"),
+                    link_to("node-a", "198.51.100.2", "203.0.113.2"),
                 ),
                 "\"model_memory_bytes\": " + to_string(node::model_memory("{}", memory)),
                 "\"model_memory_bytes\": " + to_string(60 * GIB),
@@ -263,35 +266,35 @@ fn main() {
             present: true,
         },
     ) or discard;
-    let small = place(placements, "ds", "deepseek", "spark,flare");
+    let small = place(placements, "ds", "deepseek", "node-a,node-b");
     std::test::assert(
         std::str::contains(
             small,
-            "no variant of recipe deepseek-v4-flash-0731 fits nodes spark and flare",
+            "no variant of recipe deepseek-v4-flash-0731 fits nodes node-a and node-b",
         )
-            && std::str::contains(small, "flare: 90.3 GB of 64.4 GB free for models")
+            && std::str::contains(small, "node-b: 90.3 GB of 64.4 GB free for models")
             && std::str::contains(small, "gguf-q2_k_s: no runtime that spans nodes reads gguf"),
         "a pair one of whose nodes is too small is refused, naming it: " + small,
     );
     store.put_fleet(
         st::FleetRow {
-            node: "flare",
+            node: "node-b",
             capabilities: caps(
                 memory,
                 "linux",
                 "arm64",
                 "cuda",
-                link_to("spark", "192.168.100.2", "192.168.101.2"),
+                link_to("node-a", "198.51.100.2", "203.0.113.2"),
             ),
             present: true,
         },
     ) or discard;
 
     // ---- suggestions across the pair ---------------------------------------
-    let suggested = placements.suggest(api::NodeRef { node: "spark" }) or api::NodeSuggestions { };
+    let suggested = placements.suggest(api::NodeRef { node: "node-a" }) or api::NodeSuggestions { };
     std::test::assert(
-        suggested.has_pair && suggested.pair.peer == "flare" && suggested.pair.tier_gb == 256,
-        "spark is offered what it and flare would serve together, at 256 GB",
+        suggested.has_pair && suggested.pair.peer == "node-b" && suggested.pair.tier_gb == 256,
+        "node-a is offered what it and node-b would serve together, at 256 GB",
     );
     let mut general = api::NodeSuggestion { };
     for g in suggested.pair.data {
@@ -317,28 +320,28 @@ fn main() {
     }
     std::test::assert(
         single.recipe != "deepseek-v4-flash-0731",
-        "on spark alone, its own tier's pick: " + single.recipe,
+        "on node-a alone, its own tier's pick: " + single.recipe,
     );
 
     // ---- what each has on disk ---------------------------------------------
-    // spark holds the fp8 weights whole, flare none of them: placing them
-    // across the two is a download still, on flare
+    // node-a holds the fp8 weights whole, node-b none of them: placing them
+    // across the two is a download still, on node-b
     let fp8 = api::variant_body_of(
         (
             recipes.get(api::RecipeRef { recipe: "deepseek-v4-flash-0731" }) or api::Recipe { }
         ).variants.text,
         "safetensors-fp8",
     );
-    store.put_inventory(held_whole("spark", fp8)) or discard;
-    let half = placements.suggest(api::NodeRef { node: "spark" }) or api::NodeSuggestions { };
+    store.put_inventory(held_whole("node-a", fp8)) or discard;
+    let half = placements.suggest(api::NodeRef { node: "node-a" }) or api::NodeSuggestions { };
     for g in half.pair.data {
         if g.category == "general" {
             std::test::assert(!g.downloaded, "held on one node of the pair: not downloaded");
         }
     }
-    // flare holds them too: placing them across the two is a reload
-    store.put_inventory(held_whole("flare", fp8)) or discard;
-    let both = placements.suggest(api::NodeRef { node: "spark" }) or api::NodeSuggestions { };
+    // node-b holds them too: placing them across the two is a reload
+    store.put_inventory(held_whole("node-b", fp8)) or discard;
+    let both = placements.suggest(api::NodeRef { node: "node-a" }) or api::NodeSuggestions { };
     for g in both.pair.data {
         if g.category == "general" {
             std::test::assert(g.downloaded, "held whole on both nodes of the pair: downloaded");
@@ -347,20 +350,20 @@ fn main() {
     for g in both.data {
         std::test::assert(
             !g.downloaded || g.recipe == "deepseek-v4-flash-0731",
-            "on spark alone, only what it holds is downloaded: " + g.recipe,
+            "on node-a alone, only what it holds is downloaded: " + g.recipe,
         );
     }
 
     // ---- the fit, with the real numbers ----------------------------------
-    let pair = place(placements, "ds", "deepseek", "spark,flare");
+    let pair = place(placements, "ds", "deepseek", "node-a,node-b");
     std::test::assert_eq_str(
         pair,
         "safetensors-fp8 on vllm-26.09",
         "the fp8 weights are placed across the pair on vLLM",
     );
     let p = placements.get(api::PlacementRef { placement: "ds" }) or api::Placement { };
-    std::test::assert_eq_str(p.seat, "spark/ds", "its leader's seat serves it");
-    std::test::assert_eq_str(p.follower_seat, "flare/ds", "its follower holds the other half");
+    std::test::assert_eq_str(p.seat, "node-a/ds", "its leader's seat serves it");
+    std::test::assert_eq_str(p.follower_seat, "node-b/ds", "its follower holds the other half");
     // each node: half of 166.9 GB of weights with their 5% buffers (87.6
     // GB), the cache for 32k tokens and the recipe's rounding (0.6 GB), and
     // more cache, from half of the 31.5 GB that leaves of the 121.8 GB a
@@ -404,19 +407,19 @@ fn main() {
     // its seats: the same config, each its part; the leader's address on
     // the link's first port is where the ranks meet, and each part carries
     // its node's end of the link
-    let lead = store.seat("spark", "ds") or st::SeatRow { };
-    let follow = store.seat("flare", "ds") or st::SeatRow { };
+    let lead = store.seat("node-a", "ds") or st::SeatRow { };
+    let follow = store.seat("node-b", "ds") or st::SeatRow { };
     std::test::assert(lead.present && follow.present, "both seats are made");
     std::test::assert_eq_str(
         std::str::trim(std::json::find_field_raw(lead.config, "cluster")),
-        "{\"size\": 2, \"rank\": 0, \"peer\": \"flare\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501, \"link\": "
-            + link_to("flare", "192.168.100.1", "192.168.101.1") + "}",
+        "{\"size\": 2, \"rank\": 0, \"peer\": \"node-b\", \"master_addr\": \"198.51.100.1\", \"master_port\": 29501, \"link\": "
+            + link_to("node-b", "198.51.100.1", "203.0.113.1") + "}",
         "the leader's part",
     );
     std::test::assert_eq_str(
         std::str::trim(std::json::find_field_raw(follow.config, "cluster")),
-        "{\"size\": 2, \"rank\": 1, \"peer\": \"spark\", \"master_addr\": \"192.168.100.1\", \"master_port\": 29501, \"link\": "
-            + link_to("spark", "192.168.100.2", "192.168.101.2") + "}",
+        "{\"size\": 2, \"rank\": 1, \"peer\": \"node-a\", \"master_addr\": \"198.51.100.1\", \"master_port\": 29501, \"link\": "
+            + link_to("node-a", "198.51.100.2", "203.0.113.2") + "}",
         "the follower's part",
     );
     std::test::assert_eq_int(
@@ -425,7 +428,7 @@ fn main() {
         "each node reserves its share, the same on each",
     );
     // each node holds the variant whole, and the placement uses it on each
-    for n in ["spark", "flare"] {
+    for n in ["node-a", "node-b"] {
         let d = placements.downloads(api::NodeRef { node: n }) or api::NodeDownloads { };
         let first = at(d.data, 0) or api::NodeDownload { };
         std::test::assert(
@@ -445,7 +448,7 @@ fn main() {
         api::CatalogModelCreate { id: "ds2", has_recipe: true, recipe: "deepseek-v4-flash-0731" },
     )
     or discard;
-    let second = place(placements, "ds2", "ds2", "flare,spark");
+    let second = place(placements, "ds2", "ds2", "node-b,node-a");
     std::test::assert(
         std::str::contains(second, "takes part in placement ds across nodes already"),
         "a second placement across the same nodes is refused: " + second,
@@ -459,47 +462,47 @@ fn main() {
         st::PlacementRow {
             id: "ds-raced",
             model: "ds2",
-            body: "{\"leader\": \"flare\", \"nodes\": [\"flare\", \"spark\"]}",
+            body: "{\"leader\": \"node-b\", \"nodes\": [\"node-b\", \"node-a\"]}",
             present: true,
         },
     ) or discard;
     std::test::assert(
         std::str::starts_with(
-            api::spanning_rival(raced, "ds-raced", "flare", "spark"),
-            "placement ds was placed across flare while this was",
+            api::spanning_rival(raced, "ds-raced", "node-b", "node-a"),
+            "placement ds was placed across node-b while this was",
         ),
         "a placement across nodes that meets another kept meanwhile withdraws",
     );
     std::test::assert_eq_str(
-        api::spanning_rival(raced, "ds-raced", "mac", "spark2"),
+        api::spanning_rival(raced, "ds-raced", "mac", "node-g"),
         "",
         "one on other nodes meets none",
     );
 
     // ---- a decision seat beside it, pair first ----------------------------
-    let beside = place(placements, "decide-spark", "decide", "spark");
+    let beside = place(placements, "decide-node-a", "decide", "node-a");
     std::test::assert(
         std::str::starts_with(beside, "gguf-")
             && std::str::ends_with(beside, " on decision-0.1.2-cuda"),
-        "a decision seat fits beside the pair's share on spark: " + beside,
+        "a decision seat fits beside the pair's share on node-a: " + beside,
     );
 
     // ---- served only while both are up -------------------------------------
-    let applied = store.node("spark") or st::NodeRow { };
-    let applied_f = store.node("flare") or st::NodeRow { };
-    for n in ["spark", "flare"] {
+    let applied = store.node("node-a") or st::NodeRow { };
+    let applied_f = store.node("node-b") or st::NodeRow { };
+    for n in ["node-a", "node-b"] {
         let mut f = store.fleet(n) or st::FleetRow { };
-        f.applied_version = (if n == "spark" { applied } else { applied_f }).assignment_version
+        f.applied_version = (if n == "node-a" { applied } else { applied_f }).assignment_version
             + 10;
         store.put_fleet(f) or discard;
         store.put_beat(n, api::now_seconds(), 0) or discard;
     }
     store.put_seat_state(
-        st::SeatStateRow { ref: "spark/ds", node: "spark", seat: "ds", status: "up" },
+        st::SeatStateRow { ref: "node-a/ds", node: "node-a", seat: "ds", status: "up" },
     )
     or discard;
     store.put_seat_state(
-        st::SeatStateRow { ref: "flare/ds", node: "flare", seat: "ds", status: "starting" },
+        st::SeatStateRow { ref: "node-b/ds", node: "node-b", seat: "ds", status: "starting" },
     )
     or discard;
     std::test::assert(
@@ -507,7 +510,7 @@ fn main() {
         "the leader takes no request while its follower is starting",
     );
     store.put_seat_state(
-        st::SeatStateRow { ref: "flare/ds", node: "flare", seat: "ds", status: "up" },
+        st::SeatStateRow { ref: "node-b/ds", node: "node-b", seat: "ds", status: "up" },
     )
     or discard;
     std::test::assert(api::seat_ready(store, lead) or false, "both up: the leader takes requests");
@@ -515,7 +518,7 @@ fn main() {
         !(api::seat_ready(store, follow) or true),
         "the follower never takes a request: it serves nothing itself",
     );
-    let mut fl = store.fleet("flare") or st::FleetRow { };
+    let mut fl = store.fleet("node-b") or st::FleetRow { };
     fl.draining = true;
     store.put_fleet(fl) or discard;
     std::test::assert(
@@ -526,35 +529,35 @@ fn main() {
     // ---- the follower's assignment carries its part ----------------------
     let a = api::assignment_of(
         store,
-        store.node("flare") or st::NodeRow { },
+        store.node("node-b") or st::NodeRow { },
     ) or api::AssignmentRead { };
     let assigned = api::assignment_json(a);
     std::test::assert(
         std::str::contains(assigned, "\"id\": \"ds\"")
             && std::str::contains(assigned, "\"rank\": 1"),
-        "flare is assigned its part: " + assigned,
+        "node-b is assigned its part: " + assigned,
     );
 
     // ---- removed, both seats go --------------------------------------------
     placements.remove(api::PlacementRef { placement: "ds" }) or discard;
     std::test::assert(
-        !(store.seat("spark", "ds") or st::SeatRow { }).present
-            && !(store.seat("flare", "ds") or st::SeatRow { }).present,
+        !(store.seat("node-a", "ds") or st::SeatRow { }).present
+            && !(store.seat("node-b", "ds") or st::SeatRow { }).present,
         "removing the placement removes both seats",
     );
 
     // ---- decision seat first, then the pair ---------------------------------
-    let again = place(placements, "ds3", "deepseek", "spark,flare");
+    let again = place(placements, "ds3", "deepseek", "node-a,node-b");
     std::test::assert_eq_str(
         again,
         "safetensors-fp8 on vllm-26.09",
-        "with the decision seat already on spark, the pair still fits",
+        "with the decision seat already on node-a, the pair still fits",
     );
     let p3 = placements.get(api::PlacementRef { placement: "ds3" }) or api::Placement { };
     std::test::assert_eq_int(
         p3.cache_tokens,
         p.cache_tokens,
-        "the decision seat on spark leaves room for the whole cache still, at 17.2 KB a token",
+        "the decision seat on node-a leaves room for the whole cache still, at 17.2 KB a token",
     );
 
     // ---- one node: the GGUF that fits a Spark --------------------------------
@@ -566,8 +569,8 @@ fn main() {
         },
     )
     or discard;
-    add_node(store, "spark2", caps(memory, "linux", "arm64", "cuda", ""));
-    let one = place(placements, "ds-one", "ds-one", "spark2");
+    add_node(store, "node-g", caps(memory, "linux", "arm64", "cuda", ""));
+    let one = place(placements, "ds-one", "ds-one", "node-g");
     std::test::assert_eq_str(
         one,
         "gguf-q2_k_s on llama-server-b11913-cuda",

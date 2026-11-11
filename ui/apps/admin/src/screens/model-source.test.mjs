@@ -29,16 +29,16 @@ test('an api model is metered, not flat-rate', () => {
 });
 
 test('a placed model opens its placement, served on every node it is placed on', () => {
-  const placements = [{ id: 'qwen-spark', model: 'qwen', nodes: ['spark', 'ember'], account: 'local' }];
-  const s = modelSource({ id: 'qwen', seats: ['spark/qwen-spark'] }, at(seat('spark/qwen-spark', 'managed', { placement: 'qwen-spark', account: 'local' })), kindOf, placements);
+  const placements = [{ id: 'qwen-node-a', model: 'qwen', nodes: ['node-a', 'node-e'], account: 'local' }];
+  const s = modelSource({ id: 'qwen', seats: ['node-a/qwen-node-a'] }, at(seat('node-a/qwen-node-a', 'managed', { placement: 'qwen-node-a', account: 'local' })), kindOf, placements);
   assert.deepEqual(s.sources, ['local']);
-  assert.deepEqual(s.nodes, ['spark', 'ember']);
+  assert.deepEqual(s.nodes, ['node-a', 'node-e']);
   assert.deepEqual(s.accounts, ['local']);
-  assert.deepEqual(s.target, { kind: 'placement', id: 'qwen-spark' });
+  assert.deepEqual(s.target, { kind: 'placement', id: 'qwen-node-a' });
 });
 
 test('placed but with no seat yet, or with a recipe and not placed: local', () => {
-  const placements = [{ id: 'p', model: 'qwen', nodes: ['spark'], account: 'local' }];
+  const placements = [{ id: 'p', model: 'qwen', nodes: ['node-a'], account: 'local' }];
   assert.deepEqual(modelSource({ id: 'qwen', seats: [] }, at(), kindOf, placements).sources, ['local']);
   const unplaced = modelSource({ id: 'qwen', seats: [], recipe: 'qwen3' }, at(), kindOf, []);
   assert.deepEqual(unplaced.sources, ['local']);

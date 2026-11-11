@@ -420,6 +420,74 @@ fn main() {
     std::test::assert_eq_str(str(lost.body, "state"), "failed", "failed when its node restarted");
     std::test::assert(std::str::contains(str(lost.body, "failure"), "restarted"), "and why");
 
+    // the node, registered again, says its seats are up again
+    let again = call(e, "POST", "/node/v1/register", token, reg);
+    let v2 = std::json::find_int_field(
+        std::json::find_field_raw(again.body, "assignment"),
+        "version",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/seats",
+        token,
+        "{\"assignment_version\": " + to_string(v2)
+            + ", \"seats\": [{\"id\": \"coder\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"answer\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}]}",
+    );
+
+    // a queue whose oldest attempts no seat here can run: a claim reads past
+    // them to the first one it can, oldest first among those
+    catalog.create(api::CatalogModelCreate { id: "elsewhere-1" }) or discard;
+    let mut blocked = 0;
+    while blocked < 70 {
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"harness\": \"fake\"", "\"model\": \"elsewhere-1\""),
+        );
+        blocked = blocked + 1;
+    }
+    let runnable = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let deep = call(e, "POST", "/node/v1/attempts/claim", token, "{}");
+    expect(deep, 200, "claimed past the queue's first page");
+    std::test::assert_eq_str(
+        str(std::json::find_field_raw(deep.body, "attempt"), "id"),
+        runnable,
+        "the first it can run",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + runnable + "/report",
+        token,
+        "{\"state\": \"failed\", \"failure\": \"a test\", \"events\": []}",
+    );
+
+    // a key revoked while its attempt waits: the attempt never starts
+    let late = (
+        keys.create(
+            api::KeyCreate { project: "work", name: "late" },
+        ) or api::Key { status: api::KeyStatus::revoked }
+    );
+    let waiting = str(call(e, "POST", "/v1/attempts", late.secret, ASK).body, "id");
+    keys.revoke(api::KeyRef { project: "work", key: late.id }) or discard;
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 204, "nothing it may start");
+    let refused = call(
+        e,
+        "GET",
+        "/admin/v1/attempts/" + waiting,
+        e.store.operator_token("va-test") or "",
+        "",
+    );
+    std::test::assert_eq_str(str(refused.body, "state"), "failed", "a revoked key's attempt fails");
+    std::test::assert_eq_str(
+        std::str::trim(std::json::find_field_raw(refused.body, "served")),
+        "null",
+        "and never ran",
+    );
+
     // the operator sees every project's, and the harnesses voice has
     let op = e.store.operator_token("va-test") or "";
     let all = call(e, "GET", "/admin/v1/attempts", op, "");

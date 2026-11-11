@@ -42,6 +42,12 @@ const ATTEMPT_SLOTS: Int = 4;
 /// How often a running attempt reports, at most, in ns.
 const REPORT_EVERY_NS: Int = 2000000000;
 
+/// How long the node keeps telling the api an attempt's end (and handing
+/// its bundle) when the api does not take it: as long as the api waits for
+/// a running attempt's report before it fails it as lost (api/attempts.hl,
+/// `ATTEMPT_LOST_S`).
+const FINAL_REPORT_S: Int = 600;
+
 /// The most events a report carries.
 const REPORT_EVENTS: Int = 400;
 
@@ -535,6 +541,15 @@ locus AttemptRun {
         }
         self.copy_login_back(def);
         if ran.stopped && self.cancelled { return self.stopped(base_sha, ""); }
+        // usage the harness reported last (its final output, or the file it
+        // wrote on exit) is held to the budget as well
+        if self.a.budget_tokens > 0 && self.reader.has_usage && len(self.stop) == 0
+            && self.reader.input_tokens + self.reader.output_tokens > self.a.budget_tokens
+        {
+            self.stop = "the harness used more than its budget of "
+                + to_string(self.a.budget_tokens)
+                + " tokens";
+        }
         // 4. what it left uncommitted, committed as the caller
         self.phase = "committing";
         let summary = self.reader.final_summary();
@@ -581,7 +596,7 @@ locus AttemptRun {
             60,
             slot,
         );
-        let why = if ran.stopped {
+        let why = if ran.stopped || len(self.stop) > 0 {
             self.stop
         } else if ran.code != 0 {
             "the harness exited with code " + to_string(ran.code) + tail_of(ran.err)
@@ -747,9 +762,11 @@ locus AttemptRun {
     /// `POST /node/v1/attempts/{id}/report`: the events waiting, and the
     /// fields given; a cancel in the answer stops the attempt.
     @unbounded
-    fn report_now(state: String, base_sha: String, head_sha: String, extra: String) {
+    fn report_now(state: String, base_sha: String, head_sha: String, extra: String) -> Bool {
         self.reported_ns = std::time::monotonic_ns();
-        let events = std::str::replace(std::str::trim(self.pending), "\n", ", ");
+        let held = self.pending;
+        let held_n = self.pending_n;
+        let events = std::str::replace(std::str::trim(held), "\n", ", ");
         self.pending = "";
         self.pending_n = 0;
         let body = "{\"phase\": " + q(self.phase) + ", \"harness\": "
@@ -766,14 +783,19 @@ locus AttemptRun {
             + to_string((std::time::monotonic_ns() - self.started_ns) / 1000000)
             + extra + "}";
         let resp = self.call("POST", "/node/v1/attempts/" + self.a.id + "/report", body);
-        if resp.status == 200
-            && std::json::find_bool_field(std::str::from_bytes(resp.body), "cancel")
-        {
+        if resp.status != 200 {
+            // not taken: its events go with the next report, in order
+            self.pending = held + self.pending;
+            self.pending_n = held_n + self.pending_n;
+            return false;
+        }
+        if std::json::find_bool_field(std::str::from_bytes(resp.body), "cancel") {
             if len(self.stop) == 0 && len(state) == 0 {
                 self.cancelled = true;
                 self.stop = "it was cancelled";
             }
         }
+        return true;
     }
 
     /// The attempt's end, reported (state, failure, commits, summary), and
@@ -787,13 +809,25 @@ locus AttemptRun {
     ) -> String {
         if len(failure) > 0 { self.add(event_line("error", failure)); }
         self.phase = "";
-        self.report_now(
-            state,
-            base_sha,
-            head_sha,
-            (if len(failure) > 0 { ", \"failure\": " + q(failure) } else { "" })
-                + (if len(summary) > 0 { ", \"summary\": " + q(summary) } else { "" }),
-        );
+        // the end is the attempt's result: told until the api takes it
+        // (an api restarting, or briefly away), and only then is what the
+        // attempt made removed; past `FINAL_REPORT_S` the api has failed it
+        // as lost
+        let extra = (if len(failure) > 0 { ", \"failure\": " + q(failure) } else { "" })
+            + (if len(summary) > 0 { ", \"summary\": " + q(summary) } else { "" });
+        let until = std::time::monotonic_ns() + FINAL_REPORT_S * 1000000000;
+        let mut wait_ms = 1000;
+        while !self.report_now(state, base_sha, head_sha, extra) {
+            if std::time::monotonic_ns() > until {
+                log_error(
+                    "an attempt's end could not be reported",
+                    fields2(std::log::kv("attempt", self.a.id), std::log::kv("state", state)),
+                );
+                return state;
+            }
+            std::time::sleep(wait_ms * 1ms);
+            wait_ms = if wait_ms < 30000 { wait_ms * 2 } else { 30000 };
+        }
         return state;
     }
 
@@ -994,7 +1028,15 @@ locus AttemptRun {
         }
         let body = "{\"bytes\": " + to_string(len(bytes)) + ", \"bundle\": \""
             + std::text::base64::encode(bytes) + "\"}";
-        let resp = self.call("PUT", "/node/v1/attempts/" + self.a.id + "/bundle", body);
+        // held until the api takes it, as the attempt's end is
+        let until = std::time::monotonic_ns() + FINAL_REPORT_S * 1000000000;
+        let mut wait_ms = 1000;
+        let mut resp = self.call("PUT", "/node/v1/attempts/" + self.a.id + "/bundle", body);
+        while (resp.status == 0 || resp.status >= 500) && std::time::monotonic_ns() < until {
+            std::time::sleep(wait_ms * 1ms);
+            wait_ms = if wait_ms < 30000 { wait_ms * 2 } else { 30000 };
+            resp = self.call("PUT", "/node/v1/attempts/" + self.a.id + "/bundle", body);
+        }
         if resp.status != 204 {
             return "the api did not take the bundle (" + to_string(resp.status) + ")";
         }

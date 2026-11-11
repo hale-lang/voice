@@ -29,6 +29,11 @@ const ATTEMPT_LOST_S: Int = 600;
 const ATTEMPT_DEADLINE_S: Int = 14400;
 const ATTEMPT_DEADLINE_MAX_S: Int = 86400;
 
+/// A claim reads the queue `CLAIM_PAGE` at a time, at most `CLAIM_SCAN`
+/// deep.
+const CLAIM_PAGE: Int = 64;
+const CLAIM_SCAN: Int = 4096;
+
 /// How long a bundle is held for its caller when nobody fetches it.
 const BUNDLE_TTL_S: Int = 86400;
 
@@ -70,6 +75,22 @@ fn shipped_harnesses(dir: String) -> String {
         out.add(file);
     }
     return "[" + out.text() + "]";
+}
+
+/// An answer of the attempts' plane, with its request's id, as every
+/// caller-plane answer carries one.
+fn answer(status: Int, body: String) -> std::http::Response {
+    return std::http::Response {
+        status: status,
+        content_type: "application/json",
+        headers: request_id_header(),
+        body: body,
+    };
+}
+
+/// `X-Request-Id`, a fresh id.
+fn request_id_header() -> String {
+    return "X-Request-Id: req_" + (random_hex(12) or "unnumbered");
 }
 
 /// The definition `id` among `defs` (a JSON list), "" when there is none.
@@ -334,7 +355,7 @@ locus CodingAttempts {
         };
         self.store.insert_attempt(row) or fail store_failed(err);
         let made = self.store.attempt(id) or fail metering_failed(err);
-        return json_answer(202, attempt_json(made));
+        return answer(202, attempt_json(made));
     }
 
     /// The attempt `id` as `project` ("" for the operator) may see it.
@@ -348,7 +369,7 @@ locus CodingAttempts {
 
     fn get(project: String, id: String) -> std::http::Response fallible(ApiError) {
         let a = self.visible(project, id) or raise;
-        return json_answer(200, attempt_json(a));
+        return answer(200, attempt_json(a));
     }
 
     /// `listAttempts`: newest first, of `project` ("" for every project, the
@@ -362,7 +383,7 @@ locus CodingAttempts {
         for a in rows.rows {
             out.add(attempt_json(a));
         }
-        return json_answer(200, "{\"object\": \"list\", \"data\": [" + out.text() + "]}");
+        return answer(200, "{\"object\": \"list\", \"data\": [" + out.text() + "]}");
     }
 
     /// `cancelAttempt`: a queued attempt ends now; a running one is
@@ -372,7 +393,7 @@ locus CodingAttempts {
         let a = self.store.cancel_attempt(id, now_seconds()) or fail metering_failed(err);
         if a.state == "cancelled" && len(a.transcript_digest) == 0 { self.settle(a); }
         let now = self.store.attempt(id) or fail metering_failed(err);
-        return json_answer(200, attempt_json(now));
+        return answer(200, attempt_json(now));
     }
 
     /// The stored transcript, whole: one `CodingAttemptEvent` a line
@@ -384,6 +405,7 @@ locus CodingAttempts {
         return std::http::Response {
             status: 200,
             content_type: "application/jsonl",
+            headers: request_id_header(),
             body: text,
         };
     }
@@ -470,7 +492,7 @@ locus CodingAttempts {
             return std::http::Response {
                 status: 200,
                 content_type: "text/plain",
-                headers: "X-Voice-Bundle: base64",
+                headers: "X-Voice-Bundle: base64\r\n" + request_id_header(),
                 body: b64,
             };
         }
@@ -479,7 +501,8 @@ locus CodingAttempts {
         std::io::tcp::send_fd(
             conn_fd,
             std::bytes::from_string(
-                "HTTP/1.1 200 OK\r\n" + head + "\r\nCache-Control: no-store\r\nContent-Length: "
+                "HTTP/1.1 200 OK\r\n" + head + "\r\n" + request_id_header()
+                    + "\r\nCache-Control: no-store\r\nContent-Length: "
                     + to_string(len(bytes)) + "\r\nConnection: close\r\n\r\n",
             ),
         ) or discard;
@@ -535,54 +558,77 @@ locus CodingAttempts {
         self.sweep(now);
         let f = self.store.fleet(node) or fail metering_failed(err);
         let all = self.store.seats() or fail metering_failed(err);
-        let queued = self.store.queued_attempts(64) or fail metering_failed(err);
-        for a in queued.rows {
-            if std::time::unix(a.deadline_at) <= std::time::unix(now) {
-                self.store.end_attempt(
-                    a.id,
-                    "failed",
-                    "its deadline passed before a seat took it",
-                    now,
-                ) or discard;
-                continue;
-            }
-            let k = self.store.key(a.key) or fail metering_failed(err);
-            let p = as_in_force(
-                self.store,
-                self.store.project(k.project) or fail metering_failed(err),
+        // the queue, oldest first, a page at a time: the first attempt one
+        // of this node's seats can run, however many older ones none can
+        let mut offset = 0;
+        while offset < CLAIM_SCAN {
+            let queued = self.store.queued_attempts(
+                offset,
+                CLAIM_PAGE,
             ) or fail metering_failed(err);
-            if !k.present || !p.present || p.archived {
-                self.store.end_attempt(
-                    a.id,
-                    "failed",
-                    "its project or key is no longer active",
-                    now,
-                ) or discard;
-                continue;
-            }
-            for s in all.rows {
-                if s.node != node || !s.enabled || !has_name(s.data_classes.items, "internal") {
+            let mut seen = 0;
+            let mut ended = 0;
+            for a in queued.rows {
+                seen = seen + 1;
+                if std::time::unix(a.deadline_at) <= std::time::unix(now) {
+                    self.store.end_attempt(
+                        a.id,
+                        "failed",
+                        "its deadline passed before a seat took it",
+                        now,
+                    ) or discard;
+                    ended = ended + 1;
                     continue;
                 }
-                let kind = engine_kind_of(f.capabilities, s.engine);
-                let h = seat_harness(kind, s.config);
-                if len(h) == 0 || (len(a.harness) > 0 && a.harness != h) { continue; }
-                let def = definition_of(self.harnesses, h);
-                if len(def) == 0 { continue; }
-                if len(a.model) > 0 && !seat_serves(s, a.model) { continue; }
-                if !(allows(p.accounts, s.account) && allows(k.accounts, s.account)) { continue; }
-                if !(seat_ready(self.store, s) or false) { continue; }
-                let started = self.store.start_attempt(
-                    a.id,
-                    node,
-                    s.id,
-                    s.account,
-                    h,
-                    seat_concurrency(s),
-                    now,
+                let k = self.store.key(a.key) or fail metering_failed(err);
+                let p = as_in_force(
+                    self.store,
+                    self.store.project(k.project) or fail metering_failed(err),
                 ) or fail metering_failed(err);
-                if started { return json_answer(200, self.start_json(a, s, def)); }
+                if !k.present
+                    || key_status(k, now) != KeyStatus::active
+                    || !p.present
+                    || p.archived
+                {
+                    self.store.end_attempt(
+                        a.id,
+                        "failed",
+                        "its project or key is no longer active",
+                        now,
+                    ) or discard;
+                    ended = ended + 1;
+                    continue;
+                }
+                for s in all.rows {
+                    if s.node != node || !s.enabled || !has_name(s.data_classes.items, "internal") {
+                        continue;
+                    }
+                    let kind = engine_kind_of(f.capabilities, s.engine);
+                    let h = seat_harness(kind, s.config);
+                    if len(h) == 0 || (len(a.harness) > 0 && a.harness != h) { continue; }
+                    let def = definition_of(self.harnesses, h);
+                    if len(def) == 0 { continue; }
+                    if len(a.model) > 0 && !seat_serves(s, a.model) { continue; }
+                    if !(allows(p.accounts, s.account) && allows(k.accounts, s.account)) {
+                        continue;
+                    }
+                    if !(seat_ready(self.store, s) or false) { continue; }
+                    let started = self.store.start_attempt(
+                        a.id,
+                        node,
+                        s.id,
+                        s.account,
+                        h,
+                        seat_concurrency(s),
+                        now,
+                    ) or fail metering_failed(err);
+                    if started { return json_answer(200, self.start_json(a, s, def)); }
+                }
             }
+            if seen < CLAIM_PAGE { break; }
+            // the attempts ended on this page left the queue: the next page
+            // starts that much earlier
+            offset = offset + CLAIM_PAGE - ended;
         }
         return no_content();
     }

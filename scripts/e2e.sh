@@ -889,7 +889,7 @@ wait_for up
 # no container, no network, no workspace. A node that starts removes what
 # an attempt of its own left before.
 GITD_PORT=${GITD_PORT:-14303}
-CODER_PORT=${CODER_PORT:-18094}
+CODER_PORT=${CODER_PORT:-18110}
 mkdir -p "$work/repos" "$work/seed"
 git -C "$work/seed" init -q -b main
 echo "# demo" >"$work/seed/README.md"
@@ -906,7 +906,7 @@ coder_token=$(post /admin/v1/nodes '{"id": "coder"}' | field enrollment_token)
 post /admin/v1/nodes/coder/seats '{"id": "fake", "engine": "fake", "account": "coder", "serves": [{"model": "fake-1"}], "config": {"harness": "fake", "login": "e2e-fake-login"}}' >/dev/null
 echo '{"engines": [{"id": "fake", "kind": "harness"}]}' >"$work/coder-caps.json"
 start_coder() {
-  HALE_VAULT_DIR="$work/vault" node/node --id coder --api "$api" --token "$coder_token" --data "$work/coder-data" --capabilities "$work/coder-caps.json" --port "$CODER_PORT" --readings-port "$((READINGS_PORT + 3))" >>"$work/coder.log" 2>&1 &
+  HALE_VAULT_DIR="$work/vault" node/node --id coder --api "$api" --token "$coder_token" --data "$work/coder-data" --capabilities "$work/coder-caps.json" --port "$CODER_PORT" --readings-port "$((CODER_PORT + 1000))" >>"$work/coder.log" 2>&1 &
   coder_pid=$!
   pids+=($coder_pid)
   # its own API answers once it started (and removed what attempts left)

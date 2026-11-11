@@ -1,0 +1,820 @@
+// The hosted tool `web_fetch` (web_fetch.hl): a model that calls it, and
+// the api fetching each page from a site in process, handing the model its
+// text and asking it again, streamed and not; the cap on fetches; a call of
+// the caller's own tool beside it; a project key refused; the operator's
+// settings and denylist (a redirect to a host it names included); the size,
+// timeout and content-type limits; a page's readable text; and a fetch that
+// fails told to the model as the call's output, never as the request's.
+import ".." as api;
+import "../../store" as st;
+
+// ---- the site --------------------------------------------------------
+
+const PAGE: String = "<!doctype html><html><head><title>The Lake &amp; Shore</title><style>body { color: red }</style><script>var x = '<p>not text</p>';</script></head><body><nav><a href=\"/home\">Home</a> <a href=\"/about\">About</a></nav><h1>Lake  report</h1><p>The water is <b>cold</b> today&nbsp;&mdash; see <a href=\"/data/temps.json\">the temperatures</a>.</p><ul><li>north shore</li><li>south&#32;shore &#x263A;</li></ul><!-- a comment <p>hidden</p> --><footer>made somewhere</footer></body></html>";
+
+/// The site the fetches are made of.
+locus Site {
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let p = req.path;
+        if p == "/page.html" {
+            return std::http::Response {
+                status: 200,
+                content_type: "text/html; charset=utf-8",
+                body: PAGE,
+            };
+        }
+        if p == "/plain.txt" {
+            return std::http::Response {
+                status: 200,
+                content_type: "text/plain",
+                body: "plain words, nothing more",
+            };
+        }
+        if p == "/data.json" {
+            return std::http::Response {
+                status: 200,
+                content_type: "application/json",
+                body: "{\"temp\": 4}",
+            };
+        }
+        if p == "/redirect" {
+            return std::http::Response { status: 302, headers: "Location: /page.html", body: "" };
+        }
+        if p == "/to-denied" {
+            return std::http::Response {
+                status: 301,
+                headers: "Location: http://blocked.example/secret",
+                body: "",
+            };
+        }
+        if p == "/loop" {
+            return std::http::Response { status: 302, headers: "Location: /loop", body: "" };
+        }
+        if p == "/big.txt" {
+            return std::http::Response {
+                status: 200,
+                content_type: "text/plain",
+                body: std::str::repeat("0123456789", 500),
+            };
+        }
+        if p == "/slow.txt" {
+            std::time::sleep(3s);
+            return std::http::Response { status: 200, content_type: "text/plain", body: "late" };
+        }
+        if p == "/image.png" {
+            return std::http::Response { status: 200, content_type: "image/png", body: "PNG" };
+        }
+        if p == "/headers" {
+            // what the fetch sent, so the test sees no credential went
+            return std::http::Response {
+                status: 200,
+                content_type: "text/plain",
+                body: req.headers,
+            };
+        }
+        return std::http::Response { status: 404, content_type: "text/plain", body: "not here" };
+    }
+}
+
+// ---- the model -------------------------------------------------------
+
+/// A seat whose model calls `web_fetch` while it is offered, up to
+/// `fetches` times over a conversation and `per_turn` calls a turn, each
+/// for `url`; then answers `seen: ` and the last output it was given. With
+/// `mixed`, its first turn calls `web_fetch` and the caller's `lookup` at
+/// once.
+locus Model {
+    params {
+        url: String = "";
+        fetches: Int = 1;
+        per_turn: Int = 1;
+        mixed: Bool = false;
+        offers: Int = 0;
+        // each offer's standard request, a line each
+        bodies: String = "";
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, request_id: String, reply_to: String, msg: Bytes) -> api::Offer {
+        let wire = std::str::from_bytes(msg);
+        let body = std::str::trim(std::json::find_field_raw(wire, "body"));
+        self.offers = self.offers + 1;
+        self.bodies = self.bodies + body + "\n";
+        let offered = std::str::contains(body, "\"name\": \"web_fetch\"");
+        let mut outputs = 0;
+        let mut last = "";
+        let mut it = std::json::array_first(
+            std::str::trim(std::json::find_field_raw(body, "input")),
+        );
+        while !it.done {
+            if std::json::find_string_field(it.element, "type") == "function_call_output" {
+                outputs = outputs + 1;
+                last = std::json::find_string_field(it.element, "output");
+            }
+            it = std::json::array_next(it);
+        }
+        let mut items = "";
+        let mut script = "";
+        let mut seq = 2;
+        let mut n = 0;
+        if self.mixed && offered && outputs == 0 {
+            script = script + call_events(request_id, 0, "web_fetch", self.url, seq);
+            items = call_item(request_id, 0, "web_fetch", self.url, "completed");
+            script = script + call_events(request_id, 1, "lookup", "", seq + 3);
+            items = items + "," + call_item(request_id, 1, "lookup", "", "completed");
+        } else if offered && outputs < self.fetches {
+            while n < self.per_turn {
+                script = script + call_events(request_id, n, "web_fetch", self.url, seq);
+                items = items + (if n > 0 { "," } else { "" })
+                    + call_item(request_id, n, "web_fetch", self.url, "completed");
+                seq = seq + 3;
+                n = n + 1;
+            }
+        } else {
+            let text = "seen: " + last;
+            let msg_item = "{\"type\":\"message\",\"id\":\"msg_" + request_id
+                + "\",\"status\":\"completed\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":"
+                + q(text) + ",\"annotations\":[]}]}";
+            script = "{\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"msg_"
+                + request_id
+                + "\",\"status\":\"in_progress\",\"role\":\"assistant\",\"content\":[]},\"sequence_number\":2}\n"
+                + "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_" + request_id
+                + "\",\"output_index\":0,\"content_index\":0,\"delta\":" + q(text)
+                + ",\"sequence_number\":3}\n"
+                + "{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":" + msg_item
+                + ",\"sequence_number\":4}\n";
+            items = msg_item;
+        }
+        let pending = "{\"id\":" + q(request_id)
+            + ",\"object\":\"response\",\"created_at\":1,\"status\":\"in_progress\",\"model\":\"echo-1\",\"output\":[],\"usage\":null}";
+        let done = "{\"id\":" + q(request_id)
+            + ",\"object\":\"response\",\"created_at\":1,\"status\":\"completed\",\"model\":\"echo-1\",\"output\":["
+            + items
+            + "],\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":0},\"total_tokens\":15}}";
+        script = "{\"type\":\"response.created\",\"response\":" + pending
+            + ",\"sequence_number\":0}\n"
+            + "{\"type\":\"response.in_progress\",\"response\":" + pending
+            + ",\"sequence_number\":1}\n"
+            + script + "{\"type\":\"response.completed\",\"response\":" + done
+            + ",\"sequence_number\":99}\n";
+        return Played {
+            script: script,
+            result: "{\"type\":\"result\",\"request_id\":" + q(request_id)
+                + ",\"outcome\":\"served\",\"served\":{\"model\":\"echo\"},\"timing\":{\"first_output_ms\":1,\"engine_ms\":2}}",
+        };
+    }
+}
+
+fn q(s: String) -> String { return "\"" + std::json::escape_string(s) + "\""; }
+
+fn call_item(id: String, n: Int, name: String, url: String, status: String) -> String {
+    let args = if name == "web_fetch" { "{\"url\": " + q(url) + "}" } else { "{}" };
+    return "{\"type\":\"function_call\",\"id\":\"fc_" + id + "_" + to_string(n)
+        + "\",\"call_id\":\"call_"
+        + id + "_" + to_string(n) + "\",\"name\":" + q(name) + ",\"arguments\":"
+        + q(if status == "completed" { args } else { "" }) + ",\"status\":" + q(status) + "}";
+}
+
+fn call_events(id: String, n: Int, name: String, url: String, seq: Int) -> String {
+    let args = if name == "web_fetch" { "{\"url\": " + q(url) + "}" } else { "{}" };
+    return "{\"type\":\"response.output_item.added\",\"output_index\":" + to_string(n)
+        + ",\"item\":"
+        + call_item(id, n, name, url, "in_progress") + ",\"sequence_number\":" + to_string(seq)
+        + "}\n" + "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_" + id
+        + "_"
+        + to_string(n) + "\",\"output_index\":" + to_string(n) + ",\"delta\":" + q(args)
+        + ",\"sequence_number\":" + to_string(seq + 1) + "}\n"
+        + "{\"type\":\"response.output_item.done\",\"output_index\":" + to_string(n) + ",\"item\":"
+        + call_item(id, n, name, url, "completed") + ",\"sequence_number\":" + to_string(seq + 2)
+        + "}\n";
+}
+
+/// One offer, played: its events a line each, then its result.
+locus Played {
+    params {
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+    }
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "accepted" }; }
+    fn next(wait: Duration) -> api::LinkMsg {
+        if self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            return api::LinkMsg { kind: "event", json: line };
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        return api::LinkMsg { kind: "lost" };
+    }
+    fn finish() { self.ended = true; }
+}
+
+// ---- helpers ---------------------------------------------------------
+
+fn operator(e: api::DataPlane) -> String {
+    return "Authorization: Bearer " + (e.store.operator_token("va-test") or "");
+}
+
+fn call(
+    e: api::DataPlane,
+    method: String,
+    path: String,
+    headers: String,
+    body: String
+) -> std::http::Response {
+    return e.handle(
+        std::http::Request { method: method, path: path, headers: headers, body: body },
+    );
+}
+
+fn ask(e: api::DataPlane, body: String) -> std::http::Response {
+    return call(e, "POST", "/v1/responses", operator(e) + "\r\nVoice-Project: work", body);
+}
+
+fn settings(e: api::DataPlane, body: String) -> std::http::Response {
+    return call(e, "PUT", "/admin/v1/tools", operator(e), body);
+}
+
+fn expect(r: std::http::Response, status: Int, what: String) {
+    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+}
+
+fn has(s: String, what: String, why: String) {
+    std::test::assert(std::str::contains(s, what), why + ": wanted " + what + " in " + s);
+}
+
+fn lacks(s: String, what: String, why: String) {
+    std::test::assert(!std::str::contains(s, what), why + ": no " + what + " in " + s);
+}
+
+@unbounded
+fn occurrences(s: String, what: String) -> Int {
+    let mut n = 0;
+    let mut at = std::str::index_of(s, what);
+    while at >= 0 {
+        n = n + 1;
+        at = std::str::index_of_from(s, what, at + len(what));
+    }
+    return n;
+}
+
+/// The output items of a response, their types joined with spaces.
+@unbounded
+fn item_types(response: String) -> String {
+    let mut out = "";
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        out = out + (if len(out) > 0 { " " } else { "" })
+            + std::json::find_string_field(it.element, "type");
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// The output item at `i` of a response.
+@unbounded
+fn item_at(response: String, i: Int) -> String {
+    let mut n = 0;
+    let mut it = std::json::array_first(
+        std::str::trim(std::json::find_field_raw(response, "output")),
+    );
+    while !it.done {
+        if n == i { return std::str::trim(it.element); }
+        n = n + 1;
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+fn limits(max_calls: Int, timeout_ms: Int, max_bytes: Int) -> api::WebFetchSettings {
+    return api::WebFetchSettings {
+        max_calls: max_calls,
+        timeout_ms: timeout_ms,
+        max_bytes: max_bytes,
+    };
+}
+
+const CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"reason\": null}";
+
+/// A node with one static seat serving echo-1, registered and up.
+fn bring_up(e: api::DataPlane, id: String) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: id }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let token = made.enrollment_token;
+    let mut sc = api::SeatCreate {
+        node: id,
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello\"}") or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat on " + id + ": " + api::ctl_problem(err).message);
+    };
+    let reg = call(
+        e,
+        "POST",
+        "/node/v1/register",
+        "Authorization: Bearer " + token,
+        "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS + ", \"local\": "
+            + LOCAL
+            + "}",
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/seats",
+            "Authorization: Bearer " + token,
+            "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}",
+        ),
+        204,
+        id + " reports its seat",
+    );
+}
+
+// ---- the test --------------------------------------------------------
+
+main locus App {
+    params {
+        srv: std::http::Server = std::http::Server { port: 0, handler: Site { } };
+    }
+    placement {
+        srv: cooperative(pool = io) where async_io;
+    }
+    run() {
+        let base = "http://127.0.0.1:" + to_string(std::io::tcp::__local_port(self.srv.listen_fd));
+        let site = std::http::parse_url(base + "/") or std::http::Url { };
+        let model = Model { url: base + "/page.html" };
+        let e = api::DataPlane { link: model };
+        let catalog = api::Catalog { store: e.store };
+        let accounts = api::Accounts { store: e.store };
+        let projects = api::Projects { store: e.store };
+        let keys = api::Keys { store: e.store };
+        catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+        accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+        projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+        let made = keys.create(api::KeyCreate { project: "work", name: "ci" }) or {
+            api::Key { status: api::KeyStatus::revoked }
+        };
+        bring_up(e, "laptop");
+
+        // ---- a page's readable text
+        let page = api::page_text(PAGE, site);
+        std::test::assert_eq_str(page.title, "The Lake & Shore", "the title, its entity decoded");
+        has(page.text, "# Lake report", "a heading, its spaces one");
+        has(
+            page.text,
+            "The water is cold today — see the temperatures (" + base + "/data/temps.json).",
+            "a paragraph, its link's URL read against the page",
+        );
+        has(page.text, "- north shore\n- south shore", "list items");
+        lacks(page.text, "not text", "no script");
+        lacks(page.text, "color", "no style");
+        lacks(page.text, "Home", "no navigation");
+        lacks(page.text, "made somewhere", "no footer");
+        lacks(page.text, "hidden", "no comment");
+        has(page.text, std::json::unescape_string("\\u263a"), "a numeric reference");
+        // a page of ampersands alone is read in one pass, not one per `&`
+        let amps = std::str::repeat("&", 1000000);
+        let a0 = std::time::monotonic_ns();
+        let read_amps = api::page_text("<p>" + amps + "</p>", site);
+        let amp_ms = (std::time::monotonic_ns() - a0) / 1000000;
+        std::test::assert_eq_int(len(read_amps.text), 1000000, "every & kept as text");
+        std::test::assert(amp_ms < 3000, "in linear time: " + to_string(amp_ms) + " ms");
+
+        // ---- the settings: voice's defaults, then the operator's
+        let shown = call(e, "GET", "/admin/v1/tools", operator(e), "");
+        expect(shown, 200, "the settings");
+        std::test::assert_eq_str(
+            shown.body,
+            "{\"web_fetch\": {\"enabled\": true, \"max_calls\": 8, \"timeout_ms\": 15000, \"max_bytes\": 2097152, \"max_chars\": 40000, \"denylist\": []}}",
+            "voice's defaults",
+        );
+        expect(call(e, "GET", "/admin/v1/tools", "", ""), 401, "the operator's alone");
+        expect(settings(e, "{\"web_fetch\": {\"max_calls\": 0}}"), 400, "at least one fetch");
+        expect(settings(e, "{\"web_fetch\": {\"timeout_ms\": 1.5}}"), 400, "whole milliseconds");
+        let bad = settings(e, "{\"web_fetch\": {\"denylist\": [\"198.51.100.0/33\"]}}");
+        expect(bad, 400, "a range's prefix");
+        has(bad.body, "198.51.100.0/33", "naming the entry");
+        expect(
+            settings(e, "{\"web_fetch\": {\"denylist\": [\"not a host\"]}}"),
+            400,
+            "a host name",
+        );
+
+        // ---- a request that fetches: the loop, answered whole
+        let r = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"what about the lake?\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(r, 200, "the operator's request with the hosted tool");
+        std::test::assert_eq_int(model.offers, 2, "the model asked twice");
+        std::test::assert_eq_str(
+            item_types(r.body),
+            "web_fetch_call message",
+            "the hosted call, then the answer",
+        );
+        let wf = item_at(r.body, 0);
+        std::test::assert_eq_str(
+            std::json::find_string_field(wf, "status"),
+            "completed",
+            "fetched",
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(wf, "url"),
+            base + "/page.html",
+            "its url",
+        );
+        std::test::assert_eq_int(std::json::find_int_field(wf, "http_status"), 200, "its status");
+        std::test::assert_eq_int(std::json::find_int_field(wf, "bytes"), len(PAGE), "its bytes");
+        has(
+            std::json::find_string_field(wf, "output"),
+            "Lake report",
+            "the text the model was given",
+        );
+        let id = std::json::find_string_field(r.body, "id");
+        has(r.body, "seen: {", "the model answered from the fetch's output");
+        has(r.body, "The Lake & Shore", "its title among it");
+        lacks(r.body, "\"name\": \"web_fetch\"", "the model's own call is not shown");
+        let usage = std::json::find_field_raw(r.body, "usage");
+        std::test::assert_eq_int(
+            std::json::find_int_field(usage, "input_tokens"),
+            20,
+            "both calls' input",
+        );
+        std::test::assert_eq_int(
+            std::json::find_int_field(usage, "output_tokens"),
+            10,
+            "and output",
+        );
+        let v = std::json::find_field_raw(r.body, "voice");
+        std::test::assert_eq_str(
+            std::json::find_string_field(v, "request_id"),
+            id,
+            "the request's id",
+        );
+        // each call recorded, in one conversation
+        let first = e.store.usage(id) or st::UsageRow { };
+        let second = e.store.usage(id + "_2") or st::UsageRow { };
+        std::test::assert(first.present && second.present, "each model call is a usage record");
+        std::test::assert_eq_str(
+            std::json::find_string_field(first.record, "conversation"),
+            id,
+            "in the request's conversation",
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(second.record, "conversation"),
+            id,
+            "both",
+        );
+        // the model was given the page as the call's output, never as instructions
+        has(
+            model.bodies,
+            "\"type\": \"function_call_output\"",
+            "the fetch went back as the call's output",
+        );
+        lacks(model.bodies, "\"instructions\"", "nothing was added to the instructions");
+
+        // ---- streamed: the hosted call an item of its own, then the answer
+        model.offers = 0;
+        let s = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"and now?\", \"stream\": true, \"prompt_cache_key\": \"chat_1\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(s, 200, "streamed");
+        let added = std::str::index_of(s.body, "\"type\": \"web_fetch_call\", \"id\": ");
+        std::test::assert(added > 0, "the hosted call is added: " + s.body);
+        has(
+            s.body,
+            "event: response.output_item.added\ndata: {\"type\": \"response.output_item.added\", \"output_index\": 0, \"item\": {\"type\": \"web_fetch_call\"",
+            "added at index 0",
+        );
+        has(s.body, "\"status\": \"in_progress\"", "in progress");
+        has(
+            s.body,
+            "event: response.output_item.done\ndata: {\"type\": \"response.output_item.done\", \"output_index\": 0, \"item\": {\"type\": \"web_fetch_call\"",
+            "done at index 0",
+        );
+        has(
+            s.body,
+            "\"output_index\": 1, \"content_index\": 0, \"delta\": \"seen: ",
+            "the answer's text after it, at index 1",
+        );
+        lacks(s.body, "function_call_arguments", "the model's own call is not sent");
+        lacks(s.body, "\"name\":\"web_fetch\"", "nor its item");
+        std::test::assert(
+            std::str::index_of(
+                s.body,
+                "response.output_item.done",
+            ) < std::str::index_of(s.body, "seen: "),
+            "the fetch before the answer",
+        );
+        has(s.body, "event: response.completed", "completed");
+        let completed = s.body[std::str::index_of(s.body, "event: response.completed")..len(s.body)];
+        has(completed, "\"type\": \"web_fetch_call\"", "the whole output in the last event");
+        std::test::assert(std::str::ends_with(s.body, "data: [DONE]\n\n"), "and [DONE]");
+        std::test::assert_eq_int(occurrences(s.body, "event: response.created"), 1, "one response");
+        let sid = std::json::find_string_field(
+            std::json::find_field_raw(
+                completed[std::str::index_of(completed, "{")..len(completed)],
+                "response",
+            ),
+            "id",
+        );
+        let streamed_second = e.store.usage(sid + "_2") or st::UsageRow { };
+        std::test::assert_eq_str(
+            std::json::find_string_field(streamed_second.record, "conversation"),
+            "chat_1",
+            "the caller's conversation kept",
+        );
+
+        // ---- the cap: three fetches, then the model answers without the tool
+        expect(settings(e, "{\"web_fetch\": {\"max_calls\": 3}}"), 200, "a cap of 3");
+        model.offers = 0;
+        model.bodies = "";
+        model.fetches = 100;
+        model.per_turn = 2;
+        let capped = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"fetch a lot\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(capped, 200, "capped");
+        std::test::assert_eq_str(
+            item_types(capped.body),
+            "web_fetch_call web_fetch_call web_fetch_call web_fetch_call message",
+            "two turns of two calls, then the answer",
+        );
+        std::test::assert_eq_int(
+            occurrences(capped.body, "\"status\": \"completed\", \"http_status\""),
+            3,
+            "three fetched",
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(item_at(capped.body, 3), "status"),
+            "failed",
+            "the fourth not",
+        );
+        has(
+            std::json::find_string_field(item_at(capped.body, 3), "error"),
+            "most fetches it may (3)",
+            "saying why",
+        );
+        std::test::assert_eq_int(model.offers, 3, "the model asked a last time");
+        std::test::assert_eq_int(
+            occurrences(model.bodies, "\"name\": \"web_fetch\", \"description\""),
+            2,
+            "the tool withdrawn for the last",
+        );
+
+        // ---- calls that name no URL count against the cap too: the model is
+        // asked a bounded number of times however it calls the tool
+        model.offers = 0;
+        model.per_turn = 1;
+        let kept_url = model.url;
+        model.url = "";
+        let empty = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(empty, 200, "calls with no url");
+        std::test::assert_eq_int(model.offers, 4, "three calls with no url, then a last answer");
+        std::test::assert_eq_int(
+            occurrences(empty.body, "\"error\": \"the call names no url"),
+            3,
+            "each told so",
+        );
+        model.url = kept_url;
+
+        // ---- a call of the caller's own tool: the request is the caller's again
+        expect(settings(e, "{}"), 200, "the defaults again");
+        model.offers = 0;
+        model.fetches = 1;
+        model.per_turn = 1;
+        model.mixed = true;
+        let mixed = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"look it up\", \"tools\": [{\"type\": \"web_fetch\"}, {\"type\": \"function\", \"name\": \"lookup\", \"parameters\": {\"type\": \"object\"}}]}",
+        );
+        expect(mixed, 200, "mixed");
+        std::test::assert_eq_int(model.offers, 1, "the loop stopped at once");
+        std::test::assert_eq_str(
+            item_types(mixed.body),
+            "function_call web_fetch_call",
+            "the caller's call, and the hosted one not run",
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(item_at(mixed.body, 0), "name"),
+            "lookup",
+            "the caller's tool",
+        );
+        has(
+            std::json::find_string_field(item_at(mixed.body, 1), "error"),
+            "caller's own tools",
+            "why not",
+        );
+        model.mixed = false;
+
+        // ---- the hosted tool with a caller's function of its name
+        expect(
+            ask(
+                e,
+                "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}, {\"type\": \"function\", \"name\": \"web_fetch\"}]}",
+            ),
+            400,
+            "two tools of one name",
+        );
+
+        // ---- a project key may not list it
+        let refused = call(
+            e,
+            "POST",
+            "/v1/responses",
+            "Authorization: Bearer " + made.secret,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(refused, 400, "a project key's request with the hosted tool");
+        std::test::assert_eq_str(
+            std::json::find_string_field(std::json::find_field_raw(refused.body, "error"), "code"),
+            "unsupported",
+            "unsupported",
+        );
+        has(refused.body, "operator's alone", "saying whose it is");
+
+        // ---- turned off
+        expect(settings(e, "{\"web_fetch\": {\"enabled\": false}}"), 200, "off");
+        let off = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(off, 400, "the tool turned off");
+        has(off.body, "turned off", "saying so");
+        expect(settings(e, "{}"), 200, "on again");
+
+        // ---- a fetch that fails is the model's to read, not the request's
+        model.url = base + "/missing";
+        model.offers = 0;
+        let missing = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(missing, 200, "the request is answered");
+        std::test::assert_eq_str(
+            std::json::find_string_field(item_at(missing.body, 0), "status"),
+            "failed",
+            "the call failed",
+        );
+        has(
+            std::json::find_string_field(item_at(missing.body, 0), "error"),
+            "HTTP 404",
+            "with its HTTP status",
+        );
+        has(missing.body, "seen: {", "and the model was told");
+        model.url = "http://127.0.0.1:1/nothing";
+        let unreachable = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(unreachable, 200, "answered");
+        has(
+            std::json::find_string_field(item_at(unreachable.body, 0), "error"),
+            "could not connect",
+            "a refused connection",
+        );
+
+        // ---- the denylist, at the URL asked for and at a redirect's
+        expect(
+            settings(
+                e,
+                "{\"web_fetch\": {\"denylist\": [\"192.0.2.0/24\", \"blocked.example\", \"127.0.0.1:1\"]}}",
+            ),
+            200,
+            "a denylist",
+        );
+        model.url = base + "/to-denied";
+        let redirected = ask(
+            e,
+            "{\"model\": \"echo-1\", \"input\": \"x\", \"tools\": [{\"type\": \"web_fetch\"}]}",
+        );
+        expect(redirected, 200, "answered");
+        let denied = item_at(redirected.body, 0);
+        has(
+            std::json::find_string_field(denied, "error"),
+            "denylist (blocked.example)",
+            "a redirect to a host denied",
+        );
+        let t = tool_settings(e);
+        has(
+            api::web_fetch("http://192.0.2.10/x", t).error,
+            "denylist (192.0.2.0/24)",
+            "an address in a range",
+        );
+        has(
+            api::web_fetch("http://sub.blocked.example/", t).error,
+            "denylist (blocked.example)",
+            "a name under one",
+        );
+        has(
+            api::web_fetch("http://[::ffff:192.0.2.7]/", t).error,
+            "denylist (192.0.2.0/24)",
+            "an IPv4 address written as IPv6",
+        );
+        has(
+            api::web_fetch("http://127.0.0.1:1/", t).error,
+            "denylist (127.0.0.1:1)",
+            "a host and port",
+        );
+        std::test::assert_eq_str(
+            api::web_fetch(base + "/plain.txt", t).error,
+            "",
+            "another port of that host is not",
+        );
+        std::test::assert_eq_str(
+            api::denied_by("fd00::5", 80, t.denylist),
+            "",
+            "an address outside",
+        );
+        expect(
+            settings(e, "{\"web_fetch\": {\"denylist\": [\"fd00::/8\"]}}"),
+            200,
+            "an IPv6 range",
+        );
+        std::test::assert_eq_str(
+            api::denied_by("fd00::5", 80, tool_settings(e).denylist),
+            "fd00::/8",
+            "an address in it",
+        );
+        expect(settings(e, "{}"), 200, "no denylist");
+
+        // ---- the fetch's own limits
+        let plain = api::web_fetch(base + "/plain.txt", api::WebFetchSettings { });
+        std::test::assert_eq_str(plain.text, "plain words, nothing more", "plain text as it is");
+        std::test::assert_eq_str(plain.content_type, "text/plain", "its type");
+        let via = api::web_fetch(base + "/redirect", api::WebFetchSettings { });
+        std::test::assert_eq_str(
+            via.url,
+            base + "/page.html",
+            "a redirect followed, its target the url",
+        );
+        std::test::assert_eq_str(via.title, "The Lake & Shore", "the page read");
+        has(
+            api::web_fetch(base + "/loop", api::WebFetchSettings { }).error,
+            "more than 5 redirects",
+            "at most 5",
+        );
+        let json = api::web_fetch(base + "/data.json", api::WebFetchSettings { });
+        std::test::assert_eq_str(json.text, "{\"temp\": 4}", "JSON as it is");
+        let big = api::web_fetch(base + "/big.txt", limits(8, 15000, 1024));
+        has(big.error, "too large", "past the size cap");
+        lacks(api::fetched_json(big), "\"text\"", "and nothing of it read");
+        let short = api::web_fetch(base + "/big.txt", api::WebFetchSettings { max_chars: 1000 });
+        std::test::assert_eq_int(len(short.text), 1000, "the text cut to max_chars");
+        std::test::assert(short.truncated, "and said so");
+        let t0 = std::time::monotonic_ns();
+        let slow = api::web_fetch(base + "/slow.txt", limits(8, 1000, 1024));
+        let waited = (std::time::monotonic_ns() - t0) / 1000000;
+        has(slow.error, "timed out", "past the timeout");
+        std::test::assert(waited < 2500, "within it: " + to_string(waited) + " ms");
+        let image = api::web_fetch(base + "/image.png", api::WebFetchSettings { });
+        has(image.error, "unsupported content type image/png", "a type it does not take");
+        has(
+            api::web_fetch("ftp://example.com/x", api::WebFetchSettings { }).error,
+            "only http and https",
+            "http and https alone",
+        );
+        has(
+            api::web_fetch("http://user:pw@example.com/", api::WebFetchSettings { }).error,
+            "credentials",
+            "no credentials in a URL",
+        );
+        let sent = api::web_fetch(base + "/headers", api::WebFetchSettings { });
+        has(sent.text, "User-Agent: voice-web-fetch/", "voice's user agent");
+        lacks(std::str::lower(sent.text), "authorization", "no credential");
+        lacks(std::str::lower(sent.text), "cookie", "no cookie");
+    }
+}
+
+fn tool_settings(e: api::DataPlane) -> api::WebFetchSettings {
+    return api::tool_settings_of(e.store.tool_settings() or "");
+}
+fn main() { App { }; }

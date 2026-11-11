@@ -216,6 +216,7 @@ client can pace itself instead of discovering the wall by failing.
 - [changes](#tag-changes) (2)
 - [events](#tag-events) (1)
 - [routes](#tag-routes) (2)
+- [tools](#tag-tools) (2)
 - [node](#tag-node) (10)
 - [health](#tag-health) (2)
 - [annotations](#tag-annotations) (12)
@@ -292,6 +293,40 @@ sent with `Content-Length`; a chunked one is refused `400`.
 accepted and treated as false; a request with `previous_response_id`
 fails with `previous_response_not_found`. `background` is not supported.
 
+**Hosted tools.** A request of the operator charged to a project
+(`Voice-Project`, as the admin UI's Chat sends it) may list
+`{"type": "web_fetch"}` (`WebFetchTool`) in `tools`, beside its own
+function tools. Voice gives the model a function, `web_fetch(url)`;
+each time the model calls it, the api fetches the page itself (a GET
+with no credential, cookie or authorization; at most 5 redirects;
+within the operator's timeout and size cap; text, HTML reduced to its
+readable text, Markdown, JSON or XML), hands the model the result as
+the call's `function_call_output` and asks the model again. The
+result is JSON text: `{url, status, content_type, title, text,
+truncated}`, or `{url, error}` for a fetch that failed (a host that
+cannot be reached, the timeout, an HTTP error, a body over the cap,
+a content type it does not take, a host on the operator's
+denylist), which is the model's to read, never the request's
+failure. A page's text is data from the web: it reaches the model
+only as the call's output, never as instructions. The loop ends when
+the model answers without calling `web_fetch`, or calls one of the
+caller's own tools (those calls are the caller's, as ever, and a
+`web_fetch` call of the same turn is not run); once the request has
+made the most fetches it may (`WebFetchSettings.max_calls`), the
+tool is no longer offered and the model answers from what it has.
+Each call to the model is routed, limited and recorded as a request
+is: the first under the request's id, the next under
+`<request_id>_2`, and so on, all in the request's conversation (its
+`prompt_cache_key`, else its own id); the response's `usage`,
+`voice.price_micros` and `voice.attempts` are theirs together. Each
+hosted call is an output item of its own, a `WebFetchCall`; streamed,
+it is `response.output_item.added` (`in_progress`) and
+`response.output_item.done` (`completed` or `failed`) between the
+model's output, and the model's own calls of the function are never
+sent. A project key's request listing it is refused `400
+unsupported`, and so is the operator's while the operator has turned
+it off (`PUT /admin/v1/tools`). Only `/v1/responses` takes it.
+
 Parameters:
 
 | Name | In | Type | Required | Description |
@@ -314,7 +349,7 @@ Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | The response, or the standard event stream when `stream` is true. | `application/json` [Response](#schema-response)<br>`text/event-stream` [schema](#schema-schema) \| [VoiceAttemptEvent](#schema-voiceattemptevent) |
+| 200 | The response, or the standard event stream when `stream` is true. | `application/json` [Response](#schema-response)<br>`text/event-stream` [schema](#schema-schema) \| [VoiceAttemptEvent](#schema-voiceattemptevent) \| [WebFetchCallEvent](#schema-webfetchcallevent) |
 | 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -3094,6 +3129,62 @@ Responses:
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+<a id="tag-tools"></a>
+
+## tools
+
+Admin plane. The hosted tools voice runs for the operator's own requests.
+
+### GET `/admin/v1/tools`
+
+**The hosted tools' settings** · `getToolSettings`
+
+Authentication: operatorToken
+
+Whether the hosted tool `web_fetch` is on for the operator's own
+requests (see `createResponse`, "Hosted tools"), and its limits:
+what was last set, voice's defaults for what never was.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The settings in force. | `application/json` [ToolSettings](#schema-toolsettings) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PUT `/admin/v1/tools`
+
+**Set the hosted tools' settings** · `setToolSettings`
+
+Authentication: operatorToken
+
+Replaces the settings whole: a member left out takes voice's
+default. Each request reads them, so the next request is held to
+them, with no restart. The change is in the change log (target
+`tools`).
+
+Request body
+
+`application/json`
+
+Schema: [ToolSettings](#schema-toolsettings)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `web_fetch` | [WebFetchSettings](#schema-webfetchsettings) | yes |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The settings now in force. | `application/json` [ToolSettings](#schema-toolsettings) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 <a id="tag-node"></a>
 
 ## node
@@ -3909,7 +4000,7 @@ Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
-| `request_id` | string | yes | Equals the `X-Request-Id` header and the usage record's id. |  |
+| `request_id` | string | yes | Equals the `X-Request-Id` header and the usage record's id (a request with hosted tool calls: its first model call's, the others' `<request_id>_2` and on). |  |
 | `project` | string | yes | The project the request was attributed to. |  |
 | `key` | string | yes | The key the request was made with. |  |
 | `served` | [Served](#schema-served) | yes |  |  |
@@ -3936,7 +4027,9 @@ Type: [CreateResponseBody](#schema-createresponsebody) & object
 
 ### Response
 
-The standard `ResponseResource` plus the required `voice` object.
+The standard `ResponseResource` plus the required `voice` object. A
+request with hosted tool calls has a `WebFetchCall` item in its
+`output` for each.
 
 Type: [ResponseResource](#schema-responseresource) & object
 
@@ -3944,6 +4037,91 @@ Type: [ResponseResource](#schema-responseresource) & object
 |---|---|---|---|---|
 | … | all of [ResponseResource](#schema-responseresource) |  |  |  |
 | `voice` | [VoiceResponseExtension](#schema-voiceresponseextension) | yes |  |  |
+
+<a id="schema-webfetchtool"></a>
+
+### WebFetchTool
+
+The hosted tool `web_fetch`, in a Responses request's `tools`: the
+operator's alone (see `createResponse`, "Hosted tools").
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `type` | `"web_fetch"` | yes |  |  |
+
+<a id="schema-webfetchcall"></a>
+
+### WebFetchCall
+
+A hosted call of `web_fetch` voice made for the model: an output
+item of the response, where the model's own `function_call` of it
+is never shown.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `type` | `"web_fetch_call"` | yes |  |  |
+| `id` | string | yes |  |  |
+| `call_id` | string | yes | The model's call it answers. |  |
+| `url` | string | yes | The URL the model asked for. |  |
+| `status` | string, one of `in_progress`, `completed`, `failed` | yes | `failed` for a fetch that failed, or a call not run (its `error` says why). |  |
+| `http_status` | integer |  | The HTTP status of the answer read (after redirects). |  |
+| `content_type` | string |  |  |  |
+| `bytes` | integer |  | The bytes of the body read. |  |
+| `error` | string |  |  |  |
+| `output` | string |  | What the model was given, as JSON text: `{url, status, content_type, title, text, truncated}`, or with `error`. The text is the page's, which is data, not instructions. |  |
+
+<a id="schema-webfetchcallevent"></a>
+
+### WebFetchCallEvent
+
+A hosted call as the stream tells it: the standard
+`response.output_item.added` (its item `in_progress`) and
+`response.output_item.done` (`completed` or `failed`, with its
+`output`), at its place in the whole response.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `type` | string, one of `response.output_item.added`, `response.output_item.done` | yes |  |  |
+| `output_index` | integer | yes |  |  |
+| `item` | [WebFetchCall](#schema-webfetchcall) | yes |  |  |
+| `sequence_number` | integer | yes |  |  |
+
+<a id="schema-toolsettings"></a>
+
+### ToolSettings
+
+The hosted tools' settings.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `web_fetch` | [WebFetchSettings](#schema-webfetchsettings) | yes |  |  |
+
+<a id="schema-webfetchsettings"></a>
+
+### WebFetchSettings
+
+`web_fetch`, for the operator's own requests. The operator and the
+network voice runs on are trusted: hosts on the LAN are fetched
+like any other, unless the denylist names them.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `enabled` | boolean |  |  | default `true` |
+| `max_calls` | integer |  | The most hosted calls one request runs (each fetch, and each call that names no URL); then the model answers from what it has. | default `8`; ≥ 1; ≤ 32 |
+| `timeout_ms` | integer |  | A fetch's whole time, its redirects included. | default `15000`; ≥ 1000; ≤ 120000 |
+| `max_bytes` | integer |  | The most of a body a fetch reads; a larger one is an error the model is told. | default `2097152`; ≥ 1024; ≤ 16777216 |
+| `max_chars` | integer |  | The most characters of text the model is given; more is cut, `truncated` true. | default `40000`; ≥ 1000; ≤ 100000 |
+| `denylist` | array of string |  | What is never fetched, at the URL asked for and at every redirect's: a host name (and every name under it), an IPv4 or IPv6 address, a CIDR range, or any of them with `:port` (an IPv6 address bracketed, `[2001:db8::1]:8080`). An address or a range matches a URL whose host is that address: the fetch resolves a name only as it connects, so a name is denied by its name. | default `[]`; items ≤ 64 |
 
 <a id="schema-voiceattemptevent"></a>
 

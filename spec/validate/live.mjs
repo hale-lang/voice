@@ -104,6 +104,7 @@ const bodies = {
   // a request no ledger holds: the run answers it refused, by why
   runAnnotations: { request_ids: ['resp_01j8z3q4v7m2k9x0'] },
   runAnnotation: {},
+  setToolSettings: { web_fetch: { enabled: true, max_calls: 4, denylist: ['192.0.2.0/24', 'admin.example.com'] } },
 };
 
 // the node plane: the node's enrollment token, and the bodies it sends

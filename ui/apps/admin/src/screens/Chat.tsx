@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Panel, Field, TextArea, TextInput, NumberInput, Select, Button, Confirm, Empty, Mono, micros, count, ago } from '@hale/components';
+import { Panel, Field, TextArea, TextInput, NumberInput, Select, Checkbox, Button, Confirm, Empty, Mono, micros, count, ago, bytes } from '@hale/components';
 import { api, describe, useGet, type CatalogModel, type Project } from '../api/client';
 import { operatorToken } from '../api/token';
 import type { ScreenProps } from '../App';
@@ -9,6 +9,8 @@ import { Fold } from '../peek';
 import { chats, useChats, isRunning, save, remove, stop, answer } from '../chat/run';
 import { newConversation, newId, titleFrom, type Conversation, type Message, type Options } from '../chat/store';
 import { Markdown, CopyButton } from '../chat/MarkdownView';
+import { webFetchOffered } from '../chat/tools';
+import type { FetchStep } from '../chat/responses';
 import s from '../chat/Chat.module.css';
 
 /** The project a new chat starts in: the one used last, in this browser. */
@@ -165,6 +167,7 @@ function reasons(model: string, project: Project | undefined, catalog: CatalogMo
 function Thread({ conv, projects }: { conv: Conversation; projects: Project[] }) {
   const models = useProjectModels(conv.project);
   const catalog = useGet('/admin/v1/models');
+  const tools = useGet('/admin/v1/tools');
   const project = projects.find((p) => p.id === conv.project);
   const busy = isRunning(conv.id);
   const [draft, setDraft] = useState('');
@@ -182,6 +185,9 @@ function Thread({ conv, projects }: { conv: Conversation; projects: Project[] })
   useEffect(() => {
     if (!conv.model && choices.length) save({ ...conv, model: (choices.find((m) => m.voice.available) ?? choices[0]!).id });
   }, [conv, choices]);
+  // the hosted web fetch: offered where the operator has it on and the model takes tools
+  const fetchOffered = webFetchOffered(tools.data, choices.find((m) => m.id === conv.model));
+  const webFetch = fetchOffered && !!conv.options.web_fetch;
 
   const send = () => {
     const text = draft.trim();
@@ -190,12 +196,12 @@ function Thread({ conv, projects }: { conv: Conversation; projects: Project[] })
     const first = !conv.messages.some((m) => m.role === 'user');
     save({ ...conv, title: first && conv.title === 'new chat' ? titleFrom(text) : conv.title, messages: [...conv.messages, user] });
     setDraft('');
-    void answer(conv.id);
+    void answer(conv.id, webFetch);
   };
   const regenerate = () => {
     if (busy || last?.role !== 'assistant') return;
     save({ ...conv, messages: conv.messages.slice(0, -1) });
-    void answer(conv.id);
+    void answer(conv.id, webFetch);
   };
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && (e.target as HTMLElement).tagName === 'TEXTAREA') {
@@ -268,7 +274,7 @@ function Thread({ conv, projects }: { conv: Conversation; projects: Project[] })
         </div>
       </div>
       <aside className={s.settings}>
-        <Settings conv={conv} reasons={reasons(conv.model, project, catalog.data?.data)} />
+        <Settings conv={conv} reasons={reasons(conv.model, project, catalog.data?.data)} fetchOffered={fetchOffered} />
       </aside>
     </div>
   );
@@ -281,6 +287,9 @@ function AnswerView({ m, streaming, last, busy, onRegenerate }: { m: Message; st
   return (
     <div className={`${s.bubble} ${s.assistant}`}>
       {m.reasoning && <Fold title={streaming && !m.text ? 'thinking…' : 'reasoning'} kind="reasoning" preview={m.reasoning} body={m.reasoning} />}
+      {(a?.steps ?? []).map((step) => (
+        <FetchStepView key={step.id} step={step} />
+      ))}
       {m.text ? <Markdown text={m.text} /> : streaming && <p className="c-active pulse" style={{ margin: 0 }}>{a?.alive ? 'the seat is at work' : 'waiting for a seat'}</p>}
       {failedFirst.length > 0 && (
         <p className="c-wait" style={{ fontSize: 'var(--size-sm)' }}>
@@ -305,6 +314,40 @@ function AnswerView({ m, streaming, last, busy, onRegenerate }: { m: Message; st
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * One fetch voice made for the model, folded: the URL, how it went (status
+ * and size, or the error), and on opening the page's title and the text the
+ * model was given, shown as text, never as a page.
+ */
+function FetchStepView({ step }: { step: FetchStep }) {
+  const said =
+    step.status === 'in_progress'
+      ? 'fetching…'
+      : step.status === 'failed'
+        ? `✕ ${step.error ?? 'failed'}`
+        : [step.httpStatus !== undefined ? `${step.httpStatus}` : null, step.contentType ?? null, step.bytes !== undefined ? bytes(step.bytes) : null, step.truncated ? 'cut to fit' : null].filter(Boolean).join(' · ');
+  const tone = step.status === 'in_progress' ? 'c-active pulse' : step.status === 'failed' ? 'c-fail' : 'faint';
+  return (
+    <details className={s.step}>
+      <summary>
+        <span className={s.stepKind}>web fetch</span> <span className={`mono ${s.stepUrl}`}>{step.url}</span> <span className={tone}>{said}</span>
+      </summary>
+      <div className={s.stepBody}>
+        {step.finalUrl && <p className="faint mono">answered by {step.finalUrl}</p>}
+        {step.title && <p><strong>{step.title}</strong></p>}
+        {step.text ? (
+          <div className={s.plain}>
+            {step.text}
+            {step.chars !== undefined && step.chars > step.text.length && <span className="faint">{`\n… the first ${count(step.text.length)} of ${count(step.chars)} characters the model was given`}</span>}
+          </div>
+        ) : (
+          <p className="faint">{step.status === 'in_progress' ? 'fetching…' : 'no text was read'}</p>
+        )}
+      </div>
+    </details>
   );
 }
 
@@ -350,7 +393,7 @@ const EFFORTS = [
 ];
 
 /** The chat's system prompt and sampling, sent with each of its turns. */
-function Settings({ conv, reasons }: { conv: Conversation; reasons: boolean | undefined }) {
+function Settings({ conv, reasons, fetchOffered }: { conv: Conversation; reasons: boolean | undefined; fetchOffered: boolean }) {
   const set = (o: Partial<Options>) => save({ ...conv, options: { ...conv.options, ...o } });
   const o = conv.options;
   // a model that does not reason is sent no effort
@@ -379,6 +422,11 @@ function Settings({ conv, reasons }: { conv: Conversation; reasons: boolean | un
             <Select value={o.effort} onChange={(v) => set({ effort: v as Options['effort'] })} options={EFFORTS} />
           )}
         </Field>
+        {fetchOffered && (
+          <Field label="tools" help="voice fetches the pages the model asks for (http, https); what a page says reaches the model as the tool's output, never as instructions">
+            <Checkbox checked={!!o.web_fetch} onChange={(v) => set({ web_fetch: v })} label="web fetch" />
+          </Field>
+        )}
       </div>
     </Panel>
   );

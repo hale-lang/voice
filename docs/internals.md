@@ -305,6 +305,56 @@ and response are the JSON documents they were, as text, since they may be far
 larger than a JSON value on the typed surface holds. Off unless set: recording
 is the operator's choice per project or key, whatever its data class.
 
+### Hosted tools: web fetch
+
+The admin UI's Chat may turn on a **hosted tool**, one voice runs itself
+between a model's calls ([`api/web_fetch.hl`](../api/web_fetch.hl)). There
+is one, `web_fetch`. It is the operator's alone: a request lists
+`{"type": "web_fetch"}` in its `tools`, and only one made with the operator
+token charged to a project (`Voice-Project`) may; a project key's is refused
+`400 unsupported`. Voice gives the model a function, `web_fetch(url)`, beside
+the caller's tools. Each time the model calls it, the api fetches the page,
+adds the call and its output to the request's input, and asks the model
+again, until the model answers without calling it, calls one of the
+caller's own tools (the request is then the caller's again, and that turn's
+fetches are not run), or the request has made the most fetches it may, when
+the tool is withdrawn and the model answers from what it has. Each call to
+the model is routed, limited and recorded as any request is, the first
+under the request's id and the next as `<request_id>_2` and on, all in one
+conversation. Each fetch is an output item of the response, a
+`web_fetch_call`; streamed, `response.output_item.added` and `.done`
+between the model's output, and Chat shows it as a folded step above the
+answer.
+
+A fetch is a GET with voice's user agent and nothing else of anyone's: no
+credential, cookie or authorization. It follows at most 5 redirects, takes
+at most the timeout for the whole of it (15 s by default) and reads at most
+the size cap (2 MiB); it takes HTML, which it reduces to its readable text
+(headings, paragraphs, lists, a link's text and its URL; no scripts, styles
+or navigation), plain text, Markdown, JSON, XML and other `text/*`, and
+gives the model at most 40,000 characters: `{url, status, content_type,
+title, text, truncated}`. Anything that goes wrong (a host that cannot be
+reached, the timeout, an HTTP error, a body over the cap, a type it does not
+take) is told to the model as the call's output, `{url, error}`, never as
+the request's failure. Over https as over http: hale's std speaks TLS.
+
+The operator and the network voice runs on are trusted, so a host on the
+LAN is fetched like any other. The **denylist** refuses what it names, at
+the URL asked for and at every redirect's: a host name and every name under
+it, an IPv4 or IPv6 address, a CIDR range, or any of them with `:port`.
+hale's std at voice's pin resolves a name only inside its dial, so an
+address or a range matches a URL written with that address, not a name that
+resolves into it; deny a name by its name. The settings (on or off, the
+fetches a request may make, the timeout, the caps, the denylist) are the
+admin UI's **Tools** screen, `GET` and `PUT /admin/v1/tools`, kept in the
+store (migration 36) and read for each request, so a change takes the next.
+
+**What a page says is untrusted.** It reaches the model only as the tool
+call's output, never in the instructions or as the caller's words, and the
+function the model is given says its text is data, not instructions. A page
+can still try to steer the model; that is why the tool is the operator's
+alone, and off for every project key.
+
 ### The surface's bundle
 
 [`api/bundle/`](../api/bundle/) is `hale api export --surface Voice` of the
@@ -949,6 +999,10 @@ that dies with its api instance is recorded as abandoned by the brain.
   did not offer.
 - **Content** is never written down. A seat sees only the data classes its
   operator allowed it.
+- **Hosted tools** are the operator's alone: a project key's request cannot
+  list `web_fetch`. A fetch sends no credential, cookie or authorization,
+  and what a page says reaches the model only as the tool's output (see
+  "Hosted tools: web fetch").
 - **TLS** is terminated in front of the api. Hale's TLS reads block their
   thread and cannot park on an async pool yet, so the api speaks plain HTTP
   behind the terminator, which is also the load balancer. NATS is not

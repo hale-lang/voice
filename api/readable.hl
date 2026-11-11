@@ -1,0 +1,432 @@
+// A page's readable text (web_fetch.hl): HTML reduced to what a person
+// reads. Scripts, styles and the page's furniture (navigation, footers,
+// asides, forms) are dropped; headings stay headings (`#`), paragraphs and
+// blocks are lines, list items `- ` lines, a link its text followed by its
+// URL, read against the page's; `<pre>` keeps its lines; entities are
+// decoded; runs of white space are one space. One pass over the page, its
+// text copied a run at a time.
+
+/// What a page says: its title and its text.
+type Readable { title: String = ""; text: String = ""; }
+
+/// The elements whose content is dropped whole.
+fn dropped(name: String) -> Bool {
+    return name == "script"
+        || name == "style"
+        || name == "noscript"
+        || name == "template"
+        || name == "svg"
+        || name == "nav"
+        || name == "footer"
+        || name == "aside"
+        || name == "form"
+        || name == "iframe"
+        || name == "select";
+}
+
+/// The elements that break a line, before and after.
+fn block(name: String) -> Bool {
+    return name == "p"
+        || name == "div"
+        || name == "section"
+        || name == "article"
+        || name == "main"
+        || name == "header"
+        || name == "blockquote"
+        || name == "ul"
+        || name == "ol"
+        || name == "dl"
+        || name == "dt"
+        || name == "dd"
+        || name == "table"
+        || name == "tr"
+        || name == "figure"
+        || name == "figcaption"
+        || name == "hr"
+        || name == "pre";
+}
+
+/// The text a page's writer leaves: what `readable` builds.
+locus PageText {
+    params {
+        out: std::bytes::BytesBuilder = std::bytes::BytesBuilder { initial_cap: 16384 };
+        // the line breaks the text ends with, and whether any text came
+        breaks: Int = 0;
+        any: Bool = false;
+        // a space is owed before the next word
+        space: Bool = false;
+    }
+
+    /// Words, as they come: white space between them one space.
+    @unbounded
+    fn words(raw: String) {
+        let v = std::str::bytes_view(raw);
+        let mut i = 0;
+        let mut run = -1;
+        while i < v.n {
+            let c = std::str::byte_at(v, i);
+            let white = c == 32 || c == 9 || c == 10 || c == 13 || c == 12;
+            if white {
+                if run >= 0 {
+                    self.word(std::str::slice(v, run, i));
+                    run = -1;
+                }
+                self.space = true;
+            } else if run < 0 {
+                run = i;
+            }
+            i = i + 1;
+        }
+        if run >= 0 { self.word(std::str::slice(v, run, v.n)); }
+    }
+
+    fn word(w: String) {
+        if len(w) == 0 { return; }
+        if self.space && self.any && self.breaks == 0 { self.out.append_str(" "); }
+        self.out.append_str(w);
+        self.space = false;
+        self.any = true;
+        self.breaks = 0;
+    }
+
+    /// Text as it is (`<pre>`), its own line breaks kept.
+    fn verbatim(raw: String) {
+        if len(raw) == 0 { return; }
+        if self.space && self.any && self.breaks == 0 { self.out.append_str(" "); }
+        self.out.append_str(raw);
+        self.space = false;
+        self.any = true;
+        self.breaks = if std::str::ends_with(raw, "\n") { 1 } else { 0 };
+    }
+
+    /// At least `n` line breaks before what comes next (none at the start).
+    fn lines(n: Int) {
+        self.space = false;
+        if !self.any { return; }
+        while self.breaks < n {
+            self.out.append_str("\n");
+            self.breaks = self.breaks + 1;
+        }
+    }
+
+    /// Something that is no word but goes on the line as one (`- `, `# `).
+    fn mark(m: String) {
+        if self.space && self.any && self.breaks == 0 { self.out.append_str(" "); }
+        self.out.append_str(m);
+        self.any = true;
+        self.breaks = 0;
+        self.space = false;
+    }
+
+    fn text() -> String {
+        let b = self.out.snapshot() or b"";
+        return std::str::trim(std::str::from_bytes(b));
+    }
+}
+
+/// `html`'s readable text, its links read against `base`.
+@unbounded
+fn page_text(html: String, base: std::http::Url) -> Readable {
+    let lower = std::str::lower(html);
+    let v = std::str::bytes_view(html);
+    let lv = std::str::bytes_view(lower);
+    let page = PageText { };
+    let mut title = "";
+    // the link being read: its URL, "" for none
+    let mut href = "";
+    let mut pre = 0;
+    let mut i = 0;
+    while i < v.n {
+        let lt = std::str::find(lv, "<", i);
+        let stop = if lt < 0 { v.n } else { lt };
+        if stop > i {
+            let raw = decoded(std::str::slice(v, i, stop));
+            if pre > 0 { page.verbatim(raw); } else { page.words(raw); }
+        }
+        if lt < 0 { break; }
+        i = lt;
+        // a comment, a doctype, a CDATA section: left out
+        if std::str::slice(lv, i, i + 4) == "<!--" {
+            let end = std::str::find(lv, "-->", i + 4);
+            i = if end < 0 { v.n } else { end + 3 };
+            continue;
+        }
+        let gt = std::str::find(lv, ">", i);
+        if gt < 0 { break; }
+        let tag = std::str::slice(lv, i + 1, gt);
+        let raw_tag = std::str::slice(v, i + 1, gt);
+        i = gt + 1;
+        let closing = std::str::starts_with(tag, "/");
+        let name = tag_name(if closing { tag[1..len(tag)] } else { tag });
+        if len(name) == 0 { continue; }
+        if !closing && name == "title" {
+            let end = std::str::find(lv, "</title", i);
+            let stop_at = if end < 0 { v.n } else { end };
+            if len(title) == 0 { title = collapsed(decoded(std::str::slice(v, i, stop_at))); }
+            i = stop_at;
+            continue;
+        }
+        if !closing && dropped(name) && !std::str::ends_with(tag, "/") {
+            // its content skipped to its end tag, nested ones of its kind too
+            i = past_end(lv, name, i);
+            continue;
+        }
+        if name == "br" {
+            page.lines(1);
+        } else if name == "li" {
+            page.lines(1);
+            if !closing { page.mark("- "); }
+        } else if heading(name) > 0 {
+            page.lines(2);
+            if !closing { page.mark(std::str::repeat("#", heading(name)) + " "); }
+        } else if name == "pre" {
+            page.lines(2);
+            pre = if closing { if pre > 0 { pre - 1 } else { 0 } } else { pre + 1 };
+        } else if block(name) {
+            page.lines(if name == "p" || name == "blockquote" || name == "table" { 2 } else { 1 });
+        } else if name == "td" || name == "th" {
+            if !closing { page.mark(" | "); }
+        } else if name == "a" {
+            if closing {
+                if len(href) > 0 {
+                    page.space = true;
+                    page.mark("(" + href + ")");
+                }
+                href = "";
+            } else {
+                href = link(attribute(raw_tag, "href"), base);
+            }
+        } else if name == "img" {
+            let alt = collapsed(decoded(attribute(raw_tag, "alt")));
+            if len(alt) > 0 { page.mark("[" + alt + "]"); }
+        }
+    }
+    return Readable { title: title, text: tidy(page.text()) };
+}
+
+/// Where the element `name` opened before `from` ends: past its end tag,
+/// counting ones of its kind opened inside it; the page's end when it has
+/// none.
+@unbounded
+fn past_end(lv: std::str::ByteView, name: String, from: Int) -> Int {
+    let mut depth = 1;
+    let mut i = from;
+    while depth > 0 {
+        let close = std::str::find(lv, "</" + name, i);
+        if close < 0 { return lv.n; }
+        // script and style hold text, never elements
+        if name != "script" && name != "style" {
+            let mut open = std::str::find(lv, "<" + name, i);
+            while open >= 0 && open < close {
+                if !name_char(std::str::byte_at(lv, open + 1 + len(name))) { depth = depth + 1; }
+                open = std::str::find(lv, "<" + name, open + 1);
+            }
+        }
+        if !name_char(std::str::byte_at(lv, close + 2 + len(name))) { depth = depth - 1; }
+        let gt = std::str::find(lv, ">", close);
+        i = if gt < 0 { lv.n } else { gt + 1 };
+        if gt < 0 { return lv.n; }
+    }
+    return i;
+}
+
+fn name_char(c: Int) -> Bool {
+    return c >= 97 && c <= 122 || c >= 48 && c <= 57 || c == 45;
+}
+
+/// A tag's name: its leading letters and digits.
+fn tag_name(tag: String) -> String {
+    let v = std::str::bytes_view(tag);
+    let mut i = 0;
+    while i < v.n && name_char(std::str::byte_at(v, i)) { i = i + 1; }
+    return std::str::slice(v, 0, i);
+}
+
+/// `h1`..`h6`'s level, 0 for any other element.
+fn heading(name: String) -> Int {
+    if len(name) != 2 || !std::str::starts_with(name, "h") { return 0; }
+    let n = std::str::parse_int(name[1..2]) or 0;
+    return if n >= 1 && n <= 6 { n } else { 0 };
+}
+
+/// The value of attribute `name` in a tag's text, "" for none.
+@unbounded
+fn attribute(tag: String, name: String) -> String {
+    let lower = std::str::lower(tag);
+    let v = std::str::bytes_view(tag);
+    let lv = std::str::bytes_view(lower);
+    let mut at = std::str::find(lv, name, 0);
+    while at >= 0 {
+        let before = if at > 0 { std::str::byte_at(lv, at - 1) } else { 32 };
+        let mut j = at + len(name);
+        while std::str::byte_at(lv, j) == 32 { j = j + 1; }
+        let whole = before == 32 || before == 9 || before == 10 || before == 13;
+        if whole && std::str::byte_at(lv, j) == 61 {
+            j = j + 1;
+            while std::str::byte_at(lv, j) == 32 { j = j + 1; }
+            let q = std::str::byte_at(v, j);
+            if q == 34 || q == 39 {
+                let close = std::str::find(v, if q == 34 { "\"" } else { "'" }, j + 1);
+                let end = if close < 0 { v.n } else { close };
+                return decoded(std::str::slice(v, j + 1, end));
+            }
+            let mut end = j;
+            while end < v.n && std::str::byte_at(v, end) != 32 && std::str::byte_at(v, end) != 62 {
+                end = end + 1;
+            }
+            return decoded(std::str::slice(v, j, end));
+        }
+        at = std::str::find(lv, name, at + 1);
+    }
+    return "";
+}
+
+/// A link's URL, read against `base`: "" for one that leads nowhere a
+/// reader could follow (a fragment, `javascript:`).
+fn link(raw: String, base: std::http::Url) -> String {
+    let h = std::str::trim(raw);
+    let lh = std::str::lower(h);
+    if len(h) == 0 || std::str::starts_with(h, "#") || std::str::starts_with(lh, "javascript:") {
+        return "";
+    }
+    if std::str::starts_with(lh, "http://")
+        || std::str::starts_with(lh, "https://")
+        || std::str::starts_with(lh, "mailto:")
+    {
+        return h;
+    }
+    let origin = url_text(base)[0..origin_end(url_text(base))];
+    if std::str::starts_with(h, "//") { return base.scheme + ":" + h; }
+    if std::str::contains(h, ":") && !std::str::contains(h, "/") { return ""; }
+    return origin + resolved_path(base.path, h);
+}
+
+/// Runs of white space one space, the ends trimmed.
+fn collapsed(s: String) -> String {
+    let p = PageText { };
+    p.words(s);
+    return p.text();
+}
+
+/// More than one blank line between blocks is one; no line ends in spaces.
+@unbounded
+fn tidy(text: String) -> String {
+    let v = std::str::bytes_view(text);
+    let out = std::bytes::BytesBuilder { initial_cap: v.n + 1 };
+    let mut start = 0;
+    let mut blank = 0;
+    while start < v.n {
+        let nl = std::str::find(v, "\n", start);
+        let end = if nl < 0 { v.n } else { nl };
+        let line = std::str::trim(std::str::slice(v, start, end));
+        if len(line) == 0 {
+            blank = blank + 1;
+        } else {
+            if start > 0 { out.append_str(if blank > 0 { "\n\n" } else { "\n" }); }
+            out.append_str(line);
+            blank = 0;
+        }
+        start = end + 1;
+    }
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// Text with its character references decoded: the named ones a page uses
+/// most, and every numeric one.
+@unbounded
+fn decoded(s: String) -> String {
+    if !std::str::contains(s, "&") { return s; }
+    let v = std::str::bytes_view(s);
+    let out = std::bytes::BytesBuilder { initial_cap: v.n + 1 };
+    let mut i = 0;
+    while i < v.n {
+        let amp = std::str::find(v, "&", i);
+        if amp < 0 {
+            out.append_str(std::str::slice(v, i, v.n));
+            i = v.n;
+        } else {
+            out.append_str(std::str::slice(v, i, amp));
+            // a reference is at most 10 characters: no further is looked
+            // at, so a page of `&` alone is read in one pass
+            let near = std::str::slice(v, amp, if amp + 12 < v.n { amp + 12 } else { v.n });
+            let at = std::str::index_of(near, ";");
+            let semi = if at < 0 { -1 } else { amp + at };
+            let name = if semi > amp && semi - amp <= 10 {
+                std::str::slice(v, amp + 1, semi)
+            } else {
+                ""
+            };
+            let ch = entity(name);
+            if len(ch) > 0 {
+                out.append_str(ch);
+                i = semi + 1;
+            } else {
+                out.append_str("&");
+                i = amp + 1;
+            }
+        }
+    }
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// The character an entity's name (between `&` and `;`) stands for, ""
+/// for one this does not know.
+fn entity(name: String) -> String {
+    if name == "amp" { return "&"; }
+    if name == "lt" { return "<"; }
+    if name == "gt" { return ">"; }
+    if name == "quot" { return "\""; }
+    if name == "apos" { return "'"; }
+    if name == "nbsp" { return " "; }
+    if name == "mdash" { return code_point(8212); }
+    if name == "ndash" { return code_point(8211); }
+    if name == "hellip" { return code_point(8230); }
+    if name == "lsquo" { return code_point(8216); }
+    if name == "rsquo" { return code_point(8217); }
+    if name == "ldquo" { return code_point(8220); }
+    if name == "rdquo" { return code_point(8221); }
+    if name == "copy" { return code_point(169); }
+    if name == "reg" { return code_point(174); }
+    if name == "middot" { return code_point(183); }
+    if name == "bull" { return code_point(8226); }
+    if std::str::starts_with(name, "#x") || std::str::starts_with(name, "#X") {
+        return code_point(hex_number(name[2..len(name)]));
+    }
+    if std::str::starts_with(name, "#") && digits(name[1..len(name)]) {
+        return code_point(std::str::parse_int(name[1..len(name)]) or - 1);
+    }
+    return "";
+}
+
+fn hex_number(s: String) -> Int {
+    if len(s) == 0 || len(s) > 6 { return -1; }
+    let v = std::str::bytes_view(s);
+    let mut n = 0;
+    let mut i = 0;
+    while i < v.n {
+        let d = hex_digit(std::str::byte_at(v, i));
+        if d < 0 { return -1; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    return n;
+}
+
+/// The character of code point `n`, as UTF-8; "" for none (a surrogate,
+/// NUL, past U+10FFFF).
+fn code_point(n: Int) -> String {
+    if n <= 0 || n > 1114111 || n >= 55296 && n <= 57343 { return ""; }
+    if n < 65536 { return std::json::unescape_string("\\u" + hex_quad(n)); }
+    let m = n - 65536;
+    return std::json::unescape_string(
+        "\\u" + hex_quad(55296 + m / 1024) + "\\u" + hex_quad(56320 + m % 1024),
+    );
+}
+
+fn hex_quad(n: Int) -> String {
+    let hex = "0123456789abcdef";
+    return hex[(n / 4096 % 16)..(n / 4096 % 16 + 1)] + hex[(n / 256 % 16)..(n / 256 % 16 + 1)]
+        + hex[(n / 16 % 16)..(n / 16 % 16 + 1)] + hex[(n % 16)..(n % 16 + 1)];
+}

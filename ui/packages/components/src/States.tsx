@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react';
+import { Component, type ErrorInfo, type ReactNode } from 'react';
 
 /** The designed states: each looks like something, and says what it is. */
 function State(props: { tone: 'quiet' | 'wait' | 'fail'; children: ReactNode }) {
@@ -45,4 +45,30 @@ export function Stale(props: { since: Date }) {
       stale
     </span>
   );
+}
+
+/**
+ * One section of a page, held apart: what fails to render inside it is
+ * said there, as unavailable, and the rest of the page stands. Rendered
+ * again when `resetKey` changes (another item opened, new data read).
+ */
+export class Contained extends Component<{ what: string; resetKey?: unknown; children: ReactNode }, { error: Error | null; key: unknown }> {
+  state = { error: null as Error | null, key: this.props.resetKey };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error: error instanceof Error ? error : new Error(String(error)) };
+  }
+
+  static getDerivedStateFromProps(props: { resetKey?: unknown }, state: { error: Error | null; key: unknown }) {
+    return props.resetKey !== state.key ? { error: null, key: props.resetKey } : null;
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error(`${this.props.what} failed to render`, error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) return <Unavailable what={this.props.what} detail={`It failed to render: ${this.state.error.message}`} />;
+    return this.props.children;
+  }
 }

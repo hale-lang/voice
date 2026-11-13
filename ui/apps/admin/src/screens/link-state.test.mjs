@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { cablingState, cabledSaid, linkState, speedSaid, bandwidthSaid } from './link-state.ts';
+import { cablingState, cabledSaid, linkState, portsSaid, speedSaid, bandwidthSaid } from './link-state.ts';
 
 const halves = [
   { ifname: 'enP2p1s0f0np0', speed_mbps: 200000 },
@@ -63,4 +63,23 @@ test('speeds and bandwidths as they are sold', () => {
   assert.equal(speedSaid(100), '100 Mb/s');
   assert.equal(bandwidthSaid(22_745_586_834), '22.7 GB/s');
   assert.equal(cabledSaid([{ ifname: 'a', speed_mbps: 0 }]), '1 port cabled');
+});
+
+test("a link's ports on one line, the meeting one first", () => {
+  assert.equal(
+    portsSaid([
+      { ifname: 'enp1s0f0np0', address: '198.51.100.1', hca: 'rocep1s0f0' },
+      { ifname: 'enP2p1s0f0np0', address: '203.0.113.1', hca: 'roceP2p1s0f0' },
+    ]),
+    'enp1s0f0np0 198.51.100.1 · rocep1s0f0, enP2p1s0f0np0 203.0.113.1 · roceP2p1s0f0',
+  );
+  assert.equal(portsSaid([{ ifname: 'enP2p1s0f0np0', hca: 'roceP2p1s0f0', speed_mbps: 200000 }]), 'enP2p1s0f0np0 · roceP2p1s0f0', 'not addressed: no address');
+});
+
+test('ports that are not a list say nothing, and never throw', () => {
+  // what getNode once sent: the ports' JSON as a string
+  assert.equal(portsSaid('{"ifname": "enp1s0f0np0", "address": "198.51.100.1", "hca": "rocep1s0f0"}'), '');
+  assert.equal(portsSaid(undefined), '');
+  assert.equal(portsSaid({ ifname: 'enp1s0f0np0' }), '');
+  assert.equal(portsSaid([null, 'x', { ifname: 'enp1s0f0np0' }]), 'enp1s0f0np0');
 });

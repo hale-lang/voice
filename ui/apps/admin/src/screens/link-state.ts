@@ -18,6 +18,22 @@ export type LinkLike = {
   check?: LinkCheckLike;
 };
 
+/** One of a link's ports (`NodeLink.ports`), as far as its line says it. */
+export type LinkPortLike = { ifname: string; address?: string; hca?: string };
+
+/**
+ * A link's ports on one line: each interface, its address and its RDMA
+ * device, the one the two meet on first. Anything but a list of ports says
+ * nothing, so a link the api sent malformed still shows its state.
+ */
+export function portsSaid(ports: unknown): string {
+  if (!Array.isArray(ports)) return '';
+  return ports
+    .filter((p): p is LinkPortLike => typeof p === 'object' && p !== null && typeof (p as LinkPortLike).ifname === 'string')
+    .map((p) => `${p.ifname}${p.address ? ` ${p.address}` : ''}${p.hca ? ` · ${p.hca}` : ''}`)
+    .join(', ');
+}
+
 /** One link's state: its line, how it reads, and whether a check may be started from here. */
 export type LinkState = { tone: 'quiet' | 'ok' | 'wait' | 'fail'; text: string; checkable: boolean };
 

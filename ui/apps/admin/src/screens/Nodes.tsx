@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Contained, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
 import { useGet, useNodes, type Node, type NodeSummary, type SeatSummary, type SeatView, type Schemas } from '../api/client';
 import { capacityOf } from '../api/fleet-reads';
 import { useHubState } from '../api/hub';
@@ -13,7 +13,7 @@ import { toneOf } from '../tone';
 import { ContextWindow } from '../context';
 import { Value } from '../values';
 import { nodeModels, heldSaid, type NodeModel } from './node-models';
-import { cablingState, linkState } from './link-state';
+import { cablingState, linkState, portsSaid } from './link-state';
 import { FleetMemory, NodeMemory, Toggle, useFleetMemory } from '../FleetMemory';
 import { acceleratorName, fleetNodes, memoryOf, modelMemory, placedBlocks } from '../fleet-memory';
 import { DEMO_NODES, DEMO_PLACEMENTS, demoLink } from '../fleet-memory-demo';
@@ -68,7 +68,7 @@ export function Nodes({ route, setInspector }: ScreenProps) {
   return (
     <>
       <h1>Nodes</h1>
-      <FleetPanel current={nodeId} />
+      <Contained what="Memory"><FleetPanel current={nodeId} /></Contained>
       <Panel title="Nodes" readout={readout(q, `${q.data.data.length} nodes`)}>
         <Table<NodeSummary>
           rows={q.data.data}
@@ -92,13 +92,13 @@ export function Nodes({ route, setInspector }: ScreenProps) {
           <Button onClick={() => { location.hash = `${href('nodes')}?arrange`; }}>arrange</Button>
         </p>
       </Panel>
-      {node && <Models node={node} fresh={readout(q)} />}
+      {node && <Contained what={`Models on ${node.id}`} resetKey={node}><Models node={node} fresh={readout(q)} /></Contained>}
       {node && (
         <details open={!!seatId} style={{ marginTop: 'var(--space-3)' }}>
           <summary className="muted" style={{ cursor: 'pointer', marginBottom: 'var(--space-2)' }}>
             Seats on {node.id}: {node.seats.length}, the details behind its models
           </summary>
-          <Seats node={node} selected={seatId} fresh={readout(q)} />
+          <Contained what={`Seats on ${node.id}`} resetKey={node}><Seats node={node} selected={seatId} fresh={readout(q)} /></Contained>
         </details>
       )}
     </>
@@ -304,15 +304,16 @@ function Links({ node }: { node: Node }) {
         rows={links.map((l) => {
           const st = linkState(l, node.status === 'up');
           const c = l.check;
+          const ports = portsSaid(l.ports);
           return {
             k: l.peer,
             v: (
               <>
                 <Status tone={st.tone} label={st.text} title={c?.reason ?? undefined} />
                 <span className="muted"> · {l.source === 'declared' ? 'declared' : 'found'}</span>
-                {l.ports && l.ports.length > 0 && (
+                {ports && (
                   <div>
-                    <Mono>{l.ports.map((p) => `${p.ifname}${p.address ? ` ${p.address}` : ''}${p.hca ? ` · ${p.hca}` : ''}`).join(', ')}</Mono>
+                    <Mono>{ports}</Mono>
                     {l.gid_index !== undefined && <span className="muted"> · GID {l.gid_index}</span>}
                     {' · '}
                     <a href={href('nodes', l.peer)}>{l.peer}</a>
@@ -421,7 +422,7 @@ function NodeInspector({ node }: { node: Node }) {
         <Mono>{node.id}</Mono>
       </h2>
       <div style={{ marginBottom: 'var(--space-4)' }}>
-        <NodeMemory ids={[node.id]} />
+        <Contained what="Memory" resetKey={node}><NodeMemory ids={[node.id]} /></Contained>
       </div>
       {editing ? (
         <Form
@@ -452,30 +453,34 @@ function NodeInspector({ node }: { node: Node }) {
           ]}
         />
       )}
-      <OnThisMachine node={node} />
+      <Contained what="On this machine" resetKey={node}><OnThisMachine node={node} /></Contained>
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Offers</h3>
-      {caps ? (
-        <Kv rows={caps.engines.map((e) => ({ k: e.id, v: <>{e.kind}{e.models ? <span className="muted"> · {e.models.join(', ')}</span> : null}</> }))} />
-      ) : (
-        <span className="faint">not declared yet: the node has not registered</span>
-      )}
+      <Contained what="Offers" resetKey={node}>
+        {caps ? (
+          <Kv rows={caps.engines.map((e) => ({ k: e.id, v: <>{e.kind}{e.models ? <span className="muted"> · {e.models.join(', ')}</span> : null}</> }))} />
+        ) : (
+          <span className="faint">not declared yet: the node has not registered</span>
+        )}
+      </Contained>
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Hardware</h3>
-      <Hardware node={node} />
+      <Contained what="Hardware" resetKey={node}><Hardware node={node} /></Contained>
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Links</h3>
-      <Links node={node} />
-      {node.status !== 'revoked' && <Suggested node={node} />}
+      <Contained what="Links" resetKey={node}><Links node={node} /></Contained>
+      {node.status !== 'revoked' && <Contained what="Suggested models" resetKey={node}><Suggested node={node} /></Contained>}
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Local controls</h3>
-      {local ? (
-        <Kv
-          rows={[
-            { k: 'paused', v: local.paused ? <Status tone="wait" label="paused" /> : 'no' },
-            { k: 'paused seats', v: local.paused_seats.length ? local.paused_seats.join(', ') : 'none' },
-            { k: 'reason', v: local.reason ?? '–' },
-          ]}
-        />
-      ) : (
-        <span className="faint">not reported yet</span>
-      )}
+      <Contained what="Local controls" resetKey={node}>
+        {local ? (
+          <Kv
+            rows={[
+              { k: 'paused', v: local.paused ? <Status tone="wait" label="paused" /> : 'no' },
+              { k: 'paused seats', v: local.paused_seats.length ? local.paused_seats.join(', ') : 'none' },
+              { k: 'reason', v: local.reason ?? '–' },
+            ]}
+          />
+        ) : (
+          <span className="faint">not reported yet</span>
+        )}
+      </Contained>
       {token && <div style={{ marginTop: 'var(--space-3)' }}><Secret label="new enrollment token" value={token} note="the old token stops working now; restart the node with this one" /></div>}
       {w.pending && <p className="c-wait">Proposed, pending review: {w.pending}</p>}
       {w.error && !editing && <p className="c-fail">{w.error}</p>}

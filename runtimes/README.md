@@ -150,6 +150,13 @@ a pull request that touches it is held to the pinned sha256, and the release
 asset is published only by running that workflow, from a build that matches the pin, and the node runs it under the macOS sandbox
 like every archive runtime.
 
+A node hands each server it starts a key in its environment
+(`VOICE_DECIDE_API_KEY` for a decision server, node/run.hl) and presents it
+on every call. This archive's launcher predates that: Jev's server runs
+without a key, open on loopback. The next build of the launcher passes the
+variable on (`--api-key-env VOICE_DECIDE_API_KEY` when it is set), as a new
+runtime id with its own pin.
+
 ## `decision-0.1.2-*`
 
 Voice's decision server built natively: `voice-decide` (the
@@ -165,3 +172,8 @@ release's tokenizer and answers, `voice-decide` answering a request on Metal
 and in the CPU image), and, run by hand, publishes a version once: the
 images under one tag per backend and the archive as a release. Its summary
 is what these files pin.
+
+The node hands `voice-decide` a key in `VOICE_DECIDE_API_KEY` (node/run.hl);
+started with one, it answers every route but `/healthz` only to that key as
+a bearer. `decision-0.1.2`'s builds predate the check and answer without
+one, until the next version is published and pinned.

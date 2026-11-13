@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState, useId } from 'react';
-import { useInstances, INSTANCE_LAPSE_MS } from '../api/hub';
+import { useInstances, INSTANCE_LAPSE_MS, type Instance } from '../api/hub';
 import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/components';
 import { useGet, useNodes, useUsageRecords, USAGE_PAGE } from '../api/client';
 import { subscribeAdminEvents, subscribeFlights } from '../api/events';
 import type { ScreenProps } from '../App';
-import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, pairsOf, provisional, hullOf, topologyKey, BAD_STATES, WAITING_STATES, type Fleet, type Graph, type Kind, type Pair, type Point } from './network-model';
-import { demoFleet, demoInFlight, demoCompletions, demoContext, DEMO_TICK_MS } from './network-demo';
+import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, pairsOf, provisional, hullOf, topologyKey, BAD_STATES, WAITING_STATES, RETIRED, type Fleet, type Graph, type Kind, type Pair, type Point } from './network-model';
+import { demoFleet, demoInFlight, demoCompletions, demoContext, demoInstances, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
 
@@ -31,6 +31,15 @@ export function Network(_: ScreenProps) {
     setContext(!context);
     try { localStorage.setItem('voice.network.context', context ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
   };
+  // the api instances since retired (each redeploy retires one), faint, with
+  // the requests they admitted: off unless this viewer turned it on
+  const [retired, setRetired] = useState(() => {
+    try { return localStorage.getItem('voice.network.retired') === 'on'; } catch { return false; }
+  });
+  const toggleRetired = () => {
+    setRetired(!retired);
+    try { localStorage.setItem('voice.network.retired', retired ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
+  };
   const usage = useGet('/admin/v1/usage', { params: { query: { limit: USAGE_PAGE, ...(internal ? { include_internal: true } : {}) } } });
   // the ledger lists each request without the caller's metadata: with the
   // context layer on, each is read whole once (a record never changes)
@@ -50,6 +59,11 @@ export function Network(_: ScreenProps) {
   const failure = queries.find((q) => q.isError);
   const pending = queries.some((q) => q.isPending);
   const beats = useInstances();
+  // the instances last heard: a hub reconnecting (an api redeployed) forgets
+  // them until its first beat, and the map keeps them meanwhile, so a
+  // redeploy swaps the old instance for the new at once
+  const [heard, setHeard] = useState<Instance[] | undefined>(undefined);
+  useEffect(() => { if (beats.length) setHeard(beats); }, [beats]);
   // an instance that stops beating is shown gone without a beat to say so
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 5000); return () => clearInterval(t); }, []);
@@ -62,9 +76,9 @@ export function Network(_: ScreenProps) {
       const whole = wholes[i]?.data;
       return whole && whole.id === r.id ? { ...r, metadata: whole.metadata } : r;
     }),
-    instances: beats.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })),
+    ...(heard ? { instances: heard.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })) } : {}),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [nodes.data, accounts.data, projects.data, placements.data, usage.data, beats, now, wholeKey]);
+  }), [nodes.data, accounts.data, projects.data, placements.data, usage.data, heard, now, wholeKey]);
 
   return <div className={s.screen}>
     <header className={s.header}>
@@ -73,17 +87,18 @@ export function Network(_: ScreenProps) {
         <button aria-pressed={source === 'api'} onClick={() => chooseSource('api')}>API {stub ? 'fixture' : 'data'}</button>
         <button aria-pressed={source === 'demo'} onClick={() => chooseSource('demo')}>Demo fleet</button>
         <button aria-pressed={context} onClick={toggleContext} title="each request's conversation, repository and metadata beside its project">Request context</button>
+        <button aria-pressed={retired} onClick={toggleRetired} title="api instances that no longer beat (each redeploy retires one), faint, with the requests they admitted">Retired api instances</button>
         <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project (annotations, titles), under its system key: dotted, apart from the project's flow">Internal runs</button>
       </div>
     </header>
     {source === 'api' && failure ? <Unavailable what="Network" detail={failure.error?.message} /> : source === 'api' && pending ? <Loading what="the fleet" /> :
-      <FleetNetwork key={source} fleet={source === 'demo' ? EMPTY : fleet} demo={source === 'demo'} stub={stub} context={context} />}
+      <FleetNetwork key={source} fleet={source === 'demo' ? EMPTY : fleet} demo={source === 'demo'} stub={stub} context={context} retired={retired} />}
   </div>;
 }
 
 type Pulse = { record: FleetRequest; at: number; inFlight?: boolean; color?: string };
 
-function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean }) {
+function FleetNetwork({ fleet, demo, stub, context, retired }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean; retired: boolean }) {
   const [clock, setClock] = useState(() => ({ tick: 0, now: Date.now() }));
   const [paused, setPaused] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -103,7 +118,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
   const initialDemo = useMemo(() => demoFleet(0, Date.now()), []);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
-  const data = useMemo(() => demo ? { ...demoFleet(clock.tick, clock.now), usage: initialDemo.usage } : fleet, [demo, clock, fleet, initialDemo]);
+  const data = useMemo(() => demo ? { ...demoFleet(clock.tick, clock.now), usage: initialDemo.usage, instances: demoInstances(clock.now) } : fleet, [demo, clock, fleet, initialDemo]);
   const trace = traceSelection ? arrivals.find(r => r.id === traceSelection.id) ?? traceSelection : null;
   const running = useMemo(() => demo ? demoInFlight(data, clock.tick, clock.now) : [], [demo,data,clock]);
   // the requests running now: the demo's, or those the stream says are in
@@ -115,17 +130,17 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
     : [...pulses, ...[...flying.values()].map(f => ({ record: f.record, at: f.at, inFlight: true }))];
   const fullData = useMemo(() => {
     const usage = [...new Map([...[...flying.values()].map(f => f.record), ...data.usage, ...(trace ? [trace] : []), ...running.map(job => job.record), ...arrivals].map(r => [r.id, r])).values()];
-    return { ...data, usage, contexts: demo ? Object.fromEntries(usage.map(r => [r.id, demoContext(r)])) : undefined };
-  }, [data, arrivals, demo, trace, running, flying]);
+    return { ...data, usage, inFlight: [...activeIds], contexts: demo ? Object.fromEntries(usage.map(r => [r.id, demoContext(r)])) : undefined };
+  }, [data, arrivals, demo, trace, running, flying, activeIds]);
   const filtered = useMemo(() => filterFleet(fullData, filters), [fullData, filters]);
   const options = useMemo(() => filterOptions(fullData), [fullData]);
-  const fullGraph = useMemo(() => buildGraph(fullData, { context }), [fullData, context]);
+  const fullGraph = useMemo(() => buildGraph(fullData, { context, retired }), [fullData, context, retired]);
   const graph = useMemo(() => {
-    const g = buildGraph(filtered, { context });
+    const g = buildGraph(filtered, { context, retired });
     const vertices = g.vertices.filter(v => !hidden.includes(v.kind));
     const ids = new Set(vertices.map(v => v.id));
     return { ...g, vertices, edges: g.edges.filter(e => ids.has(e.source) && ids.has(e.target)), pairs: g.pairs.filter(p => ids.has(p.leader) && ids.has(p.follower)) };
-  }, [filtered, hidden, context]);
+  }, [filtered, hidden, context, retired]);
   const changeFilter = (key: keyof Filters, value: string) => { setFilters(old => ({ ...old, [key]: value })); setSelectedIds([]); setTrace(null); setHovered(null); };
   const filterCount = Object.values(filters).filter(Boolean).length;
 
@@ -223,7 +238,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
         <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}{fullGraph.pairs.length > 0 && <><span className={`${s.legendLine} ${s.legendBond}`} title="a placement's leader seat and its follower's: the two halves of one model"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Bond</span><span className={`${s.legendLine} ${s.legendCable}`} title="the link between the hosts of a placement across two"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Cable</span></>}</div>
-        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project. A model placed across two hosts is one outlined unit: a bond joins its leader seat, which takes its requests, to its follower's, which computes half of each and serves nothing alone; a cable joins their hosts, the link between them. A request to the leader lights both hosts, both seats, the bond and the cable; a part down marks the bond, the cable and the outline, with its reason.</div>
+        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. An api instance that no longer beats, with no request in flight, is retired (each redeploy retires one): it is left off the map, and the requests it admitted flow from the project straight to the host, their trace still naming it; Retired api instances draws it faint, with them. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project. A model placed across two hosts is one outlined unit: a bond joins its leader seat, which takes its requests, to its follower's, which computes half of each and serves nothing alone; a cable joins their hosts, the link between them. A request to the leader lights both hosts, both seats, the bond and the cable; a part down marks the bond, the cable and the outline, with its reason.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">
@@ -236,7 +251,7 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
         </> : trace ? <>
           <h3>{demo ? traceInFlight ? 'Simulated request · in flight' : 'Simulated request' : traceInFlight ? 'Request in flight' : 'Recorded request'}</h3><h2 className="mono">{trace.project}</h2>
           <div className={s.participants}>{[...requestVertices(trace, fullGraph)].map(id => { const v = fullGraph.vertices.find(v => v.id === id)!; return <button key={id} onClick={() => choose(id)}><span>{kindName(v.kind)}</span>{v.name}</button>; })}</div>
-          <dl>{[['Request ID',trace.id], ['Requested model',trace.requested_model], ...(fullGraph.requests.get(trace.id)?.askedAs ? [['Asked as', `alias ${trace.requested_model} → ${trace.resolved_model ?? resolvedModel(trace, data.projects)?.model ?? 'its model'}`]] : []), ['Served model',trace.served?.model ?? 'not attributed'], ['Outcome',traceInFlight ? 'in flight' : trace.status], ['Input / output',traceInFlight ? 'available on completion' : `${count(trace.input_tokens)} / ${count(trace.output_tokens)} tokens`], ['Wall / queue / load',traceInFlight ? 'available on completion' : `${trace.timing.wall_ms} / ${trace.timing.queue_ms} / ${trace.timing.load_ms} ms`], ['Price',traceInFlight ? 'available on completion' : micros(trace.price_micros,trace.currency)], ['Recorded',trace.created_at]].map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
+          <dl>{[['Request ID',trace.id], ['Requested model',trace.requested_model], ...(fullGraph.requests.get(trace.id)?.askedAs ? [['Asked as', `alias ${trace.requested_model} → ${trace.resolved_model ?? resolvedModel(trace, data.projects)?.model ?? 'its model'}`]] : []), ['Served model',trace.served?.model ?? 'not attributed'], ['API instance', admittedBy(fullGraph, trace.id)], ['Outcome',traceInFlight ? 'in flight' : trace.status], ['Input / output',traceInFlight ? 'available on completion' : `${count(trace.input_tokens)} / ${count(trace.output_tokens)} tokens`], ['Wall / queue / load',traceInFlight ? 'available on completion' : `${trace.timing.wall_ms} / ${trace.timing.queue_ms} / ${trace.timing.load_ms} ms`], ['Price',traceInFlight ? 'available on completion' : micros(trace.price_micros,trace.currency)], ['Recorded',trace.created_at]].map(([name,value]) => <div key={name}><dt>{name}</dt><dd>{value}</dd></div>)}</dl>
           {!demo && !traceInFlight && <a href={`#/usage/${encodeURIComponent(trace.id)}`}>Open usage record →</a>}
         </> : <>
           <h3>One connected system</h3><h2>Follow the work.</h2>
@@ -255,6 +270,13 @@ function FleetNetwork({ fleet, demo, stub, context }: { fleet: Fleet; demo: bool
       </button>)}
     </section>
   </>;
+}
+
+/** The api instance that admitted a request, as its record names it: one since retired is said to be, never swapped for the live one. */
+function admittedBy(graph: Graph, id: string): string {
+  const path = graph.requests.get(id);
+  const api = path?.context.apiInstance;
+  return !api ? 'not recorded' : path.retired ? `admitted by api instance ${api}, since retired` : api;
 }
 
 function Marker({ kind }: { kind: Kind }) {
@@ -309,9 +331,10 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
       const p = points.get(v.id)!;
       const bad = BAD_STATES.includes(v.state);
       const waiting = WAITING_STATES.includes(v.state);
+      const retired = v.state === RETIRED;
       // a follower's seat and host are active while its leader's seat has work
       const active = v.active > 0 || (v.partnerActive ?? 0) > 0 || litIds.has(v.id);
-      return <button key={v.id} className={`${s.entity} ${s[v.kind] ?? s.context} ${bad || failedIds.has(v.id) ? s.bad : waiting ? s.waiting : active ? s.active : ''} ${selected.includes(v.id) ? s.selected : ''} ${focusedIds.has(v.id) ? s.fused : ''} ${focused && !focusedIds.has(v.id) ? s.dim : ''}`} style={{ left: p.x, top: p.y }} onClick={() => { if (skipClick.current) { skipClick.current = false; return; } onSelect(v.id); }}
+      return <button key={v.id} className={`${s.entity} ${s[v.kind] ?? s.context} ${bad || failedIds.has(v.id) ? s.bad : waiting ? s.waiting : retired ? s.retired : active ? s.active : ''} ${selected.includes(v.id) ? s.selected : ''} ${focusedIds.has(v.id) ? s.fused : ''} ${focused && !focusedIds.has(v.id) ? s.dim : ''}`} style={{ left: p.x, top: p.y }} onClick={() => { if (skipClick.current) { skipClick.current = false; return; } onSelect(v.id); }}
         onPointerDown={e => {
           if (e.button !== 0) return;
           skipClick.current = false;
@@ -336,7 +359,7 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
           if (e.key === 'Escape') setPins(old => { const next = new Map(old); next.delete(v.id); return next; });
         }}
         onMouseEnter={() => onHover(v.id)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(v.id)} onBlur={() => onHover(null)} aria-label={`${v.kind} ${v.kind === 'seat' ? v.id.slice(5) : v.name}, ${v.state}${v.part ? `, ${v.part.role} of ${v.part.placement} with ${v.part.partner.slice(5)}` : ''}${v.active ? `, ${v.active} in flight` : ''}${v.partnerActive ? `, computing for its leader's ${v.partnerActive} in flight` : ''}`} aria-pressed={selected.includes(v.id)}>
-        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}
+        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}{retired && !bad && <span className={s.stateLabel}>{v.state}</span>}
       </button>;
     })}
     </div></div>

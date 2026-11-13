@@ -50,5 +50,5 @@ export function filterFleet(fleet: Fleet, f: Filters): Fleet {
   const resourceScoped = Object.entries(f).some(([key,value]) => value && !['project','repository','api','model'].includes(key));
   const usage = scopedUsage.filter(r => !resourceScoped || !!r.served && refs.has(r.served.seat));
   const projects = new Set(usage.map(r => r.project));
-  return { contexts: fleet.contexts, placements: fleet.placements, nodes, accounts: fleet.accounts.filter(a => accounts.has(a.id)), projects: fleet.projects.filter(p => projects.has(p.id)), usage };
+  return { contexts: fleet.contexts, placements: fleet.placements, instances: fleet.instances, inFlight: fleet.inFlight, nodes, accounts: fleet.accounts.filter(a => accounts.has(a.id)), projects: fleet.projects.filter(p => projects.has(p.id)), usage };
 }

@@ -108,8 +108,15 @@ export function demoCompletions(fleet: Fleet, tick: number, now: number): FleetR
   });
 }
 
+/** The demo's api instances: two beating, and one retired by an earlier redeploy, which its oldest records name (demoContext). */
+export function demoInstances(now: number): NonNullable<Fleet['instances']> {
+  return [{ id: 'api-0', at: new Date(now - 2400000).toISOString(), up: false }, ...['api-1', 'api-2'].map(id => ({ id, at: new Date(now - 2000).toISOString(), up: true }))];
+}
+
 /** Only used for the synthetic fleet; never interpreted as backend telemetry. */
 export function demoContext(record: FleetRequest) {
   const sequence = Number(record.id.replace(/^demo-(?:seed-|live-)?/, ''));
+  // the oldest seeded records were admitted by an instance since retired
+  if (record.id.startsWith('demo-seed-') && sequence < 12) return { apiInstance: 'api-0' };
   return { apiInstance: sequence % 2 ? 'api-1' : 'api-2' };
 }

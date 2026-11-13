@@ -16,8 +16,12 @@ export const kindName = (kind: Kind): string => kind.startsWith('context:') ? ki
 export const graphKinds = (graph: Graph): Kind[] => [...new Set(graph.vertices.map(v => v.kind))].sort((a, b) => kindName(a).localeCompare(kindName(b)));
 
 export type RequestContext = { repository?: string; apiInstance?: string };
-/** `placements`: what is placed (`listPlacements`), so a placement across two hosts is drawn as one unit; left out, none is. */
-export type Fleet = { nodes: NodeSummary[]; accounts: Account[]; projects: Schemas['Project'][]; usage: FleetRequest[]; placements?: Schemas['Placement'][]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[] };
+/**
+ * `placements`: what is placed (`listPlacements`), so a placement across two hosts is drawn as one unit; left out, none is.
+ * `instances`: the api instances heard beating, each with its last beat and whether it beats now; left out, none has
+ * been heard, and no instance is taken for retired. `inFlight`: the requests in flight now, by id.
+ */
+export type Fleet = { nodes: NodeSummary[]; accounts: Account[]; projects: Schemas['Project'][]; usage: FleetRequest[]; placements?: Schemas['Placement'][]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[]; inFlight?: string[] };
 /** A seat's part in a placement across two hosts: its role, and its partner's seat vertex. */
 export type SeatPart = { placement: string; role: 'leader' | 'follower'; partner: string };
 /**
@@ -31,8 +35,11 @@ export type Vertex = { id: string; name: string; kind: Kind; state: string; acti
  * `bond`: a placement's leader seat to its follower's, the two halves of one model; `cable`: the link between their hosts.
  */
 export type Edge = { id: string; source: string; target: string; kind: 'offers' | 'hosts' | 'pays' | 'standing' | 'observed' | 'bond' | 'cable'; flow?: boolean };
-/** `askedAs`: the alias a request named, when it named one; it flows to the model the alias named like any other. */
-export type RequestPath = { vertices: string[]; edges: string[]; flowEdges: string[]; context: RequestContext; askedAs?: string };
+/**
+ * `askedAs`: the alias a request named, when it named one; it flows to the model the alias named like any other.
+ * `retired`: the api instance that admitted it (`context.apiInstance`, as recorded) has since retired.
+ */
+export type RequestPath = { vertices: string[]; edges: string[]; flowEdges: string[]; context: RequestContext; askedAs?: string; retired?: boolean };
 /**
  * A placement across two hosts, drawn as one unit: its leader's seat and host, its follower's, the bond between the
  * seats, the cable between the hosts, and every edge of it (`edges`). `state`: down when any part of it is, waiting
@@ -43,6 +50,8 @@ export type Graph = { vertices: Vertex[]; edges: Edge[]; total: number; requests
 /** The states drawn as failed, and as waiting. */
 export const BAD_STATES = ['down', 'failed', 'exhausted', 'refused', 'revoked'];
 export const WAITING_STATES = ['paused', 'pending', 'starting', 'fetching', 'offline', 'disabled'];
+/** An api instance's state once it no longer beats and no request in flight names it: drawn faint, and only when asked for. */
+export const RETIRED = 'retired';
 export type Point = { x: number; y: number };
 export const entityId = (kind: Kind, name: string) => `${kind}:${name}`;
 export const edgeId = (a: string, b: string) => [a, b].sort().join('|');
@@ -67,8 +76,24 @@ export function requestContext(record: FleetRequest, contexts?: Fleet['contexts'
   return { repository: record.metadata?.repository?.trim() || undefined, ...(instance ? { apiInstance: instance } : {}), ...contexts?.[record.id] };
 }
 
-/** What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source. */
-export type GraphOptions = { context?: boolean };
+/**
+ * The api instances live now: each beating, and any a request in flight names, beating or not (it is serving still).
+ * Undefined when no instance has been heard (`instances` left out): then none is taken for retired.
+ */
+export function liveInstances(fleet: Fleet): Set<string> | undefined {
+  if (!fleet.instances) return undefined;
+  const live = new Set(fleet.instances.filter(i => i.up).map(i => i.id));
+  const flying = new Set(fleet.inFlight ?? []);
+  for (const r of fleet.usage) if (flying.has(r.id)) { const id = requestContext(r, fleet.contexts).apiInstance; if (id) live.add(id); }
+  return live;
+}
+
+/**
+ * What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source.
+ * `retired`: the api instances that have retired (each redeploy retires one), faint, with the requests they admitted
+ * joined to them as recorded; off, none is drawn, and a request one admitted flows from its project straight to its host.
+ */
+export type GraphOptions = { context?: boolean; retired?: boolean };
 
 /** Each request is a hyperedge: a correlated set of participants, rendered as links. */
 export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
@@ -89,8 +114,25 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     }
     return undefined;
   };
-  // the api instances the hub announced: alive while they beat
-  for (const i of fleet.instances ?? []) add({ id: entityId('api', i.id), name: i.id, kind: 'api', state: i.up ? 'up' : 'down', active: 0, details: [['API instance', i.id], ['Last heartbeat', i.at], ['Evidence', 'Announced by the hub as it beats; which instance served a request is not yet recorded.']] });
+  // the api instances: live while they beat or a request in flight names
+  // them; retired after (each redeploy starts a new one), drawn only when
+  // asked for. Unknown when none has been heard: then each is as recorded
+  const live = liveInstances(fleet);
+  const retired = (id: string) => !!live && !live.has(id);
+  const heard = new Map((fleet.instances ?? []).map(i => [i.id, i]));
+  const apiVertex = (name: string): string | undefined => {
+    const id = entityId('api', name);
+    if (retired(name) && !options.retired) return undefined;
+    if (vertices.has(id)) return id;
+    const beat = heard.get(name);
+    const state = retired(name) ? RETIRED : live ? 'up' : 'observed';
+    const meaning = state === RETIRED ? 'Retired: it no longer beats and no request in flight names it. The requests it admitted still name it.'
+      : state === 'up' ? (beat?.up ? 'Live: beating.' : 'Live: a request in flight names it.')
+      : 'The api instance that admitted a request, as its usage record says.';
+    add({ id, name, kind: 'api', state, active: 0, details: [['API instance', name], ['State', meaning], ['Last heartbeat', beat?.at ?? 'not heard']] });
+    return id;
+  };
+  for (const i of fleet.instances ?? []) apiVertex(i.id);
   for (const p of fleet.projects) add({ id: entityId('project', p.id), name: p.id, kind: 'project', state: p.status, active: 0, href: link('projects', p.id), details: [['Name', p.name], ['State', p.status]] });
   const model = (name: string, meaning: string) => {
     const id = entityId('model', name);
@@ -220,8 +262,11 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       if (key === 'repository' || typeof value !== 'string' || !value.trim()) continue;
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));
     }
-    const api = context.apiInstance ? member('api', context.apiInstance, 'The api instance that admitted the request, as its usage record says.') : null;
-    if (api) join(project, api, true);
+    // the api instance that admitted it, as recorded; one since retired is
+    // drawn only when asked for, and never stands in for the live one
+    const admitted = context.apiInstance;
+    const api = admitted ? apiVertex(admitted) : undefined;
+    if (api) { members.push(api); join(project, api, true); }
     if (r.served) {
       const seat = member('seat', r.served.seat);
       const host = member('node', r.served.node);
@@ -236,17 +281,19 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
         join(host, followerHost, true); join(followerHost, followerSeat, true); join(seat, followerSeat, true);
       }
       // the project reaches the host through the api instance that admitted
-      // it, or straight there when the record predates naming one: a
-      // project is never left apart from its flow
+      // it, or straight there when the record predates naming one or that
+      // instance has retired and is not drawn: a project is never left apart
+      // from its flow
       if (api) join(api, host, true);
       else join(project, host, true);
     }
-    requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context, ...(resolved ? { askedAs: r.requested_model } : {}) });
+    requests.set(r.id, { vertices: [...new Set(members)], edges: [...new Set(links)], flowEdges: flowLinks, context, ...(resolved ? { askedAs: r.requested_model } : {}), ...(admitted && retired(admitted) ? { retired: true } : {}) });
   }
   // the standing topology, faint, with or without traffic: every project
   // reaches the api instances, every api instance every host; after the
-  // requests, so an instance known only from its records is joined too
-  const apis = [...vertices.values()].filter(v => v.kind === 'api').map(v => v.id);
+  // requests, so an instance known only from its records is joined too; a
+  // retired one reaches nothing now
+  const apis = [...vertices.values()].filter(v => v.kind === 'api' && v.state !== RETIRED).map(v => v.id);
   for (const p of fleet.projects) for (const a of apis) connect(entityId('project', p.id), a, 'standing');
   for (const a of apis) for (const n of fleet.nodes) connect(a, entityId('node', n.id), 'standing');
   const visible = [...vertices.values()].slice(0, 160);

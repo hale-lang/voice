@@ -13,6 +13,11 @@
 ///     GET  /v1/models      the one model
 ///     GET  /healthz        200 once the model is loaded
 ///
+/// Started with a key in `VOICE_DECIDE_API_KEY`, as a node starts it (the
+/// node draws one for each start, node/run.hl), it answers every route but
+/// its health check only to a request that presents the key as
+/// `Authorization: Bearer`; started with none, it answers any.
+///
 /// One model, one scorer: requests are served one at a time, in the order
 /// they come, which is what the scorer can do. The health check is read
 /// only while a seat starts, before any request comes.
@@ -25,6 +30,15 @@ const READOUT_FORMAT: String = "macjev-readout-v2";
 const TEMPLATE: String = "macjev-render-v2-long-options";
 /// What the GGUF must be: another model's gives plausible, wrong answers.
 const GGUF_KEYS: String = "[\"general.architecture\",\"qwen35.block_count\",\"qwen35.embedding_length\"]";
+/// The variable a node hands the server its key in (node/run.hl `key_env`).
+const KEY_ENV: String = "VOICE_DECIDE_API_KEY";
+
+/// The bearer of an `Authorization` header, "" when it names none.
+fn bearer_of(authorization: String) -> String {
+    if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { return ""; }
+    return std::str::trim(authorization[7..len(authorization)]);
+}
+
 /// A request's largest body: a full context of state, escaped.
 const BODY_MAX: Int = 4194304;
 
@@ -72,10 +86,22 @@ locus Decider {
         glue: Glue = Glue { };
         temperature: Float = 1.0;
         backend: String = "llama.cpp";
+        // the key it was started with, which every route but its health
+        // check requires when there is one
+        key: std::secret::Credential = std::secret::Credential { env_var: KEY_ENV };
     }
 
     fn handle(req: std::http::Request) -> std::http::Response {
         let c = std::http::build_context(req);
+        if !std::http::is_route(c, "GET", "/healthz") && !self.admits(req) {
+            return error_response(
+                Refusal {
+                    status: 401,
+                    code: "unauthorized",
+                    message: "this server answers the node that started it: Authorization: Bearer, with its key",
+                },
+            );
+        }
         if std::http::is_route(c, "POST", "/v1/systemone") {
             let t0 = std::time::monotonic_ns();
             let body = self.systemone(req.body) or { return error_response(err); };
@@ -98,7 +124,8 @@ locus Decider {
                 200,
                 "{\"status\": \"ok\", \"model\": \"" + MODEL_ID + "\", \"backend\": \""
                     + self.backend
-                    + "\", \"auth\": false, \"untrained\": false, \"release_kind\": \"release\"}",
+                    + "\", \"auth\": " + (if self.key.ready() { "true" } else { "false" })
+                    + ", \"untrained\": false, \"release_kind\": \"release\"}",
             );
         }
         return error_response(
@@ -107,6 +134,15 @@ locus Decider {
                 code: "not_found",
                 message: "no such endpoint: " + req.method + " " + req.path,
             },
+        );
+    }
+
+    /// True when `req` may be answered: it presents the key the server was
+    /// started with, or the server was started with none.
+    fn admits(req: std::http::Request) -> Bool {
+        if !self.key.ready() { return true; }
+        return self.key.matches(
+            std::bytes::from_string(bearer_of(std::http::header(req, "Authorization"))),
         );
     }
 

@@ -1,7 +1,10 @@
 import fs from 'fs';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
-const [bundle, base] = process.argv.slice(2);
+// the node's admin token file (`admin.token` in its data directory): a write
+// presents it, as node.yaml says
+const [bundle, base, tokenFile] = process.argv.slice(2);
+const token = tokenFile ? fs.readFileSync(tokenFile, 'utf8').trim() : '';
 const spec = JSON.parse(fs.readFileSync(bundle, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
 const calls = [
@@ -13,7 +16,8 @@ let fails = 0;
 for (const [m, p, body] of calls) {
   const op = spec.paths[p][m];
   const code = Object.keys(op.responses).find(c => c.startsWith('2'));
-  const r = await fetch(base + p.replace('{seat}', 'static'), { method: m.toUpperCase(), body: body && JSON.stringify(body) });
+  const headers = m === 'get' ? {} : { authorization: `Bearer ${token}` };
+  const r = await fetch(base + p.replace('{seat}', 'static'), { method: m.toUpperCase(), headers, body: body && JSON.stringify(body) });
   const j = await r.json();
   const f = ajv.compile((({ $schema, ...s }) => s)(op.responses[code].content['application/json'].schema));
   const ok = String(r.status) === code && f(j);

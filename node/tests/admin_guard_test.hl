@@ -1,0 +1,275 @@
+// The node's admin API takes requests from the machine's own operator and
+// tools alone (admin.hl): a request must name its loopback authority in
+// its `Host`, carry nothing a web page adds (an `Origin`, cross-site fetch
+// metadata), and a write must present the admin token the node keeps in
+// `<data>/admin.token`, mode 600. The token is never logged.
+import ".." as node;
+
+const PORT: Int = 8081;
+
+/// A request to the API at its port, with `headers` beside its Host.
+fn at(api: node::AdminApi, method: String, path: String, headers: String) -> Int {
+    return api.handle(
+        std::http::Request {
+            method: method,
+            path: path,
+            headers: headers,
+            body: "{\"paused\": false, \"paused_seats\": [], \"reason\": null}",
+        },
+    ).status;
+}
+
+fn guard() {
+    let dir = "/tmp/voice-admin-guard-test-" + to_string(std::process::pid());
+    std::io::fs::mkdir(dir) or discard;
+    let api = node::AdminApi {
+        id: "node-a",
+        data: dir,
+        capabilities: "{\"engines\": []}",
+        port: PORT,
+        token_digest: node::admin_digest("vn-right"),
+    };
+    let here = "Host: 127.0.0.1:8081";
+    let token = "\r\nAuthorization: Bearer vn-right";
+
+    // its own loopback authority, by any of its names
+    std::test::assert_eq_int(at(api, "GET", "/node/v1/status", here), 200, "127.0.0.1 is its own");
+    std::test::assert_eq_int(
+        at(api, "GET", "/node/v1/status", "host: LOCALHOST:8081"),
+        200,
+        "localhost, in any case",
+    );
+    std::test::assert_eq_int(
+        at(api, "GET", "/node/v1/local", "Host: [::1]:8081"),
+        200,
+        "and [::1]",
+    );
+    std::test::assert_eq_int(at(api, "GET", "/healthz", here), 200, "liveness is a read");
+
+    // any other Host is refused, liveness too: a name that resolved here
+    for foreign in [
+        "Host: example.com:8081",
+        "Host: example.com",
+        "Host: 127.0.0.1",
+        "Host: 127.0.0.1:8082",
+        "Host: 127.0.0.1.example.com:8081",
+        "Host: 192.0.2.10:8081",
+        "Host: 127.0.0.1:8081\r\nHost: example.com:8081",
+        "",
+    ] {
+        std::test::assert_eq_int(
+            at(api, "GET", "/node/v1/status", foreign),
+            403,
+            "a foreign Host: " + foreign,
+        );
+        std::test::assert_eq_int(
+            at(api, "GET", "/healthz", foreign),
+            403,
+            "liveness too: " + foreign,
+        );
+    }
+    // the address it listens on, when that is one address
+    let lan = node::AdminApi { data: dir, host: "192.0.2.10", port: PORT };
+    std::test::assert_eq_int(
+        at(lan, "GET", "/node/v1/local", "Host: 192.0.2.10:8081"),
+        200,
+        "an API on one address answers to it",
+    );
+    let every = node::AdminApi { data: dir, host: "0.0.0.0", port: PORT };
+    std::test::assert_eq_int(
+        at(every, "GET", "/node/v1/local", "Host: 0.0.0.0:8081"),
+        403,
+        "one on every interface answers to loopback alone",
+    );
+
+    // what a web page sends is refused, a read or a write, token or none
+    for page in [
+        "\r\nOrigin: http://example.com",
+        "\r\nOrigin: null",
+        "\r\norigin: http://127.0.0.1:8081",
+        "\r\nSec-Fetch-Site: cross-site",
+        "\r\nSec-Fetch-Site: same-site",
+        "\r\nSec-Fetch-Site: same-origin",
+    ] {
+        std::test::assert_eq_int(
+            at(api, "GET", "/node/v1/status", here + page),
+            403,
+            "a page's read: " + page,
+        );
+        std::test::assert_eq_int(
+            at(api, "PUT", "/node/v1/local", here + token + page),
+            403,
+            "a page's write: " + page,
+        );
+    }
+    std::test::assert_eq_int(
+        at(api, "GET", "/node/v1/status", here + "\r\nSec-Fetch-Site: none"),
+        200,
+        "a person's own browser, at the address they typed, reads it",
+    );
+
+    // a write takes the token; a read does not
+    std::test::assert_eq_int(at(api, "PUT", "/node/v1/local", here), 401, "a write without it");
+    std::test::assert_eq_int(
+        at(api, "PUT", "/node/v1/local", here + "\r\nAuthorization: Bearer vn-wrong"),
+        401,
+        "a write with another",
+    );
+    std::test::assert_eq_int(
+        at(api, "PUT", "/node/v1/local", here + "\r\nAuthorization: vn-right"),
+        401,
+        "a write that names no bearer",
+    );
+    std::test::assert_eq_int(at(api, "POST", "/node/v1/local", here), 401, "any write");
+    std::test::assert_eq_int(at(api, "DELETE", "/node/v1/local", here), 401, "any write");
+    std::test::assert_eq_int(
+        at(api, "PUT", "/node/v1/local", here + "\r\nauthorization: bearer vn-right"),
+        200,
+        "a write with it",
+    );
+    // a node that kept no token takes no write
+    let none = node::AdminApi { data: dir, port: PORT };
+    std::test::assert_eq_int(
+        at(none, "PUT", "/node/v1/local", here + "\r\nAuthorization: Bearer "),
+        401,
+        "no token kept, no write",
+    );
+    std::test::assert(!node::admin_matches("", ""), "an empty token matches nothing");
+}
+
+/// What the node logged, a line an event, to a file of the test's.
+locus Logged {
+    params { file: String = ""; }
+    bus { subscribe "log.**" as on_event of type std::log::LogEvent; }
+    fn on_event(e: std::log::LogEvent) {
+        std::io::fs::write_file_append(self.file, e.msg + " " + e.fields + "\n") or discard;
+    }
+}
+
+/// A request written whole on a connection of its own, its status line's
+/// code read back; 0 when none came.
+fn raw_status(port: Int, request: String) -> Int {
+    let fd = std::io::tcp::connect("127.0.0.1", port) or { return 0; };
+    let s = std::io::tcp::Stream { conn_fd: fd, owns_fd: false };
+    s.send(request) or discard;
+    let head = s.recv(4096) or "";
+    std::io::tcp::close_fd(fd);
+    if !std::str::starts_with(head, "HTTP/1.1 ") || len(head) < 12 { return 0; }
+    return std::str::parse_int(head[9..12]) or 0;
+}
+
+/// A request through the client, which names the authority it dials.
+fn status_of(method: String, url: String, headers: String) -> Int {
+    let parsed = std::http::parse_url(url) or { return 0; };
+    let r = std::http::request(
+        std::http::ClientRequest {
+            method: method,
+            url: parsed,
+            headers: headers,
+            body: std::bytes::from_string(
+                "{\"paused\": false, \"paused_seats\": [], \"reason\": null}",
+            ),
+        },
+    ) or { return 0; };
+    return r.status;
+}
+
+fn free_port() -> Int {
+    let mut port = 31000 + std::process::pid() % 9000;
+    while port < 40000 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+main locus Live {
+    params {
+        data: String = "";
+        port: Int = 0;
+        srv: std::http::Server = std::http::Server { handler: node::AdminApi { } };
+    }
+    placement { srv: cooperative(pool = io) where async_io; }
+    run() {
+        let file = self.data + "/admin.token";
+        let mut waited = 0;
+        while waited < 100
+            && status_of("GET", "http://127.0.0.1:" + to_string(self.port) + "/healthz", "") != 200
+        {
+            std::time::sleep(50ms);
+            waited = waited + 1;
+        }
+        let token = std::str::trim(std::io::fs::read_file(file) or "");
+        std::test::assert(
+            std::str::starts_with(token, "vn-") && len(token) == 67,
+            "the node keeps a token of 32 random bytes",
+        );
+        std::test::assert(
+            std::str::starts_with(node::run_out("ls\n-ldL\n" + file), "-rw------- "),
+            "readable by the node's own user alone",
+        );
+        let base = "http://127.0.0.1:" + to_string(self.port);
+        std::test::assert_eq_int(
+            status_of("GET", base + "/node/v1/status", ""),
+            200,
+            "a local read",
+        );
+        std::test::assert_eq_int(
+            status_of("PUT", base + "/node/v1/local", ""),
+            401,
+            "a local write without the token",
+        );
+        std::test::assert_eq_int(
+            status_of("PUT", base + "/node/v1/local", "Authorization: Bearer " + token),
+            200,
+            "a local write with it",
+        );
+        std::test::assert_eq_int(
+            status_of("GET", base + "/node/v1/status", "Origin: http://example.com"),
+            403,
+            "a page's read, cross-origin",
+        );
+        std::test::assert_eq_int(
+            raw_status(
+                self.port,
+                "GET /node/v1/status HTTP/1.1\r\nHost: example.com:" + to_string(self.port)
+                    + "\r\nConnection: close\r\n\r\n",
+            ),
+            403,
+            "a read that names another host",
+        );
+        std::test::assert_eq_int(
+            raw_status(
+                self.port,
+                "GET /node/v1/status HTTP/1.1\r\nHost: localhost:" + to_string(self.port)
+                    + "\r\nConnection: close\r\n\r\n",
+            ),
+            200,
+            "and one that names localhost",
+        );
+        let logged = std::io::fs::read_file(self.data + "/logged") or "";
+        std::test::assert(std::str::contains(logged, "serving the admin API"), "the node logged");
+        std::test::assert(!std::str::contains(logged, token), "and never the token");
+        std::test::assert(!std::str::contains(logged, token[3..len(token)]), "nor any of it");
+    }
+}
+
+fn main() {
+    guard();
+    let data = "/tmp/voice-admin-live-test-" + to_string(std::process::pid());
+    std::io::fs::mkdir(data) or discard;
+    let port = free_port();
+    let sink = Logged { file: data + "/logged" };
+    Live {
+        data: data,
+        port: port,
+        srv: std::http::Server {
+            port: port,
+            handler: node::admin_api("node-a", data, "{\"engines\": []}", "127.0.0.1", port),
+        },
+    };
+}

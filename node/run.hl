@@ -4,6 +4,15 @@
 // serves the seat through the openai-compatible path, to the server's
 // port on loopback (session.hl).
 //
+// Loopback is not the node's alone: any program on the machine, a web page
+// in its browser among them, reaches it. So each server is started with a
+// key of its own, drawn fresh as it starts (`engine_key`) and held in the
+// node's memory alone, and answers only a request that presents it (each
+// server's own check, `key_env`); the node presents it on every call it
+// makes to the server, its health check, its context and the requests it
+// serves. The key reaches the server in its environment, never on a
+// command line.
+//
 // Voice decides how a runtime runs; nothing here is configured:
 // - a container runtime runs under docker, its image by digest, the
 //   weights mounted read-only, its port published on loopback only, and
@@ -65,6 +74,9 @@ type Run {
     identity: String = "";
     // a part of a placement across two nodes
     spans: Bool = false;
+    // the key its server answers to (`engine_key`), which every call to it
+    // presents; never logged, never on a command line
+    key: String = "";
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -290,6 +302,15 @@ locus Runner {
             self.tell(seat, "down", "no free port on loopback for its server", "");
             return;
         }
+        // the key its server answers to, fresh for this start
+        let key = engine_key();
+        if len(key) == 0 {
+            self.tell(seat, "down", "no key could be drawn for its server", "");
+            return;
+        }
+        // a container is handed it by name (`docker run -e NAME`), its
+        // value from the environment docker is started with
+        let key_flag = "-e\n" + key_env(server) + "\n";
         let mut r = Run {
             seat: seat,
             identity: serving_identity(config),
@@ -299,6 +320,7 @@ locus Runner {
             health: "http://127.0.0.1:" + to_string(port) + health_path(server),
             endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
             spans: spans,
+            key: key,
         };
         // a follower serves no API: nothing to ask, nowhere to serve
         if spans && std::json::find_int_field(cluster, "rank") > 0 {
@@ -344,7 +366,7 @@ locus Runner {
                             "sha256",
                         ),
                     ),
-                    env,
+                    env + key_flag,
                     std::json::find_string_field(artifact, "image") + "@"
                         + std::json::find_string_field(artifact, "digest"),
                     rank_launch(
@@ -367,7 +389,7 @@ locus Runner {
                     self.id,
                     models,
                     self.data + "/blobs",
-                    env,
+                    env + key_flag,
                     server_cache_args(
                         server,
                         self.data,
@@ -396,6 +418,7 @@ locus Runner {
                     models,
                     self.data + "/blobs",
                     gpu_args(std::json::find_string_field(runtime, "accelerator")),
+                    key_flag,
                     server_cache_args(
                         server,
                         self.data,
@@ -452,17 +475,10 @@ locus Runner {
                     std::json::find_field_raw(config, "variant"),
                 );
         }
-        // started apart from the node, its output to a file of its own: sh
-        // starts it in the background and says its pid, the command handed
-        // to sh as its arguments, never as text it reads
         std::io::fs::mkdir(self.data + "/run") or discard;
         r.log = self.data + "/run/" + seat + ".log";
-        let started = std::process::run_with(
-            "sh\n-c\n\"$@\" > \"$0\" 2>&1 & echo $!\n" + r.log + "\n" + argv,
-            std::process::SpawnOptions { cwd: self.data },
-        ) or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
-        let pid = std::str::parse_int(std::str::trim(started.stdout)) or 0;
-        if started.code != 0 || pid <= 0 {
+        let pid = launch(self.data, r.log, argv, server, key);
+        if pid <= 0 {
             self.tell(seat, "down", "its server could not be started", "");
             return;
         }
@@ -503,16 +519,16 @@ locus Runner {
                 r.phase = "up";
                 changed = true;
                 self.tell_up(r);
-            } else if r.phase == "starting" && healthy(r.health) {
+            } else if r.phase == "starting" && healthy(r.health, r.key) {
                 r.phase = "up";
-                r.context = served_context(r.server, r.port);
+                r.context = served_context(r.server, r.port, r.key);
                 r.asked = 1;
                 changed = true;
                 self.tell_up(r);
             } else if r.phase == "up" && r.context == 0 && r.asked < CONTEXT_ASKS {
                 // one that answered before it could say its context is
                 // asked again, for a while
-                r.context = served_context(r.server, r.port);
+                r.context = served_context(r.server, r.port, r.key);
                 r.asked = r.asked + 1;
                 changed = true;
                 if r.context > 0 { self.tell_up(r); }
@@ -634,6 +650,7 @@ locus Runner {
             status: "up",
             reason: "",
             endpoint: r.endpoint,
+            key: r.key,
             context: r.context,
             by_runner: true,
         };
@@ -970,11 +987,11 @@ fn served_tokens(config: String) -> Int {
 
 /// The context, in tokens, a server that answers took: llama-server's
 /// `n_ctx` (`/props`), vLLM's and TensorFold's `max_model_len`
-/// (`/v1/models`); 0 when it does not say.
-fn served_context(server: String, port: Int) -> Int {
+/// (`/v1/models`); 0 when it does not say. Asked with its `key`.
+fn served_context(server: String, port: Int, key: String) -> Int {
     let base = "http://127.0.0.1:" + to_string(port);
     if server == "vllm" || server == "tensorfold" {
-        let r = std::http::get(base + "/v1/models") or { return 0; };
+        let r = keyed_get(base + "/v1/models", key) or { return 0; };
         if r.status != 200 { return 0; }
         let first = std::json::array_first(
             std::json::find_field_raw(std::str::from_bytes(r.body), "data"),
@@ -982,7 +999,7 @@ fn served_context(server: String, port: Int) -> Int {
         if first.done { return 0; }
         return std::json::find_int_field(first.element, "max_model_len");
     }
-    let r = std::http::get(base + "/props") or { return 0; };
+    let r = keyed_get(base + "/props", key) or { return 0; };
     if r.status != 200 { return 0; }
     let body = std::str::from_bytes(r.body);
     let settings = std::json::find_field_raw(body, "default_generation_settings");
@@ -996,7 +1013,8 @@ const CONTEXT_ASKS: Int = 20;
 
 /// `docker run` for a container runtime: its port on loopback only, the
 /// weights and the store they link into mounted read-only at the paths the
-/// links name, and its accelerator's devices (`gpu_args`).
+/// links name, its accelerator's devices (`gpu_args`), and its key, by
+/// name (`key`, `-e` and the variable `key_env` names).
 fn container_argv(
     name: String,
     owner: String,
@@ -1004,6 +1022,7 @@ fn container_argv(
     models: String,
     blobs: String,
     gpu: String,
+    key: String,
     cache: String,
     image: String,
     args: String
@@ -1018,6 +1037,7 @@ fn container_argv(
     // the hub; and room in shared memory, which vLLM's workers need
         + "-e\nHF_HUB_OFFLINE=1\n-e\nTRANSFORMERS_OFFLINE=1\n--shm-size\n8g\n"
         + gpu
+        + key
         + cache
         + image + "\n" + args;
 }
@@ -1238,10 +1258,65 @@ fn stop_left(id: String, data: String) {
     }
 }
 
-/// True when a server's health check answers 200.
-fn healthy(url: String) -> Bool {
-    let r = std::http::get(url) or { return false; };
+/// A server's command (`argv`, one argument a line) started apart from the
+/// node, in `data`, its output to `log`: sh starts it in the background and
+/// says its pid, the command handed to sh as its arguments, never as text
+/// it reads. Its `key` is in the environment sh starts it with, as the
+/// variable `server` reads (`key_env`; a container's docker hands it on),
+/// never among its arguments. Its pid, 0 when it could not be started.
+@unbounded
+fn launch(data: String, log: String, argv: String, server: String, key: String) -> Int {
+    let started = std::process::run_with(
+        "sh\n-c\n\"$@\" > \"$0\" 2>&1 & echo $!\n" + log + "\n" + argv,
+        std::process::SpawnOptions { cwd: data, env: key_env(server) + "=" + key },
+    ) or std::process::ProcessOutput { code: 1, signal: 0, stdout: "", stderr: "" };
+    let pid = std::str::parse_int(std::str::trim(started.stdout)) or 0;
+    return if started.code == 0 { pid } else { 0 };
+}
+
+/// True when a server's health check answers 200, asked with its `key`.
+fn healthy(url: String, key: String) -> Bool {
+    let r = keyed_get(url, key) or { return false; };
     return r.status == 200;
+}
+
+/// A GET of `url` on a seat's server, presenting its `key`.
+fn keyed_get(url: String, key: String) -> std::http::ClientResponse fallible(std::http::HttpError) {
+    let parsed = std::http::parse_url(url) or raise;
+    return std::http::request(
+        std::http::ClientRequest {
+            method: "GET",
+            url: parsed,
+            headers: engine_auth(key),
+            body: b"",
+        },
+    ) or raise;
+}
+
+/// A seat server's key: 32 random bytes from the kernel, in hex; "" when
+/// the kernel gives none.
+@unbounded
+fn engine_key() -> String {
+    let b = std::os::getrandom(32) or { return ""; };
+    return std::hex::encode(b);
+}
+
+/// The environment variable a server reads its key from, which it then
+/// requires of every request but its health check: llama-server's
+/// `LLAMA_API_KEY`, vLLM's `VLLM_API_KEY` (which it requires of its `/v1`
+/// routes), TensorFold's `TENSORFOLD_API_KEY`, and the decision server's
+/// `VOICE_DECIDE_API_KEY` (decide/, and the MLX build's launcher).
+fn key_env(server: String) -> String {
+    if server == "vllm" { return "VLLM_API_KEY"; }
+    if server == "tensorfold" { return "TENSORFOLD_API_KEY"; }
+    if server == "decision" { return "VOICE_DECIDE_API_KEY"; }
+    return "LLAMA_API_KEY";
+}
+
+/// The header a call to a seat's server presents its `key` in, "" for no
+/// key.
+fn engine_auth(key: String) -> String {
+    return if len(key) > 0 { "Authorization: Bearer " + key } else { "" };
 }
 
 /// A port on loopback no one listens on, from `from`; -1 for none.

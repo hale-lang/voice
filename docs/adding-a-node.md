@@ -212,6 +212,11 @@ curl -sS $api/admin/v1/nodes/node-a -H @admin.h        # up, its hardware, its e
 curl -sS http://127.0.0.1:8081/node/v1/status         # on the machine
 ```
 
+The node's local API answers the machine's own tools on loopback, never a
+web page. A write, such as pausing the node, takes the admin token the node
+keeps in `admin.token` in its data directory, readable by the node's user
+alone, as a bearer ([node.yaml](../spec/node.yaml), "Who may call it").
+
 The node also serves its readings at `http://<machine>:9476/metrics`, on
 every interface, for a habitat's senses to scrape: its own runtime's series,
 and each seat's `voice_node_seat_up`, `voice_node_seat_in_flight`,

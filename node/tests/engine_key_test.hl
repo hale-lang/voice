@@ -1,0 +1,291 @@
+// A managed seat's server answers only the node (run.hl): it is started
+// with a key of its own, in its environment and never on a command line,
+// and every call the node makes to it presents the key: its health check,
+// its context, the requests it serves and a decision model's. A call
+// without it, or with another, is refused. The key is never logged.
+import ".." as node;
+
+const STREAM: String = "data: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\ndata: {\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n";
+
+const DECIDED: String = "{\"model\":\"jev-2b\",\"answers\":{\"q\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":5,\"state_tokens\":3,\"output_tokens\":0}}";
+
+fn answer(s: std::io::tcp::Stream, status: String, kind: String, body: String) {
+    s.send(
+        "HTTP/1.1 " + status + "\r\nContent-Type: " + kind + "\r\nContent-Length: "
+            + to_string(len(body)) + "\r\nConnection: close\r\n\r\n" + body,
+    ) or discard;
+}
+
+/// The request's head and body, whole.
+fn read_request(s: std::io::tcp::Stream) -> String {
+    let mut req = s.recv(65536) or "";
+    let he = std::str::index_of(req, "\r\n\r\n");
+    if he < 0 { return req; }
+    let lowered = std::str::lower(req[0..he]);
+    let at = std::str::index_of(lowered, "content-length:");
+    if at < 0 { return req; }
+    let rest = lowered[(at + 15)..len(lowered)];
+    let end = std::str::index_of(rest, "\r\n");
+    let want = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or 0;
+    while len(req) < he + 4 + want {
+        let more = s.recv(65536) or "";
+        if len(more) == 0 { break; }
+        req = req + more;
+    }
+    return req;
+}
+
+/// A seat's server as llama-server, vLLM and TensorFold check a key: its
+/// health open, every other route answered only with the key it was
+/// started with, presented as a bearer.
+fn engine_conn(s: std::io::tcp::Stream, key: String) {
+    let req = read_request(s);
+    if std::str::starts_with(req, "GET /health ") {
+        answer(s, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    let he = std::str::index_of(req, "\r\n\r\n");
+    let head = if he < 0 { req } else { req[0..he] };
+    if !std::str::contains(std::str::lower(head), "\r\nauthorization: bearer " + key + "\r\n")
+        && !std::str::ends_with(std::str::lower(head), "\r\nauthorization: bearer " + key)
+    {
+        answer(
+            s,
+            "401 Unauthorized",
+            "application/json",
+            "{\"error\":{\"message\":\"Invalid API Key\",\"type\":\"authentication_error\"}}",
+        );
+        return;
+    }
+    if std::str::starts_with(req, "GET /props ") {
+        answer(
+            s,
+            "200 OK",
+            "application/json",
+            "{\"default_generation_settings\":{\"n_ctx\":4096}}",
+        );
+        return;
+    }
+    if std::str::starts_with(req, "GET /v1/models ") {
+        answer(
+            s,
+            "200 OK",
+            "application/json",
+            "{\"data\":[{\"id\":\"m\",\"max_model_len\":8192}]}",
+        );
+        return;
+    }
+    if std::str::starts_with(req, "POST /v1/chat/completions ") {
+        answer(s, "200 OK", "text/event-stream", STREAM);
+        return;
+    }
+    if std::str::starts_with(req, "POST /v1/systemone ") {
+        answer(s, "200 OK", "application/json", DECIDED);
+        return;
+    }
+    answer(s, "404 Not Found", "application/json", "{}");
+}
+
+locus Engine {
+    params {
+        fd: Int = -1;
+        key: String = "";
+    }
+    run() {
+        while true {
+            let conn = std::io::tcp::accept_one(self.fd) or - 1;
+            if conn < 0 { return; }
+            engine_conn(std::io::tcp::Stream { conn_fd: conn, owns_fd: false }, self.key);
+            std::io::tcp::close_fd(conn);
+        }
+    }
+}
+
+/// What the node logged, a line an event, to a file of the test's.
+locus Logged {
+    params { file: String = ""; }
+    bus { subscribe "log.**" as on_event of type std::log::LogEvent; }
+    fn on_event(e: std::log::LogEvent) {
+        std::io::fs::write_file_append(self.file, e.msg + " " + e.fields + "\n") or discard;
+    }
+}
+
+/// The key reaches a server in its environment, as the variable its
+/// server reads, and on no process's command line.
+fn handed_in_environment(data: String) {
+    std::test::assert_eq_str(node::key_env("llama-server"), "LLAMA_API_KEY", "llama-server's");
+    std::test::assert_eq_str(node::key_env("vllm"), "VLLM_API_KEY", "vLLM's");
+    std::test::assert_eq_str(node::key_env("tensorfold"), "TENSORFOLD_API_KEY", "TensorFold's");
+    std::test::assert_eq_str(node::key_env("decision"), "VOICE_DECIDE_API_KEY", "voice-decide's");
+
+    let key = node::engine_key();
+    std::test::assert(len(key) == 64, "32 random bytes, in hex");
+    std::test::assert(key != node::engine_key(), "fresh for each start");
+
+    // a server that writes what it was handed, then waits as a server does
+    let out = data + "/handed";
+    let pid = node::launch(
+        data,
+        data + "/server.log",
+        "sh\n-c\nprintf %s \"$LLAMA_API_KEY\" > \"$1\"; exec sleep 30\nsh\n" + out,
+        "llama-server",
+        key,
+    );
+    std::test::assert(pid > 0, "the server started");
+    let mut waited = 0;
+    while waited < 100 && len(std::io::fs::read_file(out) or "") == 0 {
+        std::time::sleep(50ms);
+        waited = waited + 1;
+    }
+    std::test::assert_eq_str(
+        std::io::fs::read_file(out) or "",
+        key,
+        "the server read its key from its environment",
+    );
+    let everyone = node::run_out("ps\n-A\n-ww\n-o\ncommand=");
+    std::test::assert(len(everyone) > 0, "the machine's processes are listed");
+    std::test::assert(!std::str::contains(everyone, key), "no command line holds the key");
+    std::test::assert(
+        !std::str::contains(std::io::fs::read_file(data + "/server.log") or "", key),
+        "nor the server's log",
+    );
+    node::end_process(pid);
+
+    // a container is handed it by name, its value docker's to read from
+    // the environment it is started with
+    let argv = node::container_argv(
+        "voice.node-a.s",
+        "node-a",
+        9000,
+        "/m",
+        "/b",
+        "",
+        "-e\nLLAMA_API_KEY\n",
+        "",
+        "img@sha256:x",
+        "-m\n/models/x.gguf",
+    );
+    std::test::assert(
+        std::str::contains(argv, "\n-e\nLLAMA_API_KEY\n"),
+        "a container's key by name: " + argv,
+    );
+}
+
+fn free_port() -> Int {
+    let mut port = 41000 + std::process::pid() % 9000;
+    while port < 50000 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+main locus App {
+    params {
+        engine: Engine = Engine { };
+        port: Int = 0;
+        key: String = "";
+        data: String = "";
+    }
+    placement { engine: cooperative(pool = io); }
+    run() {
+        std::time::sleep(200ms);
+        let key = self.key;
+        let base = "http://127.0.0.1:" + to_string(self.port);
+
+        // its health check: open on llama-server and vLLM, keyed where the
+        // server keys it (TensorFold's, its /v1/models)
+        std::test::assert(node::healthy(base + "/health", key), "healthy, with the key");
+        std::test::assert(node::healthy(base + "/v1/models", key), "a keyed health check answers");
+        std::test::assert(!node::healthy(base + "/v1/models", ""), "without the key it is refused");
+        std::test::assert(!node::healthy(base + "/v1/models", "another"), "and with another");
+
+        // its context
+        std::test::assert_eq_int(
+            node::served_context("llama-server", self.port, key),
+            4096,
+            "llama-server's context, asked with the key",
+        );
+        std::test::assert_eq_int(
+            node::served_context("vllm", self.port, key),
+            8192,
+            "vLLM's, asked with the key",
+        );
+        std::test::assert_eq_int(
+            node::served_context("tensorfold", self.port, ""),
+            0,
+            "none without it",
+        );
+        std::test::assert_eq_int(
+            node::served_context("llama-server", self.port, "another"),
+            0,
+            "nor with another",
+        );
+        let props = node::keyed_get(base + "/props", "") or std::http::ClientResponse {
+            status: 0,
+            body: b"",
+        };
+        std::test::assert_eq_int(props.status, 401, "a call without the key is refused");
+
+        // the requests it serves
+        let ask = "{\"model\":\"m\",\"input\":\"hi\"}";
+        let served = node::run_compat(
+            "resp_k1",
+            "m",
+            ask,
+            node::managed_compat(base + "/v1", "m", key),
+        );
+        std::test::assert_eq_str(
+            served.outcome,
+            "served",
+            "a request is served: " + served.failure,
+        );
+        std::test::assert(!std::str::contains(served.script, key), "the key is not played");
+        let refused = node::run_compat(
+            "resp_k2",
+            "m",
+            ask,
+            node::managed_compat(base + "/v1", "m", "another"),
+        );
+        std::test::assert_eq_str(refused.outcome, "failed", "one with another key is refused");
+        std::test::assert(!std::str::contains(refused.failure, key), "and says no key");
+        let bare = node::run_compat(
+            "resp_k3",
+            "m",
+            ask,
+            node::managed_compat(base + "/v1", "m", ""),
+        );
+        std::test::assert_eq_str(bare.outcome, "failed", "and one without a key");
+
+        // a decision model's
+        let decided = node::run_systemone(
+            "jev-2b",
+            "",
+            "{\"state\":\"s\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"?\"}}}",
+            node::managed_compat(base + "/v1", "jev-2b", key),
+        );
+        std::test::assert_eq_str(
+            decided.outcome,
+            "served",
+            "a decision is served: " + decided.failure,
+        );
+
+        let logged = std::io::fs::read_file(self.data + "/logged") or "";
+        std::test::assert(!std::str::contains(logged, key), "the key is never logged");
+    }
+}
+
+fn main() {
+    let data = "/tmp/voice-engine-key-test-" + to_string(std::process::pid());
+    std::io::fs::mkdir(data) or discard;
+    let sink = Logged { file: data + "/logged" };
+    handed_in_environment(data);
+    let port = free_port();
+    let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+    let key = node::engine_key();
+    App { engine: Engine { fd: fd, key: key }, port: port, key: key, data: data };
+}

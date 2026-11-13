@@ -1,6 +1,6 @@
 import { useIsFetching, useQueryClient } from '@tanstack/react-query';
 import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, TextInput, Button, Select, DETAIL_LAYOUTS, type DetailLayout } from '@hale/components';
-import { Appearance } from '@hale/components';
+import { Appearance, Contained } from '@hale/components';
 import { THEME_KEY } from './theme-key';
 import { EventLog } from './EventLog';
 import { useRoute, href, go } from './route';
@@ -104,13 +104,15 @@ function Admin() {
           </RailPrincipal>
         </>
       }
-      detail={inspector}
+      detail={inspector && <Contained what="This item" resetKey={inspector}>{inspector}</Contained>}
       layout={layout}
       onClose={close}
       evidence={<EvidenceStrip />}
       dock={<EventLog />}
     >
-      <Screen route={route} setInspector={setInspector} />
+      <Contained what="This screen" resetKey={route}>
+        <Screen route={route} setInspector={setInspector} />
+      </Contained>
     </Shell>
   );
 }

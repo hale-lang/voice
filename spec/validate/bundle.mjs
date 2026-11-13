@@ -244,12 +244,15 @@ function compare(at, c, bIn) {
   }
   // a contract shape with no single type: several, or none named
   if (ct === undefined) { gap(at, 'open'); return; }
+  // a string where the contract says a list or an object with fields is
+  // JSON text the wire carries as a string, not the shape a reader takes:
+  // a type mismatch, never a gap to commit
   if (ct === 'object' && bt === 'string') {
     const freeform = !cs.properties || cs.additionalProperties;
-    gap(at, freeform ? 'map' : 'json-text');
+    gap(at, freeform ? 'map' : 'type');
     return;
   }
-  if (ct === 'array' && bt === 'string') { gap(at, 'json-text'); return; }
+  if (ct === 'array' && bt === 'string') { gap(at, 'type'); return; }
   if (ct === 'object' && bt === 'object') {
     // a map's values: compared when both sides say them, a gap of its own
     // when only one does (a boolean says no schema)

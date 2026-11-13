@@ -59,12 +59,55 @@ type NodeLink {
     // `declared` or `discovered`
     source: String = "declared";
     addressed: Bool = true;
-    // its ports, as a JSON list's insides
-    ports: String = "";
+    // its local ports, the first the one the two meet on
+    ports: bounded[NodeLinkViewPort; 4];
     has_gid_index: Bool = false;
     gid_index: Int = 0;
     has_check: Bool = false;
     check: LinkCheck = no_check();
+}
+
+/// One port of a link as the node's view shows it (`NodeLink.ports`): its
+/// address only once it has one to meet on, its RDMA device and its speed
+/// when the node said them.
+type NodeLinkViewPort {
+    ifname: String;
+    has_address: Bool = false;
+    address: String = "";
+    has_hca: Bool = false;
+    hca: String = "";
+    has_speed_mbps: Bool = false;
+    speed_mbps: Int = 0;
+}
+
+type NodeLinkViewPorts { items: bounded[NodeLinkViewPort; 4]; }
+
+/// A JSON list of ports (`LinkPort`s as declared, or as `view_ports`
+/// wrote them) as the view's typed ports, at most four.
+@bounded_by(list)
+fn view_ports_of(list: String) -> NodeLinkViewPorts {
+    let mut out = NodeLinkViewPorts { };
+    let mut it = std::json::array_first(list);
+    while !it.done {
+        let p = std::str::trim(it.element);
+        it = std::json::array_next(it);
+        let address = std::json::find_string_field(p, "address");
+        let hca = std::json::find_string_field(p, "hca");
+        let speed = std::json::string_field(p, "speed_mbps").kind == "number";
+        push(
+            out.items,
+            NodeLinkViewPort {
+                ifname: std::json::find_string_field(p, "ifname"),
+                has_address: len(address) > 0,
+                address: address,
+                has_hca: len(hca) > 0,
+                hca: hca,
+                has_speed_mbps: speed,
+                speed_mbps: if speed { std::json::find_int_field(p, "speed_mbps") } else { 0 },
+            },
+        ) or discard;
+    }
+    return out;
 }
 
 /// No check: what a link never checked holds.
@@ -356,8 +399,8 @@ fn node_links(
         let mut v = NodeLink {
             peer: peer,
             paired: back,
-            ports: list_insides(std::json::find_field_raw(l, "ports")),
         };
+        v.ports = view_ports_of(std::json::find_field_raw(l, "ports")).items;
         if std::json::string_field(l, "gid_index").kind == "number" {
             v.has_gid_index = true;
             v.gid_index = std::json::find_int_field(l, "gid_index");
@@ -380,8 +423,8 @@ fn node_links(
                 || (!f.addressed && found_link(o.id, o.capabilities, node, capabilities).cabled),
             source: "discovered",
             addressed: f.addressed,
-            ports: f.ports,
         };
+        v.ports = view_ports_of("[" + f.ports + "]").items;
         if f.addressed && std::json::string_field(f.link, "gid_index").kind == "number" {
             v.has_gid_index = true;
             v.gid_index = std::json::find_int_field(f.link, "gid_index");
@@ -400,13 +443,6 @@ fn with_check(l: NodeLink, rows: st::LinkCheckRows, node: String, now: Time) -> 
         v.check = link_check_of(r, now);
     }
     return v;
-}
-
-/// A JSON list's insides: what is between its brackets.
-fn list_insides(list: String) -> String {
-    let t = std::str::trim(list);
-    if len(t) < 2 || !std::str::starts_with(t, "[") { return ""; }
-    return std::str::trim(t[1..(len(t) - 1)]);
 }
 
 fn link_check_json(c: LinkCheck) -> String {
@@ -428,13 +464,34 @@ fn link_check_json(c: LinkCheck) -> String {
         + "}";
 }
 
+/// A link's ports as its view's JSON list's insides.
+fn view_ports_json(l: NodeLink) -> String {
+    let out = st::JsonList { };
+    for p in l.ports {
+        out.add(
+            "{\"ifname\": " + jq(p.ifname)
+                + (if p.has_address { ", \"address\": " + jq(p.address) } else { "" })
+                + (if p.has_hca { ", \"hca\": " + jq(p.hca) } else { "" })
+                + (
+                    if p.has_speed_mbps {
+                        ", \"speed_mbps\": " + to_string(p.speed_mbps)
+                    } else {
+                        ""
+                    }
+                )
+                + "}",
+        );
+    }
+    return out.text();
+}
+
 fn node_links_json(links: NodeLinks) -> String {
     let out = st::JsonList { };
     for l in links.items {
         out.add(
             "{\"peer\": " + jq(l.peer) + ", \"paired\": " + jbool(l.paired) + ", \"source\": "
                 + jq(l.source) + ", \"addressed\": " + jbool(l.addressed) + ", \"ports\": ["
-                + l.ports + "]"
+                + view_ports_json(l) + "]"
                 + (if l.has_gid_index { ", \"gid_index\": " + to_string(l.gid_index) } else { "" })
                 + (if l.has_check { ", \"check\": " + link_check_json(l.check) } else { "" })
                 + "}",

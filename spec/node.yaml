@@ -32,9 +32,35 @@ info:
       given;
     - the address this API listens on (loopback by default).
 
-    Admin authentication is middleware in front of this API: the MVP runs
-    without it, on loopback, and OIDC drops in later with no change to these
-    endpoints. (The coordinator's admin plane takes its operator token.)
+    ## Who may call it
+
+    This API is for the machine's own operator and tools, on loopback. A
+    web page in a browser on the same machine reaches loopback too, so the
+    node answers only a request that is plainly not a page's:
+
+    - its `Host` names the loopback authority it serves at: `127.0.0.1`,
+      `localhost` or `[::1]` at its port (or the one address it listens on,
+      when given one). Any other, a missing one or two, is refused (`403`):
+      a name a page made resolve to this machine is never its own.
+    - it carries no `Origin`, and no `Sec-Fetch-Site` but `none` (a person's
+      own browser, at the address they typed): a browser adds them to a
+      page's request, and no tool of voice's sends them. Refused (`403`).
+    - a write (`PUT /node/v1/local`, and any method but `GET` and `HEAD`)
+      presents the node's admin token as `Authorization: Bearer` (`401`
+      without it). The node draws a new one each time it starts and keeps it
+      in `admin.token` in its data directory, mode `600`, readable by the
+      node's own user alone; it is never logged. Reads take no token: the
+      first two guard them.
+
+    ```sh
+    printf 'Authorization: Bearer %s\n' "$(cat node-data/admin.token)" \
+      | curl -fsS -X PUT -H @- http://127.0.0.1:8081/node/v1/local \
+          -d '{"paused": true, "paused_seats": [], "reason": "maintenance"}'
+    ```
+
+    (The token is read from its file into the request's headers, never put
+    on a command line. The coordinator's admin plane takes its operator
+    token.)
 
     ## The capabilities file
 
@@ -121,8 +147,9 @@ tags:
   - name: health
     description: Liveness, for a supervisor. No credential.
 
-security:
-  - nodeAdmin: []
+# reads take no credential, behind the Host and Origin checks (see "Who may
+# call it"); a write takes the admin token
+security: []
 
 paths:
   /healthz:
@@ -141,6 +168,8 @@ paths:
             application/json:
               schema:
                 $ref: './openapi.yaml#/components/schemas/Health'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /node/v1/status:
     get:
@@ -158,8 +187,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/NodeStatus'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /node/v1/capabilities:
     get:
@@ -174,8 +203,8 @@ paths:
             application/json:
               schema:
                 $ref: './protocol.yaml#/components/schemas/Capabilities'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /node/v1/local:
     get:
@@ -189,18 +218,20 @@ paths:
             application/json:
               schema:
                 $ref: './protocol.yaml#/components/schemas/LocalControls'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
     put:
       tags: [node]
       operationId: setLocalControls
       summary: Pause the node or seats
       description: |
-        Replaces the local controls. They only restrict: pausing takes no
-        new requests (in-flight ones finish). The node tells the coordinator
-        at once. A local cap is gone: a body that sets `max_in_flight` to a
-        number is refused (400) naming its removal; `null`, as a body from
-        before sent it, is taken and dropped.
+        Replaces the local controls, with the node's admin token. They only
+        restrict: pausing takes no new requests (in-flight ones finish). The
+        node tells the coordinator at once. A local cap is gone: a body that
+        sets `max_in_flight` to a number is refused (400) naming its removal;
+        `null`, as a body from before sent it, is taken and dropped.
+      security:
+        - nodeAdmin: []
       requestBody:
         required: true
         content:
@@ -224,13 +255,15 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
 components:
   securitySchemes:
     nodeAdmin:
-      type: openIdConnect
-      openIdConnectUrl: https://voice.example.invalid/.well-known/openid-configuration
-      description: A principal via OIDC, as on the coordinator's admin plane. Not enforced in the MVP.
+      type: http
+      scheme: bearer
+      description: The node's admin token, from `admin.token` in its data directory (mode 600), drawn anew each time the node starts. Writes only.
 
   responses:
     BadRequest:
@@ -239,7 +272,12 @@ components:
         application/json:
           schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
     Unauthorized:
-      description: Missing or invalid credential.
+      description: A write without the node's admin token, or with another.
+      content:
+        application/json:
+          schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }
+    Forbidden:
+      description: Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata).
       content:
         application/json:
           schema: { $ref: './openapi.yaml#/components/schemas/ErrorResponse' }

@@ -19,6 +19,9 @@ type CompatConfig {
     model: String = "";
     // the std::secret vault entry holding the API key; "" for none
     key_vault: String = "";
+    // a managed seat's: the key its own server answers to (run.hl), drawn
+    // by the node and held in its memory; "" for none
+    engine_key: String = "";
     // micros per million tokens, as a catalog model's price; 0 for local
     input_per_mtok_micros: Int = 0;
     output_per_mtok_micros: Int = 0;
@@ -61,6 +64,14 @@ fn compat_config(config: String) -> CompatConfig {
     if c.input_per_mtok_micros < 0 || c.output_per_mtok_micros < 0 {
         return CompatConfig { problem: "config prices are at least 0" };
     }
+    return c;
+}
+
+/// A managed seat's config: its own server at `endpoint`, serving `model`,
+/// asked with the `key` it answers to (run.hl `engine_key`).
+fn managed_compat(endpoint: String, model: String, key: String) -> CompatConfig {
+    let mut c = compat_config("{\"base_url\": " + q(endpoint) + ", \"model\": " + q(model) + "}");
+    c.engine_key = key;
     return c;
 }
 
@@ -358,6 +369,8 @@ locus HttpSse {
         url: String = "";
         request: String = "";
         vault: String = "";
+        // a managed seat's own server's key (`CompatConfig.engine_key`)
+        key: String = "";
         // the exchange, begun by `open`; until then a reader of a port nobody serves
         rd: std::http::BodyReader = std::http::BodyReader {
             req: std::http::ClientRequest {
@@ -377,7 +390,8 @@ locus HttpSse {
     @unbounded
     fn open() {
         let parsed = std::http::parse_url(self.url + "/chat/completions") or std::http::Url { };
-        let headers = "Content-Type: application/json";
+        let headers = "Content-Type: application/json"
+            + (if len(self.key) > 0 { "\r\n" + engine_auth(self.key) } else { "" });
         if len(self.vault) > 0 {
             // KNOWN GAP (hale #1719): the checker does not yet take a reader's
             // request as a wire write, so a revealed key cannot be written into
@@ -1041,7 +1055,12 @@ fn upstream_over_wire(id: String, model: String, body: String, c: CompatConfig) 
         model: model,
         req: body,
         use_wire: true,
-        wire: HttpSse { url: c.base_url, vault: c.key_vault, request: compat_request(body, c) },
+        wire: HttpSse {
+            url: c.base_url,
+            vault: c.key_vault,
+            key: c.engine_key,
+            request: compat_request(body, c),
+        },
     };
     up.wire.open();
     return up;
@@ -1097,9 +1116,13 @@ fn systemone_request(body: String, model: String) -> String {
 
 /// A decision model's request posted whole, keyed with the seat's API key
 /// when it has one (a revealed key is written in the statement that reveals
-/// it, as `HttpSse.whole` does).
+/// it, as `HttpSse.whole` does), or a managed seat's with its own server's
+/// `key`.
 locus SystemOnePost {
-    params { vault: String = ""; }
+    params {
+        vault: String = "";
+        key: String = "";
+    }
 
     @unbounded
     fn post(url: std::http::Url, body: String) -> std::http::ClientResponse {
@@ -1108,7 +1131,8 @@ locus SystemOnePost {
                 std::http::ClientRequest {
                     method: "POST",
                     url: url,
-                    headers: "Content-Type: application/json\r\nAccept: application/json",
+                    headers: "Content-Type: application/json\r\nAccept: application/json"
+                        + (if len(self.key) > 0 { "\r\n" + engine_auth(self.key) } else { "" }),
                     body: std::bytes::from_string(body),
                 },
             ) or std::http::ClientResponse { status: 0, body: b"" };
@@ -1184,7 +1208,10 @@ fn run_systemone(model: String, engine_model: String, body: String, c: CompatCon
     let parsed = std::http::parse_url(c.base_url + "/systemone") or {
         return compat_failed(c, served, "the upstream at " + c.base_url + " is no URL");
     };
-    let r = SystemOnePost { vault: c.key_vault }.post(parsed, systemone_request(body, served));
+    let r = SystemOnePost { vault: c.key_vault, key: c.engine_key }.post(
+        parsed,
+        systemone_request(body, served),
+    );
     if r.status == 0 {
         return compat_failed(c, served, "the upstream at " + c.base_url + " could not be reached");
     }

@@ -484,9 +484,21 @@ links into the store, and starts the runtime in voice's sandbox: a
 container under docker, the weights read-only, its port on loopback, the
 GPUs given to it on CUDA; or, on macOS, an archive unpacked into
 `runtimes/<sha256>` and run under `sandbox-exec`, writing only its own
-directory and reaching only loopback. The seat is `starting` until the
-server's health check answers, then `up`, and the session serves it
-through the openai-compatible path to that port.
+directory and reaching only loopback. Loopback is not the node's alone
+(any program on the machine reaches it, a browser's page among them), so
+each server is started with a key of its own, drawn fresh at each start
+and held in the node's memory, in its environment as the variable its
+server reads (llama-server's `LLAMA_API_KEY`, vLLM's `VLLM_API_KEY`,
+TensorFold's `TENSORFOLD_API_KEY`, voice-decide's `VOICE_DECIDE_API_KEY`;
+a container is handed it by name, `docker run -e NAME`), never on a
+command line or in a log; the node presents it as a bearer on every call
+it makes to the server. Each server leaves its health check open; vLLM
+checks the key on its `/v1` routes alone, so its other routes stay open on
+loopback; and a decision runtime built before voice-decide (and the MLX
+build's launcher) read the key ignores it, until the runtime is built
+again. The seat is `starting` until the server's health
+check answers, then `up`, and the session serves it through the
+openai-compatible path to that port.
 
 A TensorFold seat ([`node/tensorfold.hl`](../node/tensorfold.hl)) is one
 rank of DeepSeek-V4.1-Flash across two DGX Sparks. Its variant fetches
@@ -1189,7 +1201,11 @@ already there.
   empty values are written in the wrapper shell, since the newline-separated
   argv cannot carry an empty element.
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
-  controls.
+  controls. It answers only a request whose `Host` is its loopback
+  authority and that carries nothing a web page adds (an `Origin`,
+  cross-site fetch metadata), and a write also takes the node's admin
+  token, drawn at each start into `admin.token` in its data directory
+  (mode 600) (`node.yaml`, "Who may call it").
 
 ## Deployment
 

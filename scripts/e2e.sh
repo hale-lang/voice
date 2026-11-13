@@ -133,6 +133,14 @@ node/node --id laptop --api "$api" --token "$token" --data "$work/node-data" --c
 laptop_pid=$!
 pids+=($laptop_pid)
 
+# a write to a node's local API (port $1, data directory $2) takes the admin
+# token the node keeps there: read from its file into the request's
+# headers, never onto a command line
+node_put() {
+  printf 'Authorization: Bearer %s\n' "$(cat "$2/admin.token")" \
+    | curl -fsS -X PUT -H @- "http://127.0.0.1:$1/node/v1/local" -d "$3"
+}
+
 # the node has applied the assignment the last change to its seats made: the
 # seat's status is only that of the assignment before it until then
 applied() {
@@ -663,12 +671,23 @@ assert steps[0] == "queued" and steps[-1] == "kept" and "done" in steps, steps
 [ "$(curl -s -o /dev/null -w '%{http_code}' -H @"$work/admin.h" "$api/admin/v1/annotations/$quiet_id")" = 404 ] || { echo "a request of a project that does not annotate has an annotation"; exit 1; }
 echo "four annotations queued at once on a one-at-a-time decision seat, all annotated, their steps kept; a project that does not annotate wrote none"
 
+# the node's local API is the machine's own tools': a request that names
+# another host, or that a web page sent, is refused, and a write takes the
+# node's admin token
+nlocal="http://127.0.0.1:${NODE_PORT}/node/v1/local"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: example.com' "$nlocal")" = 403 ] || { echo "the node's local API answered a request for another host"; exit 1; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://example.com' "$nlocal")" = 403 ] || { echo "the node's local API answered a web page"; exit 1; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$nlocal" -d '{"paused": true, "paused_seats": [], "reason": null}')" = 401 ] || { echo "the node's local API took a write without its token"; exit 1; }
+[ "$(stat -c %a "$work/node-data/admin.token" 2>/dev/null || stat -f %Lp "$work/node-data/admin.token")" = 600 ] || { echo "the node's admin token is readable by others"; exit 1; }
+if grep -qF "$(cat "$work/node-data/admin.token")" "$work/node.log"; then echo "the node logged its admin token"; exit 1; fi
+echo "the node's local API refuses another host, a web page, and a write without its token"
+
 # a local pause only restricts: the seat is held, and nothing serves
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": ["static"], "reason": "e2e"}' >/dev/null
+node_put "$NODE_PORT" "$work/node-data" '{"paused": false, "paused_seats": ["static"], "reason": "e2e"}' >/dev/null
 wait_for paused
 code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}')
 [ "$code" = "503" ] || { echo "a paused seat served: $code"; exit 1; }
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
+node_put "$NODE_PORT" "$work/node-data" '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
 wait_for up
 
 # with a database: the brain's route table, and a standby that takes over
@@ -993,11 +1012,11 @@ start_coder
 echo "a starting node removes its attempts' leftovers: containers and networks by label, workspaces by path"
 
 # the node's own API, with its seat, against node.yaml
-(cd spec/validate && node node-live.mjs ../../build/node.bundled.json "http://127.0.0.1:${NODE_PORT}")
+(cd spec/validate && node node-live.mjs ../../build/node.bundled.json "http://127.0.0.1:${NODE_PORT}" "$work/node-data/admin.token")
 
 # a node killed mid-stream: the stream ends with the evidence, never as a
 # complete answer (laptop for a response, then mini for a chat completion)
-curl -fsS -X PUT "http://127.0.0.1:${NODE_PORT}/node/v1/local" -d '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
+node_put "$NODE_PORT" "$work/node-data" '{"paused": false, "paused_seats": [], "reason": null}' >/dev/null
 slow='{"config": {"text": "'$(printf 'x%.0s' $(seq 1 100))'", "chunk_chars": 1, "chunk_interval_ms": 200}}'
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d "$slow" >/dev/null
 wait_for up

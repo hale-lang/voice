@@ -1,5 +1,11 @@
-/// The node's local API (../spec/node.yaml), on loopback. Admin authentication
-/// is middleware that comes later; the skeleton has none.
+/// The node's local API (../spec/node.yaml), on loopback, for the machine's
+/// own operator and tools: no browser page calls it. Every request must
+/// name the loopback authority it is served at in its `Host` (a name that
+/// resolves elsewhere, then here, is refused) and carry no `Origin` and no
+/// cross-site fetch metadata (a page's request is refused); a write must
+/// also present the node's admin token, which the node draws as it starts
+/// and keeps in `<data>/admin.token`, readable by its own user alone.
+/// Reads take no token: they are guarded by the first two alone.
 locus Admin {
     params {
         id: String = "";
@@ -9,13 +15,149 @@ locus Admin {
         port: Int = 8081;
     }
     run() {
-        log_info(
-            "serving the admin API",
-            std::log::kv("url", "http://" + self.host + ":" + to_string(self.port)),
-        );
-        let api = AdminApi { id: self.id, data: self.data, capabilities: self.capabilities };
+        let api = admin_api(self.id, self.data, self.capabilities, self.host, self.port);
         std::http::Server { host: self.host, port: self.port, handler: api };
     }
+}
+
+/// The admin API a node serves at `host`:`port`, with a fresh admin token,
+/// kept where the node's own user reads it (`keep_admin_token`); its digest
+/// alone is held. With none kept, it takes no write.
+fn admin_api(id: String, data: String, capabilities: String, host: String, port: Int) -> AdminApi {
+    let token = mint_admin_token();
+    let kept = len(token) > 0 && keep_admin_token(data, token);
+    if !kept {
+        log_error(
+            "the admin token could not be kept: the admin API takes no writes",
+            std::log::kv("file", data + "/" + ADMIN_TOKEN_FILE),
+        );
+    }
+    log_info(
+        "serving the admin API",
+        fields2(
+            std::log::kv("url", "http://" + host + ":" + to_string(port)),
+            std::log::kv("token_file", data + "/" + ADMIN_TOKEN_FILE),
+        ),
+    );
+    return AdminApi {
+        id: id,
+        data: data,
+        capabilities: capabilities,
+        host: host,
+        port: port,
+        token_digest: if kept { admin_digest(token) } else { "" },
+    };
+}
+
+/// The file in the node's data directory that holds its admin token.
+const ADMIN_TOKEN_FILE: String = "admin.token";
+
+/// A new admin token: `vn-` and 32 random bytes from the kernel, in hex;
+/// "" when the kernel gives none.
+@unbounded
+fn mint_admin_token() -> String {
+    let b = std::os::getrandom(32) or { return ""; };
+    return "vn-" + std::hex::encode(b);
+}
+
+/// `token` kept as `<data>/admin.token`: written into a file `mktemp`
+/// creates with mode 600, so no byte of it is ever readable by another
+/// user, then moved over the name, replacing the token of the node's last
+/// start. False when it could not be kept.
+fn keep_admin_token(data: String, token: String) -> Bool {
+    let draft = std::io::fs::mktemp(data + "/.admin-token-", "") or { return false; };
+    std::io::fs::write_file(draft, token + "\n") or {
+        std::io::fs::unlink(draft) or discard;
+        return false;
+    };
+    std::io::fs::rename(draft, data + "/" + ADMIN_TOKEN_FILE) or {
+        std::io::fs::unlink(draft) or discard;
+        return false;
+    };
+    return true;
+}
+
+/// The digest the admin token is compared as: SHA-256, in hex.
+fn admin_digest(token: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(token)));
+}
+
+/// True when `token`'s digest is `want` (an `admin_digest`), compared in
+/// time that does not depend on where they differ; an empty `want` (no
+/// token kept) admits nothing.
+fn admin_matches(want: String, token: String) -> Bool {
+    if len(want) != 64 || len(token) == 0 { return false; }
+    let a = std::str::bytes_view(want);
+    let b = std::str::bytes_view(admin_digest(token));
+    let mut diff = 0;
+    let mut i = 0;
+    while i < 64 {
+        diff = diff | (std::str::byte_at(a, i) ^ std::str::byte_at(b, i));
+        i = i + 1;
+    }
+    return diff == 0;
+}
+
+/// The bearer of an `Authorization` header, "" when it names none.
+fn admin_bearer(authorization: String) -> String {
+    if len(authorization) < 7 || std::str::lower(authorization[0..7]) != "bearer " { return ""; }
+    return std::str::trim(authorization[7..len(authorization)]);
+}
+
+/// How many lines of a request's `headers` are the header `name` (any
+/// case).
+@bounded_by(headers)
+fn header_lines(headers: String, name: String) -> Int {
+    let needle = std::str::lower(name) + ":";
+    let v = std::str::bytes_view(headers);
+    let mut n = 0;
+    let mut from = 0;
+    while from < v.n {
+        let rel = std::str::index_of(std::str::slice(v, from, v.n), "\r\n");
+        let end = if rel < 0 { v.n } else { from + rel };
+        let line = std::str::slice(v, from, end);
+        if len(line) >= len(needle) && std::str::lower(line[0..len(needle)]) == needle {
+            n = n + 1;
+        }
+        from = end + 2;
+    }
+    return n;
+}
+
+/// The authorities a request to the admin API may name in its `Host`: the
+/// loopback ones at its port, and the address it listens on when that is
+/// one address (not every interface).
+fn admin_authority(host_header: String, host: String, port: Int) -> Bool {
+    let h = std::str::lower(std::str::trim(host_header));
+    let p = ":" + to_string(port);
+    if h == "127.0.0.1" + p || h == "localhost" + p || h == "[::1]" + p { return true; }
+    let own = std::str::lower(host);
+    if len(own) == 0 || own == "0.0.0.0" || own == "::" || own == "[::]" { return false; }
+    return if std::str::contains(own, ":") && !std::str::starts_with(own, "[") {
+        h == "[" + own + "]" + p
+    } else {
+        h == own + p
+    };
+}
+
+/// Why the admin API refuses `req` before reading it, "" when it does not:
+/// a `Host` that is not its own loopback authority (one, exactly), or a
+/// request a web page made (an `Origin`, or fetch metadata that says it
+/// came from a page, as a browser adds to every request).
+fn admin_refusal(req: std::http::Request, host: String, port: Int) -> String {
+    if header_lines(req.headers, "Host") != 1
+        || !admin_authority(std::http::header(req, "Host"), host, port)
+    {
+        return "the admin API answers only on its loopback address: the Host must be 127.0.0.1, localhost or [::1] at its port";
+    }
+    if header_lines(req.headers, "Origin") > 0 {
+        return "the admin API takes no request from a web page";
+    }
+    let site = std::str::lower(std::str::trim(std::http::header(req, "Sec-Fetch-Site")));
+    if header_lines(req.headers, "Sec-Fetch-Site") > 0 && site != "none" {
+        return "the admin API takes no request from a web page";
+    }
+    return "";
 }
 
 /// Every endpoint in ../spec/node.yaml, first match in written order.
@@ -24,9 +166,35 @@ locus AdminApi {
         id: String = "";
         data: String = "node-data";
         capabilities: String = "";
+        // where it is served, which a request's `Host` must name
+        host: String = "127.0.0.1";
+        port: Int = 8081;
+        // the admin token's digest (`admin_digest`), "" for none kept: then
+        // no write is taken
+        token_digest: String = "";
     }
 
     fn handle(req: std::http::Request) -> std::http::Response {
+        let refused = admin_refusal(req, self.host, self.port);
+        if len(refused) > 0 {
+            return error_response(403, "permission_error", "invalid_request", refused);
+        }
+        // a write presents the admin token
+        if req.method != "GET" && req.method != "HEAD"
+            && !admin_matches(
+                self.token_digest,
+                admin_bearer(std::http::header(req, "Authorization")),
+            )
+        {
+            return std::http::Response {
+                status: 401,
+                content_type: "application/json",
+                headers: "WWW-Authenticate: Bearer",
+                body: "{\"error\": {\"message\": \"a write takes the node's admin token: Authorization: Bearer, from "
+                    + ADMIN_TOKEN_FILE
+                    + " in the node's data directory\", \"type\": \"authentication_error\", \"code\": \"invalid_key\"}}",
+            };
+        }
         let c = std::http::build_context(req);
         if std::http::is_route(c, "GET", "/healthz") {
             return json_response(

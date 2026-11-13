@@ -34,9 +34,35 @@ Set at start, as flags or environment variables:
   given;
 - the address this API listens on (loopback by default).
 
-Admin authentication is middleware in front of this API: the MVP runs
-without it, on loopback, and OIDC drops in later with no change to these
-endpoints. (The coordinator's admin plane takes its operator token.)
+## Who may call it
+
+This API is for the machine's own operator and tools, on loopback. A
+web page in a browser on the same machine reaches loopback too, so the
+node answers only a request that is plainly not a page's:
+
+- its `Host` names the loopback authority it serves at: `127.0.0.1`,
+  `localhost` or `[::1]` at its port (or the one address it listens on,
+  when given one). Any other, a missing one or two, is refused (`403`):
+  a name a page made resolve to this machine is never its own.
+- it carries no `Origin`, and no `Sec-Fetch-Site` but `none` (a person's
+  own browser, at the address they typed): a browser adds them to a
+  page's request, and no tool of voice's sends them. Refused (`403`).
+- a write (`PUT /node/v1/local`, and any method but `GET` and `HEAD`)
+  presents the node's admin token as `Authorization: Bearer` (`401`
+  without it). The node draws a new one each time it starts and keeps it
+  in `admin.token` in its data directory, mode `600`, readable by the
+  node's own user alone; it is never logged. Reads take no token: the
+  first two guard them.
+
+```sh
+printf 'Authorization: Bearer %s\n' "$(cat node-data/admin.token)" \
+  | curl -fsS -X PUT -H @- http://127.0.0.1:8081/node/v1/local \
+      -d '{"paused": true, "paused_seats": [], "reason": "maintenance"}'
+```
+
+(The token is read from its file into the request's headers, never put
+on a command line. The coordinator's admin plane takes its operator
+token.)
 
 ## The capabilities file
 
@@ -119,7 +145,7 @@ never declared to the coordinator and never returned by this API.
 
 ## Authentication
 
-- **nodeAdmin** (openIdConnect): A principal via OIDC, as on the coordinator's admin plane. Not enforced in the MVP.
+- **nodeAdmin** (http, bearer): The node's admin token, from `admin.token` in its data directory (mode 600), drawn anew each time the node starts. Writes only.
 
 ## Servers
 
@@ -135,7 +161,7 @@ The node's state, what it offers, and its local controls.
 
 **The node, its connection, and its assigned seats** · `getNodeStatus`
 
-Authentication: nodeAdmin
+Authentication: none
 
 What the node is running and how it is going, as the node sees it.
 Useful when the coordinator cannot be reached; otherwise the same is
@@ -146,13 +172,13 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | The node's status. | `application/json` [NodeStatus](#schema-nodestatus) |
-| 401 | Missing or invalid credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata). | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/node/v1/capabilities`
 
 **What the node offers, as loaded from its capabilities file** · `getCapabilities`
 
-Authentication: nodeAdmin
+Authentication: none
 
 The declared capabilities, without the engines' `local` objects.
 
@@ -161,20 +187,20 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | The capabilities. | `application/json` [Capabilities](#schema-capabilities) |
-| 401 | Missing or invalid credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata). | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/node/v1/local`
 
 **Read the local controls** · `getLocalControls`
 
-Authentication: nodeAdmin
+Authentication: none
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
 | 200 | The local controls. | `application/json` [LocalControls](#schema-localcontrols) |
-| 401 | Missing or invalid credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata). | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### PUT `/node/v1/local`
 
@@ -182,11 +208,11 @@ Responses:
 
 Authentication: nodeAdmin
 
-Replaces the local controls. They only restrict: pausing takes no
-new requests (in-flight ones finish). The node tells the coordinator
-at once. A local cap is gone: a body that sets `max_in_flight` to a
-number is refused (400) naming its removal; `null`, as a body from
-before sent it, is taken and dropped.
+Replaces the local controls, with the node's admin token. They only
+restrict: pausing takes no new requests (in-flight ones finish). The
+node tells the coordinator at once. A local cap is gone: a body that
+sets `max_in_flight` to a number is refused (400) naming its removal;
+`null`, as a body from before sent it, is taken and dropped.
 
 Request body
 
@@ -206,7 +232,8 @@ Responses:
 |---|---|---|
 | 200 | The local controls, applied. | `application/json` [LocalControls](#schema-localcontrols) |
 | 400 | Malformed. | `application/json` [ErrorResponse](#schema-errorresponse) |
-| 401 | Missing or invalid credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | A write without the node's admin token, or with another. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata). | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-health"></a>
 
@@ -228,6 +255,7 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | Alive. | `application/json` [Health](#schema-health) |
+| 403 | Not a local tool's request; a Host other than the loopback authority the API serves at, or what a web page sends (an Origin, cross-site fetch metadata). | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="schemas"></a>
 
@@ -264,92 +292,6 @@ Type: object
 | `status` | string, one of `ok`, `unavailable` | yes |  |  |
 | `version` | string |  |  |  |
 | `checks` | object |  | Each dependency's state, on readiness. |  |
-
-<a id="schema-localcontrols"></a>
-
-### LocalControls
-
-What the node's operator set on the machine. Each field only
-restricts: a paused node or seat takes no new requests. A node from
-before may send a local `max_in_flight`: the coordinator reads past
-it, as no cap of a node's stands.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `paused` | boolean | yes |  |  |
-| `paused_seats` | array of string | yes |  | items ≤ 32 |
-| `reason` | string \| null |  | Why, for the admin to read. |  |
-
-<a id="schema-slug"></a>
-
-### Slug
-
-Type: string
-
-Notes: pattern `^[a-z0-9][a-z0-9-]{0,62}$`
-
-<a id="schema-seatmodel"></a>
-
-### SeatModel
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `model` | string | yes | A catalog model id. |  |
-| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
-
-<a id="schema-seat"></a>
-
-### Seat
-
-One seat as the coordinator assigns it: an engine the node offers,
-spending one account, serving some catalog models.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `id` | [Slug](#schema-slug) | yes | Unique on the node. Its full name is `<node>/<seat>`. |  |
-| `engine` | string | yes | The id of one of the node's declared engines. |  |
-| `account` | string | yes | The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits. |  |
-| `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
-| `data_classes` | array of string |  | Data classes this seat may carry. Defaults to `[internal]`. |  |
-| `concurrency` | integer |  | Requests this seat serves at once. A placement's seat's is what its runtime is started with (TensorFold's `--parallel`, 32; llama-server's slots, as many requests of the context its placement promises as its prompt cache holds, one to four; vLLM's `--max-num-seqs`, 32; the decision server's 1), derived from its config, and the node holds it to that whatever this says. Any other seat's is what its operator set. | default `1`; ≥ 1 |
-| `enabled` | boolean |  |  | default `true` |
-| `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
-
-<a id="schema-fetchprogress"></a>
-
-### FetchProgress
-
-How far a managed seat's fetch is, in bytes, across its files and its runtime's archive.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `done_bytes` | integer | yes |  | ≥ 0 |
-| `total_bytes` | integer | yes |  | ≥ 0 |
-
-<a id="schema-seatstate"></a>
-
-### SeatState
-
-One assigned seat's state on the node.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `id` | string | yes |  |  |
-| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), or its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
-| `reason` | string \| null |  |  |  |
-| `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
-| `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
-| `in_flight` | integer | yes |  | ≥ 0 |
 
 <a id="schema-limit"></a>
 
@@ -450,6 +392,92 @@ Type: object
 | `error.voice.limit` | [Limit](#schema-limit) |  | The limit that refused the request, for `rate_limited`. |  |
 | `error.voice.budget` | [Budget](#schema-budget) |  | The budget that refused the request, for `budget_exhausted`. |  |
 | `error.voice.attempts` | array of [Attempt](#schema-attempt) |  |  |  |
+
+<a id="schema-localcontrols"></a>
+
+### LocalControls
+
+What the node's operator set on the machine. Each field only
+restricts: a paused node or seat takes no new requests. A node from
+before may send a local `max_in_flight`: the coordinator reads past
+it, as no cap of a node's stands.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `paused` | boolean | yes |  |  |
+| `paused_seats` | array of string | yes |  | items ≤ 32 |
+| `reason` | string \| null |  | Why, for the admin to read. |  |
+
+<a id="schema-slug"></a>
+
+### Slug
+
+Type: string
+
+Notes: pattern `^[a-z0-9][a-z0-9-]{0,62}$`
+
+<a id="schema-seatmodel"></a>
+
+### SeatModel
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `model` | string | yes | A catalog model id. |  |
+| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
+
+<a id="schema-seat"></a>
+
+### Seat
+
+One seat as the coordinator assigns it: an engine the node offers,
+spending one account, serving some catalog models.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | [Slug](#schema-slug) | yes | Unique on the node. Its full name is `<node>/<seat>`. |  |
+| `engine` | string | yes | The id of one of the node's declared engines. |  |
+| `account` | string | yes | The coordinator account this seat spends. Several seats, on one node or many, may name the same account and share its limits. |  |
+| `serves` | array of [SeatModel](#schema-seatmodel) | yes |  | items ≥ 1 |
+| `data_classes` | array of string |  | Data classes this seat may carry. Defaults to `[internal]`. |  |
+| `concurrency` | integer |  | Requests this seat serves at once. A placement's seat's is what its runtime is started with (TensorFold's `--parallel`, 32; llama-server's slots, as many requests of the context its placement promises as its prompt cache holds, one to four; vLLM's `--max-num-seqs`, 32; the decision server's 1), derived from its config, and the node holds it to that whatever this says. Any other seat's is what its operator set. | default `1`; ≥ 1 |
+| `enabled` | boolean |  |  | default `true` |
+| `config` | object |  | Engine-specific, valid against the engine's `config_schema`. |  |
+
+<a id="schema-fetchprogress"></a>
+
+### FetchProgress
+
+How far a managed seat's fetch is, in bytes, across its files and its runtime's archive.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `done_bytes` | integer | yes |  | ≥ 0 |
+| `total_bytes` | integer | yes |  | ≥ 0 |
+
+<a id="schema-seatstate"></a>
+
+### SeatState
+
+One assigned seat's state on the node.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  |  |
+| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), or its server is loading the model. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, or a managed seat's file did not verify. `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
+| `reason` | string \| null |  |  |  |
+| `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
+| `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
+| `in_flight` | integer | yes |  | ≥ 0 |
 
 <a id="schema-engine"></a>
 

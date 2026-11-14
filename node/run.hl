@@ -1,6 +1,7 @@
 // The managed engine's run: a managed seat whose weights and runtime the
 // fetcher verified (fetch.hl) is started here, in voice's sandbox, and the
-// seat is `up` once its server answers its health check. The session then
+// seat is `up` once its server answers its health check and its first
+// answers are right (smoke.hl); else `down`, with why. The session then
 // serves the seat through the openai-compatible path, to the server's
 // port on loopback (session.hl).
 //
@@ -77,6 +78,9 @@ type Run {
     // the key its server answers to (`engine_key`), which every call to it
     // presents; never logged, never on a command line
     key: String = "";
+    // the catalog model its server serves as, which the node's own calls
+    // to it name (smoke.hl)
+    model: String = "";
 }
 
 type Runs { items: bounded[Run; 16]; }
@@ -227,6 +231,12 @@ locus Runner {
             self.tell(seat, "down", "its weights could not be laid out under " + models, "");
             return;
         }
+        // its tokenizer, as its variant says it must be loaded
+        let tokenizer = lay_out_tokenizer(models, variant);
+        if len(tokenizer) > 0 {
+            self.tell(seat, "down", tokenizer, "");
+            return;
+        }
         // a TensorFold seat's: its readied inputs beside its weights, and
         // its file sets, each a folder of its own (tensorfold.hl)
         let sets = self.data + "/sets/" + seat;
@@ -321,6 +331,7 @@ locus Runner {
             endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
             spans: spans,
             key: key,
+            model: std::json::find_string_field(config, "model"),
         };
         // a follower serves no API: nothing to ask, nowhere to serve
         if spans && std::json::find_int_field(cluster, "rank") > 0 {
@@ -520,6 +531,16 @@ locus Runner {
                 changed = true;
                 self.tell_up(r);
             } else if r.phase == "starting" && healthy(r.health, r.key) {
+                // its first answers checked before it is up: a server that
+                // loaded a model may still read or write text wrong
+                // (smoke.hl), and one that does is stopped, its seat down
+                // with why
+                let wrong = smoke_problem(r.server, r.port, r.key, r.model);
+                if len(wrong) > 0 {
+                    self.stop(r);
+                    self.tell(r.seat, "down", wrong, "");
+                    continue;
+                }
                 r.phase = "up";
                 r.context = served_context(r.server, r.port, r.key);
                 r.asked = 1;
@@ -936,12 +957,81 @@ fn kv_cache_dtype(variant: String) -> String {
 }
 
 /// The parser vLLM takes a model's thinking out of its answer with, as the
-/// seat's variant says (`RecipeVariant.reasoning_parser`): `deepseek_v4`;
-/// "" otherwise, so a variant that does not say keeps vLLM's default, and no
-/// other value reaches a server's arguments. llama-server is never given it.
+/// seat's variant says (`RecipeVariant.reasoning_parser`): `deepseek_v4`,
+/// or `deepseek_r1` for DeepSeek-R1's distills; "" otherwise, so a variant
+/// that does not say keeps vLLM's default, and no other value reaches a
+/// server's arguments. llama-server is never given it.
 fn reasoning_parser(variant: String) -> String {
     let parser = std::json::find_string_field(variant, "reasoning_parser");
-    return if parser == "deepseek_v4" { parser } else { "" };
+    return if parser == "deepseek_v4" || parser == "deepseek_r1" { parser } else { "" };
+}
+
+/// The class a seat's tokenizer is loaded as, as its variant says
+/// (`RecipeVariant.tokenizer_class`): `PreTrainedTokenizerFast`,
+/// transformers' generic fast tokenizer, which reads the variant's
+/// tokenizer.json as it is; "" otherwise, so a variant that does not say
+/// is laid out as it was pinned, and no other value reaches a file.
+fn tokenizer_class(variant: String) -> String {
+    let class = std::json::find_string_field(variant, "tokenizer_class");
+    return if class == "PreTrainedTokenizerFast" { class } else { "" };
+}
+
+/// A seat's tokenizer laid out as its variant says it must be loaded
+/// (`tokenizer_class`), in `dir`, where its files are laid out: its
+/// tokenizer_config.json, a link into the store, replaced by a file of its
+/// own, the pinned file with that class (`with_tokenizer_class`). The file
+/// in the store is never written: the link is removed, not followed. ""
+/// when it is laid out, or the variant names no class; else why not.
+@unbounded
+fn lay_out_tokenizer(dir: String, variant: String) -> String {
+    let class = tokenizer_class(variant);
+    if len(class) == 0 { return ""; }
+    let path = dir + "/tokenizer_config.json";
+    let pinned = std::io::fs::read_file(path) or {
+        return "its tokenizer_config.json, whose tokenizer_class its variant sets, is not laid out under "
+            + dir;
+    };
+    let text = with_tokenizer_class(pinned, class);
+    if len(text) == 0 { return "its tokenizer_config.json is not a JSON object"; }
+    std::io::fs::unlink(path) or {
+        return "its tokenizer_config.json could not be replaced under " + dir;
+    };
+    std::io::fs::write_file(path, text) or {
+        return "its tokenizer_config.json could not be written under " + dir;
+    };
+    return "";
+}
+
+/// A tokenizer_config.json (`config`) with its `tokenizer_class` set to
+/// `class`: every other member as it was, in its place, and the class where
+/// the file named one, else last. "" when `config` is not a JSON object.
+@bounded_by(config)
+fn with_tokenizer_class(config: String, class: String) -> String {
+    let c = std::str::trim(config);
+    if !std::json::valid_object(c) { return ""; }
+    let out = std::bytes::BytesBuilder { };
+    let mut set = false;
+    let mut first = true;
+    let mut it = std::json::object_first(c);
+    while !it.done {
+        if !first { out.append_str(",\n  "); }
+        first = false;
+        if std::json::obj_key_eq(it, c, "tokenizer_class") {
+            out.append_str("\"tokenizer_class\": " + q(class));
+            set = true;
+        } else {
+            out.append_str(
+                q(std::json::obj_key_string(it, c)) + ": "
+                    + std::str::trim(std::json::obj_value_raw(it, c)),
+            );
+        }
+        it = std::json::object_next(it, c);
+    }
+    if !set {
+        if !first { out.append_str(",\n  "); }
+        out.append_str("\"tokenizer_class\": " + q(class));
+    }
+    return "{\n  " + std::str::clone(out.text_view()) + "\n}\n";
 }
 
 /// The parser vLLM reads a model's tool calls out of its answer with, as

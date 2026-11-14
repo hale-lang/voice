@@ -1,0 +1,112 @@
+// A variant may say the class its tokenizer is loaded as
+// (`tokenizer_class`): DeepSeek-R1's Qwen3 distill names
+// `LlamaTokenizerFast` for a byte-level BPE tokenizer, which the pinned
+// vLLM's transformers rebuilds as Llama's, losing its spaces and newlines.
+// The node lays the variant's tokenizer_config.json out as the pinned file
+// with that class, every other member as it was, and the pinned file in
+// the store is left as it was fetched.
+import ".." as node;
+
+const CONFIG: String = "{\n  \"add_bos_token\": false,\n  \"bos_token\": {\n    \"__type\": \"AddedToken\",\n    \"content\": \"<｜begin▁of▁sentence｜>\"\n  },\n  \"model_max_length\": 131072,\n  \"tokenizer_class\": \"LlamaTokenizerFast\",\n  \"chat_template\": \"{% for m in messages %}{{'<｜User｜>' + m['content']}}{% endfor %}\\n\"\n}\n";
+
+const R1: String = "{\"id\": \"safetensors-bf16\", \"format\": \"safetensors\", \"quantization\": \"bf16\", \"memory_bytes\": 22100000000, \"reasoning_parser\": \"deepseek_r1\", \"tokenizer_class\": \"PreTrainedTokenizerFast\"}";
+
+fn main() {
+    // ---- what the variant says --------------------------------------------------
+    std::test::assert_eq_str(
+        node::tokenizer_class(R1),
+        "PreTrainedTokenizerFast",
+        "the R1 distill's tokenizer is loaded as the generic fast tokenizer",
+    );
+    for bad in [
+        "{\"tokenizer_class\": \"LlamaTokenizerFast\"}",
+        "{\"tokenizer_class\": \"PreTrainedTokenizerFast\\\"}\"}",
+        "{\"tokenizer_class\": true}",
+        "{}",
+    ] {
+        std::test::assert_eq_str(
+            node::tokenizer_class(bad),
+            "",
+            "no class voice does not name: " + bad,
+        );
+    }
+
+    // ---- the file it is laid out as ---------------------------------------------
+    let set = node::with_tokenizer_class(CONFIG, "PreTrainedTokenizerFast");
+    std::test::assert(std::json::valid_object(set), "a JSON object: " + set);
+    std::test::assert_eq_str(
+        std::json::find_string_field(set, "tokenizer_class"),
+        "PreTrainedTokenizerFast",
+        "with the class",
+    );
+    std::test::assert(
+        !std::str::contains(set, "LlamaTokenizerFast"),
+        "in place of the one it named",
+    );
+    for member in ["add_bos_token", "bos_token", "model_max_length", "chat_template"] {
+        std::test::assert_eq_str(
+            std::str::trim(std::json::find_field_raw(set, member)),
+            std::str::trim(std::json::find_field_raw(CONFIG, member)),
+            "every other member as it was: " + member,
+        );
+    }
+    std::test::assert(
+        std::str::index_of(set, "model_max_length") < std::str::index_of(set, "tokenizer_class")
+            && std::str::index_of(
+                set,
+                "tokenizer_class",
+            ) < std::str::index_of(set, "chat_template"),
+        "in its place",
+    );
+    let added = node::with_tokenizer_class("{\"a\": 1}", "PreTrainedTokenizerFast");
+    std::test::assert(
+        std::json::find_int_field(added, "a") == 1
+            && std::json::find_string_field(added, "tokenizer_class") == "PreTrainedTokenizerFast",
+        "a file that names none is given it: " + added,
+    );
+    std::test::assert_eq_str(
+        node::with_tokenizer_class("[1]", "PreTrainedTokenizerFast"),
+        "",
+        "a file that is not an object is not laid out",
+    );
+
+    // ---- laid out beside the weights, the store untouched -----------------------
+    let data = "/tmp/voice-tokenizer-test-" + to_string(std::process::pid());
+    let dir = data + "/models/s";
+    node::run_out("mkdir\n-p\n" + data + "/blobs\n" + dir);
+    std::io::fs::write_file(data + "/blobs/78872f2c", CONFIG) or discard;
+    node::run_out("ln\n-sfn\n" + data + "/blobs/78872f2c\n" + dir + "/tokenizer_config.json");
+    std::test::assert_eq_str(
+        node::lay_out_tokenizer(dir, "{\"id\": \"safetensors-bf16\"}"),
+        "",
+        "a variant that names no class is laid out as it was pinned",
+    );
+    std::test::assert(
+        len(std::str::trim(node::run_out("find\n" + dir + "\n-type\nl"))) > 0,
+        "its tokenizer_config.json still the link into the store",
+    );
+    std::test::assert_eq_str(node::lay_out_tokenizer(dir, R1), "", "laid out");
+    std::test::assert_eq_str(
+        std::io::fs::read_file(dir + "/tokenizer_config.json") or "",
+        set,
+        "its tokenizer_config.json is the pinned file with the class",
+    );
+    std::test::assert_eq_str(
+        std::str::trim(node::run_out("find\n" + dir + "\n-type\nl")),
+        "",
+        "a file of its own, no longer the link",
+    );
+    std::test::assert_eq_str(
+        std::io::fs::read_file(data + "/blobs/78872f2c") or "",
+        CONFIG,
+        "and the file in the store as it was fetched",
+    );
+    std::test::assert(
+        std::str::starts_with(
+            node::lay_out_tokenizer(data + "/models/none", R1),
+            "its tokenizer_config.json",
+        ),
+        "a variant whose tokenizer_config.json is not laid out is not started",
+    );
+    node::run_out("rm\n-rf\n" + data);
+}

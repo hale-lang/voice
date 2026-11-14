@@ -497,8 +497,27 @@ checks the key on its `/v1` routes alone, so its other routes stay open on
 loopback; and a decision runtime built before voice-decide (and the MLX
 build's launcher) read the key ignores it, until the runtime is built
 again. The seat is `starting` until the server's health
-check answers, then `up`, and the session serves it through the
-openai-compatible path to that port.
+check answers. A server that loaded a model can still read or write text
+wrong (a tokenizer loaded as the wrong class answers health and serves
+words run together, raw byte-level pieces like `Ġ` in the answer), so
+before the seat is `up` the node asks its own server, with the seat's key,
+for a few seconds' work it can judge ([`node/smoke.hl`](../node/smoke.hl)):
+a fixed text with spaces, a newline and a letter outside ASCII made tokens
+and back must come back as it went (llama-server's `/tokenize` and
+`/detokenize`; vLLM's, which TensorFold's leader answers too; a server that
+does not route `/tokenize` is not asked), and a raw completion of a fixed
+prompt, greedy and four tokens long (no chat template, so no thinking),
+must be text with no raw byte-level piece and no replacement character. A
+decision server generates no text: it answers one yes-or-no question,
+which must come back answered. Each call is bounded (5 s for a tokenizer's,
+30 s for a generation's). A server that fails is stopped and its seat
+`down` with why ("its tokenizer does not round-trip: …", "its first
+generation is garbled: …"); one that passes is `up`, and the session
+serves it through the openai-compatible path to that port. A variant may
+say the class its tokenizer is loaded as (`tokenizer_class`), for a model
+whose tokenizer_config.json names one the runtime loads wrong: the node
+lays that file out as the pinned one with that member changed, a file of
+the seat's own in place of the link, the store's copy untouched.
 
 A TensorFold seat ([`node/tensorfold.hl`](../node/tensorfold.hl)) is one
 rank of DeepSeek-V4.1-Flash across two DGX Sparks. Its variant fetches

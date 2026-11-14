@@ -33,6 +33,7 @@ fn main() {
     context_length();
     kv_cache();
     tool_call_parser();
+    tokenizer_class();
     // what follows holds one shipped recipe, fixture-1
     let shipped = line_with(every, "\"id\": \"fixture-1\"");
     std::test::assert(
@@ -349,6 +350,18 @@ fn kv_cache() {
         "a variant keeps its cache dtype, its own cost a token beside the recipe's, and its reasoning parser: "
             + kept,
     );
+    let r1 = api::recipe_body(
+        "kv",
+        license(),
+        0,
+        0,
+        "",
+        st + ", \"reasoning_parser\": \"deepseek_r1\"}]",
+    );
+    std::test::assert(
+        std::str::contains(r1, "\"memory_bytes\": 2, \"reasoning_parser\": \"deepseek_r1\"}]"),
+        "a variant keeps DeepSeek-R1's reasoning parser, which its distills think with: " + r1,
+    );
     let plain = api::recipe_body("kv", license(), 0, 0, "", st + "}]");
     std::test::assert(
         !std::str::contains(plain, "kv_cache_dtype") && !std::str::contains(plain, "kv_bytes")
@@ -365,7 +378,7 @@ fn kv_cache() {
                 "",
                 st + ", \"reasoning_parser\": " + bad + "}]",
             ),
-            "!variants\tvariants[0].reasoning_parser is deepseek_v4",
+            "!variants\tvariants[0].reasoning_parser is deepseek_v4 or deepseek_r1",
             "a reasoning parser voice does not name is refused: " + bad,
         );
     }
@@ -560,5 +573,118 @@ fn variant_bounds() {
         std::str::starts_with(refused, "!variants")
             && std::str::contains(refused, "at most 45 KiB"),
         "a variant over 45 KiB is refused, though its files are fewer than 300: " + refused,
+    );
+}
+
+/// A variant names the class its tokenizer is loaded as
+/// (`tokenizer_class`), from a closed set, for safetensors alone, and only
+/// when it lists the tokenizer.json the class reads and the
+/// tokenizer_config.json its node writes it into. The shipped R1 distill
+/// names it, and DeepSeek-R1's reasoning parser.
+fn tokenizer_class() {
+    let digest = std::str::repeat("a", 64);
+    let file = "{\"path\": \"PATH\", \"bytes\": 1, \"sha256\": \"" + digest + "\"}";
+    let both = std::str::replace(file, "PATH", "m.safetensors") + ", "
+        + std::str::replace(file, "PATH", "tokenizer.json") + ", "
+        + std::str::replace(file, "PATH", "tokenizer_config.json");
+    let head = "[{\"id\": \"safetensors-bf16\", \"format\": \"FORMAT\", \"quantization\": \"bf16\", \"source\": {\"hub\": \"huggingface\", \"repo\": \"o/m\", \"revision\": \"0123456789abcdef0123456789abcdef01234567\"}, \"files\": [FILES], \"memory_bytes\": 2";
+    let st = std::str::replace(std::str::replace(head, "FORMAT", "safetensors"), "FILES", both);
+    let kept = api::recipe_body(
+        "tok",
+        license(),
+        0,
+        0,
+        "",
+        st
+            + ", \"tokenizer_class\": \"PreTrainedTokenizerFast\", \"reasoning_parser\": \"deepseek_r1\"}]",
+    );
+    std::test::assert(
+        std::str::contains(
+            kept,
+            "\"memory_bytes\": 2, \"reasoning_parser\": \"deepseek_r1\", \"tokenizer_class\": \"PreTrainedTokenizerFast\"}]",
+        ),
+        "a variant keeps the class its tokenizer is loaded as: " + kept,
+    );
+    std::test::assert(
+        !std::str::contains(
+            api::recipe_body("tok", license(), 0, 0, "", st + "}]"),
+            "tokenizer_class",
+        ),
+        "a variant that names none has none",
+    );
+    for bad in [
+        "\"LlamaTokenizerFast\"",
+        "\"AutoTokenizer\"",
+        "\"pretrainedtokenizerfast\"",
+        "\"PreTrainedTokenizerFast\\n--trust-remote-code\"",
+        "true",
+        "null",
+        "\"\"",
+    ] {
+        std::test::assert_eq_str(
+            api::recipe_body(
+                "tok",
+                license(),
+                0,
+                0,
+                "",
+                st + ", \"tokenizer_class\": " + bad + "}]",
+            ),
+            "!variants\tvariants[0].tokenizer_class is PreTrainedTokenizerFast",
+            "a tokenizer class voice does not name is refused: " + bad,
+        );
+    }
+    let gguf = std::str::replace(
+        std::str::replace(head, "FORMAT", "gguf"),
+        "FILES",
+        std::str::replace(file, "PATH", "m.gguf"),
+    );
+    std::test::assert(
+        std::str::starts_with(
+            api::recipe_body(
+                "tok",
+                license(),
+                0,
+                0,
+                "",
+                gguf + ", \"tokenizer_class\": \"PreTrainedTokenizerFast\"}]",
+            ),
+            "!variants\tvariants[0].tokenizer_class is a safetensors",
+        ),
+        "a GGUF variant names none: llama-server reads the GGUF's own tokenizer",
+    );
+    for files in [
+        std::str::replace(file, "PATH", "m.safetensors") + ", "
+            + std::str::replace(file, "PATH", "tokenizer.json"),
+        std::str::replace(file, "PATH", "m.safetensors") + ", "
+            + std::str::replace(file, "PATH", "tokenizer_config.json"),
+        std::str::replace(file, "PATH", "m.safetensors") + ", "
+            + std::str::replace(file, "PATH", "sub/tokenizer.json") + ", "
+            + std::str::replace(file, "PATH", "sub/tokenizer_config.json"),
+    ] {
+        std::test::assert_eq_str(
+            api::recipe_body(
+                "tok",
+                license(),
+                0,
+                0,
+                "",
+                std::str::replace(std::str::replace(head, "FORMAT", "safetensors"), "FILES", files)
+                    + ", \"tokenizer_class\": \"PreTrainedTokenizerFast\"}]",
+            ),
+            "!variants\tvariants[0].tokenizer_class is for a variant that lists tokenizer.json and tokenizer_config.json",
+            "a variant that does not list both files names no tokenizer class: " + files,
+        );
+    }
+    let shipped = line_with(
+        api::shipped_recipes(fixtures("../../../recipes")),
+        "{\"id\": \"deepseek-r1-0528-qwen3-8b\"",
+    );
+    std::test::assert(
+        std::str::contains(shipped, "\"tokenizer_class\": \"PreTrainedTokenizerFast\"")
+            && std::str::contains(shipped, "\"reasoning_parser\": \"deepseek_r1\"")
+            && !std::str::contains(shipped, "tool_call_parser"),
+        "the shipped R1 distill is taken with its tokenizer class and its reasoning parser, and no tools: "
+            + shipped,
     );
 }

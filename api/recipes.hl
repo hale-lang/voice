@@ -575,7 +575,7 @@ fn variant_body(v: String, n: Int) -> String {
     let at = "variants[" + to_string(n - 1) + "]";
     let keys = only_keys(
         v,
-        ",id,format,quantization,source,files,memory_bytes,kv_cache_dtype,kv_bytes_per_token,reasoning_parser,tool_call_parser,file_sets,prepare,prepared,",
+        ",id,format,quantization,source,files,memory_bytes,kv_cache_dtype,kv_bytes_per_token,reasoning_parser,tool_call_parser,tokenizer_class,file_sets,prepare,prepared,",
     );
     if len(keys) > 0 { return "!variants\t" + at + " has no field " + keys; }
     let id = text_of(v, "id");
@@ -618,7 +618,7 @@ fn variant_body(v: String, n: Int) -> String {
     let parser_given = len(std::json::find_field_raw(v, "reasoning_parser")) > 0;
     let parser = text_of(v, "reasoning_parser");
     if parser_given && !reasoning_parser_known(parser) {
-        return "!variants\t" + at + ".reasoning_parser is deepseek_v4";
+        return "!variants\t" + at + ".reasoning_parser is deepseek_v4 or deepseek_r1";
     }
     if parser_given && format != "safetensors" {
         return "!variants\t" + at
@@ -638,6 +638,29 @@ fn variant_body(v: String, n: Int) -> String {
     }
     let files = files_body(std::json::find_field_raw(v, "files"), at + ".files", true);
     if std::str::starts_with(files, "!") { return files; }
+    // the class the model's tokenizer is loaded as, where the one its
+    // tokenizer_config.json names loads it wrong under the pinned vLLM's
+    // transformers, from a closed set: its node writes the variant's
+    // tokenizer_config.json with it (node/run.hl `tokenizer_class`), and
+    // the generic class reads the tokenizer.json listed beside it
+    let class_given = len(std::json::find_field_raw(v, "tokenizer_class")) > 0;
+    let class = text_of(v, "tokenizer_class");
+    if class_given && !tokenizer_class_known(class) {
+        return "!variants\t" + at + ".tokenizer_class is PreTrainedTokenizerFast";
+    }
+    if class_given && format != "safetensors" {
+        return "!variants\t" + at
+            + ".tokenizer_class is a safetensors variant's, which vLLM serves";
+    }
+    if class_given
+        && !(
+            lists_path(std::json::find_field_raw(v, "files"), "tokenizer.json")
+                && lists_path(std::json::find_field_raw(v, "files"), "tokenizer_config.json")
+        )
+    {
+        return "!variants\t" + at
+            + ".tokenizer_class is for a variant that lists tokenizer.json and tokenizer_config.json";
+    }
     // what an EXL3 variant's server needs beside its weights, each pinned:
     // more files from other repositories (`file_sets`), and the inputs its
     // node readies from them before it starts (`prepare`, `prepared`)
@@ -673,6 +696,7 @@ fn variant_body(v: String, n: Int) -> String {
         + kv_field(kv_given, kv)
         + (if parser_given { ", \"reasoning_parser\": " + jq(parser) } else { "" })
         + (if tools_given { ", \"tool_call_parser\": " + jq(tools) } else { "" })
+        + (if class_given { ", \"tokenizer_class\": " + jq(class) } else { "" })
         + (if sets_given { ", \"file_sets\": [" + sets + "]" } else { "" })
         + (if prepare_given { ", \"prepare\": " + jq(prepare) } else { "" })
         + (if prepared_given { ", \"prepared\": [" + prepared + "]" } else { "" }) + "}";
@@ -897,9 +921,28 @@ fn tool_call_parser_known(parser: String) -> Bool {
 }
 
 /// A reasoning parser a variant may name (`RecipeVariant.reasoning_parser`),
-/// as vLLM names it.
+/// as vLLM v0.29.0 names it (`vllm/reasoning/__init__.py`): DeepSeek-V4's,
+/// and DeepSeek-R1's, which its distills think with too.
 fn reasoning_parser_known(parser: String) -> Bool {
-    return parser == "deepseek_v4";
+    return parser == "deepseek_v4" || parser == "deepseek_r1";
+}
+
+/// A tokenizer class a variant may name (`RecipeVariant.tokenizer_class`):
+/// `PreTrainedTokenizerFast`, transformers' generic fast tokenizer, which
+/// reads a tokenizer.json as it is.
+fn tokenizer_class_known(class: String) -> Bool {
+    return class == "PreTrainedTokenizerFast";
+}
+
+/// True when a list of files (`files`) lists `path`.
+@bounded_by(files)
+fn lists_path(files: String, path: String) -> Bool {
+    let mut it = std::json::array_first(files);
+    while !it.done {
+        if text_of(it.element, "path") == path { return true; }
+        it = std::json::array_next(it);
+    }
+    return false;
 }
 
 /// A KV cache dtype a variant may name (`RecipeVariant.kv_cache_dtype`):

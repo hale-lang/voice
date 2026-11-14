@@ -412,13 +412,20 @@ def kv_per_token(cfg):
 # no chat template besides: vLLM picks its own tokenizer mode for the architecture (config/model.py), whose
 # renderer writes the tools into the prompt. A model with no parser here (Phi-4-mini-reasoning, the Phi MoEs,
 # OpenReasoning-Nemotron, the R1 distill, MiMo's Qwen3.5 distill) is served without tools.
+#
+# DeepSeek-R1-0528-Qwen3-8B thinks with DeepSeek-R1's reasoning parser (`deepseek_r1`), and its
+# tokenizer_config.json names LlamaTokenizerFast for a byte-level BPE tokenizer, which the pinned vLLM's
+# transformers 5 rebuilds as Llama's (spaces and newlines lost, raw Ġ/Ċ pieces in the answer): its variant names
+# the class its node lays the file out with (`tokenizer_class`, transformers' generic fast tokenizer).
 VLLM_SERVES = {"DeepseekV4ForCausalLM": {"kv_cache_dtype": "fp8", "kv_bytes_per_token": 17200,
                                           "reasoning_parser": "deepseek_v4", "tool_call_parser": "deepseek_v4"},
                "GptOssForCausalLM": {"tool_call_parser": "openai"},
                "Glm4MoeLiteForCausalLM": {"tool_call_parser": "glm47"},
                "GraniteMoeHybridForCausalLM": {"tool_call_parser": "granite4"},
                "Qwen/Qwen3-Coder-30B-A3B-Instruct": {"tool_call_parser": "qwen3_coder"},
-               "Qwen/Qwen3-Coder-Next": {"tool_call_parser": "qwen3_coder"}}
+               "Qwen/Qwen3-Coder-Next": {"tool_call_parser": "qwen3_coder"},
+               "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": {"reasoning_parser": "deepseek_r1",
+                                                         "tokenizer_class": "PreTrainedTokenizerFast"}}
 
 
 def need_bytes(files, kv):

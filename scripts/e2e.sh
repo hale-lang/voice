@@ -39,7 +39,8 @@ NERVES_PORT=${NERVES_PORT:-14297}
 NOHEAD_PORT=${NOHEAD_PORT:-14300}
 DECIDE_PORT=${DECIDE_PORT:-14301}
 KEPT_PORT=${KEPT_PORT:-14302}
-STRICT_PORT=${STRICT_PORT:-14303}
+# the tool-argument case's strict upstream (14303 is the attempts case's git daemon)
+STRICT_PORT=${STRICT_PORT:-14304}
 work=$(mktemp -d)
 container=""
 org_container="voice-e2e-org-$$"

@@ -373,7 +373,7 @@ function Readout({ m }: { m: Message }) {
       {a?.requestId && (
         <>
           {said ? ' · ' : ''}
-          <a href={href('usage', a.requestId)}>{a.requestId}</a>
+          <a href={href('requests', a.requestId)}>{a.requestId}</a>
         </>
       )}
     </span>

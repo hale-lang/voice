@@ -3,7 +3,8 @@ import { Shell, RailHeader, RailNav, RailPrincipal, Evidence, ago, Form, Field, 
 import { Appearance, Contained } from '@hale/components';
 import { THEME_KEY } from './theme-key';
 import { EventLog } from './EventLog';
-import { useRoute, href, go } from './route';
+import { useRoute, go } from './route';
+import { railOf, type Screen as ScreenKey } from './nav';
 import { useGet } from './api/client';
 import { Overview } from './screens/Overview';
 import { Network } from './screens/Network';
@@ -28,25 +29,27 @@ import { setEventsLive } from './api/live';
 import { useOperatorToken, keepOperatorToken } from './api/token';
 import { useCallback, useEffect, useLayoutEffect, useState, type ReactNode } from 'react';
 
-const NAV = [
-  { href: href(), label: 'Overview', key: '' },
-  { href: href('models'), label: 'Models', key: 'models' },
-  { href: href('network'), label: 'Network', key: 'network' },
-  { href: href('usage'), label: 'Usage', key: 'usage' },
-  { href: href('chat'), label: 'Chat', key: 'chat' },
-  { href: href('attempts'), label: 'Attempts', key: 'attempts' },
-  { href: href('tools'), label: 'Tools', key: 'tools' },
-  { href: href('routes'), label: 'Route table', key: 'routes' },
-  { href: href('nodes'), label: 'Nodes', key: 'nodes' },
-  { href: href('accounts'), label: 'Accounts', key: 'accounts' },
-  { href: href('placements'), label: 'Placements', key: 'placements' },
-  { href: href('recipes'), label: 'Recipes', key: 'recipes' },
-  { href: href('runtimes'), label: 'Runtimes', key: 'runtimes' },
-  { href: href('projects'), label: 'Projects', key: 'projects' },
-  { href: href('annotators'), label: 'Annotators', key: 'annotators' },
-  { href: href('changes'), label: 'Changes', key: 'changes' },
-  { href: href('api'), label: 'API', key: 'api' },
-];
+/** Each screen nav.ts places. */
+const SCREENS: Record<ScreenKey, (p: ScreenProps) => ReactNode> = {
+  '': Overview,
+  models: Models,
+  placements: Placements,
+  nodes: Nodes,
+  recipes: Recipes,
+  runtimes: Runtimes,
+  accounts: Accounts,
+  routes: Routes,
+  requests: Usage,
+  conversations: Usage,
+  network: Network,
+  projects: Projects,
+  chat: Chat,
+  annotators: Annotators,
+  tools: Tools,
+  attempts: Attempts,
+  changes: Changes,
+  api: Api,
+};
 
 export function App() {
   const token = useOperatorToken();
@@ -78,8 +81,8 @@ function Admin() {
   const route = useRoute();
   const [inspector, setInspector] = useState<ReactNode>(null);
   const section = route.parts[0] ?? '';
-  const screen = { '': Overview, network: Network, nodes: Nodes, usage: Usage, routes: Routes, changes: Changes, accounts: Accounts, models: Models, placements: Placements, recipes: Recipes, runtimes: Runtimes, projects: Projects, annotators: Annotators, api: Api, chat: Chat, tools: Tools, attempts: Attempts }[section];
-  const Screen = screen ?? Overview;
+  const known = Object.hasOwn(SCREENS, section);
+  const Screen = known ? SCREENS[section as ScreenKey] : Overview;
 
   // The inspector belongs to the screen; a new screen starts it empty. A
   // layout effect, so it runs before the screen's own effect fills it.
@@ -93,7 +96,7 @@ function Admin() {
       rail={
         <>
           <RailHeader app="voice" sub="admin" />
-          <RailNav items={NAV.map((n) => ({ ...n, active: n.key === section }))} />
+          <RailNav groups={railOf(known ? section : '')} />
           <RailPrincipal>
             <Appearance storageKey={THEME_KEY} />
             <div style={{ marginBottom: 'var(--space-3)' }}>

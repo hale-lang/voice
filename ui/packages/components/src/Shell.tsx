@@ -106,23 +106,6 @@ export function RailHeader(props: { app: string; sub?: string }) {
   );
 }
 
-export function RailNav(props: { items: { href: string; label: string; active?: boolean }[] }) {
-  return (
-    <div className={s.nav}>
-      {props.items.map((it) => (
-        <a
-          key={it.href}
-          href={it.href}
-          className={`${s.navLink} ${it.active ? s.navActive : ''}`}
-          aria-current={it.active ? 'page' : undefined}
-        >
-          {it.label}
-        </a>
-      ))}
-    </div>
-  );
-}
-
 export function RailPrincipal(props: { children: ReactNode }) {
   return <div className={s.principal}>{props.children}</div>;
 }

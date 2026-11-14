@@ -1,14 +1,18 @@
 import type { Schemas, UsageRecordSummary } from '../api/client';
+import { href } from '../nav.ts';
 
 export type ConversationUsage = Schemas['ConversationUsage'];
 export type UsageStatus = UsageRecordSummary['status'];
 
-/** The two views of the ledger: each request, or each conversation. */
+/**
+ * The two views of the ledger: each request, or each conversation; each a
+ * screen of its own (nav.ts), whose name is the view's.
+ */
 export type UsageTab = 'requests' | 'conversations';
 
 /**
- * What the Usage page shows, as its URL's query keeps it: the view, and
- * each filter, "" (or false) for any. `since` is how far back, in seconds;
+ * What the Usage page shows: the view, as its route names it, and each
+ * filter, as its URL's query keeps it, "" (or false) for any. `since` is how far back, in seconds;
  * the cutoff it names is fixed where the page reads it (`fromOf`), so a
  * query stays the same while the page is open.
  */
@@ -40,16 +44,14 @@ export const SINCE: { value: string; label: string }[] = [
 ];
 
 /**
- * The view a URL's query names. `tab` defaults to conversations when the
- * route opens one (`usage/c/<conversation>`), else to requests; a value no
- * filter takes is dropped.
+ * The view on screen `tab` with the filters a URL's query names; a value
+ * no filter takes is dropped.
  */
-export function viewOf(query: URLSearchParams, openConversation = false): UsageView {
-  const tab = query.get('view');
+export function viewOf(query: URLSearchParams, tab: UsageTab = 'requests'): UsageView {
   const status = query.get('status') ?? '';
   const since = query.get('since') ?? '';
   return {
-    tab: tab === 'conversations' || tab === 'requests' ? tab : openConversation ? 'conversations' : 'requests',
+    tab,
     project: query.get('project') ?? '',
     key: query.get('key') ?? '',
     model: query.get('model') ?? '',
@@ -63,15 +65,9 @@ export function viewOf(query: URLSearchParams, openConversation = false): UsageV
   };
 }
 
-/**
- * The query that names `v`: only what differs from the default, the tab
- * among it: on a route that opens a conversation (`viewOf`'s
- * `openConversation`) the default tab is conversations, so requests is
- * written there.
- */
-export function queryOf(v: UsageView, openConversation = false): string {
+/** The query that names `v`'s filters: only what differs from the default (the view is the route's). */
+export function queryOf(v: UsageView): string {
   const q = new URLSearchParams();
-  if (v.tab !== (openConversation ? 'conversations' : 'requests')) q.set('view', v.tab);
   for (const k of ['project', 'key', 'model', 'account', 'status', 'conversation', 'metadata', 'since'] as const) {
     if (v[k]) q.set(k, v[k]);
   }
@@ -80,20 +76,15 @@ export function queryOf(v: UsageView, openConversation = false): string {
   return q.toString();
 }
 
-/** A hash link to `parts` (as `href` writes them) with `v` as its query, read back as `v` on that route. */
-export function viewHref(v: UsageView, ...parts: string[]): string {
-  const q = queryOf(v, opensConversation(parts));
-  return '#/' + parts.map(encodeURIComponent).join('/') + (q ? `?${q}` : '');
+/** A hash link to `v`'s screen, `item` (a request, or a conversation) open if given, `v`'s filters its query. */
+export function viewHref(v: UsageView, item?: string): string {
+  const q = queryOf(v);
+  return href(v.tab, ...(item ? [item] : [])) + (q ? `?${q}` : '');
 }
 
-/** True for a route that opens a conversation: `usage/c/<conversation>`. */
-export function opensConversation(parts: readonly string[]): boolean {
-  return parts[0] === 'usage' && parts[1] === 'c';
-}
-
-/** True when any filter is set (the view itself aside). */
+/** True when any filter is set. */
 export function filtered(v: UsageView): boolean {
-  return queryOf({ ...v, tab: 'requests' }) !== '';
+  return queryOf(v) !== '';
 }
 
 /** The cutoff `since` names from `now` (ms), as RFC 3339; "" for any time. */

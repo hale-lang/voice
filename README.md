@@ -232,21 +232,28 @@ Hardening the runtime's container is tracked in
 
 ## The admin UI
 
-Served by the api at `/`, under the operator token:
+Served by the api at `/`, under the operator token. The rail lists its
+screens in layers:
 
-- **Overview**, **Network** (the fleet as a graph, lit while each request
-  runs, the api instances live over the hub), **Route table**;
-- **Usage**: the ledger as two live tables, each request or each
-  conversation, filtered (project, key, model, status, time) and paged, the
-  view kept in the URL; a request opened shows its annotation and its
-  recording (for a project or key that **peeks**: kept seven days), and a
-  conversation opened reads as one, its context beside the back and forth;
-- **Chat**: talk to a model as a project's caller, with the hosted **web
-  fetch** where its model takes tool calls; **Tools**: web fetch on or off,
-  its limits and its denylist ([docs/internals.md](docs/internals.md));
-- **Nodes**, **Accounts**, **Catalog**, **Placements**, **Arrange**, **Recipes**,
-  **Runtimes**, **Projects** (subprojects, keys, limits, budgets, peek),
-  **Changes** (every admin change, field by field), **API** (the contract);
+- **Overview**;
+- **Models**: the **Catalogue** (every model, however it is served),
+  **Placements**, **Nodes** (and **Arrange**), **Recipes**, **Runtimes**,
+  **Accounts**, **Routes** (the route table), **Requests** (the ledger,
+  each request, filtered by project, key, model, status and time, paged,
+  the filters kept in the URL; one opened shows its annotation and its
+  recording, for a project or key that **peeks**: kept seven days) and
+  **Live** (the fleet as a graph, lit while each request runs, the api
+  instances live over the hub);
+- **Projects** (subprojects, keys, limits, budgets, peek);
+- **Conversations**: **Chat** (talk to a model as a project's caller, with
+  the hosted **web fetch** where its model takes tool calls) and
+  **Conversations** (the ledger by conversation; one opened reads as one,
+  its context beside the back and forth);
+- **Harness**: **Annotators**, **Tools** (web fetch on or off, its limits
+  and its denylist, [docs/internals.md](docs/internals.md)) and
+  **Attempts**;
+- and apart, **Changes** (every admin change, field by field) and **API**
+  (the contract);
 - an event log docked at the foot of every screen: requests taking off and
   landing, nodes, changes.
 

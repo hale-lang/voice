@@ -116,7 +116,7 @@ function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; not
   const r = t.record;
   return (
     <div className={`${s.turn} ${threads > 1 && t.thread >= 0 ? s.threaded : ''}`} style={{ ['--hue' as string]: threadHue(Math.max(0, t.thread)) }}>
-      <a className={s.divider} href={href('usage', r.id)} title="the request">
+      <a className={s.divider} href={href('requests', r.id)} title="the request">
         {threads > 1 && t.thread >= 0 && <span className={s.threadTag}>thread {t.thread + 1}</span>}
         <span>{when(r.created_at)}</span>
         <span>{r.served?.seat ?? r.requested_model}</span>

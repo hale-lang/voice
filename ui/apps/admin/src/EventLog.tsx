@@ -249,7 +249,7 @@ function lineOf(e: AdminEvent): Line | null {
           ? `${a.project} · not annotated: ${a.reason}`
           : `${a.project} · ${said || `${a.answers.length} answers`}${a.title ? ` · “${a.title}”` : ''} · ${a.runs.length} run${a.runs.length === 1 ? '' : 's'}, ${count(tokens)} tok`,
         detail: a.conversation ?? a.request_id,
-        open: () => go('usage', a.request_id),
+        open: () => go('requests', a.request_id),
         replayed,
       };
     }
@@ -283,7 +283,7 @@ function lineOf(e: AdminEvent): Line | null {
         tone,
         text: `${short} · ${said}`,
         detail: st.conversation || st.project,
-        open: () => go('usage', st.request_id),
+        open: () => go('requests', st.request_id),
         replayed,
       };
     }
@@ -312,7 +312,7 @@ function landing(r: UsageRecord | UsageRecordSummary, at: number, replayed: bool
     tone: failed ? 'fail' : r.internal ? 'quiet' : r.status === 'incomplete' ? 'warn' : 'ok',
     text: `${r.project}${r.internal ? ` · ${side === 'title' ? 'title' : `${side} stage`}` : ''} · ${r.served?.model ?? r.requested_model} on ${r.served?.seat ?? '–'} · ${inputTokens(r)} → ${count(r.output_tokens)} tok · ${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s${rate}`,
     detail: r.conversation ?? r.id,
-    open: () => go('usage', r.id),
+    open: () => go('requests', r.id),
     replayed,
   };
 }

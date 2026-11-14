@@ -1179,7 +1179,8 @@ already there.
   (`reasoning_content`) becomes a `reasoning` item streamed as
   `response.reasoning_text.delta` and `.done`, the OpenAI Responses names
   its clients (Codex among them) read, where Open Responses `2026-04-24`
-  says `response.reasoning.delta`; the api reads either from a node.
+  says `response.reasoning.delta`; the api sends a node from before's
+  thinking, under that name, renamed.
   Calls arrive in index
   order; one that interleaves fails the seat. The api renders them as
   `tool_calls` deltas with `finish_reason: "tool_calls"`, or as the

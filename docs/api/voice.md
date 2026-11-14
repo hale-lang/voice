@@ -205,7 +205,7 @@ client can pace itself instead of discovering the wall by failing.
 - [capabilities](#tag-capabilities) (1)
 - [projects](#tag-projects) (9)
 - [keys](#tag-keys) (5)
-- [usage](#tag-usage) (14)
+- [usage](#tag-usage) (15)
 - [models](#tag-models) (5)
 - [recipes](#tag-recipes) (5)
 - [runtimes](#tag-runtimes) (4)
@@ -1045,17 +1045,19 @@ One summary per request, newest first, across the projects the
 principal may see: each without its attempts or the caller's
 `metadata`, which `getUsage` answers with the whole record. A page
 holds at most 40. A `cursor` is a page's `next_cursor`; one that
-names no record, or a `limit` outside 1 to 40, is a `422`.
+names no record, or a `limit` outside 1 to 40, is a `422`, as is a
+`status` a record never ends as.
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
-| `project` | query | array of string |  | Only these projects. Repeatable. |
-| `key` | query | array of string |  | Only these keys. Repeatable. |
-| `model` | query | array of string |  | Only these requested models. Repeatable. |
-| `account` | query | array of string |  | Only requests served on these accounts. Repeatable. |
+| `project` | query | string |  | Only this project's requests. One value, given once. |
+| `key` | query | string |  | Only this key's requests. One value, given once. |
+| `model` | query | string |  | Only requests of this model, asked for or served. One value, given once. |
+| `account` | query | string |  | Only requests served on this account. Each of the usage filters takes one value, given once; a repeated one is read as its first. |
 | `conversation` | query | string |  | Only the turns of this conversation (`UsageRecord.conversation`). |
+| `status` | query | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` |  | Only requests that ended so (`UsageRecord.status`). One value, given once. |
 | `metadata` | query | string |  | Only requests whose `metadata` has every pair asked: one pair written `name=value`, or several as a JSON object of them, `{"name": "value", …}` (at most 16), all of which must match. The parameter is given once. |
 | `from` | query | string (date-time) |  |  |
 | `to` | query | string (date-time) |  |  |
@@ -1096,11 +1098,12 @@ Parameters:
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
 | `group_by` | query | array of string, one of `project`, `key`, `model`, `account`, `seat`, `node`, `conversation`, `internal`, `day`, `hour` | yes |  |
-| `project` | query | array of string |  | Only these projects. Repeatable. |
-| `key` | query | array of string |  | Only these keys. Repeatable. |
-| `model` | query | array of string |  | Only these requested models. Repeatable. |
-| `account` | query | array of string |  | Only requests served on these accounts. Repeatable. |
+| `project` | query | string |  | Only this project's requests. One value, given once. |
+| `key` | query | string |  | Only this key's requests. One value, given once. |
+| `model` | query | string |  | Only requests of this model, asked for or served. One value, given once. |
+| `account` | query | string |  | Only requests served on this account. Each of the usage filters takes one value, given once; a repeated one is read as its first. |
 | `conversation` | query | string |  | Only the turns of this conversation (`UsageRecord.conversation`). |
+| `status` | query | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` |  | Only requests that ended so (`UsageRecord.status`). One value, given once. |
 | `metadata` | query | string |  | Only requests whose `metadata` has every pair asked: one pair written `name=value`, or several as a JSON object of them, `{"name": "value", …}` (at most 16), all of which must match. The parameter is given once. |
 | `from` | query | string (date-time) |  |  |
 | `to` | query | string (date-time) |  |  |
@@ -1111,6 +1114,48 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | One row per group. | `application/json` [UsageSummary](#schema-usagesummary) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/usage/conversations`
+
+**List conversations' usage** · `listUsageConversations`
+
+Authentication: operatorToken
+
+The conversations the ledger's requests are turns of
+(`UsageRecord.conversation`), one row each, the most recently
+active first: each one's requests the filters keep, summed, by
+project and currency (a conversation's requests in another
+currency are a row of their own). A request of no conversation is
+in none. Voice's own requests for its projects are left out unless
+`include_internal` is `true`, as `listUsage` leaves them out. A
+page holds at most 40. A `cursor` is a page's `next_cursor`, the
+rows active before its last; one that is not, or a `limit` outside
+1 to 40, is a `422`.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `project` | query | string |  | Only this project's requests. One value, given once. |
+| `key` | query | string |  | Only this key's requests. One value, given once. |
+| `model` | query | string |  | Only requests of this model, asked for or served. One value, given once. |
+| `from` | query | string (date-time) |  |  |
+| `to` | query | string (date-time) |  |  |
+| `has_failures` | query | boolean |  | Only conversations with a failed request (`failed_requests` above 0). |
+| `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
+| `include_internal` | query | boolean |  | Voice's own requests for its projects, under each project's system key (`UsageRecord.internal`: annotations, conversation titles), are left out unless this is `true`, or `key` names a system key. |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | A page of conversations. | `application/json` object |
 | 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -5536,6 +5581,37 @@ Type: object
 | `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. |  |
 | `tool_arguments_repaired` | boolean |  | As `UsageRecord.tool_arguments_repaired`. |  |
 
+<a id="schema-conversationusage"></a>
+
+### ConversationUsage
+
+One conversation's requests, summed (`listUsageConversations`): of
+one project, in one currency. Its tokens are those engines reported,
+as a summary counts them: an estimate (`input_tokens_estimated`) is
+in none.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `conversation` | string | yes | Its `prompt_cache_key` (`UsageRecord.conversation`), as `ConversationFilter` takes it. |  |
+| `project` | string | yes |  |  |
+| `keys` | array of string | yes | The keys its requests were made with, in order, at most 4. | items ≤ 4 |
+| `models` | array of string | yes | The models that served its requests (else the ones asked for), in order, at most 4. | items ≤ 4 |
+| `requests` | integer | yes |  |  |
+| `failed_requests` | integer | yes | Its requests that ended other than `served` or `incomplete`. |  |
+| `input_tokens` | integer | yes |  |  |
+| `cached_input_tokens` | integer | yes |  |  |
+| `output_tokens` | integer | yes |  |  |
+| `reasoning_tokens` | integer | yes |  |  |
+| `price_micros` | integer | yes |  |  |
+| `currency` | string | yes |  |  |
+| `first_at` | string (date-time) | yes | When its earliest request was made. |  |
+| `last_at` | string (date-time) | yes | When its latest was. |  |
+| `last_request` | string | yes | The latest request's id, as `getUsage` reads it. |  |
+| `last_status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | How its latest request ended. |  |
+| `title` | string |  | Its title, as the title annotator last wrote it (`ConversationTitle`); left out when none is written. |  |
+
 <a id="schema-usagesummary"></a>
 
 ### UsageSummary
@@ -6777,6 +6853,7 @@ Type: object
 | `from` | string (date-time) |  |  |  |
 | `to` | string (date-time) |  |  |  |
 | `include_internal` | boolean |  | Voice's own requests for its projects (their system keys') too; left out, not. |  |
+| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` |  | How the request ended (`UsageRecord.status`). |  |
 
 <a id="schema-annotationrunoutcome"></a>
 

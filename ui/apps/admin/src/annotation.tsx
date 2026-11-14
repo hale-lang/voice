@@ -202,7 +202,7 @@ export function LiveSteps({ steps }: { steps: Step[] }) {
  * as a problem, without the reason or the project). `error` is the api's
  * own failure, not a refusal.
  */
-export function useRunAnnotation(id: string) {
+function useRunAnnotation(id: string) {
   const w = useWrite();
   const [outcome, setOutcome] = useState<RunOutcome | null>(null);
   async function run() {
@@ -214,7 +214,7 @@ export function useRunAnnotation(id: string) {
 }
 
 /** A refusal in plain words; annotation off links its project, where it is turned on. */
-export function RefusalText({ o }: { o: RunOutcome }) {
+function RefusalText({ o }: { o: RunOutcome }) {
   const r = refusalOf(o);
   if (!r.turnOn) return <>{r.said}</>;
   const to = r.turnOn.project ? href('projects', r.turnOn.project) : href('projects');

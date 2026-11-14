@@ -719,7 +719,7 @@ type UsageRow {
 }
 
 /// Which usage, newest first: of `project`, `key`, `account`, `model`
-/// (requested or served) and `conversation` where not "", with every `metadata` pair
+/// (requested or served), `conversation` and `status` where not "", with every `metadata` pair
 /// (`name=value`), in [from, to] where set, older than `cursor` (a row's
 /// `seq`) when above 0, at most `limit`.
 type UsageQuery {
@@ -730,6 +730,8 @@ type UsageQuery {
     // the record's `conversation`
     conversation: String = "";
     metadata: Names = Names { };
+    // how the request ended (`UsageRecord.status`)
+    status: String = "";
     has_from: Bool = false;
     from: Time = `1970-01-01T00:00:00Z`;
     has_to: Bool = false;
@@ -768,6 +770,80 @@ type UsageGroup {
 }
 
 type UsageGroups { rows: bounded[UsageGroup; 1000]; }
+
+/// Which conversations, the most recently active first: the rows `q`
+/// matches (its own `cursor` and `limit` aside) that name a conversation,
+/// grouped by project, conversation and currency; of those, the ones whose
+/// latest row is older than `cursor` (a row's `seq`) when above 0, with a
+/// failed request when `has_failures`, at most `limit`.
+type ConversationQuery {
+    q: UsageQuery = UsageQuery { };
+    has_failures: Bool = false;
+    limit: Int = 40;
+    cursor: Int = 0;
+}
+
+/// One conversation's requests, summed: `keys` and `models` (the served
+/// model, else the requested) each sorted, at most `CONVERSATION_NAMES`;
+/// `failed` the requests that ended other than served or incomplete
+/// (`failed_status`); `title` its title when one is written (`TitleRow`).
+type ConversationRow {
+    project: String = "";
+    conversation: String = "";
+    currency: String = "USD";
+    keys: Names = Names { };
+    models: Names = Names { };
+    requests: Int = 0;
+    failed: Int = 0;
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+    first_at: Time = `1970-01-01T00:00:00Z`;
+    last_at: Time = `1970-01-01T00:00:00Z`;
+    // the latest row's: the cursor of the page after it
+    last_seq: Int = 0;
+    last_request: String = "";
+    last_status: String = "";
+    has_title: Bool = false;
+    title: String = "";
+}
+
+type ConversationRows { rows: bounded[ConversationRow; 100]; more: Bool = false; }
+
+/// The memory store's conversations while it sums them: at most
+/// `SUMMARY_GROUPS`, the most recently active.
+type ConversationGroups { rows: bounded[ConversationRow; 1000]; }
+
+/// The most keys, and models, a conversation's row names.
+const CONVERSATION_NAMES: Int = 4;
+
+/// True for a status a request failed with: any but served and incomplete.
+fn failed_status(status: String) -> Bool {
+    return status != "served" && status != "incomplete";
+}
+
+/// `n` with `v` in it, kept sorted, at most `CONVERSATION_NAMES`: the
+/// first in order are kept.
+fn name_added(n: Names, v: String) -> Names {
+    let mut out = Names { };
+    let mut placed = false;
+    for x in n.items {
+        if x == v { return n; }
+        if !placed && v < x {
+            push(out.items, v) or discard;
+            placed = true;
+        }
+        push(out.items, x) or discard;
+    }
+    if !placed { push(out.items, v) or discard; }
+    let mut kept = Names { };
+    for x in out.items {
+        if count(kept.items) < CONVERSATION_NAMES { push(kept.items, x) or discard; }
+    }
+    return kept;
+}
 
 /// The most groups a summary answers: the most recently active.
 const SUMMARY_GROUPS: Int = 1000;
@@ -818,6 +894,7 @@ fn usage_matches(r: UsageRow, q: UsageQuery) -> Bool {
     if len(q.conversation) > 0 && conversation_of(r) != q.conversation {
         return false;
     }
+    if len(q.status) > 0 && r.status != q.status { return false; }
     let at = std::time::unix(r.created_at);
     if q.has_from && at < std::time::unix(q.from) { return false; }
     if q.has_to && at > std::time::unix(q.to) { return false; }
@@ -1098,6 +1175,8 @@ interface Store {
     fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError);
     /// Totals over the matching rows, grouped.
     fn usage_summary(q: UsageSummaryQuery) -> UsageGroups fallible(StoreError);
+    /// The conversations the matching rows are turns of, as `q` asks.
+    fn usage_conversations(q: ConversationQuery) -> ConversationRows fallible(StoreError);
 
     /// The route table the brain last wrote (internal.yaml `RouteTable`),
     /// as JSON; "" when none has been.
@@ -2039,6 +2118,95 @@ locus MemoryStore {
                     last_request: u.last_request,
                 },
             ) or discard;
+        }
+        return out;
+    }
+
+    @unbounded
+    fn usage_conversations(c: ConversationQuery) -> ConversationRows fallible(StoreError) {
+        let mut groups = ConversationGroups { };
+        // newest first, so a conversation is first met at its latest row
+        // and the groups come most recently active first; past the cap,
+        // the least recent are left out, as a summary's are
+        let mut i = self.usage_log.len();
+        while i > 0 {
+            i = i - 1;
+            let r = self.usage_log.get(i) or UsageRow { };
+            let conversation = conversation_of(r);
+            if len(conversation) == 0 || !usage_matches(r, c.q) { continue; }
+            let mut found = -1;
+            let mut n = 0;
+            while n < count(groups.rows) {
+                let g = at(groups.rows, n) or ConversationRow { };
+                if g.project == r.project && g.conversation == conversation
+                    && g.currency == r.currency
+                {
+                    found = n;
+                    break;
+                }
+                n = n + 1;
+            }
+            if found < 0 {
+                if count(groups.rows) >= SUMMARY_GROUPS { continue; }
+                let title = self.title(r.project, conversation) or TitleRow { };
+                push(
+                    groups.rows,
+                    ConversationRow {
+                        project: r.project,
+                        conversation: conversation,
+                        currency: r.currency,
+                        last_at: r.created_at,
+                        last_seq: r.seq,
+                        last_request: r.id,
+                        last_status: r.status,
+                        has_title: title.present,
+                        title: title.title,
+                    },
+                ) or discard;
+                found = count(groups.rows) - 1;
+            }
+            let g = at(groups.rows, found) or ConversationRow { };
+            // the conversation with this row counted, a new value rather
+            // than a written copy; read newest first, so this is the earliest
+            set(
+                groups.rows,
+                found,
+                ConversationRow {
+                    project: g.project,
+                    conversation: g.conversation,
+                    currency: g.currency,
+                    keys: name_added(g.keys, r.key),
+                    models: name_added(
+                        g.models,
+                        if len(r.served_model) > 0 { r.served_model } else { r.requested_model },
+                    ),
+                    requests: g.requests + 1,
+                    failed: g.failed + (if failed_status(r.status) { 1 } else { 0 }),
+                    input_tokens: g.input_tokens + r.input_tokens,
+                    cached_input_tokens: g.cached_input_tokens + r.cached_input_tokens,
+                    output_tokens: g.output_tokens + r.output_tokens,
+                    reasoning_tokens: g.reasoning_tokens + r.reasoning_tokens,
+                    price_micros: g.price_micros + r.price_micros,
+                    first_at: r.created_at,
+                    last_at: g.last_at,
+                    last_seq: g.last_seq,
+                    last_request: g.last_request,
+                    last_status: g.last_status,
+                    has_title: g.has_title,
+                    title: g.title,
+                },
+            ) or discard;
+        }
+        let limit = if c.limit < 1 { 40 } else if c.limit > 100 { 100 } else { c.limit };
+        let mut out = ConversationRows { };
+        for g in groups.rows {
+            if c.cursor > 0 && g.last_seq >= c.cursor { continue; }
+            if c.has_failures && g.failed == 0 { continue; }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
+            push(out.rows, g) or discard;
         }
         return out;
     }

@@ -1581,7 +1581,7 @@ locus PgStore {
         a.add(to_string(limit + 1));
         let all = self.rows(
             "SELECT row_to_json(t) FROM (SELECT seq, id, created_at, record FROM usage WHERE "
-                + cond + " ORDER BY seq DESC LIMIT $" + to_string(9 + 2 * count(q.metadata.items))
+                + cond + " ORDER BY seq DESC LIMIT $" + to_string(10 + 2 * count(q.metadata.items))
                 + "::int) t",
             a,
         ) or raise;
@@ -1678,6 +1678,81 @@ locus PgStore {
                 first_at: pg_time(pg_text(line, "first_at")),
                 last_at: pg_time(pg_text(line, "last_at")),
                 last_request: pg_text(line, "last_request")
+            }) or discard;
+        }
+        return out;
+    }
+
+    fn usage_conversations(c: ConversationQuery) -> ConversationRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.usage_conversations_locked(c) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn usage_conversations_locked(c: ConversationQuery) -> ConversationRows fallible(StoreError) {
+        let limit = if c.limit < 1 { 40 } else if c.limit > 100 { 100 } else { c.limit };
+        // the rows' own cursor is none: the page's is on each conversation's latest row
+        let mut q = c.q;
+        q.cursor = 0;
+        let a = db::Args { };
+        let cond = usage_where(q, a);
+        let n = 10 + 2 * count(q.metadata.items);
+        a.add(to_string(c.cursor));
+        a.add(if c.has_failures { "true" } else { "false" });
+        a.add(to_string(limit + 1));
+        let failed = "count(*) FILTER (WHERE status NOT IN ('served', 'incomplete'))";
+        let model = "coalesce(served->>'model', requested_model)";
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT u.*, ct.title FROM (SELECT project, record->>'conversation' AS conversation, currency, count(*) AS requests, "
+                + failed
+                + " AS failed, coalesce(sum(input_tokens), 0)::bigint AS input_tokens, coalesce(sum(cached_input_tokens), 0)::bigint AS cached_input_tokens, coalesce(sum(output_tokens), 0)::bigint AS output_tokens, coalesce(sum(reasoning_tokens), 0)::bigint AS reasoning_tokens, coalesce(sum(price_micros), 0)::bigint AS price_micros, min(created_at) AS first_at, max(created_at) AS last_at, max(seq) AS last_seq, (array_agg(id ORDER BY seq DESC))[1] AS last_request, (array_agg(status ORDER BY seq DESC))[1] AS last_status, (array_agg(DISTINCT key ORDER BY key))[1:"
+                + to_string(CONVERSATION_NAMES) + "] AS keys, (array_agg(DISTINCT " + model
+                + " ORDER BY " + model + "))[1:" + to_string(CONVERSATION_NAMES)
+                + "] AS models FROM usage WHERE " + cond
+                + " AND coalesce(record->>'conversation', '') <> '' GROUP BY project, record->>'conversation', currency HAVING ($"
+                + to_string(n) + "::bigint = 0 OR max(seq) < $" + to_string(n)
+                + "::bigint) AND (NOT $" + to_string(n + 1) + "::boolean OR " + failed
+                + " > 0) ORDER BY max(seq) DESC LIMIT $" + to_string(n + 2)
+                + "::int) u LEFT JOIN conversation_title ct ON ct.project = u.project AND ct.conversation = u.conversation ORDER BY u.last_seq DESC) t",
+            a,
+        ) or raise;
+        let mut out = ConversationRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
+            let title = std::json::string_field(line, "title");
+            push(out.rows, ConversationRow {
+                project: pg_text(line, "project"),
+                conversation: pg_text(line, "conversation"),
+                currency: pg_text(line, "currency"),
+                keys: pg_names(raw_or_empty_list(line, "keys")),
+                models: pg_names(raw_or_empty_list(line, "models")),
+                requests: std::json::find_int_field(line, "requests"),
+                failed: std::json::find_int_field(line, "failed"),
+                input_tokens: std::json::find_int_field(line, "input_tokens"),
+                cached_input_tokens: std::json::find_int_field(line, "cached_input_tokens"),
+                output_tokens: std::json::find_int_field(line, "output_tokens"),
+                reasoning_tokens: std::json::find_int_field(line, "reasoning_tokens"),
+                price_micros: std::json::find_int_field(line, "price_micros"),
+                first_at: pg_time(pg_text(line, "first_at")),
+                last_at: pg_time(pg_text(line, "last_at")),
+                last_seq: std::json::find_int_field(line, "last_seq"),
+                last_request: pg_text(line, "last_request"),
+                last_status: pg_text(line, "last_status"),
+                has_title: title.kind == "string",
+                title: title.text
             }) or discard;
         }
         return out;
@@ -4062,7 +4137,7 @@ fn group_sql(field: String) -> String {
 }
 
 /// The condition `q` puts on `usage` (the cursor included), its
-/// parameters added to `a` as $1..$8 and then a pair each for the metadata.
+/// parameters added to `a` as $1..$9 and then a pair each for the metadata.
 // Each parameter goes into `a`, a list built for one statement.
 @bounded_by(a)
 fn usage_where(q: UsageQuery, a: db::Args) -> String {
@@ -4074,11 +4149,12 @@ fn usage_where(q: UsageQuery, a: db::Args) -> String {
     if q.has_to { a.add(std::time::iso8601(q.to)); } else { a.add_null(); }
     a.add(to_string(q.cursor));
     a.add(q.conversation);
-    let mut cond = "($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR requested_model = $3 OR served->>'model' = $3) AND ($4 = '' OR account = $4) AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz) AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz) AND ($7::bigint = 0 OR seq < $7::bigint) AND ($8 = '' OR record->>'conversation' = $8)"
+    a.add(q.status);
+    let mut cond = "($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR requested_model = $3 OR served->>'model' = $3) AND ($4 = '' OR account = $4) AND ($5::timestamptz IS NULL OR created_at >= $5::timestamptz) AND ($6::timestamptz IS NULL OR created_at <= $6::timestamptz) AND ($7::bigint = 0 OR seq < $7::bigint) AND ($8 = '' OR record->>'conversation' = $8) AND ($9 = '' OR status = $9)"
     // a project's system key's rows, voice's own requests for it: left
     // out unless asked for, or unless the key asked for is one
         + (if q.include_internal { "" } else { " AND ($2 <> '' OR key <> project || '-system')" });
-    let mut n = 9;
+    let mut n = 10;
     for pair in q.metadata.items {
         let eq = std::str::index_of(pair, "=");
         a.add(if eq < 0 { pair } else { pair[0..eq] });

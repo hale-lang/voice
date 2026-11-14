@@ -56,8 +56,9 @@ export const AFFECTS: Record<string, string[]> = {
   // query changes until its usage is recorded
   request: [],
   // a request annotated: its annotation, the searches over them, the
-  // conversations' titles, and the annotators' counts
-  annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/annotators'],
+  // conversations' titles (and the conversations listed with them), and
+  // the annotators' counts
+  annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/usage/conversations', '/admin/v1/annotators'],
   // a step of one: told to the step store (steps.ts), no query read again
   annotation_step: [],
 };

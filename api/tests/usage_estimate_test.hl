@@ -1,0 +1,79 @@
+// A request cut off before its seat reported usage records voice's own
+// estimate of its input, marked so, which the ledger's sums leave out; one
+// its seat reported records the engine's count, unmarked.
+import ".." as api;
+import "../../store" as st;
+
+fn main() {
+    // instructions of 40 characters, an input of 80 as written, no tools:
+    // 120 characters, 30 tokens at four a token
+    let body = "{\"model\": \"m\", \"instructions\": \"" + std::str::repeat("i", 40)
+        + "\", \"input\": \"" + std::str::repeat("x", 78) + "\"}";
+    let r = api::read_inference(body, "responses") or api::InferenceRequest { };
+    std::test::assert_eq_int(
+        api::estimated_input_tokens(r.body),
+        30,
+        "a token per four characters",
+    );
+    let attempts = api::Attempts { };
+    let cut = api::unfinished_row(
+        r,
+        "req_1",
+        st::KeyRow { id: "k", project: "p" },
+        st::ModelRow { id: "m" },
+        api::Candidate { seat: st::SeatRow { id: "s", node: "n", ref: "n/s", account: "a" } },
+        "cancelled",
+        67000,
+        attempts.items
+    );
+    std::test::assert(
+        std::str::contains(cut.record, "\"input_tokens\": 30")
+            && std::str::contains(cut.record, "\"input_tokens_estimated\": true"),
+        "a cancelled request records its estimated input, marked so: " + cut.record,
+    );
+    std::test::assert_eq_int(cut.input_tokens, 0, "and the ledger's sums count none of it");
+    let read = api::record_of(cut.record, "req_1") or api::UsageRecord { };
+    std::test::assert(
+        read.input_tokens == 30 && read.input_tokens_estimated,
+        "it reads back as an estimate",
+    );
+    std::test::assert(
+        api::usage_summary_of(read).input_tokens_estimated,
+        "and is listed as one",
+    );
+    // a long prompt and a short one, cut off alike, tell apart
+    let long = api::read_inference(
+        "{\"model\": \"m\", \"input\": [{\"role\": \"user\", \"content\": \""
+            + std::str::repeat("y", 4000)
+            + "\"}], \"tools\": [{\"type\": \"function\", \"name\": \"f\"}]}",
+        "responses",
+    ) or api::InferenceRequest { };
+    std::test::assert(
+        api::estimated_input_tokens(long.body) > 1000,
+        "a long prompt's estimate is long, its tools counted",
+    );
+    let served = api::usage_row(
+        r,
+        "req_2",
+        "p",
+        "k",
+        api::ServedBy { model: "m", node: "n", seat: "n/s", account: "a" },
+        "served",
+        api::Tokens { input: 12, output: 3 },
+        0,
+        "USD",
+        "{\"wall_ms\": 1, \"queue_ms\": 0, \"load_ms\": 0}",
+        attempts.items
+    );
+    std::test::assert(
+        std::str::contains(served.record, "\"input_tokens\": 12")
+            && std::str::contains(served.record, "\"input_tokens_estimated\": false"),
+        "a served request records its engine's count, unmarked",
+    );
+    std::test::assert_eq_int(served.input_tokens, 12, "which the sums count");
+    let before = api::record_of(
+        "{\"id\": \"req_0\", \"created_at\": \"2026-01-01T00:00:00Z\", \"project\": \"p\", \"key\": \"k\", \"requested_model\": \"m\", \"endpoint\": \"responses\", \"status\": \"cancelled\", \"served\": null, \"input_tokens\": 0, \"output_tokens\": 0, \"price_micros\": 0, \"currency\": \"USD\", \"timing\": {\"wall_ms\": 1, \"queue_ms\": 0, \"load_ms\": 0}, \"metadata\": {}}",
+        "req_0",
+    ) or api::UsageRecord { input_tokens_estimated: true };
+    std::test::assert(!before.input_tokens_estimated, "a record from before is no estimate");
+}

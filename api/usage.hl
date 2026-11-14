@@ -42,7 +42,8 @@ fn usage_row(
         + ", \"conversation\": " + jstring_or_null(len(conversation) > 0, conversation)
         + ", \"instance\": " + jstring_or_null(len(r.instance) > 0, r.instance)
         + ", \"internal\": " + jbool(key == st::system_key(project))
-        + ", \"metadata\": " + metadata + "}";
+        + ", \"metadata\": " + metadata + ", \"input_tokens_estimated\": " + jbool(t.estimated)
+        + "}";
     return st::UsageRow {
         id: request_id,
         created_at: at,
@@ -54,7 +55,8 @@ fn usage_row(
         node: by.node,
         seat: by.seat,
         status: status,
-        input_tokens: t.input,
+        // the ledger's sums count what engines reported, never an estimate
+        input_tokens: if t.estimated { 0 } else { t.input },
         cached_input_tokens: t.cached,
         output_tokens: t.output,
         reasoning_tokens: t.reasoning,
@@ -199,7 +201,29 @@ fn asked_for(r: InferenceRequest) -> String {
 
 /// The tokens a seat reported for a request: its input, of it what the
 /// seat's prompt cache held, its output, of it the model's thinking.
-type Tokens { input: Int = 0; cached: Int = 0; output: Int = 0; reasoning: Int = 0; }
+/// `estimated` when the seat reported none and `input` is voice's own
+/// estimate (`estimated_input_tokens`), not an engine's count.
+type Tokens {
+    input: Int = 0;
+    cached: Int = 0;
+    output: Int = 0;
+    reasoning: Int = 0;
+    estimated: Bool = false;
+}
+
+/// Voice's estimate of a request's input tokens, for a request whose seat
+/// reported none (it was cancelled or failed first): its instructions,
+/// input and tools as the caller wrote them, a token per four characters,
+/// rounded up, as a node counts an upstream that reports no usage
+/// (node/engine.hl `tokens_of`). It tells a request cut off with a long
+/// prompt from one cut off with a short one, never what an engine read.
+fn estimated_input_tokens(body: String) -> Int {
+    let instructions = std::json::string_field(body, "instructions");
+    let chars = (if instructions.kind == "string" { len(instructions.text) } else { 0 })
+        + len(std::str::trim(std::json::find_field_raw(body, "input")))
+        + len(std::str::trim(std::json::find_field_raw(body, "tools")));
+    return (chars + 3) / 4;
+}
 
 /// A request a seat served, as its row.
 fn served_usage(r: InferenceRequest, s: Served) -> st::UsageRow {
@@ -225,7 +249,8 @@ fn served_usage(r: InferenceRequest, s: Served) -> st::UsageRow {
 }
 
 /// A request seat `c` began and did not finish, as its row: nothing is
-/// charged, and the seat reported no tokens.
+/// charged, and the seat reported no tokens, so its input is voice's
+/// estimate, marked so.
 fn unfinished_row(
     r: InferenceRequest,
     request_id: String,
@@ -249,7 +274,7 @@ fn unfinished_row(
             engine: c.seat.engine,
         },
         status,
-        Tokens { },
+        Tokens { input: estimated_input_tokens(r.body), estimated: true },
         0,
         if m.priced { m.price.currency } else { "USD" },
         timing_json(wall_ms, 0, false, 0, 0),
@@ -310,6 +335,9 @@ type UsageRecord {
     // for the project, an annotation or a title, apart from its usage
     internal: Bool = false;
     metadata: std::json::Value = std::json::Value::null();
+    // `input_tokens` is voice's estimate, the seat having reported none
+    // (`unfinished_row`); false in a record from before it was kept
+    input_tokens_estimated: Bool = false;
 }
 
 /// `UsageRecordSummary`: a request as `listUsage` lists it, without its
@@ -349,6 +377,7 @@ type UsageRecordSummary {
     annotates: String = "";
     has_side: Bool = false;
     side: String = "";
+    input_tokens_estimated: Bool = false;
 }
 
 /// A page of the ledger, newest first, at most `USAGE_PAGE_MAX`;
@@ -578,6 +607,7 @@ fn usage_summary_of(r: UsageRecord) -> UsageRecordSummary {
         annotates: annotates.text,
         has_side: side.kind == "string",
         side: side.text,
+        input_tokens_estimated: r.input_tokens_estimated,
     };
 }
 

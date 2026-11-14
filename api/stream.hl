@@ -281,7 +281,44 @@ fn output_event(kind: String) -> Bool {
     return kind == "response.output_text.delta"
         || kind == "response.function_call_arguments.delta"
         || kind == "response.refusal.delta"
-        || kind == "response.reasoning.delta";
+        || reasoning_delta(kind);
+}
+
+/// True for an event of the model's thinking as it comes: the standard's
+/// `response.reasoning_text.delta`, or `response.reasoning.delta`, which a
+/// node from before voice took up the standard's name sends.
+fn reasoning_delta(kind: String) -> Bool {
+    return kind == "response.reasoning_text.delta" || kind == "response.reasoning.delta";
+}
+
+/// A node's event under the name the caller reads: the thinking a node
+/// from before sent as `response.reasoning.delta` or `.done` renamed
+/// `response.reasoning_text.delta` or `.done`, its `type` alone rewritten
+/// and its other members kept as written; every other event as it is.
+fn standard_event(event: String) -> String {
+    let kind = std::json::find_string_field(event, "type");
+    if kind == "response.reasoning.delta" {
+        return typed(event, "response.reasoning_text.delta");
+    }
+    if kind == "response.reasoning.done" {
+        return typed(event, "response.reasoning_text.done");
+    }
+    return event;
+}
+
+/// `event` with its `type` member `kind`, its other members as written.
+fn typed(event: String, kind: String) -> String {
+    let out = st::JsonList { };
+    out.add("\"type\": " + jq(kind));
+    let mut it = std::json::object_first(event);
+    while !it.done {
+        let key = std::json::obj_key_string(it, event);
+        if key != "type" {
+            out.add(jq(key) + ": " + std::str::trim(std::json::obj_value_raw(it, event)));
+        }
+        it = std::json::object_next(it, event);
+    }
+    return "{" + out.text() + "}";
 }
 
 /// A chat completion chunk with one choice.
@@ -295,8 +332,9 @@ fn chat_chunk(s: StreamState, delta: String, finish: String, extra: String) -> S
 /// A node's event, as the caller's stream carries it; the state moves on.
 /// A terminal event is not sent here: it waits for the result, which says
 /// what served it (`finish_stream`).
-fn forward(out: EventStream, s: StreamState, event: String) -> StreamState {
+fn forward(out: EventStream, s: StreamState, given: String) -> StreamState {
     let mut st = s;
+    let event = standard_event(given);
     let kind = std::json::find_string_field(event, "type");
     if st.hosted && hidden(st, event, kind) {
         if kind == "response.output_item.added" {
@@ -327,7 +365,7 @@ fn forward(out: EventStream, s: StreamState, event: String) -> StreamState {
         st.role_sent = true;
     }
     // a model's thinking, as the chat wire's servers send it
-    if kind == "response.reasoning.delta" {
+    if reasoning_delta(kind) {
         out.send(
             "",
             chat_chunk(

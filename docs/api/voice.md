@@ -350,7 +350,7 @@ Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | The response, or the standard event stream when `stream` is true. | `application/json` [Response](#schema-response)<br>`text/event-stream` [schema](#schema-schema) \| [VoiceAttemptEvent](#schema-voiceattemptevent) \| [WebFetchCallEvent](#schema-webfetchcallevent) |
+| 200 | The response, or the standard event stream when `stream` is true. | `application/json` [Response](#schema-response)<br>`text/event-stream` [schema](#schema-schema) \| [VoiceAttemptEvent](#schema-voiceattemptevent) \| [WebFetchCallEvent](#schema-webfetchcallevent) \| [ReasoningTextDeltaEvent](#schema-reasoningtextdeltaevent) \| [ReasoningTextDoneEvent](#schema-reasoningtextdoneevent) |
 | 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -4627,6 +4627,49 @@ Type: object
 | `max_chars` | integer |  | The most characters of text the model is given; more is cut, `truncated` true. | default `40000`; ≥ 1000; ≤ 100000 |
 | `denylist` | array of string |  | What is never fetched, at the URL asked for and at every redirect's: a host name (and every name under it), an IPv4 or IPv6 address, a CIDR range, or any of them with `:port` (an IPv6 address bracketed, `[2001:db8::1]:8080`). An address or a range matches a URL whose host is that address: the fetch resolves a name only as it connects, so a name is denied by its name. | default `[]`; items ≤ 64 |
 
+<a id="schema-reasoningtextdeltaevent"></a>
+
+### ReasoningTextDeltaEvent
+
+A piece of the model's thinking, as it comes: text appended to the
+`reasoning_text` content part `content_index` of the `reasoning`
+item `item_id`. The OpenAI Responses API's name for it, which
+clients of that API (Codex among them) read; Open Responses
+`2026-04-24` calls it `response.reasoning.delta`, which voice does
+not send. A model's thinking is not a summary of it:
+`response.reasoning_summary_text.*` is never sent.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `type` | `"response.reasoning_text.delta"` | yes |  |  |
+| `item_id` | string | yes |  |  |
+| `output_index` | integer | yes |  |  |
+| `content_index` | integer | yes |  |  |
+| `delta` | string | yes |  |  |
+| `sequence_number` | integer | yes |  |  |
+
+<a id="schema-reasoningtextdoneevent"></a>
+
+### ReasoningTextDoneEvent
+
+The model's thinking, whole, once it is over: the last
+`response.reasoning_text.delta`'s part, its `text` all of them.
+The OpenAI Responses API's name; Open Responses `2026-04-24`'s
+`response.reasoning.done`, which voice does not send.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `type` | `"response.reasoning_text.done"` | yes |  |  |
+| `item_id` | string | yes |  |  |
+| `output_index` | integer | yes |  |  |
+| `content_index` | integer | yes |  |  |
+| `text` | string | yes |  |  |
+| `sequence_number` | integer | yes |  |  |
+
 <a id="schema-voiceattemptevent"></a>
 
 ### VoiceAttemptEvent
@@ -5398,7 +5441,7 @@ Type: object
 | `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
-| `input_tokens` | integer | yes |  |  |
+| `input_tokens` | integer | yes | The input tokens its engine reported, or, when `input_tokens_estimated`, voice's estimate. |  |
 | `cached_input_tokens` | integer |  | Input tokens the seat's prompt cache held, as its engine reported them; counted in `input_tokens`. |  |
 | `cache_write_input_tokens` | integer |  | Input tokens written to the provider's cache, as the engine reported them; counted in `input_tokens`. |  |
 | `output_tokens` | integer | yes |  |  |
@@ -5411,6 +5454,7 @@ Type: object
 | `conversation` | string \| null |  | The conversation the request was a turn of: its `prompt_cache_key`, the same on each turn. `null` when the caller sent none (the key voice derives to route such a request is not recorded). The ledger's turns of one conversation share it. |  |
 | `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
+| `input_tokens_estimated` | boolean |  | True when its seat reported no usage, the request having been cancelled or having failed first, and `input_tokens` is voice's own estimate from the request's length (its instructions, input and tools, a token per four characters), never an engine's count: it tells a request cut off with a long prompt from one cut off with a short one. Usage summaries count only the tokens engines reported, so an estimate is in none. False (or absent, in a record from before it was kept) when `input_tokens` is the engine's. |  |
 
 <a id="schema-usagerecordsummary"></a>
 
@@ -5450,6 +5494,7 @@ Type: object
 | `internal` | boolean |  |  |  |
 | `annotates` | string |  | For an internal request, the request it annotated (its metadata's `annotates`); left out otherwise. |  |
 | `side` | string |  | For an internal request, its stage, or `title` (its metadata's `side`); left out otherwise. |  |
+| `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. |  |
 
 <a id="schema-usagesummary"></a>
 

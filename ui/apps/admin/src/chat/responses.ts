@@ -65,7 +65,7 @@ export function newAnswer(): Answer {
 /** True for an event that is output reaching the caller: the first one is the time to first token. */
 export function isOutput(ev: SseEvent): boolean {
   const t = typeOf(ev);
-  return t === 'response.output_text.delta' || t === 'response.reasoning.delta' || t === 'response.reasoning_text.delta' || t === 'response.reasoning_summary_text.delta' || t === 'response.refusal.delta';
+  return t === 'response.output_text.delta' || t === 'response.reasoning_text.delta' || t === 'response.reasoning_summary_text.delta' || t === 'response.refusal.delta';
 }
 
 function typeOf(ev: SseEvent): string {
@@ -104,7 +104,6 @@ export function apply(a: Answer, ev: SseEvent): Answer {
     case 'response.output_text.delta':
     case 'response.refusal.delta':
       return { ...a, status: 'streaming', text: a.text + str(d.delta) };
-    case 'response.reasoning.delta':
     case 'response.reasoning_text.delta':
     case 'response.reasoning_summary_text.delta':
       return { ...a, status: 'streaming', reasoning: a.reasoning + str(d.delta) };

@@ -22,6 +22,10 @@ type CompatConfig {
     // a managed seat's: the key its own server answers to (run.hl), drawn
     // by the node and held in its memory; "" for none
     engine_key: String = "";
+    // a managed seat's: its server is voice's own, one of the pinned
+    // engines, whose chat templates take an assistant turn's thinking back
+    // (`reasoning_content`), as a hosted upstream's may not
+    managed: Bool = false;
     // micros per million tokens, as a catalog model's price; 0 for local
     input_per_mtok_micros: Int = 0;
     output_per_mtok_micros: Int = 0;
@@ -72,6 +76,7 @@ fn compat_config(config: String) -> CompatConfig {
 fn managed_compat(endpoint: String, model: String, key: String) -> CompatConfig {
     let mut c = compat_config("{\"base_url\": " + q(endpoint) + ", \"model\": " + q(model) + "}");
     c.engine_key = key;
+    c.managed = true;
     return c;
 }
 
@@ -149,16 +154,53 @@ fn add_message(messages: String, m: String) -> String {
     return messages + (if len(messages) > 0 { "," } else { "" }) + m;
 }
 
-/// An assistant's turn of tool calls, as one message.
-fn calls_message(calls: String) -> String {
-    return "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[" + calls + "]}";
+/// The text of a `reasoning` input item: its `content` parts' texts
+/// joined (the model's own thinking, as a reasoning item of voice's carries
+/// it back); a summary is not the thinking, and is left out.
+@unbounded
+fn thought_text(item: String) -> String {
+    let mut out = "";
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(item, "content")));
+    while !it.done {
+        let part = std::json::string_field(it.element, "text");
+        if part.kind == "string" { out = out + part.text; }
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// One assistant turn as one chat message: what it said (`said`, `null`
+/// when it only called tools), its thinking as `reasoning_content` when
+/// `thinking` (a managed seat's server, whose template renders it back
+/// where the model wrote it), and its tool calls; "" when the turn holds
+/// nothing the message can carry.
+fn assistant_turn(
+    thought: String,
+    said: String,
+    spoke: Bool,
+    calls: String,
+    thinking: Bool
+) -> String {
+    let thought_kept = thinking && len(thought) > 0;
+    if !spoke && len(calls) == 0 && !thought_kept { return ""; }
+    return "{\"role\":\"assistant\",\"content\":"
+        + (if spoke || len(calls) == 0 { q(said) } else { "null" })
+        + (if thought_kept { ",\"reasoning_content\":" + q(thought) } else { "" })
+        + (if len(calls) > 0 { ",\"tool_calls\":[" + calls + "]" } else { "" }) + "}";
 }
 
 /// The chat-completions request for a standard request body: its
 /// `instructions` as a system message, its `input` (a text, or items with a
 /// role and content, calls and their outputs) as the rest, its tools, and
-/// the output cap. A run of `function_call` items is one assistant message
-/// with `tool_calls`; a `function_call_output` is a `tool` message.
+/// the output cap. An assistant's turn is one message, as a chat template
+/// renders one turn: its `reasoning` item, its message and the
+/// `function_call`s after it together, the message's text as `content`,
+/// the calls as `tool_calls`. Sent apart, a template that closes each
+/// assistant message's thinking (DeepSeek-V4's, Qwen3's) renders the turn
+/// as two, each with its own close of the thinking block and an end of
+/// turn between them, and the model learns from its own history to write
+/// a second close after its words. A `function_call_output` is a `tool`
+/// message.
 @unbounded
 fn compat_request(body: String, c: CompatConfig) -> String {
     let mut messages = "";
@@ -170,23 +212,54 @@ fn compat_request(body: String, c: CompatConfig) -> String {
     if input.kind == "string" {
         messages = add_message(messages, chat_message("user", input.text));
     } else {
+        // the assistant's turn being gathered: its thinking, its words
+        // (whether it said any), its calls
+        let mut thought = "";
+        let mut said = "";
+        let mut spoke = false;
         let mut calls = "";
         let mut it = std::json::array_first(
             std::str::trim(std::json::find_field_raw(body, "input")),
         );
         while !it.done {
             let kind = std::json::find_string_field(it.element, "type");
-            if kind == "function_call" {
+            let role = std::json::string_field(it.element, "role");
+            let assistant = role.kind == "string" && role.text == "assistant"
+                && (kind == "message" || len(kind) == 0);
+            // a turn's thinking or words after its calls begin the next turn
+            if (kind == "reasoning" || assistant) && len(calls) > 0
+                || kind == "reasoning" && spoke
+            {
+                let turn = assistant_turn(thought, said, spoke, calls, c.managed);
+                if len(turn) > 0 { messages = add_message(messages, turn); }
+                thought = "";
+                said = "";
+                spoke = false;
+                calls = "";
+            }
+            if kind == "reasoning" {
+                thought = thought + thought_text(it.element);
+            } else if assistant {
+                let text = content_text(std::json::find_field_raw(it.element, "content"));
+                said = if spoke && len(said) > 0 && len(text) > 0 {
+                    said + "\n\n" + text
+                } else {
+                    said + text
+                };
+                spoke = true;
+            } else if kind == "function_call" {
                 calls = calls + (if len(calls) > 0 { "," } else { "" }) + "{\"id\":"
                     + q(std::json::find_string_field(it.element, "call_id"))
                     + ",\"type\":\"function\",\"function\":{\"name\":"
                     + q(std::json::find_string_field(it.element, "name")) + ",\"arguments\":"
                     + q(std::json::find_string_field(it.element, "arguments")) + "}}";
             } else {
-                if len(calls) > 0 {
-                    messages = add_message(messages, calls_message(calls));
-                    calls = "";
-                }
+                let turn = assistant_turn(thought, said, spoke, calls, c.managed);
+                if len(turn) > 0 { messages = add_message(messages, turn); }
+                thought = "";
+                said = "";
+                spoke = false;
+                calls = "";
                 if kind == "function_call_output" {
                     let out = std::json::string_field(it.element, "output");
                     let text = if out.kind == "string" {
@@ -200,17 +273,15 @@ fn compat_request(body: String, c: CompatConfig) -> String {
                             + q(std::json::find_string_field(it.element, "call_id"))
                             + ",\"content\":" + q(text) + "}",
                     );
-                } else {
-                    let role = std::json::string_field(it.element, "role");
+                } else if role.kind == "string" {
                     let text = content_text(std::json::find_field_raw(it.element, "content"));
-                    if role.kind == "string" {
-                        messages = add_message(messages, chat_message(role.text, text));
-                    }
+                    messages = add_message(messages, chat_message(role.text, text));
                 }
             }
             it = std::json::array_next(it);
         }
-        if len(calls) > 0 { messages = add_message(messages, calls_message(calls)); }
+        let turn = assistant_turn(thought, said, spoke, calls, c.managed);
+        if len(turn) > 0 { messages = add_message(messages, turn); }
     }
     let mut out = "{\"model\":" + q(c.model) + ",\"messages\":[" + messages
         + "],\"stream\":true,\"stream_options\":{\"include_usage\":true}";
@@ -586,6 +657,14 @@ locus Upstream {
         ran: String = "";
         input: Int = -1;
         output: Int = -1;
+        // of the input, the tokens the engine's prompt cache held, as its
+        // usage says (`prompt_tokens_details.cached_tokens`: vLLM's,
+        // TensorFold's, llama-server's) or, apart, llama-server's
+        // `timings.cache_n`; of the output, its thinking
+        // (`completion_tokens_details.reasoning_tokens`); -1 while unsaid
+        cached: Int = -1;
+        cache_n: Int = -1;
+        reasoning: Int = -1;
         began: Bool = false;
         // the message item (text) is open, and is closed, and its place
         text_open: Bool = false;
@@ -659,6 +738,18 @@ locus Upstream {
         if std::str::starts_with(usage, "{") {
             self.input = std::json::find_int_field(usage, "prompt_tokens");
             self.output = std::json::find_int_field(usage, "completion_tokens");
+            let prompt = std::json::find_field_raw(usage, "prompt_tokens_details");
+            if std::json::string_field(prompt, "cached_tokens").kind == "number" {
+                self.cached = std::json::find_int_field(prompt, "cached_tokens");
+            }
+            let completion = std::json::find_field_raw(usage, "completion_tokens_details");
+            if std::json::string_field(completion, "reasoning_tokens").kind == "number" {
+                self.reasoning = std::json::find_int_field(completion, "reasoning_tokens");
+            }
+        }
+        let timings = std::json::find_field_raw(data, "timings");
+        if std::json::string_field(timings, "cache_n").kind == "number" {
+            self.cache_n = std::json::find_int_field(timings, "cache_n");
         }
         let choice = std::json::array_first(
             std::str::trim(std::json::find_field_raw(data, "choices")),
@@ -948,6 +1039,32 @@ locus Upstream {
         return out;
     }
 
+    /// Of `input` tokens, those the engine's prompt cache held: as its
+    /// usage says, else as llama-server's timings say, else none.
+    fn cached_of(input: Int) -> Int {
+        let held = if self.cached >= 0 {
+            self.cached
+        } else if self.cache_n >= 0 {
+            self.cache_n
+        } else {
+            0
+        };
+        return if held > input { input } else { held };
+    }
+
+    /// Of `output` tokens, the model's thinking: as the engine counts it,
+    /// else its share of the output by the length of what it thought
+    /// beside what it answered and called.
+    fn reasoning_of(output: Int) -> Int {
+        if self.reasoning >= 0 {
+            return if self.reasoning > output { output } else { self.reasoning };
+        }
+        let thought = len(self.thought);
+        if thought == 0 { return 0; }
+        let all = thought + len(self.text) + self.args_len;
+        return output * thought / all;
+    }
+
     /// End the run: close the connection and say how it went, with the
     /// events that close the stream as the script.
     fn finish() -> StaticRun {
@@ -963,6 +1080,8 @@ locus Upstream {
         } else {
             self.output
         };
+        let cached = self.cached_of(input);
+        let reasoning = self.reasoning_of(output);
         let tail = self.close_thought() + self.close_text(state) + self.close_call();
         let end = line(
             "{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" })
@@ -974,7 +1093,7 @@ locus Upstream {
                     self.model,
                     self.req,
                     self.done_items,
-                    usage_object(input, output),
+                    usage_details(input, cached, output, reasoning),
                 )
                 + ",\"sequence_number\":" + to_string(self.seq) + "}",
         );

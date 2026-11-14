@@ -58,6 +58,11 @@ type InferenceRequest {
     // a string, "" when none; read once, when the request is read, so no
     // later step scans the body for it again
     conversation: String = "";
+    // when it names no conversation, the one voice derives from the turn
+    // itself (`derived_conversation`), which keeps the conversation on one
+    // seat as a named one is kept (`affinity_of`); never its
+    // `conversation`, nor recorded as one; "" when it names one
+    derived: String = "";
     // the caller's connection, watched while the request waits for a slot
     // (`caller_gone`); -1 for none, as in process
     conn_fd: Int = -1;
@@ -128,6 +133,10 @@ type Served {
     text: String = "";
     input_tokens: Int = 0;
     output_tokens: Int = 0;
+    // of the input, what the seat's prompt cache held; of the output, the
+    // model's thinking: as its usage says
+    cached_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
     response: String = "{}";
     voice: VoiceExtension = VoiceExtension { };
     // the rate-limit headers its answer carries (admission.hl), "" for none
@@ -809,7 +818,7 @@ locus Inference {
         let mut c = candidates;
         if len(r.conversation) == 0 {
             r.conversation = request_id;
-            if count(c.items) > 1 { c = first_for(c, request_id); }
+            if count(c.items) > 1 && len(r.derived) == 0 { c = first_for(c, request_id); }
         }
         let mut h = Hosted { request_id: request_id };
         let mut offered = true;
@@ -880,7 +889,7 @@ locus Inference {
         let mut c = candidates;
         if len(r.conversation) == 0 {
             r.conversation = request_id;
-            if count(c.items) > 1 { c = first_for(c, request_id); }
+            if count(c.items) > 1 && len(r.derived) == 0 { c = first_for(c, request_id); }
         }
         let mut st = begun;
         st.hosted = true;
@@ -1437,8 +1446,9 @@ locus Inference {
             }
         }
         // a conversation goes to the same seat each turn, so its cache there
-        // holds what it said: the seat its key hashes to is offered first
-        let key = r.conversation;
+        // holds what it said: the seat its key hashes to is offered first,
+        // the key it names or, naming none, the one derived from its turn
+        let key = affinity_of(r);
         if len(key) > 0 && count(out.items) > 1 {
             out = first_for(out, key);
         }
@@ -1871,6 +1881,14 @@ fn served(
         text: output_text(o.response),
         input_tokens: input,
         output_tokens: output,
+        cached_tokens: std::json::find_int_field(
+            std::json::find_field_raw(usage, "input_tokens_details"),
+            "cached_tokens",
+        ),
+        reasoning_tokens: std::json::find_int_field(
+            std::json::find_field_raw(usage, "output_tokens_details"),
+            "reasoning_tokens",
+        ),
         response: o.response,
         voice: voice
     };
@@ -2269,6 +2287,17 @@ fn chat_message(msg: String, out: st::JsonList) -> Bool fallible(ApiError) {
         fail invalid("only an assistant's message has `tool_calls`", "messages");
     }
     let has_calls = role == "assistant" && calls == "array";
+    // an assistant's thinking, as the chat wire's servers answer it and a
+    // caller sends it back: the turn's reasoning item, before its words
+    if role == "assistant" && kind_of(msg, "reasoning_content") == "string" {
+        let thought = std::json::find_string_field(msg, "reasoning_content");
+        if len(thought) > 0 {
+            out.add(
+                "{\"type\": \"reasoning\", \"summary\": [], \"content\": [{\"type\": \"reasoning_text\", \"text\": "
+                    + jq(thought) + "}]}",
+            );
+        }
+    }
     if ckind == "array" {
         out.add(
             "{\"type\": \"message\", \"role\": " + jq(role) + ", \"content\": "
@@ -2474,6 +2503,7 @@ fn read_inference(raw: String, endpoint: String) -> InferenceRequest fallible(Ap
         deadline: if has_voice { nullable_string(voice, "deadline") or raise } else { "" },
         body: standard,
         conversation: conversation_in(body),
+        derived: if len(conversation_in(body)) > 0 { "" } else { derived_conversation(standard) },
         web_fetch: endpoint == "responses" && asks_web_fetch(body),
     };
 }

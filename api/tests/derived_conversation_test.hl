@@ -1,0 +1,141 @@
+// A request that names no `prompt_cache_key` keeps its seat by a key voice
+// derives from its turn: an agent resends the whole conversation each turn,
+// its opening the same, so each turn derives the same key and finds the
+// seat whose prompt cache holds it, as a named key does; another
+// conversation derives another. The derived key is never the caller's
+// conversation. What the seat's engine said of its prompt cache and of the
+// model's thinking reaches the usage record.
+import ".." as api;
+import "../../store" as st;
+
+fn seat(id: String) -> api::Candidate {
+    return api::Candidate { seat: st::SeatRow { id: id, ref: "n/" + id } };
+}
+
+fn first_id(c: api::Candidates) -> String {
+    for x in c.items { return x.seat.id; }
+    return "";
+}
+
+fn read(body: String) -> api::InferenceRequest {
+    return api::read_inference(body, "responses") or api::InferenceRequest { };
+}
+
+const OPENING: String = "{\"type\": \"message\", \"role\": \"developer\", \"content\": [{\"type\": \"input_text\", \"text\": \"You are a coding agent.\"}]}, {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"# AGENTS.md\"}]}";
+
+fn turn_one(task: String) -> String {
+    return "{\"model\": \"coder\", \"input\": [" + OPENING
+        + ", {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": "
+        + "\"" + task + "\"}]}]}";
+}
+
+fn turn_two(task: String) -> String {
+    return "{\"model\": \"coder\", \"input\": [" + OPENING
+        + ", {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": "
+        + "\"" + task
+        + "\"}]}, {\"type\": \"reasoning\", \"summary\": [], \"content\": [{\"type\": \"reasoning_text\", \"text\": \"Look first.\"}]}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"Looking.\"}]}, {\"type\": \"function_call\", \"call_id\": \"c1\", \"name\": \"exec\", \"arguments\": \"{}\"}, {\"type\": \"function_call_output\", \"call_id\": \"c1\", \"output\": \"ok\"}, {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"go on\"}]}]}";
+}
+
+fn main() {
+    let one = read(turn_one("build the client"));
+    let two = read(turn_two("build the client"));
+    std::test::assert(
+        std::str::starts_with(one.derived, "derived:"),
+        "a key is derived: " + one.derived,
+    );
+    std::test::assert_eq_int(len(one.derived), 40, "derived: and 32 hex digits");
+    std::test::assert_eq_str(two.derived, one.derived, "the next turn derives the same key");
+    let other = read(turn_one("write the docs"));
+    std::test::assert(other.derived != one.derived, "another conversation derives another");
+    std::test::assert_eq_str(
+        one.conversation,
+        "",
+        "the derived key is not the caller's conversation",
+    );
+    std::test::assert_eq_str(api::affinity_of(one), one.derived, "and keeps the seat");
+    std::test::assert_eq_str(
+        api::conversation_of(one),
+        "",
+        "the usage record names no conversation",
+    );
+
+    // instructions are part of the opening; a text input is the whole of it
+    let told = read("{\"model\": \"m\", \"instructions\": \"be brief\", \"input\": \"hi\"}");
+    let untold = read("{\"model\": \"m\", \"input\": \"hi\"}");
+    std::test::assert(
+        len(told.derived) == 40 && told.derived != untold.derived,
+        "instructions tell conversations apart",
+    );
+
+    // a key named is the key kept: nothing derived
+    let named = read(
+        "{\"model\": \"coder\", \"prompt_cache_key\": \"conv-7\", \"input\": \"hi\"}",
+    );
+    std::test::assert_eq_str(named.derived, "", "nothing is derived when a key is named");
+    std::test::assert_eq_str(api::affinity_of(named), "conv-7", "the named key keeps the seat");
+
+    // Chat Completions: its turns derive one key too
+    let chat_one = api::read_inference(
+        "{\"model\": \"coder\", \"messages\": [{\"role\": \"system\", \"content\": \"agent\"}, {\"role\": \"user\", \"content\": \"fix it\"}]}",
+        "chat",
+    ) or api::InferenceRequest { };
+    let chat_two = api::read_inference(
+        "{\"model\": \"coder\", \"messages\": [{\"role\": \"system\", \"content\": \"agent\"}, {\"role\": \"user\", \"content\": \"fix it\"}, {\"role\": \"assistant\", \"content\": \"done\"}, {\"role\": \"user\", \"content\": \"thanks\"}]}",
+        "chat",
+    ) or api::InferenceRequest { };
+    std::test::assert(
+        len(chat_one.derived) == 40 && chat_two.derived == chat_one.derived,
+        "a chat's turns derive one key: " + chat_one.derived + " " + chat_two.derived,
+    );
+
+    // routing: the derived key finds the same seat each turn
+    let mut c = api::Candidates { serving: 3 };
+    push(c.items, seat("a")) or discard;
+    push(c.items, seat("b")) or discard;
+    push(c.items, seat("c")) or discard;
+    std::test::assert_eq_str(
+        first_id(api::first_for(c, api::affinity_of(two))),
+        first_id(api::first_for(c, api::affinity_of(one))),
+        "both turns are offered the same seat first",
+    );
+    let mut spread = "";
+    let mut i = 0;
+    while i < 24 {
+        let r = read(turn_one("task " + to_string(i)));
+        let pick = first_id(api::first_for(c, api::affinity_of(r)));
+        if !std::str::contains(spread, pick) { spread = spread + pick; }
+        i = i + 1;
+    }
+    std::test::assert_eq_int(len(spread), 3, "conversations spread across the seats: " + spread);
+
+    // what the seat's engine said of its cache and the thinking is kept
+    let served = api::served(
+        "resp_1",
+        "coder",
+        st::KeyRow { },
+        st::ModelRow { },
+        seat("a"),
+        api::ServeOutcome {
+            ack: "accepted",
+            outcome: "served",
+            response: "{\"id\": \"resp_1\", \"output\": [], \"usage\": {\"input_tokens\": 173865, \"input_tokens_details\": {\"cached_tokens\": 169984}, \"output_tokens\": 900, \"output_tokens_details\": {\"reasoning_tokens\": 700}, \"total_tokens\": 174765}}",
+        },
+        api::Attempts { }.items,
+        10,
+        0,
+    );
+    std::test::assert_eq_int(served.cached_tokens, 169984, "the cached input is read");
+    std::test::assert_eq_int(served.reasoning_tokens, 700, "and the thinking");
+    let row = api::served_usage(one, served);
+    std::test::assert(
+        std::str::contains(
+            row.record,
+            "\"input_tokens\": 173865, \"cached_input_tokens\": 169984, \"cache_write_input_tokens\": 0, \"output_tokens\": 900, \"reasoning_tokens\": 700",
+        ),
+        "the usage record keeps both: " + row.record,
+    );
+    std::test::assert(
+        row.cached_input_tokens == 169984 && row.reasoning_tokens == 700,
+        "and its row",
+    );
+}

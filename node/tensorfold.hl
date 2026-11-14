@@ -51,10 +51,45 @@ const TF_PARALLEL: Int = concurrency::TENSORFOLD_PARALLEL;
 const TF_ENGINE_ENV: String = "TF_DS_GRAPHS=1\nTF_DS_HC_SIDE=1\nTF_DS_L2_PREFETCH=1\nTF_DS_ENGRAM_AIO=1\nTF_DS_REPLAY_FLOOR=1\nTF_DS_IDX_SPLIT=8192\nTENSORFOLD_PLAIN_SPECIALS=1\nTENSORFOLD_GRAMMAR_LIB=/engine/lib/libtfgrammar.so\nTENSORFOLD_SSE_KEEPALIVE=15\nTENSORFOLD_STATS_EVERY=60\nTF_DS_PROMPT_ALIAS=1\nTF_DS_ROUND_MS=30.0,35.2,39.9,44.9,48.6,52.1,55.6,59.1,62.7,66.3,69.6,72.9,75.5,78.2,81.3,84.4,87.5,90.6,93.7,96.8,99.9,103.0,106.1,109.2,112.2,115.3,122.0,123.9,125.5,127.2,130.5,134.6,138.8,142.9,145.9,148.2,150.6,152.9,155.3,157.6,160.0,162.3,164.7,167.0,169.4,171.7,174.1,176.4,179.0,181.6,184.2,186.9,189.5,192.1,194.7,197.3,199.9,202.5,205.1,207.8,210.4,213.0,215.6,218.2\n";
 
 /// Rank 0's server flags beside its shape, as the recipe serves them: the
-/// model thinks unless a request says not to, a reply is at most 32,768
-/// tokens unless it asks for fewer, sampled at the recipe's defaults (top_k
-/// 20, top_p 0.95, temperature 1.0), and kept prompt states may take 2 GiB.
-const TF_SERVER_FLAGS: String = "--thinking\n--max-tokens\n32768\n--temperature\n1.0\n--top-p\n0.95\n--top-k\n20\n--prompt-cache-gib\n2\n";
+/// model thinks unless a request says not to (its server splits the
+/// thinking from the answer, `reasoning_content`, and counts it), a reply
+/// is at most 32,768 tokens unless it asks for fewer, sampled at the
+/// recipe's defaults (top_k 20, top_p 0.95, temperature 1.0), and kept
+/// prompt states may take `TF_PROMPT_CACHE_GIB`.
+const TF_SERVER_FLAGS: String = "--thinking\n--max-tokens\n32768\n--temperature\n1.0\n--top-p\n0.95\n--top-k\n20\n";
+
+/// What rank 0's kept prompt states may take (`--prompt-cache-gib`), in
+/// GiB. A dsv41 state is a stream's own part where a prompt pass stands at
+/// a chunk end, the same size whatever the prompt's length: its sliding
+/// window's rings and the compressing layers' raw rows. The compressed KV
+/// rows the state resumes from stay in the window (`TF_WINDOW`), which it
+/// only points into, so a conversation of 174k tokens keeps a state no
+/// larger than one of 4k. A pass keeps a few: where the history ends, the
+/// prefix it shares with the prompt before it, a shared block. So the
+/// budget is sized to hold `TF_STATES_PER_CONVERSATION` for each of the
+/// seat's streams (`TF_PARALLEL`), of `TF_STATE_BYTES` each
+/// (`prompt_cache_fits`).
+const TF_PROMPT_CACHE_GIB: Int = 2;
+
+/// One kept state, as the served pair measured it: 318 MiB for 50 states.
+const TF_STATE_BYTES: Int = 6710886;
+
+/// The states a conversation keeps at once: its newest history mark, the
+/// prefix it shares with its turn before, and the ones a newer turn has not
+/// yet superseded.
+const TF_STATES_PER_CONVERSATION: Int = 4;
+
+/// Whether `TF_PROMPT_CACHE_GIB` holds every stream's conversation's
+/// states at once.
+fn prompt_cache_fits() -> Bool {
+    return TF_PARALLEL * TF_STATES_PER_CONVERSATION * TF_STATE_BYTES
+        <= TF_PROMPT_CACHE_GIB * 1073741824;
+}
+
+/// Rank 0's server flags, its prompt cache's budget with them.
+fn server_flags() -> String {
+    return TF_SERVER_FLAGS + "--prompt-cache-gib\n" + to_string(TF_PROMPT_CACHE_GIB) + "\n";
+}
 
 /// How long rank 1 waits for rank 0's rendezvous: a day, longer than any
 /// node takes to ready its inputs; its seat leaving the assignment stops it.
@@ -391,7 +426,7 @@ fn rank_launch(cluster: String, hcas: String, name: String, port: Int, context: 
         command: "/engine/bin/tensorfold-native\nserve\n/model\n--host\n127.0.0.1\n--port\n"
             + to_string(port) + "\n--name\n" + name + "\n--context\n" + to_string(context)
             + "\n--parallel\n"
-            + to_string(TF_PARALLEL) + "\n" + TF_SERVER_FLAGS + "--backend\ncuda",
+            + to_string(TF_PARALLEL) + "\n" + server_flags() + "--backend\ncuda",
     };
 }
 

@@ -399,7 +399,7 @@ Schema: [ChatCompletionRequest](#schema-chatcompletionrequest)
 | `stop` | string \| array of string |  |  |  |
 | `seed` | integer |  |  |  |
 | `n` | `1` |  |  |  |
-| `prompt_cache_key` | string |  | One value per conversation, the same on each of its turns (as on `/v1/responses`). Voice sends a conversation to the same seat each turn when several serve its model, so the seat's prompt cache holds what it said and a turn reads only what it added. A routing key, never a secret or user data; leave it out for one-shot calls. |  |
+| `prompt_cache_key` | string |  | One value per conversation, the same on each of its turns (as on `/v1/responses`). Voice sends a conversation to the same seat each turn when several serve its model, so the seat's prompt cache holds what it said and a turn reads only what it added. A routing key, never a secret or user data; leave it out for one-shot calls. A request that names none is routed by a key voice derives from its opening messages (its system, developer and user messages before the first answer), the same on each turn of a conversation that resends them; that key is never recorded as its `conversation`. |  |
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
@@ -4647,7 +4647,7 @@ Type: object
 | `role` | string, one of `system`, `developer`, `user`, `assistant`, `tool` | yes |  |  |
 | `content` | string \| null \| array of object |  | Text, or an array of content parts. |  |
 | `name` | string |  |  |  |
-| `reasoning_content` | string |  | An answer's: the model's thinking before it, when it thought (llama-server's and vLLM's `reasoning_content`; on `/v1/responses` a `reasoning` output item). A stream carries it as `delta.reasoning_content`. An answer whose output cap ran out while it thought has its thinking and finish reason `length`. |  |
+| `reasoning_content` | string |  | An answer's: the model's thinking before it, when it thought (llama-server's and vLLM's `reasoning_content`; on `/v1/responses` a `reasoning` output item). A stream carries it as `delta.reasoning_content`. An answer whose output cap ran out while it thought has its thinking and finish reason `length`. Sent back on an assistant's message, it is that turn's thinking, which a managed seat's server is given back with the turn. |  |
 | `tool_calls` | array of object |  |  |  |
 | `tool_call_id` | string |  |  |  |
 
@@ -4672,7 +4672,7 @@ Type: object
 | `stop` | string \| array of string |  |  |  |
 | `seed` | integer |  |  |  |
 | `n` | `1` |  |  |  |
-| `prompt_cache_key` | string |  | One value per conversation, the same on each of its turns (as on `/v1/responses`). Voice sends a conversation to the same seat each turn when several serve its model, so the seat's prompt cache holds what it said and a turn reads only what it added. A routing key, never a secret or user data; leave it out for one-shot calls. |  |
+| `prompt_cache_key` | string |  | One value per conversation, the same on each of its turns (as on `/v1/responses`). Voice sends a conversation to the same seat each turn when several serve its model, so the seat's prompt cache holds what it said and a turn reads only what it added. A routing key, never a secret or user data; leave it out for one-shot calls. A request that names none is routed by a key voice derives from its opening messages (its system, developer and user messages before the first answer), the same on each turn of a conversation that resends them; that key is never recorded as its `conversation`. |  |
 | `stream` | boolean |  |  | default `false` |
 | `stream_options` | object |  |  |  |
 | `stream_options.include_usage` | boolean |  |  |  |
@@ -5392,7 +5392,7 @@ Type: object
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
 | `input_tokens` | integer | yes |  |  |
-| `cached_input_tokens` | integer |  |  |  |
+| `cached_input_tokens` | integer |  | Input tokens the seat's prompt cache held, as its engine reported them; counted in `input_tokens`. |  |
 | `cache_write_input_tokens` | integer |  | Input tokens written to the provider's cache, as the engine reported them; counted in `input_tokens`. |  |
 | `output_tokens` | integer | yes |  |  |
 | `reasoning_tokens` | integer |  |  |  |
@@ -5401,7 +5401,7 @@ Type: object
 | `timing` | [Timing](#schema-timing) | yes |  |  |
 | `attempts` | array of [Attempt](#schema-attempt) |  |  |  |
 | `instance` | string \| null |  | The api instance that admitted the request (`api-<id>`, the id the hub's `InstanceBeat` announces): which of an api's replicas the caller reached. `null` for a record from before instances were kept. |  |
-| `conversation` | string \| null |  | The conversation the request was a turn of: its `prompt_cache_key`, the same on each turn. `null` when the caller sent none. The ledger's turns of one conversation share it. |  |
+| `conversation` | string \| null |  | The conversation the request was a turn of: its `prompt_cache_key`, the same on each turn. `null` when the caller sent none (the key voice derives to route such a request is not recorded). The ledger's turns of one conversation share it. |  |
 | `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 

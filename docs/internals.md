@@ -798,10 +798,13 @@ when it cannot reach the coordinator.
    hashing, so the route table's order and seats coming or going move only
    the conversations that preferred them). The key is the request's
    `prompt_cache_key`; a request that names none is given one derived
-   from its turn, `derived:` and 32 hex digits of the sha256 of its
-   `instructions` and its opening messages (every system, developer and
-   user message before the model's first item or a call's output), which
-   an agent resends unchanged each turn. A derived key only routes: it is
+   from its turn when there is a choice of seat, `derived:` and 32 hex
+   digits of the sha256 of its `instructions` and its opening messages
+   (every system, developer and user message before the model's first item
+   or a call's output, each by its role and its content as written; a text
+   longer than 8 KiB by its length and its first and last 4 KiB, read where
+   it lies in the body, so a 12 MiB body is not copied for it), which an
+   agent resends unchanged each turn. A derived key only routes: it is
    never the request's `conversation`, so no usage record names it. No
    slot within the seat is named: llama-server's `id_slot` would skip its
    own restore of a returning conversation's prefix from its prompt cache,

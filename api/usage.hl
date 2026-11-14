@@ -81,46 +81,77 @@ fn conversation_in(body: String) -> String {
 
 /// The key a request's turns keep their seat by, so the seat's prompt cache
 /// holds what the conversation said: the `prompt_cache_key` it names, else
-/// the one derived from its turn (`derived_conversation`).
+/// the one derived from its turn (`derived_conversation`), which is never
+/// its `conversation` nor recorded as one.
 fn affinity_of(r: InferenceRequest) -> String {
-    return if len(r.conversation) > 0 { r.conversation } else { r.derived };
+    return if len(r.conversation) > 0 { r.conversation } else { derived_conversation(r.body) };
 }
 
+/// The most of each end of one opening text a derived key reads
+/// (`sampled`): a body may be 12 MiB, and the key is not worth a copy of it.
+const DERIVED_SAMPLE: Int = 4096;
+
+/// The most of one input item read whole to find its role and content; a
+/// larger one is read as `sampled` text alone.
+const DERIVED_ITEM_MAX: Int = 1048576;
+
 /// The conversation a standard request body that names none is a turn of,
-/// as voice derives it: `derived:` and 32 hex digits of the sha256 of its
-/// `instructions` and its opening messages, every message of the system,
-/// developer or user before the first item of the model's (its words,
-/// thinking or calls) or a call's output, each by its role and text. An
-/// agent resends the whole conversation each turn, its opening the same,
-/// so each turn derives the same key; another conversation opens with
-/// another task and derives another. "" when the body has neither.
+/// as voice derives it to keep its turns on one seat: `derived:` and 32 hex
+/// digits of the sha256 of its `instructions` and its opening, every
+/// message of the system, developer or user before the first item of the
+/// model's (its words, thinking or calls) or a call's output, each by its
+/// role and its content as written (`sampled`). An agent resends the whole
+/// conversation each turn, its opening the same, so each turn derives the
+/// same key; another conversation opens with another task and derives
+/// another. "" when the body has neither.
 @unbounded
 fn derived_conversation(body: String) -> String {
-    let mut text = "";
-    let instructions = std::json::string_field(body, "instructions");
-    if instructions.kind == "string" && len(instructions.text) > 0 {
-        text = "instructions\n" + instructions.text + "\n";
+    let v = std::str::bytes_view(body);
+    let mut told = "";
+    let mut input_at = -1;
+    let mut input_end = -1;
+    let mut it = std::json::object_first(body);
+    while !it.done {
+        if std::json::obj_key_eq(it, body, "instructions")
+            && std::str::byte_at(v, it.val_start) == 34
+        {
+            told = "instructions\n" + sampled(v, it.val_start, it.val_end) + "\n";
+        } else if std::json::obj_key_eq(it, body, "input") {
+            input_at = it.val_start;
+            input_end = it.val_end;
+        }
+        it = std::json::object_next(it, body);
     }
-    let input = std::json::string_field(body, "input");
-    if input.kind == "string" {
-        text = text + "user\n" + input.text + "\n";
-    } else {
-        let mut it = std::json::array_first(
-            std::str::trim(std::json::find_field_raw(body, "input")),
+    let mut text = told;
+    let opener = if input_at >= 0 { std::str::byte_at(v, input_at) } else { -1 };
+    if opener == 34 {
+        text = text + "user\n" + sampled(v, input_at, input_end) + "\n";
+    } else if opener == 91 {
+        // the list's items read where they lie in the body, none copied
+        // past `DERIVED_ITEM_MAX`
+        let mut item = std::json::array_next_span(
+            std::json::ArrayIterSpan { pos: input_at + 1, cur_start: -1, cur_end: 0, done: false },
+            body,
         );
         let mut opening = true;
-        while !it.done && opening {
-            let kind = std::json::find_string_field(it.element, "type");
-            let role = std::json::find_string_field(it.element, "role");
-            if (kind == "message" || len(kind) == 0)
-                && (role == "system" || role == "developer" || role == "user")
-            {
-                text = text + role + "\n"
-                    + said_text(std::json::find_field_raw(it.element, "content")) + "\n";
+        while !item.done && opening && item.cur_end <= input_end {
+            if item.cur_end - item.cur_start > DERIVED_ITEM_MAX {
+                text = text + "item\n" + sampled(v, item.cur_start, item.cur_end) + "\n";
             } else {
-                opening = false;
+                let one = std::str::slice(v, item.cur_start, item.cur_end);
+                let kind = std::json::find_string_field(one, "type");
+                let role = std::json::find_string_field(one, "role");
+                if (kind == "message" || len(kind) == 0)
+                    && (role == "system" || role == "developer" || role == "user")
+                {
+                    let content = std::json::find_field_raw(one, "content");
+                    let cv = std::str::bytes_view(content);
+                    text = text + role + "\n" + sampled(cv, 0, cv.n) + "\n";
+                } else {
+                    opening = false;
+                }
             }
-            it = std::json::array_next(it);
+            item = std::json::array_next_span(item, body);
         }
     }
     if len(text) == 0 { return ""; }
@@ -128,22 +159,15 @@ fn derived_conversation(body: String) -> String {
     return "derived:" + digest[0..32];
 }
 
-/// A message's content as text: a string as it is, a list of parts as
-/// their texts joined.
-@unbounded
-fn said_text(content: String) -> String {
-    let raw = std::str::trim(content);
-    if !std::str::starts_with(raw, "[") {
-        return std::json::string_field("{\"c\":" + raw + "}", "c").text;
-    }
-    let mut out = "";
-    let mut it = std::json::array_first(raw);
-    while !it.done {
-        let part = std::json::string_field(it.element, "text");
-        if part.kind == "string" { out = out + part.text; }
-        it = std::json::array_next(it);
-    }
-    return out;
+/// The text of `v` in [from, to) as a derived key reads it: whole up to
+/// twice `DERIVED_SAMPLE`, else its length and its first and last
+/// `DERIVED_SAMPLE` bytes, so no long text is copied whole. Two texts that
+/// differ only between those ends read the same: they keep one seat, which
+/// costs a cache, never an answer.
+fn sampled(v: std::str::ByteView, from: Int, to: Int) -> String {
+    if to - from <= 2 * DERIVED_SAMPLE { return std::str::slice(v, from, to); }
+    return to_string(to - from) + "\n" + std::str::slice(v, from, from + DERIVED_SAMPLE)
+        + std::str::slice(v, to - DERIVED_SAMPLE, to);
 }
 
 /// The model a caller asked for: the alias, when it named one (aliases.hl).

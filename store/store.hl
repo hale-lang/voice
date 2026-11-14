@@ -450,7 +450,21 @@ type PeekRow {
 }
 
 /// Recorded requests, newest first: their bodies left out ("") when listed.
-type PeekRows { rows: bounded[PeekRow; 200]; }
+/// From `peeks`, `more` is true when more match past the last, and
+/// `cursor_known` false when the query's cursor names no recording.
+type PeekRows { rows: bounded[PeekRow; 200]; more: Bool = false; cursor_known: Bool = true; }
+
+/// Which recordings `peeks` lists, newest first (and by request id within
+/// a second): of `project`, `key` and `model` (the catalog model each was
+/// routed as) where not "", past the recording `cursor` names where not "",
+/// at most `limit` (1 to 200).
+type PeekQuery {
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    cursor: String = "";
+    limit: Int = 200;
+}
 
 /// A request being served now: on which seat, since when (inference.hl). A
 /// row is written as each attempt is offered and gone once it ends; the
@@ -481,6 +495,11 @@ type FlightRows { rows: bounded[FlightRow; 100]; }
 
 /// The days a recorded request is kept.
 const PEEK_DAYS: Int = 7;
+
+/// A `PeekQuery`'s `limit`, held to 1 to 200.
+fn peek_limit(limit: Int) -> Int {
+    return if limit < 1 { 1 } else if limit > 200 { 200 } else { limit };
+}
 
 /// An `account` row, with its account-scope limits. `provider` "" is `null`.
 type AccountRow {
@@ -1133,10 +1152,9 @@ interface Store {
     /// reported, "" for none.
     /// Record a request whole; those past `PEEK_DAYS` go.
     fn put_peek(row: PeekRow) fallible(StoreError);
-    /// Recorded requests, newest first, at most `limit`: a project's (and a
-    /// key's, when `key` is not ""), all of them when `project` is "". Their
-    /// bodies are left out.
-    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError);
+    /// Recorded requests, a page of those `q` names (`PeekQuery`), their
+    /// bodies left out.
+    fn peeks(q: PeekQuery) -> PeekRows fallible(StoreError);
     /// One recorded request whole; `present` false when there is none.
     fn peek(request_id: String) -> PeekRow fallible(StoreError);
     /// Recorded requests a backfill reads (api/annotate.hl): of `project`
@@ -2606,29 +2624,52 @@ locus MemoryStore {
     }
 
     fn put_peek(row: PeekRow) fallible(StoreError) {
+        // in the list's order, as Postgres reads it: newest first, by
+        // request id within a second; a request recorded twice keeps its first
+        for held in self.peek_rows.rows {
+            if held.request_id == row.request_id { return; }
+        }
         let mut next = PeekRows { };
         let mut r = row;
         r.present = true;
-        push(next.rows, r) or discard;
+        let at = std::time::unix(r.created_at);
+        let mut placed = false;
         for held in self.peek_rows.rows {
-            if count(next.rows) < 200 && held.request_id != row.request_id {
-                push(next.rows, held) or discard;
+            let held_at = std::time::unix(held.created_at);
+            if !placed && (at > held_at || (at == held_at && r.request_id < held.request_id)) {
+                push(next.rows, r) or discard;
+                placed = true;
             }
+            push(next.rows, held) or discard;
         }
+        if !placed { push(next.rows, r) or discard; }
         self.peek_rows = next;
     }
 
-    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+    fn peeks(q: PeekQuery) -> PeekRows fallible(StoreError) {
         let mut out = PeekRows { };
+        let limit = peek_limit(q.limit);
+        let mut started = len(q.cursor) == 0;
         for r in self.peek_rows.rows {
-            if count(out.rows) >= limit { break; }
-            if (len(project) == 0 || r.project == project) && (len(key) == 0 || r.key == key) {
-                let mut listed = r;
-                listed.input = "";
-                listed.output = "";
-                push(out.rows, listed) or discard;
+            if !started {
+                started = r.request_id == q.cursor;
+                continue;
             }
+            if (len(q.project) > 0 && r.project != q.project) || (len(q.key) > 0 && r.key != q.key)
+                || (len(q.model) > 0 && r.model != q.model)
+            {
+                continue;
+            }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
+            let mut listed = r;
+            listed.input = "";
+            listed.output = "";
+            push(out.rows, listed) or discard;
         }
+        if !started { out.cursor_known = false; }
         return out;
     }
 

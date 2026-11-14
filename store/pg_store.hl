@@ -2732,9 +2732,9 @@ locus PgStore {
         ) or raise;
     }
 
-    fn peeks(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+    fn peeks(q: PeekQuery) -> PeekRows fallible(StoreError) {
         self.lock.enter();
-        let out = self.peeks_locked(project, key, limit) or {
+        let out = self.peeks_locked(q) or {
             self.lock.leave();
             fail err;
         };
@@ -2742,13 +2742,27 @@ locus PgStore {
         return out;
     }
 
-    fn peeks_locked(project: String, key: String, limit: Int) -> PeekRows fallible(StoreError) {
+    fn peeks_locked(q: PeekQuery) -> PeekRows fallible(StoreError) {
+        let limit = peek_limit(q.limit);
+        if len(q.cursor) > 0 {
+            let c = db::Args { };
+            c.add(q.cursor);
+            let known = self.row(
+                "SELECT row_to_json(t) FROM (SELECT request_id FROM peek WHERE request_id = $1) t",
+                c,
+            ) or raise;
+            if len(known) == 0 { return PeekRows { cursor_known: false }; }
+        }
         let a = db::Args { };
-        a.add(project);
-        a.add(key);
-        a.add(to_string(if limit > 200 { 200 } else { limit }));
+        a.add(q.project);
+        a.add(q.key);
+        a.add(q.model);
+        a.add(q.cursor);
+        a.add(to_string(limit + 1));
+        // past the cursor's recording in the list's order: newest first,
+        // by request id within a second (peek_by_model, migration 39)
         let all = self.rows(
-            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) ORDER BY created_at DESC, request_id LIMIT $3::int) t",
+            "SELECT row_to_json(t) FROM (SELECT request_id, project, key, model, created_at FROM peek WHERE ($1 = '' OR project = $1) AND ($2 = '' OR key = $2) AND ($3 = '' OR model = $3) AND ($4 = '' OR created_at < (SELECT created_at FROM peek WHERE request_id = $4) OR (created_at = (SELECT created_at FROM peek WHERE request_id = $4) AND request_id > $4)) ORDER BY created_at DESC, request_id LIMIT $5::int) t",
             a,
         ) or raise;
         let mut out = PeekRows { };
@@ -2759,6 +2773,10 @@ locus PgStore {
             let line = std::str::trim(std::str::slice(v, start, nl));
             start = nl + 1;
             if len(line) == 0 { continue; }
+            if count(out.rows) >= limit {
+                out.more = true;
+                return out;
+            }
             push(out.rows, peek_row(line)) or discard;
         }
         return out;

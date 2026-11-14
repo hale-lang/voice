@@ -1,0 +1,61 @@
+// The recordings listed (GET /admin/v1/peeks): a model's, a page at a time,
+// each page's `next_cursor` the next one's `cursor`.
+import ".." as api;
+import "../../store" as st;
+
+/// A failed call, as `class param`; "" when it succeeded.
+fn why(err: api::CtlError) -> String {
+    return api::ctl_class(err) + " " + api::ctl_problem(err).param;
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let base = std::time::unix(std::time::current()) - 3600;
+    let mut i = 0;
+    while i < 45 {
+        store.put_peek(
+            st::PeekRow {
+                request_id: "rec_" + to_string(100 + i),
+                project: "work",
+                key: "k_ci",
+                model: if i % 9 == 0 { "quiet" } else { "busy" },
+                created_at: std::time::time_from_unix(base + i),
+                input: "{}",
+                output: "{}",
+            },
+        ) or discard;
+        i = i + 1;
+    }
+    let peeks = api::Peeks { store: store };
+
+    let first = peeks.list(api::PeekAsk { }) or api::PeekList { };
+    std::test::assert_eq_int(count(first.data), 45, "50 unasked, so all 45 on one page");
+    std::test::assert(!first.has_next_cursor, "the last page has no next_cursor");
+
+    let quiet = peeks.list(api::PeekAsk { model: "quiet" }) or api::PeekList { };
+    std::test::assert_eq_int(count(quiet.data), 5, "a quiet model's, behind the busy one's");
+    for p in quiet.data {
+        std::test::assert_eq_str(p.model, "quiet", "only the model asked for");
+    }
+
+    let page = peeks.list(api::PeekAsk { limit: 40 }) or api::PeekList { };
+    std::test::assert_eq_int(count(page.data), 40, "a page of 40");
+    std::test::assert(page.has_next_cursor, "with more past it");
+    std::test::assert_eq_str(page.next_cursor, "rec_105", "its next_cursor its last recording");
+    let next = peeks.list(api::PeekAsk { limit: 40, cursor: page.next_cursor })
+    or api::PeekList { };
+    std::test::assert_eq_int(count(next.data), 5, "the rest on the next");
+    std::test::assert_eq_str(
+        (at(next.data, 0) or api::PeekSummary { }).request_id,
+        "rec_104",
+        "starting where the last left off",
+    );
+    std::test::assert(!next.has_next_cursor, "and no further");
+
+    let mut problem = "";
+    peeks.list(api::PeekAsk { limit: 201 }) or { problem = why(err); };
+    std::test::assert_eq_str(problem, "invalid limit", "a limit past 200 is refused");
+    problem = "";
+    peeks.list(api::PeekAsk { cursor: "rec_none" }) or { problem = why(err); };
+    std::test::assert_eq_str(problem, "invalid cursor", "a cursor naming no recording is refused");
+}

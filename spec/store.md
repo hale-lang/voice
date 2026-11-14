@@ -1341,3 +1341,13 @@ update attempt set failure_kind = case
 end
 where state = 'failed';
 ```
+
+### Migration 39: a model's recordings, paged
+
+`/admin/v1/peeks` lists a model's recordings (`model`, the catalog model each
+request was routed as) a page at a time, newest first and by request id within
+a second, each page past the last one's final recording.
+
+```sql
+create index peek_by_model on peek (model, created_at desc, request_id);
+```

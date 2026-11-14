@@ -139,6 +139,10 @@ type Served {
     // what its project or key annotating asks (annotate.hl): the data
     // plane annotates it once the caller has its answer
     job: AnnotationJob = AnnotationJob { };
+    // the tool calls whose arguments its node repaired before they reached
+    // the caller (protocol.yaml `Result.tool_arguments_repaired`), as a
+    // JSON list; "" for none
+    repairs: String = "";
 }
 
 /// What a request is served as (`Inference.served_as`): its model, the
@@ -272,12 +276,33 @@ locus Inference {
         let mut n = 0;
         // the seats that failed it, never offered it again
         let mut failed = "\n";
+        // the seat it was offered last that failed it, which its row names
+        // when no seat serves it
+        let mut last = Candidate { };
         let mut w = self.waiting(r, candidates, request_id, started);
         let mut offering = true;
         while offering {
             if w.queued {
                 w = self.await_turn(r, w);
-                if w.state != "turn" { fail waited_out(r, w, why, request_id, attempts.items); }
+                if w.state != "turn" {
+                    let e = waited_out(r, w, why, request_id, attempts.items);
+                    if self.wait / 1ns > 0 || count(attempts.items) > 0 {
+                        self.unfinished(
+                            r,
+                            request_id,
+                            k,
+                            m,
+                            last,
+                            waited_status(w),
+                            started,
+                            attempts.items,
+                            candidates.peek,
+                            e.message,
+                            "",
+                        );
+                    }
+                    fail e;
+                }
             }
             let mut busy = 0;
             for c in candidates.items {
@@ -343,11 +368,7 @@ locus Inference {
                 let reason = failure_of(o);
                 why = c.seat.ref + ": " + reason;
                 failed = failed + c.seat.ref + "\n";
-                // a decision model that refused the questions themselves refuses
-                // them on any seat: the caller is told, as its own mistake
-                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
-                    fail decision_refusal(reason, "response_format");
-                }
+                last = c;
                 push(
                     attempts.items,
                     Attempt {
@@ -358,6 +379,24 @@ locus Inference {
                         wall_ms: ms,
                     },
                 ) or discard;
+                // a decision model that refused the questions themselves refuses
+                // them on any seat: the caller is told, as its own mistake
+                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        "",
+                    );
+                    fail decision_refusal(reason, "response_format");
+                }
                 // a seat whose window the request overflows: another may hold
                 // it, so the next is tried
                 let overflow = context_overflow(reason);
@@ -365,21 +404,19 @@ locus Inference {
                 if o.output
                     || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
                 {
-                    if o.output {
-                        self.unfinished(
-                            r,
-                            request_id,
-                            k,
-                            m,
-                            c,
-                            "failed",
-                            started,
-                            attempts.items,
-                            candidates.peek,
-                            reason,
-                            "",
-                        );
-                    }
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        "",
+                    );
                     fail ApiError {
                         status: 502,
                         kind: "model_error",
@@ -393,6 +430,20 @@ locus Inference {
             // a seat at capacity takes it once a slot frees: it waits for one
             if busy > 0 { w = self.queued(w); } else { offering = false; }
         }
+        // every seat failed it: its row, as a request that ended so
+        self.unfinished(
+            r,
+            request_id,
+            k,
+            m,
+            last,
+            "failed",
+            started,
+            attempts.items,
+            candidates.peek,
+            "every eligible seat failed; the last, " + why,
+            "",
+        );
         if all_overflow && count(attempts.items) > 0 {
             fail too_long(why, attempts_voice(request_id, attempts.items));
         }
@@ -480,6 +531,9 @@ locus Inference {
         let mut n = 0;
         // the seats that failed it, never offered it again
         let mut failed = "\n";
+        // the seat it was offered last that failed it, which its row names
+        // when no seat serves it
+        let mut last = Candidate { };
         let mut w = self.waiting(r, candidates, request_id, started);
         let mut offering = true;
         while offering {
@@ -490,6 +544,21 @@ locus Inference {
                 w = self.await_turn(r, w);
                 if w.state != "turn" {
                     let e = waited_out(r, w, why, request_id, attempts.items);
+                    if self.wait / 1ns > 0 || count(attempts.items) > 0 {
+                        self.unfinished(
+                            r,
+                            request_id,
+                            k,
+                            m,
+                            last,
+                            waited_status(w),
+                            started,
+                            attempts.items,
+                            candidates.peek,
+                            e.message,
+                            "",
+                        );
+                    }
                     if !out.opened { fail e; }
                     if w.state != "gone" {
                         let last = at(
@@ -598,21 +667,19 @@ locus Inference {
                             // the caller went away: the seat is told to stop,
                             // and what it spent on the caller is told
                             offer.finish();
-                            if st.output || o.output {
-                                self.unfinished(
-                                    r,
-                                    request_id,
-                                    k,
-                                    m,
-                                    c,
-                                    "cancelled",
-                                    started,
-                                    attempts.items,
-                                    candidates.peek,
-                                    "the caller went away",
-                                    out.text_so_far(),
-                                );
-                            }
+                            self.unfinished(
+                                r,
+                                request_id,
+                                k,
+                                m,
+                                c,
+                                "cancelled",
+                                started,
+                                attempts.items,
+                                candidates.peek,
+                                "the caller went away",
+                                out.text_so_far(),
+                            );
                             self.landed(request_id);
                             return Streamed { st: st };
                         }
@@ -669,11 +736,7 @@ locus Inference {
                 let reason = failure_of(o);
                 why = c.seat.ref + ": " + reason;
                 failed = failed + c.seat.ref + "\n";
-                // a decision model that refused the questions themselves refuses
-                // them on any seat: the caller is told, as its own mistake
-                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
-                    fail decision_refusal(reason, "response_format");
-                }
+                last = c;
                 push(
                     attempts.items,
                     Attempt {
@@ -684,6 +747,24 @@ locus Inference {
                         wall_ms: ms,
                     },
                 ) or discard;
+                // a decision model that refused the questions themselves refuses
+                // them on any seat: the caller is told, as its own mistake
+                if r.seat_endpoint == "decision" && std::str::contains(reason, "answered 422") {
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        "",
+                    );
+                    fail decision_refusal(reason, "response_format");
+                }
                 // a seat whose window the request overflows: another may hold
                 // it, so the next is tried
                 let overflow = context_overflow(reason);
@@ -692,21 +773,19 @@ locus Inference {
                     || o.output
                     || (o.ack == "accepted" && o.outcome == "failed" && !o.retryable && !overflow)
                 {
-                    if st.output || o.output {
-                        self.unfinished(
-                            r,
-                            request_id,
-                            k,
-                            m,
-                            c,
-                            "failed",
-                            started,
-                            attempts.items,
-                            candidates.peek,
-                            reason,
-                            out.text_so_far(),
-                        );
-                    }
+                    self.unfinished(
+                        r,
+                        request_id,
+                        k,
+                        m,
+                        c,
+                        "failed",
+                        started,
+                        attempts.items,
+                        candidates.peek,
+                        reason,
+                        out.text_so_far(),
+                    );
                     if out.opened {
                         fail_stream(
                             out,
@@ -737,6 +816,20 @@ locus Inference {
             // a seat at capacity takes it once a slot frees: it waits for one
             if busy > 0 { w = self.queued(w); } else { offering = false; }
         }
+        // every seat failed it: its row, as a request that ended so
+        self.unfinished(
+            r,
+            request_id,
+            k,
+            m,
+            last,
+            "failed",
+            started,
+            attempts.items,
+            candidates.peek,
+            "every eligible seat failed; the last, " + why,
+            out.text_so_far(),
+        );
         let overflowed = all_overflow && count(attempts.items) > 0;
         if out.opened {
             let last = at(candidates.items, count(candidates.items) - 1) or Candidate { };
@@ -958,8 +1051,12 @@ locus Inference {
         return out.end();
     }
 
-    /// A request that seat `c` began and did not finish: its row written, its usage told,
-    /// `status` saying how it ended (`cancelled`, `failed`).
+    /// A request admitted and offered that no seat served whole: its row
+    /// written, its usage told, `status` saying how it ended (`cancelled`,
+    /// `failed`, `no_capacity`, `deadline_exceeded`). `c` is the seat that
+    /// began it and was cut off, or the last that failed it, or none (every
+    /// seat refused it for capacity); `why` is the error its caller was
+    /// told.
     fn unfinished(
         r: InferenceRequest,
         request_id: String,
@@ -1259,7 +1356,7 @@ locus Inference {
                     model: r.model,
                     created_at: now_seconds(),
                     input: standard_body(r.body),
-                    output: s.response,
+                    output: with_originals(s.response, s.repairs),
                 },
             ) or {
                 log_error(
@@ -1681,6 +1778,16 @@ type Waiting {
 /// own `voice.deadline`, `504 deadline_exceeded`; past voice's bound, `429
 /// no_capacity` with `Retry-After`, never a seat failure; a caller gone is
 /// answered nothing it reads. `why` is the last seat's refusal.
+/// How a request that waited out its wait for a slot ended, as its row
+/// says: its caller gone, its deadline passed, or no slot freed. An
+/// instance that waits none (the annotator's: its queue backs off and asks
+/// again, the same work) writes no row for a request no seat had an
+/// attempt of: the next ask is that request again.
+fn waited_status(w: Waiting) -> String {
+    if w.state == "gone" { return "cancelled"; }
+    return if w.by_deadline { "deadline_exceeded" } else { "no_capacity" };
+}
+
 fn waited_out(
     r: InferenceRequest,
     w: Waiting,
@@ -1884,7 +1991,8 @@ fn served(
             "reasoning_tokens",
         ),
         response: o.response,
-        voice: voice
+        voice: voice,
+        repairs: o.repairs
     };
 }
 
@@ -1915,6 +2023,18 @@ fn failed_voice(
     };
     v.attempts = attempts;
     return v;
+}
+
+/// A recorded response (peek.hl) with what its node repaired: the
+/// response, and, when a call's arguments were repaired, each such call's id,
+/// name and arguments as the engine wrote them, as its member
+/// `tool_arguments_original`. The caller was answered without it.
+fn with_originals(response: String, repairs: String) -> String {
+    let r = std::str::trim(response);
+    if len(repairs) == 0 || !std::str::ends_with(r, "}") { return response; }
+    let body = std::str::trim(r[0..(len(r) - 1)]);
+    return body + (if std::str::ends_with(body, "{") { "" } else { ", " })
+        + "\"tool_arguments_original\": " + repairs + "}";
 }
 
 /// The text of a response's output messages, joined.

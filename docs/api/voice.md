@@ -290,6 +290,38 @@ away is found by the next write that fails,
 so within about 16 seconds, and its seat is told to stop. A request body is
 sent with `Content-Length`; a chunked one is refused `400`.
 
+**Tool call arguments.** A `function_call`'s `arguments` are one
+JSON object whose every number is a finite double, in well-formed
+UTF-8, or voice repairs them: a number no double holds (`58e595`,
+`-1e400`) and the bare words `NaN`, `Infinity` and `-Infinity` become
+a string of the same text (`"58e595"`), a raw control character in a
+string is escaped, a byte that is not UTF-8 is U+FFFD, and a call
+with no arguments at all has `{}`. Streamed, a number is held back
+until it ends, so each `response.function_call_arguments.delta`
+(and each chat chunk's `arguments`) carries the repaired text, and
+the deltas join into the `arguments` of
+`response.function_call_arguments.done`, `response.output_item.done`,
+the terminal response and an unstreamed answer. Arguments that are
+not one JSON object are not passed on as they are: when nothing of
+the call has been sent (an engine that sends a call whole), the seat
+has failed before output (`engine_failed`, naming the call) and the
+request is retried on another seat; once its deltas have been sent,
+the call ends with `{"_unparsed_arguments": "<the text>"}` when its
+tool takes members its parameters do not name (it is not `strict`
+and its `parameters` do not say `additionalProperties: false`), and
+otherwise the response fails (`response.failed`, `upstream_failed`,
+naming the call). A call the output cap cut off is `incomplete`,
+its arguments as far as they came. Arguments that are valid are
+never changed. The same check repairs every past call in `input`
+before a seat reads it (a `function_call` item's `arguments`; on
+`/v1/chat/completions`, an assistant message's
+`tool_calls[].function.arguments`), each as above, text that is not
+JSON as `{"_unparsed_arguments": ...}`, so one bad call in a
+conversation's history never fails its later turns; valid ones reach
+the seat byte for byte. A repair is recorded: the request's usage
+record says `tool_arguments_repaired`, and a recording (`Peek`)
+keeps what the engine wrote.
+
 **State (MVP).** Voice does not store responses in the MVP. `store` is
 accepted and treated as false; a request with `previous_response_id`
 fails with `previous_response_not_found`. `background` is not supported.
@@ -374,6 +406,12 @@ Routing, retries, limits and the `voice` extension behave exactly as on
 once it has begun ends with a final chunk whose `finish_reason` is
 `error`, carrying an `error` object, `usage: null` and `voice`, then
 `data: [DONE]`: a truncated answer never ends as a complete one.
+Tool call arguments are checked and repaired as on `/v1/responses`
+(*Tool call arguments*), in each chunk as in the whole message; a
+streamed call whose arguments end not JSON and are kept as
+`{"_unparsed_arguments": ...}` has had its deltas sent as they were
+(a chunk takes back nothing), and the next request's history is
+repaired so.
 
 Parameters:
 
@@ -5438,7 +5476,7 @@ Type: object
 | `resolved_model` | string |  | The catalog model the request was routed and served as: `requested_model` itself when the caller named a model, the model it named when it is a name the project gives one, read when the request was admitted. Absent from a record written before it was kept, and from an abandoned one (its instance stopped before it settled). |  |
 | `requested_account` | string \| null |  | The account the request named in `voice.account`, if any. |  |
 | `endpoint` | string, one of `responses`, `chat.completions`, `attempt` | yes | `attempt`: a coding attempt's one record, under the attempt's id, its `conversation` the attempt's id, its `timing.engine_ms` the harness's wall time, and its tokens as the harness's output reported them (`metadata.tokens` is `unreported`, and the counts 0, when it reports none). |  |
-| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
+| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | Every request admitted and offered to a seat has a record, however it ended. `failed`: a seat failed it after output, or every seat it was offered failed it (the `502`), its `attempts` each seat's error, `served` the last seat tried; `no_capacity` and `deadline_exceeded`: it waited for a slot and none freed in time (`429`, `504`); `cancelled`: its caller went away. Such a record's tokens are voice's estimate (`input_tokens_estimated`) and it is charged nothing. A request refused before it was offered (its key, its model, its limits, its body) has none. `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
 | `input_tokens` | integer | yes | The input tokens its engine reported, or, when `input_tokens_estimated`, voice's estimate. |  |
@@ -5455,6 +5493,7 @@ Type: object
 | `internal` | boolean |  | A request of its project's system key (`Key.internal`): voice's own for the project, an annotation or a conversation's title, its `metadata` naming the request it annotated (`annotates`) and its stage (`side`). It counts against the **account** that served it, which paid the provider for it: an account's spend and its provider windows include it, and an account's summary shows it as its own line (`group_by` `internal`). It does not count against the project's usage: left out of usage lists and summaries unless asked for (`include_internal`), out of the project's, its parents', tenants' and habitat's totals and limits, and out of the usage told to the organization. Only limits on the system key itself cap it. |  |
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 | `input_tokens_estimated` | boolean |  | True when its seat reported no usage, the request having been cancelled or having failed first, and `input_tokens` is voice's own estimate from the request's length (its instructions, input and tools, a token per four characters), never an engine's count: it tells a request cut off with a long prompt from one cut off with a short one. Usage summaries count only the tokens engines reported, so an estimate is in none. False (or absent, in a record from before it was kept) when `input_tokens` is the engine's. |  |
+| `tool_arguments_repaired` | boolean |  | True when voice repaired a tool call's arguments its engine wrote before the caller had them (`createResponse`, *Tool call arguments*): a number no double holds, written as a string of its text, say. A recording of the request (`Peek`) keeps what the engine wrote. False (or absent, in a record from before it was kept) otherwise. |  |
 
 <a id="schema-usagerecordsummary"></a>
 
@@ -5495,6 +5534,7 @@ Type: object
 | `annotates` | string |  | For an internal request, the request it annotated (its metadata's `annotates`); left out otherwise. |  |
 | `side` | string |  | For an internal request, its stage, or `title` (its metadata's `side`); left out otherwise. |  |
 | `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. |  |
+| `tool_arguments_repaired` | boolean |  | As `UsageRecord.tool_arguments_repaired`. |  |
 
 <a id="schema-usagesummary"></a>
 
@@ -6252,7 +6292,7 @@ Type: [PeekSummary](#schema-peeksummary) & object
 |---|---|---|---|---|
 | … | all of [PeekSummary](#schema-peeksummary) |  |  |  |
 | `input` | string | yes | The standard request as it was served, a JSON document as text. |  |
-| `output` | string | yes | The final response, reasoning included, a JSON document as text. |  |
+| `output` | string | yes | The final response, reasoning included, a JSON document as text. When voice repaired a tool call's arguments before the caller had them (`UsageRecord.tool_arguments_repaired`), the document has one more member than the response, `tool_arguments_original`: a list of each such call's `call_id`, `name` and `arguments` as the engine wrote them. A request no seat served whole is recorded with its `status`, its `error` (what its caller was told) and its `output` so far. |  |
 
 <a id="schema-annotatorstage"></a>
 

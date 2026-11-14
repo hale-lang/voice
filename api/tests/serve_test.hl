@@ -40,6 +40,9 @@ locus Nodes {
         // when set, every seat answers as an openai-compatible one whose
         // upstream streamed this SSE (a tool call in fragments)
         compat_sse: String = "";
+        // a node whose seat's upstream sends a tool call whole, its
+        // arguments not JSON (`GARBLED_CALL`)
+        garbled: String = "";
         offers: Int = 0;
         last_body: String = "";
         // offers finished before their result came (the link sends cancel):
@@ -109,7 +112,8 @@ locus Nodes {
         let cfg = node::compat_config(
             "{\"base_url\": \"http://upstream.test/v1\", \"model\": \"stub-7b\"}",
         );
-        let run = if len(self.compat_sse) > 0 {
+        let sse = if to == self.garbled { GARBLED_CALL } else { self.compat_sse };
+        let run = if len(sse) > 0 {
             node::compat_play(
                 id,
                 model,
@@ -117,7 +121,7 @@ locus Nodes {
                 std::str::trim(std::json::find_field_raw(body, "body")),
                 cfg,
                 200,
-                self.compat_sse,
+                sse,
             )
         } else {
             node::run_static(
@@ -136,7 +140,11 @@ locus Nodes {
             )
         };
         script = run.script;
-        result = node::result_message(id, run, 0, 0);
+        result = if run.outcome == "failed" {
+            node::failed_result(id, "engine_failed", run.failure, true)
+        } else {
+            node::result_message(id, run, 0, 0)
+        };
         if to == self.dying {
             // its events up to and including its first delta, then nothing
             let cut = std::str::index_of(run.script, "response.output_text.delta");
@@ -572,6 +580,17 @@ fn streamed_with_sse(e: api::DataPlane, key: String, nodes: Nodes) {
     );
     nodes.compat_sse = "";
 }
+
+/// An upstream's call whose arguments hold a number no double holds, cut
+/// across two fragments, as a model wrote it for a lab's coding agent.
+const OVERFLOWING_CALL: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_7\",\"type\":\"function\",\"function\":{\"name\":\"write_stdin\",\"arguments\":\"\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"session_id\\\":58\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"e595,\\\"chars\\\":\\\"\\\"}\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+
+/// An upstream's call sent whole, its arguments not JSON.
+const GARBLED_CALL: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_8\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"city\\\": oops}\"}}]}}]}\n\n"
+    + "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
 
 /// An upstream's stream of one tool call, its arguments in fragments.
 /// The operator token's header (operator.hl): the token `e`'s store keeps,
@@ -1454,6 +1473,159 @@ fn change_backlog() {
 /// An input whose conversation, derived from it (`derived_conversation`),
 /// prefers the laptop's seat to the desktop's: the order the tests of a
 /// seat that refuses or fails rely on.
+/// A request every seat failed, in the ledger: `failed`, its input voice's
+/// estimate, the model it was routed as, and every seat's attempt with its
+/// error, the last one's saying `why`.
+fn failed_row(e: api::DataPlane, id: String, why: String) {
+    let usage = api::Usage { store: e.store };
+    let g = usage.get(api::UsageRef { request_id: id }) or api::UsageRecord { };
+    std::test::assert_eq_str(g.id, id, "a request every seat failed has its row: " + id);
+    std::test::assert_eq_str(g.status, "failed", "failed");
+    std::test::assert_eq_str(g.resolved_model, "echo-1", "routed as its model");
+    std::test::assert(g.input_tokens_estimated && g.input_tokens > 0, "its input estimated");
+    std::test::assert_eq_int(g.output_tokens, 0, "nothing out");
+    std::test::assert_eq_int(g.price_micros, 0, "nothing charged");
+    std::test::assert_eq_int(count(g.attempts), 2, "both seats' attempts");
+    let mut said = 0;
+    for a in g.attempts {
+        std::test::assert(
+            a.outcome == api::AttemptOutcome::failed && len(a.error) > 0,
+            "each failed, with its error",
+        );
+        if std::str::contains(a.error, why) { said = said + 1; }
+    }
+    std::test::assert(said > 0, "the last seat's among them: " + why);
+    std::test::assert(g.timing.wall_ms >= 0, "and its wall time");
+}
+
+/// A call an engine sends whole, its arguments not JSON (TensorFold sends
+/// calls whole): nothing of it reaches the caller, the seat fails before
+/// output, and the request goes to another seat; when every seat sends one,
+/// the request fails, a row in the ledger.
+fn garbled_calls(e: api::DataPlane, key: String, nodes: Nodes) {
+    nodes.refusing = "";
+    nodes.failing = "";
+    nodes.garbled = "laptop";
+    let ask_tools = "{\"model\": \"echo-1\", \"input\": \"" + laptop_first()
+        + "\", \"tools\": [{\"type\": \"function\", \"name\": \"lookup\"}]";
+    let moved = ask(e, "/v1/responses", key, ask_tools + ", \"stream\": true}");
+    expect(moved, 200, "a seat whose call is not JSON is failed over");
+    std::test::assert(
+        std::str::starts_with(moved.body, "event: voice:attempt\ndata: {")
+            && std::str::contains(moved.body, "other than a JSON object")
+            && std::str::contains(moved.body, "\"next_seat\": \"desktop/static\""),
+        "the caller told the switch, and why: " + moved.body,
+    );
+    std::test::assert(
+        !std::str::contains(moved.body, "oops"),
+        "and nothing of the garbled call: " + moved.body,
+    );
+    nodes.garbled = "laptop";
+    nodes.failing = "desktop";
+    let lost = ask(e, "/v1/responses", key, ask_tools + "}");
+    expect(lost, 502, "when no other seat serves it, it fails");
+    let lv = std::json::find_field_raw(std::json::find_field_raw(lost.body, "error"), "voice");
+    let usage = api::Usage { store: e.store };
+    let g = usage.get(
+        api::UsageRef { request_id: std::json::find_string_field(lv, "request_id") },
+    ) or api::UsageRecord { };
+    std::test::assert_eq_str(g.status, "failed", "a row, failed");
+    let first = at(g.attempts, 0) or api::Attempt { outcome: api::AttemptOutcome::served };
+    std::test::assert(
+        std::str::contains(first.error, "engine_failed")
+            && std::str::contains(first.error, "`lookup`"),
+        "its attempt names the call whose arguments were not JSON: " + first.error,
+    );
+    nodes.garbled = "";
+    nodes.failing = "";
+}
+
+/// An engine's call whose arguments a double cannot read (`58e595`): the
+/// caller is given them repaired, in the done events, the response and the
+/// chat message, and the ledger says so; a project that peeks has what the
+/// engine wrote recorded.
+fn repaired_arguments(e: api::DataPlane, key: String, nodes: Nodes) {
+    nodes.compat_sse = OVERFLOWING_CALL;
+    let fixed = "{\\\"session_id\\\":\\\"58e595\\\",\\\"chars\\\":\\\"\\\"}";
+    let streamed = ask(
+        e,
+        "/v1/responses",
+        key,
+        "{\"model\": \"echo-1\", \"input\": \"go\", \"tools\": [{\"type\": \"function\", \"name\": \"write_stdin\"}], \"stream\": true}",
+    );
+    expect(streamed, 200, "a call repaired streams");
+    std::test::assert(
+        std::str::contains(
+            streamed.body,
+            "event: response.function_call_arguments.done\ndata: {\"type\": \"response.function_call_arguments.done\", \"item_id\": \"fc_",
+        )
+            && std::str::contains(
+                streamed.body,
+                "\"output_index\": 0, \"arguments\": \"" + fixed + "\"",
+            ),
+        "its done event repaired: " + streamed.body,
+    );
+    std::test::assert(!std::str::contains(streamed.body, ":58e595"), "the bare number never sent");
+    let done_at = std::str::index_of(streamed.body, "event: response.completed");
+    std::test::assert(
+        done_at > 0
+            && std::str::contains(
+                streamed.body[done_at..len(streamed.body)],
+                "\"arguments\":\"" + fixed + "\"",
+            ),
+        "and the response it completes with",
+    );
+    let sid = request_id_in(streamed.body);
+    let usage = api::Usage { store: e.store };
+    let g = usage.get(api::UsageRef { request_id: sid }) or api::UsageRecord { };
+    std::test::assert(g.tool_arguments_repaired, "the ledger says it was repaired: " + sid);
+    let plain = ask(
+        e,
+        "/v1/chat/completions",
+        key,
+        "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"go\"}], \"tools\": [{\"type\": \"function\", \"function\": {\"name\": \"write_stdin\"}}]}",
+    );
+    let message = std::json::find_field_raw(
+        std::json::array_first(std::json::find_field_raw(plain.body, "choices")).element,
+        "message",
+    );
+    let fn_call = std::json::find_field_raw(
+        std::json::array_first(std::json::find_field_raw(message, "tool_calls")).element,
+        "function",
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(fn_call, "arguments"),
+        "{\"session_id\":\"58e595\",\"chars\":\"\"}",
+        "a chat message carries them repaired",
+    );
+    let pid = std::json::find_string_field(
+        std::json::find_field_raw(plain.body, "voice"),
+        "request_id",
+    );
+    let pg = usage.get(api::UsageRef { request_id: pid }) or api::UsageRecord { };
+    std::test::assert(pg.tool_arguments_repaired, "and its row says so");
+    std::test::assert_eq_str(
+        api::with_originals("{\"id\": \"r\"}", "[{\"call_id\": \"c\"}]"),
+        "{\"id\": \"r\", \"tool_arguments_original\": [{\"call_id\": \"c\"}]}",
+        "a recording keeps what the engine wrote beside the response",
+    );
+    std::test::assert_eq_str(
+        api::with_originals("{\"id\": \"r\"}", ""),
+        "{\"id\": \"r\"}",
+        "and is the response when nothing was repaired",
+    );
+    nodes.compat_sse = "";
+}
+
+/// The request id a stream's terminal event names in its `voice`.
+fn request_id_in(body: String) -> String {
+    let mark = "\"request_id\": \"";
+    let at = std::str::index_of(body, mark);
+    if at < 0 { return ""; }
+    let rest = body[(at + len(mark))..len(body)];
+    return rest[0..std::str::index_of(rest, "\"")];
+}
+
 fn laptop_first() -> String {
     let mut i = 0;
     while i < 1000 {
@@ -1760,6 +1932,7 @@ fn main() {
         before + 6,
         "each of the six requests streamed_with_sse served, streamed or not, is a row",
     );
+    repaired_arguments(e, key, nodes);
     streamed_failures(e, key, nodes, laptop);
     first_output_span(e, key, nodes, laptop);
     quiet_at_work(e, key, nodes, laptop);
@@ -1855,6 +2028,8 @@ fn main() {
         ),
         "each attempt answering on a subject of its own",
     );
+    // and it is in the ledger: failed, with each seat's error
+    failed_row(e, std::json::find_string_field(fv, "request_id"), "the engine exited");
     let failed_stream = ask(
         e,
         "/v1/responses",
@@ -1870,6 +2045,18 @@ fn main() {
         std::str::starts_with(failed_stream.content_type, "application/json"),
         "as JSON, no stream begun",
     );
+    failed_row(
+        e,
+        std::json::find_string_field(
+            std::json::find_field_raw(
+                std::json::find_field_raw(failed_stream.body, "error"),
+                "voice",
+            ),
+            "request_id",
+        ),
+        "the engine exited",
+    );
+    garbled_calls(e, key, nodes);
     nodes.refusing = "";
     nodes.failing = "";
     busy_seats(e, key, nodes);

@@ -1,0 +1,478 @@
+// A tool call's arguments, as an engine wrote them and as voice passes
+// them on. A chat template re-reads every past call's arguments as JSON
+// when it renders a conversation (llama-server parses each with
+// nlohmann::json, which refuses a number past a double's range: `58e595`
+// is `number overflow parsing`), so arguments that are not strict JSON
+// poison every later turn that carries them. Voice checks a call's
+// arguments when the call is whole, and repairs what a repair keeps the
+// model's meaning in:
+//
+// - a number no double holds (`58e595`, `-1e400`, a 400-digit integer),
+//   and the bare words `NaN`, `Infinity` and `-Infinity`, become a JSON
+//   string of the same text (`"58e595"`);
+// - a raw control character inside a string is escaped (`\n`, `\u0001`);
+// - a byte that is not UTF-8 is U+FFFD.
+//
+// Anything else that is not one JSON object is not repaired here: the
+// caller decides (node/compat.hl `close_call`, `history_args`). Arguments
+// that are valid are never changed by a byte, since an engine's prompt
+// cache matches a conversation's history by its text.
+
+/// The most bytes of one scalar (a number, or a bare word) the scanner
+/// holds back while it waits for the scalar's end. A longer number is
+/// passed on as a string of its text as it comes, so the scanner never
+/// holds an engine's run of digits without end; a longer word as it is.
+const ARGS_SCALAR_MAX: Int = 1024;
+
+/// 2^1024 - 2^970 in decimal, its trailing zeros left off: the least value
+/// a double rounds to infinity (the midpoint past the largest double, a
+/// tie going to the even neighbour, infinity). It has 309 digits, so it is
+/// 0.DOUBLE_OVERFLOW x 10^309.
+const DOUBLE_OVERFLOW: String = "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792";
+const DOUBLE_OVERFLOW_EXP: Int = 309;
+
+/// The key a call's arguments are kept under when they are not JSON and
+/// its tool takes members it does not name (`unparsed_args`).
+const UNPARSED_ARGS: String = "_unparsed_arguments";
+
+fn digit_byte(c: Int) -> Bool {
+    return c >= 48 && c <= 57;
+}
+
+/// A byte of a scalar outside a string: a number's (digits, `-`, `+`, `.`,
+/// `e`) or a bare word's (letters).
+fn scalar_byte(c: Int) -> Bool {
+    return digit_byte(c) || c >= 65 && c <= 90 || c >= 97 && c <= 122 || c == 43 || c == 45
+        || c == 46;
+}
+
+/// A byte a scalar starts with: a digit, `-`, or a letter.
+fn scalar_start(c: Int) -> Bool {
+    return digit_byte(c) || c == 45 || c >= 65 && c <= 90 || c >= 97 && c <= 122;
+}
+
+/// Whether `t` is one JSON number, whole (RFC 8259 §6): an optional `-`,
+/// `0` or a digit run led by a nonzero digit, an optional fraction of at
+/// least one digit, an optional exponent of at least one digit.
+fn number_literal(t: String) -> Bool {
+    let v = std::str::bytes_view(t);
+    let mut p = 0;
+    if std::str::byte_at(v, p) == 45 { p = p + 1; }
+    let lead = std::str::byte_at(v, p);
+    if lead == 48 {
+        p = p + 1;
+    } else if lead >= 49 && lead <= 57 {
+        while digit_byte(std::str::byte_at(v, p)) { p = p + 1; }
+    } else {
+        return false;
+    }
+    if std::str::byte_at(v, p) == 46 {
+        p = p + 1;
+        let frac = p;
+        while digit_byte(std::str::byte_at(v, p)) { p = p + 1; }
+        if p == frac { return false; }
+    }
+    let marker = std::str::byte_at(v, p);
+    if marker == 101 || marker == 69 {
+        p = p + 1;
+        let sign = std::str::byte_at(v, p);
+        if sign == 43 || sign == 45 { p = p + 1; }
+        let digits = p;
+        while digit_byte(std::str::byte_at(v, p)) { p = p + 1; }
+        if p == digits { return false; }
+    }
+    return p == v.n;
+}
+
+/// Whether the JSON number `t` (`number_literal`) is a finite double once
+/// read, rounding to nearest as strtod does: below 2^1024 - 2^970. A
+/// number too small for a double reads as zero, which is finite. Decided
+/// on the digits alone, exactly: the value is 0.d1d2... x 10^E, finite
+/// when E < 309, never when E > 309, and at 309 when its digits come
+/// before DOUBLE_OVERFLOW's.
+fn finite_literal(t: String) -> Bool {
+    let v = std::str::bytes_view(t);
+    let mut p = 0;
+    if std::str::byte_at(v, p) == 45 { p = p + 1; }
+    let int_from = p;
+    while digit_byte(std::str::byte_at(v, p)) { p = p + 1; }
+    let int_to = p;
+    let mut frac_from = p;
+    let mut frac_to = p;
+    if std::str::byte_at(v, p) == 46 {
+        p = p + 1;
+        frac_from = p;
+        while digit_byte(std::str::byte_at(v, p)) { p = p + 1; }
+        frac_to = p;
+    }
+    // the exponent, held at a quadrillion either way: past any length a
+    // text has, so a held one decides as the whole one would
+    let mut exp = 0;
+    let marker = std::str::byte_at(v, p);
+    if marker == 101 || marker == 69 {
+        p = p + 1;
+        let mut negative = false;
+        let sign = std::str::byte_at(v, p);
+        if sign == 43 || sign == 45 {
+            negative = sign == 45;
+            p = p + 1;
+        }
+        while digit_byte(std::str::byte_at(v, p)) {
+            if exp < 1000000000000000 { exp = exp * 10 + std::str::byte_at(v, p) - 48; }
+            p = p + 1;
+        }
+        if negative { exp = 0 - exp; }
+    }
+    let digits = std::str::slice(v, int_from, int_to) + std::str::slice(v, frac_from, frac_to);
+    let dv = std::str::bytes_view(digits);
+    let mut lead = 0;
+    while std::str::byte_at(dv, lead) == 48 { lead = lead + 1; }
+    // zero, however written
+    if lead == dv.n { return true; }
+    let e = (int_to - int_from) - lead + exp;
+    if e < DOUBLE_OVERFLOW_EXP { return true; }
+    if e > DOUBLE_OVERFLOW_EXP { return false; }
+    let mut last = dv.n;
+    while last > lead && std::str::byte_at(dv, last - 1) == 48 { last = last - 1; }
+    let ov = std::str::bytes_view(DOUBLE_OVERFLOW);
+    let mut i = 0;
+    while lead + i < last && i < ov.n {
+        let a = std::str::byte_at(dv, lead + i);
+        let b = std::str::byte_at(ov, i);
+        if a != b { return a < b; }
+        i = i + 1;
+    }
+    // equal as far as the shorter goes: less only when it is shorter (a
+    // tie rounds to infinity)
+    return last - lead < ov.n;
+}
+
+/// One scalar as it is passed on: a number no double holds, and `NaN`,
+/// `Infinity` and `-Infinity`, as a string of its text; anything else as it
+/// is (a word that is not JSON stays, for the check to find).
+fn settled_scalar(t: String) -> String {
+    if t == "NaN" || t == "Infinity" || t == "-Infinity" { return "\"" + t + "\""; }
+    if number_literal(t) && !finite_literal(t) { return "\"" + t + "\""; }
+    return t;
+}
+
+/// A raw control character's escape inside a JSON string.
+fn control_escape(c: Int) -> String {
+    if c == 10 { return "\\n"; }
+    if c == 13 { return "\\r"; }
+    if c == 9 { return "\\t"; }
+    let hex = "0123456789abcdef";
+    return "\\u00" + hex[(c / 16)..(c / 16 + 1)] + hex[(c % 16)..(c % 16 + 1)];
+}
+
+/// The width of the UTF-8 sequence at byte `i` of `v`, 1 to 4, or -1 when
+/// it is not well-formed: an overlong form, a surrogate, past U+10FFFF, a
+/// stray continuation byte, or cut short. std::json's rules.
+fn utf8_width(v: std::str::ByteView, i: Int) -> Int {
+    let c = std::str::byte_at(v, i);
+    if c < 0 { return -1; }
+    if c < 128 { return 1; }
+    let width = if c >= 194 && c <= 223 {
+        2
+    } else if c >= 224 && c <= 239 {
+        3
+    } else if c >= 240 && c <= 244 {
+        4
+    } else {
+        0
+    };
+    if width == 0 || i + width > v.n { return -1; }
+    let second = std::str::byte_at(v, i + 1);
+    if c == 224 && second < 160 || c == 237 && second > 159 || c == 240 && second < 144
+        || c == 244 && second > 143
+    {
+        return -1;
+    }
+    let mut k = 1;
+    while k < width {
+        let part = std::str::byte_at(v, i + k);
+        if part < 128 || part > 191 { return -1; }
+        k = k + 1;
+    }
+    return width;
+}
+
+/// `text` with each byte that is not well-formed UTF-8 as U+FFFD; `text`
+/// itself when it is.
+@bounded_by(text)
+fn mended_utf8(text: String) -> String {
+    let v = std::str::bytes_view(text);
+    let mut i = 0;
+    while i < v.n {
+        let w = utf8_width(v, i);
+        if w < 0 { break; }
+        i = i + w;
+    }
+    if i >= v.n { return text; }
+    let mut out = std::str::slice(v, 0, i);
+    let mut run = i;
+    while i < v.n {
+        let w = utf8_width(v, i);
+        if w < 0 {
+            out = out + std::str::slice(v, run, i) + std::json::unescape_string("\\ufffd");
+            i = i + 1;
+            run = i;
+        } else {
+            i = i + w;
+        }
+    }
+    return out + std::str::slice(v, run, v.n);
+}
+
+/// The arguments' repair as their text comes, a piece at a time
+/// (`feed`), then ended (`flush`): every piece is passed on as it is but a
+/// scalar outside a string, held back until it ends (it may end in the next
+/// piece) and then passed on settled (`settled_scalar`), and a raw control
+/// character in a string, escaped. So what is passed on, piece by piece,
+/// joins into the repaired text, and valid text is passed on unchanged.
+locus ArgsScanner {
+    params {
+        in_str: Bool = false;
+        esc: Bool = false;
+        // a scalar is being held: its bytes so far
+        in_scalar: Bool = false;
+        scalar: String = "";
+        // a scalar too long to hold: a number passed on as a string as it
+        // comes (`quoting`), a word as it is (`passing`)
+        quoting: Bool = false;
+        passing: Bool = false;
+    }
+
+    fn reset() {
+        self.in_str = false;
+        self.esc = false;
+        self.in_scalar = false;
+        self.scalar = "";
+        self.quoting = false;
+        self.passing = false;
+    }
+
+    /// The next piece of the arguments' text, as it is passed on.
+    @bounded_by(piece)
+    fn feed(piece: String) -> String {
+        let text = mended_utf8(piece);
+        let v = std::str::bytes_view(text);
+        let mut out = "";
+        let mut from = 0;
+        let mut i = 0;
+        while i < v.n {
+            let c = std::str::byte_at(v, i);
+            if self.in_scalar {
+                if scalar_byte(c) {
+                    i = i + 1;
+                    continue;
+                }
+                out = out + self.end_scalar(std::str::slice(v, from, i));
+                from = i;
+                continue;
+            }
+            if self.in_str {
+                if self.esc {
+                    self.esc = false;
+                } else if c == 92 {
+                    self.esc = true;
+                } else if c == 34 {
+                    self.in_str = false;
+                } else if c < 32 {
+                    out = out + std::str::slice(v, from, i) + control_escape(c);
+                    from = i + 1;
+                }
+                i = i + 1;
+                continue;
+            }
+            if c == 34 {
+                self.in_str = true;
+            } else if scalar_start(c) {
+                out = out + std::str::slice(v, from, i);
+                from = i;
+                self.in_scalar = true;
+            }
+            i = i + 1;
+        }
+        let rest = std::str::slice(v, from, v.n);
+        return out + (if self.in_scalar { self.hold(rest) } else { rest });
+    }
+
+    /// What is passed on of the end of the text: a scalar still held.
+    fn flush() -> String {
+        if !self.in_scalar { return ""; }
+        return self.end_scalar("");
+    }
+
+    /// `part` of a scalar that goes on past the piece: held, and "" passed
+    /// on, until it is longer than ARGS_SCALAR_MAX.
+    @bounded_by(part)
+    fn hold(part: String) -> String {
+        if self.quoting || self.passing { return part; }
+        let held = self.scalar + part;
+        if len(held) <= ARGS_SCALAR_MAX {
+            self.scalar = held;
+            return "";
+        }
+        self.scalar = "";
+        let c = std::str::byte_at(std::str::bytes_view(held), 0);
+        if c == 45 || digit_byte(c) {
+            self.quoting = true;
+            return "\"" + held;
+        }
+        self.passing = true;
+        return held;
+    }
+
+    /// The scalar held, ended by `part`, its last bytes, as it is passed on.
+    @bounded_by(part)
+    fn end_scalar(part: String) -> String {
+        let out = if self.quoting {
+            part + "\""
+        } else if self.passing {
+            part
+        } else {
+            settled_scalar(self.scalar + part)
+        };
+        self.in_scalar = false;
+        self.scalar = "";
+        self.quoting = false;
+        self.passing = false;
+        return out;
+    }
+}
+
+/// `text` repaired whole: each byte that is not UTF-8 as U+FFFD, each
+/// scalar settled, each raw control character in a string escaped; `text`
+/// unchanged, byte for byte, when there is nothing to repair.
+fn args_repaired(text: String) -> String {
+    let s = ArgsScanner { };
+    let out = s.feed(text);
+    return out + s.flush();
+}
+
+/// Whether text is blank: nothing but whitespace.
+fn blank_args(text: String) -> Bool {
+    return len(std::str::trim(text)) == 0;
+}
+
+/// Whether `text` nests containers deeper than `most` outside its strings.
+fn nested_past(text: String, most: Int) -> Bool {
+    let v = std::str::bytes_view(text);
+    let mut depth = 0;
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < v.n {
+        let c = std::str::byte_at(v, i);
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 {
+                esc = true;
+            } else if c == 34 {
+                in_str = false;
+            }
+        } else if c == 34 {
+            in_str = true;
+        } else if c == 123 || c == 91 {
+            depth = depth + 1;
+            if depth > most { return true; }
+        } else if c == 125 || c == 93 {
+            depth = depth - 1;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// Whether every number in the JSON text `text` is a finite double.
+fn numbers_finite(text: String) -> Bool {
+    let v = std::str::bytes_view(text);
+    let mut in_str = false;
+    let mut esc = false;
+    let mut i = 0;
+    while i < v.n {
+        let c = std::str::byte_at(v, i);
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == 92 {
+                esc = true;
+            } else if c == 34 {
+                in_str = false;
+            }
+            i = i + 1;
+        } else if c == 34 {
+            in_str = true;
+            i = i + 1;
+        } else if c == 45 || digit_byte(c) {
+            let from = i;
+            while i < v.n && scalar_byte(std::str::byte_at(v, i)) { i = i + 1; }
+            if !finite_literal(std::str::slice(v, from, i)) { return false; }
+        } else {
+            i = i + 1;
+        }
+    }
+    return true;
+}
+
+/// How a call's arguments read as written: `ok`, one JSON object (strict
+/// JSON, well-formed UTF-8) whose every number a double holds; `deep`,
+/// nested past std::json's 64 levels, so not judged (no engine's model
+/// writes such arguments, and voice will not call text it cannot read
+/// broken); `bad`, anything else.
+fn args_verdict(text: String) -> String {
+    if !std::json::valid(text) { return if nested_past(text, 64) { "deep" } else { "bad" }; }
+    if !std::str::starts_with(std::str::trim(text), "{") { return "bad"; }
+    return if numbers_finite(text) { "ok" } else { "bad" };
+}
+
+/// Arguments that are not JSON kept as one: an object whose one member,
+/// `_unparsed_arguments`, is their text.
+fn unparsed_args(raw: String) -> String {
+    return "{\"" + UNPARSED_ARGS + "\":\"" + std::json::escape_string(mended_utf8(raw)) + "\"}";
+}
+
+/// A past call's arguments as an engine is given them back, so that none
+/// can make it fail to render the conversation: as written when they are
+/// one JSON object a double holds every number of (byte for byte: the
+/// engine's prompt cache matches the history's text); else repaired
+/// (`args_repaired`) when that makes them one; `{}` for none at all; and
+/// otherwise kept as text (`unparsed_args`).
+fn history_args(text: String) -> String {
+    if blank_args(text) { return "{}"; }
+    let verdict = args_verdict(text);
+    if verdict == "ok" { return text; }
+    let fixed = args_repaired(text);
+    if verdict == "deep" { return fixed; }
+    let again = args_verdict(fixed);
+    if again == "ok" || again == "deep" { return fixed; }
+    return unparsed_args(text);
+}
+
+/// Whether the function tool `name` of the standard request `body` takes
+/// members its parameters do not name: it is offered, it is not `strict`,
+/// and its parameters do not say `additionalProperties: false`.
+fn tool_takes_more(body: String, name: String) -> Bool {
+    let mut it = std::json::array_first(std::str::trim(std::json::find_field_raw(body, "tools")));
+    while !it.done {
+        let t = std::str::trim(it.element);
+        if std::json::find_string_field(t, "type") == "function"
+            && std::json::find_string_field(t, "name") == name
+        {
+            if std::json::string_field(t, "strict").kind == "bool"
+                && std::json::find_bool_field(t, "strict")
+            {
+                return false;
+            }
+            let params = std::str::trim(std::json::find_field_raw(t, "parameters"));
+            return !(
+                std::json::string_field(params, "additionalProperties").kind == "bool"
+                    && !std::json::find_bool_field(params, "additionalProperties")
+            );
+        }
+        it = std::json::array_next(it);
+    }
+    return false;
+}

@@ -295,6 +295,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'price', v: micros(r.price_micros, r.currency) },
           { k: 'timing', v: `wall ${r.timing.wall_ms} · queue ${r.timing.queue_ms} · load ${r.timing.load_ms} ms` },
           { k: 'attempts', v: (r.attempts ?? []).map((a, i) => <div key={i}><Mono>{a.seat}</Mono> <Status tone={a.outcome === 'served' ? 'quiet' : 'fail'} label={a.outcome} />{a.error ? <span className="muted"> {a.error}</span> : null}</div>) },
+          ...(r.tool_arguments_repaired ? [{ k: 'tool arguments', v: <span className="muted">repaired before the caller had them; a recording keeps what the engine wrote</span> }] : []),
           { k: 'metadata', v: <Metadata of={r.metadata} /> },
         ]}
       />

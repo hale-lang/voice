@@ -200,7 +200,8 @@ it in turn: a seat that refuses, does not answer, or fails before output is
 an attempt in `voice.attempts`, and the next is offered the request. Each
 attempt answers on a reply subject of its own, and a seat the api stops
 waiting for is sent `cancel`. When every seat fails, the `502` carries the
-request id and the attempts in `error.voice`. A seat that refuses for
+request id and the attempts in `error.voice`, and the request is a `failed`
+row in the ledger with the same attempts. A seat that refuses for
 capacity (its ack's `refusal` is `capacity`: it, or its node, serves its
 most at once) has not failed and is no attempt: when every seat left
 refuses so, the request waits for a slot on this instance, in arrival
@@ -254,15 +255,23 @@ sees it, where the api used to take 12 MiB; and a chunked one (hale reads
 
 Every request a seat served, streamed or not, is one row in the store's
 ledger (`usage`, store.md), written where its response completes
-(`Inference.settled`); a request a seat began and did not finish
-(`cancelled`, `failed` after output) is a row too, with no tokens and no
-price. The row holds the whole `UsageRecord` beside the columns a read
+(`Inference.settled`). Every other request that was admitted and offered
+to a seat is a row too, written where it ends (`Inference.unfinished`),
+charged nothing, its input voice's estimate (`input_tokens_estimated`):
+one a seat began and did not finish (`cancelled`, `failed` after output),
+one every seat it was offered failed (the `502`, `failed`, its `attempts`
+each seat's error, `served` the last seat tried), one that waited for a
+slot and none freed in time (`no_capacity`, `deadline_exceeded`; not the
+annotator's, which wait for none and which its queue asks again), and one
+whose caller went away while it was offered (`cancelled`). A request
+refused before it was offered (its key, its model, a rate limit, its body:
+`401`, `404`, `429 rate_limited`, `400`) has no row. The row holds the whole `UsageRecord` beside the columns a read
 filters and sums by: `GET /admin/v1/usage` pages it newest first (cursor =
 the row's order), `/usage/{request_id}` reads one, `/usage/summary`
 totals requests, tokens and spend by any of project, key, model, account,
 seat, node, day and hour (SQL `group by` on Postgres). Rows of another
-currency are another group, and requests refused before a seat served
-them are not in the ledger.
+currency are another group. A row whose node repaired a tool call's
+arguments says `tool_arguments_repaired` (*Tool call arguments*, below).
 
 `GET /admin/v1/events` answers from the rows past a subscriber's place
 (`AdminEvents`, admin_events.hl): the ledger rows written (`usage`, the
@@ -305,6 +314,73 @@ days, the older ones deleted as new ones are written. A recording's request
 and response are the JSON documents they were, as text, since they may be far
 larger than a JSON value on the typed surface holds. Off unless set: recording
 is the operator's choice per project or key, whatever its data class.
+
+### Tool call arguments
+
+A chat template parses every past tool call's arguments again when it
+renders a conversation. llama-server parses them with nlohmann::json,
+which refuses a number past a double's range: a model that once wrote
+`{"session_id":58e595}` (valid JSON grammar, but 5.8 x 10^596) made every
+later request of that conversation answer `500 Failed to parse tool call
+arguments as JSON: ... number overflow parsing`, on every seat, and the
+conversation was lost. So voice checks a call's arguments before they
+reach the caller, and every past call's before a seat reads it
+([`node/tool_args.hl`](../node/tool_args.hl)). Arguments are valid when
+they are one JSON object (std::json's strict grammar, well-formed UTF-8)
+whose every number is a finite double once read, rounding to nearest as
+strtod does: below 2^1024 - 2^970, decided exactly on the literal's digits
+and exponent (no float is parsed; a number too small reads as zero, which
+is finite). Valid arguments are never changed by a byte, since an
+engine's prompt cache matches a conversation by its text. The repair keeps
+what the model meant: a number no double holds, and the bare words `NaN`,
+`Infinity` and `-Infinity`, become a string of the same text (`"58e595"`);
+a raw control character in a string is escaped; a byte that is not UTF-8
+is U+FFFD. Arguments nested past std::json's 64 levels are not judged,
+their numbers still repaired.
+
+An engine's call (`Upstream`, node/compat.hl) is repaired as it streams
+(`ArgsScanner`): its text passes through as it comes but a scalar outside
+a string, held until it ends (at most 1 KiB of it; a longer number is
+passed on as a string as it comes) and passed on settled, so each delta
+carries the repaired text and the deltas join into the `arguments` of
+the done events, the item and the terminal response, which the api relays
+and builds the chat message from. A call's events are held back until a
+second of its fragments carries arguments: llama-server streams them a
+token at a time, while TensorFold sends a call whole. When the call is
+whole its arguments are checked; arguments that are not one JSON object
+from an answer the model finished:
+
+- nothing of the call left the node (it came whole): the run fails,
+  `engine_failed` naming the call, before any output, so the api offers
+  the request to another seat (a sampling gone wrong is unlikely to recur
+  there), and when every seat fails it is a `502`;
+- its deltas had left: it ends with `{"_unparsed_arguments": "<text>"}`
+  when its tool takes members its parameters do not name (not `strict`,
+  no `additionalProperties: false`), which a client can carry in its
+  history and its tool can refuse, and otherwise the run fails after
+  output (`response.failed`), since a call its tool's schema forbids is
+  no answer. A chat stream's chunks cannot take text back, so there the
+  wrapped form is in the whole message only, and the history repair
+  takes the rest.
+
+A call the output cap cut off is `incomplete`, its arguments as far as
+they came, as the response is. A call with no arguments at all has `{}`.
+Each repair is in the run's `result` (`tool_arguments_repaired`,
+protocol.yaml: the call, and its arguments as the engine wrote them); the
+api records `tool_arguments_repaired: true` in the request's usage, and a
+recording of a request that peeks keeps what the engine wrote as
+`tool_arguments_original` beside the response. The caller is never sent
+the original.
+
+Before a request reaches an openai-compatible or managed seat, each past
+call's arguments are given as `history_args` makes them (`compat_request`,
+for a hosted upstream's messages and a managed seat's one-message turns
+alike, and so for both wires, the api having made a Chat Completions
+request's `tool_calls` the standard's `function_call` items): as written
+when valid, repaired when that makes them valid, `{}` for none, and
+otherwise as `{"_unparsed_arguments": "<text>"}`. A conversation a model
+poisoned before this check existed is served again with no change on the
+client's side.
 
 ### Hosted tools: web fetch
 

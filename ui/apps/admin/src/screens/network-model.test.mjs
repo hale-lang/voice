@@ -320,7 +320,7 @@ test('a request draws its conversation, keyed by its prompt_cache_key whatever t
   const graph = buildGraph({ ...fleet, usage: [record] }, { context: true });
   const c = graph.vertices.find((v) => v.id === entityId('context:conversation', 'b909ae4b'));
   assert(c, 'the conversation is a context node');
-  assert.equal(c.href, '#/usage/c/b909ae4b');
+  assert.equal(c.href, '#/conversations/history/b909ae4b');
   assert(graph.edges.some((e) => e.id === edgeId(entityId('project', record.project), c.id)));
   assert(graph.vertices.some((v) => v.id === entityId('context:team', 'search')), 'a metadata pair is still a label');
   const none = buildGraph({ ...fleet, usage: [{ ...record, conversation: null }] }, { context: true });

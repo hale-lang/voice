@@ -1,6 +1,7 @@
 import type { Account, NodeSummary, Schemas, UsageRecordSummary } from '../api/client';
 import { capacityOf } from '../api/fleet-reads.ts';
 import type { Flight } from '../api/events';
+import { href } from '../nav.ts';
 
 /**
  * A request as the graph draws it: as the ledger lists it, with the
@@ -55,7 +56,6 @@ export const RETIRED = 'retired';
 export type Point = { x: number; y: number };
 export const entityId = (kind: Kind, name: string) => `${kind}:${name}`;
 export const edgeId = (a: string, b: string) => [a, b].sort().join('|');
-const link = (...parts: string[]) => '#/' + parts.map(encodeURIComponent).join('/');
 
 /**
  * The catalog model a request's alias named; none when it named a model. The
@@ -133,10 +133,10 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     return id;
   };
   for (const i of fleet.instances ?? []) apiVertex(i.id);
-  for (const p of fleet.projects) add({ id: entityId('project', p.id), name: p.id, kind: 'project', state: p.status, active: 0, href: link('projects', p.id), details: [['Name', p.name], ['State', p.status]] });
+  for (const p of fleet.projects) add({ id: entityId('project', p.id), name: p.id, kind: 'project', state: p.status, active: 0, href: href('projects', p.id), details: [['Name', p.name], ['State', p.status]] });
   const model = (name: string, meaning: string) => {
     const id = entityId('model', name);
-    if (!vertices.has(id)) add({ id, name, kind: 'model', state: 'configured', active: 0, href: link('models', name), details: [['Catalog model', name], ['Meaning', meaning]] });
+    if (!vertices.has(id)) add({ id, name, kind: 'model', state: 'configured', active: 0, href: href('models', name), details: [['Catalog model', name], ['Meaning', meaning]] });
     return id;
   };
   // each seat of a placement, its placement: a leader's and follower's of one
@@ -149,13 +149,13 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     if (!p?.follower_seat || !seatAt.has(p.seat) || !seatAt.has(p.follower_seat)) return undefined;
     return ref === p.seat ? { placement: p.id, role: 'leader', partner: entityId('seat', p.follower_seat), at: p } : { placement: p.id, role: 'follower', partner: entityId('seat', p.seat), at: p };
   };
-  for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: link('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });
+  for (const a of fleet.accounts) add({ id: entityId('account', a.id), name: a.id, kind: 'account', state: a.exhausted_until ? 'exhausted' : a.status, active: 0, href: href('accounts', a.id), details: [['Billing', a.billing ?? 'none'], ['State', a.status], ...a.windows.map((w): [string, string] => [w.name.replaceAll('_', ' '), `${w.used_percent}% used · reported ${w.observed_at}`])] });
   for (const n of fleet.nodes) {
     // a follower's seat serves nothing itself: the node's capacity is its
     // other seats', and what it computes for a leader is told as that
     const follows = n.seats.flatMap(s => { const part = partOf(s.ref); return part?.role === 'follower' ? [part] : []; });
     const computing = follows.reduce((sum, f) => sum + (seatAt.get(f.at.seat)?.in_flight ?? 0), 0);
-    add({ id: entityId('node', n.id), name: n.id, kind: 'node', state: n.status, active: n.in_flight ?? 0, ...(follows.length ? { partnerActive: computing } : {}), href: link('nodes', n.id), details: [['Name', n.name ?? n.id], ['State', n.status], ['In flight / capacity', `${n.in_flight ?? '—'} / ${capacityOf({ seats: n.seats.filter(s => partOf(s.ref)?.role !== 'follower') })}`], ...follows.map((f): [string, string] => ['Follower of', `${f.at.seat} (${f.at.id}): computes half of its ${seatAt.get(f.at.seat)?.in_flight ?? 0} in flight`]), ['Last heartbeat', n.last_heartbeat_at ?? 'not reported'], ['Assignment / applied', `${n.assignment_version ?? '—'} / ${n.applied_version ?? '—'}`]] });
+    add({ id: entityId('node', n.id), name: n.id, kind: 'node', state: n.status, active: n.in_flight ?? 0, ...(follows.length ? { partnerActive: computing } : {}), href: href('nodes', n.id), details: [['Name', n.name ?? n.id], ['State', n.status], ['In flight / capacity', `${n.in_flight ?? '—'} / ${capacityOf({ seats: n.seats.filter(s => partOf(s.ref)?.role !== 'follower') })}`], ...follows.map((f): [string, string] => ['Follower of', `${f.at.seat} (${f.at.id}): computes half of its ${seatAt.get(f.at.seat)?.in_flight ?? 0} in flight`]), ['Last heartbeat', n.last_heartbeat_at ?? 'not reported'], ['Assignment / applied', `${n.assignment_version ?? '—'} / ${n.applied_version ?? '—'}`]] });
     for (const s of n.seats) {
       const part = partOf(s.ref);
       const placement = part?.at ?? placedAt.get(s.ref);
@@ -165,7 +165,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
         : part.role === 'leader' ? [['Role', `Leader: takes its requests, and computes them with ${part.at.follower_seat} across the link`], ['Placement', `${part.at.id}${part.at.model !== part.at.id ? ` · ${part.at.model}` : ''} across ${part.at.nodes.join(' + ')}`], ['Partner seat', part.at.follower_seat!]]
         : [['Role', `Follower: serves through its leader, ${part.at.seat}; it takes no request of its own`], ['Placement', `${part.at.id}${part.at.model !== part.at.id ? ` · ${part.at.model}` : ''} across ${part.at.nodes.join(' + ')}`], ['Partner seat', part.at.seat]];
       const flight: [string, string] = leader ? ['In flight', `none of its own; computes half of its leader's ${leader.in_flight}`] : ['In flight / cap', `${s.in_flight} / ${s.concurrency ?? 1}`];
-      add({ id: entityId('seat', s.ref), name: s.id, kind: 'seat', parent: entityId('node', n.id), state: s.status, active: s.in_flight, ...(leader ? { partnerActive: leader.in_flight } : {}), ...(placement ? { placement: placement.id } : {}), ...(part ? { part: { placement: part.placement, role: part.role, partner: part.partner } } : {}), href: link('nodes', n.id, s.id), details: [['Seat', s.ref], ...role, ['Engine', s.engine], ...(runtime ? [['Runtime', runtime] as [string, string]] : []), ['Account', s.account], ['State', s.status], flight, ['Reason', s.reason ?? (s.problems.join('; ') || 'none reported')]] });
+      add({ id: entityId('seat', s.ref), name: s.id, kind: 'seat', parent: entityId('node', n.id), state: s.status, active: s.in_flight, ...(leader ? { partnerActive: leader.in_flight } : {}), ...(placement ? { placement: placement.id } : {}), ...(part ? { part: { placement: part.placement, role: part.role, partner: part.partner } } : {}), href: href('nodes', n.id, s.id), details: [['Seat', s.ref], ...role, ['Engine', s.engine], ...(runtime ? [['Runtime', runtime] as [string, string]] : []), ['Account', s.account], ['State', s.status], flight, ['Reason', s.reason ?? (s.problems.join('; ') || 'none reported')]] });
       connect(entityId('node', n.id), entityId('seat', s.ref), 'hosts');
       // a follower reaches its model only through its leader, across the bond
       if (part?.role === 'follower') continue;
@@ -255,7 +255,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     if (options.context && r.conversation) {
       const c = member('context:conversation', r.conversation, "The request's conversation: the prompt_cache_key its client sent, as its usage record keeps it.");
       const v = vertices.get(c);
-      if (v && !v.href) v.href = link('usage', 'c', r.conversation);
+      if (v && !v.href) v.href = href('conversations', r.conversation);
       join(project, c);
     }
     if (options.context) for (const [key, value] of Object.entries(r.metadata ?? {})) {

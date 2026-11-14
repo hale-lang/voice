@@ -194,7 +194,7 @@ function ProjectInspector({ project: p }: { project: Project }) {
                     options={[...(p.parent ? [{ value: 'parent', label: `${p.parent}'s` }] : []), { value: 'on', label: 'on' }, { value: 'off', label: 'off' }]}
                   />
                 )}
-                {p.peeks && <span className="muted"> · shown on each request in Usage</span>}
+                {p.peeks && <span className="muted"> · shown on each request in Requests</span>}
               </>
             ),
           },

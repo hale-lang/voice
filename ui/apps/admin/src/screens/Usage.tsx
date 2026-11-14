@@ -15,13 +15,11 @@ import { refusalLine } from '../refusal';
 import { inputTokens } from '../input-tokens';
 import { listedProjects } from '../projects-listed';
 import { ConversationView } from './Conversation';
-import { Toggle } from '../FleetMemory';
 import { href } from '../route';
 import { ConversationName } from '../titles';
 import {
   viewOf,
   viewHref,
-  opensConversation,
   filtered,
   fromOf,
   metadataPairs,
@@ -50,23 +48,24 @@ const RUN_MAX = 500;
 type RunOutcome = Schemas['AnnotationRunOutcome'];
 
 /**
- * The ledger two ways, a table each: every request, or every conversation
- * its requests are turns of. The view and its filters are the URL's query,
- * so a link keeps them; a row opens the request, or the conversation, in
- * the inspector, which shows its annotations. Each table is live: a new
- * request (or a conversation active again) rises to the top as the events
- * say, and the pages loaded below it stay.
+ * The ledger two ways, a screen each (nav.ts): every request, or every
+ * conversation its requests are turns of. The filters are the URL's
+ * query, so a link keeps them; a row opens the request, or the
+ * conversation, in the inspector, which shows its annotations. Each table
+ * is live: a new request (or a conversation active again) rises to the
+ * top as the events say, and the pages loaded below it stay.
  */
 export function Usage({ route, setInspector }: ScreenProps) {
-  // `usage/<request>`, or a conversation, `usage/c/<prompt_cache_key>`
-  const conversation = route.parts[1] === 'c' ? (route.parts[2] ?? '') : null;
-  const selected = conversation === null ? route.parts[1] : undefined;
-  const view = viewOf(route.query, opensConversation(route.parts));
+  // `requests/<request>`, or `conversations/<prompt_cache_key>`
+  const tab: UsageTab = route.parts[0] === 'conversations' ? 'conversations' : 'requests';
+  const conversation = tab === 'conversations' ? route.parts[1] : undefined;
+  const selected = tab === 'requests' ? route.parts[1] : undefined;
+  const view = viewOf(route.query, tab);
   // the cutoff the range names, fixed when it is chosen (or the page
   // opens), so the query stays the same while the events refresh it
   const from = useMemo(() => fromOf(view.since, Date.now()), [view.since]);
   const set = (next: Partial<UsageView>) => {
-    location.hash = viewHref({ ...view, ...next }, ...route.parts);
+    location.hash = viewHref({ ...view, ...next }, route.parts[1]);
   };
   useEffect(() => {
     if (conversation) setInspector(<ConversationView key={conversation} conversation={conversation} />);
@@ -75,21 +74,12 @@ export function Usage({ route, setInspector }: ScreenProps) {
 
   return (
     <>
-      <h1>Usage</h1>
-      <Toggle<UsageTab>
-        label="what the table lists"
-        value={view.tab}
-        options={[
-          ['requests', 'Requests'],
-          ['conversations', 'Conversations'],
-        ]}
-        onChange={(tab) => set({ tab })}
-      />
+      <h1>{tab === 'requests' ? 'Requests' : 'Conversations'}</h1>
       <Filters view={view} set={set} />
-      {view.tab === 'requests' ? (
-        <Requests view={view} from={from} selected={selected} open={(r) => (location.hash = viewHref(view, 'usage', r.id))} />
+      {tab === 'requests' ? (
+        <Requests view={view} from={from} selected={selected} open={(r) => (location.hash = viewHref(view, r.id))} />
       ) : (
-        <Conversations view={view} from={from} selected={conversation ?? undefined} open={(c) => (location.hash = viewHref(view, 'usage', 'c', c.conversation))} />
+        <Conversations view={view} from={from} selected={conversation} open={(c) => (location.hash = viewHref(view, c.conversation))} />
       )}
     </>
   );
@@ -513,7 +503,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
-          { k: 'conversation', v: r.conversation ? <><ConversationName conversation={r.conversation} project={r.project} mono /> <a href={href('usage', 'c', r.conversation)}>read it</a></> : <span className="faint">none</span> },
+          { k: 'conversation', v: r.conversation ? <><ConversationName conversation={r.conversation} project={r.project} mono /> <a href={href('conversations', r.conversation)}>read it</a></> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
           { k: 'tokens', v: `${inputTokens(r)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
@@ -552,7 +542,7 @@ function Internal({ of: r }: { of: { annotates?: string; side?: string } }) {
       internal{side ? ` · ${side === 'title' ? 'its title' : `the ${side} stage`}` : ''}
       {of && (
         <>
-          {' '}of <a href={href('usage', of)} onClick={(e) => e.stopPropagation()}><Mono>{of}</Mono></a>
+          {' '}of <a href={href('requests', of)} onClick={(e) => e.stopPropagation()}><Mono>{of}</Mono></a>
         </>
       )}
     </div>

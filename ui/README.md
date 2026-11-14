@@ -118,12 +118,18 @@ context, execution direction, selection composition and layout continuity.
 
 ## Screens
 
-One per part of the admin API:
+One per part of the admin API, listed on the rail in layers
+(`apps/admin/src/nav.ts`, which places each screen under its layer's
+route, `#/models/nodes/<node>`; a route from before the layers opens where
+its screen lives now): Overview; Models (Catalogue, Placements, Nodes,
+Recipes, Runtimes, Accounts, Routes, Requests, Live); Projects;
+Conversations (Chat, Conversations); Harness (Annotators, Tools,
+Attempts); and apart, Changes and API.
 
 - **Overview:** quota headroom per account, node health, spend against
   budget, recent usage.
 - **Route table:** per model, the ranked slots and why.
-- **Usage:** requests or conversations, each a live table filtered and paged in the URL; a row opens the request or the conversation.
+- **Requests** and **Conversations:** the ledger, each a live table filtered and paged in the URL; a row opens the request or the conversation.
 - **Accounts:** quota windows, limits.
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token
   rotation.

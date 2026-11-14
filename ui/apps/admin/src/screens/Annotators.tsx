@@ -411,7 +411,7 @@ function Queue() {
           rowKey={(r) => r.request_id}
           columns={[
             { key: 'when', header: 'Queued', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
-            { key: 'id', header: 'Request', render: (r) => <a href={href('usage', r.request_id)}><Mono>{r.request_id}</Mono></a> },
+            { key: 'id', header: 'Request', render: (r) => <a href={href('requests', r.request_id)}><Mono>{r.request_id}</Mono></a> },
             { key: 'p', header: 'Project', render: (r) => <Mono>{r.project}</Mono> },
             { key: 'step', header: 'Now', render: (r) => <QueueStep id={r.request_id} /> },
           ]}

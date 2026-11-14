@@ -143,7 +143,7 @@ export function Runs({ runs, project }: { runs: Run[]; project: string }) {
           <span className="faint"> · {count(r.input_tokens)} in, {count(r.output_tokens)} out · {r.ms} ms</span>
           {r.request_id && (
             <span className="faint">
-              {' '}· <a href={href('usage', r.request_id)} title={`its usage record, under ${project}-system`}>run</a>
+              {' '}· <a href={href('requests', r.request_id)} title={`its usage record, under ${project}-system`}>run</a>
             </span>
           )}
           {r.status !== 'annotated' && <span className="c-wait"> · {r.status.replace('_', ' ')}{r.reason ? `: ${r.reason}` : ''}</span>}
@@ -359,9 +359,9 @@ export function AnnotationsPanel({ slice, title = 'Annotations' }: { slice: Slic
           rowKey={(r) => r.request_id}
           columns={[
             { key: 'when', header: 'When', render: (r) => <span className="muted">{ago(r.created_at)}</span> },
-            { key: 'id', header: 'Request', render: (r) => <a href={href('usage', r.request_id)}><Mono>{r.request_id}</Mono></a> },
+            { key: 'id', header: 'Request', render: (r) => <a href={href('requests', r.request_id)}><Mono>{r.request_id}</Mono></a> },
             { key: 'p', header: 'Project', render: (r) => <Mono>{r.project}</Mono> },
-            { key: 'c', header: 'Conversation', render: (r) => (r.conversation ? <a href={href('usage', 'c', r.conversation)}><Mono>{r.conversation}</Mono></a> : <span className="faint">–</span>) },
+            { key: 'c', header: 'Conversation', render: (r) => (r.conversation ? <a href={href('conversations', r.conversation)}><Mono>{r.conversation}</Mono></a> : <span className="faint">–</span>) },
             { key: 's', header: 'Annotated', render: (r) => (r.status === 'annotated' ? (r.clipped ? <span className="c-wait">yes, a text cut</span> : 'yes') : <span className="c-wait" title={r.reason}>no</span>) },
           ]}
         />

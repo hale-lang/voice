@@ -1,6 +1,8 @@
 import './base.css';
 
-export { Shell, RailHeader, RailNav, RailPrincipal, Evidence } from './Shell';
+export { Shell, RailHeader, RailPrincipal, Evidence } from './Shell';
+export { RailNav } from './RailNav';
+export type { RailGroup, RailLink } from './RailNav';
 export { DETAIL_LAYOUTS, useDetail } from './Detail';
 export type { DetailLayout } from './Detail';
 export { Panel, PanelGrid, Kv, Mono } from './Panel';

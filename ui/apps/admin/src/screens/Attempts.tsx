@@ -118,7 +118,7 @@ function AttemptInspector({ id }: { id: string }) {
           { k: 'summary', v: a.summary ?? <span className="faint">–</span> },
           ...(a.failure_kind ? [{ k: 'failure kind', v: <Mono>{a.failure_kind}</Mono> }] : []),
           ...(a.failure ? [{ k: 'failure', v: <span className="c-fail">{a.failure}</span> }] : []),
-          { k: 'usage', v: <>{usage} · <a href={href('usage', 'c', a.id)}>in Usage</a></> },
+          { k: 'usage', v: <>{usage} · <a href={href('conversations', a.id)}>in Conversations</a></> },
           { k: 'wall time', v: a.wall_ms ? wall(a.wall_ms) : '–' },
           { k: 'created', v: when(a.created_at) },
           { k: 'deadline', v: when(a.deadline) },

@@ -6,7 +6,7 @@
 // store (`UsageRow.record`) beside the columns a read filters and sums by.
 
 /// The row for a request of `r` that ended as `status`: `by` is what
-/// served it, `input` and `output` the tokens its seat reported. A
+/// served it, `t` the tokens its seat reported. A
 /// request the caller named `metadata` on keeps it, untouched, and one
 /// that named a `prompt_cache_key` keeps it as its `conversation`.
 fn usage_row(
@@ -16,8 +16,7 @@ fn usage_row(
     key: String,
     by: ServedBy,
     status: String,
-    input: Int,
-    output: Int,
+    t: Tokens,
     price_micros: Int,
     currency: String,
     timing: String,
@@ -34,9 +33,10 @@ fn usage_row(
         + ", \"requested_account\": "
         + jstring_or_null(len(r.account) > 0, r.account) + ", \"endpoint\": "
         + jq(endpoint_name(r)) + ", \"status\": " + jq(status) + ", \"served\": " + served
-        + ", \"data_class\": " + jq(r.data_class) + ", \"input_tokens\": " + to_string(input)
-        + ", \"cached_input_tokens\": 0, \"cache_write_input_tokens\": 0, \"output_tokens\": "
-        + to_string(output) + ", \"reasoning_tokens\": 0, \"price_micros\": "
+        + ", \"data_class\": " + jq(r.data_class) + ", \"input_tokens\": " + to_string(t.input)
+        + ", \"cached_input_tokens\": " + to_string(t.cached)
+        + ", \"cache_write_input_tokens\": 0, \"output_tokens\": " + to_string(t.output)
+        + ", \"reasoning_tokens\": " + to_string(t.reasoning) + ", \"price_micros\": "
         + to_string(price_micros) + ", \"currency\": " + jq(currency)
         + ", \"timing\": " + timing + ", \"attempts\": " + attempts_json(attempts)
         + ", \"conversation\": " + jstring_or_null(len(conversation) > 0, conversation)
@@ -54,8 +54,10 @@ fn usage_row(
         node: by.node,
         seat: by.seat,
         status: status,
-        input_tokens: input,
-        output_tokens: output,
+        input_tokens: t.input,
+        cached_input_tokens: t.cached,
+        output_tokens: t.output,
+        reasoning_tokens: t.reasoning,
         price_micros: price_micros,
         currency: currency,
         served: served,
@@ -77,10 +79,127 @@ fn conversation_in(body: String) -> String {
     return if cache_key.kind == "string" { cache_key.text } else { "" };
 }
 
+/// The key a request's turns keep their seat by, so the seat's prompt cache
+/// holds what the conversation said: the `prompt_cache_key` it names, else
+/// the one derived from its turn (`derived_conversation`), which is never
+/// its `conversation` nor recorded as one.
+fn affinity_of(r: InferenceRequest) -> String {
+    return if len(r.conversation) > 0 { r.conversation } else { derived_conversation(r.body) };
+}
+
+/// The most of each end of one opening text a derived key reads
+/// (`sampled`): a body may be 12 MiB, and the key is not worth a copy of it.
+const DERIVED_SAMPLE: Int = 4096;
+
+/// The conversation a standard request body that names none is a turn of,
+/// as voice derives it to keep its turns on one seat: `derived:` and 32 hex
+/// digits of the sha256 of its `instructions` and its opening, every
+/// message of the system, developer or user before the first item of the
+/// model's (its words, thinking or calls) or a call's output, each by its
+/// role and its content as written (`sampled`). An agent resends the whole
+/// conversation each turn, its opening the same, so each turn derives the
+/// same key; another conversation opens with another task and derives
+/// another. "" when the body has neither.
+@unbounded
+fn derived_conversation(body: String) -> String {
+    let v = std::str::bytes_view(body);
+    let mut told = "";
+    let mut input_at = -1;
+    let mut input_end = -1;
+    let mut it = std::json::object_first(body);
+    while !it.done {
+        if std::json::obj_key_eq(it, body, "instructions")
+            && std::str::byte_at(v, it.val_start) == 34
+        {
+            told = "instructions\n" + sampled(v, it.val_start, it.val_end) + "\n";
+        } else if std::json::obj_key_eq(it, body, "input") {
+            input_at = it.val_start;
+            input_end = it.val_end;
+        }
+        it = std::json::object_next(it, body);
+    }
+    let mut text = told;
+    let opener = if input_at >= 0 { std::str::byte_at(v, input_at) } else { -1 };
+    if opener == 34 {
+        text = text + "user\n" + sampled(v, input_at, input_end) + "\n";
+    } else if opener == 91 {
+        // the list's items, and each item's members, read where they lie in
+        // the body, none copied: an item of any size is told by its type and
+        // role
+        let mut item = std::json::array_next_span(
+            std::json::ArrayIterSpan { pos: input_at + 1, cur_start: -1, cur_end: 0, done: false },
+            body,
+        );
+        let mut opening = true;
+        while !item.done && opening && item.cur_end <= input_end {
+            let said = opening_message(body, v, item);
+            if len(said) == 0 { opening = false; } else { text = text + said; }
+            item = std::json::array_next_span(item, body);
+        }
+    }
+    if len(text) == 0 { return ""; }
+    let digest = std::hex::encode(std::crypto::sha256(std::bytes::from_string(text)));
+    return "derived:" + digest[0..32];
+}
+
+/// Input item `item` of `body` as a derived key reads it: a message of the
+/// system, developer or user as its role and its content (`sampled`); ""
+/// for any other item, which ends the opening. Its members are read where
+/// they lie, so an item of any size costs no copy of it.
+@unbounded
+fn opening_message(body: String, v: std::str::ByteView, item: std::json::ArrayIterSpan) -> String {
+    if std::str::byte_at(v, item.cur_start) != 123 { return ""; }
+    let mut kind = "";
+    let mut role = "";
+    let mut content_at = -1;
+    let mut content_end = -1;
+    let mut it = std::json::object_next(
+        std::json::ObjectIterSpan {
+            pos: item.cur_start + 1,
+            key_start: -1,
+            key_end: 0,
+            val_start: -1,
+            val_end: 0,
+            done: false,
+        },
+        body,
+    );
+    while !it.done && it.val_end <= item.cur_end {
+        if std::json::obj_key_eq(it, body, "type") {
+            kind = std::json::obj_value_string(it, body);
+        } else if std::json::obj_key_eq(it, body, "role") {
+            role = std::json::obj_value_string(it, body);
+        } else if std::json::obj_key_eq(it, body, "content") {
+            content_at = it.val_start;
+            content_end = it.val_end;
+        }
+        it = std::json::object_next(it, body);
+    }
+    let message = kind == "message" || len(kind) == 0;
+    if !message || !(role == "system" || role == "developer" || role == "user") { return ""; }
+    return role + "\n" + (if content_at >= 0 { sampled(v, content_at, content_end) } else { "" })
+        + "\n";
+}
+
+/// The text of `v` in [from, to) as a derived key reads it: whole up to
+/// twice `DERIVED_SAMPLE`, else its length and its first and last
+/// `DERIVED_SAMPLE` bytes, so no long text is copied whole. Two texts that
+/// differ only between those ends read the same: they keep one seat, which
+/// costs a cache, never an answer.
+fn sampled(v: std::str::ByteView, from: Int, to: Int) -> String {
+    if to - from <= 2 * DERIVED_SAMPLE { return std::str::slice(v, from, to); }
+    return to_string(to - from) + "\n" + std::str::slice(v, from, from + DERIVED_SAMPLE)
+        + std::str::slice(v, to - DERIVED_SAMPLE, to);
+}
+
 /// The model a caller asked for: the alias, when it named one (aliases.hl).
 fn asked_for(r: InferenceRequest) -> String {
     return if len(r.alias) > 0 { r.alias } else { r.model };
 }
+
+/// The tokens a seat reported for a request: its input, of it what the
+/// seat's prompt cache held, its output, of it the model's thinking.
+type Tokens { input: Int = 0; cached: Int = 0; output: Int = 0; reasoning: Int = 0; }
 
 /// A request a seat served, as its row.
 fn served_usage(r: InferenceRequest, s: Served) -> st::UsageRow {
@@ -92,8 +211,12 @@ fn served_usage(r: InferenceRequest, s: Served) -> st::UsageRow {
         v.key,
         v.served,
         if s.status == "incomplete" { "incomplete" } else { "served" },
-        s.input_tokens,
-        s.output_tokens,
+        Tokens {
+            input: s.input_tokens,
+            cached: s.cached_tokens,
+            output: s.output_tokens,
+            reasoning: s.reasoning_tokens,
+        },
         v.price_micros,
         v.currency,
         timing_json(v.wall_ms, v.queue_ms, v.has_engine_timing, v.first_output_ms, v.engine_ms),
@@ -126,8 +249,7 @@ fn unfinished_row(
             engine: c.seat.engine,
         },
         status,
-        0,
-        0,
+        Tokens { },
         0,
         if m.priced { m.price.currency } else { "USD" },
         timing_json(wall_ms, 0, false, 0, 0),

@@ -1,0 +1,184 @@
+// An assistant's turn reaches a chat-completions server as one message: its
+// reasoning item, its words and the calls after them together, as the
+// chat template renders one turn, so the template never closes the
+// thinking twice in a turn (the model would learn to write the second
+// close itself). A managed seat's server is given the thinking back; a
+// hosted upstream is not. What the engine says of its prompt cache and of
+// the model's thinking reaches the standard's `usage`.
+import ".." as node;
+
+fn managed() -> node::CompatConfig {
+    return node::managed_compat("http://127.0.0.1:1/v1", "coder", "k");
+}
+
+fn hosted() -> node::CompatConfig {
+    return node::compat_config("{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"coder\"}");
+}
+
+/// A Codex turn as it comes back: the reasoning item, the words, two calls,
+/// their outputs, and the user's next message.
+const AGENT: String = "{\"model\": \"coder\", \"input\": [{\"type\": \"message\", \"role\": \"developer\", \"content\": [{\"type\": \"input_text\", \"text\": \"be an agent\"}]}, {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"read it\"}]}, {\"type\": \"reasoning\", \"id\": \"rs_1\", \"summary\": [], \"content\": [{\"type\": \"reasoning_text\", \"text\": \"Read the file.\"}], \"encrypted_content\": null}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"Reading it now.\", \"annotations\": []}]}, {\"type\": \"function_call\", \"call_id\": \"c1\", \"name\": \"exec\", \"arguments\": \"{\\\"cmd\\\":\\\"cat a\\\"}\"}, {\"type\": \"function_call\", \"call_id\": \"c2\", \"name\": \"exec\", \"arguments\": \"{\\\"cmd\\\":\\\"cat b\\\"}\"}, {\"type\": \"function_call_output\", \"call_id\": \"c1\", \"output\": \"A\"}, {\"type\": \"function_call_output\", \"call_id\": \"c2\", \"output\": \"B\"}, {\"type\": \"reasoning\", \"id\": \"rs_2\", \"summary\": [], \"content\": [{\"type\": \"reasoning_text\", \"text\": \"Again.\"}]}, {\"type\": \"function_call\", \"call_id\": \"c3\", \"name\": \"exec\", \"arguments\": \"{}\"}, {\"type\": \"function_call_output\", \"call_id\": \"c3\", \"output\": \"C\"}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"Done.\"}]}, {\"type\": \"message\", \"role\": \"user\", \"content\": [{\"type\": \"input_text\", \"text\": \"thanks\"}]}]}";
+
+fn chunk(delta: String, finish: String, extra: String) -> String {
+    return "data: {\"model\":\"coder\",\"choices\":[{\"index\":0,\"delta\":" + delta
+        + ",\"finish_reason\":"
+        + (if len(finish) > 0 { "\"" + finish + "\"" } else { "null" }) + "}]" + extra + "}\n\n";
+}
+
+fn play(sse: String) -> node::StaticRun {
+    return node::drain(
+        node::upstream_for(
+            "resp_u1",
+            "coder",
+            "{\"model\": \"coder\", \"input\": \"hi\", \"prompt_cache_key\": \"conv-9\"}",
+            hosted(),
+            200,
+            sse,
+        ),
+    );
+}
+
+fn usage_of(run: node::StaticRun) -> String {
+    let at = std::str::index_of(run.script, "\"type\":\"response.completed\"");
+    let done = run.script[at..len(run.script)];
+    let u = std::str::index_of(done, "\"usage\":");
+    return done[u..len(done)];
+}
+
+fn count_of(s: String, part: String) -> Int {
+    let mut n = 0;
+    let mut at = std::str::index_of(s, part);
+    while at >= 0 {
+        n = n + 1;
+        at = std::str::index_of_from(s, part, at + len(part));
+    }
+    return n;
+}
+
+fn main() {
+    let req = node::compat_request(AGENT, managed());
+    std::test::assert(
+        std::str::contains(
+            req,
+            "{\"role\":\"user\",\"content\":\"read it\"},{\"role\":\"assistant\",\"content\":\"Reading it now.\",\"reasoning_content\":\"Read the file.\",\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"exec\",\"arguments\":\"{\\\"cmd\\\":\\\"cat a\\\"}\"}},{\"id\":\"c2\",",
+        ),
+        "the turn's thinking, words and calls are one message: " + req,
+    );
+    std::test::assert(
+        std::str::contains(
+            req,
+            "\"cat b\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"A\"},{\"role\":\"tool\",\"tool_call_id\":\"c2\",\"content\":\"B\"},",
+        ),
+        "the calls' outputs follow it as tool messages: " + req,
+    );
+    std::test::assert(
+        std::str::contains(
+            req,
+            "{\"role\":\"assistant\",\"content\":null,\"reasoning_content\":\"Again.\",\"tool_calls\":[{\"id\":\"c3\"",
+        ),
+        "a turn of calls alone says nothing: " + req,
+    );
+    std::test::assert(
+        std::str::contains(
+            req,
+            "{\"role\":\"tool\",\"tool_call_id\":\"c3\",\"content\":\"C\"},{\"role\":\"assistant\",\"content\":\"Done.\"},{\"role\":\"user\",\"content\":\"thanks\"}]",
+        ),
+        "a closing answer is a message of its own: " + req,
+    );
+    std::test::assert_eq_int(
+        count_of(req, "\"role\":\"assistant\""),
+        3,
+        "three turns, three assistant messages",
+    );
+
+    let away = node::compat_request(AGENT, hosted());
+    std::test::assert(
+        !std::str::contains(away, "reasoning_content"),
+        "a hosted upstream is not given the thinking back: " + away,
+    );
+    std::test::assert(
+        std::str::contains(
+            away,
+            "{\"role\":\"assistant\",\"content\":\"Reading it now.\",\"tool_calls\":[{\"id\":\"c1\"",
+        ),
+        "but its turn is still one message: " + away,
+    );
+
+    let back_to_back = node::compat_request(
+        "{\"model\": \"coder\", \"input\": [{\"role\": \"user\", \"content\": \"go\"}, {\"type\": \"function_call\", \"call_id\": \"a\", \"name\": \"f\", \"arguments\": \"{}\"}, {\"type\": \"reasoning\", \"content\": [{\"type\": \"reasoning_text\", \"text\": \"next\"}]}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": \"then\"}]}",
+        managed(),
+    );
+    std::test::assert(
+        std::str::contains(
+            back_to_back,
+            "\"tool_calls\":[{\"id\":\"a\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]},{\"role\":\"assistant\",\"content\":\"then\",\"reasoning_content\":\"next\"}]",
+        ),
+        "thinking after a turn's calls begins the next turn: " + back_to_back,
+    );
+
+    // thinking off: the template told so, and the history is as it is
+    let off = node::compat_request(
+        "{\"model\": \"coder\", \"input\": \"hi\", \"reasoning\": {\"effort\": \"none\"}}",
+        managed(),
+    );
+    std::test::assert(
+        std::str::contains(off, "\"chat_template_kwargs\":{\"enable_thinking\":false}"),
+        "reasoning off reaches the template: " + off,
+    );
+
+    // usage: TensorFold's and vLLM's shape
+    let tf = play(
+        chunk("{\"reasoning_content\":\"think\"}", "", "") + chunk("{\"content\":\"hi\"}", "", "")
+            + chunk(
+                "{}",
+                "stop",
+                ",\"usage\":{\"prompt_tokens\":173865,\"completion_tokens\":900,\"prompt_tokens_details\":{\"cached_tokens\":169984},\"completion_tokens_details\":{\"reasoning_tokens\":700}}",
+            )
+            + "data: [DONE]\n\n",
+    );
+    std::test::assert_eq_str(tf.outcome, "served", "served: " + tf.failure);
+    std::test::assert(
+        std::str::contains(
+            usage_of(tf),
+            "\"input_tokens\":173865,\"output_tokens\":900,\"total_tokens\":174765,\"input_tokens_details\":{\"cached_tokens\":169984},\"output_tokens_details\":{\"reasoning_tokens\":700}",
+        ),
+        "the engine's cached and thinking tokens reach usage: " + usage_of(tf),
+    );
+    std::test::assert(
+        std::str::contains(usage_of(tf), "\"prompt_cache_key\":\"conv-9\""),
+        "and the response names the caller's prompt_cache_key: " + usage_of(tf),
+    );
+
+    // llama-server's: its timings, apart from its usage
+    let llama = play(
+        chunk("{\"content\":\"hi\"}", "", "")
+            + chunk(
+                "{}",
+                "stop",
+                ",\"timings\":{\"cache_n\":4096,\"prompt_n\":12},\"usage\":{\"prompt_tokens\":4108,\"completion_tokens\":3}",
+            )
+            + "data: [DONE]\n\n",
+    );
+    std::test::assert(
+        std::str::contains(
+            usage_of(llama),
+            "\"input_tokens_details\":{\"cached_tokens\":4096},\"output_tokens_details\":{\"reasoning_tokens\":0}",
+        ),
+        "llama-server's cache_n is the cached input: " + usage_of(llama),
+    );
+
+    // none said: nothing cached, and the thinking's share of the output
+    let quiet = play(
+        chunk("{\"reasoning_content\":\"abcdefgh\"}", "", "")
+            + chunk("{\"content\":\"ab\"}", "", "")
+            + chunk("{}", "stop", ",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}")
+            + "data: [DONE]\n\n",
+    );
+    std::test::assert(
+        std::str::contains(
+            usage_of(quiet),
+            "\"input_tokens_details\":{\"cached_tokens\":0},\"output_tokens_details\":{\"reasoning_tokens\":4}",
+        ),
+        "an engine that counts no thinking has it counted from the split: " + usage_of(quiet),
+    );
+}

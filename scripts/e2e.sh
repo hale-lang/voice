@@ -809,12 +809,12 @@ for i in $(seq 1 100); do
   sleep 0.2
 done
 routed mini/steady
-# with a brain, two idle seats are ranked with a little jitter, so either
-# may be offered first: ask again each tick until laptop's is (mini's
-# answers at once)
+# a request that names no conversation is offered first the seat its
+# opening's derived key hashes to: ask with another opening each tick until
+# laptop's is (mini's answers at once)
 for try in $(seq 1 12); do
   t0=$(date +%s%N)
-  out=$(responds)
+  out=$(curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi '"$try"'"}' || true)
   ms=$(( ($(date +%s%N) - t0) / 1000000 ))
   echo "$out" | python3 -c 'import json, sys; sys.exit(0 if json.load(sys.stdin)["voice"]["attempts"][0]["seat"] == "laptop/static" else 1)' 2>/dev/null && break
   sleep 1

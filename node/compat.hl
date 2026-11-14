@@ -169,6 +169,17 @@ fn thought_text(item: String) -> String {
     return out;
 }
 
+/// A `function_call` input item's arguments as text: its string, or, from a
+/// caller that sent them as an object, that object's text; "" for none.
+fn call_arguments(item: String) -> String {
+    let args = std::json::string_field(item, "arguments");
+    if args.kind == "string" { return args.text; }
+    if args.kind == "object" {
+        return std::str::trim(std::json::find_field_raw(item, "arguments"));
+    }
+    return "";
+}
+
 /// One assistant turn as one chat message: what it said (`said`, `null`
 /// when it only called tools), its thinking as `reasoning_content` when
 /// `thinking` (a managed seat's server, whose template renders it back
@@ -200,7 +211,11 @@ fn assistant_turn(
 /// as two, each with its own close of the thinking block and an end of
 /// turn between them, and the model learns from its own history to write
 /// a second close after its words. A `function_call_output` is a `tool`
-/// message.
+/// message. Each past call's arguments are given as `history_args` makes
+/// them (tool_args.hl): a template parses them again, and arguments it
+/// cannot parse (a number no double holds, written by a model in an
+/// earlier turn) would fail every later turn of the conversation; valid
+/// ones are given byte for byte.
 @unbounded
 fn compat_request(body: String, c: CompatConfig) -> String {
     let mut messages = "";
@@ -252,7 +267,7 @@ fn compat_request(body: String, c: CompatConfig) -> String {
                     + q(std::json::find_string_field(it.element, "call_id"))
                     + ",\"type\":\"function\",\"function\":{\"name\":"
                     + q(std::json::find_string_field(it.element, "name")) + ",\"arguments\":"
-                    + q(std::json::find_string_field(it.element, "arguments")) + "}}";
+                    + q(history_args(call_arguments(it.element))) + "}}";
             } else {
                 let turn = assistant_turn(thought, said, spoke, calls, c.managed);
                 if len(turn) > 0 { messages = add_message(messages, turn); }
@@ -690,6 +705,19 @@ locus Upstream {
         call_args: String = "";
         calls: Int = 0;
         args_len: Int = 0;
+        // the call's arguments as the engine wrote them, their repair as
+        // they come (tool_args.hl), how many of its fragments carried
+        // any, and its events held back until a second one did: an
+        // engine that sends a call whole (TensorFold) has sent nothing of
+        // it the caller saw when its arguments prove not JSON, so the
+        // attempt fails and another seat may serve the request
+        call_raw: String = "";
+        call_scan: ArgsScanner = ArgsScanner { };
+        call_frags: Int = 0;
+        call_held: String = "";
+        // the calls whose arguments were repaired, each its call id, name
+        // and arguments as the engine wrote them, as a list body
+        repairs: String = "";
     }
 
     /// The next event's payload, "" when there is none (the caller asks
@@ -936,24 +964,72 @@ locus Upstream {
         return out;
     }
 
-    /// The events that close the tool call being built, when there is one.
+    /// The events that close the tool call being built, when there is one;
+    /// `complete` unless the model was cut off by the output cap. Its
+    /// arguments are checked whole (tool_args.hl), their repair as they
+    /// came ended: as repaired when that makes them one JSON object, which
+    /// every delta already carried. Arguments that are not one, from an
+    /// answer the model finished: when nothing of the call has left the
+    /// node (`call_frags` under 2), the run fails, so the attempt may go to
+    /// another seat; when its deltas have, the call ends with its text kept
+    /// as one (`unparsed_args`) if its tool takes members its parameters do
+    /// not name, else the run fails, after output. A call the output cap
+    /// cut off is `incomplete`, its arguments as far as they came.
     @unbounded
-    fn close_call() -> String {
+    fn close_call(complete: Bool) -> String {
         if self.call_at < 0 { return ""; }
+        let tail = self.call_scan.flush();
+        self.call_args = self.call_args + tail;
+        let mut out = self.call_held;
+        self.call_held = "";
+        let mut status = "completed";
+        if complete && blank_args(self.call_args) {
+            // a call with no arguments at all: an empty object, as a call
+            // of a tool that takes none is
+            self.call_args = self.call_args + "{}";
+            out = out + self.args_delta("{}");
+        } else if len(tail) > 0 {
+            out = out + self.args_delta(tail);
+        }
+        let verdict = args_verdict(self.call_args);
+        if !complete && verdict == "bad" {
+            status = "incomplete";
+        } else if verdict == "bad" {
+            if self.call_frags < 2 || !tool_takes_more(self.req, self.call_name) {
+                self.failure = "the engine wrote the arguments of its call of `" + self.call_name
+                    + "` as something other than a JSON object"
+                    + (if self.call_frags < 2 {
+                        ""
+                    } else {
+                        ", after they began to stream, and the tool takes no members its parameters do not name"
+                    });
+                self.done = true;
+                self.call_at = -1;
+                return "";
+            }
+            self.call_args = unparsed_args(self.call_raw);
+        }
+        if self.call_args != self.call_raw {
+            self.repairs = self.repairs + (if len(self.repairs) > 0 { "," } else { "" })
+                + "{\"call_id\":" + q(self.call_id) + ",\"name\":" + q(self.call_name)
+                + ",\"arguments\":" + q(mended_utf8(self.call_raw)) + "}";
+        }
         let item = function_call_item(
             self.call_item,
             self.call_id,
             self.call_name,
             self.call_args,
-            "completed",
+            status,
         );
         self.done_items = self.done_items + (if len(self.done_items) > 0 { "," } else { "" })
             + item;
-        let out = line(
-            "{\"type\":\"response.function_call_arguments.done\",\"item_id\":" + q(self.call_item)
-                + ",\"output_index\":" + to_string(self.call_out) + ",\"arguments\":"
-                + q(self.call_args) + ",\"sequence_number\":" + to_string(self.seq) + "}",
-        )
+        out = out
+            + line(
+                "{\"type\":\"response.function_call_arguments.done\",\"item_id\":"
+                    + q(self.call_item) + ",\"output_index\":" + to_string(self.call_out)
+                    + ",\"arguments\":" + q(self.call_args) + ",\"sequence_number\":"
+                    + to_string(self.seq) + "}",
+            )
             + line(
                 "{\"type\":\"response.output_item.done\",\"output_index\":"
                     + to_string(self.call_out) + ",\"item\":" + item + ",\"sequence_number\":"
@@ -964,9 +1040,22 @@ locus Upstream {
         return out;
     }
 
+    /// The delta event of `piece` of the call's arguments, numbered.
+    fn args_delta(piece: String) -> String {
+        let out = line(
+            "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":"
+                + q(self.call_item) + ",\"output_index\":" + to_string(self.call_out)
+                + ",\"delta\":" + q(piece) + ",\"sequence_number\":" + to_string(self.seq) + "}",
+        );
+        self.seq = self.seq + 1;
+        return out;
+    }
+
     /// One fragment of an upstream tool call: a new index opens a call (the
     /// one before it is whole), and its argument text is relayed as it
-    /// arrives. The upstream sends calls in index order.
+    /// arrives, repaired as it comes (`ArgsScanner`). The upstream sends
+    /// calls in index order. A call's events are held back until a second
+    /// of its fragments carries arguments (`close_call`).
     @unbounded
     fn tool_fragment(f: String) -> String {
         let at = std::json::string_field(f, "index");
@@ -985,7 +1074,8 @@ locus Upstream {
                 return "";
             }
             out = self.preamble() + self.close_thought() + self.close_text("completed")
-                + self.close_call();
+                + self.close_call(true);
+            if len(self.failure) > 0 { return out; }
             self.call_at = idx;
             self.call_out = self.nout;
             self.nout = self.nout + 1;
@@ -999,19 +1089,21 @@ locus Upstream {
             };
             self.call_name = name;
             self.call_args = "";
-            out = out
-                + line(
-                    "{\"type\":\"response.output_item.added\",\"output_index\":"
-                        + to_string(self.call_out) + ",\"item\":"
-                        + function_call_item(
-                            self.call_item,
-                            self.call_id,
-                            self.call_name,
-                            "",
-                            "in_progress",
-                        )
-                        + ",\"sequence_number\":" + to_string(self.seq) + "}",
-                );
+            self.call_raw = "";
+            self.call_frags = 0;
+            self.call_scan.reset();
+            self.call_held = line(
+                "{\"type\":\"response.output_item.added\",\"output_index\":"
+                    + to_string(self.call_out) + ",\"item\":"
+                    + function_call_item(
+                        self.call_item,
+                        self.call_id,
+                        self.call_name,
+                        "",
+                        "in_progress",
+                    )
+                    + ",\"sequence_number\":" + to_string(self.seq) + "}",
+            );
             self.seq = self.seq + 1;
         } else if len(name) > 0 && len(self.call_name) == 0 {
             self.call_name = name;
@@ -1026,16 +1118,18 @@ locus Upstream {
             ""
         };
         if len(args) > 0 {
-            self.call_args = self.call_args + args;
+            self.call_raw = self.call_raw + args;
             self.args_len = self.args_len + len(args);
-            out = out
-                + line(
-                    "{\"type\":\"response.function_call_arguments.delta\",\"item_id\":"
-                        + q(self.call_item) + ",\"output_index\":" + to_string(self.call_out)
-                        + ",\"delta\":" + q(args) + ",\"sequence_number\":" + to_string(self.seq)
-                        + "}",
-                );
-            self.seq = self.seq + 1;
+            self.call_frags = self.call_frags + 1;
+            let piece = self.call_scan.feed(args);
+            self.call_args = self.call_args + piece;
+            let delta = if len(piece) > 0 { self.args_delta(piece) } else { "" };
+            if self.call_frags < 2 {
+                self.call_held = self.call_held + delta;
+            } else {
+                out = out + self.call_held + delta;
+                self.call_held = "";
+            }
         }
         return out;
     }
@@ -1074,6 +1168,11 @@ locus Upstream {
         if !self.began { return compat_failed(self.cfg, served, "the upstream sent no output"); }
         let complete = self.finish_reason != "length";
         let state = if complete { "completed" } else { "incomplete" };
+        // a call still open is whole now, and is checked: its arguments may
+        // fail the run (a call open means the message and the thinking are
+        // closed already, so this comes first in the script as it is)
+        let call_tail = self.close_call(complete);
+        if len(self.failure) > 0 { return compat_failed(self.cfg, served, self.failure); }
         let input = if self.input < 0 { tokens_of(input_chars(self.req)) } else { self.input };
         let output = if self.output < 0 {
             // thinking is output too, as the upstream counts it
@@ -1083,7 +1182,7 @@ locus Upstream {
         };
         let cached = self.cached_of(input);
         let reasoning = self.reasoning_of(output);
-        let tail = self.close_thought() + self.close_text(state) + self.close_call();
+        let tail = self.close_thought() + self.close_text(state) + call_tail;
         let end = line(
             "{\"type\":" + q(if complete { "response.completed" } else { "response.incomplete" })
                 + ",\"response\":"
@@ -1104,7 +1203,8 @@ locus Upstream {
             model: if len(self.ran) > 0 { self.ran } else { served },
             input_tokens: input,
             output_tokens: output,
-            cost_micros: compat_cost(self.cfg, input, output)
+            cost_micros: compat_cost(self.cfg, input, output),
+            repairs: self.repairs
         };
     }
 }
@@ -1146,6 +1246,7 @@ fn drain(up: Upstream) -> StaticRun {
         input_tokens: end.input_tokens,
         output_tokens: end.output_tokens,
         cost_micros: end.cost_micros,
+        repairs: end.repairs,
     };
 }
 

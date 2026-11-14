@@ -39,6 +39,8 @@ NERVES_PORT=${NERVES_PORT:-14297}
 NOHEAD_PORT=${NOHEAD_PORT:-14300}
 DECIDE_PORT=${DECIDE_PORT:-14301}
 KEPT_PORT=${KEPT_PORT:-14302}
+# the tool-argument case's strict upstream (14303 is the attempts case's git daemon)
+STRICT_PORT=${STRICT_PORT:-14304}
 work=$(mktemp -d)
 container=""
 org_container="voice-e2e-org-$$"
@@ -591,6 +593,72 @@ assert "response.function_call_arguments.delta" in names and names[-1] == "respo
 assert "error" not in names, names
 PY
 echo "a seat quiet 18 s past its first output, past the 10 s idle span, its engine sending keep-alives: waited for, its call served"
+
+# tool call arguments: an engine whose model writes a number no double holds
+# (`58e595`) has its call reach the caller repaired, in the done events and
+# the response, the repair in the ledger; a conversation whose history holds
+# the call as the model wrote it is served (the engine, as strict as
+# llama-server, fails a request whose past arguments it cannot parse), on
+# both wires; and a request every seat fails is a `failed` row with its
+# attempts
+python3 scripts/strict-upstream.py "$STRICT_PORT" "$work/strict-upstream.log" &
+pids+=($!)
+for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$STRICT_PORT") 2>/dev/null && break; sleep 0.1; done
+post /admin/v1/models '{"id": "strict-1"}' >/dev/null
+stoken=$(post /admin/v1/nodes '{"id": "strict"}' | field enrollment_token)
+post /admin/v1/nodes/strict/seats '{"id": "up", "engine": "openai-compatible", "account": "static", "serves": [{"model": "strict-1"}], "config": {"base_url": "http://127.0.0.1:'"$STRICT_PORT"'/v1", "model": "stub-7b"}}' >/dev/null
+echo '{"engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/strict-caps.json"
+node/node --id strict --api "$api" --token "$stoken" --data "$work/strict-data" --capabilities "$work/strict-caps.json" --port "$((QUIET_PORT + 4))" --readings-port "$((QUIET_PORT + 1004))" >"$work/strict.log" 2>&1 &
+pids+=($!)
+for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/strict/seats/up" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
+tools='"tools": [{"type": "function", "name": "write_stdin", "parameters": {"type": "object", "properties": {"session_id": {"type": "number"}, "chars": {"type": "string"}}}}]'
+curl -s -N --max-time 30 -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "strict-1", "input": "type it", "stream": true, '"$tools"'}' >"$work/strict.sse"
+strict_id=$(python3 - "$work/strict.sse" <<'PY' || { echo "a call whose arguments a double cannot read did not reach the caller repaired: $(head -c 800 "$work/strict.sse")"; tail -5 "$work/strict.log"; exit 1; }
+import json, sys
+events = [json.loads(l[6:]) for l in open(sys.argv[1]).read().split("\n") if l.startswith("data: {")]
+fixed = '{"session_id":"58e595","chars":""}'
+done = [e for e in events if e["type"] == "response.function_call_arguments.done"]
+assert done and done[0]["arguments"] == fixed, done
+item = [e for e in events if e["type"] == "response.output_item.done" and e["item"]["type"] == "function_call"]
+assert item and item[0]["item"]["arguments"] == fixed, item
+deltas = "".join(e["delta"] for e in events if e["type"] == "response.function_call_arguments.delta")
+assert deltas == fixed, deltas
+end = events[-1]
+assert end["type"] == "response.completed", end["type"]
+assert [o["arguments"] for o in end["response"]["output"] if o["type"] == "function_call"] == [fixed], end
+print(end["response"]["voice"]["request_id"])
+PY
+)
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage/$strict_id" | python3 -c 'import json,sys; u=json.load(sys.stdin); assert u["tool_arguments_repaired"] is True and u["status"] == "served", u' \
+  || { echo "the repair is not in the ledger"; exit 1; }
+poisoned='{"session_id":58e595,"chars":""}'
+history=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$poisoned")
+code=$(curl -s -o "$work/strict-again.json" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' \
+  -d '{"model": "strict-1", "input": [{"role": "user", "content": "type it"}, {"type": "function_call", "call_id": "call_s", "name": "write_stdin", "arguments": '"$history"'}, {"type": "function_call_output", "call_id": "call_s", "output": "ok"}, {"role": "user", "content": "again"}], '"$tools"'}')
+[ "$code" = 200 ] || { echo "a conversation holding the call as the model wrote it failed ($code): $(cat "$work/strict-again.json")"; exit 1; }
+code=$(curl -s -o "$work/strict-chat.json" -w '%{http_code}' -X POST "$api/v1/chat/completions" -H "authorization: Bearer $key" -H 'content-type: application/json' \
+  -d '{"model": "strict-1", "messages": [{"role": "user", "content": "type it"}, {"role": "assistant", "content": null, "tool_calls": [{"id": "call_s", "type": "function", "function": {"name": "write_stdin", "arguments": '"$history"'}}]}, {"role": "tool", "tool_call_id": "call_s", "content": "ok"}, {"role": "user", "content": "again"}], "tools": [{"type": "function", "function": {"name": "write_stdin"}}]}')
+[ "$code" = 200 ] || { echo "a chat conversation holding the call as the model wrote it failed ($code): $(cat "$work/strict-chat.json")"; exit 1; }
+python3 -c 'import json,sys; m=json.load(open(sys.argv[1]))["choices"][0]["message"]; assert m["tool_calls"][0]["function"]["arguments"] == "{\"session_id\":\"58e595\",\"chars\":\"\"}", m' "$work/strict-chat.json" \
+  || { echo "the chat message's call is not repaired: $(cat "$work/strict-chat.json")"; exit 1; }
+grep -q ':\\"58e595\\"' "$work/strict-upstream.log" && ! grep -q ':58e595' "$work/strict-upstream.log" \
+  || { echo "the engine was sent the call unrepaired: $(tail -c 800 "$work/strict-upstream.log")"; exit 1; }
+code=$(curl -s -o "$work/strict-fail.json" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $key" -H 'content-type: application/json' -d '{"model": "strict-1", "input": "fail"}')
+[ "$code" = 502 ] || { echo "a request every seat failed was not 502 ($code): $(cat "$work/strict-fail.json")"; exit 1; }
+fail_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["error"]["voice"]["request_id"])' "$work/strict-fail.json")
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage/$fail_id" | python3 -c '
+import json, sys
+u = json.load(sys.stdin)
+assert u["status"] == "failed" and u["resolved_model"] == "strict-1", u
+assert u["input_tokens_estimated"] is True and u["input_tokens"] > 0, u
+assert len(u["attempts"]) == 1 and u["attempts"][0]["outcome"] == "failed" and "503" in u["attempts"][0]["error"], u
+' || { echo "a request every seat failed has no failed row: $(curl -H @"$work/admin.h" -sS "$api/admin/v1/usage/$fail_id")"; exit 1; }
+curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage?model=strict-1&limit=40" | FAIL_ID="$fail_id" python3 -c '
+import json, sys, os
+ids = [r["id"] for r in json.load(sys.stdin)["data"]]
+assert os.environ["FAIL_ID"] in ids, ids
+' || { echo "the failed row is not listed"; exit 1; }
+echo "a call a double cannot read reached the caller repaired and recorded so; its conversation is served again on both wires; a request every seat failed is a failed row"
 
 # annotations queued on NATS: four requests of a project that annotates,
 # their annotations at once on a decision seat that takes one at a time, each stage a

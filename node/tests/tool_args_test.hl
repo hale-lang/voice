@@ -1,0 +1,408 @@
+// A tool call's arguments, checked and repaired (tool_args.hl): a number
+// no double holds becomes a string of its text, and so do NaN and the
+// infinities; valid arguments are never changed by a byte; a past call's
+// arguments reach the engine as one JSON object it can parse; and an
+// engine's call is repaired as it streams, the repair in its final events
+// and recorded, or failed when it is not JSON.
+import ".." as node;
+
+fn chunk(delta: String, finish: String) -> String {
+    return "data: {\"model\":\"coder\",\"choices\":[{\"index\":0,\"delta\":" + delta
+        + ",\"finish_reason\":"
+        + (if len(finish) > 0 { "\"" + finish + "\"" } else { "null" }) + "}]}\n\n";
+}
+
+/// A fragment of call 0: its id and name when `open`, and `args`.
+fn call(open: Bool, args: String) -> String {
+    return chunk(
+        "{\"tool_calls\":[{\"index\":0"
+            + (if open { ",\"id\":\"call_1\",\"type\":\"function\"" } else { "" })
+            + ",\"function\":{" + (if open { "\"name\":\"write_stdin\"," } else { "" })
+            + "\"arguments\":" + node::q(args) + "}}]}",
+        "",
+    );
+}
+
+fn ended() -> String {
+    return chunk("{}", "tool_calls") + "data: [DONE]\n\n";
+}
+
+fn hosted() -> node::CompatConfig {
+    return node::compat_config("{\"base_url\": \"http://127.0.0.1:1/v1\", \"model\": \"coder\"}");
+}
+
+const LOOSE: String = "{\"model\": \"coder\", \"input\": \"go\", \"tools\": [{\"type\": \"function\", \"name\": \"write_stdin\", \"parameters\": {\"type\": \"object\", \"properties\": {\"session_id\": {\"type\": \"number\"}}}}]}";
+const STRICT: String = "{\"model\": \"coder\", \"input\": \"go\", \"tools\": [{\"type\": \"function\", \"name\": \"write_stdin\", \"parameters\": {\"type\": \"object\", \"properties\": {\"session_id\": {\"type\": \"number\"}}, \"additionalProperties\": false}}]}";
+
+/// The events the upstream's `sse` makes, as the slot publishes them
+/// (each chunk's as it comes), and how the run ends.
+type Played { events: String = ""; run: node::StaticRun = node::StaticRun { }; }
+
+fn play(body: String, sse: String) -> Played {
+    let up = node::upstream_for("resp_a1", "coder", body, hosted(), 200, sse);
+    let mut events = "";
+    while !up.done {
+        let d = up.next_data();
+        if len(d) > 0 { events = events + up.feed(d); }
+    }
+    let run = up.finish();
+    return Played { events: events + run.script, run: run };
+}
+
+fn count_of(s: String, part: String) -> Int {
+    let mut n = 0;
+    let mut at = std::str::index_of(s, part);
+    while at >= 0 {
+        n = n + 1;
+        at = std::str::index_of_from(s, part, at + len(part));
+    }
+    return n;
+}
+
+/// The arguments the deltas of `events` carry, joined.
+fn joined_deltas(events: String) -> String {
+    let mut out = "";
+    let mut it = std::str::index_of(events, "\n");
+    let mut from = 0;
+    while it >= 0 {
+        let ev = events[from..it];
+        if std::json::find_string_field(ev, "type") == "response.function_call_arguments.delta" {
+            out = out + std::json::find_string_field(ev, "delta");
+        }
+        from = it + 1;
+        it = std::str::index_of_from(events, "\n", from);
+    }
+    return out;
+}
+
+fn nested(depth: Int) -> String {
+    let mut open = "";
+    let mut close = "";
+    let mut i = 0;
+    while i < depth {
+        open = open + "{\"a\":";
+        close = close + "}";
+        i = i + 1;
+    }
+    return open + "1" + close;
+}
+
+fn validator() {
+    // numbers past a double's range, either way
+    std::test::assert(!node::finite_literal("58e595"), "58e595 overflows");
+    std::test::assert(!node::finite_literal("-58e595"), "and so does its negative");
+    std::test::assert(!node::finite_literal("1e309"), "1e309 overflows");
+    std::test::assert(!node::finite_literal("1000e306"), "so does 1000e306");
+    std::test::assert(!node::finite_literal("0.1e310"), "and 0.1e310");
+    std::test::assert(
+        !node::finite_literal(
+            "1"
+                + "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        ),
+        "a 400-digit integer overflows",
+    );
+    std::test::assert(!node::finite_literal("1e99999999999999999999999999"), "a huge exponent");
+    // and the edge: the largest double, and the least value past it
+    std::test::assert(node::finite_literal("1.7976931348623157e308"), "the largest double");
+    std::test::assert(node::finite_literal("1.7976931348623158e308"), "which this reads as");
+    std::test::assert(
+        node::finite_literal("-1.79769313486231580793e308"),
+        "just under the midpoint past it",
+    );
+    std::test::assert(
+        !node::finite_literal("1.797693134862315808e308"),
+        "just past the midpoint, infinity",
+    );
+    std::test::assert(
+        !node::finite_literal(
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497792",
+        ),
+        "the midpoint itself rounds to infinity",
+    );
+    std::test::assert(
+        node::finite_literal(
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819860834936475292719074168444365510704342711559699508093042880177904174497791",
+        ),
+        "one less does not",
+    );
+    // huge exponents that still fit
+    std::test::assert(node::finite_literal("1e308"), "1e308 fits");
+    std::test::assert(node::finite_literal("100e306"), "100e306 fits");
+    std::test::assert(node::finite_literal("0.000001e313"), "0.000001e313 fits");
+    std::test::assert(node::finite_literal("1e-99999"), "a tiny number reads as zero");
+    std::test::assert(node::finite_literal("0e99999999999999"), "zero, whatever its exponent");
+    std::test::assert(
+        node::finite_literal("123456789012345678901234567890"),
+        "a long integer a double rounds",
+    );
+    // NaN-like words, and numbers past range, are strings once settled
+    std::test::assert_eq_str(node::settled_scalar("NaN"), "\"NaN\"", "NaN");
+    std::test::assert_eq_str(node::settled_scalar("Infinity"), "\"Infinity\"", "Infinity");
+    std::test::assert_eq_str(node::settled_scalar("-Infinity"), "\"-Infinity\"", "-Infinity");
+    std::test::assert_eq_str(node::settled_scalar("58e595"), "\"58e595\"", "58e595");
+    std::test::assert_eq_str(node::settled_scalar("1e5"), "1e5", "a number in range stays");
+    std::test::assert_eq_str(node::settled_scalar("true"), "true", "a literal stays");
+    std::test::assert(!node::number_literal("01"), "a leading zero is no JSON number");
+    std::test::assert(!node::number_literal("1."), "nor is a bare point");
+    std::test::assert(!node::number_literal("-"), "nor a lone minus");
+
+    // verdicts as written
+    std::test::assert_eq_str(node::args_verdict("{\"a\": 1}"), "ok", "an object");
+    std::test::assert_eq_str(
+        node::args_verdict("{\"session_id\":58e595}"),
+        "bad",
+        "a number no double holds",
+    );
+    std::test::assert_eq_str(node::args_verdict("{\"a\": NaN}"), "bad", "NaN");
+    std::test::assert_eq_str(node::args_verdict("[1]"), "bad", "a list is no object");
+    std::test::assert_eq_str(node::args_verdict("{\"a\": "), "bad", "cut off");
+    std::test::assert_eq_str(node::args_verdict(nested(64)), "ok", "64 levels deep");
+    std::test::assert_eq_str(node::args_verdict(nested(200)), "deep", "past them, not judged");
+    let raw_ff = std::str::from_bytes(b"{\"a\": \"x\xff\"}");
+    std::test::assert_eq_str(node::args_verdict(raw_ff), "bad", "a byte that is not UTF-8");
+
+    // repairs
+    std::test::assert_eq_str(
+        node::args_repaired("{\"session_id\":58e595,\"chars\":\"\",\"yield_time_ms\":1000}"),
+        "{\"session_id\":\"58e595\",\"chars\":\"\",\"yield_time_ms\":1000}",
+        "the overflowing number becomes its text",
+    );
+    std::test::assert_eq_str(
+        node::args_repaired(
+            "{\"a\":NaN,\"b\":[-Infinity, Infinity],\"c\":-1e999,\"d\":\"58e595\"}",
+        ),
+        "{\"a\":\"NaN\",\"b\":[\"-Infinity\", \"Infinity\"],\"c\":\"-1e999\",\"d\":\"58e595\"}",
+        "NaN, the infinities and negative overflow; a string is left alone",
+    );
+    std::test::assert_eq_str(
+        node::args_repaired("{\"s\":\"line\nnext\ttab\"}"),
+        "{\"s\":\"line\\nnext\\ttab\"}",
+        "a raw control character in a string is escaped",
+    );
+    std::test::assert_eq_str(
+        node::args_repaired(raw_ff),
+        "{\"a\": \"x" + std::json::unescape_string("\\ufffd") + "\"}",
+        "a byte that is not UTF-8 is U+FFFD",
+    );
+    // valid arguments, byte for byte
+    let valid = "{ \"cmd\" :  [\"ls\", \"-la\"], \"n\": 1.5e308, \"m\": -0.0e-5, \"t\": true, \"u\": \"\\u00e9\\n\", \"deep\": "
+        + nested(30) + " }";
+    std::test::assert_eq_str(node::args_repaired(valid), valid, "valid text is repaired to itself");
+    std::test::assert_eq_str(node::history_args(valid), valid, "and given back as it is");
+    std::test::assert_eq_str(node::history_args(nested(200)), nested(200), "deep, as it is");
+
+    // the history: repaired, kept as text, or an empty object
+    std::test::assert_eq_str(
+        node::history_args("{\"session_id\":58e595}"),
+        "{\"session_id\":\"58e595\"}",
+        "a past call's overflowing number",
+    );
+    std::test::assert_eq_str(
+        node::history_args("{\"cmd\": ls}"),
+        "{\"_unparsed_arguments\":\"{\\\"cmd\\\": ls}\"}",
+        "text that is not JSON is kept as a string",
+    );
+    std::test::assert_eq_str(node::history_args(""), "{}", "none at all");
+    std::test::assert_eq_str(
+        node::history_args("[1, 2]"),
+        "{\"_unparsed_arguments\":\"[1, 2]\"}",
+        "JSON that is no object",
+    );
+
+    // the scanner holds a number back across pieces until it ends
+    let s = node::ArgsScanner { };
+    std::test::assert_eq_str(s.feed("{\"session_id\":58"), "{\"session_id\":", "held");
+    std::test::assert_eq_str(s.feed("e5"), "", "still held");
+    std::test::assert_eq_str(
+        s.feed("95,\"chars\":\"58e595\"}"),
+        "\"58e595\",\"chars\":\"58e595\"}",
+        "settled where it ends",
+    );
+    std::test::assert_eq_str(s.flush(), "", "nothing left");
+    let t = node::ArgsScanner { };
+    std::test::assert_eq_str(t.feed("[1e400"), "[", "a number at the end");
+    std::test::assert_eq_str(t.flush(), "\"1e400\"", "is settled by the flush");
+    std::test::assert_eq_str(node::args_repaired("1" + nested(0)), "11", "a short number");
+}
+
+fn streaming() {
+    // llama-server's shape: the call opens, its arguments in fragments,
+    // the overflowing number cut across two of them
+    let p = play(
+        LOOSE,
+        call(true, "") + call(false, "{\"session_id\":58") + call(false, "e595,\"chars\":")
+            + call(false, "\"\"}") + ended(),
+    );
+    std::test::assert_eq_str(p.run.outcome, "served", "served: " + p.run.failure);
+    let fixed = "{\"session_id\":\"58e595\",\"chars\":\"\"}";
+    std::test::assert(
+        std::str::contains(
+            p.events,
+            "\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_a1_0\",\"output_index\":0,\"arguments\":"
+                + node::q(fixed),
+        ),
+        "the done event carries the repaired arguments: " + p.events,
+    );
+    std::test::assert(
+        std::str::contains(
+            p.events,
+            "\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc_a1_0\",\"call_id\":\"call_1\",\"name\":\"write_stdin\",\"arguments\":"
+                + node::q(fixed),
+        ),
+        "so does the item done",
+    );
+    let completed = p.events[std::str::index_of(p.events, "\"type\":\"response.completed\"")..len(
+        p.events,
+    )];
+    std::test::assert(
+        std::str::contains(completed, "\"arguments\":" + node::q(fixed)),
+        "and the response: " + completed,
+    );
+    std::test::assert_eq_str(joined_deltas(p.events), fixed, "the deltas join into it");
+    std::test::assert(!std::str::contains(p.events, ":58e595"), "the bare number never leaves");
+    std::test::assert_eq_str(
+        p.run.repairs,
+        "{\"call_id\":\"call_1\",\"name\":\"write_stdin\",\"arguments\":\"{\\\"session_id\\\":58e595,\\\"chars\\\":\\\"\\\"}\"}",
+        "the repair is recorded, with what the engine wrote",
+    );
+    std::test::assert(
+        std::str::contains(
+            node::result_message("resp_a1", p.run, 1, 2),
+            ",\"tool_arguments_repaired\":[{\"call_id\":\"call_1\"",
+        ),
+        "and the result carries it",
+    );
+
+    // valid arguments: as they came, no repair recorded
+    let v = play(
+        LOOSE,
+        call(true, "") + call(false, "{\"session_id\":") + call(false, "58,\"chars\":\"x\"}")
+            + ended(),
+    );
+    std::test::assert_eq_str(
+        joined_deltas(v.events),
+        "{\"session_id\":58,\"chars\":\"x\"}",
+        "valid arguments stream as they came",
+    );
+    std::test::assert_eq_str(v.run.repairs, "", "with no repair");
+    std::test::assert(
+        !std::str::contains(node::result_message("resp_a1", v.run, 1, 2), "repaired"),
+        "and the result says none",
+    );
+
+    // a call sent whole (TensorFold's way), repairable: served repaired
+    let w = play(LOOSE, call(true, "{\"session_id\":1e999}") + ended());
+    std::test::assert_eq_str(w.run.outcome, "served", "a whole call repaired: " + w.run.failure);
+    std::test::assert_eq_str(
+        joined_deltas(w.events),
+        "{\"session_id\":\"1e999\"}",
+        "its one delta repaired",
+    );
+
+    // a call sent whole that is not JSON: nothing of it leaves, the run fails
+    let bad = play(LOOSE, call(true, "{\"session_id\": 58, oops}") + ended());
+    std::test::assert_eq_str(bad.run.outcome, "failed", "a whole call that is not JSON fails");
+    std::test::assert(
+        std::str::contains(bad.run.failure, "`write_stdin`")
+            && std::str::contains(bad.run.failure, "other than a JSON object"),
+        "naming the call: " + bad.run.failure,
+    );
+    std::test::assert(
+        !std::str::contains(bad.events, "function_call"),
+        "and nothing of the call left the node, so another seat may serve it: " + bad.events,
+    );
+
+    // streamed, then not JSON: kept as text when its tool takes more members
+    let loose = play(
+        LOOSE,
+        call(true, "") + call(false, "{\"session_id\": ") + call(false, "58 oops}") + ended(),
+    );
+    std::test::assert_eq_str(loose.run.outcome, "served", "kept as text: " + loose.run.failure);
+    std::test::assert(
+        std::str::contains(
+            loose.events,
+            "\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_a1_0\",\"output_index\":0,\"arguments\":"
+                + node::q("{\"_unparsed_arguments\":\"{\\\"session_id\\\": 58 oops}\"}"),
+        ),
+        "as one member of an object: " + loose.events,
+    );
+    // and failed, after output, when the tool takes no other members
+    let strict = play(
+        STRICT,
+        call(true, "") + call(false, "{\"session_id\": ") + call(false, "58 oops}") + ended(),
+    );
+    std::test::assert_eq_str(strict.run.outcome, "failed", "a strict tool's call fails");
+    std::test::assert(
+        std::str::contains(strict.run.failure, "takes no members its parameters do not name"),
+        "saying why: " + strict.run.failure,
+    );
+    std::test::assert(
+        std::str::contains(strict.events, "response.function_call_arguments.delta"),
+        "its deltas had left (so the caller is told the response failed)",
+    );
+
+    // cut off by the output cap: incomplete, as far as it came
+    let cut = play(
+        LOOSE,
+        call(true, "") + call(false, "{\"session_id\": ") + call(false, "58, \"ch")
+            + chunk("{}", "length") + "data: [DONE]\n\n",
+    );
+    std::test::assert_eq_str(cut.run.outcome, "incomplete", "a cut-off call: " + cut.run.failure);
+    std::test::assert(
+        std::str::contains(cut.events, "\"status\":\"incomplete\"")
+            && std::str::contains(
+                cut.events,
+                "\"arguments\":" + node::q("{\"session_id\": 58, \"ch")
+                    + ",\"status\":\"incomplete\"",
+            ),
+        "its item incomplete, its arguments as far as they came: " + cut.events,
+    );
+
+    // no arguments at all: an empty object
+    let none = play(LOOSE, call(true, "") + ended());
+    std::test::assert_eq_str(none.run.outcome, "served", "a call with none: " + none.run.failure);
+    std::test::assert_eq_str(joined_deltas(none.events), "{}", "is an empty object");
+    std::test::assert_eq_int(
+        count_of(none.events, "\"type\":\"response.output_item.added\""),
+        1,
+        "opened once",
+    );
+}
+
+fn history() {
+    // a conversation a model poisoned: its call reaches the engine repaired,
+    // the valid one beside it byte for byte, on both a hosted upstream's
+    // path and a managed seat's one-message turns
+    let body = "{\"model\": \"coder\", \"input\": [{\"role\": \"user\", \"content\": \"go\"}, {\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"on it\"}]}, {\"type\": \"function_call\", \"call_id\": \"c1\", \"name\": \"write_stdin\", \"arguments\": \"{\\\"session_id\\\":58e595,\\\"chars\\\":\\\"\\\"}\"}, {\"type\": \"function_call\", \"call_id\": \"c2\", \"name\": \"exec\", \"arguments\": \"{ \\\"cmd\\\" :  \\\"cat a\\\" }\"}, {\"type\": \"function_call_output\", \"call_id\": \"c1\", \"output\": \"ok\"}, {\"type\": \"function_call_output\", \"call_id\": \"c2\", \"output\": \"A\"}, {\"type\": \"function_call\", \"call_id\": \"c3\", \"name\": \"exec\", \"arguments\": {\"cmd\": \"ls\"}}, {\"type\": \"function_call_output\", \"call_id\": \"c3\", \"output\": \"B\"}]}";
+    let plain = node::compat_request(body, hosted());
+    let turns = node::compat_request(
+        body,
+        node::managed_compat("http://127.0.0.1:1/v1", "coder", "k"),
+    );
+    std::test::assert(
+        std::str::contains(
+            plain,
+            "\"arguments\":\"{\\\"session_id\\\":\\\"58e595\\\",\\\"chars\\\":\\\"\\\"}\"",
+        )
+            && std::str::contains(
+                turns,
+                "\"arguments\":\"{\\\"session_id\\\":\\\"58e595\\\",\\\"chars\\\":\\\"\\\"}\"",
+            ),
+        "the past call's arguments, repaired: " + plain,
+    );
+    std::test::assert(
+        std::str::contains(plain, "\"arguments\":\"{ \\\"cmd\\\" :  \\\"cat a\\\" }\"")
+            && std::str::contains(turns, "\"arguments\":\"{ \\\"cmd\\\" :  \\\"cat a\\\" }\""),
+        "valid ones byte for byte",
+    );
+    std::test::assert(
+        std::str::contains(plain, "\"arguments\":\"{\\\"cmd\\\": \\\"ls\\\"}\""),
+        "and arguments a caller sent as an object, as its text",
+    );
+}
+
+fn main() {
+    validator();
+    streaming();
+    history();
+}

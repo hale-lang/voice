@@ -250,7 +250,42 @@ fn stub_conn(s: std::io::tcp::Stream) {
         ) or discard;
         return;
     }
+    if std::str::starts_with(req, "POST /strict/chat/completions ") {
+        // as llama-server does: a past call's arguments its chat template
+        // cannot parse fail the whole request
+        if std::str::contains(req, ":58e595") {
+            answer(
+                s,
+                "500 Internal Server Error",
+                "{\"error\":{\"code\":500,\"message\":\"Failed to parse tool call arguments as JSON: [json.exception.out_of_range.406] number overflow parsing '58e595'\",\"type\":\"server_error\"}}",
+            );
+            return;
+        }
+        if !std::str::contains(req, "\"arguments\":\"{ \\\"cmd\\\" :  \\\"cat a\\\" }\"") {
+            answer(s, "400 Bad Request", "{\"error\":{\"message\":\"the valid call changed\"}}");
+            return;
+        }
+        s.send(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+                + sse(
+                    "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n\n",
+                    "",
+                    "stop",
+                ),
+        ) or discard;
+        return;
+    }
     answer(s, "503 Service Unavailable", "{\"error\":{\"message\":\"model is loading\"}}");
+}
+
+fn occurrences(s: String, part: String) -> Int {
+    let mut n = 0;
+    let mut at = std::str::index_of(s, part);
+    while at >= 0 {
+        n = n + 1;
+        at = std::str::index_of_from(s, part, at + len(part));
+    }
+    return n;
 }
 
 /// Takes the stub's connections, one at a time, on a listener the test
@@ -568,9 +603,8 @@ main locus App {
             let d = tup.next_data();
             if len(d) > 0 {
                 let lines = tup.feed(d);
-                if std::str::contains(lines, "response.function_call_arguments.delta") {
-                    fragments = fragments + 1;
-                }
+                fragments = fragments
+                    + occurrences(lines, "response.function_call_arguments.delta");
                 events = events + lines;
             }
         }
@@ -580,6 +614,8 @@ main locus App {
             "served",
             "a tool call is a served run: " + tend.failure,
         );
+        // the first held until the second shows the call streams (a call
+        // sent whole that is not JSON then leaves nothing behind it)
         std::test::assert_eq_int(fragments, 2, "the arguments leave in the upstream's fragments");
         std::test::assert(
             std::str::contains(
@@ -621,6 +657,26 @@ main locus App {
             std::str::contains(answered.script, "\"text\":\"It is 12 C.\""),
             "with the text the upstream gave",
         );
+        // a conversation a model poisoned with a number no double holds: the
+        // engine is given the call repaired (it fails a request whose history
+        // it cannot parse, as llama-server does), the valid one as it was
+        let poisoned = "{\"model\": \"voice-1\", \"input\": [{\"role\": \"user\", \"content\": \"go\"}, {\"type\": \"function_call\", \"call_id\": \"c1\", \"name\": \"write_stdin\", \"arguments\": \"{\\\"session_id\\\":58e595,\\\"chars\\\":\\\"\\\"}\"}, {\"type\": \"function_call\", \"call_id\": \"c2\", \"name\": \"exec\", \"arguments\": \"{ \\\"cmd\\\" :  \\\"cat a\\\" }\"}, {\"type\": \"function_call_output\", \"call_id\": \"c1\", \"output\": \"ok\"}, {\"type\": \"function_call_output\", \"call_id\": \"c2\", \"output\": \"A\"}]}";
+        let strict = node::compat_config(
+            "{\"base_url\": \"" + self.base + "/strict\", \"model\": \"stub-7b\"}",
+        );
+        let healed = node::run_compat("resp_h1", "voice-1", poisoned, strict);
+        std::test::assert_eq_str(
+            healed.outcome,
+            "served",
+            "a poisoned conversation is served again: " + healed.failure,
+        );
+        let still = node::run_compat(
+            "resp_h2",
+            "voice-1",
+            std::str::replace(poisoned, "58e595", "58"),
+            strict,
+        );
+        std::test::assert_eq_str(still.outcome, "served", "and a clean one: " + still.failure);
         let nobody = node::run_compat(
             "resp_k5",
             "voice-1",

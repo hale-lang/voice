@@ -792,7 +792,23 @@ when it cannot reach the coordinator.
    count. If the model's accounts are all exhausted, the answer is
    `503 no_capacity` with the earliest reset. If every seat is busy, the api
    waits for a slot, until the request's deadline or for 60 s, then
-   answers `429 no_capacity`.
+   answers `429 no_capacity`. A conversation is offered the same seat
+   first each turn, so that seat's prompt cache holds what it said: the
+   seat whose ref hashes highest with the conversation's key (rendezvous
+   hashing, so the route table's order and seats coming or going move only
+   the conversations that preferred them). The key is the request's
+   `prompt_cache_key`; a request that names none is given one derived
+   from its turn when there is a choice of seat, `derived:` and 32 hex
+   digits of the sha256 of its `instructions` and its opening messages
+   (every system, developer and user message before the model's first item
+   or a call's output, each by its role and its content as written; a text
+   longer than 8 KiB by its length and its first and last 4 KiB, read where
+   it lies in the body, so a 12 MiB body is not copied for it), which an
+   agent resends unchanged each turn. A derived key only routes: it is
+   never the request's `conversation`, so no usage record names it. No
+   slot within the seat is named: llama-server's `id_slot` would skip its
+   own restore of a returning conversation's prefix from its prompt cache,
+   and every engine finds that prefix itself.
 4. **Serve.** The api publishes `serve` on the node's subject as a request,
    naming a reply subject for this one, and the node answers `accepted` or
    `refused` at once. `refused`, or no answer, means the next candidate;
@@ -809,7 +825,15 @@ when it cannot reach the coordinator.
 6. **Settle,** in one transaction. The node's `result` carries the model
    that actually ran, cache writes, timing and, from the CLI engines, the
    account's quota windows. The api settles the reservation on actual
-   usage and writes the usage record. The response's `voice` object reports
+   usage and writes the usage record: of the input, what the seat's prompt
+   cache held (`cached_input_tokens`), and of the output, the model's
+   thinking (`reasoning_tokens`), as the standard's `usage` carries them
+   from the node. The openai-compatible engine reads them off its server's
+   usage: `prompt_tokens_details.cached_tokens` (TensorFold, llama-server,
+   and vLLM, which a managed seat starts with
+   `--enable-prompt-tokens-details`), else llama-server's `timings.cache_n`;
+   `completion_tokens_details.reasoning_tokens`, else the thinking's share
+   of the output by its length beside the answer's and the calls'. The response's `voice` object reports
    what served it and what it cost.
 
 The coordinator never redirects and never stores prompts or responses. Content
@@ -1120,7 +1144,11 @@ already there.
   against it, and seat states are posted back.
 - Each seat is a locus running its engine: the static engine answers in
   process; the openai-compatible engine (node/compat.hl) posts the request's
-  messages to `<base_url>/chat/completions` with `stream: true` and plays
+  messages to `<base_url>/chat/completions` with `stream: true` (an
+  assistant's turn as one message: its reasoning item, its words and the
+  calls after them together, as a chat template renders one turn, the
+  thinking as `reasoning_content` to a managed seat's server, whose
+  template renders it back where the model wrote it) and plays
   the upstream's chunks as the standard's events, reporting the upstream's
   final usage and the cost at the seat's price (0 for a local server); its
   key is read from a vault slot into the request and goes nowhere else. An

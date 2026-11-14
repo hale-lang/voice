@@ -4,6 +4,7 @@ import { subscribeAdminEvents, subscribeFlights, type Flight } from './api/event
 import { api, type Schemas, type UsageRecord, type UsageRecordSummary } from './api/client';
 import { capacityOf } from './api/fleet-reads';
 import { go } from './route';
+import { inputTokens } from './input-tokens';
 import { DEFAULT, clamp, dragged, keyed, room as roomFor, type Size } from './resize';
 import s from './EventLog.module.css';
 
@@ -309,7 +310,7 @@ function landing(r: UsageRecord | UsageRecordSummary, at: number, replayed: bool
     at,
     tag: failed ? '✕ ' + r.status.replace(/_/g, ' ') : r.internal ? '· internal' : '■ done',
     tone: failed ? 'fail' : r.internal ? 'quiet' : r.status === 'incomplete' ? 'warn' : 'ok',
-    text: `${r.project}${r.internal ? ` · ${side === 'title' ? 'title' : `${side} stage`}` : ''} · ${r.served?.model ?? r.requested_model} on ${r.served?.seat ?? '–'} · ${count(r.input_tokens)} → ${count(r.output_tokens)} tok · ${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s${rate}`,
+    text: `${r.project}${r.internal ? ` · ${side === 'title' ? 'title' : `${side} stage`}` : ''} · ${r.served?.model ?? r.requested_model} on ${r.served?.seat ?? '–'} · ${inputTokens(r)} → ${count(r.output_tokens)} tok · ${secs < 10 ? secs.toFixed(1) : Math.round(secs)} s${rate}`,
     detail: r.conversation ?? r.id,
     open: () => go('usage', r.id),
     replayed,

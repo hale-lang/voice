@@ -10,6 +10,7 @@ import { readout } from '../readout';
 import { PeekSection } from '../peek';
 import { AnnotationSection, AnnotationsPanel, RefusedSummary } from '../annotation';
 import { refusalLine } from '../refusal';
+import { inputTokens } from '../input-tokens';
 import { listedProjects } from '../projects-listed';
 import { Board } from './Board';
 import { ConversationView } from './Conversation';
@@ -111,7 +112,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
               { key: 'model', header: 'Model', render: (r) => r.served?.model ?? r.requested_model },
               { key: 'account', header: 'Account', render: (r) => <Mono>{r.served?.account ?? '–'}</Mono> },
               { key: 'status', header: 'Status', render: (r) => <Status tone={toneOf(r.status)} label={r.status} /> },
-              { key: 'in', header: 'In', num: true, render: (r) => count(r.input_tokens) },
+              { key: 'in', header: 'In', num: true, render: (r) => inputTokens(r) },
               { key: 'out', header: 'Out', num: true, render: (r) => count(r.output_tokens) },
               { key: 'price', header: 'Price', num: true, render: (r) => micros(r.price_micros, r.currency) },
               { key: 'wall', header: 'Wall', num: true, render: (r) => `${r.timing.wall_ms} ms` },
@@ -277,7 +278,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
         <Mono>{r.id}</Mono> <Status tone={toneOf(r.status)} label={r.status} />
       </h2>
       <p className="muted" style={{ marginTop: 0 }}>
-        {r.served?.model ?? r.requested_model} on <Mono>{r.served?.seat ?? '–'}</Mono> · {count(r.input_tokens)} in · {count(r.output_tokens)} out · {r.timing.wall_ms} ms · {when(r.created_at)}
+        {r.served?.model ?? r.requested_model} on <Mono>{r.served?.seat ?? '–'}</Mono> · {inputTokens(r)} in · {count(r.output_tokens)} out · {r.timing.wall_ms} ms · {when(r.created_at)}
       </p>
       <Kv
         rows={[
@@ -290,7 +291,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'account', v: r.served?.account ?? '–' },
           { k: 'conversation', v: r.conversation ? <><ConversationName conversation={r.conversation} project={r.project} mono /> <a href={href('usage', 'c', r.conversation)}>read it</a></> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
-          { k: 'tokens', v: `${count(r.input_tokens)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
+          { k: 'tokens', v: `${inputTokens(r)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
           { k: 'timing', v: `wall ${r.timing.wall_ms} · queue ${r.timing.queue_ms} · load ${r.timing.load_ms} ms` },
           { k: 'attempts', v: (r.attempts ?? []).map((a, i) => <div key={i}><Mono>{a.seat}</Mono> <Status tone={a.outcome === 'served' ? 'quiet' : 'fail'} label={a.outcome} />{a.error ? <span className="muted"> {a.error}</span> : null}</div>) },

@@ -4,6 +4,7 @@ import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecor
 import { AnnotationLine, AnnotationsPanel, Runs } from '../annotation';
 import { useTitles } from '../titles';
 import { href } from '../route';
+import { inputTokens } from '../input-tokens';
 import { Fold, ItemView, texts, parse, type Item } from '../peek';
 import s from './Conversation.module.css';
 
@@ -47,7 +48,7 @@ export function ConversationView({ conversation }: { conversation: string }) {
       </h2>
       <p className="muted" style={{ marginTop: 0 }}>
         {all.length} turn{all.length === 1 ? '' : 's'}
-        {q.data.truncated ? ' (the latest 2000)' : ''} · {last.project} · {last.served?.model ?? last.requested_model} · {count(all.reduce((n, t) => n + t.input_tokens, 0))} in · {count(all.reduce((n, t) => n + t.output_tokens, 0))} out · {when(first.created_at)} → {when(last.created_at)}
+        {q.data.truncated ? ' (the latest 2000)' : ''} · {last.project} · {last.served?.model ?? last.requested_model} · {count(all.reduce((n, t) => n + (t.input_tokens_estimated ? 0 : t.input_tokens), 0))} in · {count(all.reduce((n, t) => n + t.output_tokens, 0))} out · {when(first.created_at)} → {when(last.created_at)}
       </p>
       {[...noteOf.values()].some(Boolean) && <AnnotationsPanel slice={{ conversation }} title="This conversation's annotations" />}
       {!read ? (
@@ -119,7 +120,7 @@ function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; not
         {threads > 1 && t.thread >= 0 && <span className={s.threadTag}>thread {t.thread + 1}</span>}
         <span>{when(r.created_at)}</span>
         <span>{r.served?.seat ?? r.requested_model}</span>
-        <span>{count(r.input_tokens)} in · {count(r.output_tokens)} out</span>
+        <span>{inputTokens(r)} in · {count(r.output_tokens)} out</span>
         {r.status !== 'served' && <span className="c-wait">{r.status}</span>}
         {note && <AnnotationLine a={note} />}
       </a>

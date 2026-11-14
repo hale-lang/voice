@@ -834,7 +834,12 @@ when it cannot reach the coordinator.
    `--enable-prompt-tokens-details`), else llama-server's `timings.cache_n`;
    `completion_tokens_details.reasoning_tokens`, else the thinking's share
    of the output by its length beside the answer's and the calls'. The response's `voice` object reports
-   what served it and what it cost.
+   what served it and what it cost. A request cancelled or failed after
+   output began, before its seat reported usage, records voice's estimate
+   of its input (its instructions, input and tools, a token per four
+   characters) marked `input_tokens_estimated`, so a request cut off with a
+   long prompt reads apart from one cut off with a short one; the usage
+   summaries count only what engines reported.
 
 The coordinator never redirects and never stores prompts or responses. Content
 passes through one api instance and one node in memory; what is kept is the
@@ -1170,7 +1175,12 @@ already there.
   for each argument fragment as it arrives (a server that sends the
   arguments as an object whole is relayed the same), and the `.done` pair
   when the next call or the stream ends; on the https whole-read path the
-  same events are played after the stream ends. Calls arrive in index
+  same events are played after the stream ends. A model's thinking
+  (`reasoning_content`) becomes a `reasoning` item streamed as
+  `response.reasoning_text.delta` and `.done`, the OpenAI Responses names
+  its clients (Codex among them) read, where Open Responses `2026-04-24`
+  says `response.reasoning.delta`; the api reads either from a node.
+  Calls arrive in index
   order; one that interleaves fails the seat. The api renders them as
   `tool_calls` deltas with `finish_reason: "tool_calls"`, or as the
   Responses API's `function_call` items. Which seats carry tools is derived,

@@ -34,8 +34,8 @@ const STREAM =
   ':\n\n' +
   ev('response.in_progress', { response: { id: 'resp_abc' } }) +
   ev('voice:attempt', { attempt: { seat: 'node-b/llama', account: 'local', outcome: 'failed', error: 'the engine exited' }, next_seat: 'node-a/llama' }) +
-  ev('response.reasoning.delta', { delta: 'Think ' }) +
-  ev('response.reasoning.delta', { delta: 'first.' }) +
+  ev('response.reasoning_text.delta', { delta: 'Think ' }) +
+  ev('response.reasoning_text.delta', { delta: 'first.' }) +
   ev('response.output_text.delta', { delta: 'Hello, ' }) +
   ev('response.output_text.delta', { delta: 'wörld ✓' }) +
   ev('response.completed', {

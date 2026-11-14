@@ -63,10 +63,15 @@ export function viewOf(query: URLSearchParams, openConversation = false): UsageV
   };
 }
 
-/** The query that names `v`: only what differs from the default. */
-export function queryOf(v: UsageView): string {
+/**
+ * The query that names `v`: only what differs from the default, the tab
+ * among it: on a route that opens a conversation (`viewOf`'s
+ * `openConversation`) the default tab is conversations, so requests is
+ * written there.
+ */
+export function queryOf(v: UsageView, openConversation = false): string {
   const q = new URLSearchParams();
-  if (v.tab !== 'requests') q.set('view', v.tab);
+  if (v.tab !== (openConversation ? 'conversations' : 'requests')) q.set('view', v.tab);
   for (const k of ['project', 'key', 'model', 'account', 'status', 'conversation', 'metadata', 'since'] as const) {
     if (v[k]) q.set(k, v[k]);
   }
@@ -75,10 +80,15 @@ export function queryOf(v: UsageView): string {
   return q.toString();
 }
 
-/** A hash link to `parts` (as `href` writes them) with `v` as its query. */
+/** A hash link to `parts` (as `href` writes them) with `v` as its query, read back as `v` on that route. */
 export function viewHref(v: UsageView, ...parts: string[]): string {
-  const q = queryOf(v);
+  const q = queryOf(v, opensConversation(parts));
   return '#/' + parts.map(encodeURIComponent).join('/') + (q ? `?${q}` : '');
+}
+
+/** True for a route that opens a conversation: `usage/c/<conversation>`. */
+export function opensConversation(parts: readonly string[]): boolean {
+  return parts[0] === 'usage' && parts[1] === 'c';
 }
 
 /** True when any filter is set (the view itself aside). */

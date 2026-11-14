@@ -21,6 +21,7 @@ import { ConversationName } from '../titles';
 import {
   viewOf,
   viewHref,
+  opensConversation,
   filtered,
   fromOf,
   metadataPairs,
@@ -60,7 +61,7 @@ export function Usage({ route, setInspector }: ScreenProps) {
   // `usage/<request>`, or a conversation, `usage/c/<prompt_cache_key>`
   const conversation = route.parts[1] === 'c' ? (route.parts[2] ?? '') : null;
   const selected = conversation === null ? route.parts[1] : undefined;
-  const view = viewOf(route.query, conversation !== null);
+  const view = viewOf(route.query, opensConversation(route.parts));
   // the cutoff the range names, fixed when it is chosen (or the page
   // opens), so the query stays the same while the events refresh it
   const from = useMemo(() => fromOf(view.since, Date.now()), [view.since]);

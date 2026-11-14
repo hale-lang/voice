@@ -5,6 +5,7 @@ import {
   queryOf,
   viewHref,
   filtered,
+  opensConversation,
   fromOf,
   metadataPairs,
   requestsQuery,
@@ -28,8 +29,21 @@ test('a view round-trips through the URL query, only what differs from the defau
   assert.deepEqual(viewOf(q('')), NO_VIEW);
   const v = { ...NO_VIEW, tab: 'conversations', project: 'work', key: 'k_ci', model: 'echo-1', account: 'paid', status: 'no_capacity', conversation: 'conv 7', metadata: 'team=search, run=7', since: '3600', failures: true, internal: true };
   assert.deepEqual(viewOf(q(queryOf(v))), v);
-  assert.equal(viewHref({ ...NO_VIEW, status: 'failed' }, 'usage', 'c', 'a/b'), '#/usage/c/a%2Fb?status=failed');
+  assert.equal(viewHref({ ...NO_VIEW, tab: 'conversations', status: 'failed' }, 'usage', 'c', 'a/b'), '#/usage/c/a%2Fb?status=failed');
   assert.equal(viewHref(NO_VIEW, 'usage'), '#/usage');
+});
+
+test('the tab chosen holds on every route, a conversation open or none', () => {
+  for (const parts of [['usage'], ['usage', 'resp_1'], ['usage', 'c', 'conv-7']]) {
+    for (const tab of ['requests', 'conversations']) {
+      const v = { ...NO_VIEW, tab, status: 'failed' };
+      const url = viewHref(v, ...parts);
+      const query = new URLSearchParams(url.split('?')[1] ?? '');
+      assert.deepEqual(viewOf(query, opensConversation(parts)), v, url);
+    }
+  }
+  assert.equal(viewHref({ ...NO_VIEW, tab: 'conversations' }, 'usage', 'c', 'x'), '#/usage/c/x');
+  assert.equal(viewHref(NO_VIEW, 'usage', 'c', 'x'), '#/usage/c/x?view=requests');
 });
 
 test('a query value no filter takes is dropped, and the tab follows what the route opens', () => {

@@ -1218,6 +1218,111 @@ fn annotations(s: st::Store, label: String) {
     std::test::assert(!missing.present, label + ": none for a request not annotated");
 }
 
+/// Recordings listed a page at a time: a quiet model's found behind a busy
+/// one's, and a walk past one page with none twice and none skipped.
+/// Recorded two to a second, from an hour ago: storing one drops those past
+/// PEEK_DAYS, and within a second they list by request id.
+fn peeks(s: st::Store, label: String) {
+    s.insert_project(
+        st::ProjectRow { id: "peeky", name: "Peeky" },
+        ch("create", "projects/peeky"),
+    ) or discard;
+    let base = std::time::unix(std::time::current()) - 3600;
+    let mut i = 0;
+    while i < 60 {
+        s.put_peek(
+            st::PeekRow {
+                request_id: peek_id(i),
+                project: "peeky",
+                key: "k_peek",
+                model: if i % 12 == 0 { "quiet" } else { "busy" },
+                created_at: std::time::time_from_unix(base + i / 2),
+                input: "{}",
+                output: "{}",
+            },
+        ) or discard;
+        i = i + 1;
+    }
+    let quiet = s.peeks(st::PeekQuery { project: "peeky", model: "quiet", limit: 40 })
+    or st::PeekRows { };
+    std::test::assert_eq_int(
+        count(quiet.rows),
+        5,
+        label + ": a quiet model's, past the busy one's",
+    );
+    std::test::assert(!quiet.more, label + ": all of them on one page");
+    for r in quiet.rows {
+        std::test::assert_eq_str(r.model, "quiet", label + ": only that model's");
+        std::test::assert_eq_str(r.input, "", label + ": listed without its body");
+    }
+    std::test::assert_eq_str(
+        (at(quiet.rows, 0) or st::PeekRow { }).request_id,
+        "pk_48",
+        label + ": newest first",
+    );
+    // every recording, 40 a page: in order, none twice, none skipped
+    let mut seen = 0;
+    let mut cursor = "";
+    let mut pages = 0;
+    let mut more = true;
+    while more && pages < 10 {
+        let page = s.peeks(st::PeekQuery { project: "peeky", cursor: cursor, limit: 40 })
+        or st::PeekRows { };
+        std::test::assert(page.cursor_known, label + ": a page's last names a recording");
+        for r in page.rows {
+            std::test::assert_eq_str(
+                r.request_id,
+                peek_id(walked(seen)),
+                label + ": the next in order",
+            );
+            seen = seen + 1;
+            cursor = r.request_id;
+        }
+        more = page.more;
+        pages = pages + 1;
+    }
+    std::test::assert_eq_int(seen, 60, label + ": every recording walked");
+    std::test::assert_eq_int(pages, 2, label + ": on two pages of 40");
+    // a model's, 7 a page: only its own, in order
+    let mut busy = 0;
+    let mut last = "";
+    more = true;
+    pages = 0;
+    while more && pages < 20 {
+        let page = s.peeks(st::PeekQuery { model: "busy", cursor: last, limit: 7 })
+        or st::PeekRows { };
+        for r in page.rows {
+            std::test::assert_eq_str(
+                r.model,
+                "busy",
+                label + ": a model's pages hold only its own",
+            );
+            busy = busy + 1;
+            last = r.request_id;
+        }
+        more = page.more;
+        pages = pages + 1;
+    }
+    std::test::assert_eq_int(busy, 55, label + ": a model's, every one walked");
+    std::test::assert_eq_int(pages, 8, label + ": on eight pages of 7");
+    let lost = s.peeks(st::PeekQuery { cursor: "pk_none" }) or st::PeekRows { };
+    std::test::assert(
+        !lost.cursor_known && count(lost.rows) == 0,
+        label + ": a cursor naming no recording",
+    );
+}
+
+/// The `n`th recording `peeks` stores, its request id sorting as its number.
+fn peek_id(n: Int) -> String {
+    return if n < 10 { "pk_0" + to_string(n) } else { "pk_" + to_string(n) };
+}
+
+/// Which of `peeks`' recordings lists `j`th: two to a second, newest first,
+/// by request id within one.
+fn walked(j: Int) -> Int {
+    return 2 * (29 - j / 2) + j % 2;
+}
+
 fn answer(
     id: String,
     annotator: String,
@@ -1757,6 +1862,7 @@ fn main() {
     inventories(st::MemoryStore { }, "memory");
     flights(st::MemoryStore { }, "memory");
     attempts(st::MemoryStore { }, "memory");
+    peeks(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1796,6 +1902,9 @@ fn main() {
     flights(pg, "postgres");
     pg.conn.exec("TRUNCATE attempt CASCADE");
     attempts(pg, "postgres");
+    pg.conn.exec("TRUNCATE peek");
+    pg.conn.exec("DELETE FROM project WHERE id = 'peeky'");
+    peeks(pg, "postgres");
 }
 
 fn attempt_row(id: String, project: String, when: Time) -> st::AttemptRow {

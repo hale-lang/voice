@@ -1110,23 +1110,30 @@ Responses:
 Authentication: operatorToken
 
 The requests recorded whole for a project or key that peeks, newest
-first, without their bodies (`getPeek`). Kept seven days.
+first (by request id within a second), without their bodies
+(`getPeek`). Kept seven days. A page holds at most 200, 50 unasked.
+A `cursor` is a page's `next_cursor`, the page after it; one that
+names no recording (one past seven days, say), or a `limit` outside
+1 to 200, is a `422`.
 
 Parameters:
 
 | Name | In | Type | Required | Description |
 |---|---|---|---|---|
-| `project` | query | string |  |  |
-| `key` | query | string |  |  |
+| `project` | query | string |  | Only this project's recordings. |
+| `key` | query | string |  | Only this key's recordings. |
+| `model` | query | string |  | Only the recordings of requests routed as this catalog model (`PeekSummary.model`; `UsageRecord.served.model` when served), not the alias a project names it by. |
 | `limit` | query | integer |  |  |
+| `cursor` | query | string |  |  |
 
 Responses:
 
 | Status | Description | Body |
 |---|---|---|
-| 200 | Recorded requests. | `application/json` object |
+| 200 | A page of recorded requests. | `application/json` object |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 ### GET `/admin/v1/peeks/{request_id}`
@@ -6184,7 +6191,7 @@ Type: object
 | `request_id` | string | yes |  |  |
 | `project` | string | yes |  |  |
 | `key` | string | yes |  |  |
-| `model` | string | yes |  |  |
+| `model` | string | yes | The catalog model it was routed as, not the alias it asked by. |  |
 | `created_at` | string (date-time) | yes |  |  |
 
 <a id="schema-peek"></a>

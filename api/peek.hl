@@ -5,11 +5,15 @@
 // recording's request and response are the JSON documents they were, as
 // text: they may be far larger than a JSON value here holds.
 
-/// `listPeeks`: a project's, or a key's within it; all when neither.
+/// `listPeeks`: a project's, a key's, a model's (the catalog model each
+/// was routed as), all when none; a page's size, and the `next_cursor` it
+/// follows.
 type PeekAsk {
     project: String = "";
     key: String = "";
+    model: String = "";
     limit: Int = -1;
+    cursor: String = "";
 }
 
 /// A recorded request, listed: its bodies are read with `getPeek`.
@@ -21,7 +25,17 @@ type PeekSummary {
     created_at: Time = `1970-01-01T00:00:00Z`;
 }
 
-type PeekList { data: bounded[PeekSummary; 200]; }
+/// A page of recordings; `next_cursor` is `null` on the last.
+type PeekList {
+    data: bounded[PeekSummary; 200];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
+}
+
+/// The most recordings a page lists: a recording's summary is about 200
+/// bytes, so a page is about 40 KiB. It lists `PEEK_PAGE_DEFAULT` unasked.
+const PEEK_PAGE_MAX: Int = 200;
+const PEEK_PAGE_DEFAULT: Int = 50;
 
 type PeekRef { request_id: String; }
 
@@ -45,15 +59,35 @@ locus Peeks {
         gate: st::Lock = st::Lock { };
     }
 
-    /// `listPeeks`: newest first, at most `limit` (50 by default, 200 at most).
+    /// `listPeeks`: newest first, a page at a time.
     fn list(a: PeekAsk) -> PeekList fallible(CtlError) {
+        let mut q = st::PeekQuery {
+            project: a.project,
+            key: a.key,
+            model: a.model,
+            cursor: a.cursor,
+            limit: PEEK_PAGE_DEFAULT,
+        };
+        if a.limit != -1 {
+            if a.limit < 1 || a.limit > PEEK_PAGE_MAX {
+                fail bad("`limit` is 1 to " + to_string(PEEK_PAGE_MAX), "limit");
+            }
+            q.limit = a.limit;
+        }
         self.gate.enter();
-        let rows = self.store.peeks(a.project, a.key, if a.limit < 1 { 50 } else { a.limit }) or {
+        let rows = self.store.peeks(q) or {
             self.gate.leave();
             fail store_down(err);
         };
         self.gate.leave();
+        if !rows.cursor_known {
+            fail bad(
+                "`cursor` names no recording; pass a page's `next_cursor`",
+                "cursor"
+            );
+        }
         let mut out = PeekList { };
+        let mut last = "";
         for r in rows.rows {
             push(
                 out.data,
@@ -65,6 +99,11 @@ locus Peeks {
                     created_at: r.created_at,
                 },
             ) or discard;
+            last = r.request_id;
+        }
+        if rows.more {
+            out.has_next_cursor = true;
+            out.next_cursor = last;
         }
         return out;
     }

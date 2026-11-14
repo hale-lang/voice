@@ -123,7 +123,7 @@ One per part of the admin API:
 - **Overview:** quota headroom per account, node health, spend against
   budget, recent usage.
 - **Route table:** per model, the ranked slots and why.
-- **Usage:** summaries by project, account, model and day; the records.
+- **Usage:** requests or conversations, each a live table filtered and paged in the URL; a row opens the request or the conversation.
 - **Accounts:** quota windows, limits.
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token
   rotation.

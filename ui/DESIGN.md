@@ -117,9 +117,11 @@ right ones comparable.
   time), node and seat health as a quiet table that colors only what is
   wrong, spend this period per project against its budget, and recent
   requests with afterglow on failures.
-- **Usage.** Summaries by project, key, model, account and day as tables and
-  sparklines; the records behind them, filterable by every field the API
-  filters by. Tabular numerals, right-aligned, units muted.
+- **Usage.** Two tables, switched in place: each request, or each
+  conversation its requests are turns of, filterable by every field the API
+  filters by and paged, the view in the URL. Tabular numerals,
+  right-aligned, units muted. Annotations are read in a request or a
+  conversation opened, not across the ledger.
 - **Accounts.** Windows, limits, the seats that spend it, and whether it is
   exhausted and until when.
 - **Nodes.** Capabilities as declared, its load against its capacity (the

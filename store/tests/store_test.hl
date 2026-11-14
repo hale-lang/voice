@@ -814,6 +814,191 @@ fn ledger(s: st::Store, label: String) {
     );
 }
 
+/// A request of `conversation` ("" for none) that ended as `status`.
+fn turn(
+    id: String,
+    when: String,
+    key: String,
+    model: String,
+    status: String,
+    conversation: String,
+    input: Int,
+    cached: Int,
+    output: Int,
+    price: Int
+) -> st::UsageRow {
+    return st::UsageRow {
+        id: id,
+        created_at: t(when),
+        project: if key == "k3" { "play" } else { "convo" },
+        key: key,
+        requested_model: model,
+        served_model: if status == "served" { model } else { "" },
+        status: status,
+        input_tokens: input,
+        cached_input_tokens: cached,
+        output_tokens: output,
+        reasoning_tokens: if status == "served" { 1 } else { 0 },
+        price_micros: price,
+        served: if status == "served" { "{\"model\": \"" + model + "\"}" } else { "null" },
+        record: "{\"id\": \"" + id + "\", \"status\": \"" + status + "\", \"conversation\": "
+            + (if len(conversation) > 0 { "\"" + conversation + "\"" } else { "null" }) + "}"
+    };
+}
+
+fn conversation_ids(r: st::ConversationRows) -> String {
+    let mut out = "";
+    for c in r.rows {
+        out = out + (if len(out) > 0 { " " } else { "" }) + c.conversation;
+    }
+    return out;
+}
+
+fn joined(n: st::Names) -> String {
+    let mut out = "";
+    for x in n.items {
+        out = out + (if len(out) > 0 { " " } else { "" }) + x;
+    }
+    return out;
+}
+
+/// The ledger by how its requests ended, and its conversations: each one's
+/// turns summed, the most recently active first, filtered and paged.
+fn conversations(s: st::Store, label: String) {
+    s.insert_project(
+        st::ProjectRow { id: "convo", name: "Convo", created_at: std::time::current() },
+        ch("create", "projects/convo"),
+    ) or discard;
+    s.insert_usage(turn("a1", "2026-10-17T10:00:00Z", "k1", "m1", "served", "ca", 10, 4, 2, 10))
+    or discard;
+    s.insert_usage(turn("a2", "2026-10-17T10:05:00Z", "k2", "m2", "failed", "cb", 5, 0, 0, 0))
+    or discard;
+    s.insert_usage(turn("a3", "2026-10-17T10:10:00Z", "k1", "m2", "served", "ca", 20, 0, 3, 20))
+    or discard;
+    s.insert_usage(turn("a4", "2026-10-17T10:15:00Z", "k1", "m1", "served", "", 1, 0, 1, 1))
+    or discard;
+    s.insert_usage(turn("a5", "2026-10-17T10:20:00Z", "k3", "m1", "cancelled", "cc", 7, 0, 0, 0))
+    or discard;
+    s.put_title(
+        st::TitleRow {
+            project: "convo",
+            conversation: "ca",
+            title: "Sort a list",
+            annotator: "conversation-title",
+            version: 1,
+            made_at: std::time::current(),
+        },
+    ) or discard;
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { status: "failed" }) or st::UsageRows { }),
+        "a2",
+        label + ": by how a request ended",
+    );
+    std::test::assert_eq_str(
+        ids(s.usage_rows(st::UsageQuery { status: "served" }) or st::UsageRows { }),
+        "a4 a3 a1",
+        label + ": each one so",
+    );
+    std::test::assert_eq_str(
+        ids(
+            s.usage_rows(st::UsageQuery { status: "served", key: "k2" }) or st::UsageRows { },
+        ),
+        "",
+        label + ": and by the other filters too",
+    );
+    let all = s.usage_conversations(st::ConversationQuery { }) or st::ConversationRows { };
+    std::test::assert_eq_str(
+        conversation_ids(all),
+        "cc ca cb",
+        label + ": conversations, the most recently active first, a request of none in none",
+    );
+    let ca = at(all.rows, 1) or st::ConversationRow { };
+    std::test::assert(
+        ca.project == "convo" && ca.requests == 2 && ca.failed == 0 && ca.input_tokens == 30
+            && ca.cached_input_tokens == 4 && ca.output_tokens == 5 && ca.reasoning_tokens == 2
+            && ca.price_micros == 30 && ca.currency == "USD",
+        label + ": a conversation's turns, summed",
+    );
+    std::test::assert(
+        joined(ca.keys) == "k1" && joined(ca.models) == "m1 m2",
+        label + ": its keys and models, each once, in order: " + joined(ca.keys) + " / "
+            + joined(ca.models),
+    );
+    std::test::assert(
+        std::time::iso8601(ca.first_at) == "2026-10-17T10:00:00Z"
+            && std::time::iso8601(ca.last_at) == "2026-10-17T10:10:00Z" && ca.last_request == "a3"
+            && ca.last_status == "served",
+        label + ": from its first turn to its last, the last named and how it ended",
+    );
+    std::test::assert(
+        ca.has_title && ca.title == "Sort a list",
+        label + ": with its title, when one is written",
+    );
+    let cb = at(all.rows, 2) or st::ConversationRow { has_title: true };
+    std::test::assert(
+        cb.failed == 1 && cb.last_status == "failed" && !cb.has_title,
+        label + ": a failed turn counted, and no title when none is written",
+    );
+    std::test::assert_eq_str(
+        conversation_ids(
+            s.usage_conversations(st::ConversationQuery { has_failures: true })
+            or st::ConversationRows { },
+        ),
+        "cc cb",
+        label + ": those with a failed turn, a cancelled one among them",
+    );
+    let page = s.usage_conversations(
+        st::ConversationQuery { limit: 1 },
+    ) or st::ConversationRows { };
+    std::test::assert(
+        conversation_ids(page) == "cc" && page.more,
+        label + ": a page says there is more",
+    );
+    let cc = at(page.rows, 0) or st::ConversationRow { };
+    std::test::assert_eq_str(
+        conversation_ids(
+            s.usage_conversations(st::ConversationQuery { cursor: cc.last_seq })
+            or st::ConversationRows { },
+        ),
+        "ca cb",
+        label + ": and the next goes on from its last",
+    );
+    std::test::assert_eq_str(
+        conversation_ids(
+            s.usage_conversations(st::ConversationQuery { q: st::UsageQuery { project: "convo" } })
+            or st::ConversationRows { },
+        ),
+        "ca cb",
+        label + ": by project",
+    );
+    let served = s.usage_conversations(
+        st::ConversationQuery { q: st::UsageQuery { status: "served" } },
+    ) or st::ConversationRows { };
+    std::test::assert(
+        conversation_ids(served) == "ca"
+            && (at(served.rows, 0) or st::ConversationRow { }).requests == 2,
+        label + ": of the requests that ended so",
+    );
+    let m2 = s.usage_conversations(st::ConversationQuery { q: st::UsageQuery { model: "m2" } })
+    or st::ConversationRows { };
+    std::test::assert(
+        conversation_ids(m2) == "ca cb"
+            && (at(m2.rows, 0) or st::ConversationRow { }).requests == 1,
+        label + ": summed over the requests the filters keep",
+    );
+    std::test::assert_eq_str(
+        conversation_ids(
+            s.usage_conversations(
+                st::ConversationQuery {
+                    q: st::UsageQuery { has_to: true, to: t("2026-10-17T10:07:00Z") },
+                },
+            ) or st::ConversationRows { },
+        ),
+        "cb ca",
+        label + ": and in a time range, by their latest turn in it",
+    );
+}
+
 /// The operator token: none until one is kept, then the first one kept,
 /// whatever a later api mints.
 /// A project is made with its own system key, which no token names; the
@@ -1851,6 +2036,7 @@ fn main() {
     exercise(st::MemoryStore { }, "memory");
     ledger(st::MemoryStore { }, "memory");
     crowded(st::MemoryStore { }, "memory");
+    conversations(st::MemoryStore { }, "memory");
     bounded(st::MemoryStore { }, "memory");
     operator(st::MemoryStore { }, "memory");
     tools(st::MemoryStore { }, "memory");
@@ -1875,6 +2061,8 @@ fn main() {
     ledger(pg, "postgres");
     pg.conn.exec("TRUNCATE usage RESTART IDENTITY");
     crowded(pg, "postgres");
+    pg.conn.exec("TRUNCATE usage RESTART IDENTITY");
+    conversations(pg, "postgres");
     pg.conn.exec(
         "TRUNCATE usage, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
     );

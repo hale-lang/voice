@@ -1,7 +1,7 @@
 // The usage ledger: one row per inference request, written where the
 // request ends (inference.hl: `settled` and `unfinished`), read back by
 // the admin plane (`GET /admin/v1/usage`, `/usage/{request_id}`,
-// `/usage/summary`) and followed by the event stream (admin_events.hl).
+// `/usage/summary`, `/usage/conversations`) and followed by the event stream (admin_events.hl).
 // A row is the `UsageRecord` of ../spec/openapi.yaml, kept whole in the
 // store (`UsageRow.record`) beside the columns a read filters and sums by.
 
@@ -421,6 +421,52 @@ type UsageAsk {
     // voice's own requests for its projects (their system keys'), left out
     // unless asked for
     include_internal: Bool = false;
+    // how the request ended (`UsageRecord.status`)
+    status: String = "";
+}
+
+/// `GET /admin/v1/usage/conversations`'s filters, as `UsageAsk`'s, and
+/// only conversations with a failed request when `has_failures`.
+type ConversationUsageAsk {
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    from: String = "";
+    to: String = "";
+    has_failures: Bool = false;
+    limit: Int = -1;
+    cursor: String = "";
+    include_internal: Bool = false;
+}
+
+/// `ConversationUsage`: one conversation's requests, summed (st::ConversationRow).
+type ConversationUsage {
+    conversation: String = "";
+    project: String = "";
+    keys: bounded[String; 4];
+    models: bounded[String; 4];
+    requests: Int = 0;
+    failed_requests: Int = 0;
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+    currency: String = "USD";
+    first_at: Time = `1970-01-01T00:00:00Z`;
+    last_at: Time = `1970-01-01T00:00:00Z`;
+    last_request: String = "";
+    last_status: String = "served";
+    has_title: Bool = false;
+    title: String = "";
+}
+
+/// A page of conversations, the most recently active first, at most
+/// `USAGE_PAGE_MAX`; `next_cursor` is `null` on the last.
+type ConversationUsageList {
+    data: bounded[ConversationUsage; 40];
+    has_next_cursor: Bool = false;
+    next_cursor: String = "";
 }
 
 /// `GET /admin/v1/usage/summary`'s: the same filters, and the fields to group by.
@@ -435,6 +481,7 @@ type UsageSummaryAsk {
     from: String = "";
     to: String = "";
     include_internal: Bool = false;
+    status: String = "";
 }
 
 /// One group of a summary: `group` keys the `group_by` fields.
@@ -538,6 +585,7 @@ locus Usage {
                 from: a.from,
                 to: a.to,
                 include_internal: a.include_internal,
+                status: a.status,
             },
             false,
         ) or raise;
@@ -569,6 +617,85 @@ locus Usage {
         }
         return out;
     }
+
+    /// `listUsageConversations`: the most recently active first.
+    fn conversations(a: ConversationUsageAsk) -> ConversationUsageList fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.conversations_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `conversations`, inside the gate.
+    fn conversations_in_gate(a: ConversationUsageAsk) -> ConversationUsageList fallible(CtlError) {
+        // the page's limit and cursor are the conversations', not the rows'
+        let q = usage_query_of(
+            UsageAsk {
+                project: a.project,
+                key: a.key,
+                model: a.model,
+                from: a.from,
+                to: a.to,
+                limit: a.limit,
+                cursor: a.cursor,
+                include_internal: a.include_internal,
+            },
+            true,
+        ) or raise;
+        let mut rows_q = q;
+        rows_q.cursor = 0;
+        let rows = self.store.usage_conversations(
+            st::ConversationQuery {
+                q: rows_q,
+                has_failures: a.has_failures,
+                limit: q.limit,
+                cursor: q.cursor,
+            },
+        ) or fail store_down(err);
+        let mut out = ConversationUsageList { };
+        let mut last = 0;
+        for r in rows.rows {
+            push(out.data, conversation_usage_of(r)) or discard;
+            last = r.last_seq;
+        }
+        if rows.more {
+            out.has_next_cursor = true;
+            out.next_cursor = to_string(last);
+        }
+        return out;
+    }
+}
+
+/// A conversation as `listUsageConversations` lists it.
+fn conversation_usage_of(r: st::ConversationRow) -> ConversationUsage {
+    let mut out = ConversationUsage {
+        conversation: r.conversation,
+        project: r.project,
+        requests: r.requests,
+        failed_requests: r.failed,
+        input_tokens: r.input_tokens,
+        cached_input_tokens: r.cached_input_tokens,
+        output_tokens: r.output_tokens,
+        reasoning_tokens: r.reasoning_tokens,
+        price_micros: r.price_micros,
+        currency: r.currency,
+        first_at: r.first_at,
+        last_at: r.last_at,
+        last_request: r.last_request,
+        last_status: r.last_status,
+        has_title: r.has_title,
+        title: r.title,
+    };
+    for k in r.keys.items {
+        push(out.keys, k) or discard;
+    }
+    for m in r.models.items {
+        push(out.models, m) or discard;
+    }
+    return out;
 }
 
 /// A record as `listUsage` lists it.
@@ -678,6 +805,15 @@ fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError)
         conversation: a.conversation,
         include_internal: a.include_internal,
     };
+    if len(a.status) > 0 {
+        if !usage_status(a.status) {
+            fail bad(
+                "`status` is one of served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned",
+                "status"
+            );
+        }
+        q.status = a.status;
+    }
     if len(a.from) > 0 {
         q.has_from = true;
         q.from = rfc3339(a.from) or fail bad(
@@ -710,6 +846,13 @@ fn usage_query_of(a: UsageAsk, paged: Bool) -> st::UsageQuery fallible(CtlError)
         }
     }
     return q;
+}
+
+/// True for a status a usage record ends as (`UsageRecord.status`).
+fn usage_status(s: String) -> Bool {
+    return s == "served" || s == "incomplete" || s == "failed" || s == "rate_limited"
+        || s == "budget_exhausted" || s == "no_capacity" || s == "deadline_exceeded"
+        || s == "cancelled" || s == "abandoned";
 }
 
 /// `group_by`: the fields a summary groups by, comma separated.

@@ -1,0 +1,128 @@
+// The ledger listed by how its requests ended, and its conversations
+// listed a row each: the filters checked by name, the pages followed.
+import ".." as api;
+import "../../store" as st;
+
+/// A failed call, as `class param`.
+fn why(err: api::CtlError) -> String {
+    return api::ctl_class(err) + " " + api::ctl_problem(err).param;
+}
+
+/// A request of `conversation` ("" for none) that ended as `status`.
+fn row(id: String, conversation: String, status: String, attempts: api::Attempts) -> st::UsageRow {
+    let cache_key = if len(conversation) > 0 {
+        ", \"prompt_cache_key\": \"" + conversation + "\""
+    } else {
+        ""
+    };
+    return api::usage_row(
+        (api::read_inference("{\"model\": \"m\", \"input\": \"hi\"" + cache_key + "}", "responses")
+            or api::InferenceRequest { }),
+        id,
+        "p",
+        "k",
+        api::ServedBy { model: "m", node: "n", seat: "n/s", account: "a" },
+        status,
+        api::Tokens { input: 10, output: 2 },
+        5,
+        "USD",
+        "{\"wall_ms\": 1, \"queue_ms\": 0, \"load_ms\": 0}",
+        attempts.items
+    );
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let none = api::Attempts { };
+    store.insert_usage(row("r1", "c1", "served", none)) or discard;
+    store.insert_usage(row("r2", "c2", "failed", none)) or discard;
+    store.insert_usage(row("r3", "c1", "served", none)) or discard;
+    store.insert_usage(row("r4", "", "cancelled", none)) or discard;
+    store.put_title(
+        st::TitleRow {
+            project: "p",
+            conversation: "c1",
+            title: "Sort a list",
+            annotator: "conversation-title",
+            version: 1,
+        },
+    ) or discard;
+    let usage = api::Usage { store: store };
+
+    // by how a request ended
+    let failed = usage.list(api::UsageAsk { status: "failed" }) or api::UsageList { };
+    std::test::assert_eq_int(count(failed.data), 1, "the failed requests alone");
+    std::test::assert_eq_str(
+        (at(failed.data, 0) or api::UsageRecordSummary { }).id,
+        "r2",
+        "the one that failed",
+    );
+    let served = usage.list(api::UsageAsk { status: "served" }) or api::UsageList { };
+    std::test::assert_eq_int(count(served.data), 2, "and the served ones");
+    let mut refused = "";
+    usage.list(api::UsageAsk { status: "lost" }) or { refused = why(err); };
+    std::test::assert_eq_str(refused, "invalid status", "a status no record ends as is refused");
+    let summed = usage.summary(api::UsageSummaryAsk { group_by: "project", status: "served" })
+    or api::UsageSummary { };
+    std::test::assert(
+        (at(summed.data, 0) or api::UsageGroupOut { }).requests == 2,
+        "a summary is filtered so too",
+    );
+
+    // the conversations
+    let all = usage.conversations(api::ConversationUsageAsk { }) or api::ConversationUsageList { };
+    std::test::assert_eq_int(count(all.data), 2, "a row a conversation, a request of none in none");
+    let c1 = at(all.data, 0) or api::ConversationUsage { };
+    std::test::assert(
+        c1.conversation == "c1" && c1.project == "p" && c1.requests == 2
+            && c1.failed_requests == 0 && c1.input_tokens == 20 && c1.output_tokens == 4
+            && c1.price_micros == 10 && c1.last_request == "r3" && c1.last_status == "served",
+        "the most recently active first, its turns summed",
+    );
+    std::test::assert(
+        count(c1.keys) == 1 && (at(c1.keys, 0) or "") == "k" && count(c1.models) == 1
+            && (at(c1.models, 0) or "") == "m",
+        "its keys and models",
+    );
+    std::test::assert(c1.has_title && c1.title == "Sort a list", "and its title");
+    let json = api::ConversationUsageList::api_encode(all);
+    std::test::assert(
+        std::str::contains(json, "\"title\":\"Sort a list\"")
+            && !std::str::contains(
+                json[std::str::index_of(json, "\"c2\"")..len(json)],
+                "\"title\"",
+            ),
+        "a title is left out when none is written: " + json,
+    );
+    let failing = usage.conversations(api::ConversationUsageAsk { has_failures: true })
+    or api::ConversationUsageList { };
+    let c2 = at(failing.data, 0) or api::ConversationUsage { };
+    std::test::assert(
+        count(failing.data) == 1 && c2.conversation == "c2" && c2.failed_requests == 1
+            && c2.last_status == "failed",
+        "those with a failed request",
+    );
+    let page = usage.conversations(api::ConversationUsageAsk { limit: 1 })
+    or api::ConversationUsageList { };
+    std::test::assert(
+        count(page.data) == 1 && page.has_next_cursor,
+        "a page says where the next begins",
+    );
+    let next = usage.conversations(api::ConversationUsageAsk { cursor: page.next_cursor })
+    or api::ConversationUsageList { has_next_cursor: true };
+    std::test::assert(
+        count(next.data) == 1
+            && (at(next.data, 0) or api::ConversationUsage { }).conversation == "c2"
+            && !next.has_next_cursor,
+        "and the next is the rest",
+    );
+    refused = "";
+    usage.conversations(api::ConversationUsageAsk { cursor: "c1" }) or { refused = why(err); };
+    std::test::assert_eq_str(refused, "invalid cursor", "a cursor is a page's");
+    refused = "";
+    usage.conversations(api::ConversationUsageAsk { limit: 41 }) or { refused = why(err); };
+    std::test::assert_eq_str(refused, "invalid limit", "a page holds at most 40");
+    let other = usage.conversations(api::ConversationUsageAsk { project: "q" })
+    or api::ConversationUsageList { };
+    std::test::assert_eq_int(count(other.data), 0, "filtered by project");
+}

@@ -1377,7 +1377,8 @@ paths:
         principal may see: each without its attempts or the caller's
         `metadata`, which `getUsage` answers with the whole record. A page
         holds at most 40. A `cursor` is a page's `next_cursor`; one that
-        names no record, or a `limit` outside 1 to 40, is a `422`.
+        names no record, or a `limit` outside 1 to 40, is a `422`, as is a
+        `status` a record never ends as.
       security:
         - operatorToken: []
       parameters:
@@ -1386,6 +1387,7 @@ paths:
         - $ref: '#/components/parameters/ModelFilter'
         - $ref: '#/components/parameters/AccountFilter'
         - $ref: '#/components/parameters/ConversationFilter'
+        - $ref: '#/components/parameters/StatusFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -1457,6 +1459,7 @@ paths:
         - $ref: '#/components/parameters/ModelFilter'
         - $ref: '#/components/parameters/AccountFilter'
         - $ref: '#/components/parameters/ConversationFilter'
+        - $ref: '#/components/parameters/StatusFilter'
         - $ref: '#/components/parameters/MetadataFilter'
         - $ref: '#/components/parameters/From'
         - $ref: '#/components/parameters/To'
@@ -1468,6 +1471,66 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UsageSummary'
+        '400':
+          $ref: '#/components/responses/Malformed'
+        '422':
+          $ref: '#/components/responses/AdminInvalid'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/v1/usage/conversations:
+    get:
+      tags: [usage]
+      operationId: listUsageConversations
+      summary: List conversations' usage
+      description: |
+        The conversations the ledger's requests are turns of
+        (`UsageRecord.conversation`), one row each, the most recently
+        active first: each one's requests the filters keep, summed, by
+        project and currency (a conversation's requests in another
+        currency are a row of their own). A request of no conversation is
+        in none. Voice's own requests for its projects are left out unless
+        `include_internal` is `true`, as `listUsage` leaves them out. A
+        page holds at most 40. A `cursor` is a page's `next_cursor`, the
+        rows active before its last; one that is not, or a `limit` outside
+        1 to 40, is a `422`.
+      security:
+        - operatorToken: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectFilter'
+        - $ref: '#/components/parameters/KeyFilter'
+        - $ref: '#/components/parameters/ModelFilter'
+        - $ref: '#/components/parameters/From'
+        - $ref: '#/components/parameters/To'
+        - name: has_failures
+          in: query
+          description: Only conversations with a failed request (`failed_requests` above 0).
+          schema: { type: boolean, default: false }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 40, default: 40 }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/IncludeInternal'
+      responses:
+        '200':
+          description: A page of conversations.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    maxItems: 40
+                    items:
+                      $ref: '#/components/schemas/ConversationUsage'
+                  next_cursor:
+                    type: [string, 'null']
         '400':
           $ref: '#/components/responses/Malformed'
         '422':
@@ -4843,39 +4906,32 @@ components:
     AccountFilter:
       name: account
       in: query
-      description: Only requests served on these accounts. Repeatable.
-      style: form
-      explode: true
-      schema:
-        type: array
-        items: { type: string }
+      description: |
+        Only requests served on this account. Each of the usage filters
+        takes one value, given once; a repeated one is read as its first.
+      schema: { type: string }
     ProjectFilter:
       name: project
       in: query
-      description: Only these projects. Repeatable.
-      style: form
-      explode: true
-      schema:
-        type: array
-        items: { type: string }
+      description: Only this project's requests. One value, given once.
+      schema: { type: string }
     KeyFilter:
       name: key
       in: query
-      description: Only these keys. Repeatable.
-      style: form
-      explode: true
-      schema:
-        type: array
-        items: { type: string }
+      description: Only this key's requests. One value, given once.
+      schema: { type: string }
     ModelFilter:
       name: model
       in: query
-      description: Only these requested models. Repeatable.
-      style: form
-      explode: true
+      description: Only requests of this model, asked for or served. One value, given once.
+      schema: { type: string }
+    StatusFilter:
+      name: status
+      in: query
+      description: Only requests that ended so (`UsageRecord.status`). One value, given once.
       schema:
-        type: array
-        items: { type: string }
+        type: string
+        enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]
     ConversationFilter:
       name: conversation
       in: query
@@ -6982,6 +7038,58 @@ components:
           type: boolean
           description: As `UsageRecord.tool_arguments_repaired`.
 
+    ConversationUsage:
+      type: object
+      description: |
+        One conversation's requests, summed (`listUsageConversations`): of
+        one project, in one currency. Its tokens are those engines reported,
+        as a summary counts them: an estimate (`input_tokens_estimated`) is
+        in none.
+      required: [conversation, project, keys, models, requests, failed_requests, input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros, currency, first_at, last_at, last_request, last_status]
+      properties:
+        conversation:
+          type: string
+          description: Its `prompt_cache_key` (`UsageRecord.conversation`), as `ConversationFilter` takes it.
+        project: { type: string }
+        keys:
+          type: array
+          maxItems: 4
+          items: { type: string }
+          description: The keys its requests were made with, in order, at most 4.
+        models:
+          type: array
+          maxItems: 4
+          items: { type: string }
+          description: The models that served its requests (else the ones asked for), in order, at most 4.
+        requests: { type: integer }
+        failed_requests:
+          type: integer
+          description: Its requests that ended other than `served` or `incomplete`.
+        input_tokens: { type: integer }
+        cached_input_tokens: { type: integer }
+        output_tokens: { type: integer }
+        reasoning_tokens: { type: integer }
+        price_micros: { type: integer }
+        currency: { type: string }
+        first_at:
+          type: string
+          format: date-time
+          description: When its earliest request was made.
+        last_at:
+          type: string
+          format: date-time
+          description: When its latest was.
+        last_request:
+          type: string
+          description: The latest request's id, as `getUsage` reads it.
+        last_status:
+          type: string
+          enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]
+          description: How its latest request ended.
+        title:
+          type: string
+          description: Its title, as the title annotator last wrote it (`ConversationTitle`); left out when none is written.
+
     UsageSummary:
       type: object
       required: [group_by, data]
@@ -9055,6 +9163,10 @@ components:
         include_internal:
           type: boolean
           description: Voice's own requests for its projects (their system keys') too; left out, not.
+        status:
+          type: string
+          enum: [served, incomplete, failed, rate_limited, budget_exhausted, no_capacity, deadline_exceeded, cancelled, abandoned]
+          description: How the request ended (`UsageRecord.status`).
 
     AnnotationRunOutcome:
       type: object

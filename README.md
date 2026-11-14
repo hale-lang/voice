@@ -236,9 +236,11 @@ Served by the api at `/`, under the operator token:
 
 - **Overview**, **Network** (the fleet as a graph, lit while each request
   runs, the api instances live over the hub), **Route table**;
-- **Usage**: a live board of conversations, the ledger with filters, and a
-  request's recording (for a project or key that **peeks**: kept seven days)
-  read as a conversation, its context beside the back and forth;
+- **Usage**: the ledger as two live tables, each request or each
+  conversation, filtered (project, key, model, status, time) and paged, the
+  view kept in the URL; a request opened shows its annotation and its
+  recording (for a project or key that **peeks**: kept seven days), and a
+  conversation opened reads as one, its context beside the back and forth;
 - **Chat**: talk to a model as a project's caller, with the hosted **web
   fetch** where its model takes tool calls; **Tools**: web fetch on or off,
   its limits and its denylist ([docs/internals.md](docs/internals.md));

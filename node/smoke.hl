@@ -1,0 +1,184 @@
+// A seat's first answers, checked before it counts as up (run.hl
+// `Runner.look`): a server that answers its health check has loaded a
+// model, which says nothing of whether it reads and writes text right. A
+// tokenizer loaded as the wrong class answers health and serves garbage:
+// words run together, raw byte-level pieces (`Ġ`, `Ċ`) in the answer. So
+// once a seat's server is healthy, the node asks its own server, with the
+// seat's key, for a few seconds' work it can judge:
+//
+// - a round trip through its tokenizer, where its server offers one: a
+//   fixed text with spaces, a newline and a letter outside ASCII, made
+//   tokens and the tokens made text again, must come back as it went;
+// - a tiny generation, a raw completion of a fixed prompt (no chat
+//   template, so no thinking), greedy and a few tokens long, must come back
+//   as text with no raw byte-level piece and no replacement character.
+//
+// Per server:
+// - llama-server: `/tokenize` and `/detokenize` (`content`), then
+//   `/v1/completions`;
+// - vLLM: `/tokenize` and `/detokenize` (`prompt`), then `/v1/completions`;
+// - TensorFold: its server answers vLLM's `/tokenize`, `/detokenize` and
+//   `/v1/completions`, so it is checked as vLLM is, on its leader's part (a
+//   follower serves no API, and is up while it runs);
+// - the decision server (voice-decide, and the MLX build's launcher)
+//   generates no text and offers no tokenizer: it answers one yes-or-no
+//   question, which must come back answered.
+//
+// A seat that fails is taken down, its server stopped, with why: never up.
+// Every call is bounded, the whole of it (`std::http::Client`, no retry).
+
+/// The text a seat's tokenizer must give back as it was: spaces, a newline,
+/// and a letter outside ASCII, with no space before a mark, which some
+/// tokenizers' decoding takes out.
+const SMOKE_TEXT: String = "Hello world,\nsecond line: café";
+
+/// The prompt a seat completes, and how much of it: any model goes on from
+/// it in plain text.
+const SMOKE_PROMPT: String = "The capital of France is";
+const SMOKE_TOKENS: Int = 4;
+
+/// How long each call of the check may take: a tokenizer's answer, and a
+/// generation's (a few tokens, the model already loaded).
+const SMOKE_TOKENIZE_MS: Int = 5000;
+const SMOKE_GENERATE_MS: Int = 30000;
+
+/// Why a seat's server, which answers its health check, is not to be up:
+/// "" when its first answers are right. `port` is its port on loopback,
+/// `key` the key it answers to and `model` the name it serves as.
+@unbounded
+fn smoke_problem(server: String, port: Int, key: String, model: String) -> String {
+    let base = "http://127.0.0.1:" + to_string(port);
+    if server == "decision" {
+        let wrong = decision_problem(base, key);
+        return if len(wrong) > 0 { "its first decision is wrong: " + wrong } else { "" };
+    }
+    let trip = round_trip_problem(server, base, key, model);
+    if len(trip) > 0 { return "its tokenizer does not round-trip: " + trip; }
+    let gen = generation_problem(base, key, model);
+    if len(gen) > 0 { return "its first generation is garbled: " + gen; }
+    return "";
+}
+
+/// Why the server's tokenizer does not give `SMOKE_TEXT` back, "" when it
+/// does or the server offers no tokenizer (a `/tokenize` it does not
+/// route). llama-server's tokenizer reads and writes `content`, vLLM's and
+/// TensorFold's `prompt`.
+@unbounded
+fn round_trip_problem(server: String, base: String, key: String, model: String) -> String {
+    let llama = server == "llama-server";
+    let named = if llama { "" } else { "\"model\":" + q(model) + "," };
+    let field = if llama { "content" } else { "prompt" };
+    let special = if llama { "add_special" } else { "add_special_tokens" };
+    let t = smoke_post(
+        base + "/tokenize",
+        key,
+        "{" + named + q(field) + ":" + q(SMOKE_TEXT) + "," + q(special) + ":false}",
+        SMOKE_TOKENIZE_MS,
+    );
+    if t.status == 404 { return ""; }
+    if t.status != 200 { return "/tokenize " + answered(t, SMOKE_TOKENIZE_MS); }
+    let tokens = std::str::trim(std::json::find_field_raw(std::str::from_bytes(t.body), "tokens"));
+    if !std::str::starts_with(tokens, "[") {
+        return "/tokenize answered no tokens";
+    }
+    let d = smoke_post(
+        base + "/detokenize",
+        key,
+        "{" + named + "\"tokens\":" + tokens + "}",
+        SMOKE_TOKENIZE_MS,
+    );
+    if d.status != 200 { return "/detokenize " + answered(d, SMOKE_TOKENIZE_MS); }
+    let back = std::json::string_field(std::str::from_bytes(d.body), field);
+    if back.kind != "string" { return "/detokenize answered no " + field; }
+    // a SentencePiece tokenizer marks a text's start as a space, which
+    // llama-server's detokenize writes: that one space is not a change
+    if back.text == SMOKE_TEXT || back.text == " " + SMOKE_TEXT { return ""; }
+    return q(SMOKE_TEXT) + " came back as " + q(harness::clip_utf8(back.text, 200));
+}
+
+/// Why the server's completion of `SMOKE_PROMPT` is not plain text, "" when
+/// it is: some text, greedy, with no raw byte-level piece (`Ġ` a space, `Ċ`
+/// a newline, as a byte-level BPE tokenizer keeps them) and no replacement
+/// character (U+FFFD, bytes that are not UTF-8).
+@unbounded
+fn generation_problem(base: String, key: String, model: String) -> String {
+    let r = smoke_post(
+        base + "/v1/completions",
+        key,
+        "{\"model\":" + q(model) + ",\"prompt\":" + q(SMOKE_PROMPT) + ",\"max_tokens\":"
+            + to_string(SMOKE_TOKENS) + ",\"temperature\":0,\"stream\":false}",
+        SMOKE_GENERATE_MS,
+    );
+    if r.status != 200 { return "/v1/completions " + answered(r, SMOKE_GENERATE_MS); }
+    let choice = std::json::array_first(
+        std::json::find_field_raw(std::str::from_bytes(r.body), "choices"),
+    );
+    if choice.done { return "/v1/completions answered no choice"; }
+    let text = std::json::string_field(choice.element, "text");
+    if text.kind != "string" || len(text.text) == 0 {
+        return "/v1/completions answered no text";
+    }
+    if garbled(text.text) {
+        return q(SMOKE_PROMPT) + " went on as " + q(harness::clip_utf8(text.text, 200));
+    }
+    return "";
+}
+
+/// True when generated text holds what no model's text holds: a byte-level
+/// BPE tokenizer's raw pieces for a space (`Ġ`, U+0120) or a newline (`Ċ`,
+/// U+010A), or the replacement character (U+FFFD).
+fn garbled(text: String) -> Bool {
+    return std::str::contains(text, "Ġ")
+        || std::str::contains(text, "Ċ")
+        || std::str::contains(text, "�");
+}
+
+/// Why the decision server's answer to one yes-or-no question is not an
+/// answer, "" when it is: the question answered, as a yes-or-no question
+/// (protocol.yaml's systemone).
+@unbounded
+fn decision_problem(base: String, key: String) -> String {
+    let r = smoke_post(
+        base + "/v1/systemone",
+        key,
+        "{\"state\":\"The sky is blue.\",\"questions\":{\"q\":{\"type\":\"noul\",\"instructions\":\"Is the sky blue?\"}}}",
+        SMOKE_GENERATE_MS,
+    );
+    if r.status != 200 { return "/v1/systemone " + answered(r, SMOKE_GENERATE_MS); }
+    let q_answer = std::json::find_field_raw(
+        std::json::find_field_raw(std::str::from_bytes(r.body), "answers"),
+        "q",
+    );
+    if std::json::find_string_field(q_answer, "type") != "noul" {
+        return "/v1/systemone did not answer its question";
+    }
+    return "";
+}
+
+/// What a call answered that is not its answer: its status and the start
+/// of its body, or that it did not answer in `ms`.
+fn answered(r: std::http::ClientResponse, ms: Int) -> String {
+    if r.status == 0 { return "did not answer within " + to_string(ms / 1000) + " s"; }
+    return "answered " + to_string(r.status) + ": "
+        + harness::clip_utf8(std::str::from_bytes(r.body), 200);
+}
+
+/// A POST of `body` to `url` on a seat's server, presenting its `key`,
+/// bounded at `ms` the whole of it and never tried twice; status 0 when it
+/// did not answer in that time.
+fn smoke_post(url: String, key: String, body: String, ms: Int) -> std::http::ClientResponse {
+    let parsed = std::http::parse_url(url) or {
+        return std::http::ClientResponse { status: 0, body: b"" };
+    };
+    let client = std::http::Client { timeout_ms: ms, max_retries: 0 };
+    let auth = engine_auth(key);
+    return client.request(
+        std::http::ClientRequest {
+            method: "POST",
+            url: parsed,
+            headers: "Content-Type: application/json"
+                + (if len(auth) > 0 { "\r\n" + auth } else { "" }),
+            body: std::bytes::from_string(body),
+        },
+    ) or std::http::ClientResponse { status: 0, body: b"" };
+}

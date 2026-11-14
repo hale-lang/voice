@@ -1,0 +1,314 @@
+// A seat is up only once its server's first answers are right (smoke.hl):
+// its tokenizer gives a fixed text back as it was, and a tiny completion is
+// plain text. Stub servers here answer as llama-server, vLLM (and
+// TensorFold, which answers as vLLM does) and the decision server do, each
+// with a key, some right and some wrong: a broken detokenize, a completion
+// in raw byte-level pieces, a decision with no answer. Then a runner looks
+// at two seats starting, one served right and one with a broken
+// detokenize: the first goes up, the second down with why, its server
+// stopped.
+import ".." as node;
+
+const TEXT: String = "Hello world,\nsecond line: café";
+
+fn answer(s: std::io::tcp::Stream, status: String, body: String) {
+    s.send(
+        "HTTP/1.1 " + status + "\r\nContent-Type: application/json\r\nContent-Length: "
+            + to_string(len(body)) + "\r\nConnection: close\r\n\r\n" + body,
+    ) or discard;
+}
+
+/// The request's head and body, whole.
+fn read_request(s: std::io::tcp::Stream) -> String {
+    let mut req = s.recv(65536) or "";
+    let he = std::str::index_of(req, "\r\n\r\n");
+    if he < 0 { return req; }
+    let lowered = std::str::lower(req[0..he]);
+    let at = std::str::index_of(lowered, "content-length:");
+    if at < 0 { return req; }
+    let rest = lowered[(at + 15)..len(lowered)];
+    let end = std::str::index_of(rest, "\r\n");
+    let want = std::str::parse_int(std::str::trim(if end < 0 { rest } else { rest[0..end] })) or 0;
+    while len(req) < he + 4 + want {
+        let more = s.recv(65536) or "";
+        if len(more) == 0 { break; }
+        req = req + more;
+    }
+    return req;
+}
+
+/// A server as the key a request presents says, `<key>.<mode>`: `llama`
+/// (llama-server's tokenizer fields, a SentencePiece start), `vllm`,
+/// `broken` (its detokenize loses spaces and newlines), `garbled` (its
+/// completion in raw byte-level pieces), `notok` (no tokenizer routes),
+/// `decision`, `undecided` (an answer without one). Its health is open;
+/// every other route needs a key of `key`'s.
+fn engine_conn(s: std::io::tcp::Stream, key: String) {
+    let req = read_request(s);
+    if std::str::starts_with(req, "GET /health") {
+        answer(s, "200 OK", "{\"status\":\"ok\"}");
+        return;
+    }
+    let he = std::str::index_of(req, "\r\n\r\n");
+    let head = std::str::lower(if he < 0 { req } else { req[0..he] }) + "\r\n";
+    let body = if he < 0 { "" } else { req[(he + 4)..len(req)] };
+    let at = std::str::index_of(head, "\r\nauthorization: bearer " + key + ".");
+    if at < 0 {
+        answer(s, "401 Unauthorized", "{\"error\":{\"message\":\"Invalid API Key\"}}");
+        return;
+    }
+    let rest = head[(at + 24 + len(key) + 1)..len(head)];
+    let mode = rest[0..std::str::index_of(rest, "\r\n")];
+    let llama = mode == "llama";
+    if std::str::starts_with(req, "POST /tokenize ") && mode != "notok" {
+        let field = if llama { "content" } else { "prompt" };
+        let special = if llama { "add_special" } else { "add_special_tokens" };
+        // the text it is asked for, without its special tokens
+        if std::json::string_field(body, field).text != TEXT
+            || std::str::trim(std::json::find_field_raw(body, special)) != "false"
+        {
+            answer(s, "400 Bad Request", "{\"error\":{\"message\":\"unexpected\"}}");
+            return;
+        }
+        answer(s, "200 OK", "{\"tokens\":[9707,1879,11,198,5569,1555,25,51950]}");
+        return;
+    }
+    if std::str::starts_with(req, "POST /detokenize ") && mode != "notok" {
+        if std::str::trim(
+            std::json::find_field_raw(body, "tokens"),
+        ) != "[9707,1879,11,198,5569,1555,25,51950]" {
+            answer(s, "400 Bad Request", "{\"error\":{\"message\":\"unexpected\"}}");
+            return;
+        }
+        if llama {
+            answer(s, "200 OK", "{\"content\":" + node::q(" " + TEXT) + "}");
+        } else if mode == "broken" {
+            answer(s, "200 OK", "{\"prompt\":\"Helloworld,secondline:café\"}");
+        } else {
+            answer(s, "200 OK", "{\"prompt\":" + node::q(TEXT) + "}");
+        }
+        return;
+    }
+    if std::str::starts_with(req, "POST /v1/completions ") {
+        if std::json::find_int_field(body, "max_tokens") > 8
+            || std::str::trim(std::json::find_field_raw(body, "temperature")) != "0"
+        {
+            answer(s, "400 Bad Request", "{\"error\":{\"message\":\"too much\"}}");
+            return;
+        }
+        let text = if mode == "garbled" { "ĠParis,ĠtheĠcapital" } else { " Paris, the capital" };
+        answer(s, "200 OK", "{\"choices\":[{\"index\":0,\"text\":" + node::q(text) + "}]}");
+        return;
+    }
+    if std::str::starts_with(req, "POST /v1/systemone ") {
+        if mode == "decision" {
+            answer(
+                s,
+                "200 OK",
+                "{\"model\":\"jev\",\"answers\":{\"q\":{\"type\":\"noul\",\"noul\":0.97}}}",
+            );
+        } else {
+            answer(s, "200 OK", "{\"model\":\"jev\",\"answers\":{}}");
+        }
+        return;
+    }
+    answer(s, "404 Not Found", "{}");
+}
+
+locus Engine {
+    params {
+        fd: Int = -1;
+        key: String = "";
+    }
+    run() {
+        while true {
+            let conn = std::io::tcp::accept_one(self.fd) or - 1;
+            if conn < 0 { return; }
+            engine_conn(std::io::tcp::Stream { conn_fd: conn, owns_fd: false }, self.key);
+            std::io::tcp::close_fd(conn);
+        }
+    }
+}
+
+/// What the runner said of its seats, a line each: the seat, its status
+/// and why.
+locus Told {
+    params { file: String = ""; }
+    bus { subscribe node::FetchUpdated as on_told; }
+    fn on_told(f: node::FetchState) {
+        std::io::fs::write_file_append(self.file, f.seat + "\t" + f.status + "\t" + f.reason + "\n")
+        or discard;
+    }
+}
+
+fn listen_from(from: Int) -> Int {
+    let mut port = from;
+    while port < from + 500 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+main locus App {
+    params {
+        engine: Engine = Engine { };
+        port: Int = 0;
+        runner: node::Runner = node::Runner { };
+        key: String = "";
+        data: String = "";
+        broken_pid: Int = 0;
+    }
+    placement {
+        engine: cooperative(pool = io);
+        runner: pinned;
+    }
+    run() {
+        std::time::sleep(200ms);
+        let key = self.key;
+        let port = self.port;
+
+        // ---- each server's first answers --------------------------------------------
+        std::test::assert_eq_str(
+            node::smoke_problem("llama-server", port, key + ".llama", "m"),
+            "",
+            "llama-server's: its tokenizer gives the text back (a SentencePiece start's one space is no change) and it completes in plain text",
+        );
+        std::test::assert_eq_str(
+            node::smoke_problem("vllm", port, key + ".vllm", "m"),
+            "",
+            "vLLM's",
+        );
+        std::test::assert_eq_str(
+            node::smoke_problem("tensorfold", port, key + ".vllm", "m"),
+            "",
+            "TensorFold's, which answers as vLLM does",
+        );
+        let broken = node::smoke_problem("vllm", port, key + ".broken", "m");
+        std::test::assert(
+            std::str::starts_with(broken, "its tokenizer does not round-trip: ")
+                && std::str::contains(broken, "Helloworld,secondline:café"),
+            "a detokenize that loses spaces and newlines is a tokenizer that does not round-trip: "
+                + broken,
+        );
+        let garbled = node::smoke_problem("vllm", port, key + ".garbled", "m");
+        std::test::assert(
+            std::str::starts_with(garbled, "its first generation is garbled: ")
+                && std::str::contains(garbled, "ĠParis"),
+            "a completion in raw byte-level pieces is garbled: " + garbled,
+        );
+        std::test::assert_eq_str(
+            node::smoke_problem("vllm", port, key + ".notok", "m"),
+            "",
+            "a server with no tokenizer routes is checked by its completion alone",
+        );
+        std::test::assert_eq_str(
+            node::smoke_problem("decision", port, key + ".decision", "jev"),
+            "",
+            "a decision server answers its question",
+        );
+        let undecided = node::smoke_problem("decision", port, key + ".undecided", "jev");
+        std::test::assert(
+            std::str::starts_with(undecided, "its first decision is wrong: "),
+            "one that does not answer it is wrong: " + undecided,
+        );
+        let unkeyed = node::smoke_problem("vllm", port, "another.vllm", "m");
+        std::test::assert(
+            std::str::contains(unkeyed, "answered 401"),
+            "every call presents the seat's key: " + unkeyed,
+        );
+        std::test::assert(!std::str::contains(unkeyed, key), "and says no key");
+        let gone = node::smoke_problem("vllm", listen_from(port + 1), key + ".vllm", "m");
+        std::test::assert(len(gone) > 0, "a server that does not answer fails: " + gone);
+        std::test::assert(
+            node::garbled("aĊb") && node::garbled("a�b"),
+            "a newline's raw piece, a replacement character",
+        );
+        std::test::assert(!node::garbled("Paris — café, 東京"), "text outside ASCII is not garbled");
+
+        // ---- a runner's seats ---------------------------------------------------------
+        // its looks run twice a second; a few of them
+        std::time::sleep(3000ms);
+        let told = std::io::fs::read_file(self.data + "/told") or "";
+        std::test::assert(
+            std::str::contains(told, "good\tup\t"),
+            "a seat whose server answers right goes up: " + told,
+        );
+        std::test::assert(
+            std::str::contains(told, "bad\tdown\tits tokenizer does not round-trip: ")
+                && !std::str::contains(told, "bad\tup"),
+            "one whose detokenize is broken goes down with why, never up: " + told,
+        );
+        std::test::assert(!node::alive(self.broken_pid), "its server is stopped");
+        std::test::assert(!std::str::contains(told, key), "no key is told");
+    }
+}
+
+/// A listening socket on loopback at `port`.
+fn listen(port: Int) -> Int {
+    return std::io::tcp::__listen_socket("127.0.0.1", port);
+}
+
+/// A process standing in for a seat's server, which a runner may stop.
+fn stand_in(data: String) -> Int {
+    return node::launch(data, data + "/stand-in.log", "sleep\n60", "vllm", "");
+}
+
+fn main() {
+    let data = "/tmp/voice-smoke-test-" + to_string(std::process::pid());
+    std::io::fs::mkdir(data) or discard;
+    std::io::fs::mkdir(data + "/run") or discard;
+    let sink = Told { file: data + "/told" };
+    let key = node::engine_key();
+    let port = listen_from(42000 + std::process::pid() % 7000);
+    let good_pid = stand_in(data);
+    let bad_pid = stand_in(data);
+    let mut runs = node::Runs { };
+    push(
+        runs.items,
+        node::Run {
+            seat: "good",
+            port: port,
+            health: "http://127.0.0.1:" + to_string(port) + "/health",
+            endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
+            pid: good_pid,
+            log: data + "/stand-in.log",
+            server: "vllm",
+            key: key + ".vllm",
+            model: "m",
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "bad",
+            port: port,
+            health: "http://127.0.0.1:" + to_string(port) + "/health",
+            endpoint: "http://127.0.0.1:" + to_string(port) + "/v1",
+            pid: bad_pid,
+            log: data + "/stand-in.log",
+            server: "vllm",
+            key: key + ".broken",
+            model: "m",
+        },
+    )
+    or discard;
+    App {
+        engine: Engine { fd: listen(port), key: key },
+        port: port,
+        runner: node::Runner {
+            id: "smoke-test-" + to_string(std::process::pid()),
+            data: data,
+            runs: runs,
+        },
+        key: key,
+        data: data,
+        broken_pid: bad_pid,
+    };
+    node::end_process(good_pid);
+}

@@ -33,6 +33,25 @@ its calls with (`tool_call_parser`, one vLLM v0.29.0 registers): DeepSeek-V4
 rest are served text only under vLLM (a GGUF seat carries them, through the
 model's own chat template).
 
+DeepSeek-R1-0528-Qwen3-8B always thinks: its model writes `<think>` itself
+(its chat template does not open it), so its variant names DeepSeek-R1's
+reasoning parser (`deepseek_r1`), which takes the thinking out of the
+answer whether the model or the template opens it, and its seats say they
+reason. It names no tool-call parser: its template writes DeepSeek's tool
+tokens, which its tokenizer does not hold as tokens, so no vLLM parser
+reads its calls reliably, and it is served text only. Its
+tokenizer_config.json names `LlamaTokenizerFast` for what is a byte-level
+BPE tokenizer; the pinned vLLM's transformers (5.x) rebuilds that class as
+Llama's, which runs words together and writes raw byte-level pieces (`Ġ`,
+`Ċ`) into the answer. So the variant names the class its tokenizer is
+loaded as (`tokenizer_class`: `PreTrainedTokenizerFast`, transformers'
+generic fast tokenizer, which reads its tokenizer.json as it is), and its
+node lays out its tokenizer_config.json as the pinned file with that one
+member changed; the files stay pinned as they were published. The
+publisher's repository has no generation_config.json at the pinned
+revision (nor at any other): vLLM then takes the end of a sequence from the
+model's config.json and samples as the request says.
+
 `deepseek-v4.1-flash-1017` is hand-made too: DeepSeek-V4.1-Flash-1017 as
 bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10 v0.7.5 serves it, on
 TensorFold across two DGX Sparks (`runtimes/tensorfold-0.7.5.json`). Its one

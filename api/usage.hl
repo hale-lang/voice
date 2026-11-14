@@ -91,10 +91,6 @@ fn affinity_of(r: InferenceRequest) -> String {
 /// (`sampled`): a body may be 12 MiB, and the key is not worth a copy of it.
 const DERIVED_SAMPLE: Int = 4096;
 
-/// The most of one input item read whole to find its role and content; a
-/// larger one is read as `sampled` text alone.
-const DERIVED_ITEM_MAX: Int = 1048576;
-
 /// The conversation a standard request body that names none is a turn of,
 /// as voice derives it to keep its turns on one seat: `derived:` and 32 hex
 /// digits of the sha256 of its `instructions` and its opening, every
@@ -127,36 +123,62 @@ fn derived_conversation(body: String) -> String {
     if opener == 34 {
         text = text + "user\n" + sampled(v, input_at, input_end) + "\n";
     } else if opener == 91 {
-        // the list's items read where they lie in the body, none copied
-        // past `DERIVED_ITEM_MAX`
+        // the list's items, and each item's members, read where they lie in
+        // the body, none copied: an item of any size is told by its type and
+        // role
         let mut item = std::json::array_next_span(
             std::json::ArrayIterSpan { pos: input_at + 1, cur_start: -1, cur_end: 0, done: false },
             body,
         );
         let mut opening = true;
         while !item.done && opening && item.cur_end <= input_end {
-            if item.cur_end - item.cur_start > DERIVED_ITEM_MAX {
-                text = text + "item\n" + sampled(v, item.cur_start, item.cur_end) + "\n";
-            } else {
-                let one = std::str::slice(v, item.cur_start, item.cur_end);
-                let kind = std::json::find_string_field(one, "type");
-                let role = std::json::find_string_field(one, "role");
-                if (kind == "message" || len(kind) == 0)
-                    && (role == "system" || role == "developer" || role == "user")
-                {
-                    let content = std::json::find_field_raw(one, "content");
-                    let cv = std::str::bytes_view(content);
-                    text = text + role + "\n" + sampled(cv, 0, cv.n) + "\n";
-                } else {
-                    opening = false;
-                }
-            }
+            let said = opening_message(body, v, item);
+            if len(said) == 0 { opening = false; } else { text = text + said; }
             item = std::json::array_next_span(item, body);
         }
     }
     if len(text) == 0 { return ""; }
     let digest = std::hex::encode(std::crypto::sha256(std::bytes::from_string(text)));
     return "derived:" + digest[0..32];
+}
+
+/// Input item `item` of `body` as a derived key reads it: a message of the
+/// system, developer or user as its role and its content (`sampled`); ""
+/// for any other item, which ends the opening. Its members are read where
+/// they lie, so an item of any size costs no copy of it.
+@unbounded
+fn opening_message(body: String, v: std::str::ByteView, item: std::json::ArrayIterSpan) -> String {
+    if std::str::byte_at(v, item.cur_start) != 123 { return ""; }
+    let mut kind = "";
+    let mut role = "";
+    let mut content_at = -1;
+    let mut content_end = -1;
+    let mut it = std::json::object_next(
+        std::json::ObjectIterSpan {
+            pos: item.cur_start + 1,
+            key_start: -1,
+            key_end: 0,
+            val_start: -1,
+            val_end: 0,
+            done: false,
+        },
+        body,
+    );
+    while !it.done && it.val_end <= item.cur_end {
+        if std::json::obj_key_eq(it, body, "type") {
+            kind = std::json::obj_value_string(it, body);
+        } else if std::json::obj_key_eq(it, body, "role") {
+            role = std::json::obj_value_string(it, body);
+        } else if std::json::obj_key_eq(it, body, "content") {
+            content_at = it.val_start;
+            content_end = it.val_end;
+        }
+        it = std::json::object_next(it, body);
+    }
+    let message = kind == "message" || len(kind) == 0;
+    if !message || !(role == "system" || role == "developer" || role == "user") { return ""; }
+    return role + "\n" + (if content_at >= 0 { sampled(v, content_at, content_end) } else { "" })
+        + "\n";
 }
 
 /// The text of `v` in [from, to) as a derived key reads it: whole up to

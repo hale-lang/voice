@@ -7261,6 +7261,7 @@ Type: object
 | `context` | integer |  | As `SeatView.context`. | ≥ 1 |
 | `in_flight` | integer | yes |  |  |
 | `problems` | array of string | yes |  |  |
+| `since` | string (date-time) |  | As `SeatView.since`. |  |
 | `placement` | string |  | A placement's seat's placement (its config's `placement`); left out for any other. |  |
 | `variant` | string |  | The recipe variant a placement's seat runs (its config's `variant.id`). |  |
 | `runtime` | string |  | The runtime a placement's seat runs it under (its config's `runtime.id`). |  |
@@ -7285,6 +7286,7 @@ Type: [Seat](#schema-seat) & object
 | `context` | integer |  | A managed seat's: the context, in tokens, its server took, as its node last reported (`SeatState.context`). Left out until it says. A llama.cpp seat's is what each of its slots holds: its prompt cache divided among its slots, never less than the context its placement promises (32768, or the model's own when it is made for less). | ≥ 1 |
 | `in_flight` | integer | yes |  |  |
 | `problems` | array of string | yes | What the coordinator sees wrong with it, e.g. a model not in the catalog or an archived account. |  |
+| `since` | string (date-time) |  | When the seat's state, its `status` and `reason`, began: the time of the node's report that changed either. A report that repeats them keeps it. Left out while the seat is `pending` or `offline`. |  |
 
 <a id="schema-hub"></a>
 

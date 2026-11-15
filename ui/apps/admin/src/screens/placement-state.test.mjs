@@ -21,9 +21,20 @@ test('a fetch says how much of it is in', () => {
   assert.equal(placementState({ seat: 'node-a/llm' }, at(seat('node-a/llm', 'pending'))).state, 'starting');
 });
 
-test('no time is invented: a start says how far, not for how long', () => {
+test('no time is invented: a seat with no since says how far, not for how long', () => {
   const st = placementState(two, at(seat('node-a/llm', 'starting'), seat('node-e/llm', 'starting')));
-  assert.doesNotMatch(st.detail, /\d+[smh]\b|ago/);
+  assert.doesNotMatch(st.detail, /\d+ ?[smhd]\b|ago/);
+});
+
+test('a seat whose reports stamp since says for how long it has held its state', () => {
+  const now = Date.parse('2026-11-15T12:00:00Z');
+  const since = (min) => new Date(now - min * 60000).toISOString();
+  const stuck = placementState({ seat: 'node-a/llm' }, at(seat('node-a/llm', 'starting', { since: since(72) })), now);
+  assert.equal(stuck.detail, 'node-a loading the model · 1 h 12 m');
+  const down = placementState({ seat: 'node-a/llm' }, at(seat('node-a/llm', 'down', { reason: 'exited 137', since: since(3) })), now);
+  assert.equal(down.detail, 'node-a/llm down: exited 137 · 3 m');
+  const m = modelState({ id: 'm', available: false, seats: ['node-a/llm'] }, [], at(seat('node-a/llm', 'starting', { since: since(5) })), now);
+  assert.equal(m.detail, 'node-a loading the model · 5 m');
 });
 
 test('nothing coming up: no seat serves this, always with why', () => {

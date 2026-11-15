@@ -4,6 +4,7 @@ import { useGet, useNodes, type Account, type NodeSummary, type SeatSummary, typ
 import type { ScreenProps } from '../App';
 import { href } from '../route';
 import { readout } from '../readout';
+import { sinceExact, withLasted } from '../seat-since';
 
 /** Headroom, health, spend, recent requests: the glance. */
 export function Overview(_: ScreenProps) {
@@ -75,7 +76,7 @@ function Fleet() {
           { key: 'engine', header: 'Engine', render: (r) => r.engine },
           { key: 'account', header: 'Account', render: (r) => <Mono>{r.account}</Mono> },
           { key: 'serves', header: 'Serves', render: (r) => r.serves.map((m) => m.model).join(', ') },
-          { key: 'status', header: 'State', render: (r) => <Status tone={toneOf(r.status)} label={r.status} title={r.reason ?? undefined} /> },
+          { key: 'status', header: 'State', render: (r) => <Status tone={toneOf(r.status)} label={withLasted(r.status, r.since)} title={[r.reason, sinceExact(r.since)].filter(Boolean).join(' · ') || undefined} /> },
           { key: 'flight', header: 'In flight', num: true, render: (r) => `${r.in_flight} / ${r.concurrency}` },
           { key: 'problems', header: 'Problems', wrap: true, render: (r) => (r.problems.length ? <span className="c-wait">{r.problems.join('; ')}</span> : <span className="faint">–</span>) },
         ]}

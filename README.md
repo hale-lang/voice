@@ -244,7 +244,9 @@ screens in layers:
   recording, for a project or key that **peeks**: kept seven days) and
   **Live** (the fleet as a graph, lit while each request runs, the api
   instances live over the hub);
-- **Projects** (subprojects, keys, limits, budgets, peek);
+- **Projects** (subprojects, keys, limits, budgets, peek; each project's
+  tokens and spend over the last 24 hours, 7 days or 30 days, and its
+  keys' and models' share);
 - **Conversations**: **Chat** (talk to a model as a project's caller, with
   the hosted **web fetch** where its model takes tool calls) and
   **Conversations** (the ledger by conversation; one opened reads as one,

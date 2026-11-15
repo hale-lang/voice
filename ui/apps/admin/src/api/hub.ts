@@ -31,7 +31,7 @@ function adminFrame(qc: QueryClient, topic: string, payload: Record<string, unkn
   const type = ADMIN_TOPICS[topic]!;
   const whole = payload.whole !== false && typeof payload.data === 'string';
   if (!whole) {
-    refresh(qc, type === 'change' ? COVERED : AFFECTS[type] ?? COVERED);
+    refresh(qc, type === 'change' ? COVERED : AFFECTS[type] ?? COVERED, true);
     return;
   }
   const data = JSON.parse(payload.data as string) as unknown;
@@ -198,7 +198,7 @@ export function useHub(): HubState {
             const admin = ADMIN_TOPICS[f.topic];
             // a change shed names a resource no event left can say: every
             // admin read again; another topic's gap, what that topic covers
-            if (admin && before !== undefined && f.seq > before + 1) refresh(qc, admin === 'change' ? COVERED : AFFECTS[admin] ?? COVERED);
+            if (admin && before !== undefined && f.seq > before + 1) refresh(qc, admin === 'change' ? COVERED : AFFECTS[admin] ?? COVERED, true);
             if (admin && f.payload) adminFrame(qc, f.topic, f.payload);
             else if (f.topic === 'NodeObserved' && typeof f.payload?.body === 'string') {
               // a seat that moved changes what can be routed

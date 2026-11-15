@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Button, Confirm, Secret, Checkbox, micros, when, ago } from '@hale/components';
-import { useGet, type Project, type Schemas } from '../api/client';
+import { useGet, useUsageTotals, type Project, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
 import { go } from '../route';
@@ -11,6 +11,7 @@ import { describeLimit } from './Accounts';
 import { Aliases } from './Aliases';
 import { AnnotateRoutes } from '../readiness';
 import { isRetiredSystem, listedProjects } from '../projects-listed';
+import { WINDOWS, DEFAULT_WINDOW, windowFrom, totalsBy, breakdown, sumOf, tokensSaid, NO_TOTALS, type Totals, type UsageWindow } from '../usage-totals';
 
 type Key = Schemas['Key'];
 
@@ -22,10 +23,15 @@ export function Projects({ route, setInspector }: ScreenProps) {
   const creating = selected === 'new';
   // voice's retired system project, kept where it has history: shown on asking
   const [showRetired, setShowRetired] = useState(false);
+  // the window each project's usage is shown over, its inspector's too
+  const [usageWindow, setUsageWindow] = useState<UsageWindow>(DEFAULT_WINDOW);
+  const from = windowFrom(usageWindow, Date.now());
+  const totals = useUsageTotals({ group_by: ['project'], from });
+  const byProject = useMemo(() => totalsBy(totals.data?.data ?? [], 'project'), [totals.data]);
 
   useEffect(() => {
-    setInspector(creating ? <CreateProject /> : project ? <ProjectInspector project={project} /> : null);
-  }, [creating, project, setInspector]);
+    setInspector(creating ? <CreateProject /> : project ? <ProjectInspector project={project} usageWindow={usageWindow} from={from} /> : null);
+  }, [creating, project, setInspector, usageWindow, from]);
 
   if (q.isPending) return <Loading what="projects" />;
   if (q.isError) return <Unavailable what="Projects" detail={q.error.message} />;
@@ -37,6 +43,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
     <>
       <h1>Projects</h1>
       <Panel title="Projects" readout={readout(q, `${listed.length} projects`)}>
+        <WindowChoice value={usageWindow} onChange={setUsageWindow} error={totals.isError ? totals.error.message : undefined} />
         <Table<Project>
           rows={inTree(listed)}
           rowKey={(p) => p.id}
@@ -48,7 +55,8 @@ export function Projects({ route, setInspector }: ScreenProps) {
             { key: 'status', header: 'State', render: (p) => <Status tone={toneOf(p.status)} label={p.status} /> },
             { key: 'keys', header: 'Keys', num: true, render: (p) => p.key_count ?? 0 },
             { key: 'accounts', header: 'Accounts', render: (p) => (spendsNone(p, q.data.data) ? <SpendsNone /> : p.inherits ? <span className="muted">{p.parent}'s</span> : p.accounts ? p.accounts.join(', ') : <span className="muted">any</span>) },
-            { key: 'spent', header: 'Spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
+            ...usageColumns<Project>((p) => (totals.data ? byProject.get(p.id) ?? NO_TOTALS : undefined), usageWindow),
+            { key: 'spent', header: 'Budget spent', num: true, render: (p) => (p.budget ? micros(p.budget.spent_micros, p.budget.currency) : <span className="faint">no budget</span>) },
             { key: 'budget', header: 'Allowance', num: true, render: (p) => (p.budget ? `${micros(p.budget.allowance_micros, p.budget.currency)} / ${p.budget.period}` : '') },
           ]}
           empty="No projects. Create one, then keys under it."
@@ -61,6 +69,44 @@ export function Projects({ route, setInspector }: ScreenProps) {
       {project && <Keys project={project} />}
     </>
   );
+}
+
+/** The window usage is shown over, chosen: totals are to the hour. */
+function WindowChoice({ value, onChange, error }: { value: UsageWindow; onChange: (w: UsageWindow) => void; error?: string }) {
+  return (
+    <p style={{ marginTop: 0, display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
+      <span className="muted">tokens and spend over the last</span>
+      <Select value={value} onChange={(v) => onChange(v as UsageWindow)} options={WINDOWS.map((w) => ({ value: w.value, label: w.label }))} />
+      <span className="faint">to the hour</span>
+      {error && <span className="c-fail">usage unavailable: {error}</span>}
+    </p>
+  );
+}
+
+/** A token count, short, its whole count on hover; a dash for none. */
+function TokensCell({ n }: { n: number }): ReactNode {
+  return n === 0 ? <span className="faint">–</span> : <span title={n.toLocaleString()}>{tokensSaid(n)}</span>;
+}
+
+/** Spend in each currency; a dash for none. */
+function SpendCell({ t }: { t: Totals }): ReactNode {
+  return t.spend.length === 0 ? <span className="faint">–</span> : <>{t.spend.map((x) => micros(x.micros, x.currency)).join(' + ')}</>;
+}
+
+/** The usage columns of a row whose totals `of` says, `undefined` while they are read. */
+function usageColumns<T>(of: (row: T) => Totals | undefined, w: UsageWindow) {
+  const label = WINDOWS.find((x) => x.value === w)!.label;
+  const cell = (row: T, said: (t: Totals) => ReactNode) => {
+    const t = of(row);
+    return t ? said(t) : <span className="faint">…</span>;
+  };
+  return [
+    { key: 'in', header: 'In', num: true, render: (r: T) => cell(r, (t) => <TokensCell n={t.input} />) },
+    { key: 'cached', header: 'Cached', num: true, render: (r: T) => cell(r, (t) => <TokensCell n={t.cached} />) },
+    { key: 'out', header: 'Out', num: true, render: (r: T) => cell(r, (t) => <TokensCell n={t.output} />) },
+    { key: 'reasoning', header: 'Reasoning', num: true, render: (r: T) => cell(r, (t) => <TokensCell n={t.reasoning} />) },
+    { key: 'spend', header: `Spend · ${label}`, num: true, render: (r: T) => cell(r, (t) => <SpendCell t={t} />) },
+  ];
 }
 
 /** A list that may be none, any, or some names: `[]`, `null`, or the names. */
@@ -145,7 +191,45 @@ function SpendsNone() {
   return <Status tone="fail" label="none" title="may spend no account: requests will be refused; grant one" />;
 }
 
-function ProjectInspector({ project: p }: { project: Project }) {
+/**
+ * A project's usage over the window, from the hourly rollup: its totals,
+ * and each of its keys' and models' share, the most spent first.
+ */
+function ProjectUsage({ project, usageWindow, from }: { project: string; usageWindow: UsageWindow; from: string }) {
+  const q = useUsageTotals({ group_by: ['key', 'model'], project, from });
+  const rows = useMemo(() => q.data?.data ?? [], [q.data]);
+  const keys = useMemo(() => breakdown(rows, 'key'), [rows]);
+  const models = useMemo(() => breakdown(rows, 'model'), [rows]);
+  const label = WINDOWS.find((x) => x.value === usageWindow)!.label;
+  if (q.isPending) return <Loading what="usage" />;
+  if (q.isError && !q.data) return <Unavailable what="Usage" detail={q.error.message} />;
+  const all = sumOf(rows);
+  if (all.requests === 0) return <span className="faint">no requests in the last {label}</span>;
+  type Share = { name: string; totals: Totals };
+  const columns = (first: string) => [
+    { key: 'name', header: first, render: (r: Share) => <Mono>{r.name}</Mono> },
+    { key: 'requests', header: 'Requests', num: true, render: (r: Share) => <span title={r.totals.failed ? `${r.totals.failed.toLocaleString()} failed` : undefined}>{r.totals.requests.toLocaleString()}{r.totals.failed > 0 && <span className="c-fail"> · {r.totals.failed.toLocaleString()} failed</span>}</span> },
+    ...usageColumns<Share>((r) => r.totals, usageWindow),
+  ];
+  return (
+    <>
+      <Kv
+        rows={[
+          { k: 'requests', v: <>{all.requests.toLocaleString()}{all.failed > 0 && <span className="c-fail"> · {all.failed.toLocaleString()} failed</span>}</> },
+          { k: 'input', v: <>{all.input.toLocaleString()} <span className="muted">· {all.cached.toLocaleString()} cached</span></> },
+          { k: 'output', v: <>{all.output.toLocaleString()} <span className="muted">· {all.reasoning.toLocaleString()} reasoning</span></> },
+          { k: 'spend', v: <SpendCell t={all} /> },
+        ]}
+      />
+      <Table<Share> rows={keys} rowKey={(r) => r.name} columns={columns('Key')} empty="No keys used." />
+      <div style={{ marginTop: 'var(--space-3)' }}>
+        <Table<Share> rows={models} rowKey={(r) => r.name} columns={columns('Model')} empty="No models used." />
+      </div>
+    </>
+  );
+}
+
+function ProjectInspector({ project: p, usageWindow, from }: { project: Project; usageWindow: UsageWindow; from: string }) {
   const w = useWrite();
   const [mode, setMode] = useState<'view' | 'budget' | 'limits' | 'access'>('view');
   const [accountScope, setAccountScope] = useState<Scope>(p.inherits ? 'parent' : scopeOf(p.accounts, 'none'));
@@ -301,6 +385,8 @@ function ProjectInspector({ project: p }: { project: Project }) {
       ) : (
         p.status !== 'archived' && <p><Button onClick={() => setMode('access')}>edit access</Button></p>
       )}
+      <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Usage · last {WINDOWS.find((x) => x.value === usageWindow)!.label}</h3>
+      <ProjectUsage project={p.id} usageWindow={usageWindow} from={from} />
       <h3 style={{ margin: 'var(--space-4) 0 var(--space-2)' }}>Budget</h3>
       {mode === 'budget' ? (
         <Form

@@ -4,6 +4,7 @@
 // a database at the current schema (`api migrate`), which this test
 // empties first.
 import ".." as st;
+import "../../lib/pond/db" as db;
 
 fn t(text: String) -> Time {
     return std::time::parse_time(text) or `1970-01-01T00:00:00Z`;
@@ -1967,6 +1968,262 @@ fn flights(s: st::Store, label: String) {
     std::test::assert_eq_int(count(left.rows), 0, label + ": landed, none is in flight");
 }
 
+/// A ledger row as the api writes one (api/usage.hl `usage_row`): `model`
+/// served it unless "", else `asked` was asked for and none served; an
+/// input the seat did not report is voice's estimate, 0 in the columns.
+fn ended(
+    id: String,
+    when: String,
+    project: String,
+    key: String,
+    asked: String,
+    model: String,
+    status: String,
+    input: Int,
+    cached: Int,
+    output: Int,
+    reasoning: Int,
+    price: Int,
+    currency: String
+) -> st::UsageRow {
+    return st::UsageRow {
+        id: id,
+        created_at: t(when),
+        project: project,
+        key: key,
+        requested_model: asked,
+        served_model: model,
+        status: status,
+        input_tokens: input,
+        cached_input_tokens: cached,
+        output_tokens: output,
+        reasoning_tokens: reasoning,
+        price_micros: price,
+        currency: currency,
+        served: if len(model) > 0 { "{\"model\": \"" + model + "\"}" } else { "null" },
+        record: "{\"id\": \"" + id + "\", \"input_tokens_estimated\": "
+            + (if input == 0 && status != "served" { "true" } else { "false" }) + "}"
+    };
+}
+
+/// Totals as text: each group's values of `fields`, its currency and its
+/// sums, in the order read.
+fn totals_said(r: st::UsageTotals, fields: st::Names) -> String {
+    let mut out = "";
+    for x in r.rows {
+        let mut g = "";
+        for f in fields.items {
+            g = g + (if len(g) > 0 { "/" } else { "" }) + std::json::find_string_field(x.group, f);
+        }
+        out = out + (if len(out) > 0 { "; " } else { "" }) + g + " " + x.currency + " "
+            + to_string(x.requests) + " " + to_string(x.failed) + " " + to_string(x.input_tokens)
+            + " " + to_string(x.cached_input_tokens) + " " + to_string(x.output_tokens) + " "
+            + to_string(x.reasoning_tokens) + " " + to_string(x.price_micros);
+    }
+    return out;
+}
+
+/// True when totals grouped by `by` are refused as invalid.
+fn refused_total(s: st::Store, by: String) -> Bool {
+    s.usage_totals(st::UsageTotalsQuery { by: names(by, "") }) or { return err.kind == "invalid"; };
+    return false;
+}
+
+/// The hourly rollup (migration 40): each row the ledger takes is added to
+/// its project's, key's, model's and currency's hour as it is written,
+/// once; totals over a range are to the hour, count failures among the
+/// requests and estimates in no token sum, leave a project's system key out
+/// unless asked, and are what a scan of the ledger sums.
+fn rollup(s: st::Store, label: String) {
+    let w = "2026-11-02T";
+    s.insert_usage(
+        ended(
+            "r1",
+            w + "10:05:00Z",
+            "work",
+            "k1",
+            "fast",
+            "qwen",
+            "served",
+            100,
+            40,
+            10,
+            3,
+            1000,
+            "USD",
+        ),
+    ) or discard;
+    s.insert_usage(
+        ended(
+            "r2",
+            w + "10:55:00Z",
+            "work",
+            "k1",
+            "fast",
+            "qwen",
+            "incomplete",
+            50,
+            0,
+            5,
+            0,
+            500,
+            "USD",
+        ),
+    ) or discard;
+    // failed with no seat: the model asked for, an estimated input (0)
+    s.insert_usage(
+        ended("r3", w + "10:30:00Z", "work", "k1", "fast", "", "no_capacity", 0, 0, 0, 0, 0, "USD"),
+    ) or discard;
+    // failed after a seat took it: its input estimated, its output reported
+    s.insert_usage(
+        ended("r4", w + "11:10:00Z", "work", "k2", "big", "dsv4", "failed", 0, 0, 7, 2, 70, "USD"),
+    ) or discard;
+    s.insert_usage(
+        ended("r5", w + "12:00:00Z", "work", "k2", "big", "dsv4", "served", 9, 1, 1, 0, 90, "EUR"),
+    ) or discard;
+    s.insert_usage(
+        ended("r6", w + "11:20:00Z", "play", "k3", "fast", "qwen", "served", 1, 0, 1, 0, 1, "USD"),
+    ) or discard;
+    // voice's own request for work, under its system key
+    s.insert_usage(
+        ended(
+            "r7",
+            w + "10:40:00Z",
+            "work",
+            "work-system",
+            "decide",
+            "qwen",
+            "served",
+            30,
+            0,
+            3,
+            0,
+            300,
+            "USD",
+        ),
+    ) or discard;
+    // a row the ledger has is not counted again
+    s.insert_usage(
+        ended(
+            "r1",
+            w + "10:05:00Z",
+            "work",
+            "k1",
+            "fast",
+            "qwen",
+            "served",
+            100,
+            40,
+            10,
+            3,
+            1000,
+            "USD",
+        ),
+    ) or discard;
+
+    let projects = names("project", "");
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(st::UsageTotalsQuery { by: projects }) or st::UsageTotals { },
+            projects,
+        ),
+        "play USD 1 0 1 0 1 0 1; work EUR 1 0 9 1 1 0 90; work USD 4 2 150 40 22 5 1570",
+        label
+            + ": by project and currency, failures among the requests, estimates in no sum, the system key's left out",
+    );
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(
+                st::UsageTotalsQuery { by: projects, project: "work", include_internal: true },
+            ) or st::UsageTotals { },
+            projects,
+        ),
+        "work EUR 1 0 9 1 1 0 90; work USD 5 2 180 40 25 5 1870",
+        label + ": the system key's too, asked for",
+    );
+    let km = names("key", "model");
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(st::UsageTotalsQuery { by: km, project: "work" }) or st::UsageTotals { },
+            km,
+        ),
+        "k1/fast USD 1 1 0 0 0 0 0; k1/qwen USD 2 0 150 40 15 3 1500; k2/dsv4 EUR 1 0 9 1 1 0 90; k2/dsv4 USD 1 1 0 0 7 2 70",
+        label + ": by key and model, the model that served, else the one asked for",
+    );
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(
+                st::UsageTotalsQuery { by: km, key: "work-system" },
+            ) or st::UsageTotals { },
+            km,
+        ),
+        "work-system/qwen USD 1 0 30 0 3 0 300",
+        label + ": a system key named is its own",
+    );
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(
+                st::UsageTotalsQuery { by: projects, model: "fast" },
+            ) or st::UsageTotals { },
+            projects,
+        ),
+        "work USD 1 1 0 0 0 0 0",
+        label + ": a model filter names the model that served, else the one asked for",
+    );
+    // a range is widened to whole hours: from 10:59 counts 10:00 to 10:59,
+    // to 11:00 counts the hour that starts then
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(
+                st::UsageTotalsQuery {
+                    by: projects,
+                    has_from: true,
+                    from: t(w + "10:59:00Z"),
+                    has_to: true,
+                    to: t(w + "11:00:00Z")
+                },
+            ) or st::UsageTotals { },
+            projects,
+        ),
+        "play USD 1 0 1 0 1 0 1; work USD 4 2 150 40 22 5 1570",
+        label + ": to the hour, from the one holding from to the one holding to",
+    );
+    std::test::assert_eq_str(
+        totals_said(
+            s.usage_totals(
+                st::UsageTotalsQuery { by: projects, has_from: true, from: t(w + "11:00:01Z") },
+            ) or st::UsageTotals { },
+            projects,
+        ),
+        "play USD 1 0 1 0 1 0 1; work EUR 1 0 9 1 1 0 90; work USD 1 1 0 0 7 2 70",
+        label + ": an hour before the one holding from is not counted",
+    );
+    std::test::assert(
+        refused_total(s, "account"),
+        label + ": the totals group by project, key or model alone",
+    );
+    // what a scan of the ledger sums, group for group
+    let summed = s.usage_summary(st::UsageSummaryQuery { by: projects }) or st::UsageGroups { };
+    let totals = s.usage_totals(st::UsageTotalsQuery { by: projects }) or st::UsageTotals { };
+    let mut same = count(summed.rows) == count(totals.rows);
+    for g in summed.rows {
+        let mut met = false;
+        for x in totals.rows {
+            if std::json::find_string_field(x.group, "project") == std::json::find_string_field(
+                g.group,
+                "project",
+            )
+                && x.currency == g.currency
+            {
+                met = x.requests == g.requests && x.input_tokens == g.input_tokens
+                    && x.output_tokens == g.output_tokens && x.price_micros == g.price_micros;
+            }
+        }
+        same = same && met;
+    }
+    std::test::assert(same, label + ": the totals are what a scan of the ledger sums");
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -2049,6 +2306,7 @@ fn main() {
     flights(st::MemoryStore { }, "memory");
     attempts(st::MemoryStore { }, "memory");
     peeks(st::MemoryStore { }, "memory");
+    rollup(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -2093,6 +2351,26 @@ fn main() {
     pg.conn.exec("TRUNCATE peek");
     pg.conn.exec("DELETE FROM project WHERE id = 'peeky'");
     peeks(pg, "postgres");
+    pg.conn.exec("TRUNCATE usage, usage_hourly RESTART IDENTITY");
+    rollup(pg, "postgres");
+    std::test::assert_eq_int(
+        ledger_unlike_rollup(pg),
+        0,
+        "postgres: the rollup the trigger kept is a fresh sum of the ledger, hour for hour",
+    );
+}
+
+/// How many hours of the rollup differ from what the ledger sums to now,
+/// either way: the sum migration 40's backfill takes.
+fn ledger_unlike_rollup(pg: st::PgStore) -> Int {
+    let fresh = "SELECT project, key, coalesce(served->>'model', requested_model) AS model, currency, date_trunc('hour', created_at, 'UTC') AS hour, count(*) AS requests, count(*) FILTER (WHERE status NOT IN ('served', 'incomplete')) AS failed_requests, sum(input_tokens) AS input_tokens, sum(cached_input_tokens) AS cached_input_tokens, sum(output_tokens) AS output_tokens, sum(reasoning_tokens) AS reasoning_tokens, sum(price_micros) AS price_micros FROM usage GROUP BY 1, 2, 3, 4, 5";
+    let kept = "SELECT project, key, model, currency, hour, requests, failed_requests, input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros FROM usage_hourly";
+    let line = pg.row(
+        "SELECT row_to_json(t) FROM (SELECT (SELECT count(*) FROM (" + fresh + " EXCEPT " + kept
+            + ") a) + (SELECT count(*) FROM (" + kept + " EXCEPT " + fresh + ") b) AS n) t",
+        db::Args { },
+    ) or "";
+    return if len(line) == 0 { -1 } else { std::json::find_int_field(line, "n") };
 }
 
 fn attempt_row(id: String, project: String, when: Time) -> st::AttemptRow {

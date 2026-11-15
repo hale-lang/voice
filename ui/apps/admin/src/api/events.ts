@@ -4,6 +4,7 @@ import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
 import { addSteps, type Step } from './steps';
 import { ARRANGEMENTS, FITS, RECIPE_READS, changeReads } from './fleet-reads';
+import { paceWait } from '../usage-totals';
 
 type AdminEvent = Schemas['AdminEvent'];
 const listeners = new Set<(event: AdminEvent) => void>();
@@ -68,10 +69,35 @@ export { RECIPE_READS };
 /** What a (re)connect reads again: every admin read, for what was missed. */
 export const COVERED = ['/admin/v1'];
 
-/** Read again every query under `paths` (a path, or anything below it). */
-export function refresh(qc: QueryClient, paths: string[]) {
+/**
+ * Reads an event refreshes at most so often, in ms: the usage totals, which
+ * every request's record would otherwise read again, though they are to
+ * the hour. The first read waits for none; the reads asked for meanwhile
+ * are one, at the end of the wait. What is shown stays until it lands.
+ */
+export const PACED: Record<string, number> = { '/admin/v1/usage/totals': 5_000 };
+const pacedLast = new Map<string, number>();
+const pacedDue = new Set<string>();
+
+function refreshPaced(qc: QueryClient, path: string, every: number) {
+  if (pacedDue.has(path)) return;
+  pacedDue.add(path);
+  setTimeout(() => {
+    pacedDue.delete(path);
+    pacedLast.set(path, Date.now());
+    void qc.invalidateQueries({ queryKey: [path] });
+  }, paceWait(pacedLast.get(path) ?? 0, Date.now(), every));
+}
+
+/**
+ * Read again every query under `paths` (a path, or anything below it);
+ * with `paced`, the reads in `PACED` no more often than it says.
+ */
+export function refresh(qc: QueryClient, paths: string[], paced = false) {
   const under = (k: unknown) => typeof k === 'string' && paths.some((p) => k === p || k.startsWith(`${p}/`));
-  void qc.invalidateQueries({ predicate: (q) => under(q.queryKey[0]) });
+  const held = (k: unknown) => paced && typeof k === 'string' && k in PACED;
+  void qc.invalidateQueries({ predicate: (q) => under(q.queryKey[0]) && !held(q.queryKey[0]) });
+  if (paced) for (const [path, every] of Object.entries(PACED)) if (under(path)) refreshPaced(qc, path, every);
 }
 
 const seen = new Set<string>();
@@ -102,7 +128,7 @@ export function deliver(qc: QueryClient, event: AdminEvent) {
     // the saved arrangements (fleet-reads.ts)
     paths.push(...changeReads(event.data.target));
   }
-  refresh(qc, paths);
+  refresh(qc, paths, true);
 }
 
 /** The requests in flight, as the hub tells them whole. */

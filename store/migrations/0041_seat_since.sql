@@ -1,3 +1,2 @@
-alter table seat_state add column since timestamptz;
+alter table seat_state add column since timestamptz not null default now();
 update seat_state set since = reported_at;
-alter table seat_state alter column since set not null;

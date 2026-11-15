@@ -46,8 +46,8 @@
 # trigger, and a row the ledger already has adds nothing.
 #
 # Then when a seat's state began (migration 41): a seat's state from
-# before takes the time of its last report as its `since`, and the column
-# is required from then on.
+# before takes the time of its last report as its `since`, and a state an
+# api from before writes after it, with none, begins now.
 #
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
@@ -346,5 +346,7 @@ INSERT INTO seat_state (node, seat, status, reason, in_flight, reported_at) VALU
 SQL
 migrate $((head - 40))
 test "$(q "SELECT count(*) FROM seat_state WHERE since = reported_at")" = 2
-test "$(q "SELECT is_nullable FROM information_schema.columns WHERE table_name = 'seat_state' AND column_name = 'since'")" = NO
+# an api from before writes a state without one: it begins now
+q "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('mini', 'late', 'starting', 0, now())" >/dev/null
+test "$(q "SELECT count(*) FROM seat_state WHERE seat = 'late' AND now() - since < interval '1 minute'")" = 1
 echo "migration 41 gives each seat's state from before the time of its last report as its since: $(tail -1 "$work/migrate.log")"

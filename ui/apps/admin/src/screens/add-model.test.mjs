@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, nodesOffering, noNodeOffers, priceOf, seatIdFor, voiceKeyed } from './add-model.ts';
+import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, nodesOffering, noNodeOffers, priceOf, recipeKinds, runsOnHost, seatIdFor, voiceKeyed } from './add-model.ts';
 
 const nodes = [
   { id: 'mac', status: 'up', capabilities: { engines: [{ id: 'managed', kind: 'managed' }, { id: 'claude', kind: 'claude-cli' }] } },
@@ -51,6 +51,20 @@ test("a CLI under voice's own key: its seat names no login, its model the voice 
   assert.equal(loginEntry(pi, 'work'), '', 'no login to suggest');
   const w = harnessWrites({ model: 'pi-qwen3-coder', offer: { node: 'gpu', engine: 'coding' }, account: 'local', harness: 'pi', login: '', cliModel: 'qwen3-coder' });
   assert.deepEqual(w.seat.config, { harness: 'pi', model: 'qwen3-coder' });
+});
+
+test('where a recipe runs: a container unless the seat opts in to the host, or the host alone', () => {
+  const both = { id: 'codex', name: 'Codex', login: { kind: 'home' }, backends: [{ kind: 'container' }, { kind: 'host' }] };
+  const boxed = { id: 'fake', name: 'Fake', login: { kind: 'env' }, image: { base: 'x', install: 'y' } };
+  const hostOnly = { id: 'mine', name: 'Mine', login: { kind: 'env' }, backends: [{ kind: 'host' }] };
+  assert.deepEqual(recipeKinds(both), ['container', 'host']);
+  assert.deepEqual(recipeKinds(boxed), ['container'], 'the older image is a container');
+  assert.equal(runsOnHost(both, false), false, 'a container by default');
+  assert.equal(runsOnHost(both, true), true, 'the host on the opt-in');
+  assert.equal(runsOnHost(boxed, true), false, 'no host backend, no host');
+  assert.equal(runsOnHost(hostOnly, false), true, 'a recipe of the host alone');
+  const w = harnessWrites({ model: 'codex-host', offer: { node: 'gpu', engine: 'coding' }, account: 'work', harness: 'codex', login: 'codex-work', cliModel: '', host: true });
+  assert.deepEqual(w.seat.config, { harness: 'codex', login: 'codex-work', backend: 'host' }, 'the seat opts in');
 });
 
 test('an api model: priced, its endpoint and upstream name on an openai-compatible seat', () => {

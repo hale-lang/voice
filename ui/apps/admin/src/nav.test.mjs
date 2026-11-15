@@ -27,6 +27,7 @@ test('every screen has a route of its own, which opens it with its item', () => 
     annotators: '#/harness/annotators',
     tools: '#/harness/tools',
     attempts: '#/harness/attempts',
+    clis: '#/harness/clis',
     changes: '#/changes',
     api: '#/api',
   };
@@ -54,6 +55,8 @@ test('the deep links the screens write open on their new routes', () => {
     [['chat', 'c1'], '#/conversations/chat/c1'],
     [['annotators', 'rules', 'r1'], '#/harness/annotators/rules/r1'],
     [['attempts', 'a1'], '#/harness/attempts/a1'],
+    [['clis', 'claude'], '#/harness/clis/claude'],
+    [['clis', 'new'], '#/harness/clis/new'],
     [['projects', 'work'], '#/projects/work'],
     [['api', 'schema', 'Model'], '#/api/schema/Model'],
     [['changes', 'ch1'], '#/changes/ch1'],
@@ -119,7 +122,7 @@ test('the rail: Overview, the Models layer, Projects, Conversations, Harness, an
       ['Models', false, ['Catalogue', 'Placements', 'Nodes', 'Recipes', 'Runtimes', 'Accounts', 'Routes', 'Requests', 'Live']],
       [null, false, ['Projects']],
       ['Conversations', false, ['Chat', 'Conversations']],
-      ['Harness', false, ['Annotators', 'Tools', 'Attempts']],
+      ['Harness', false, ['Annotators', 'Tools', 'Attempts', 'CLI recipes']],
       [null, true, ['Changes', 'API']],
     ],
   );

@@ -26,6 +26,7 @@ export const PLACES = {
   annotators: ['harness', 'annotators'],
   tools: ['harness', 'tools'],
   attempts: ['harness', 'attempts'],
+  clis: ['harness', 'clis'],
   changes: ['changes'],
   api: ['api'],
 } as const satisfies Record<string, readonly string[]>;
@@ -63,6 +64,7 @@ export const NAV: { label?: string; system?: boolean; items: { screen: Screen; l
       { screen: 'annotators', label: 'Annotators' },
       { screen: 'tools', label: 'Tools' },
       { screen: 'attempts', label: 'Attempts' },
+      { screen: 'clis', label: 'CLI recipes' },
     ],
   },
   {

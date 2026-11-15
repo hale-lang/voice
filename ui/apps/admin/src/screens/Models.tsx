@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Button, Confirm, micros, when } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Checkbox, Button, Confirm, micros, when } from '@hale/components';
 import { useGet, useNodes, useNodesWhole, useRecipes, type CatalogModel, type Node, type NodeSummary, type Placement } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -9,7 +9,8 @@ import { ContextWindow } from '../context';
 import { NamedByList, useAliasesByModel } from '../aliases';
 import { modelState } from './placement-state';
 import { modelSource, sourceLabel, type EngineKindOf, type ModelSource, type SeatInfo } from './model-source';
-import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, noNodeOffers, nodesOffering, priceOf, voiceKeyed, type AddWrites, type HarnessInfo, type Offer } from './add-model';
+import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, noNodeOffers, nodesOffering, priceOf, recipeKinds, runsOnHost, voiceKeyed, type AddWrites, type HarnessInfo, type Offer } from './add-model';
+import { HOST_WARNING } from './cli-recipe';
 
 /**
  * What the Models screen reads besides the catalog: every node's seats (a
@@ -176,18 +177,21 @@ async function addBoth(w: ReturnType<typeof useWrite>, writes: AddWrites, catalo
 }
 
 /**
- * One form for every coding CLI: the harness (its definition says how a
- * login of it is made and named), the node and engine that run it, the
- * account it spends, its login, and the CLI's own name for its model.
+ * One form for every coding CLI: the recipe (it says how a login of it is
+ * made and named, and where it may run), the node and engine that run it,
+ * the account it spends, its login, the CLI's own name for its model, and,
+ * for a recipe that can run on the host, whether the seat opts in to it.
  */
 function AddHarness() {
   const w = useWrite();
   const catalog = useGet('/admin/v1/models');
   const accounts = useGet('/admin/v1/accounts');
-  const defs = useGet('/admin/v1/harnesses');
+  const defs = useGet('/admin/v1/cli-recipes');
   const nodes = useNodes();
   const [harness, setHarness] = useState('');
-  const list: HarnessInfo[] = (defs.data?.data ?? []) as HarnessInfo[];
+  const [hostOptIn, setHostOptIn] = useState(false);
+  // the enabled recipes: a disabled one's seats take no attempt
+  const list: HarnessInfo[] = (defs.data?.data ?? []).filter((r) => r.enabled).map((r) => r.recipe as unknown as HarnessInfo);
   const h = list.find((d) => d.id === harness) ?? list[0];
   const { offers, ready } = useOffers(...harnessKinds(h?.id ?? ''));
   const [node, setNode] = useState('');
@@ -198,19 +202,21 @@ function AddHarness() {
   const [name, setName] = useState('');
   const [nameSet, setNameSet] = useState(false);
   const [refused, setRefused] = useState<string | null>(null);
-  if (defs.isPending || !ready) return <Loading what="the harnesses and the nodes' engines" />;
-  if (!h) return <p className="c-fail">voice has no harness definitions: its api reads them from its harnesses directory at start.</p>;
+  if (defs.isPending || !ready) return <Loading what="the CLI recipes and the nodes' engines" />;
+  if (!h) return <p className="c-fail">voice has no enabled CLI recipe: enable one, or make one, in <a href={href('clis')}>CLI recipes</a>.</p>;
   const offer = offers.find((o) => o.node === node) ?? (offers.length === 1 ? offers[0] : undefined);
   // a CLI under voice's own key names no login, and its model is the voice model it calls
   const keyed = voiceKeyed(h);
   const shownLogin = keyed ? '' : loginSet ? login : loginEntry(h, account);
   const shownName = nameSet ? name : `${h.id}-${cliModel.trim() || 'default'}`;
+  const kinds = recipeKinds(h);
+  const host = runsOnHost(h, hostOptIn);
   return (
     <Form
       error={refused ?? w.error}
       onSubmit={async () => {
         if (!offer) return;
-        setRefused(await addBoth(w, harnessWrites({ model: shownName, offer, account, harness: h.id, login: shownLogin, cliModel }), catalog.data?.data ?? [], nodes.data?.data ?? []));
+        setRefused(await addBoth(w, harnessWrites({ model: shownName, offer, account, harness: h.id, login: shownLogin, cliModel, host }), catalog.data?.data ?? [], nodes.data?.data ?? []));
       }}
       actions={
         <>
@@ -219,9 +225,14 @@ function AddHarness() {
         </>
       }
     >
-      <Field label="harness" required help="the coding CLI, as voice's definition of it runs it: in a container, under its own permission policy">
-        <Select value={h.id} onChange={(v) => { setHarness(v); setNameSet(false); setLoginSet(false); }} options={list.map((d) => ({ value: d.id, label: `${d.id} · ${d.name}` }))} required />
+      <Field label="CLI recipe" required help="the coding CLI, as its recipe runs it, under its own permission policy (CLI recipes)">
+        <Select value={h.id} onChange={(v) => { setHarness(v); setNameSet(false); setLoginSet(false); setHostOptIn(false); }} options={list.map((d) => ({ value: d.id, label: `${d.id} · ${d.name}` }))} required />
       </Field>
+      {kinds.includes('host') && kinds.includes('container') && (
+        <Checkbox checked={hostOptIn} onChange={setHostOptIn} label="run it on the node's own machine (the host), not in a container" />
+      )}
+      {kinds.includes('host') && !kinds.includes('container') && <p className="faint">This recipe runs only on the host.</p>}
+      {host && <p className="c-wait">{HOST_WARNING}</p>}
       {offers.length === 0 ? (
         <p className="c-fail">{noNodeOffers('harness')}.</p>
       ) : (

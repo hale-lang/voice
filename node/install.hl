@@ -9,8 +9,8 @@
 // enrollment token in the node's vault, writes the capabilities voice
 // decides (the managed engine, which runs the models placed on the node,
 // and the claude CLI when the vault holds a Claude account's token, which
-// the habitat hands over, keep_claude_tokens), copies the node
-// program where the service runs it, and installs and starts the service
+// the habitat hands over, keep_claude_tokens), keeping what its operator
+// declared there (other engines, links), copies the node program where the service runs it, and installs and starts the service
 // as the account that ran it with sudo. Models come to the node through
 // placements, never through its install. It prints no secret, and running
 // it again changes nothing that is already right.
@@ -89,13 +89,17 @@ fn quote(s: String) -> String { return "\"" + std::json::escape_string(s) + "\""
 /// The capabilities voice decides for a node: the managed engine, the
 /// claude CLI when the machine holds its login, and, when some of the
 /// machine is another's, the memory left for models (`model_memory`, -1
-/// for all of it); with the links its operator declared (`links`, the
-/// file's own list as JSON, "" for none), which are the machine's and
-/// never voice's to decide.
+/// for all of it); with what its operator declared in the file it had
+/// (`existing`, "" for none), which is the machine's and never voice's to
+/// decide: its other engines (`kept_engines`), its links (`kept_links`) and
+/// any other entry (`kept_entries`), each written again as it was.
 @unbounded
-fn node_capabilities(claude: Bool, model_memory: Int, links: String) -> String {
+fn node_capabilities(claude: Bool, model_memory: Int, existing: String) -> String {
+    let declared = kept_engines(existing, claude);
+    let links = kept_links(existing);
     return "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}"
-        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" }) + "]"
+        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" })
+        + (if len(declared) > 0 { ", " + declared } else { "" }) + "]"
         + (
             if model_memory >= 0 {
                 ", \"hardware\": {\"model_memory_bytes\": " + to_string(model_memory) + "}"
@@ -104,7 +108,53 @@ fn node_capabilities(claude: Bool, model_memory: Int, links: String) -> String {
             }
         )
         + (if len(links) > 0 { ", \"links\": " + links } else { "" })
+        + kept_entries(existing)
         + "}";
+}
+
+/// Whether an engine is one install writes itself, by its id and kind:
+/// the managed engine, and the claude CLI's when the machine holds its
+/// login. An entry of either in the file is install's, written again or
+/// dropped as the machine now has it, never kept beside it.
+fn installs_engine(id: String, kind: String) -> Bool {
+    return (id == "managed" && kind == "managed") || (id == "claude" && kind == "claude-cli");
+}
+
+/// The engines a capabilities file declares besides install's own, each
+/// entry as the file writes it, in order, joined by ", "; "" for none, and
+/// for a file that is no JSON object. Install writes its own engines
+/// (`installs_engine`) afresh, so an entry of theirs is not kept, nor one
+/// whose id install writes now (`managed`, and `claude` when the machine
+/// holds its login): install's entry wins. Nor is one the node could not
+/// run, as an unusable link is not: one without an id matching
+/// ^[a-z0-9][a-z0-9-]{0,62}$, of a kind this build does not run, or whose
+/// id an entry before it has. Install adds none of its own finding: a
+/// harness engine, say, is the operator's to declare.
+@unbounded
+fn kept_engines(file: String, claude: Bool) -> String {
+    if !std::json::valid_object(file) { return ""; }
+    let engines = top_value(file, "engines");
+    if !std::str::starts_with(engines, "[") { return ""; }
+    let mut seen = "\nmanaged\n" + (if claude { "claude\n" } else { "" });
+    let mut out = "";
+    let mut it = std::json::array_first_span(engines);
+    while !it.done {
+        let id = std::json::iter_find_string_field(it, engines, "id");
+        let kind = std::json::iter_find_string_field(it, engines, "kind");
+        if is_slug(id)
+            && runs_kind(kind)
+            && !installs_engine(id, kind)
+            && !std::str::contains(seen, "\n" + id + "\n")
+        {
+            seen = seen + id + "\n";
+            out = out + (if len(out) > 0 { ", " } else { "" }) + std::json::iter_substring(
+                it,
+                engines,
+            );
+        }
+        it = std::json::array_next_span(it, engines);
+    }
+    return out;
 }
 
 /// The links a capabilities file declares, as its JSON list, when they
@@ -113,6 +163,27 @@ fn node_capabilities(claude: Bool, model_memory: Int, links: String) -> String {
 fn kept_links(file: String) -> String {
     if !std::json::valid_object(file) || len(links_problem(file)) > 0 { return ""; }
     return std::str::trim(top_value(file, "links"));
+}
+
+/// The entries of a capabilities file install does not write, each as
+/// `, "key": value` with the value as the file writes it, in order; "" for
+/// none, and for a file that is no JSON object. Install writes `engines`
+/// (keeping the operator's, `kept_engines`), `hardware` and `links`
+/// (keeping usable ones, `kept_links`); `max_in_flight` is no longer
+/// read, and an install from before wrote it, so it is dropped.
+@unbounded
+fn kept_entries(file: String) -> String {
+    if !std::json::valid_object(file) { return ""; }
+    let mut out = "";
+    let mut it = std::json::object_first(file);
+    while !it.done {
+        let key = std::json::obj_key_string(it, file);
+        if key != "engines" && key != "hardware" && key != "links" && key != "max_in_flight" {
+            out = out + ", " + quote(key) + ": " + std::json::obj_value_raw(it, file);
+        }
+        it = std::json::object_next(it, file);
+    }
+    return out;
 }
 
 /// What the coordinator takes of a machine it shares with a node, outside a
@@ -314,11 +385,12 @@ fn install() {
     let claude = offers_claude(vault, cli);
     // the memory left for models, where some of the machine is another's
     let model_memory = model_memory_for(machine_memory(os_of(run_out("uname\n-s"))), api);
-    // the links its operator declared there are kept as they are
-    let links = kept_links(std::io::fs::read_file(data + "/capabilities.json") or "");
+    // what its operator declared there (engines, links, anything else) is
+    // kept as it is; a missing or unreadable file keeps nothing
+    let existing = std::io::fs::read_file(data + "/capabilities.json") or "";
     std::io::fs::write_file(
         data + "/capabilities.json",
-        node_capabilities(claude, model_memory, links),
+        node_capabilities(claude, model_memory, existing),
     ) or fail_install(
         "the capabilities file could not be written",
     );

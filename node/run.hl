@@ -701,7 +701,7 @@ locus Runner {
             } else if r.phase == "starting" && r.meet > 0 {
                 // a leader not yet answering: waiting for its follower, or
                 // loading
-                let waiting = awaits_follower(read_tables(self.sockets), r.meet);
+                let waiting = follower_awaited(self.sockets, r.meet);
                 if waiting != r.waiting {
                     r.waiting = waiting;
                     changed = true;
@@ -947,93 +947,131 @@ fn peer_ended(wrote: String) -> Bool {
         || std::str::contains(wrote, "its link to rank");
 }
 
-/// The kernel's TCP socket tables (`paths`, one a line), as one text; ""
-/// where there are none (macOS, whose parts never span nodes).
+/// True when a leader waits for its follower at its rendezvous, port
+/// `meet`, as the kernel's TCP tables say (`tables`, the paths of
+/// /proc/net/tcp and tcp6, one a line): it listens there, and no follower
+/// holds a connection to it (`rendezvous`). TensorFold's leader listens
+/// there before its own load finishes and holds its follower's line for its
+/// life; its log says nothing as it waits, and its API answers only once
+/// both ranks have loaded. A node whose kernel has no such tables (macOS,
+/// whose parts never span nodes) never says a leader waits. Read twice a
+/// second while a leader starts, so nothing of a table is kept: each is
+/// read and scanned in place.
 @unbounded
-fn read_tables(paths: String) -> String {
-    let mut out = "";
-    let v = std::str::bytes_view(paths);
+fn follower_awaited(tables: String, meet: Int) -> Bool {
+    let mut listens = false;
+    let v = std::str::bytes_view(tables);
     let mut from = 0;
     while from < v.n {
         let nl = line_end(v, from);
         let path = std::str::slice(v, from, nl);
         from = nl + 1;
-        if len(path) > 0 { out = out + (std::io::fs::read_file(path) or "") + "\n"; }
+        if len(path) == 0 { continue; }
+        let found = rendezvous(std::io::fs::read_file(path) or "", meet);
+        if found == 2 { return false; }
+        if found == 1 { listens = true; }
     }
-    return out;
+    return listens;
 }
 
-/// True when a leader waits for its follower at its rendezvous, port
-/// `meet`, as the kernel's TCP tables say (`table`, /proc/net/tcp's and
-/// tcp6's lines): it listens there (state 0A), and no follower holds a
-/// connection to it (state 01, from an address not its own). TensorFold's
-/// leader listens there before its own load finishes and holds its
-/// follower's line for its life; its log says nothing as it waits, and its
-/// API answers only once both ranks have loaded. A node whose kernel has no
-/// such tables (macOS) never says a leader waits.
-@bounded_by(table)
+/// `follower_awaited` of one table's text.
 fn awaits_follower(table: String, meet: Int) -> Bool {
+    return rendezvous(table, meet) == 1;
+}
+
+/// What a TCP table (`table`, /proc/net/tcp's or tcp6's lines: a slot, the
+/// local and the remote `ADDRESS:PORT` in hex, the state) says of port
+/// `meet`: 2 when a connection from another address holds it (state 01,
+/// the remote address not the local one), else 1 when something listens
+/// there (state 0A), else 0. Scanned by index, its lines never copied.
+@bounded_by(table)
+fn rendezvous(table: String, meet: Int) -> Int {
     let mut listens = false;
     let v = std::str::bytes_view(table);
     let mut from = 0;
     while from < v.n {
         let nl = line_end(v, from);
-        let line = std::str::slice(v, from, nl);
+        let local = word_start(v, from, nl, 1);
+        let remote = word_start(v, from, nl, 2);
+        let state = word_start(v, from, nl, 3);
         from = nl + 1;
-        let local = word_at(line, 1);
-        let remote = word_at(line, 2);
-        let state = word_at(line, 3);
-        let lc = std::str::index_of(local, ":");
-        let rc = std::str::index_of(remote, ":");
-        if lc <= 0 || rc <= 0 || hex_int(local[(lc + 1)..len(local)]) != meet { continue; }
-        if state == "0A" { listens = true; }
-        if state == "01" && local[0..lc] != remote[0..rc] { return false; }
+        if local < 0 || remote < 0 || state < 0 { continue; }
+        let lc = colon_at(v, local, nl);
+        let rc = colon_at(v, remote, nl);
+        if lc < 0 || rc < 0 || hex_at(v, lc + 1, nl) != meet { continue; }
+        if state + 2 > nl || std::str::byte_at(v, state) != 48 { continue; }
+        let st = std::str::byte_at(v, state + 1);
+        // 0A: listening
+        if st == 65 { listens = true; }
+        // 01: established, from another address
+        if st == 49 && !same_bytes(v, local, lc, remote, rc) { return 2; }
     }
-    return listens;
+    return if listens { 1 } else { 0 };
 }
 
-/// The `n`th word (from 0) of `line`, its words apart by spaces; "" past
-/// its last.
-@bounded_by(line)
-fn word_at(line: String, n: Int) -> String {
-    let v = std::str::bytes_view(line);
-    let mut i = 0;
+/// Where the `n`th word (from 0) of `v`'s bytes from `from` to `end` starts,
+/// its words apart by spaces; -1 past its last.
+@bounded_by(v)
+fn word_start(v: std::str::ByteView, from: Int, end: Int, n: Int) -> Int {
+    let mut i = from;
     let mut k = 0;
-    while i < v.n {
-        while i < v.n && std::str::byte_at(v, i) == 32 { i = i + 1; }
-        let start = i;
-        while i < v.n && std::str::byte_at(v, i) != 32 { i = i + 1; }
-        if start < i {
-            if k == n { return std::str::slice(v, start, i); }
-            k = k + 1;
-        }
+    while i < end {
+        while i < end && std::str::byte_at(v, i) == 32 { i = i + 1; }
+        if i >= end { return -1; }
+        if k == n { return i; }
+        while i < end && std::str::byte_at(v, i) != 32 { i = i + 1; }
+        k = k + 1;
     }
-    return "";
+    return -1;
 }
 
-/// A number in hex (either case), -1 for none.
-@bounded_by(s)
-fn hex_int(s: String) -> Int {
-    if len(s) == 0 { return -1; }
-    let v = std::str::bytes_view(s);
-    let mut n = 0;
-    let mut i = 0;
-    while i < v.n {
+/// Where the `:` of the word at `at` is, before `end`; -1 for none.
+@bounded_by(v)
+fn colon_at(v: std::str::ByteView, at: Int, end: Int) -> Int {
+    let mut i = at;
+    while i < end {
         let c = std::str::byte_at(v, i);
+        if c == 58 { return i; }
+        if c == 32 { return -1; }
         i = i + 1;
-        let d = if c >= 48 && c <= 57 {
-            c - 48
-        } else if c >= 65 && c <= 70 {
-            c - 55
-        } else if c >= 97 && c <= 102 {
-            c - 87
-        } else {
-                -1
-        };
+    }
+    return -1;
+}
+
+/// The number in hex at `at` in `v`, up to a space or `end`; -1 for none.
+@bounded_by(v)
+fn hex_at(v: std::str::ByteView, at: Int, end: Int) -> Int {
+    let mut n = 0;
+    let mut i = at;
+    while i < end {
+        let c = std::str::byte_at(v, i);
+        if c == 32 { break; }
+        let d = hex_digit(c);
         if d < 0 { return -1; }
         n = n * 16 + d;
+        i = i + 1;
     }
-    return n;
+    return if i > at { n } else { -1 };
+}
+
+/// A hex digit's value (either case), -1 for none.
+fn hex_digit(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
+/// True when `v`'s bytes from `a` to `a_end` are those from `b` to `b_end`.
+@bounded_by(v)
+fn same_bytes(v: std::str::ByteView, a: Int, a_end: Int, b: Int, b_end: Int) -> Bool {
+    if a_end - a != b_end - b { return false; }
+    let mut i = 0;
+    while a + i < a_end {
+        if std::str::byte_at(v, a + i) != std::str::byte_at(v, b + i) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// A variant's own files as its server reads them, `path\tsha256` a line.

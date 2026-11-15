@@ -45,7 +45,8 @@ fn usage_row(
         + ", \"instance\": " + jstring_or_null(len(r.instance) > 0, r.instance)
         + ", \"internal\": " + jbool(key == st::system_key(project))
         + ", \"metadata\": " + metadata + ", \"input_tokens_estimated\": " + jbool(t.estimated)
-        + ", \"tool_arguments_repaired\": " + jbool(repaired) + "}";
+        + ", \"tool_arguments_repaired\": " + jbool(repaired) + ", \"output_tokens_estimated\": "
+        + jbool(t.output_estimated) + "}";
     return st::UsageRow {
         id: request_id,
         created_at: at,
@@ -60,8 +61,8 @@ fn usage_row(
         // the ledger's sums count what engines reported, never an estimate
         input_tokens: if t.estimated { 0 } else { t.input },
         cached_input_tokens: t.cached,
-        output_tokens: t.output,
-        reasoning_tokens: t.reasoning,
+        output_tokens: if t.output_estimated { 0 } else { t.output },
+        reasoning_tokens: if t.output_estimated { 0 } else { t.reasoning },
         price_micros: price_micros,
         currency: currency,
         served: served,
@@ -204,13 +205,108 @@ fn asked_for(r: InferenceRequest) -> String {
 /// The tokens a seat reported for a request: its input, of it what the
 /// seat's prompt cache held, its output, of it the model's thinking.
 /// `estimated` when the seat reported none and `input` is voice's own
-/// estimate (`estimated_input_tokens`), not an engine's count.
+/// estimate (`estimated_input_tokens`), not an engine's count;
+/// `output_estimated` when `output` and `reasoning` are voice's count of
+/// the output the seat sent before it was cut off (`delivered_tokens`).
 type Tokens {
     input: Int = 0;
     cached: Int = 0;
     output: Int = 0;
     reasoning: Int = 0;
     estimated: Bool = false;
+    output_estimated: Bool = false;
+}
+
+/// What a seat sent of a request's output while it served it, as the api
+/// saw it come: its output deltas (text, a refusal, the thinking, a tool
+/// call's arguments) and their characters, of them the thinking's, and
+/// when the first came, in ms from the seat's offer. Where the seat is cut
+/// off (`cut_output`), from its offer to then, and the `usage` its engine
+/// reported by then ("" for none).
+type SeatOutput {
+    deltas: Int = 0;
+    chars: Int = 0;
+    reasoning_deltas: Int = 0;
+    reasoning_chars: Int = 0;
+    first_output_ms: Int = 0;
+    engine_ms: Int = 0;
+    usage: String = "";
+}
+
+/// `s` with a seat's event `event`, `at_ms` from its offer, counted when it
+/// is output: a delta that carries text.
+fn seat_output(s: SeatOutput, event: String, at_ms: Int) -> SeatOutput {
+    let kind = std::json::find_string_field(event, "type");
+    if !output_event(kind) { return s; }
+    let delta = std::json::find_string_field(event, "delta");
+    if len(delta) == 0 { return s; }
+    let thinking = reasoning_delta(kind);
+    return SeatOutput {
+        deltas: s.deltas + 1,
+        chars: s.chars + len(delta),
+        reasoning_deltas: s.reasoning_deltas + (if thinking { 1 } else { 0 }),
+        reasoning_chars: s.reasoning_chars + (if thinking { len(delta) } else { 0 }),
+        first_output_ms: if s.deltas == 0 { at_ms } else { s.first_output_ms },
+        engine_ms: s.engine_ms,
+        usage: s.usage,
+    };
+}
+
+/// `s` as its seat is cut off, `at_ms` from its offer, its engine's
+/// response so far `response` (`ServeOutcome.response`, "" for none).
+fn cut_output(s: SeatOutput, at_ms: Int, response: String) -> SeatOutput {
+    let usage = std::str::trim(std::json::find_field_raw(response, "usage"));
+    return SeatOutput {
+        deltas: s.deltas,
+        chars: s.chars,
+        reasoning_deltas: s.reasoning_deltas,
+        reasoning_chars: s.reasoning_chars,
+        first_output_ms: s.first_output_ms,
+        engine_ms: at_ms,
+        usage: if std::json::string_field(usage, "output_tokens").kind == "number" {
+            usage
+        } else {
+            ""
+        },
+    };
+}
+
+/// Voice's count of the tokens in `deltas` output deltas of `chars`
+/// characters, for a seat cut off before it reported usage: a token per
+/// delta (llama-server, vLLM and TensorFold stream one a chunk), or a token
+/// per four characters, rounded up (`estimated_input_tokens`), when that is
+/// more, as for a server that streams several a chunk.
+fn delivered_tokens(deltas: Int, chars: Int) -> Int {
+    let by_length = (chars + 3) / 4;
+    return if by_length > deltas { by_length } else { deltas };
+}
+
+/// The tokens of a request seat output `s` was cut off on: its engine's
+/// usage when it reported one by then; else voice's estimate of its input
+/// (`estimated_input_tokens`) and, when output had come, its count of it
+/// (`delivered_tokens`), each marked so.
+fn cut_tokens(body: String, s: SeatOutput) -> Tokens {
+    if len(s.usage) > 0 {
+        return Tokens {
+            input: std::json::find_int_field(s.usage, "input_tokens"),
+            cached: std::json::find_int_field(
+                std::json::find_field_raw(s.usage, "input_tokens_details"),
+                "cached_tokens",
+            ),
+            output: std::json::find_int_field(s.usage, "output_tokens"),
+            reasoning: std::json::find_int_field(
+                std::json::find_field_raw(s.usage, "output_tokens_details"),
+                "reasoning_tokens",
+            ),
+        };
+    }
+    return Tokens {
+        input: estimated_input_tokens(body),
+        estimated: true,
+        output: delivered_tokens(s.deltas, s.chars),
+        reasoning: delivered_tokens(s.reasoning_deltas, s.reasoning_chars),
+        output_estimated: s.deltas > 0,
+    };
 }
 
 /// Voice's estimate of a request's input tokens, for a request whose seat
@@ -252,8 +348,10 @@ fn served_usage(r: InferenceRequest, s: Served) -> st::UsageRow {
 }
 
 /// A request seat `c` began and did not finish, as its row: nothing is
-/// charged, and the seat reported no tokens, so its input is voice's
-/// estimate, marked so.
+/// charged, and unless its engine reported usage by then (`out.usage`) its
+/// input is voice's estimate and its output voice's count of what the seat
+/// sent, each marked so (`cut_tokens`); the seat's first output, when one
+/// came, is its timing's.
 fn unfinished_row(
     r: InferenceRequest,
     request_id: String,
@@ -262,7 +360,8 @@ fn unfinished_row(
     c: Candidate,
     status: String,
     wall_ms: Int,
-    attempts: bounded[Attempt; 8]
+    attempts: bounded[Attempt; 8],
+    out: SeatOutput
 ) -> st::UsageRow {
     return usage_row(
         r,
@@ -277,10 +376,10 @@ fn unfinished_row(
             engine: c.seat.engine,
         },
         status,
-        Tokens { input: estimated_input_tokens(r.body), estimated: true },
+        cut_tokens(r.body, out),
         0,
         if m.priced { m.price.currency } else { "USD" },
-        timing_json(wall_ms, 0, false, 0, 0),
+        timing_json(wall_ms, 0, out.deltas > 0, out.first_output_ms, out.engine_ms),
         attempts,
         false
     );
@@ -345,6 +444,10 @@ type UsageRecord {
     // its node repaired a tool call's arguments before they reached the
     // caller (node/tool_args.hl); false in a record from before it was kept
     tool_arguments_repaired: Bool = false;
+    // `output_tokens` and `reasoning_tokens` are voice's count of the
+    // output its seat sent before it was cut off, the seat having reported
+    // no usage (`cut_tokens`); false in a record from before it was kept
+    output_tokens_estimated: Bool = false;
 }
 
 /// `UsageRecordSummary`: a request as `listUsage` lists it, without its
@@ -386,6 +489,7 @@ type UsageRecordSummary {
     side: String = "";
     input_tokens_estimated: Bool = false;
     tool_arguments_repaired: Bool = false;
+    output_tokens_estimated: Bool = false;
 }
 
 /// A page of the ledger, newest first, at most `USAGE_PAGE_MAX`;
@@ -846,6 +950,7 @@ fn usage_summary_of(r: UsageRecord) -> UsageRecordSummary {
         side: side.text,
         input_tokens_estimated: r.input_tokens_estimated,
         tool_arguments_repaired: r.tool_arguments_repaired,
+        output_tokens_estimated: r.output_tokens_estimated,
     };
 }
 

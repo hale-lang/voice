@@ -5626,9 +5626,8 @@ Type: object
 | `internal` | boolean |  |  |  |
 | `annotates` | string |  | For an internal request, the request it annotated (its metadata's `annotates`); left out otherwise. |  |
 | `side` | string |  | For an internal request, its stage, or `title` (its metadata's `side`); left out otherwise. |  |
-| `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. |  |
+| `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. A request so marked whose `output_tokens` is not 0 had its output counted by voice too (`UsageRecord.output_tokens_estimated`, which `getUsage` answers): a seat that reported usage reported both. |  |
 | `tool_arguments_repaired` | boolean |  | As `UsageRecord.tool_arguments_repaired`. |  |
-| `output_tokens_estimated` | boolean |  | As `UsageRecord.output_tokens_estimated`. |  |
 
 <a id="schema-conversationusage"></a>
 

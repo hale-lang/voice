@@ -26,16 +26,35 @@
 // The weights are laid out under the names the recipe gives them, in
 // `models/<seat>`, as links into the store, so a server finds a model of
 // several files where it expects them. A server's port is the node's to
-// pick. A server that ends takes its seat `down`, with what it said last;
-// a seat that leaves the assignment has its server stopped. A server left
-// running by a node that stopped is stopped when the node starts again.
+// pick. A seat that leaves the assignment, or that a local control holds,
+// has its server stopped. A server left running by a node that stopped is
+// stopped when the node starts again.
+//
+// A server that ends while its seat is still assigned is started again
+// (`after_end`), its seat `starting` and saying why and which attempt, after
+// a wait that grows with each end in a row: 5 s, 15 s, 60 s, then every
+// 5 min. A server that ran ten minutes before it ended starts again at the
+// first step. One that ended more than five times in thirty minutes is
+// `down`, saying its server keeps ending and what it said last, and is still
+// started again every 5 min: what made it end (a peer, a disk, a driver)
+// may pass, and a seat given up on stays down until someone reassigns it.
+// A server the node stopped on purpose is never started again by this: its
+// seat removed, held or assigned another server, or its first answers wrong
+// (smoke.hl), which a restart would only repeat; that seat stays down with
+// why until it is assigned again.
 //
 // A seat's part of a placement across two nodes (its config's `cluster`,
 // span.hl) runs vLLM's multi-node executor in the runtime's container on
 // the host's network, its API on loopback alone. The leader's is `up` once
 // its API answers, which it does only when both ranks have loaded; the
 // follower's, headless, answers nothing, and is `up` while its server runs,
-// joined or waiting for the leader to be there.
+// joined or waiting for the leader to be there. A follower that ended starts
+// again at the first step, as does either rank when the other's end ended
+// it (TensorFold's follower says `PeerDown`), and that end is not counted
+// as the seat's own: a follower comes back within seconds of its leader. A
+// TensorFold leader waits for its follower at its rendezvous before its own
+// load finishes, and says so (`awaits_follower`): `waiting for its follower
+// on <peer> to join` for as long as it waits, never down for it.
 
 /// A managed seat to run, once its fetch verified.
 type RunJob { seat: String = ""; config: String = ""; }
@@ -81,9 +100,56 @@ type Run {
     // the catalog model its server serves as, which the node's own calls
     // to it name (smoke.hl)
     model: String = "";
+    // the config it was started with, to start it again should it end
+    config: String = "";
+    // when it was started (monotonic ns)
+    began: Int = 0;
+    // its starts again in a row, and its ends counted since `ends_from`
+    // (`after_end`)
+    attempt: Int = 0;
+    ends: Int = 0;
+    ends_from: Int = 0;
+    // a TensorFold leader's: the node its follower runs on, the port the
+    // follower joins it at (its rendezvous), and whether it waits for it
+    peer: String = "";
+    meet: Int = 0;
+    waiting: Bool = false;
 }
 
 type Runs { items: bounded[Run; 16]; }
+
+/// A managed seat whose server ended, to start again (`after_end`).
+type Restart {
+    seat: String = "";
+    config: String = "";
+    // when to start it (monotonic ns)
+    due: Int = 0;
+    // its starts again in a row, this one among them, and its ends counted
+    // since `ends_from`
+    attempt: Int = 0;
+    ends: Int = 0;
+    ends_from: Int = 0;
+    // what its server said last as it ended
+    reason: String = "";
+    // its server keeps ending: the seat is down while it waits
+    looping: Bool = false;
+}
+
+type Restarts { items: bounded[Restart; 16]; }
+
+/// The waits before a server that ended is started again, by its starts
+/// again in a row: 5 s, 15 s, 60 s, then 5 min each.
+const RESTART_FIRST_NS: Int = 5000000000;
+const RESTART_CAP_NS: Int = 300000000000;
+
+/// A server that ran this long before it ended starts again at the first
+/// step: ten minutes.
+const RESTART_STABLE_NS: Int = 600000000000;
+
+/// A seat whose server ended more than `LOOP_ENDS` times within
+/// `LOOP_WINDOW_NS` (thirty minutes, from the first of them) keeps ending.
+const LOOP_ENDS: Int = 5;
+const LOOP_WINDOW_NS: Int = 1800000000000;
 
 /// The label a node's containers carry, its id the value.
 const OWNER_LABEL: String = "net.hale-lang.voice.node";
@@ -112,6 +178,11 @@ locus Runner {
         // the node's declared capabilities, whose links a part across two
         // nodes runs over (span.hl)
         capabilities: String = "";
+        // seats whose servers ended, waiting to start again
+        restarts: Restarts = Restarts { };
+        // the kernel's tables of TCP sockets, one a line, which say whether
+        // a leader's follower has joined it (`awaits_follower`)
+        sockets: String = "/proc/net/tcp\n/proc/net/tcp6";
     }
 
     bus {
@@ -129,8 +200,8 @@ locus Runner {
     }
 
     /// One turn: what a node that stopped left running is stopped, the
-    /// next seat started, every server looked at, then a sleep, where
-    /// asks arrive.
+    /// next seat started, or else a seat whose server ended once its wait
+    /// is over, every server looked at, then a sleep, where asks arrive.
     @unbounded
     fn step() {
         if !self.cleaned {
@@ -142,7 +213,13 @@ locus Runner {
             let line = self.queue[0..nl];
             self.queue = self.queue[(nl + 1)..len(self.queue)];
             let tab = std::str::index_of(line, "\t");
-            self.start(line[0..tab], std::json::unescape_string(line[(tab + 1)..len(line)]));
+            self.start(
+                line[0..tab],
+                std::json::unescape_string(line[(tab + 1)..len(line)]),
+                Restart { },
+            );
+        } else {
+            self.restart_due();
         }
         self.look();
         std::time::sleep(500ms);
@@ -158,8 +235,10 @@ locus Runner {
     fn on_wanted(j: RunJob) {
         // a fetch that finished after its seat was withdrawn starts nothing
         if !self.holds(j.seat) { return; }
-        // a start still waiting takes the config asked for last
+        // a start still waiting takes the config asked for last, and a
+        // restart waiting gives way to it
         self.queue = queue_without(self.queue, j.seat);
+        self.drop_restart(j.seat);
         let mut next = Runs { };
         let mut replaced = false;
         for r in self.runs.items {
@@ -199,6 +278,17 @@ locus Runner {
             if tab > 0 && self.holds(line[0..tab]) { queue = queue + line + "\n"; }
         }
         self.queue = queue;
+        // and restarts waiting, of seats it no longer holds
+        let mut kept = 0;
+        let mut i = 0;
+        while i < count(self.restarts.items) {
+            let w = at(self.restarts.items, i) or Restart { };
+            i = i + 1;
+            if !self.holds(w.seat) { continue; }
+            if kept < i - 1 { set(self.restarts.items, kept, w) or discard; }
+            kept = kept + 1;
+        }
+        truncate(self.restarts.items, kept);
         let mut next = Runs { };
         for r in self.runs.items {
             if std::str::contains("\n" + m.ids, "\n" + r.seat + "\n") {
@@ -216,10 +306,63 @@ locus Runner {
         return !self.heard || std::str::contains("\n" + self.assigned, "\n" + seat + "\n");
     }
 
-    /// Start a seat's server: its weights laid out, its runtime ready, its
-    /// process begun; the seat is `starting` until it answers.
+    /// A restart waiting for `seat`, dropped. In place, as `look` keeps
+    /// its runs.
     @unbounded
-    fn start(seat: String, config: String) {
+    fn drop_restart(seat: String) {
+        let mut kept = 0;
+        let mut i = 0;
+        while i < count(self.restarts.items) {
+            let w = at(self.restarts.items, i) or Restart { };
+            i = i + 1;
+            if w.seat == seat { continue; }
+            if kept < i - 1 { set(self.restarts.items, kept, w) or discard; }
+            kept = kept + 1;
+        }
+        truncate(self.restarts.items, kept);
+    }
+
+    /// The first seat whose server ended and whose wait is over, started
+    /// again with the config it was started with, if the assignment still
+    /// holds it.
+    @unbounded
+    fn restart_due() {
+        if self.draining { return; }
+        let now = std::time::monotonic_ns();
+        let mut i = 0;
+        while i < count(self.restarts.items) {
+            let w = at(self.restarts.items, i) or Restart { };
+            i = i + 1;
+            if w.due <= now {
+                self.drop_restart(w.seat);
+                self.start(w.seat, w.config, w);
+                return;
+            }
+        }
+    }
+
+    /// A server that ended, which the node did not stop: started again
+    /// after a wait (`after_end`) while the assignment holds its seat, the
+    /// seat starting and saying so, or down while its server keeps ending;
+    /// else its seat down, with what it wrote last.
+    @unbounded
+    fn ended(r: Run) {
+        let wrote = last_of(std::io::fs::read_file(r.log) or "", 1500);
+        if self.draining || !self.heard || !self.holds(r.seat) || len(r.config) == 0 {
+            self.tell(r.seat, "down", "its server ended: " + ended_line(wrote), "");
+            return;
+        }
+        let w = after_end(r, wrote, std::time::monotonic_ns());
+        self.drop_restart(r.seat);
+        push(self.restarts.items, w) or discard;
+        self.tell(r.seat, if w.looping { "down" } else { "starting" }, end_reason(w), "");
+    }
+
+    /// Start a seat's server: its weights laid out, its runtime ready, its
+    /// process begun; the seat is `starting` until it answers. `after` is
+    /// the end it is started again after (`Restart { }` for none).
+    @unbounded
+    fn start(seat: String, config: String, after: Restart) {
         if !self.holds(seat) { return; }
         let runtime = std::json::find_field_raw(config, "runtime");
         let artifact = std::json::find_field_raw(runtime, "artifact");
@@ -332,11 +475,19 @@ locus Runner {
             spans: spans,
             key: key,
             model: std::json::find_string_field(config, "model"),
+            config: config,
+            attempt: after.attempt,
+            ends: after.ends,
+            ends_from: after.ends_from,
         };
         // a follower serves no API: nothing to ask, nowhere to serve
         if spans && std::json::find_int_field(cluster, "rank") > 0 {
             r.health = "";
             r.endpoint = "";
+        } else if spans && server == "tensorfold" {
+            // a TensorFold leader, whose follower joins it at its rendezvous
+            r.peer = std::json::find_string_field(cluster, "peer");
+            r.meet = std::json::find_int_field(cluster, "master_port");
         }
         let mut argv = "";
         if std::json::find_string_field(artifact, "kind") == "container" {
@@ -494,6 +645,7 @@ locus Runner {
             return;
         }
         r.pid = pid;
+        r.began = std::time::monotonic_ns();
         if len(r.container) == 0 {
             let pidf = std::io::file::open(self.data + "/run/" + seat + ".pid", "w") or { return; };
             // the pid and when the process began: a pid alone is not this
@@ -501,11 +653,12 @@ locus Runner {
             pidf.write_line(to_string(pid) + "\t" + started_at(pid)) or discard;
         }
         push(self.runs.items, r) or discard;
-        self.tell(seat, "starting", "its server is loading the model", "");
+        self.tell(seat, "starting", start_reason(after), "");
     }
 
-    /// Every server looked at: one that ended taking its seat down, with
-    /// what it wrote last, one that answers its health check taking it up.
+    /// Every server looked at: one that ended started again or its seat
+    /// down (`ended`), one that answers its health check taking it up, a
+    /// leader waiting for its follower saying so.
     /// It runs twice a second for the node's life, so `self.runs` is
     /// changed in place, a run written back only when it changed or moved
     /// down over one that ended: a `Runs` stored whole keeps every String
@@ -520,8 +673,7 @@ locus Runner {
             i = i + 1;
             if !alive(r.pid) {
                 std::io::fs::unlink(self.data + "/run/" + r.seat + ".pid") or discard;
-                let wrote = last_of(std::io::fs::read_file(r.log) or "", 1500);
-                self.tell(r.seat, "down", "its server ended: " + last_line(wrote), "");
+                self.ended(r);
                 continue;
             }
             let mut changed = false;
@@ -546,6 +698,24 @@ locus Runner {
                 r.asked = 1;
                 changed = true;
                 self.tell_up(r);
+            } else if r.phase == "starting" && r.meet > 0 {
+                // a leader not yet answering: waiting for its follower, or
+                // loading
+                let waiting = follower_awaited(self.sockets, r.meet);
+                if waiting != r.waiting {
+                    r.waiting = waiting;
+                    changed = true;
+                    self.tell(
+                        r.seat,
+                        "starting",
+                        if waiting {
+                            "waiting for its follower on " + r.peer + " to join"
+                        } else {
+                            "its server is loading the model"
+                        },
+                        "",
+                    );
+                }
             } else if r.phase == "up" && r.context == 0 && r.asked < CONTEXT_ASKS {
                 // one that answered before it could say its context is
                 // asked again, for a while
@@ -686,6 +856,222 @@ locus Runner {
             by_runner: true,
         };
     }
+}
+
+/// What a seat's server that ended (`r`, having written `wrote` last) is
+/// started again after, `now` (monotonic ns):
+/// - its attempt: one past the run's, or the first when it ran
+///   `RESTART_STABLE_NS` or its peer's end ended it;
+/// - its ends counted: one more, or the first when the first counted was
+///   `LOOP_WINDOW_NS` ago; an end its peer's ended is not its own, and not
+///   counted;
+/// - it keeps ending past `LOOP_ENDS` of them, and then waits the cap;
+/// - its wait: the first step when its peer's end ended it, or it is a
+///   follower (which waits for its leader on its own, and which the pair
+///   needs back promptly); else `restart_wait` of its attempt.
+@bounded_by(wrote)
+fn after_end(r: Run, wrote: String, now: Int) -> Restart {
+    let peer = r.spans && peer_ended(wrote);
+    let follower = r.spans && len(r.health) == 0;
+    let mut ends = r.ends;
+    let mut from = r.ends_from;
+    if !peer {
+        if ends == 0 || now - from > LOOP_WINDOW_NS {
+            ends = 1;
+            from = now;
+        } else {
+            ends = ends + 1;
+        }
+    }
+    let looping = !peer && ends > LOOP_ENDS;
+    let attempt = if peer || now - r.began >= RESTART_STABLE_NS { 1 } else { r.attempt + 1 };
+    let wait = if peer {
+        RESTART_FIRST_NS
+    } else if looping {
+        RESTART_CAP_NS
+    } else if follower {
+        RESTART_FIRST_NS
+    } else {
+        restart_wait(attempt)
+    };
+    return Restart {
+        seat: r.seat,
+        config: r.config,
+        due: now + wait,
+        attempt: attempt,
+        ends: ends,
+        ends_from: from,
+        reason: ended_line(wrote),
+        looping: looping,
+    };
+}
+
+/// The wait before start again number `attempt`: 5 s, 15 s, 60 s, then the
+/// cap, 5 min.
+fn restart_wait(attempt: Int) -> Int {
+    if attempt <= 1 { return RESTART_FIRST_NS; }
+    if attempt == 2 { return 15000000000; }
+    if attempt == 3 { return 60000000000; }
+    return RESTART_CAP_NS;
+}
+
+/// What a seat whose server ended says while it waits to start again: down,
+/// its server keeps ending, or starting again, which attempt.
+fn end_reason(w: Restart) -> String {
+    if w.looping { return "its server keeps ending: " + w.reason; }
+    return start_reason(w);
+}
+
+/// What a seat says as its server starts: loading the model, or started
+/// again after it ended (`after`), which attempt.
+fn start_reason(after: Restart) -> String {
+    if after.attempt == 0 { return "its server is loading the model"; }
+    return "restarting after its server ended (" + after.reason + "), attempt "
+        + to_string(after.attempt);
+}
+
+/// What a server that ended wrote last (`wrote`'s last line that says
+/// something), or that it wrote nothing.
+@bounded_by(wrote)
+fn ended_line(wrote: String) -> String {
+    let said = last_line(wrote);
+    return if len(said) > 0 { said } else { "it wrote nothing" };
+}
+
+/// True when a part across two nodes ended because the other's did, as its
+/// last words say: TensorFold's follower stops following with `PeerDown`,
+/// its leader stops when a follower's line closes.
+fn peer_ended(wrote: String) -> Bool {
+    return std::str::contains(wrote, "PeerDown")
+        || std::str::contains(wrote, "another rank's process ended")
+        || std::str::contains(wrote, "its link to rank");
+}
+
+/// True when a leader waits for its follower at its rendezvous, port
+/// `meet`, as the kernel's TCP tables say (`tables`, the paths of
+/// /proc/net/tcp and tcp6, one a line): it listens there, and no follower
+/// holds a connection to it (`rendezvous`). TensorFold's leader listens
+/// there before its own load finishes and holds its follower's line for its
+/// life; its log says nothing as it waits, and its API answers only once
+/// both ranks have loaded. A node whose kernel has no such tables (macOS,
+/// whose parts never span nodes) never says a leader waits. Read twice a
+/// second while a leader starts, so nothing of a table is kept: each is
+/// read and scanned in place.
+@unbounded
+fn follower_awaited(tables: String, meet: Int) -> Bool {
+    let mut listens = false;
+    let v = std::str::bytes_view(tables);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let path = std::str::slice(v, from, nl);
+        from = nl + 1;
+        if len(path) == 0 { continue; }
+        let found = rendezvous(std::io::fs::read_file(path) or "", meet);
+        if found == 2 { return false; }
+        if found == 1 { listens = true; }
+    }
+    return listens;
+}
+
+/// `follower_awaited` of one table's text.
+fn awaits_follower(table: String, meet: Int) -> Bool {
+    return rendezvous(table, meet) == 1;
+}
+
+/// What a TCP table (`table`, /proc/net/tcp's or tcp6's lines: a slot, the
+/// local and the remote `ADDRESS:PORT` in hex, the state) says of port
+/// `meet`: 2 when a connection from another address holds it (state 01,
+/// the remote address not the local one), else 1 when something listens
+/// there (state 0A), else 0. Scanned by index, its lines never copied.
+@bounded_by(table)
+fn rendezvous(table: String, meet: Int) -> Int {
+    let mut listens = false;
+    let v = std::str::bytes_view(table);
+    let mut from = 0;
+    while from < v.n {
+        let nl = line_end(v, from);
+        let local = word_start(v, from, nl, 1);
+        let remote = word_start(v, from, nl, 2);
+        let state = word_start(v, from, nl, 3);
+        from = nl + 1;
+        if local < 0 || remote < 0 || state < 0 { continue; }
+        let lc = colon_at(v, local, nl);
+        let rc = colon_at(v, remote, nl);
+        if lc < 0 || rc < 0 || hex_at(v, lc + 1, nl) != meet { continue; }
+        if state + 2 > nl || std::str::byte_at(v, state) != 48 { continue; }
+        let st = std::str::byte_at(v, state + 1);
+        // 0A: listening
+        if st == 65 { listens = true; }
+        // 01: established, from another address
+        if st == 49 && !same_bytes(v, local, lc, remote, rc) { return 2; }
+    }
+    return if listens { 1 } else { 0 };
+}
+
+/// Where the `n`th word (from 0) of `v`'s bytes from `from` to `end` starts,
+/// its words apart by spaces; -1 past its last.
+@bounded_by(v)
+fn word_start(v: std::str::ByteView, from: Int, end: Int, n: Int) -> Int {
+    let mut i = from;
+    let mut k = 0;
+    while i < end {
+        while i < end && std::str::byte_at(v, i) == 32 { i = i + 1; }
+        if i >= end { return -1; }
+        if k == n { return i; }
+        while i < end && std::str::byte_at(v, i) != 32 { i = i + 1; }
+        k = k + 1;
+    }
+    return -1;
+}
+
+/// Where the `:` of the word at `at` is, before `end`; -1 for none.
+@bounded_by(v)
+fn colon_at(v: std::str::ByteView, at: Int, end: Int) -> Int {
+    let mut i = at;
+    while i < end {
+        let c = std::str::byte_at(v, i);
+        if c == 58 { return i; }
+        if c == 32 { return -1; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// The number in hex at `at` in `v`, up to a space or `end`; -1 for none.
+@bounded_by(v)
+fn hex_at(v: std::str::ByteView, at: Int, end: Int) -> Int {
+    let mut n = 0;
+    let mut i = at;
+    while i < end {
+        let c = std::str::byte_at(v, i);
+        if c == 32 { break; }
+        let d = hex_digit(c);
+        if d < 0 { return -1; }
+        n = n * 16 + d;
+        i = i + 1;
+    }
+    return if i > at { n } else { -1 };
+}
+
+/// A hex digit's value (either case), -1 for none.
+fn hex_digit(c: Int) -> Int {
+    if c >= 48 && c <= 57 { return c - 48; }
+    if c >= 65 && c <= 70 { return c - 55; }
+    if c >= 97 && c <= 102 { return c - 87; }
+    return -1;
+}
+
+/// True when `v`'s bytes from `a` to `a_end` are those from `b` to `b_end`.
+@bounded_by(v)
+fn same_bytes(v: std::str::ByteView, a: Int, a_end: Int, b: Int, b_end: Int) -> Bool {
+    if a_end - a != b_end - b { return false; }
+    let mut i = 0;
+    while a + i < a_end {
+        if std::str::byte_at(v, a + i) != std::str::byte_at(v, b + i) { return false; }
+        i = i + 1;
+    }
+    return true;
 }
 
 /// A variant's own files as its server reads them, `path\tsha256` a line.

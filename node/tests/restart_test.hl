@@ -1,0 +1,553 @@
+// A managed seat's server that ends while its seat is assigned is started
+// again (run.hl `after_end`, `Runner.ended`): after 5 s, 15 s, 60 s, then
+// every 5 min, its seat starting and saying which attempt; down, saying its
+// server keeps ending, past five ends in thirty minutes, and still started
+// again at the cap. A follower, or a rank its peer's end ended, starts again
+// at the first step. A server the node stopped on purpose is never started
+// again: its seat removed, or its first answers wrong (smoke.hl). A
+// TensorFold leader whose follower has not joined its rendezvous says it
+// waits for it (`awaits_follower`).
+//
+// Then a runner, with stub servers: processes that ended, processes that
+// run, and one that answers its health and nothing else.
+import ".." as node;
+
+const S: Int = 1000000000;
+
+/// A config whose start is refused at its tokenizer, the first thing a
+/// start lays out that a test can leave missing: a restart's start shows
+/// as that refusal.
+const CONFIG: String = "{\"model\": \"m\", \"runtime\": {\"server\": \"llama-server\", \"artifact\": {\"kind\": \"archive\", \"sha256\": \"x\"}}, \"variant\": {\"id\": \"v\", \"files\": [], \"tokenizer_class\": \"PreTrainedTokenizerFast\"}}";
+
+const REFUSED: String = "down\tits tokenizer_config.json, whose tokenizer_class its variant sets";
+
+/// A table as /proc/net/tcp holds it: its head, and `rows`.
+fn table(rows: String) -> String {
+    return "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        + rows;
+}
+
+/// A row of it: `local` and `remote` (`ADDR:PORT` in hex) in state `st`.
+fn row(local: String, remote: String, st: String) -> String {
+    return "   0: " + local + " " + remote + " " + st
+        + " 00000000:00000000 00:00000000 00000000     0        0 4242 1 0000000000000000 100 0 0 10 0\n";
+}
+
+fn policy() {
+    let now = 4000 * S;
+    std::test::assert(
+        node::restart_wait(1) == 5 * S && node::restart_wait(2) == 15 * S
+            && node::restart_wait(3) == 60 * S && node::restart_wait(4) == 300 * S
+            && node::restart_wait(9) == 300 * S,
+        "the waits: 5 s, 15 s, 60 s, then 5 min each",
+    );
+    let single = node::Run {
+        seat: "s",
+        config: CONFIG,
+        health: "http://127.0.0.1:47100/health",
+        began: now - 2 * S,
+    };
+    let first = node::after_end(single, "loading\nboom: out of memory\n", now);
+    std::test::assert(
+        first.attempt == 1 && first.due == now + 5 * S && first.ends == 1
+            && first.ends_from == now && !first.looping,
+        "a server that ended is started again in 5 s, its first attempt",
+    );
+    std::test::assert(first.seat == "s" && first.config == CONFIG, "with the config it ran");
+    std::test::assert_eq_str(
+        node::end_reason(first),
+        "restarting after its server ended (boom: out of memory), attempt 1",
+        "its seat says why and which attempt",
+    );
+    std::test::assert_eq_str(
+        node::start_reason(first),
+        node::end_reason(first),
+        "and says it again as its server starts",
+    );
+    std::test::assert_eq_str(
+        node::start_reason(node::Restart { }),
+        "its server is loading the model",
+        "a first start loads the model",
+    );
+    // ends in a row, each soon after its start
+    let mut r = single;
+    let mut waits = "";
+    let mut k = 0;
+    while k < 5 {
+        let w = node::after_end(r, "boom", now + k * S);
+        waits = waits + to_string((w.due - (now + k * S)) / S) + " ";
+        r.attempt = w.attempt;
+        r.ends = w.ends;
+        r.ends_from = w.ends_from;
+        r.began = now + k * S;
+        k = k + 1;
+    }
+    std::test::assert_eq_str(
+        waits,
+        "5 15 60 300 300 ",
+        "each end in a row waits longer, to the cap",
+    );
+    std::test::assert_eq_str(
+        node::after_end(single, "", now).reason,
+        "it wrote nothing",
+        "a server that wrote nothing says so",
+    );
+
+    // one that ran ten minutes starts again at the first step
+    let stable = node::after_end(
+        node::Run {
+            seat: "s",
+            attempt: 3,
+            ends: 2,
+            ends_from: now - 700 * S,
+            began: now - 700 * S,
+        },
+        "boom",
+        now,
+    );
+    std::test::assert(
+        stable.attempt == 1 && stable.due == now + 5 * S,
+        "a server that ran ten minutes is started again at the first step",
+    );
+
+    // keeps ending: more than five ends in thirty minutes
+    let loop = node::after_end(
+        node::Run { seat: "s", attempt: 4, ends: 5, ends_from: now - 600 * S, began: now - S },
+        "segfault",
+        now,
+    );
+    std::test::assert(
+        loop.looping && loop.ends == 6 && loop.due == now + 300 * S,
+        "a sixth end in thirty minutes keeps ending, and is started again at the cap",
+    );
+    std::test::assert_eq_str(
+        node::end_reason(loop),
+        "its server keeps ending: segfault",
+        "its seat down, saying so",
+    );
+    let later = node::after_end(
+        node::Run { seat: "s", attempt: 4, ends: 5, ends_from: now - 1900 * S, began: now - S },
+        "segfault",
+        now,
+    );
+    std::test::assert(
+        !later.looping && later.ends == 1 && later.ends_from == now,
+        "ends counted from thirty minutes before are counted afresh",
+    );
+
+    // a pair's ranks
+    let follower = node::Run {
+        seat: "f",
+        spans: true,
+        attempt: 3,
+        ends: 5,
+        ends_from: now - 60 * S,
+        began: now - 30 * S,
+    };
+    let peer_down = node::after_end(
+        follower,
+        "dsv41: rank 1 stopped following rank 0: PeerDown\n{\"rank\": 1, \"follow\": \"PeerDown\"}\n",
+        now,
+    );
+    std::test::assert(
+        peer_down.due == now + 5 * S && peer_down.attempt == 1 && peer_down.ends == 5
+            && !peer_down.looping,
+        "a follower its leader's end ended starts again at the first step, that end not its own",
+    );
+    std::test::assert_eq_str(
+        peer_down.reason,
+        "{\"rank\": 1, \"follow\": \"PeerDown\"}",
+        "saying what it said",
+    );
+    let crashed = node::after_end(
+        node::Run { seat: "f", spans: true, attempt: 2, began: now - S },
+        "CUDA error",
+        now,
+    );
+    std::test::assert(
+        crashed.due == now + 5 * S && crashed.attempt == 3,
+        "a follower that ended otherwise starts again at the first step too",
+    );
+    let leader = node::after_end(
+        node::Run {
+            seat: "l",
+            spans: true,
+            health: "http://127.0.0.1:47100/v1/models",
+            attempt: 3,
+            began: now - S,
+        },
+        "dsv41: rank 1 stopped (its link to rank 0 closed), so rank 0 stops too",
+        now,
+    );
+    std::test::assert(
+        leader.due == now + 5 * S && leader.attempt == 1,
+        "a leader its follower's end ended starts again at the first step",
+    );
+    let leader_own = node::after_end(
+        node::Run {
+            seat: "l",
+            spans: true,
+            health: "http://127.0.0.1:47100/v1/models",
+            attempt: 1,
+            began: now - S,
+        },
+        "out of memory",
+        now,
+    );
+    std::test::assert(leader_own.due == now + 15 * S, "a leader's own end waits as any seat's");
+
+    // a leader waiting for its follower, as the kernel's tables say
+    let listen = row("0164A8C0:733D", "00000000:0000", "0A");
+    let joined = row("0164A8C0:733D", "0264A8C0:9C40", "01");
+    let itself = row("0164A8C0:733D", "0164A8C0:B000", "01");
+    std::test::assert(
+        node::awaits_follower(table(listen), 29501),
+        "listening at its rendezvous, no follower joined: waiting",
+    );
+    std::test::assert(
+        !node::awaits_follower(table(listen + joined), 29501),
+        "a follower's line held: joined",
+    );
+    std::test::assert(
+        node::awaits_follower(table(listen + itself), 29501),
+        "a line from its own address is no follower",
+    );
+    std::test::assert(
+        !node::awaits_follower(table(row("0164A8C0:1F90", "00000000:0000", "0A")), 29501),
+        "listening elsewhere is not its rendezvous",
+    );
+    std::test::assert(!node::awaits_follower("", 29501), "no tables (macOS): never waiting");
+    std::test::assert(
+        node::awaits_follower(
+            table(
+                row(
+                    "000080FE00000000FF02A8C0AB12CD34:733D",
+                    "00000000000000000000000000000000:0000",
+                    "0A",
+                ),
+            ),
+            29501,
+        ),
+        "an IPv6 rendezvous, tcp6's rows",
+    );
+    std::test::assert(
+        node::hex_int("733D") == 29501 && node::hex_int("ff") == 255 && node::hex_int("x") == -1,
+        "ports in hex",
+    );
+    std::test::assert_eq_str(node::word_at("  a  bb c", 1), "bb", "words apart by spaces");
+}
+
+// ---- a runner -------------------------------------------------------------------
+
+/// What the runner said of its seats, a line each: the seat, its status
+/// and why.
+locus Told {
+    params { file: String = ""; }
+    bus { subscribe node::FetchUpdated as on_told; }
+    fn on_told(f: node::FetchState) {
+        std::io::fs::write_file_append(self.file, f.seat + "\t" + f.status + "\t" + f.reason + "\n")
+        or discard;
+    }
+}
+
+/// A server that answers its health and nothing else: its first answers
+/// are wrong.
+locus Engine {
+    params { fd: Int = -1; }
+    run() {
+        while true {
+            let conn = std::io::tcp::accept_one(self.fd) or - 1;
+            if conn < 0 { return; }
+            let s = std::io::tcp::Stream { conn_fd: conn, owns_fd: false };
+            let req = s.recv(65536) or "";
+            let ok = std::str::starts_with(req, "GET /health");
+            let body = if ok { "{\"status\":\"ok\"}" } else { "{}" };
+            s.send(
+                "HTTP/1.1 " + (if ok { "200 OK" } else { "404 Not Found" })
+                    + "\r\nContent-Type: application/json\r\nContent-Length: "
+                    + to_string(len(body)) + "\r\nConnection: close\r\n\r\n" + body,
+            ) or discard;
+            std::io::tcp::close_fd(conn);
+        }
+    }
+}
+
+/// The assignment, as the session says it: `ids`, one a line.
+locus Session {
+    params { }
+    bus { publish node::ManagedAssigned; }
+    fn assign(ids: String) {
+        node::ManagedAssigned <- node::ManagedSeats { ids: ids };
+    }
+}
+
+main locus App {
+    params {
+        engine: Engine = Engine { };
+        runner: node::Runner = node::Runner { };
+        session: Session = Session { };
+        data: String = "";
+        removed_pid: Int = 0;
+        smoke_pid: Int = 0;
+    }
+    placement {
+        engine: cooperative(pool = io);
+        runner: pinned;
+    }
+    run() {
+        let told_file = self.data + "/told";
+        std::time::sleep(1500ms);
+        let told = std::io::fs::read_file(told_file) or "";
+        std::test::assert(
+            std::str::contains(
+                told,
+                "single\tstarting\trestarting after its server ended (boom: out of memory), attempt 1\n",
+            ),
+            "a seat whose server ended is starting again, saying why and which attempt: " + told,
+        );
+        std::test::assert(
+            std::str::contains(
+                told,
+                "follower\tstarting\trestarting after its server ended ({\"rank\": 1, \"follow\": \"PeerDown\"}), attempt 1\n",
+            ),
+            "a follower its leader's end ended is starting again: " + told,
+        );
+        std::test::assert(
+            std::str::contains(told, "looping\tdown\tits server keeps ending: segfault\n"),
+            "one that keeps ending is down, saying so: " + told,
+        );
+        std::test::assert(
+            std::str::contains(told, "unassigned\tdown\tits server ended: bye\n"),
+            "one the assignment no longer holds is down, as before: " + told,
+        );
+        std::test::assert(
+            std::str::contains(
+                told,
+                "leader\tstarting\twaiting for its follower on node-b to join\n",
+            ),
+            "a leader whose follower has not joined says it waits for it: " + told,
+        );
+        std::test::assert(
+            std::str::contains(told, "smoke\tdown\t") && !node::alive(self.smoke_pid),
+            "one whose first answers are wrong is stopped, its seat down: " + told,
+        );
+        std::test::assert(!std::str::contains(told, REFUSED), "none started again yet: " + told);
+
+        // the follower joins the leader; a seat is withdrawn
+        std::io::fs::write_file(
+            self.data + "/tcp",
+            table(
+                row("0164A8C0:733D", "00000000:0000", "0A")
+                    + row("0164A8C0:733D", "0264A8C0:9C40", "01"),
+            ),
+        )
+        or discard;
+        self.session.assign("single\nfollower\nlooping\nleader\nsmoke\n");
+        std::time::sleep(1500ms);
+        let joined = std::io::fs::read_file(told_file) or "";
+        std::test::assert(
+            std::str::contains(joined, "leader\tstarting\tits server is loading the model\n"),
+            "joined, the leader loads: " + joined,
+        );
+        std::test::assert(!node::alive(self.removed_pid), "a withdrawn seat's server is stopped");
+
+        // past the first step
+        std::time::sleep(4000ms);
+        let after = std::io::fs::read_file(told_file) or "";
+        std::test::assert(
+            std::str::contains(after, "single\t" + REFUSED),
+            "after 5 s the seat's server is started again with its config: " + after,
+        );
+        std::test::assert(
+            std::str::contains(after, "follower\t" + REFUSED),
+            "and the follower's, within the first step: " + after,
+        );
+        std::test::assert(
+            !std::str::contains(after, "looping\t" + REFUSED),
+            "one that keeps ending waits the cap: " + after,
+        );
+        std::test::assert(
+            !std::str::contains(after, "unassigned\tstarting")
+                && !std::str::contains(after, "unassigned\t" + REFUSED),
+            "one the assignment no longer holds is never started again: " + after,
+        );
+        std::test::assert(
+            !std::str::contains(after, "removed\t"),
+            "a server stopped on purpose is never started again: " + after,
+        );
+        std::test::assert(
+            !std::str::contains(after, "smoke\tstarting")
+                && !std::str::contains(after, "smoke\t" + REFUSED),
+            "nor one whose first answers were wrong: " + after,
+        );
+    }
+}
+
+/// A process standing in for a seat's server, running `argv`, writing
+/// `says` first.
+fn stand_in(data: String, seat: String, says: String, argv: String) -> Int {
+    let log = data + "/run/" + seat + ".log";
+    std::io::fs::write_file(log, says) or discard;
+    return node::launch(data, data + "/run/" + seat + ".out", argv, "vllm", "");
+}
+
+/// A stand-in that has already ended.
+fn ended(data: String, seat: String, says: String) -> Int {
+    let pid = stand_in(data, seat, says, "true");
+    let mut i = 0;
+    while i < 50 && node::alive(pid) {
+        std::time::sleep(100ms);
+        i = i + 1;
+    }
+    return pid;
+}
+
+fn listen_from(from: Int) -> Int {
+    let mut port = from;
+    while port < from + 500 {
+        let fd = std::io::tcp::__listen_socket("127.0.0.1", port);
+        if fd >= 0 {
+            std::io::tcp::__close_fd(fd);
+            return port;
+        }
+        port = port + 1;
+    }
+    return -1;
+}
+
+fn main() {
+    policy();
+
+    let data = "/tmp/voice-restart-test-" + to_string(std::process::pid());
+    std::io::fs::mkdir(data) or discard;
+    std::io::fs::mkdir(data + "/run") or discard;
+    std::io::fs::write_file(data + "/tcp", table(row("0164A8C0:733D", "00000000:0000", "0A")))
+    or discard;
+    let sink = Told { file: data + "/told" };
+    let now = std::time::monotonic_ns();
+    let port = listen_from(43000 + std::process::pid() % 7000);
+    let closed = listen_from(port + 1);
+    let removed_pid = stand_in(data, "removed", "", "sleep\n60");
+    let smoke_pid = stand_in(data, "smoke", "", "sleep\n60");
+    let leader_pid = stand_in(data, "leader", "", "sleep\n60");
+    let mut runs = node::Runs { };
+    push(
+        runs.items,
+        node::Run {
+            seat: "single",
+            phase: "up",
+            pid: ended(data, "single", "loading\nboom: out of memory\n"),
+            log: data + "/run/single.log",
+            health: "http://127.0.0.1:47100/health",
+            config: CONFIG,
+            began: now,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "follower",
+            phase: "up",
+            pid: ended(
+                data,
+                "follower",
+                "dsv41: rank 1 stopped following rank 0: PeerDown\n{\"rank\": 1, \"follow\": \"PeerDown\"}\n",
+            ),
+            log: data + "/run/follower.log",
+            spans: true,
+            config: CONFIG,
+            attempt: 3,
+            ends: 5,
+            ends_from: now,
+            began: now,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "looping",
+            pid: ended(data, "looping", "segfault\n"),
+            log: data + "/run/looping.log",
+            health: "http://127.0.0.1:47100/health",
+            config: CONFIG,
+            attempt: 4,
+            ends: 5,
+            ends_from: now,
+            began: now,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "unassigned",
+            pid: ended(data, "unassigned", "bye\n"),
+            log: data + "/run/unassigned.log",
+            config: CONFIG,
+            began: now,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "removed",
+            phase: "up",
+            pid: removed_pid,
+            log: data + "/run/removed.log",
+            config: CONFIG,
+            began: now,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "leader",
+            pid: leader_pid,
+            log: data + "/run/leader.log",
+            health: "http://127.0.0.1:" + to_string(closed) + "/v1/models",
+            server: "tensorfold",
+            spans: true,
+            config: CONFIG,
+            began: now,
+            peer: "node-b",
+            meet: 29501,
+        },
+    )
+    or discard;
+    push(
+        runs.items,
+        node::Run {
+            seat: "smoke",
+            port: port,
+            pid: smoke_pid,
+            log: data + "/run/smoke.log",
+            health: "http://127.0.0.1:" + to_string(port) + "/health",
+            server: "vllm",
+            model: "m",
+            config: CONFIG,
+            began: now,
+        },
+    )
+    or discard;
+    App {
+        engine: Engine { fd: std::io::tcp::__listen_socket("127.0.0.1", port) },
+        runner: node::Runner {
+            id: "restart-test-" + to_string(std::process::pid()),
+            data: data,
+            runs: runs,
+            assigned: "single\nfollower\nlooping\nremoved\nleader\nsmoke\n",
+            heard: true,
+            sockets: data + "/tcp",
+        },
+        data: data,
+        removed_pid: removed_pid,
+        smoke_pid: smoke_pid,
+    };
+    node::end_process(leader_pid);
+    node::end_process(removed_pid);
+    node::run_out("rm\n-rf\n" + data);
+}

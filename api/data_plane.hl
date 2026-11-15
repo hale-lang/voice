@@ -14,6 +14,8 @@
 ///   - the admin event stream (`/admin/v1/events`) and the route table
 ///     (`/admin/v1/routes`, the brain's JSON as stored), which no row
 ///     states, under the operator token (operator.hl);
+///   - the probes (`/healthz`, `/readyz`), answered whatever credential a
+///     request carries, of any plane, a wrong one or none;
 ///   - the app (`--ui`), the files of the admin ui.
 ///
 /// `is_route` takes the first match in written order.
@@ -97,6 +99,8 @@ locus DataPlane {
         // the stages being read on this instance now, at most
         // `ANNOTATE_WORKERS`: callers always come first
         reading: Int = 0;
+        // liveness and readiness (health.hl)
+        probes: Probes = Probes { store: self.store };
     }
 
     bus {
@@ -147,12 +151,67 @@ locus DataPlane {
         return std::http::Response { status: 200, body: "", takeover_raw: true };
     }
 
+    /// `getLiveness` (`ready` false) or `getReadiness`: the same answer
+    /// whatever `Authorization` the request carries, none included. `HEAD`
+    /// is answered with no body, another method 405. Readiness that fails
+    /// is the 503 a control-plane failure is (`ctl_response`).
+    fn probe(req: std::http::Request, ready: Bool) -> std::http::Response {
+        if req.method != "GET" && req.method != "HEAD" {
+            let refused = error_response(
+                405,
+                "invalid_request",
+                "invalid_request",
+                req.method + " is not allowed: a probe takes GET or HEAD",
+            );
+            return std::http::Response {
+                status: 405,
+                content_type: refused.content_type,
+                headers: "Allow: GET, HEAD",
+                body: refused.body,
+            };
+        }
+        let answer = if !ready {
+            std::http::Response {
+                status: 200,
+                content_type: "application/json",
+                body: Health::api_encode(self.probes.liveness()),
+            }
+        } else {
+            self.readiness_response()
+        };
+        if req.method == "HEAD" {
+            return std::http::Response {
+                status: answer.status,
+                content_type: answer.content_type,
+                headers: answer.headers,
+                body: "",
+            };
+        }
+        return answer;
+    }
+
+    /// `getReadiness`'s answer: 200 with the checks, or the 503 of a store
+    /// that does not answer.
+    fn readiness_response() -> std::http::Response {
+        let h = self.probes.readiness() or {
+            return ctl_response(err);
+        };
+        return std::http::Response {
+            status: 200,
+            content_type: "application/json",
+            body: Health::api_encode(h),
+        };
+    }
+
     fn handle(req: std::http::Request) -> std::http::Response {
         return self.route(req) or failed(err);
     }
 
     fn route(req: std::http::Request) -> std::http::Response fallible(ApiError) {
         let c = std::http::build_context(req);
+        // the probes, before anything reads the request's credential
+        if std::http::is_route(c, req.method, "/healthz") { return self.probe(req, false); }
+        if std::http::is_route(c, req.method, "/readyz") { return self.probe(req, true); }
         whole_body(req) or raise;
 
         // caller plane

@@ -4,7 +4,7 @@ import { Loading, Unavailable, Empty, Mono, ago, count, micros } from '@hale/com
 import { useGet, useNodes, useUsageRecords, USAGE_PAGE } from '../api/client';
 import { subscribeAdminEvents, subscribeFlights } from '../api/events';
 import type { ScreenProps } from '../App';
-import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, pairsOf, provisional, hullOf, topologyKey, BAD_STATES, WAITING_STATES, RETIRED, type Fleet, type Graph, type Kind, type Pair, type Point } from './network-model';
+import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, resizeLayout, requestEdges, requestFlowEdges, requestVertices, matchingRequests, graphKinds, kindName, pairsOf, provisional, hullOf, topologyKey, retiredMode, RETIRED_MODES, BAD_STATES, WAITING_STATES, RETIRED, type Fleet, type RetiredMode, type Graph, type Kind, type Pair, type Point } from './network-model';
 import { demoFleet, demoInFlight, demoCompletions, demoContext, demoInstances, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
@@ -32,13 +32,15 @@ export function Network(_: ScreenProps) {
     try { localStorage.setItem('voice.network.context', context ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
   };
   // the api instances since retired (each redeploy retires one), faint, with
-  // the requests they admitted: off unless this viewer turned it on
-  const [retired, setRetired] = useState(() => {
-    try { return localStorage.getItem('voice.network.retired') === 'on'; } catch { return false; }
+  // the requests they admitted: while any of those is in view, unless this
+  // viewer chose always or never (the old on/off switch read as always or
+  // the default)
+  const [retired, setRetired] = useState<RetiredMode>(() => {
+    try { return retiredMode(localStorage.getItem('voice.network.retired')); } catch { return 'in-view'; }
   });
-  const toggleRetired = () => {
-    setRetired(!retired);
-    try { localStorage.setItem('voice.network.retired', retired ? 'off' : 'on'); } catch { /* Storage can be disabled. */ }
+  const chooseRetired = (mode: RetiredMode) => {
+    setRetired(mode);
+    try { localStorage.setItem('voice.network.retired', mode); } catch { /* Storage can be disabled. */ }
   };
   const usage = useGet('/admin/v1/usage', { params: { query: { limit: USAGE_PAGE, ...(internal ? { include_internal: true } : {}) } } });
   // the ledger lists each request without the caller's metadata: with the
@@ -87,7 +89,7 @@ export function Network(_: ScreenProps) {
         <button aria-pressed={source === 'api'} onClick={() => chooseSource('api')}>API {stub ? 'fixture' : 'data'}</button>
         <button aria-pressed={source === 'demo'} onClick={() => chooseSource('demo')}>Demo fleet</button>
         <button aria-pressed={context} onClick={toggleContext} title="each request's conversation, repository and metadata beside its project">Request context</button>
-        <button aria-pressed={retired} onClick={toggleRetired} title="api instances that no longer beat (each redeploy retires one), faint, with the requests they admitted">Retired api instances</button>
+        <label className={s.retiredChoice} title="api instances that no longer beat (each redeploy retires one), faint, with the requests they admitted: while any of those is in view, always, or never (their requests then flow from the project straight to the host)">Retired api instances<select value={retired} onChange={e => chooseRetired(e.target.value as RetiredMode)}>{RETIRED_MODES.map(([mode, label]) => <option key={mode} value={mode}>{label}{mode === 'in-view' ? ' (default)' : ''}</option>)}</select></label>
         <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project (annotations, titles), under its system key: dotted, apart from the project's flow">Internal runs</button>
       </div>
     </header>
@@ -98,7 +100,7 @@ export function Network(_: ScreenProps) {
 
 type Pulse = { record: FleetRequest; at: number; inFlight?: boolean; color?: string };
 
-function FleetNetwork({ fleet, demo, stub, context, retired }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean; retired: boolean }) {
+function FleetNetwork({ fleet, demo, stub, context, retired }: { fleet: Fleet; demo: boolean; stub: boolean; context: boolean; retired: RetiredMode }) {
   const [clock, setClock] = useState(() => ({ tick: 0, now: Date.now() }));
   const [paused, setPaused] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
@@ -238,7 +240,7 @@ function FleetNetwork({ fleet, demo, stub, context, retired }: { fleet: Fleet; d
         {graph.vertices.length === 0 ? <Empty>{filterCount || hidden.length ? "No entities match these filters. Reset filters to see the fleet." : "No nodes, seats, accounts or projects have been reported yet."}</Empty> :
           <Constellation layout={fullGraph} graph={graph} selected={selectedIds} focusedIds={focusedIds} focusedEdges={focusedEdges} paused={paused} pulses={paused && !demo ? [] : motion.filter(p => filtered.usage.some(r => r.id === p.record.id) && (!focus && !trace || cohort.some(r => r.id === p.record.id)))} onSelect={choose} onHover={setHovered} />}
         <div className={s.legend}>{kinds.map((kind) => <span key={kind} className={s[kind] ?? s.context}><Marker kind={kind} />{kindName(kind)}</span>)}{fullGraph.pairs.length > 0 && <><span className={`${s.legendLine} ${s.legendBond}`} title="a placement's leader seat and its follower's: the two halves of one model"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Bond</span><span className={`${s.legendLine} ${s.legendCable}`} title="the link between the hosts of a placement across two"><svg viewBox="0 0 30 12" aria-hidden="true"><path d="M3 6H27" /></svg>Cable</span></>}</div>
-        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. An api instance that no longer beats, with no request in flight, is retired (each redeploy retires one): it is left off the map, and the requests it admitted flow from the project straight to the host, their trace still naming it; Retired api instances draws it faint, with them. Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project. A model placed across two hosts is one outlined unit: a bond joins its leader seat, which takes its requests, to its follower's, which computes half of each and serves nothing alone; a cable joins their hosts, the link between them. A request to the leader lights both hosts, both seats, the bond and the cable; a part down marks the bond, the cable and the outline, with its reason.</div>
+        <div className={s.mapNote}>Each project is the source of its requests: project → API instance → host → seat → account → served model; one asked by an alias flows to the model it named, and a model lists the aliases projects give it beneath its name. Faint lines are the standing topology (each project to the api, the api to every host, each seat to its account and models), drawn with or without traffic; solid ones are requests. Hosts contain seats; the account layer shows budget attribution. An api instance that no longer beats, with no request in flight, is retired (each redeploy retires one): it is drawn faint, labelled retired, while any request it admitted is in view, those requests flowing through it as recorded, and drops off once none is; Retired api instances can draw every one known always, or never (the requests it admitted then flow from the project straight to the host, their trace still naming it). Request context (conversations, repositories, metadata) is a layer of its own, off until asked for, drawn dotted beside its project. A model placed across two hosts is one outlined unit: a bond joins its leader seat, which takes its requests, to its follower's, which computes half of each and serves nothing alone; a cable joins their hosts, the link between them. A request to the leader lights both hosts, both seats, the bond and the cable; a part down marks the bond, the cable and the outline, with its reason.</div>
         {graph.total > 160 && <p className="c-wait">Layout is limited to the first 160 of {graph.total} matching entities; hidden layers may reduce the visible count.</p>}
       </div>
       <aside className={s.detail} aria-label="Network inspector">

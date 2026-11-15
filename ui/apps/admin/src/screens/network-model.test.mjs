@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildGraph, entityId, edgeId, requestEdges, requestVertices, requestContext, relatedRequests, matchingRequests, graphKinds, requestFlowEdges, layoutGraph, resizeLayout, topologyKey, provisional, pairsOf, hullOf, liveInstances, RETIRED } from './network-model.ts';
+import { buildGraph, entityId, edgeId, requestEdges, requestVertices, requestContext, relatedRequests, matchingRequests, graphKinds, requestFlowEdges, layoutGraph, resizeLayout, topologyKey, provisional, pairsOf, hullOf, liveInstances, retiredMode, RETIRED } from './network-model.ts';
 import { demoFleet, demoRequest, demoInFlight, demoCompletions, demoContext, demoInstances } from './network-demo.ts';
 
 test('graph relationships come from configuration or usage, never all-to-all guesses', () => {
@@ -533,9 +533,36 @@ const redeployed = (instances = [{ id: 'api-old', at: AT, up: false }, { id: 'ap
 });
 const OLD = entityId('api', 'api-old'), NEW = entityId('api', 'api-new');
 
-test('by default the map shows only the live api instance; a request a retired one admitted flows project → host, and still names it', () => {
-  const fleet = redeployed();
+test('right after a redeploy, with only the old instance\'s records in view, it is shown by default, retired, and they flow through it', () => {
+  const fleet = { ...redeployed(), usage: [served('before', 'host-c/mid-model', { instance: 'api-old' }), served('before-2', 'host-a/small-model', { instance: 'api-old' })] };
   const graph = buildGraph(fleet);
+  const apis = new Map(graph.vertices.filter((v) => v.kind === 'api').map((v) => [v.id, v.state]));
+  assert.deepEqual([...apis.keys()].sort(), [NEW, OLD]);
+  assert.equal(apis.get(OLD), RETIRED, 'faint, labelled retired');
+  assert.equal(apis.get(NEW), 'up');
+  const project = entityId('project', 'work');
+  for (const [r, host] of [[fleet.usage[0], 'host-c'], [fleet.usage[1], 'host-a']]) {
+    const flow = requestFlowEdges(r, graph);
+    assert(flow.has(edgeId(project, OLD)) && flow.has(edgeId(OLD, entityId('node', host))), 'project → retired instance → host, as recorded');
+    assert(!flow.has(edgeId(project, entityId('node', host))), 'never bypassing the api');
+    assert(!flow.has(edgeId(project, NEW)), 'never reattributed to the live instance');
+    assert.equal(graph.requests.get(r.id).retired, true);
+  }
+  // a retired instance reaches nothing now: no standing links of its own
+  assert(!graph.edges.some((e) => e.kind === 'standing' && (e.source === OLD || e.target === OLD)));
+});
+
+test('once its records scroll out of view, the retired instance drops off', () => {
+  const fleet = { ...redeployed(), usage: [served('after', 'host-c/mid-model', { instance: 'api-new' })] };
+  const graph = buildGraph(fleet);
+  assert.deepEqual(graph.vertices.filter((v) => v.kind === 'api').map((v) => v.id), [NEW]);
+  // a filter that leaves none of them in view drops it as well
+  assert(!buildGraph({ ...redeployed(), usage: redeployed().usage.filter((r) => r.instance !== 'api-old') }).vertices.some((v) => v.id === OLD));
+});
+
+test('never: only the live api instance; a request a retired one admitted flows project → host, and still names it', () => {
+  const fleet = redeployed();
+  const graph = buildGraph(fleet, { retired: 'never' });
   assert.deepEqual(graph.vertices.filter((v) => v.kind === 'api').map((v) => v.id), [NEW], 'one api vertex');
   const before = fleet.usage[0], project = entityId('project', 'work'), host = entityId('node', 'host-c');
   const flow = requestFlowEdges(before, graph);
@@ -553,9 +580,13 @@ test('by default the map shows only the live api instance; a request a retired o
   assert(buildGraph({ ...fleet, instances: undefined }).vertices.some((v) => v.id === OLD));
 });
 
-test('asked for, a retired api instance is drawn faint with the requests it admitted, as recorded; the live one stays', () => {
+test('always: every retired api instance known is drawn faint, in view or not, with the requests it admitted as recorded; the live one stays', () => {
+  const known = [{ id: 'api-old', at: AT, up: false }, { id: 'api-older', at: AT, up: false }, { id: 'api-new', at: AT, up: true }];
+  const OLDER = entityId('api', 'api-older');
+  assert(!buildGraph(redeployed(known)).vertices.some((v) => v.id === OLDER), 'none of its records in view: not by default');
+  assert.equal(buildGraph(redeployed(known), { retired: 'always' }).vertices.find((v) => v.id === OLDER)?.state, RETIRED);
   const fleet = redeployed();
-  const graph = buildGraph(fleet, { retired: true });
+  const graph = buildGraph(fleet, { retired: 'always' });
   const apis = new Map(graph.vertices.filter((v) => v.kind === 'api').map((v) => [v.id, v.state]));
   assert.deepEqual([...apis.keys()].sort(), [NEW, OLD]);
   assert.equal(apis.get(OLD), RETIRED);
@@ -571,9 +602,9 @@ test('asked for, a retired api instance is drawn faint with the requests it admi
 
 test('a redeploy changes the api layer once; retired instances and their records never move the map while hidden', () => {
   // before: api-old beats and admitted a request
-  const before = buildGraph({ ...lab(), instances: [{ id: 'api-old', at: AT, up: true }], usage: [served('r1', 'host-c/mid-model', { instance: 'api-old' })] });
+  const before = buildGraph({ ...lab(), instances: [{ id: 'api-old', at: AT, up: true }], usage: [served('r1', 'host-c/mid-model', { instance: 'api-old' })] }, { retired: 'never' });
   // after: api-old retired, api-new beats; more records, and an instance retired long ago
-  const after = (usage, instances) => buildGraph({ ...lab(), instances, usage });
+  const after = (usage, instances) => buildGraph({ ...lab(), instances, usage }, { retired: 'never' });
   const live = [{ id: 'api-new', at: AT, up: true }];
   const a = after([served('r1', 'host-c/mid-model', { instance: 'api-old' })], [{ id: 'api-old', at: AT, up: false }, ...live]);
   const b = after([served('r1', 'host-c/mid-model', { instance: 'api-old' }), served('r0', 'host-a/small-model', { instance: 'api-older' })], live);
@@ -585,6 +616,20 @@ test('a redeploy changes the api layer once; retired instances and their records
   assert.equal(topologyKey(c), topologyKey(a));
 });
 
+test('in view, a retired instance coming or going re-runs the layout once; traffic and its ending never do', () => {
+  const live = [{ id: 'api-old', at: AT, up: false }, { id: 'api-new', at: AT, up: true }];
+  const key = (usage, inFlight) => topologyKey(buildGraph({ ...lab(), instances: live, usage, ...(inFlight ? { inFlight } : {}) }));
+  const old = served('r1', 'host-c/mid-model', { instance: 'api-old' });
+  const shown = key([old]), gone = key([served('r2', 'host-c/mid-model', { instance: 'api-new' })]);
+  assert.notEqual(shown, gone, 'its coming and going is a topology change');
+  assert(shown.includes('api:api-old') && !gone.includes('api:api-old'));
+  // while it is shown, the live instance's traffic, starting, running and ending, leaves the key as it is
+  const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'big-model', resolved_model: 'big-model', seat: 'host-a/big-model', account: 'local', started_at: AT, instance: 'api-new', conversation: null };
+  assert.equal(key([provisional(flight), old], ['f1']), shown);
+  assert.equal(key([served('f1', 'host-a/big-model', { instance: 'api-new' }), old]), shown);
+  assert.equal(key([served('r3', 'host-a/small-model', { instance: 'api-old' }), old]), shown, 'more of its records: still the one vertex');
+});
+
 test('a request in flight on an instance that has just stopped beating keeps it live and drawn', () => {
   const flight = { id: 'f1', project: 'work', key: 'k1', requested_model: 'mid-model', resolved_model: 'mid-model', seat: 'host-c/mid-model', account: 'local', started_at: AT, instance: 'api-old', conversation: null };
   const fleet = { ...redeployed(), usage: [provisional(flight), served('before', 'host-c/mid-model', { instance: 'api-old' })], inFlight: ['f1'] };
@@ -594,17 +639,30 @@ test('a request in flight on an instance that has just stopped beating keeps it 
   assert.equal(old?.state, 'up', 'live while it serves');
   assert(requestFlowEdges(provisional(flight), graph).has(edgeId(entityId('project', 'work'), OLD)));
   assert.equal(graph.requests.get('before').retired, undefined, 'its records too, while it is live');
-  // settled: it retires, and is drawn no more
-  assert(!buildGraph({ ...fleet, inFlight: [] }).vertices.some((v) => v.id === OLD));
+  // settled: it retires, drawn faint while its records are in view, the map unmoved; asked never, drawn no more
+  const settled = buildGraph({ ...fleet, inFlight: [] });
+  assert.equal(settled.vertices.find((v) => v.id === OLD)?.state, RETIRED);
+  assert.equal(topologyKey(settled), topologyKey(graph), 'its flight ending never moves the map');
+  assert(!buildGraph({ ...fleet, inFlight: [] }, { retired: 'never' }).vertices.some((v) => v.id === OLD));
 });
 
-test("the demo fleet has a retired api instance, its oldest records' admitter, shown only when asked for", () => {
+test("the demo fleet has a retired api instance, its oldest records' admitter, shown while they are in view", () => {
   const fleet = { ...demoFleet(0, 1_800_000_000_000), instances: demoInstances(1_800_000_000_000) };
   const contexts = Object.fromEntries(fleet.usage.map((r) => [r.id, demoContext(r)]));
   const apis = (g) => g.vertices.filter((v) => v.kind === 'api').map((v) => v.id).sort();
-  assert.deepEqual(apis(buildGraph({ ...fleet, contexts })), ['api:api-1', 'api:api-2']);
-  const shown = buildGraph({ ...fleet, contexts }, { retired: true });
+  assert.deepEqual(apis(buildGraph({ ...fleet, contexts }, { retired: 'never' })), ['api:api-1', 'api:api-2']);
+  assert.deepEqual(apis(buildGraph({ ...fleet, contexts }, { retired: 'always' })), ['api:api-0', 'api:api-1', 'api:api-2']);
+  const shown = buildGraph({ ...fleet, contexts });
   assert.deepEqual(apis(shown), ['api:api-0', 'api:api-1', 'api:api-2']);
   assert.equal(shown.vertices.find((v) => v.id === 'api:api-0').state, RETIRED);
   assert(fleet.usage.some((r) => shown.requests.get(r.id)?.retired));
+});
+
+test("a viewer's saved choice of retired api instances: the old switch's on is always, its off the default", () => {
+  assert.equal(retiredMode('on'), 'always');
+  assert.equal(retiredMode('off'), 'in-view');
+  assert.equal(retiredMode(null), 'in-view', 'nothing saved: when in view');
+  assert.equal(retiredMode(undefined), 'in-view');
+  for (const mode of ['in-view', 'always', 'never']) assert.equal(retiredMode(mode), mode);
+  assert.equal(retiredMode('sometimes'), 'in-view');
 });

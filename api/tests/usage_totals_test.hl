@@ -1,0 +1,170 @@
+// `getUsageTotals`: the hourly rollup's sums by project, key or model, to
+// the hour, read through the admin plane: failures counted among the
+// requests, estimated inputs in no sum, the range widened to whole hours
+// and said back, and a group or a time it does not take refused by name.
+import ".." as api;
+import "../../store" as st;
+
+/// A failed call, as `class param`.
+fn why(err: api::CtlError) -> String {
+    return api::ctl_class(err) + " " + api::ctl_problem(err).param;
+}
+
+/// A request of key `key` that ended as `status` at `when`, served by `by`,
+/// as the api writes its row.
+fn row(
+    id: String,
+    when: String,
+    key: String,
+    by: api::ServedBy,
+    status: String,
+    t: api::Tokens,
+    price: Int
+) -> st::UsageRow {
+    let mut r = api::usage_row(
+        (api::read_inference("{\"model\": \"fast\", \"input\": \"hi\"}", "responses")
+            or api::InferenceRequest { }),
+        id,
+        "p",
+        key,
+        by,
+        status,
+        t,
+        price,
+        "USD",
+        "{\"wall_ms\": 1, \"queue_ms\": 0, \"load_ms\": 0}",
+        api::Attempts { }.items
+    );
+    r.created_at = std::time::parse_time(when) or `1970-01-01T00:00:00Z`;
+    return r;
+}
+
+/// A total's group value `f`, its requests, failures and sums, as text.
+fn said(x: api::UsageTotal, f: String) -> String {
+    return std::json::find_string_field(x.group.text, f) + " " + to_string(x.requests) + " "
+        + to_string(x.failed_requests) + " " + to_string(x.input_tokens) + " "
+        + to_string(x.cached_input_tokens) + " " + to_string(x.output_tokens) + " "
+        + to_string(x.reasoning_tokens) + " " + to_string(x.price_micros);
+}
+
+fn main() {
+    let store = st::MemoryStore { };
+    let qwen = api::ServedBy { model: "qwen", node: "n", seat: "n/s", account: "a" };
+    store.insert_usage(
+        row(
+            "r1",
+            "2026-11-02T10:05:00Z",
+            "k1",
+            qwen,
+            "served",
+            api::Tokens { input: 10, cached: 4, output: 2, reasoning: 1 },
+            50,
+        ),
+    ) or discard;
+    // failed before a seat reported: its input voice's estimate
+    store.insert_usage(
+        row(
+            "r2",
+            "2026-11-02T10:50:00Z",
+            "k1",
+            qwen,
+            "failed",
+            api::Tokens { input: 900, estimated: true },
+            0,
+        ),
+    ) or discard;
+    // no seat took it: the model asked for
+    store.insert_usage(
+        row(
+            "r3",
+            "2026-11-02T11:30:00Z",
+            "k2",
+            api::ServedBy { },
+            "no_capacity",
+            api::Tokens { input: 7, estimated: true },
+            0,
+        ),
+    ) or discard;
+    store.insert_usage(
+        row(
+            "r4",
+            "2026-11-02T13:00:00Z",
+            "k2",
+            qwen,
+            "served",
+            api::Tokens { input: 3, output: 3 },
+            9,
+        ),
+    ) or discard;
+    let usage = api::Usage { store: store };
+
+    let by_key = usage.totals(api::UsageTotalsAsk { group_by: "key", project: "p" })
+    or api::UsageTotals { };
+    std::test::assert_eq_int(count(by_key.data), 2, "a row per key");
+    std::test::assert_eq_str(
+        said(at(by_key.data, 0) or api::UsageTotal { }, "key"),
+        "k1 2 1 10 4 2 1 50",
+        "a key's requests, its failures among them, and only what its seats reported",
+    );
+    std::test::assert_eq_str(
+        said(at(by_key.data, 1) or api::UsageTotal { }, "key"),
+        "k2 2 1 3 0 3 0 9",
+        "and the next key's",
+    );
+    std::test::assert(!by_key.has_from && !by_key.has_to, "no range asked for, none said");
+
+    let by_model = usage.totals(api::UsageTotalsAsk { group_by: "model" }) or api::UsageTotals { };
+    std::test::assert_eq_str(
+        said(at(by_model.data, 0) or api::UsageTotal { }, "model"),
+        "fast 1 1 0 0 0 0 0",
+        "a request no seat took is the model asked for's",
+    );
+    std::test::assert_eq_str(
+        said(at(by_model.data, 1) or api::UsageTotal { }, "model"),
+        "qwen 3 1 13 4 5 1 59",
+        "the others the model that served them",
+    );
+
+    // to the hour: 10:59 to 11:00 counts the hours 10:00 and 11:00 whole
+    let hours = usage.totals(
+        api::UsageTotalsAsk {
+            group_by: "project",
+            from: "2026-11-02T10:59:00Z",
+            to: "2026-11-02T11:00:00Z",
+        },
+    ) or api::UsageTotals { };
+    std::test::assert_eq_str(
+        said(at(hours.data, 0) or api::UsageTotal { }, "project"),
+        "p 3 2 10 4 2 1 50",
+        "every hour the range touches, whole",
+    );
+    std::test::assert(
+        hours.has_from && std::time::iso8601(hours.from) == "2026-11-02T10:00:00Z",
+        "from: the start of the hour holding it",
+    );
+    std::test::assert(
+        hours.has_to && std::time::iso8601(hours.to) == "2026-11-02T12:00:00Z",
+        "to: the end of the hour holding it",
+    );
+    std::test::assert_eq_str(
+        (at(hours.group_by, 0) or ""),
+        "project",
+        "the fields grouped by, said back",
+    );
+
+    let mut refused = "";
+    usage.totals(api::UsageTotalsAsk { group_by: "account" }) or { refused = why(err); };
+    std::test::assert_eq_str(
+        refused,
+        "invalid group_by",
+        "a field the rollup does not keep is refused",
+    );
+    refused = "";
+    usage.totals(api::UsageTotalsAsk { group_by: "" }) or { refused = why(err); };
+    std::test::assert_eq_str(refused, "invalid group_by", "group_by is required");
+    refused = "";
+    usage.totals(api::UsageTotalsAsk { group_by: "key", from: "yesterday" }) or {
+        refused = why(err);
+    };
+    std::test::assert_eq_str(refused, "invalid from", "a from that is not a time is refused");
+}

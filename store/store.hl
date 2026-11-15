@@ -771,6 +771,155 @@ type UsageGroup {
 
 type UsageGroups { rows: bounded[UsageGroup; 1000]; }
 
+/// Which totals, from the hourly rollup (`usage_hourly`): of `project`,
+/// `key` and `model` (the model that served, else the one asked for) where
+/// not "", grouped by `by` (any of project, key, model), over the hours
+/// that start in [the hour holding `from`, `to`] where set, so a range is
+/// widened to whole hours: totals are to the hour. A project's system key's
+/// hours are left out unless `include_internal` or `key` names one.
+type UsageTotalsQuery {
+    by: Names = Names { };
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    has_from: Bool = false;
+    from: Time = `1970-01-01T00:00:00Z`;
+    has_to: Bool = false;
+    to: Time = `1970-01-01T00:00:00Z`;
+    include_internal: Bool = false;
+}
+
+/// One group's totals, by currency: `group` a JSON object keyed by the `by`
+/// fields; `failed` the requests that ended other than served or incomplete
+/// (`failed_status`). The token sums count what engines reported: an
+/// estimated input is 0 in the ledger's columns, so in none of these.
+type UsageTotal {
+    group: String = "{}";
+    currency: String = "USD";
+    requests: Int = 0;
+    failed: Int = 0;
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+}
+
+/// Totals in the order of their groups' values (`by`'s, in turn) and then
+/// currency, at most `SUMMARY_GROUPS`, the first in that order.
+type UsageTotals { rows: bounded[UsageTotal; 1000]; }
+
+/// One hour of the rollup: what the ledger's rows of one project, key,
+/// model and currency made in it add up to (`usage_hourly`).
+type HourlyRow {
+    // project, key, model, currency and hour, a newline between each
+    id: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    currency: String = "USD";
+    hour: Time = `1970-01-01T00:00:00Z`;
+    requests: Int = 0;
+    failed: Int = 0;
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+    present: Bool = false;
+}
+
+/// True for a field the totals group by.
+fn valid_total_group(f: String) -> Bool {
+    return f == "project" || f == "key" || f == "model";
+}
+
+/// The hour `t` is in: its start, in UTC.
+fn hour_of(t: Time) -> Time {
+    let s = std::time::unix(t);
+    return std::time::time_from_unix(s - s % 3600);
+}
+
+/// True when hour `h` of the rollup is one `q` asks for; `from` is the
+/// start of the hour holding `q.from`, in Unix seconds.
+fn hourly_matches(h: HourlyRow, q: UsageTotalsQuery, from: Int) -> Bool {
+    if !q.include_internal && len(q.key) == 0 && h.key == system_key(h.project) { return false; }
+    if len(q.project) > 0 && h.project != q.project { return false; }
+    if len(q.key) > 0 && h.key != q.key { return false; }
+    if len(q.model) > 0 && h.model != q.model { return false; }
+    let at = std::time::unix(h.hour);
+    if q.has_from && at < from { return false; }
+    if q.has_to && at > std::time::unix(q.to) { return false; }
+    return true;
+}
+
+/// The memory store's totals while it sums them, each beside the text it
+/// sorts by: its group's values and then its currency, each ended by a
+/// newline, which sorts before any character a value holds, so the text's
+/// order is the values' order, one after another.
+type TotalsSorted {
+    rows: bounded[UsageTotal; 1000];
+    order: bounded[String; 1000];
+}
+
+/// `s` with hour `h` counted: added to its group's totals, else a group of
+/// its own in its place, the first `SUMMARY_GROUPS` in order kept. A new
+/// value, `s` left as it is.
+fn total_added(s: TotalsSorted, h: HourlyRow, by: Names) -> TotalsSorted {
+    let mut group = "";
+    let mut order = "";
+    for f in by.items {
+        let v = if f == "project" { h.project } else if f == "key" { h.key } else { h.model };
+        group = group + (if len(group) > 0 { ", " } else { "" }) + "\"" + f + "\": \""
+            + std::json::escape_string(v) + "\"";
+        order = order + v + "\n";
+    }
+    group = "{" + group + "}";
+    order = order + h.currency + "\n";
+    // where it goes: its group's place, or the first after it
+    let mut n = 0;
+    let mut found = false;
+    while n < count(s.order) {
+        let o = at(s.order, n) or "";
+        if o == order { found = true; break; }
+        if order < o { break; }
+        n = n + 1;
+    }
+    if n >= SUMMARY_GROUPS { return s; }
+    let had = if found {
+        at(s.rows, n) or UsageTotal { }
+    } else {
+        UsageTotal { group: group, currency: h.currency }
+    };
+    let summed = UsageTotal {
+        group: had.group,
+        currency: had.currency,
+        requests: had.requests + h.requests,
+        failed: had.failed + h.failed,
+        input_tokens: had.input_tokens + h.input_tokens,
+        cached_input_tokens: had.cached_input_tokens + h.cached_input_tokens,
+        output_tokens: had.output_tokens + h.output_tokens,
+        reasoning_tokens: had.reasoning_tokens + h.reasoning_tokens,
+        price_micros: had.price_micros + h.price_micros,
+    };
+    // the group summed in its place, those after a new one a place further
+    // on, the last past the cap left out
+    let mut out = TotalsSorted { };
+    let mut i = 0;
+    while i <= count(s.rows) {
+        if i == n {
+            push(out.rows, summed) or discard;
+            push(out.order, order) or discard;
+        }
+        if i < count(s.rows) && !(found && i == n) {
+            push(out.rows, at(s.rows, i) or UsageTotal { }) or discard;
+            push(out.order, at(s.order, i) or "") or discard;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
 /// Which conversations, the most recently active first: the rows `q`
 /// matches (its own `cursor` and `limit` aside) that name a conversation,
 /// grouped by project, conversation and currency; of those, the ones whose
@@ -1175,6 +1324,9 @@ interface Store {
     fn flights_after(seq: Int, limit: Int) -> FlightRows fallible(StoreError);
     /// Totals over the matching rows, grouped.
     fn usage_summary(q: UsageSummaryQuery) -> UsageGroups fallible(StoreError);
+    /// Totals from the hourly rollup, which each row's insert adds to:
+    /// what the ledger holds, read without scanning it.
+    fn usage_totals(q: UsageTotalsQuery) -> UsageTotals fallible(StoreError);
     /// The conversations the matching rows are turns of, as `q` asks.
     fn usage_conversations(q: ConversationQuery) -> ConversationRows fallible(StoreError);
 
@@ -1416,6 +1568,10 @@ type UsageSlot { id: String = ""; seq: Int = 0; present: Bool = false; }
 @form(hashmap)
 locus UsageSlots { capacity { pool rows of UsageSlot indexed_by id; } }
 
+/// The hourly rollup, by its key (`HourlyRow.id`).
+@form(hashmap)
+locus HourlyTable { capacity { pool rows of HourlyRow indexed_by id; } }
+
 /// The rows in the process. Bounded as the lists it answers are.
 ///
 /// Its writes are `@unbounded`, which `hale verify` asks of a hashmap write
@@ -1445,6 +1601,10 @@ locus MemoryStore {
         log: ChangeLog = ChangeLog { };
         usage_log: UsageLog = UsageLog { };
         usage_slots: UsageSlots = UsageSlots { };
+        // the ledger summed by the hour, as each row is written, and the
+        // rollup's keys in the order they were first written
+        hourly_rows: HourlyTable = HourlyTable { };
+        hourly_order: IdOrder = IdOrder { };
         fleet_rows: FleetTable = FleetTable { };
         inventory_rows: InventoryTable = InventoryTable { };
         // a node's last beat, by its place in `node_order`: scalars set in
@@ -2025,6 +2185,60 @@ locus MemoryStore {
         r.present = true;
         self.usage_log.push(r);
         self.usage_slots.set(UsageSlot { id: r.id, seq: r.seq, present: true });
+        self.add_hourly(r);
+    }
+
+    /// `r` added to its hour of the rollup, with the row, as the Postgres
+    /// store's insert adds it (`usage_hourly_add`): a row the ledger had
+    /// already is never added again.
+    @unbounded
+    fn add_hourly(r: UsageRow) {
+        let model = group_value(r, "model");
+        let hour = hour_of(r.created_at);
+        let id = r.project + "\n" + r.key + "\n" + model + "\n" + r.currency + "\n"
+            + std::time::iso8601(hour);
+        let cur = self.hourly_rows.get(id) or HourlyRow { };
+        if !cur.present { self.hourly_order.push(id); }
+        self.hourly_rows.set(
+            HourlyRow {
+                id: id,
+                project: r.project,
+                key: r.key,
+                model: model,
+                currency: r.currency,
+                hour: hour,
+                requests: cur.requests + 1,
+                failed: cur.failed + (if failed_status(r.status) { 1 } else { 0 }),
+                input_tokens: cur.input_tokens + r.input_tokens,
+                cached_input_tokens: cur.cached_input_tokens + r.cached_input_tokens,
+                output_tokens: cur.output_tokens + r.output_tokens,
+                reasoning_tokens: cur.reasoning_tokens + r.reasoning_tokens,
+                price_micros: cur.price_micros + r.price_micros,
+                present: true,
+            },
+        );
+    }
+
+    fn usage_totals(q: UsageTotalsQuery) -> UsageTotals fallible(StoreError) {
+        for f in q.by.items {
+            if !valid_total_group(f) {
+                fail StoreError { kind: "invalid", message: "no total group " + f };
+            }
+        }
+        let from = if q.has_from { std::time::unix(hour_of(q.from)) } else { 0 };
+        let mut out = TotalsSorted { };
+        let mut i = 0;
+        while i < self.hourly_order.len() {
+            let h = self.hourly_rows.get(self.hourly_order.get(i) or "") or HourlyRow { };
+            i = i + 1;
+            if !hourly_matches(h, q, from) { continue; }
+            out = total_added(out, h, q.by);
+        }
+        let mut totals = UsageTotals { };
+        for t in out.rows {
+            push(totals.rows, t) or discard;
+        }
+        return totals;
     }
 
     fn usage(id: String) -> UsageRow fallible(StoreError) {

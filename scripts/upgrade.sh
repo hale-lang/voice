@@ -39,6 +39,12 @@
 # for a text voice did not write (a harness's own), and a done or
 # cancelled one none.
 #
+# Then the ledger's hourly rollup (migration 40): on a store at migration
+# 39 with a ledger, the migration's backfill is what the ledger sums to,
+# hour for hour (failures counted, a system key's rows their own, another
+# currency another row); a row written after it is added by the insert
+# trigger, and a row the ledger already has adds nothing.
+#
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -293,3 +299,35 @@ bad=$(q "SELECT string_agg(w.id || ': ' || a.failure_kind || ' for ' || w.kind, 
 [ -z "$bad" ] || { echo "a failed attempt from before has the wrong kind: $bad" >&2; exit 1; }
 test "$(q "SELECT count(*) FROM attempt")" = 33
 echo "attempts that failed before migration 38 have the kind their failure names, internal when voice did not write it; none when they did not fail"
+
+# the ledger's hourly rollup (migration 40), backfilled from the ledger an
+# api from before wrote
+store_at 39
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+INSERT INTO usage (id, created_at, project, key, requested_model, status, served, input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros, currency, record) VALUES
+  ('h1', '2026-11-02T10:05:00Z', 'work', 'k_work', 'fast', 'served', '{"model": "qwen"}', 100, 40, 10, 3, 1000, 'USD', '{}'),
+  ('h2', '2026-11-02T10:55:00Z', 'work', 'k_work', 'fast', 'incomplete', '{"model": "qwen"}', 50, 0, 5, 0, 500, 'USD', '{}'),
+  ('h3', '2026-11-02T10:30:00Z', 'work', 'k_work', 'fast', 'no_capacity', NULL, 0, 0, 0, 0, 0, 'USD', '{"input_tokens_estimated": true}'),
+  ('h4', '2026-11-02T11:10:00Z', 'work', 'k_ci', 'big', 'failed', '{"model": "dsv4"}', 0, 0, 7, 2, 70, 'USD', '{"input_tokens_estimated": true}'),
+  ('h5', '2026-11-02T11:20:00Z', 'work', 'k_ci', 'big', 'served', '{"model": "dsv4"}', 9, 1, 1, 0, 90, 'EUR', '{}'),
+  ('h6', '2026-11-02T10:40:00Z', 'work', 'work-system', 'decide', 'served', '{"model": "qwen"}', 30, 0, 3, 0, 300, 'USD', '{}');
+SQL
+migrate $((head - 39))
+fresh="SELECT project, key, coalesce(served->>'model', requested_model), currency, date_trunc('hour', created_at, 'UTC'), count(*), count(*) FILTER (WHERE status NOT IN ('served', 'incomplete')), sum(input_tokens), sum(cached_input_tokens), sum(output_tokens), sum(reasoning_tokens), sum(price_micros) FROM usage GROUP BY 1, 2, 3, 4, 5"
+kept="SELECT project, key, model, currency, hour, requests, failed_requests, input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros FROM usage_hourly"
+unlike() { q "SELECT (SELECT count(*) FROM ($fresh EXCEPT $kept) a) + (SELECT count(*) FROM ($kept EXCEPT $fresh) b)"; }
+test "$(unlike)" = 0
+test "$(q "SELECT count(*) FROM usage_hourly")" = 5
+test "$(q "SELECT requests || ':' || failed_requests || ':' || input_tokens || ':' || price_micros FROM usage_hourly WHERE key = 'k_work' AND model = 'qwen'")" = "2:0:150:1500"
+test "$(q "SELECT requests || ':' || failed_requests || ':' || input_tokens FROM usage_hourly WHERE key = 'k_work' AND model = 'fast'")" = "1:1:0"
+echo "migration 40 sums the ledger from before into its hours: $(tail -1 "$work/migrate.log")"
+# written after: the trigger adds it, once
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+INSERT INTO usage (id, created_at, project, key, requested_model, status, served, input_tokens, output_tokens, price_micros, currency, record) VALUES
+  ('h7', '2026-11-02T10:59:59Z', 'work', 'k_work', 'fast', 'served', '{"model": "qwen"}', 1, 1, 1, 'USD', '{}');
+INSERT INTO usage (id, created_at, project, key, requested_model, status, record) VALUES
+  ('h7', '2026-11-02T10:59:59Z', 'work', 'k_work', 'fast', 'served', '{}') ON CONFLICT (id) DO NOTHING;
+SQL
+test "$(unlike)" = 0
+test "$(q "SELECT requests || ':' || input_tokens FROM usage_hourly WHERE key = 'k_work' AND model = 'qwen'")" = "3:151"
+echo "a row written after it is added to its hour as it is inserted, and a row the ledger has adds nothing"

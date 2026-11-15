@@ -205,7 +205,7 @@ client can pace itself instead of discovering the wall by failing.
 - [capabilities](#tag-capabilities) (1)
 - [projects](#tag-projects) (9)
 - [keys](#tag-keys) (5)
-- [usage](#tag-usage) (15)
+- [usage](#tag-usage) (16)
 - [models](#tag-models) (5)
 - [recipes](#tag-recipes) (5)
 - [runtimes](#tag-runtimes) (4)
@@ -1114,6 +1114,52 @@ Responses:
 | Status | Description | Body |
 |---|---|---|
 | 200 | One row per group. | `application/json` [UsageSummary](#schema-usagesummary) |
+| 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 422 | The request is well formed and the handler judged it invalid. The body is the variant `Invalid` with its problem; `Hale-Error-Class: invalid` names the class. | `application/json` [AdminInvalid](#schema-admininvalid) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/usage/totals`
+
+**Total usage by project, key or model, to the hour** · `getUsageTotals`
+
+Authentication: operatorToken
+
+Requests, failed requests, tokens and spend, grouped by any of
+project, key and model, read from the ledger's hourly rollup, which
+each request's record adds to as it is written: as cheap over a
+month as over an hour, however long the ledger. Totals are to the
+hour: every hour from the one holding `from` to the one holding `to`
+is counted whole, so a range is widened to whole hours, and the
+answer's `from` and `to` say the hours counted. `model` is the model
+that served, else the one asked for, as `summarizeUsage` groups by
+it, and the `model` filter matches it so. The token sums count what
+engines reported: an input voice estimated
+(`UsageRecord.input_tokens_estimated`) adds none, as in a summary.
+Voice's own requests for its projects (their system keys') are left
+out unless `include_internal` is `true` or `key` names a system key.
+The groups come in the order of their values, then currency: at most
+1000, those after left out. A `group_by` naming another field, or a
+`from` or `to` that is not a time, is a `422`.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `group_by` | query | array of string, one of `project`, `key`, `model` | yes |  |
+| `project` | query | string |  | Only this project's requests. One value, given once. |
+| `key` | query | string |  | Only this key's requests. One value, given once. |
+| `model` | query | string |  | Only requests of this model, the one that served, else the one asked for. One value, given once. |
+| `from` | query | string (date-time) |  |  |
+| `to` | query | string (date-time) |  |  |
+| `include_internal` | query | boolean |  | Voice's own requests for its projects, under each project's system key (`UsageRecord.internal`: annotations, conversation titles), are left out unless this is `true`, or `key` names a system key. |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | One row per group and currency. | `application/json` [UsageTotals](#schema-usagetotals) |
 | 400 | The transport refuses the request before the handler sees it: a body that is not the request's JSON, a field missing or of the wrong type (`reason` names it), a path or query value that is not the field's type. The control plane is served by `http::Rest` from the surface's routes; its refusals are `{"refusal": {"kind", "reason"}}`. | `application/json` [Refusal](#schema-refusal) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
@@ -5634,6 +5680,41 @@ Type: object
 | `data[].first_at` | string (date-time) | yes | When the group's earliest request was made. |  |
 | `data[].last_at` | string (date-time) | yes | When its latest was. |  |
 | `data[].last_request` | string | yes | The latest request's id, as `getUsage` reads it. |  |
+
+<a id="schema-usagetotals"></a>
+
+### UsageTotals
+
+What `getUsageTotals` counted, a row per group and currency.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `group_by` | array of string | yes |  |  |
+| `from` | string (date-time) |  | The start of the first hour counted, the one holding the `from` asked for; absent when none was. |  |
+| `to` | string (date-time) |  | The end of the last hour counted, the one holding the `to` asked for; absent when none was. |  |
+| `data` | array of [UsageTotal](#schema-usagetotal) | yes |  | items ≤ 1000 |
+
+<a id="schema-usagetotal"></a>
+
+### UsageTotal
+
+One group's requests, tokens and spend in one currency, over the hours counted.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `group` | object | yes | The group's values, keyed by the `group_by` fields, e.g. `{"key": "k_ci", "model": "qwen3-8b"}`. |  |
+| `currency` | string | yes |  |  |
+| `requests` | integer | yes |  |  |
+| `failed_requests` | integer | yes | Of `requests`, those that ended other than `served` or `incomplete`. |  |
+| `input_tokens` | integer | yes | What the engines reported; an input voice estimated adds none. |  |
+| `cached_input_tokens` | integer | yes | Of the input, what the seats' prompt caches held. |  |
+| `output_tokens` | integer | yes |  |  |
+| `reasoning_tokens` | integer | yes | Of the output, the models' thinking. |  |
+| `price_micros` | integer | yes |  |  |
 
 <a id="schema-catalogmodelcreate"></a>
 

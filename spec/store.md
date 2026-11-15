@@ -265,8 +265,9 @@ create index on usage (project, created_at desc);
 create index on usage (account, created_at desc);
 ```
 
-Summaries (`GET /admin/v1/usage/summary`) are aggregates over `usage`, and
-the admin event stream's `usage` events are its rows past the subscriber's
+Summaries (`GET /admin/v1/usage/summary`) are aggregates over `usage`;
+totals (`GET /admin/v1/usage/totals`) are read from its hourly rollup
+(migration 40), which each insert adds to. The admin event stream's `usage` events are its rows past the subscriber's
 place. `seq` (migration 0006) numbers rows in the order they were written: a
 page is "older than" a row, and the stream follows "newer than" the last.
 
@@ -358,6 +359,7 @@ insert into usage (id, created_at, project, key, account, requested_model, statu
                    input_tokens, cached_input_tokens, cache_write_input_tokens,
                    output_tokens, reasoning_tokens, price_micros, currency, record)
 values (...);
+-- the trigger usage_hourly_add adds the row to its hour (migration 40)
 
 update request set status = 'settled' where id = $id;
 
@@ -1350,4 +1352,84 @@ a second, each page past the last one's final recording.
 
 ```sql
 create index peek_by_model on peek (model, created_at desc, request_id);
+```
+
+### Migration 40: the ledger, summed by the hour
+
+What a project, a key or a model used over a day or a month is read from
+`usage_hourly`, not from the ledger: one row per project, key, model (the
+model that served, else the one asked for, as a summary's `model` group
+names it), currency and hour (`date_trunc('hour', created_at, 'UTC')`), its
+requests, the failed among them (ended other than `served` or
+`incomplete`), its tokens and its spend. `GET /admin/v1/usage/totals` sums
+the hours a range covers, so its totals are to the hour.
+
+A trigger keeps it: each row the ledger takes is added to its hour in the
+transaction that inserts it (an upsert that adds), so the rollup is never
+behind the ledger, whichever api instance, or version of one, wrote the
+row. A row the ledger already holds is not inserted again (`on conflict
+(id) do nothing`), so it is never counted twice, and a write retried after
+a lost connection adds nothing. The ledger is append-only: no transaction
+updates or deletes a row once written (a request's row is written once,
+when it ends, `Settle`), so the rollup has no change to follow. Rows are not
+pruned; were the ledger ever pruned, the hours stay, so totals outlive the
+rows they were summed from. An estimated input is written as 0 in
+`input_tokens` (the record says it, `input_tokens_estimated`), so the
+rollup's sums, as a summary's, count only what engines reported.
+
+The migration sums the ledger written before it into the rollup in the
+same transaction that makes the trigger, whose lock on `usage` holds every
+insert off until it commits: a row is in the backfill or added by the
+trigger, never both.
+
+```sql
+create table usage_hourly (
+  project             text not null,
+  key                 text not null,
+  model               text not null,                 -- the model that served, else the one asked for
+  currency            text not null,
+  hour                timestamptz not null,          -- date_trunc('hour', created_at, 'UTC')
+  requests            bigint not null default 0,
+  failed_requests     bigint not null default 0,     -- those that ended other than served or incomplete
+  input_tokens        bigint not null default 0,
+  cached_input_tokens bigint not null default 0,
+  output_tokens       bigint not null default 0,
+  reasoning_tokens    bigint not null default 0,
+  price_micros        bigint not null default 0,
+  primary key (project, key, model, currency, hour)
+);
+create index usage_hourly_by_project on usage_hourly (project, hour);
+create index usage_hourly_by_hour on usage_hourly (hour);
+
+-- each row the ledger takes, added to its hour in the transaction that
+-- inserts it; a row it already had (on conflict do nothing) inserts none
+create function usage_hourly_add() returns trigger language plpgsql as '
+begin
+  insert into usage_hourly as h (project, key, model, currency, hour, requests, failed_requests,
+                                 input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros)
+  values (new.project, new.key, coalesce(new.served->>''model'', new.requested_model), new.currency,
+          date_trunc(''hour'', new.created_at, ''UTC''), 1,
+          case when new.status in (''served'', ''incomplete'') then 0 else 1 end,
+          new.input_tokens, new.cached_input_tokens, new.output_tokens, new.reasoning_tokens, new.price_micros)
+  on conflict (project, key, model, currency, hour) do update set
+    requests = h.requests + excluded.requests,
+    failed_requests = h.failed_requests + excluded.failed_requests,
+    input_tokens = h.input_tokens + excluded.input_tokens,
+    cached_input_tokens = h.cached_input_tokens + excluded.cached_input_tokens,
+    output_tokens = h.output_tokens + excluded.output_tokens,
+    reasoning_tokens = h.reasoning_tokens + excluded.reasoning_tokens,
+    price_micros = h.price_micros + excluded.price_micros;
+  return null;
+end';
+create trigger usage_hourly_add after insert on usage for each row execute function usage_hourly_add();
+
+-- the ledger written before it, summed: the trigger's lock on usage holds
+-- off every insert until this commits, so each row is counted once
+insert into usage_hourly (project, key, model, currency, hour, requests, failed_requests,
+                          input_tokens, cached_input_tokens, output_tokens, reasoning_tokens, price_micros)
+select project, key, coalesce(served->>'model', requested_model), currency, date_trunc('hour', created_at, 'UTC'),
+       count(*), count(*) filter (where status not in ('served', 'incomplete')),
+       sum(input_tokens), sum(cached_input_tokens), sum(output_tokens), sum(reasoning_tokens), sum(price_micros)
+from usage
+group by 1, 2, 3, 4, 5;
 ```

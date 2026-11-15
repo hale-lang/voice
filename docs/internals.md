@@ -270,7 +270,11 @@ filters and sums by: `GET /admin/v1/usage` pages it newest first (cursor =
 the row's order), `/usage/{request_id}` reads one, `/usage/summary`
 totals requests, tokens and spend by any of project, key, model, account,
 seat, node, day and hour (SQL `group by` on Postgres). Rows of another
-currency are another group. A row whose node repaired a tool call's
+currency are another group. `/usage/totals` sums requests, failures,
+tokens and spend by project, key and model from the ledger's hourly
+rollup (`usage_hourly`, store.md migration 40), which each row's insert
+adds to in its own transaction, so a month's totals read a few rows an
+hour rather than the month's ledger: totals are to the hour. A row whose node repaired a tool call's
 arguments says `tool_arguments_repaired` (*Tool call arguments*, below).
 
 `GET /admin/v1/events` answers from the rows past a subscriber's place

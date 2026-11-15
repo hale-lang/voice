@@ -304,3 +304,26 @@ export function useConversationTitles() {
     return r.data;
   }, TITLE_PAGES);
 }
+
+type TotalsQuery = NonNullable<paths['/admin/v1/usage/totals']['get']['parameters']['query']>;
+
+/**
+ * The usage totals `query` asks for (`getUsageTotals`), from the hourly
+ * rollup. Under its path, so a usage event reads them again, at most every
+ * few seconds (events.ts `PACED`); the totals shown stay while the next
+ * are read, a window changed included, though not into another project's.
+ */
+export function useUsageTotals(query: TotalsQuery) {
+  const refetchInterval = useRefetchInterval();
+  return useQuery({
+    queryKey: ['/admin/v1/usage/totals', { params: { query } }],
+    refetchInterval,
+    // the last totals of the same project (or of all of them), never another's
+    placeholderData: (previous, last) => (last && (last.queryKey[1] as { params: { query: TotalsQuery } }).params.query.project === query.project ? previous : undefined),
+    queryFn: async () => {
+      const r = await api.GET('/admin/v1/usage/totals', { params: { query } });
+      if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
+      return r.data;
+    },
+  });
+}

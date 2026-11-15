@@ -1,7 +1,7 @@
 // The usage ledger: one row per inference request, written where the
 // request ends (inference.hl: `settled` and `unfinished`), read back by
 // the admin plane (`GET /admin/v1/usage`, `/usage/{request_id}`,
-// `/usage/summary`, `/usage/conversations`) and followed by the event stream (admin_events.hl).
+// `/usage/summary`, `/usage/totals`, `/usage/conversations`) and followed by the event stream (admin_events.hl).
 // A row is the `UsageRecord` of ../spec/openapi.yaml, kept whole in the
 // store (`UsageRow.record`) beside the columns a read filters and sums by.
 
@@ -506,6 +506,42 @@ type UsageSummary {
     data: bounded[UsageGroupOut; 1000];
 }
 
+/// `GET /admin/v1/usage/totals`'s: the fields to group by (any of project,
+/// key, model) and the filters the hourly rollup keeps.
+type UsageTotalsAsk {
+    group_by: String = "";
+    project: String = "";
+    key: String = "";
+    model: String = "";
+    from: String = "";
+    to: String = "";
+    include_internal: Bool = false;
+}
+
+/// `UsageTotal`: one group's totals in one currency (st::UsageTotal).
+type UsageTotal {
+    group: std::json::Value = std::json::Value::null();
+    currency: String = "USD";
+    requests: Int = 0;
+    failed_requests: Int = 0;
+    input_tokens: Int = 0;
+    cached_input_tokens: Int = 0;
+    output_tokens: Int = 0;
+    reasoning_tokens: Int = 0;
+    price_micros: Int = 0;
+}
+
+/// `UsageTotals`: the hours counted, from the start of the first to the
+/// end of the last, and a row per group.
+type UsageTotals {
+    group_by: bounded[String; 32];
+    has_from: Bool = false;
+    from: Time = `1970-01-01T00:00:00Z`;
+    has_to: Bool = false;
+    to: Time = `1970-01-01T00:00:00Z`;
+    data: bounded[UsageTotal; 1000];
+}
+
 /// The ledger, read.
 locus Usage {
     params {
@@ -573,7 +609,7 @@ locus Usage {
 
     /// `summary`, inside the gate.
     fn summary_in_gate(a: UsageSummaryAsk) -> UsageSummary fallible(CtlError) {
-        let by = group_by_of(a.group_by) or raise;
+        let by = group_by_of(a.group_by, false) or raise;
         let q = usage_query_of(
             UsageAsk {
                 project: a.project,
@@ -612,6 +648,72 @@ locus Usage {
                     first_at: g.first_at,
                     last_at: g.last_at,
                     last_request: g.last_request,
+                },
+            ) or discard;
+        }
+        return out;
+    }
+
+    /// `getUsageTotals`: the hourly rollup's sums, one per group, to the hour.
+    fn totals(a: UsageTotalsAsk) -> UsageTotals fallible(CtlError) {
+        self.gate.enter();
+        let gated = self.totals_in_gate(a) or {
+            self.gate.leave();
+            fail err;
+        };
+        self.gate.leave();
+        return gated;
+    }
+
+    /// `totals`, inside the gate.
+    fn totals_in_gate(a: UsageTotalsAsk) -> UsageTotals fallible(CtlError) {
+        let by = group_by_of(a.group_by, true) or raise;
+        let q = usage_query_of(
+            UsageAsk {
+                project: a.project,
+                key: a.key,
+                model: a.model,
+                from: a.from,
+                to: a.to,
+                include_internal: a.include_internal,
+            },
+            false,
+        ) or raise;
+        let rows = self.store.usage_totals(
+            st::UsageTotalsQuery {
+                by: by,
+                project: q.project,
+                key: q.key,
+                model: q.model,
+                has_from: q.has_from,
+                from: q.from,
+                has_to: q.has_to,
+                to: q.to,
+                include_internal: q.include_internal,
+            },
+        ) or fail store_down(err);
+        // the hours counted: from the start of the one holding `from` to the
+        // end of the one holding `to`
+        let mut out = UsageTotals {
+            has_from: q.has_from,
+            from: st::hour_of(q.from),
+            has_to: q.has_to,
+            to: std::time::time_from_unix(std::time::unix(st::hour_of(q.to)) + 3600),
+        };
+        out.group_by = by.items;
+        for r in rows.rows {
+            push(
+                out.data,
+                UsageTotal {
+                    group: stored_value(r.group, "a usage group") or raise,
+                    currency: r.currency,
+                    requests: r.requests,
+                    failed_requests: r.failed,
+                    input_tokens: r.input_tokens,
+                    cached_input_tokens: r.cached_input_tokens,
+                    output_tokens: r.output_tokens,
+                    reasoning_tokens: r.reasoning_tokens,
+                    price_micros: r.price_micros,
                 },
             ) or discard;
         }
@@ -855,8 +957,8 @@ fn usage_status(s: String) -> Bool {
         || s == "cancelled" || s == "abandoned";
 }
 
-/// `group_by`: the fields a summary groups by, comma separated.
-fn group_by_of(raw: String) -> st::Names fallible(CtlError) {
+/// `group_by`: the fields a summary groups by, comma separated, or the totals (`totals`).
+fn group_by_of(raw: String, totals: Bool) -> st::Names fallible(CtlError) {
     if len(raw) == 0 { fail bad("`group_by` is required", "group_by"); }
     let mut out = st::Names { };
     let mut rest = raw;
@@ -864,7 +966,10 @@ fn group_by_of(raw: String) -> st::Names fallible(CtlError) {
         let comma = std::str::index_of(rest, ",");
         let f = if comma < 0 { rest } else { rest[0..comma] };
         rest = if comma < 0 { "" } else { rest[(comma + 1)..len(rest)] };
-        if !st::valid_group(f) {
+        if totals && !st::valid_total_group(f) {
+            fail bad("`group_by` is any of project, key, model", "group_by");
+        }
+        if !totals && !st::valid_group(f) {
             fail bad(
                 "`group_by` is any of project, key, model, account, seat, node, conversation, internal, day, hour",
                 "group_by"

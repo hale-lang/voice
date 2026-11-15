@@ -156,7 +156,7 @@ const refusals = {
 };
 
 // the query an operation needs to be answered at all
-const queries = { summarizeUsage: '?group_by=project,account', annotationFacets: '?question=request-basics.task', annotationTrend: '?question=request-basics.task&bucket=hour' };
+const queries = { summarizeUsage: '?group_by=project,account', getUsageTotals: '?group_by=project,key&from=2026-11-01T00:00:00Z', annotationFacets: '?question=request-basics.task', annotationTrend: '?question=request-basics.task&bucket=hour' };
 
 const calls = [], last = [];
 for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object.entries(item)) {

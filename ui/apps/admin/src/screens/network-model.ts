@@ -51,7 +51,7 @@ export type Graph = { vertices: Vertex[]; edges: Edge[]; total: number; requests
 /** The states drawn as failed, and as waiting. */
 export const BAD_STATES = ['down', 'failed', 'exhausted', 'refused', 'revoked'];
 export const WAITING_STATES = ['paused', 'pending', 'starting', 'fetching', 'offline', 'disabled'];
-/** An api instance's state once it no longer beats and no request in flight names it: drawn faint, and only when asked for. */
+/** An api instance's state once it no longer beats and no request in flight names it: drawn faint, while its requests are in view or always, as asked. */
 export const RETIRED = 'retired';
 export type Point = { x: number; y: number };
 export const entityId = (kind: Kind, name: string) => `${kind}:${name}`;
@@ -89,11 +89,24 @@ export function liveInstances(fleet: Fleet): Set<string> | undefined {
 }
 
 /**
- * What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source.
- * `retired`: the api instances that have retired (each redeploy retires one), faint, with the requests they admitted
- * joined to them as recorded; off, none is drawn, and a request one admitted flows from its project straight to its host.
+ * Which retired api instances (each redeploy retires one) the map draws, faint, with the requests they admitted joined to
+ * them as recorded. `in-view`, the default: each while any request it admitted is in view, so traffic just after a
+ * redeploy is never seen to bypass the api; it drops off once none is. `always`: every one known. `never`: none, and a
+ * request one admitted flows from its project straight to its host.
  */
-export type GraphOptions = { context?: boolean; retired?: boolean };
+export type RetiredMode = 'in-view' | 'always' | 'never';
+export const RETIRED_MODES: [RetiredMode, string][] = [['in-view', 'when in view'], ['always', 'always'], ['never', 'never']];
+/** A viewer's saved choice, read back: the old on/off switch's value as always (on) or the default (off), anything else the default. */
+export function retiredMode(saved: string | null | undefined): RetiredMode {
+  if (saved === 'on') return 'always';
+  return RETIRED_MODES.some(([mode]) => mode === saved) ? saved as RetiredMode : 'in-view';
+}
+
+/**
+ * What the graph draws beyond the flow. `context`: each request's caller-supplied context (its conversation, repository and metadata keys) as nodes beside its project; off, the project is the flow's only source.
+ * `retired`: which retired api instances are drawn (RetiredMode); in view by default.
+ */
+export type GraphOptions = { context?: boolean; retired?: RetiredMode };
 
 /** Each request is a hyperedge: a correlated set of participants, rendered as links. */
 export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
@@ -115,14 +128,16 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
     return undefined;
   };
   // the api instances: live while they beat or a request in flight names
-  // them; retired after (each redeploy starts a new one), drawn only when
-  // asked for. Unknown when none has been heard: then each is as recorded
+  // them; retired after (each redeploy starts a new one), drawn while a
+  // request it admitted is in view (`inView`: asked for by one), always or
+  // never, as asked. Unknown when none has been heard: then each is as recorded
   const live = liveInstances(fleet);
   const retired = (id: string) => !!live && !live.has(id);
+  const retiredMode = options.retired ?? 'in-view';
   const heard = new Map((fleet.instances ?? []).map(i => [i.id, i]));
-  const apiVertex = (name: string): string | undefined => {
+  const apiVertex = (name: string, inView = false): string | undefined => {
     const id = entityId('api', name);
-    if (retired(name) && !options.retired) return undefined;
+    if (retired(name) && (retiredMode === 'never' || (retiredMode === 'in-view' && !inView))) return undefined;
     if (vertices.has(id)) return id;
     const beat = heard.get(name);
     const state = retired(name) ? RETIRED : live ? 'up' : 'observed';
@@ -263,9 +278,10 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       join(project, member(`context:${key}`, value, `Caller-supplied metadata.${key}; request context, not verified infrastructure identity.`));
     }
     // the api instance that admitted it, as recorded; one since retired is
-    // drawn only when asked for, and never stands in for the live one
+    // drawn while this request is in view unless asked never to be, and
+    // never stands in for the live one
     const admitted = context.apiInstance;
-    const api = admitted ? apiVertex(admitted) : undefined;
+    const api = admitted ? apiVertex(admitted, true) : undefined;
     if (api) { members.push(api); join(project, api, true); }
     if (r.served) {
       const seat = member('seat', r.served.seat);
@@ -282,7 +298,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       }
       // the project reaches the host through the api instance that admitted
       // it, or straight there when the record predates naming one or that
-      // instance has retired and is not drawn: a project is never left apart
+      // instance has retired and is asked never to be drawn: a project is never left apart
       // from its flow
       if (api) join(api, host, true);
       else join(project, host, true);
@@ -310,7 +326,8 @@ export function pairsOf(ids: Iterable<string>, graph: Graph): Pair[] {
 /**
  * What re-runs the layout: the vertices and the configured edges (a host's seats, what they offer and who pays, the
  * bonds and cables of placements across two hosts). A request starting, running or ending changes neither: the edges it
- * draws are observed, and its flow is never part of it; the standing topology follows from the vertices.
+ * draws are observed, and its flow is never part of it; the standing topology follows from the vertices. A retired api
+ * instance coming into view with its requests, or dropping off once none is, is a vertex come or gone: it re-runs once.
  */
 export function topologyKey(graph: Graph): string {
   return graph.vertices.map(v => `${v.id}/${v.parent ?? ''}`).sort().join(',') + '|' + graph.edges.filter(e => e.kind !== 'observed' && e.kind !== 'standing').map(e => `${e.id}/${e.kind}`).sort().join(',');

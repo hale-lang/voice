@@ -257,7 +257,9 @@ Every request a seat served, streamed or not, is one row in the store's
 ledger (`usage`, store.md), written where its response completes
 (`Inference.settled`). Every other request that was admitted and offered
 to a seat is a row too, written where it ends (`Inference.unfinished`),
-charged nothing, its input voice's estimate (`input_tokens_estimated`):
+charged nothing, its input voice's estimate (`input_tokens_estimated`)
+and its output, once a seat had sent some, voice's count of it
+(`output_tokens_estimated`):
 one a seat began and did not finish (`cancelled`, `failed` after output),
 one every seat it was offered failed (the `502`, `failed`, its `attempts`
 each seat's error, `served` the last seat tried), one that waited for a
@@ -937,8 +939,15 @@ when it cannot reach the coordinator.
    output began, before its seat reported usage, records voice's estimate
    of its input (its instructions, input and tools, a token per four
    characters) marked `input_tokens_estimated`, so a request cut off with a
-   long prompt reads apart from one cut off with a short one; the usage
-   summaries count only what engines reported.
+   long prompt reads apart from one cut off with a short one. One whose
+   seat had sent output records voice's count of it, marked
+   `output_tokens_estimated`: a token per output delta the seat sent (text,
+   a refusal, the thinking, a tool call's arguments), as llama-server, vLLM
+   and TensorFold stream them, or a token per four characters of them when
+   that is more; its `first_output_ms` is the first delta's, measured by
+   the api from the seat's offer. An engine's usage that came before the
+   cut is recorded as it is. The usage summaries count only what engines
+   reported.
 
 The coordinator never redirects and never stores prompts or responses. Content
 passes through one api instance and one node in memory; what is kept is the

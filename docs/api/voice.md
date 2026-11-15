@@ -1135,8 +1135,9 @@ is counted whole, so a range is widened to whole hours, and the
 answer's `from` and `to` say the hours counted. `model` is the model
 that served, else the one asked for, as `summarizeUsage` groups by
 it, and the `model` filter matches it so. The token sums count what
-engines reported: an input voice estimated
-(`UsageRecord.input_tokens_estimated`) adds none, as in a summary.
+engines reported: an input or output voice estimated
+(`UsageRecord.input_tokens_estimated`,
+`UsageRecord.output_tokens_estimated`) adds none, as in a summary.
 Voice's own requests for its projects (their system keys') are left
 out unless `include_internal` is `true` or `key` names a system key.
 The groups come in the order of their values, then currency: at most
@@ -5567,14 +5568,14 @@ Type: object
 | `resolved_model` | string |  | The catalog model the request was routed and served as: `requested_model` itself when the caller named a model, the model it named when it is a name the project gives one, read when the request was admitted. Absent from a record written before it was kept, and from an abandoned one (its instance stopped before it settled). |  |
 | `requested_account` | string \| null |  | The account the request named in `voice.account`, if any. |  |
 | `endpoint` | string, one of `responses`, `chat.completions`, `attempt` | yes | `attempt`: a coding attempt's one record, under the attempt's id, its `conversation` the attempt's id, its `timing.engine_ms` the harness's wall time, and its tokens as the harness's output reported them (`metadata.tokens` is `unreported`, and the counts 0, when it reports none). |  |
-| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | Every request admitted and offered to a seat has a record, however it ended. `failed`: a seat failed it after output, or every seat it was offered failed it (the `502`), its `attempts` each seat's error, `served` the last seat tried; `no_capacity` and `deadline_exceeded`: it waited for a slot and none freed in time (`429`, `504`); `cancelled`: its caller went away. Such a record's tokens are voice's estimate (`input_tokens_estimated`) and it is charged nothing. A request refused before it was offered (its key, its model, its limits, its body) has none. `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
+| `status` | string, one of `served`, `incomplete`, `failed`, `rate_limited`, `budget_exhausted`, `no_capacity`, `deadline_exceeded`, `cancelled`, `abandoned` | yes | Every request admitted and offered to a seat has a record, however it ended. `failed`: a seat failed it after output, or every seat it was offered failed it (the `502`), its `attempts` each seat's error, `served` the last seat tried; `no_capacity` and `deadline_exceeded`: it waited for a slot and none freed in time (`429`, `504`); `cancelled`: its caller went away. Such a record's tokens are voice's estimate (`input_tokens_estimated`, and `output_tokens_estimated` once output had come) unless its engine reported usage first, and it is charged nothing. A request refused before it was offered (its key, its model, its limits, its body) has none. `abandoned`: the api instance serving it stopped before it settled. The brain records it when the instance's heartbeat stops, with the reservation released and tokens as far as they were known. |  |
 | `served` | [Served](#schema-served) \| null | yes |  |  |
 | `data_class` | [DataClass](#schema-dataclass) |  |  |  |
 | `input_tokens` | integer | yes | The input tokens its engine reported, or, when `input_tokens_estimated`, voice's estimate. |  |
 | `cached_input_tokens` | integer |  | Input tokens the seat's prompt cache held, as its engine reported them; counted in `input_tokens`. |  |
 | `cache_write_input_tokens` | integer |  | Input tokens written to the provider's cache, as the engine reported them; counted in `input_tokens`. |  |
-| `output_tokens` | integer | yes |  |  |
-| `reasoning_tokens` | integer |  |  |  |
+| `output_tokens` | integer | yes | The output tokens its engine reported, or, when `output_tokens_estimated`, voice's count of the output its seat sent. |  |
+| `reasoning_tokens` | integer |  | Of `output_tokens`, the model's thinking, as its engine reported it, or, when `output_tokens_estimated`, voice's count of it. |  |
 | `price_micros` | integer | yes |  |  |
 | `currency` | string | yes |  |  |
 | `timing` | [Timing](#schema-timing) | yes |  |  |
@@ -5585,6 +5586,7 @@ Type: object
 | `metadata` | [Metadata](#schema-metadata) | yes |  |  |
 | `input_tokens_estimated` | boolean |  | True when its seat reported no usage, the request having been cancelled or having failed first, and `input_tokens` is voice's own estimate from the request's length (its instructions, input and tools, a token per four characters), never an engine's count: it tells a request cut off with a long prompt from one cut off with a short one. Usage summaries count only the tokens engines reported, so an estimate is in none. False (or absent, in a record from before it was kept) when `input_tokens` is the engine's. |  |
 | `tool_arguments_repaired` | boolean |  | True when voice repaired a tool call's arguments its engine wrote before the caller had them (`createResponse`, *Tool call arguments*): a number no double holds, written as a string of its text, say. A recording of the request (`Peek`) keeps what the engine wrote. False (or absent, in a record from before it was kept) otherwise. |  |
+| `output_tokens_estimated` | boolean |  | True when its seat sent output and was cut off before it reported usage (its caller went away, or the seat failed or fell silent mid-answer), and `output_tokens` and `reasoning_tokens` are voice's count of the output deltas the seat sent (text, a refusal, the thinking, a tool call's arguments): a token a delta, as llama-server, vLLM and TensorFold stream them, or a token per four characters of them, rounded up, when that is more, as for a server that streams several a chunk. Its `timing.first_output_ms` is then the first delta's, and `timing.engine_ms` the time to the cut, each from the seat's offer, as the api measured them. Usage summaries count only the tokens engines reported, so a count is in none. False (or absent, in a record from before it was kept) when the output is the engine's, or none came. |  |
 
 <a id="schema-usagerecordsummary"></a>
 
@@ -5624,7 +5626,7 @@ Type: object
 | `internal` | boolean |  |  |  |
 | `annotates` | string |  | For an internal request, the request it annotated (its metadata's `annotates`); left out otherwise. |  |
 | `side` | string |  | For an internal request, its stage, or `title` (its metadata's `side`); left out otherwise. |  |
-| `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. |  |
+| `input_tokens_estimated` | boolean |  | As `UsageRecord.input_tokens_estimated`. A request so marked whose `output_tokens` is not 0 had its output counted by voice too (`UsageRecord.output_tokens_estimated`, which `getUsage` answers): a seat that reported usage reported both. |  |
 | `tool_arguments_repaired` | boolean |  | As `UsageRecord.tool_arguments_repaired`. |  |
 
 <a id="schema-conversationusage"></a>
@@ -5633,8 +5635,8 @@ Type: object
 
 One conversation's requests, summed (`listUsageConversations`): of
 one project, in one currency. Its tokens are those engines reported,
-as a summary counts them: an estimate (`input_tokens_estimated`) is
-in none.
+as a summary counts them: an estimate (`input_tokens_estimated`,
+`output_tokens_estimated`) is in none.
 
 Type: object
 
@@ -5712,7 +5714,7 @@ Type: object
 | `failed_requests` | integer | yes | Of `requests`, those that ended other than `served` or `incomplete`. |  |
 | `input_tokens` | integer | yes | What the engines reported; an input voice estimated adds none. |  |
 | `cached_input_tokens` | integer | yes | Of the input, what the seats' prompt caches held. |  |
-| `output_tokens` | integer | yes |  |  |
+| `output_tokens` | integer | yes | What the engines reported; an output voice counted adds none. |  |
 | `reasoning_tokens` | integer | yes | Of the output, the models' thinking. |  |
 | `price_micros` | integer | yes |  |  |
 

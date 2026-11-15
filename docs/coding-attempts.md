@@ -83,7 +83,8 @@ the attempt's conversation (whatever session the CLI names), so they are in
 the ledger under the attempt; the attempt's own record counts none of
 their tokens again. It expires at the attempt's deadline and names nobody
 once the attempt is done, failed or cancelled, its node is lost, or the key
-that asked is revoked. The api keeps only its digest; an attempt is started
+that asked stops holding (revoked, or a habitat tenant's whose member is
+rotated or removed from the vault). The api keeps only its digest; an attempt is started
 once, so each run's key is its own. pi's model is the seat's `model` (or
 the engine name its `serves` gives the model asked for), named to pi as
 `--provider voice --model <name>`: pi accepts a name its provider does not

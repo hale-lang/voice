@@ -286,6 +286,28 @@ curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -
 [ "$(ask_tenant)" != 200 ] || { echo "a tenant narrowed to no account was served"; exit 1; }
 curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
 [ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
+# a pi attempt the tenant starts runs under a key voice mints for it (a
+# node enrolled for it claims it here by hand): the key calls inference as
+# long as the tenant holds the key that asked, and names nobody once the
+# tenant's member is rotated or removed (api/projects.hl, attempt_context)
+post /admin/v1/models '{"id": "pi-e2e"}' >/dev/null
+pitoken=$(post /admin/v1/nodes '{"id": "keyer"}' | field enrollment_token)
+post /admin/v1/nodes/keyer/seats '{"id": "pi", "engine": "coding", "account": "static", "concurrency": 2, "serves": [{"model": "pi-e2e"}], "config": {"harness": "pi", "model": "echo-1"}}' >/dev/null
+piv=$(curl -fsS -X POST "$api/node/v1/register" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' \
+  -d '{"protocol": 2, "version": "e2e", "capabilities": {"engines": [{"id": "coding", "kind": "harness", "models": null, "config_schema": {"type": "object", "required": ["harness"]}}]}, "local": {"paused": false, "paused_seats": []}}' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["assignment"]["version"])')
+curl -fsS -X POST "$api/node/v1/seats" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' \
+  -d '{"assignment_version": '"$piv"', "seats": [{"id": "pi", "status": "up", "reason": null, "in_flight": 0}]}' >/dev/null
+pi_attempt() {
+  [ "$(tenant /v1/attempts "$1" -H 'content-type: application/json' -d '{"repo": "https://forge.example.com/team/app.git", "base": "main", "instruction": "add a HELLO.md", "harness": "pi"}')" = 202 ] \
+    || { echo "the tenant's pi attempt was refused: $(cat "$work/tenant.out")"; exit 1; }
+  curl -fsS -X POST "$api/node/v1/attempts/claim" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' -d '{}' \
+    | python3 -c 'import json,sys; a=json.load(sys.stdin)["attempt"]; assert a["harness"]["id"] == "pi" and a["login"] == "" and a["model"] == "echo-1", a; print(a["id"], a["credential"])'
+}
+read -r pi1 pikey1 <<<"$(pi_attempt "$tenant_key")"
+[ "$(tenant /v1/models "$pikey1")" = 200 ] || { echo "an attempt's key was refused on /v1/models: $(cat "$work/tenant.out")"; exit 1; }
+[ "$(tenant /v1/attempts "$pikey1")" = 403 ] || { echo "an attempt's key listed attempts"; exit 1; }
+! grep -qF "$pikey1" "$work/api.log" || { echo "the api logged an attempt's key"; exit 1; }
 # renamed by the operator, it is still the tenant's: rotated, the old value
 # stops and the new one serves; removed, it stops
 tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print([k for k in json.load(sys.stdin)["data"] if not k["internal"]][0]["id"])')
@@ -294,8 +316,16 @@ tenant_new=$(openssl rand -hex 16)
 printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }
 [ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
+[ "$(tenant /v1/models "$pikey1")" = 401 ] || { echo "an attempt's key still works once the tenant's key that asked was rotated"; exit 1; }
+read -r pi2 pikey2 <<<"$(pi_attempt "$tenant_new")"
+[ "$(tenant /v1/models "$pikey2")" = 200 ] || { echo "the rotated tenant's attempt key was refused: $(cat "$work/tenant.out")"; exit 1; }
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
+[ "$(tenant /v1/models "$pikey2")" = 401 ] || { echo "an attempt's key still works once its tenant was removed"; exit 1; }
+for a in "$pi1" "$pi2"; do
+  curl -fsS -X POST "$api/node/v1/attempts/$a/report" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' -d '{"state": "failed", "failure": "an e2e check", "events": []}' >/dev/null
+done
+echo "a tenant's pi attempt runs under a key voice minted for it, which names nobody once the tenant's key is rotated or removed"
 echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
 # every project has its own system key for the requests voice makes for it
 # (annotate.hl): listed with its keys, internal, and no token names it

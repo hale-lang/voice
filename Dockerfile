@@ -103,8 +103,10 @@ COPY spec/validate/runtimes spec/validate/runtimes
 COPY runtimes runtimes
 COPY recipes recipes
 COPY catalog catalog
-# the test's fake harness (attempts_test)
+# the test's fake harness (attempts_test), and the harness definitions
+# voice ships (attempt_key_test)
 COPY scripts/e2e-harnesses scripts/e2e-harnesses
+COPY harnesses harnesses
 RUN --mount=type=cache,id=voice-hale-runtime,sharing=private,target=/root/.cache/hale/runtime \
     hale test api && mkdir /tested
 

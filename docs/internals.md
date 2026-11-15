@@ -8,30 +8,32 @@ logs, how it is written in Hale and how it deploys.
 
 [`api/`](../api/) is a Hale program that serves every endpoint in
 `openapi.yaml`. One port serves one origin (the admin UI is served from it
-too), in two parts. The control plane, the probes and the whole admin plane,
-is the rows of an `api` surface ([`api/surface.hl`](../api/surface.hl)): each
-a handler on a receiver over the configuration store, with the route it is
-served at (`rpc Projects::get at "GET /admin/v1/projects/{project}"`), served
-by hale's `http::Rest`, which decodes the path, the query and the body into
-the row's request, encodes the answer, and answers 404, 405, `OPTIONS` and
-`HEAD` itself ([`api/front.hl`](../api/front.hl)). Everything Rest does not
-serve goes to the data plane
-([`api/data_plane.hl`](../api/data_plane.hl)), a `std::http` handler on the
-same listener and connection: the OpenAI-compatible inference wire
-(`/v1/responses`, `/v1/chat/completions`, streamed), the caller plane's
+too), in two parts. The control plane (the whole admin plane) is the rows of
+an `api` surface ([`api/surface.hl`](../api/surface.hl)): each a handler on a
+receiver over the configuration store, with the route it is served at (`rpc
+Projects::get at "GET /admin/v1/projects/{project}"`), served by hale's
+`http::Rest`, which decodes the path, the query and the body into the row's
+request, encodes the answer, and answers 404, 405, `OPTIONS` and `HEAD` itself
+([`api/front.hl`](../api/front.hl)). Everything Rest does not serve goes to
+the data plane ([`api/data_plane.hl`](../api/data_plane.hl)), a `std::http`
+handler on the same listener and connection: the OpenAI-compatible inference
+wire (`/v1/responses`, `/v1/chat/completions`, streamed), the caller plane's
 `/v1/models` and `/v1/capabilities`, the node link (`/node/v1/*`), the admin
 event stream, the route table (`/admin/v1/routes`, the brain's JSON as it is
-stored) and the app. The data plane authenticates its own callers (a project
-key, a node's token, the operator token on the event stream and the route
-table) and keeps the OpenAI error shape, which never moves; the exposure's
-gate judges only the rows.
+stored), the probes (`/healthz`, `/readyz`) and the app. The data plane
+authenticates its own callers (a project key, a node's token, the operator
+token on the event stream and the route table) and keeps the OpenAI error
+shape, which never moves; the exposure's gate judges only the rows. The probes
+ignore credentials: the exposure judges every credential a request sends
+before it routes it, so a probe as a row refused a project key; the data plane
+answers a probe alike with any `Authorization` header or none.
 
 The admin plane takes the **operator token**
 ([`api/operator.hl`](../api/operator.hl)): the exposure's bearer source,
 `AdminBearer` ([`api/ctl.hl`](../api/ctl.hl)), names a request whose
 `Authorization: Bearer` is the token the operator, who holds `admin`, and
 every other request nobody, refused `unauthenticated` (401); a request with
-no credential is the anonymous caller a probe is, which an admin row refuses
+no credential is the anonymous caller, which an admin row refuses
 `unauthorized` (403). The bearer holds only the token's SHA-256 digest and
 compares digests in constant time. The api mints the token on its first
 start: over Postgres into the `operator_token` row (store.md, migration 7),

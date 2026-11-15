@@ -1,4 +1,5 @@
 import { bytes } from '@hale/components/src/format.ts';
+import { lasted } from '../seat-since.ts';
 
 /** A seat as its node reports it, as far as a placement's state reads it. */
 export type SeatReport = {
@@ -7,6 +8,8 @@ export type SeatReport = {
   status: string;
   reason?: string | null;
   progress?: { done_bytes: number; total_bytes: number } | null;
+  // when its state (status and reason) began
+  since?: string | null;
 };
 
 /** What a placement's state is read from: its leader's seat, and across two nodes its follower's. */
@@ -27,11 +30,12 @@ export const NO_SEAT = 'no seat serves this';
 const COMING = new Set(['pending', 'fetching', 'starting']);
 
 /**
- * The state of a placement's seats, from its nodes' reports. Nodes report
- * no time a seat entered its state, so a start says how far it is, not
- * for how long.
+ * The state of a placement's seats, from its nodes' reports: a seat on its
+ * way up or stopped says how far it is and how long it has been so
+ * ("node-a loading the model · 1 h 12 m"), from the `since` its reports
+ * stamp.
  */
-export function placementState(p: PlacementSeats, seatAt: (ref: string) => SeatReport | undefined): PlacementState {
+export function placementState(p: PlacementSeats, seatAt: (ref: string) => SeatReport | undefined, now = Date.now()): PlacementState {
   const refs = [p.seat, ...(p.follower_seat ? [p.follower_seat] : [])];
   const seats = refs.map((ref) => ({ ref, s: seatAt(ref) }));
   const up = seats.filter((x) => x.s?.status === 'up').length;
@@ -41,25 +45,35 @@ export function placementState(p: PlacementSeats, seatAt: (ref: string) => SeatR
   // the leader is the seat that serves: up, it serves, whatever its follower reports
   if (seats[0]!.s?.status === 'up') {
     const f = seats[1]!;
-    return { state: 'up', label: 'up', detail: `follower ${f.s && COMING.has(f.s.status) ? comingUp(f.s) : whyStopped(f.ref, f.s)}` };
+    return { state: 'up', label: 'up', detail: `follower ${f.s && COMING.has(f.s.status) ? comingUp(f.s, now) : whyStopped(f.ref, f.s, now)}` };
   }
   const stopped = seats.filter((x) => !x.s || (!COMING.has(x.s.status) && x.s.status !== 'up'));
   if (stopped.length > 0) {
-    return { state: 'stopped', label: NO_SEAT, detail: stopped.map((x) => whyStopped(x.ref, x.s)).join('; ') };
+    return { state: 'stopped', label: NO_SEAT, detail: stopped.map((x) => whyStopped(x.ref, x.s, now)).join('; ') };
   }
-  const coming = seats.filter((x) => x.s!.status !== 'up').map((x) => comingUp(x.s!));
+  const coming = seats.filter((x) => x.s!.status !== 'up').map((x) => comingUp(x.s!, now));
   const ups = seats.length > 1 ? `${up} of ${seats.length} seats up · ` : '';
   return { state: 'starting', label: 'starting', detail: `${ups}${coming.join(', ')}` };
 }
 
-/** A seat on its way up, in words: "node-a fetching 42 of 167 GiB", "node-a loading the model". */
-function comingUp(s: SeatReport): string {
+/** A seat on its way up, in words, and for how long: "node-a fetching 42 of 167 GiB · 3 m", "node-a loading the model · 1 h 12 m". */
+function comingUp(s: SeatReport, now: number): string {
+  return held(comingWords(s), s, now);
+}
+
+function comingWords(s: SeatReport): string {
   if (s.status === 'fetching') {
     const p = s.progress;
     return p && p.total_bytes > 0 ? `${s.node} fetching ${fetched(p.done_bytes, p.total_bytes)}` : `${s.node} fetching`;
   }
   if (s.status === 'starting') return `${s.node} loading the model`;
   return `${s.node} yet to take it up`;
+}
+
+/** Words for a seat's state, and how long it has held it when its reports say. */
+function held(words: string, s: SeatReport, now: number): string {
+  const l = lasted(s.since, now);
+  return l ? `${words} · ${l}` : words;
 }
 
 /** "42 of 167 GiB", or "512 MiB of 167 GiB" when their units differ. */
@@ -71,11 +85,11 @@ function fetched(done: number, total: number): string {
 }
 
 /** Why a seat serves nothing and is not coming up. */
-function whyStopped(ref: string, s: SeatReport | undefined): string {
+function whyStopped(ref: string, s: SeatReport | undefined, now: number): string {
   if (!s) return `${ref} is not on its node`;
   if (s.status === 'offline') return `${s.node} is offline`;
   if (s.status === 'up') return `${ref} up, but takes no requests: its node draining or its account archived`;
-  return `${s.ref} ${s.status}${s.reason ? `: ${s.reason}` : ''}`;
+  return held(`${s.ref} ${s.status}${s.reason ? `: ${s.reason}` : ''}`, s, now);
 }
 
 /**
@@ -88,21 +102,22 @@ export function modelState(
   m: { id: string; available: boolean; seats: string[] },
   placements: (PlacementSeats & { model: string })[],
   seatAt: (ref: string) => SeatReport | undefined,
+  now = Date.now(),
 ): PlacementState | null {
   if (m.available) return null;
   const mine = placements.filter((p) => p.model === m.id);
-  const states = mine.map((p) => placementState(p, seatAt));
+  const states = mine.map((p) => placementState(p, seatAt, now));
   const starting = states.find((s) => s.state === 'starting');
   if (starting) return starting;
   // a seat assigned it by hand, not by a placement
   const placedRefs = new Set(mine.flatMap((p) => [p.seat, ...(p.follower_seat ? [p.follower_seat] : [])]));
   const others = m.seats.filter((ref) => !placedRefs.has(ref)).map((ref) => ({ ref, s: seatAt(ref) }));
   const coming = others.filter((x) => x.s && COMING.has(x.s.status));
-  if (coming.length > 0) return { state: 'starting', label: 'starting', detail: coming.map((x) => comingUp(x.s!)).join(', ') };
+  if (coming.length > 0) return { state: 'starting', label: 'starting', detail: coming.map((x) => comingUp(x.s!, now)).join(', ') };
   if (mine.length === 0 && others.length === 0) return { state: 'stopped', label: NO_SEAT, detail: 'none is assigned: place it on a node' };
   const why = [
     ...states.map((s) => (s.state === 'stopped' ? s.detail : 'its placement is up, but takes no requests: its node draining or its account archived')),
-    ...others.map((x) => whyStopped(x.ref, x.s)),
+    ...others.map((x) => whyStopped(x.ref, x.s, now)),
   ];
   return { state: 'stopped', label: NO_SEAT, detail: why.join('; ') };
 }

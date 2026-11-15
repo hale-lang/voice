@@ -2,6 +2,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Panel, Table, Status, Loading, Unavailable, Missing, Contained, Kv, Mono, Form, Field, TextInput, NumberInput, Select, ListInput, Checkbox, Button, Confirm, Secret, SchemaForm, ago, bytes, type JsonObject, type JsonSchema } from '@hale/components';
 import { useGet, useNodes, type Node, type NodeSummary, type SeatSummary, type SeatView, type Schemas } from '../api/client';
+import { sinceExact, withLasted } from '../seat-since';
 import { capacityOf } from '../api/fleet-reads';
 import { useHubState } from '../api/hub';
 import { useWrite } from '../api/mutate';
@@ -228,7 +229,7 @@ function Models({ node, fresh }: { node: NodeSummary; fresh: string }) {
           {
             key: 'state',
             header: 'State',
-            render: (r) => (r.seat ? <Status tone={toneOf(r.seat.status)} label={reported(r.seat)} title={r.seat.reason ?? undefined} /> : <Status tone="quiet" label={r.placement ? 'placed, no seat here yet' : 'on disk, not served'} />),
+            render: (r) => (r.seat ? <Status tone={toneOf(r.seat.status)} label={reported(r.seat)} title={stateTitle(r.seat)} /> : <Status tone="quiet" label={r.placement ? 'placed, no seat here yet' : 'on disk, not served'} />),
           },
           {
             key: 'disk',
@@ -262,7 +263,7 @@ function Seats({ node, selected, fresh }: { node: NodeSummary; selected?: string
           { key: 'account', header: 'Account', render: (s) => <Mono>{s.account}</Mono> },
           { key: 'serves', header: 'Serves', render: (s) => s.serves.map((m) => (m.as ? `${m.model} as ${m.as}` : m.model)).join(', ') },
           { key: 'assigned', header: 'Assigned', render: (s) => (s.enabled === false ? 'disabled' : `enabled · ${s.concurrency ?? 1} at once`) },
-          { key: 'reported', header: 'Reported', render: (s) => <Status tone={toneOf(s.status)} label={reported(s)} title={s.reason ?? undefined} /> },
+          { key: 'reported', header: 'Reported', render: (s) => <Status tone={toneOf(s.status)} label={reported(s)} title={stateTitle(s)} /> },
           { key: 'reason', header: 'Reason', wrap: true, render: (s) => s.reason ?? (s.problems.length ? <span className="c-wait">{s.problems.join('; ')}</span> : <span className="faint">–</span>) },
           { key: 'ctx', header: 'Context', num: true, render: (s) => <ContextWindow served={s.context} native={nativeOf(s)} /> },
           { key: 'flight', header: 'In flight', num: true, render: (s) => s.in_flight },
@@ -278,11 +279,16 @@ function Seats({ node, selected, fresh }: { node: NodeSummary; selected?: string
   );
 }
 
-/** A seat's reported state, with how far a fetch has come. */
+/** A seat's reported state, with how far a fetch has come and how long it has held: "starting · 1 h 12 m". */
 function reported(s: SeatSummary | SeatView): string {
   const p = s.progress;
-  if (s.status !== 'fetching' || !p || p.total_bytes <= 0) return s.status;
-  return `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
+  const state = s.status !== 'fetching' || !p || p.total_bytes <= 0 ? s.status : `fetching ${Math.floor((100 * p.done_bytes) / p.total_bytes)}%`;
+  return withLasted(state, s.since);
+}
+
+/** A seat's state on hover: its reason, and the exact time the state began. */
+function stateTitle(s: SeatSummary | SeatView): string | undefined {
+  return [s.reason, sinceExact(s.since)].filter(Boolean).join(' · ') || undefined;
 }
 
 /**
@@ -667,7 +673,7 @@ function SeatInspector({ node, seat }: { node: Node; seat: SeatView }) {
       </h2>
       <Kv
         rows={[
-          { k: 'reported', v: <Status tone={toneOf(seat.status)} label={reported(seat)} /> },
+          { k: 'reported', v: <Status tone={toneOf(seat.status)} label={reported(seat)} title={sinceExact(seat.since)} /> },
           ...(seat.status === 'fetching' && seat.progress ? [{ k: 'fetched', v: `${bytes(seat.progress.done_bytes)} of ${bytes(seat.progress.total_bytes)}` }] : []),
           { k: 'reason', v: seat.reason ?? '–' },
           { k: 'problems', v: seat.problems.length ? <span className="c-wait">{seat.problems.join('; ')}</span> : 'none' },

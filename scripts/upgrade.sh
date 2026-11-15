@@ -45,6 +45,10 @@
 # currency another row); a row written after it is added by the insert
 # trigger, and a row the ledger already has adds nothing.
 #
+# Then when a seat's state began (migration 41): a seat's state from
+# before takes the time of its last report as its `since`, and a state an
+# api from before writes after it, with none, begins now.
+#
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -331,3 +335,18 @@ SQL
 test "$(unlike)" = 0
 test "$(q "SELECT requests || ':' || input_tokens FROM usage_hourly WHERE key = 'k_work' AND model = 'qwen'")" = "3:151"
 echo "a row written after it is added to its hour as it is inserted, and a row the ledger has adds nothing"
+
+# when a seat's state began (migration 41), for the states a node reported
+# before it
+store_at 40
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+INSERT INTO seat_state (node, seat, status, reason, in_flight, reported_at) VALUES
+  ('node-a', 'dsv4', 'starting', 'loading the model', 0, '2026-11-02T10:00:00Z'),
+  ('mini', 'echo', 'up', NULL, 1, '2026-11-02T11:30:00Z');
+SQL
+migrate $((head - 40))
+test "$(q "SELECT count(*) FROM seat_state WHERE since = reported_at")" = 2
+# an api from before writes a state without one: it begins now
+q "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('mini', 'late', 'starting', 0, now())" >/dev/null
+test "$(q "SELECT count(*) FROM seat_state WHERE seat = 'late' AND now() - since < interval '1 minute'")" = 1
+echo "migration 41 gives each seat's state from before the time of its last report as its since: $(tail -1 "$work/migrate.log")"

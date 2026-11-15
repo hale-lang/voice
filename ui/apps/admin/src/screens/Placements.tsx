@@ -7,6 +7,7 @@ import { go, href } from '../route';
 import { readout } from '../readout';
 import { NodeMemory } from '../FleetMemory';
 import { placementState, type SeatReport } from './placement-state';
+import { sinceExact } from '../seat-since';
 
 /**
  * A model put on nodes: voice picks the variant and runtime that fit the
@@ -66,10 +67,15 @@ export function Seats({ p, seatAt, ready = true }: { p: Placement; seatAt: (ref:
   if (!ready) return <span className="faint">–</span>;
   const st = placementState(p, seatAt);
   const tone = st.state === 'up' ? 'quiet' : st.state === 'starting' ? 'wait' : 'fail';
+  // the exact time each seat's state began, on hover
+  const exact = [p.seat, ...(p.follower_seat ? [p.follower_seat] : [])]
+    .map((ref) => seatAt(ref))
+    .flatMap((s) => (s?.since ? [`${s.ref} ${sinceExact(s.since)}`] : []))
+    .join('; ');
   return (
     <>
-      <Status tone={tone} label={st.label} />
-      {st.detail && <span className="muted">: {st.detail}</span>}
+      <Status tone={tone} label={st.label} title={exact || undefined} />
+      {st.detail && <span className="muted" title={exact || undefined}>: {st.detail}</span>}
     </>
   );
 }

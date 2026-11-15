@@ -78,8 +78,16 @@ It:
   take there (`HALE_DNA_HOST_RESERVED_BYTES`), or less 8 GiB from a hale
   that does not say; outside one, less 8 GiB for the coordinator when
   `--api` is on this machine (localhost);
-  the links its operator declared in the file (`links`, below) are kept as
-  they are;
+  what its operator declared in the file is kept as it is: the links
+  (`links`, below), every other engine, such as a harness engine for coding
+  attempts ([coding attempts](coding-attempts.md)), after install's own and
+  in the order written, and any other entry. Install's own engines, `managed`
+  and the claude CLI's (`claude`, kind `claude-cli`), are written afresh:
+  the claude engine goes when the machine no longer has the CLI, and a
+  declared engine of an id install writes gives way to install's. Install
+  adds no engine of its own finding, and drops one the node could not run
+  (no usable id, a kind it does not run, an id declared twice), as it does
+  unusable links, and the `max_in_flight` an install from before wrote;
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a

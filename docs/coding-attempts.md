@@ -31,6 +31,13 @@ and every login:
 { "engines": [{ "id": "coding", "kind": "harness" }] }
 ```
 
+A declared engine survives re-installs: `voice-node install`, which every
+upgrade and re-place runs, writes its own engines (`managed`, and `claude`
+when the machine has the claude CLI) afresh and keeps every other as it was,
+after its own. Install never adds a harness engine itself, and a declared
+engine with an id install writes (`managed`, `claude`) gives way to
+install's, so name it something else ([adding a node](adding-a-node.md)).
+
 A **harness seat** on it names the definition it runs, the login it runs
 under, and optionally the CLI's own name for its model and hosts its
 attempts may reach besides the vendor's:

@@ -34,6 +34,7 @@ locus RefusingApi {
 fn main() {
     claude_tokens_kept();
     claude_found();
+    declared_engines_kept();
     let api = FakeApi { };
     let fresh = node::enroll(api, "new", false);
     std::test::assert(
@@ -82,7 +83,7 @@ fn main() {
     // the links its operator declared are the machine's: written again as
     // they were, and an unusable list is not carried over
     let declared = "{\"max_in_flight\": 4, \"engines\": [], \"links\": [{\"peer\": \"node-b\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"198.51.100.1\", \"hca\": \"rocep1s0f0\"}], \"gid_index\": 3}]}";
-    let kept = node::node_capabilities(false, -1, node::kept_links(declared));
+    let kept = node::node_capabilities(false, -1, declared);
     std::test::assert(
         node::capabilities_problem(kept) == ""
             && std::str::contains(kept, "\"links\": [{\"peer\": \"node-b\""),
@@ -362,4 +363,93 @@ fn claude_found() {
         "and so does the systemd unit",
     );
     node::run_out("rm\n-rf\n" + root);
+}
+
+/// An install writes the capabilities file again over the one it had: the
+/// engines its operator declared there, a harness engine for coding
+/// attempts or any other, are kept as they were, in order, after
+/// install's own, which it writes afresh, once each.
+fn declared_engines_kept() {
+    let harness = "{\"id\": \"coding\", \"kind\": \"harness\"}";
+    let custom = "{\"id\": \"lab-proxy\", \"kind\": \"openai-compatible\", \"local\": {\"note\": \"x\"}}";
+    let had = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}, "
+        + harness + ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}, " + custom
+        + "], \"hardware\": {\"model_memory_bytes\": 1}, \"links\": [{\"peer\": \"node-b\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"198.51.100.1\"}]}], \"site\": {\"rack\": 2}}";
+    let again = node::node_capabilities(true, 120000000000, had);
+    std::test::assert_eq_str(
+        node::top_value(again, "engines"),
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}, "
+            + harness + ", " + custom + "]",
+        "a re-install keeps a declared harness engine and a custom one, as written, after its own, each once",
+    );
+    std::test::assert_eq_str(node::capabilities_problem(again), "", "and the node runs it");
+    std::test::assert(
+        node::held_back(again) == 120000000000,
+        "the memory left for models is install's, written afresh: " + again,
+    );
+    std::test::assert(
+        std::str::contains(again, "\"links\": [{\"peer\": \"node-b\""),
+        "the links are still kept: " + again,
+    );
+    std::test::assert_eq_str(
+        node::top_value(again, "site"),
+        "{\"rack\": 2}",
+        "an entry install does not write is kept as it was",
+    );
+    std::test::assert(
+        !std::str::contains(again, "max_in_flight"),
+        "and the cap an install from before wrote is not: " + again,
+    );
+    std::test::assert_eq_str(
+        node::node_capabilities(true, 120000000000, again),
+        again,
+        "installing again changes nothing that is already right",
+    );
+
+    let gone = node::node_capabilities(false, -1, had);
+    std::test::assert_eq_str(
+        node::top_value(gone, "engines"),
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, " + harness + ", " + custom + "]",
+        "the claude CLI's engine is install's: it goes when the machine no longer has the CLI",
+    );
+    std::test::assert(
+        !std::str::contains(gone, "hardware"),
+        "and so does memory no longer held back",
+    );
+
+    let clash = "{\"engines\": [{\"id\": \"managed\", \"kind\": \"static\", \"text\": \"x\"}, {\"id\": \"claude\", \"kind\": \"harness\"}]}";
+    std::test::assert_eq_str(
+        node::top_value(node::node_capabilities(true, -1, clash), "engines"),
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}]",
+        "a declared engine whose id install writes gives way to install's",
+    );
+    std::test::assert_eq_str(
+        node::top_value(node::node_capabilities(false, -1, clash), "engines"),
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"harness\"}]",
+        "and is kept while install writes no engine of that id",
+    );
+
+    let unusable = "{\"engines\": [{\"id\": \"Bad Id\", \"kind\": \"harness\"}, {\"id\": \"gpu\", \"kind\": \"warp-drive\"}, \"coding\", {\"id\": \"twin\", \"kind\": \"harness\"}, {\"id\": \"twin\", \"kind\": \"static\"}]}";
+    std::test::assert_eq_str(
+        node::top_value(node::node_capabilities(false, -1, unusable), "engines"),
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"twin\", \"kind\": \"harness\"}]",
+        "an engine the node could not run is not carried over",
+    );
+
+    let fresh = "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}]}";
+    std::test::assert_eq_str(
+        node::node_capabilities(false, -1, ""),
+        fresh,
+        "no file: the managed engine alone, and no harness engine of install's finding",
+    );
+    std::test::assert_eq_str(
+        node::node_capabilities(false, -1, "{\"engines\": [" + harness + ", "),
+        fresh,
+        "and a file that is no JSON object is as none",
+    );
+    std::test::assert_eq_str(
+        node::node_capabilities(false, -1, "{\"engines\": " + harness + "}"),
+        fresh,
+        "as are engines that are no list",
+    );
 }

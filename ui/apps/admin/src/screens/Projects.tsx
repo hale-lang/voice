@@ -11,7 +11,7 @@ import { describeLimit } from './Accounts';
 import { Aliases } from './Aliases';
 import { AnnotateRoutes } from '../readiness';
 import { isRetiredSystem, listedProjects } from '../projects-listed';
-import { WINDOWS, DEFAULT_WINDOW, windowFrom, totalsBy, breakdown, sumOf, tokensSaid, NO_TOTALS, type Totals, type UsageWindow } from '../usage-totals';
+import { WINDOWS, DEFAULT_WINDOW, windowFrom, totalsBy, breakdown, sumOf, capped, tokensSaid, NO_TOTALS, TOTALS_GROUPS, type Totals, type UsageWindow } from '../usage-totals';
 
 type Key = Schemas['Key'];
 
@@ -43,7 +43,7 @@ export function Projects({ route, setInspector }: ScreenProps) {
     <>
       <h1>Projects</h1>
       <Panel title="Projects" readout={readout(q, `${listed.length} projects`)}>
-        <WindowChoice value={usageWindow} onChange={setUsageWindow} error={totals.isError ? totals.error.message : undefined} />
+        <WindowChoice value={usageWindow} onChange={setUsageWindow} error={totals.isError ? totals.error.message : undefined} capped={capped(totals.data?.data ?? [])} />
         <Table<Project>
           rows={inTree(listed)}
           rowKey={(p) => p.id}
@@ -72,13 +72,14 @@ export function Projects({ route, setInspector }: ScreenProps) {
 }
 
 /** The window usage is shown over, chosen: totals are to the hour. */
-function WindowChoice({ value, onChange, error }: { value: UsageWindow; onChange: (w: UsageWindow) => void; error?: string }) {
+function WindowChoice({ value, onChange, error, capped }: { value: UsageWindow; onChange: (w: UsageWindow) => void; error?: string; capped?: boolean }) {
   return (
     <p style={{ marginTop: 0, display: 'flex', gap: 'var(--space-2)', alignItems: 'center' }}>
       <span className="muted">tokens and spend over the last</span>
       <Select value={value} onChange={(v) => onChange(v as UsageWindow)} options={WINDOWS.map((w) => ({ value: w.value, label: w.label }))} />
       <span className="faint">to the hour</span>
       {error && <span className="c-fail">usage unavailable: {error}</span>}
+      {capped && <span className="c-wait">only the first {TOTALS_GROUPS.toLocaleString()} projects by name have totals</span>}
     </p>
   );
 }
@@ -193,24 +194,34 @@ function SpendsNone() {
 
 /**
  * A project's usage over the window, from the hourly rollup: its totals,
- * and each of its keys' and models' share, the most spent first.
+ * read whole (a row per currency), and each of its keys' and models' share,
+ * each read by itself, the most spent first. A breakdown at the most groups
+ * an answer holds says it may be short.
  */
 function ProjectUsage({ project, usageWindow, from }: { project: string; usageWindow: UsageWindow; from: string }) {
-  const q = useUsageTotals({ group_by: ['key', 'model'], project, from });
-  const rows = useMemo(() => q.data?.data ?? [], [q.data]);
-  const keys = useMemo(() => breakdown(rows, 'key'), [rows]);
-  const models = useMemo(() => breakdown(rows, 'model'), [rows]);
+  const whole = useUsageTotals({ group_by: ['project'], project, from });
+  const byKey = useUsageTotals({ group_by: ['key'], project, from });
+  const byModel = useUsageTotals({ group_by: ['model'], project, from });
+  const keys = useMemo(() => breakdown(byKey.data?.data ?? [], 'key'), [byKey.data]);
+  const models = useMemo(() => breakdown(byModel.data?.data ?? [], 'model'), [byModel.data]);
   const label = WINDOWS.find((x) => x.value === usageWindow)!.label;
-  if (q.isPending) return <Loading what="usage" />;
-  if (q.isError && !q.data) return <Unavailable what="Usage" detail={q.error.message} />;
-  const all = sumOf(rows);
+  if (whole.isPending) return <Loading what="usage" />;
+  if (whole.isError && !whole.data) return <Unavailable what="Usage" detail={whole.error.message} />;
+  const all = sumOf(whole.data.data);
   if (all.requests === 0) return <span className="faint">no requests in the last {label}</span>;
   type Share = { name: string; totals: Totals };
   const columns = (first: string) => [
     { key: 'name', header: first, render: (r: Share) => <Mono>{r.name}</Mono> },
-    { key: 'requests', header: 'Requests', num: true, render: (r: Share) => <span title={r.totals.failed ? `${r.totals.failed.toLocaleString()} failed` : undefined}>{r.totals.requests.toLocaleString()}{r.totals.failed > 0 && <span className="c-fail"> · {r.totals.failed.toLocaleString()} failed</span>}</span> },
+    { key: 'requests', header: 'Requests', num: true, render: (r: Share) => <span>{r.totals.requests.toLocaleString()}{r.totals.failed > 0 && <span className="c-fail"> · {r.totals.failed.toLocaleString()} failed</span>}</span> },
     ...usageColumns<Share>((r) => r.totals, usageWindow),
   ];
+  const share = (q: typeof byKey, rows: Share[], first: string, what: string) =>
+    q.isPending ? <Loading what={what} /> : q.isError && !q.data ? <Unavailable what={first} detail={q.error.message} /> : (
+      <>
+        <Table<Share> rows={rows} rowKey={(r) => r.name} columns={columns(first)} empty={`No ${what} used.`} />
+        {capped(q.data?.data ?? []) && <p className="c-wait">only the first {TOTALS_GROUPS.toLocaleString()} {what} by name are shown; the totals above are whole</p>}
+      </>
+    );
   return (
     <>
       <Kv
@@ -221,10 +232,8 @@ function ProjectUsage({ project, usageWindow, from }: { project: string; usageWi
           { k: 'spend', v: <SpendCell t={all} /> },
         ]}
       />
-      <Table<Share> rows={keys} rowKey={(r) => r.name} columns={columns('Key')} empty="No keys used." />
-      <div style={{ marginTop: 'var(--space-3)' }}>
-        <Table<Share> rows={models} rowKey={(r) => r.name} columns={columns('Model')} empty="No models used." />
-      </div>
+      {share(byKey, keys, 'Key', 'keys')}
+      <div style={{ marginTop: 'var(--space-3)' }}>{share(byModel, models, 'Model', 'models')}</div>
     </>
   );
 }

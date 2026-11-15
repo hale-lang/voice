@@ -4,7 +4,7 @@
 // reads them again at.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { WINDOWS, DEFAULT_WINDOW, windowOf, windowFrom, totalsBy, breakdown, sumOf, tokensSaid, paceWait, TOTALS_PACE_MS, NO_TOTALS } from './usage-totals.ts';
+import { WINDOWS, DEFAULT_WINDOW, windowOf, windowFrom, totalsBy, breakdown, sumOf, capped, tokensSaid, paceWait, TOTALS_PACE_MS, TOTALS_GROUPS, NO_TOTALS } from './usage-totals.ts';
 
 const row = (group, currency, n) => ({
   group,
@@ -62,7 +62,7 @@ test('totals by project sum a row per currency into one, the spend kept per curr
   assert.equal(by.get('none'), undefined);
 });
 
-test("a project's keys and models, from one read grouped by both, the most spent first", () => {
+test("a project's keys and models summed by each, the most spent first", () => {
   const rows = [
     row({ key: 'k_ci', model: 'qwen' }, 'USD', { requests: 5, input: 500, output: 50, price: 100 }),
     row({ key: 'k_ci', model: 'dsv4' }, 'USD', { requests: 1, failed: 1, input: 0, output: 7, price: 900 }),
@@ -78,6 +78,13 @@ test("a project's keys and models, from one read grouped by both, the most spent
   assert.equal(sumOf(rows).requests, 10, 'and the whole of it');
   assert.equal(sumOf(rows).input, 3521);
   assert.deepEqual(sumOf([]), NO_TOTALS);
+});
+
+test('an answer as full as one can be says it may be short', () => {
+  assert.equal(TOTALS_GROUPS, 1000);
+  const many = (n) => Array.from({ length: n }, (_, i) => row({ key: `k${i}` }, 'USD', {}));
+  assert.equal(capped(many(999)), false);
+  assert.equal(capped(many(1000)), true);
 });
 
 test('token counts are short', () => {

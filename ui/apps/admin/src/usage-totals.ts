@@ -99,6 +99,14 @@ export function breakdown(rows: UsageTotal[], field: 'key' | 'model'): { name: s
     .sort((a, b) => spent(b.totals) - spent(a.totals) || tokens(b.totals) - tokens(a.totals) || a.name.localeCompare(b.name));
 }
 
+/** The most groups one answer of `getUsageTotals` holds, the first by name. */
+export const TOTALS_GROUPS = 1000;
+
+/** True when an answer holds as many groups as one can: there may be more, left out. */
+export function capped(rows: UsageTotal[]): boolean {
+  return rows.length >= TOTALS_GROUPS;
+}
+
 /** All of `rows` summed. */
 export function sumOf(rows: UsageTotal[]): Totals {
   return rows.reduce(added, NO_TOTALS);

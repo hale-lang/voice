@@ -11,7 +11,9 @@
 //      by digest, with the CLI installed as the definition says), and
 //      starts the attempt's egress: a network of its own with no route
 //      out, and a proxy on it that lets through only the hosts the
-//      definition, the common package registries and the seat allow;
+//      definition, the common package registries and the seat allow, and,
+//      for a harness whose model calls go to voice (`base_url_env`), the
+//      api's own host and port, as the node reaches it;
 //   3. runs the harness in a container of its own: the workspace mounted
 //      and nothing else of the machine (no home, no other credential), as
 //      the node's user, every capability dropped, its login in its
@@ -101,6 +103,9 @@ type AttemptStart {
     email: String = "";
     egress: String = "";
     definition: String = "";
+    // the key voice minted for the run of a harness whose login is voice's
+    // own: written to a private file for the run's shell, then forgotten
+    credential: String = "";
     problem: String = "";
 }
 
@@ -126,6 +131,7 @@ fn attempt_start(start: String) -> AttemptStart {
         email: harness::text_of(as_, "email"),
         egress: harness::lines_of(std::json::find_field_raw(a, "egress")),
         definition: def,
+        credential: harness::text_of(a, "credential"),
     };
     if !attempt_id(s.id) {
         s.problem = "the attempt's id is not one voice makes";
@@ -158,9 +164,20 @@ fn attempt_start(start: String) -> AttemptStart {
         s.problem = "its login is not the name of a login directory";
     } else if d.login_kind == "env" && !std::secret::vault_name_is_safe(s.login) {
         s.problem = "its login is not a vault entry's name";
+    } else if d.login_kind == "voice"
+        && (len(s.credential) == 0 || std::str::contains(s.credential, "\n"))
+    {
+        s.problem = "the api handed no key for its harness's calls to voice";
     }
     if std::str::contains(s.model, "\n") { s.problem = "its model is not a name"; }
     return s;
+}
+
+/// `a` with its run's key let go.
+fn forget_credential(a: AttemptStart) -> AttemptStart {
+    let mut out = a;
+    out.credential = "";
+    return out;
 }
 
 /// `att_` and hex, as the api makes them: safe in a path and a name.
@@ -190,8 +207,12 @@ fn dockerfile(base: String, install: String) -> String {
     return "FROM " + base + "\nRUN " + install + "\n";
 }
 
-/// The egress proxy's filter: one extended regular expression a line, a
-/// host whole or (`.example.com`) any host under a domain.
+/// The egress proxy's filter, matched against each request's URL (a
+/// tunnel's `host:port`, a plain request's `http://host[:port]/path`): one
+/// extended regular expression a line, a host whole or (`.example.com`)
+/// any host under a domain, tunnelled to on the web's ports, 443 and 80,
+/// or asked plainly on 80. A host's part is letters, digits, dashes and
+/// dots alone, so no URL that names another host before it matches.
 @bounded_by(hosts)
 fn egress_filter(hosts: String) -> String {
     let mut out = "";
@@ -203,16 +224,92 @@ fn egress_filter(hosts: String) -> String {
         if len(h) == 0 { continue; }
         let under = std::str::starts_with(h, ".");
         let host = std::str::replace(if under { h[1..len(h)] } else { h }, ".", "\\.");
-        out = out + (if under { "^(.+\\.)?" + host + "$" } else { "^" + host + "$" }) + "\n";
+        let re = if under { "([a-z0-9-]+\\.)*" + host } else { host };
+        out = out + "^" + re + ":(443|80)$\n^http://" + re + "(:80)?(/|$)\n";
     }
     return out;
 }
 
-/// The egress proxy's configuration: it denies every host its filter does
-/// not name, and tunnels only to the web's ports.
-fn egress_config() -> String {
+/// How a harness whose model calls go to voice reaches it: the base URL it
+/// is handed, and the host and port its egress lets through; or why the
+/// node's address for the api is one an attempt's container cannot use.
+type ApiRoute {
+    base_url: String = "";
+    host: String = "";
+    port: Int = 0;
+    problem: String = "";
+}
+
+/// The route to the api at `api`, the address the node itself calls it at.
+/// Every wire voice serves a harness on (lib/harness `PROTOCOLS`) is at its
+/// `/v1`. The attempt's proxy runs on docker's bridge, where a loopback
+/// address is the proxy's own: such an address is refused, as is a host
+/// the proxy's filter cannot name (an IPv6 literal).
+@bounded_by(api)
+fn api_route(api: String) -> ApiRoute {
+    let mut base = std::str::trim(api);
+    while std::str::ends_with(base, "/") {
+        base = base[0..(len(base) - 1)];
+    }
+    let u = std::http::parse_url(base + "/") or {
+        return ApiRoute { problem: "the node's address for the api, " + api + ", is not a URL" };
+    };
+    let host = std::str::lower(u.host);
+    if !route_host(host) || u.port < 1 {
+        return ApiRoute {
+            problem: "the node reaches the api at " + api
+                + ", whose host the attempt's egress proxy cannot let through: start the node with an --api address of a host name or an IPv4 address",
+        };
+    }
+    if host == "localhost" || std::str::ends_with(host, ".localhost")
+        || std::str::starts_with(host, "127.") || host == "0.0.0.0"
+    {
+        return ApiRoute {
+            problem: "the node reaches the api at " + api
+                + ", a loopback address, which the attempt's container cannot reach: start the node with an --api address its containers can reach (the machine's host name or address)",
+        };
+    }
+    return ApiRoute { base_url: base + "/v1", host: host, port: u.port };
+}
+
+/// A host the egress filter can name: letters, digits, dashes and dots.
+@bounded_by(host)
+fn route_host(host: String) -> Bool {
+    let v = std::str::bytes_view(host);
+    let n = len(host);
+    if n == 0 || n > 253 { return false; }
+    let mut i = 0;
+    while i < n {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 45 || b == 46) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// The filter's lines that let through exactly the api's host and port:
+/// tunnelled to, or asked plainly (with no port when it is 80).
+fn route_filter(r: ApiRoute) -> String {
+    if len(r.host) == 0 { return ""; }
+    let host = std::str::replace(r.host, ".", "\\.");
+    let port = to_string(r.port);
+    return "^" + host + ":" + port + "$\n^http://" + host
+        + (if r.port == 80 { "(:80)?" } else { ":" + port }) + "(/|$)\n";
+}
+
+/// The egress proxy's configuration: it denies every URL its filter does
+/// not name, and tunnels only to the web's ports and `route_port` (the
+/// api's, 0 for none), which the filter allows for the api's host alone.
+fn egress_config(route_port: Int) -> String {
     return "Port " + to_string(EGRESS_PORT)
-        + "\nListen 0.0.0.0\nTimeout 600\nMaxClients 64\nLogLevel Notice\nFilter \"/etc/voice-egress/filter\"\nFilterType ere\nFilterDefaultDeny Yes\nFilterURLs No\nConnectPort 443\nConnectPort 80\n";
+        + "\nListen 0.0.0.0\nTimeout 600\nMaxClients 64\nLogLevel Notice\nFilter \"/etc/voice-egress/filter\"\nFilterType ere\nFilterDefaultDeny Yes\nFilterURLs Yes\nConnectPort 443\nConnectPort 80\n"
+        + (
+            if route_port > 0 && route_port != 443 && route_port != 80 {
+                "ConnectPort " + to_string(route_port) + "\n"
+            } else {
+                ""
+            }
+        );
 }
 
 /// The container names an attempt runs under.
@@ -222,10 +319,11 @@ fn egress_name(id: String) -> String { return "voice-attempt-" + id + "-egress";
 
 /// The harness's `docker run`, newline-separated, from `def` for attempt
 /// `a`, in `dir`, under the node's `owner` label, as `user` (uid:gid),
-/// in `image`. Credentials are never here: a login from the vault is
-/// passed by name (`-e NAME`), its value in the docker client's own
-/// environment (`harness_argv`); a login directory is a mount of the
-/// attempt's scratch copy.
+/// in `image`; `base_url` is voice's address for a harness whose model
+/// calls go to voice ("" for one whose go to its vendor). Credentials are
+/// never here: a login from the vault is passed by name (`-e NAME`), its
+/// value in the docker client's own environment (`harness_argv`); a login
+/// directory is a mount of the attempt's scratch copy.
 @unbounded
 fn docker_run_argv(
     def: harness::HarnessDef,
@@ -233,7 +331,8 @@ fn docker_run_argv(
     dir: String,
     owner: String,
     user: String,
-    image: String
+    image: String,
+    base_url: String
 ) -> String {
     let proxy = "http://" + egress_name(a.id) + ":" + to_string(EGRESS_PORT);
     let mut argv = "docker\nrun\n--rm\n-i\n--name\n" + harness_name(a.id) + "\n--label\n"
@@ -265,6 +364,9 @@ fn docker_run_argv(
         argv = argv + "-e\n" + env[0..nl] + "\n";
         env = env[(nl + 1)..len(env)];
     }
+    if len(def.base_url_env) > 0 && len(base_url) > 0 {
+        argv = argv + "-e\n" + def.base_url_env + "=" + base_url + "\n";
+    }
     if len(a.model) > 0 && len(def.model_env) > 0 {
         argv = argv + "-e\n" + def.model_env + "=" + a.model + "\n";
     }
@@ -283,12 +385,13 @@ fn instruction_of(def: harness::HarnessDef, a: AttemptStart) -> String {
     return if def.via == "argument" { std::str::replace(text, "\n", " ") } else { text };
 }
 
-/// The whole argv of the harness's run: for a login from the vault, a
-/// shell that reads the login from `secret` (a private file the sealed
-/// credential wrote) into the variable the definition names, removes the
-/// file, and starts `docker run`, which passes the variable on by name.
+/// The whole argv of the harness's run: for a login from the vault, or
+/// voice's own key, a shell that reads it from `secret` (a private file
+/// the sealed credential, or the node, wrote) into the variable the
+/// definition names, removes the file, and starts `docker run`, which
+/// passes the variable on by name.
 fn harness_argv(def: harness::HarnessDef, run: String, secret: String) -> String {
-    if def.login_kind != "env" { return run; }
+    if def.login_kind != "env" && def.login_kind != "voice" { return run; }
     return "sh\n-c\n" + def.login_env + "=\"$(cat \"$1\")\"; rm -f \"$1\"; export " + def.login_env
         + "; shift; exec \"$@\"\nsh\n" + secret + "\n" + run;
 }
@@ -519,8 +622,13 @@ locus AttemptRun {
         self.git("-C\n" + self.dir + "/work\nconfig\nuser.name\n" + self.a.name, 60, slot);
         self.git("-C\n" + self.dir + "/work\nconfig\nuser.email\n" + self.a.email, 60, slot);
         self.report_now("", base_sha, "", "");
-        // 2. the images, and the attempt's egress
+        // 2. the images, and the attempt's egress: for a harness whose model
+        // calls go to voice, the api as the node reaches it
         self.phase = "building";
+        let route = if len(def.base_url_env) > 0 { api_route(self.api) } else { ApiRoute { } };
+        if len(route.problem) > 0 {
+            return self.failed(route.problem, "sandbox_failed", base_sha, "", "");
+        }
         let image = image_tag(
             "voice-harness-" + harness::text_of(self.a.definition, "id"),
             def.base,
@@ -532,7 +640,7 @@ locus AttemptRun {
         let pbuilt = self.ensure_image(proxy, EGRESS_BASE, EGRESS_INSTALL, slot);
         if len(pbuilt) > 0 { return self.failed(pbuilt, "sandbox_failed", base_sha, "", ""); }
         if self.stopping(slot) { return self.stopped(base_sha, ""); }
-        let egress = self.start_egress(proxy, slot);
+        let egress = self.start_egress(proxy, route, slot);
         if len(egress) > 0 { return self.failed(egress, "sandbox_failed", base_sha, "", ""); }
         // 3. the harness
         let login = self.login_ready(def);
@@ -542,7 +650,7 @@ locus AttemptRun {
             instruction_of(def, self.a),
         ) or discard;
         let user = to_string(std::process::uid()) + ":" + std::str::trim(run_out("id\n-g"));
-        let run = docker_run_argv(def, self.a, self.dir, self.node, user, image);
+        let run = docker_run_argv(def, self.a, self.dir, self.node, user, image, route.base_url);
         let mut argv = run;
         if def.login_kind == "env" {
             let c = std::secret::Credential { vault: self.a.login };
@@ -564,6 +672,23 @@ locus AttemptRun {
                     "",
                 );
             }
+            argv = harness_argv(def, run, self.dir + "/secret/login");
+        } else if def.login_kind == "voice" {
+            // voice's own key for this run, from the claim's answer: into a
+            // file of the attempt's private directory, read by the shell
+            // that starts docker and removed by it; the node keeps no copy
+            let key = self.a.credential;
+            self.a = forget_credential(self.a);
+            std::io::fs::write_file(self.dir + "/secret/login", key) or {
+                return self.failed(
+                    "voice's key for the harness could not be written privately",
+                    "login_unavailable",
+                    base_sha,
+                    "",
+                    "",
+                );
+            };
+            run_out("chmod\n600\n" + self.dir + "/secret/login");
             argv = harness_argv(def, run, self.dir + "/secret/login");
         }
         self.phase = "running";
@@ -943,14 +1068,22 @@ locus AttemptRun {
     }
 
     /// The attempt's network, with no route out, and its egress proxy on
-    /// it and on docker's own bridge: "" when they run, else why not.
+    /// it and on docker's own bridge, which also lets through `route`'s
+    /// host and port, the api's (none when it has no host): "" when they
+    /// run, else why not.
     @unbounded
-    fn start_egress(proxy: String, slot: Attempter) -> String {
+    fn start_egress(proxy: String, route: ApiRoute, slot: Attempter) -> String {
         // the api's list holds the definition's hosts, the registries and the
         // seat's
         let hosts = self.a.egress;
-        std::io::fs::write_file(self.dir + "/egress/filter", egress_filter(hosts)) or discard;
-        std::io::fs::write_file(self.dir + "/egress/tinyproxy.conf", egress_config()) or discard;
+        std::io::fs::write_file(
+            self.dir + "/egress/filter",
+            egress_filter(hosts) + route_filter(route),
+        ) or discard;
+        std::io::fs::write_file(
+            self.dir + "/egress/tinyproxy.conf",
+            egress_config(route.port),
+        ) or discard;
         run_out("chmod\n755\n" + self.dir + "/egress");
         run_out(
             "chmod\n644\n" + self.dir + "/egress/filter\n" + self.dir + "/egress/tinyproxy.conf",
@@ -987,7 +1120,16 @@ locus AttemptRun {
         if c.code != 0 {
             return "the attempt's egress proxy could not join its network: " + clip(c.err);
         }
-        self.note("egress: " + std::str::replace(std::str::trim(hosts), "\n", ", "));
+        self.note(
+            "egress: " + std::str::replace(std::str::trim(hosts), "\n", ", ")
+                + (
+                    if len(route.host) > 0 {
+                        "; voice's api at " + route.host + ":" + to_string(route.port)
+                    } else {
+                        ""
+                    }
+                ),
+        );
         return "";
     }
 

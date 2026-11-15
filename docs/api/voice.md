@@ -5379,8 +5379,8 @@ Why an attempt failed, one value for each way voice fails one:
 - `harness_failed`: the harness failed: it exited non-zero, reported a failure, fell silent past its idle limit, or left a workspace whose commits voice cannot take onto the base.
 - `no_changes`: the harness ran to its end and changed nothing on the branch.
 - `repo_unavailable`: `repo` could not be fetched, or `base` named no commit in it.
-- `login_unavailable`: the seat's login for its harness is missing on its node, or could not be handed to the harness.
-- `sandbox_failed`: the attempt's container could not be made or run: no docker, an image that would not build, or its network or egress proxy that would not start.
+- `login_unavailable`: the seat's login for its harness is missing on its node, or could not be handed to the harness (voice's own key included).
+- `sandbox_failed`: the attempt's container could not be made or run: no docker, an image that would not build, its network or egress proxy that would not start, or, for a harness whose model calls go to voice, a node that reaches the api at an address no container reaches (loopback).
 - `bundle_too_large`: its commits' bundle is over 6 MiB, the most voice holds.
 - `node_lost`: its node stopped reporting it, registered again, or stopped while it ran.
 - `key_revoked`: its key was revoked, or its project archived, before a seat took it.
@@ -5423,8 +5423,9 @@ Type: object
 An agentic coding CLI as data, which voice's one wrapper runs: in a
 container of the attempt's own, with only the workspace mounted, its
 egress through a proxy that lets through only `egress`, the
-registries, and the seat's own hosts. Nothing in it skips the CLI's
-own permissions: a definition whose command holds a bypass flag is
+registries, and the seat's own hosts (and voice's api, for a CLI
+whose model calls go to voice). Nothing in it skips the CLI's own
+permissions: a definition whose command holds a bypass flag is
 refused.
 
 Type: object
@@ -5444,8 +5445,8 @@ Type: object
 | `model` | object | yes | How a model is named, by a flag or an environment variable. |  |
 | `model.flag` | string |  |  |  |
 | `model.env` | string |  |  |  |
-| `login` | object | yes | How a login reaches a run. `env`: a vault entry's value, in the variable `env`, read into the container's environment and never its argv. `home`: a directory per login on the node (`<data>/logins/<login>`), of which only `files` are copied into the attempt's scratch copy, mounted at `mount` (and copied back when the CLI refreshes them). |  |
-| `login.kind` | string, one of `env`, `home` | yes |  |  |
+| `login` | object | yes | How a login reaches a run. `env`: a vault entry's value, in the variable `env`, read into the container's environment and never its argv. `home`: a directory per login on the node (`<data>/logins/<login>`), of which only `files` are copied into the attempt's scratch copy, mounted at `mount` (and copied back when the CLI refreshes them). `voice`: no vendor's login but a key voice mints for each attempt as a node claims it (`AttemptStart.credential`), handed in the variable `env` as an `env` login is: the attempt's project's, charged as the key that asked for the attempt, for the caller plane's inference alone (`/v1/responses`, `/v1/chat/completions`, `/v1/models`; any other route refuses it with 403), its requests the attempt's conversation, and naming nobody once the attempt ends or passes its deadline, or the key that asked stops holding (revoked, or a habitat tenant's whose member is rotated or removed). A seat of such a CLI names no login. |  |
+| `login.kind` | string, one of `env`, `home`, `voice` | yes |  |  |
 | `login.env` | string |  |  |  |
 | `login.mount` | string |  |  |  |
 | `login.from` | string |  |  |  |
@@ -5461,8 +5462,8 @@ Type: object
 | `preamble` | string | yes |  |  |
 | `egress` | array of string | yes | The vendor's hosts; a leading dot allows any host under it. |  |
 | `idle_seconds` | integer |  | How long it may write nothing before it has failed. |  |
-| `base_url_env` | string \| null |  | The variable the CLI reads its API's address from. Not used yet; routing the CLI's own model calls through voice will set it. |  |
-| `protocol` | string \| null |  | The wire its model calls speak. Not used yet, as `base_url_env`. |  |
+| `base_url_env` | string \| null |  | For a CLI whose model calls go to voice (its `login.kind` is `voice`, and only then): the variable the node puts voice's base URL in, the address the node itself calls the api at with `/v1` after it. The attempt's egress proxy then lets through exactly that host and port besides `egress`. An api the node reaches at a loopback address is one no container reaches: such an attempt fails `sandbox_failed`. Null for a CLI whose calls go to its vendor. |  |
+| `protocol` | string \| null, one of `openai-chat`, `openai-responses`, `null` |  | The wire a CLI whose model calls go to voice speaks, one voice serves at its `/v1`: `openai-chat` (`/v1/chat/completions`) or `openai-responses` (`/v1/responses`). Set with `base_url_env`, null with it. |  |
 | `mcp` | object \| null |  | An MCP configuration to inject. Not used yet. |  |
 
 <a id="schema-harnesslist"></a>
@@ -5494,7 +5495,8 @@ Type: object
 | `attempt.branch` | string | yes |  |  |
 | `attempt.instruction` | string | yes |  |  |
 | `attempt.model` | string | yes | The CLI's own name for the model, "" for its default. |  |
-| `attempt.login` | string | yes | The vault entry or login directory the seat runs under, by name. |  |
+| `attempt.login` | string | yes | The vault entry or login directory the seat runs under, by name; "" for a CLI under voice's own key. |  |
+| `attempt.credential` | string |  | For a CLI whose `login.kind` is `voice`: the key voice minted for this attempt's run, here and nowhere else (the store keeps its digest alone). The node hands it to the CLI as it hands a vault login, by name in the container's environment, never an argv, and keeps no copy. |  |
 | `attempt.budget_tokens` | integer | yes | 0 for none. |  |
 | `attempt.deadline` | integer | yes | Unix seconds. |  |
 | `attempt.as` | [CommitIdentity](#schema-commitidentity) | yes |  |  |

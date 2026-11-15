@@ -1450,3 +1450,20 @@ replaced) begins now.
 alter table seat_state add column since timestamptz not null default now();
 update seat_state set since = reported_at;
 ```
+
+### Migration 42: the key of an attempt's run
+
+A harness whose model calls go to voice (its definition's `login.kind` is
+`voice`) runs under a key voice mints for the attempt as a node claims it:
+the attempt's project's, for the caller plane's inference routes alone. The
+key is the attempt's, not a project key: no `api_key` row holds it, so a
+project's keys never fill with them. Its secret is handed to the node once,
+in the claim's answer; the row keeps only its sha256, `run_digest`, set as
+the attempt starts and emptied as it ends (done, failed, cancelled, or its
+node lost), so the key names nobody from then on. Its requests are charged
+as the key that asked for the attempt, the attempt their conversation.
+
+```sql
+alter table attempt add column run_digest text not null default '';  -- sha256 of the key voice minted for its run while it runs, empty otherwise
+create unique index attempt_by_run_digest on attempt (run_digest) where run_digest <> '';
+```

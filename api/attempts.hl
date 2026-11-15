@@ -19,6 +19,15 @@
 // `internal`, its harness and model the ones asked for, and fewer attempts
 // running on it than its concurrency (checked in the store, so two api
 // instances never start more).
+//
+// A harness whose model calls go to voice (its definition's login is
+// `voice`) runs under a key voice mints for the attempt as it starts it:
+// handed to the node once, in the claim's answer, and kept only as its
+// digest on the attempt's row, which the store empties as the attempt ends
+// (projects.hl, `attempt_context`; store migration 42). It is the
+// attempt's project's, charged as the key that asked for the attempt, for
+// the caller plane's inference alone, and its requests are the attempt's
+// conversation, so they are in the ledger under it.
 
 /// A running attempt whose node has not reported for this long is lost:
 /// its node is gone, or lost the api. The node reports every few seconds.
@@ -117,6 +126,12 @@ fn answers_requests(store: st::Store, s: st::SeatRow) -> Bool fallible(st::Store
     let f = store.fleet(s.node) or raise;
     let kind = engine_kind_of(f.capabilities, s.engine);
     return kind != "harness" || seat_harness(kind, s.config) == "claude";
+}
+
+/// How definition `def` (JSON) hands its CLI a login (`login.kind`): `env`,
+/// `home`, or `voice`, a key voice mints for each attempt; "" for none.
+fn login_kind(def: String) -> String {
+    return harness::text_of(std::json::find_field_raw(def, "login"), "kind");
 }
 
 /// The vault entry or login directory a harness seat runs under: its
@@ -619,11 +634,22 @@ locus CodingAttempts {
                     if len(h) == 0 || (len(a.harness) > 0 && a.harness != h) { continue; }
                     let def = definition_of(self.harnesses, h);
                     if len(def) == 0 { continue; }
+                    // a CLI's own login is the seat's to name; voice's own is
+                    // minted below
+                    let kind = login_kind(def);
+                    if kind != "voice" && len(seat_login(s.config)) == 0 { continue; }
                     if len(a.model) > 0 && !seat_serves(s, a.model) { continue; }
                     if !(allows(p.accounts, s.account) && allows(k.accounts, s.account)) {
                         continue;
                     }
                     if !(seat_ready(self.store, s) or false) { continue; }
+                    // the key of a run whose model calls go to voice: its
+                    // secret goes to the node in this answer alone
+                    let secret = if kind == "voice" {
+                        "vk-" + (random_hex(20) or fail entropy_failed(err.message))
+                    } else {
+                        ""
+                    };
                     let started = self.store.start_attempt(
                         a.id,
                         node,
@@ -631,9 +657,10 @@ locus CodingAttempts {
                         s.account,
                         h,
                         seat_concurrency(s),
+                        if len(secret) > 0 { secret_digest(secret) } else { "" },
                         now,
                     ) or fail metering_failed(err);
-                    if started { return json_answer(200, self.start_json(a, s, def)); }
+                    if started { return json_answer(200, self.start_json(a, s, def, secret)); }
                 }
             }
             if seen < CLAIM_PAGE { break; }
@@ -644,9 +671,10 @@ locus CodingAttempts {
         return no_content();
     }
 
-    /// What the node runs `a` with, on seat `s`, under definition `def`.
+    /// What the node runs `a` with, on seat `s`, under definition `def`;
+    /// `secret` the key minted for its run, "" for a CLI under its own login.
     @unbounded
-    fn start_json(a: st::AttemptRow, s: st::SeatRow, def: String) -> String {
+    fn start_json(a: st::AttemptRow, s: st::SeatRow, def: String, secret: String) -> String {
         // the CLI's own name for the model: the seat's for the one asked
         // for, or its config's
         let mut model = harness::text_of(s.config, "model");
@@ -686,7 +714,8 @@ locus CodingAttempts {
             )
             + ", \"deadline\": " + to_string(std::time::unix(a.deadline_at)) + ", \"as\": "
             + std::str::trim(std::json::find_field_raw(a.body, "as")) + ", \"egress\": ["
-            + egress.text() + "], \"harness\": " + def + "}}";
+            + egress.text() + "], \"harness\": " + def
+            + (if len(secret) > 0 { ", \"credential\": " + jq(secret) } else { "" }) + "}}";
     }
 
     /// `reportAttempt`: what the node that runs attempt `id` says of it.
@@ -748,6 +777,12 @@ locus CodingAttempts {
         let wall = (std::time::unix(at) - std::time::unix(a.created_at)) * 1000;
         let queue = (std::time::unix(a.started_at) - std::time::unix(a.created_at)) * 1000;
         let model = if len(a.model) > 0 { a.model } else { a.ran };
+        // a harness whose model calls went to voice has them in the ledger
+        // already, each a request of the attempt's conversation: its own
+        // record counts none of their tokens again
+        let routed = login_kind(definition_of(self.harnesses, a.ran)) == "voice";
+        let input = if routed { 0 } else { a.input_tokens };
+        let output = if routed { 0 } else { a.output_tokens };
         let served = "{\"model\": " + jq(model) + ", \"quantization\": null, \"node\": "
             + jq(a.node)
             + ", \"seat\": " + jq(a.seat) + ", \"account\": " + jq(a.account) + ", \"engine\": "
@@ -756,16 +791,24 @@ locus CodingAttempts {
             + jq(a.project) + ", \"key\": " + jq(a.key) + ", \"requested_model\": " + jq(a.model)
             + ", \"requested_account\": null, \"endpoint\": \"attempt\", \"status\": " + jq(status)
             + ", \"served\": " + served + ", \"data_class\": \"internal\", \"input_tokens\": "
-            + to_string(a.input_tokens)
+            + to_string(input)
             + ", \"cached_input_tokens\": 0, \"cache_write_input_tokens\": 0, \"output_tokens\": "
-            + to_string(a.output_tokens)
+            + to_string(output)
             + ", \"reasoning_tokens\": 0, \"price_micros\": 0, \"currency\": \"USD\", \"timing\": {\"wall_ms\": "
             + to_string(wall) + ", \"queue_ms\": " + to_string(queue)
             + ", \"load_ms\": 0, \"engine_ms\": " + to_string(a.wall_ms)
             + "}, \"attempts\": [], \"conversation\": " + jq(a.id)
             + ", \"instance\": null, \"internal\": false, \"metadata\": {\"attempt\": " + jq(a.id)
             + ", \"harness\": " + jq(a.ran) + ", \"tokens\": "
-            + jq(if a.tokens_reported { "reported" } else { "unreported" }) + "}}";
+            + jq(
+                if routed {
+                    "requests"
+                } else if a.tokens_reported {
+                    "reported"
+                } else {
+                    "unreported"
+                },
+            ) + "}}";
         self.store.insert_usage(
             st::UsageRow {
                 id: a.id,
@@ -778,8 +821,8 @@ locus CodingAttempts {
                 node: a.node,
                 seat: a.seat,
                 status: status,
-                input_tokens: a.input_tokens,
-                output_tokens: a.output_tokens,
+                input_tokens: input,
+                output_tokens: output,
                 price_micros: 0,
                 currency: "USD",
                 served: served,

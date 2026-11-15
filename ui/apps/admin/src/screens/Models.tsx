@@ -9,7 +9,7 @@ import { ContextWindow } from '../context';
 import { NamedByList, useAliasesByModel } from '../aliases';
 import { modelState } from './placement-state';
 import { modelSource, sourceLabel, type EngineKindOf, type ModelSource, type SeatInfo } from './model-source';
-import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, noNodeOffers, nodesOffering, priceOf, type AddWrites, type HarnessInfo, type Offer } from './add-model';
+import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, noNodeOffers, nodesOffering, priceOf, voiceKeyed, type AddWrites, type HarnessInfo, type Offer } from './add-model';
 
 /**
  * What the Models screen reads besides the catalog: every node's seats (a
@@ -201,7 +201,9 @@ function AddHarness() {
   if (defs.isPending || !ready) return <Loading what="the harnesses and the nodes' engines" />;
   if (!h) return <p className="c-fail">voice has no harness definitions: its api reads them from its harnesses directory at start.</p>;
   const offer = offers.find((o) => o.node === node) ?? (offers.length === 1 ? offers[0] : undefined);
-  const shownLogin = loginSet ? login : loginEntry(h, account);
+  // a CLI under voice's own key names no login, and its model is the voice model it calls
+  const keyed = voiceKeyed(h);
+  const shownLogin = keyed ? '' : loginSet ? login : loginEntry(h, account);
   const shownName = nameSet ? name : `${h.id}-${cliModel.trim() || 'default'}`;
   return (
     <Form
@@ -212,7 +214,7 @@ function AddHarness() {
       }}
       actions={
         <>
-          <Button type="submit" tone="primary" disabled={w.busy || !offer || !account || !shownLogin || !shownName}>add</Button>
+          <Button type="submit" tone="primary" disabled={w.busy || !offer || !account || (keyed ? !cliModel.trim() : !shownLogin) || !shownName}>add</Button>
           <Button onClick={() => go('models')}>cancel</Button>
         </>
       }
@@ -230,12 +232,22 @@ function AddHarness() {
       <Field label="account" required help="the subscription it spends: flat-rate, its windows the only cap">
         <Select value={account} onChange={setAccount} options={(accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => ({ value: a.id, label: `${a.id} · ${a.billing}` }))} required empty="" />
       </Field>
-      <Field label="login" required help={`${h.login.describe ?? ''}${h.login.setup ? ` On the node: ${h.login.setup}` : ''}`}>
-        <TextInput mono value={shownLogin} onChange={(v) => { setLogin(v); setLoginSet(true); }} required placeholder={loginEntry(h, 'work')} />
-      </Field>
-      <Field label="model" help="the CLI's own name for its model; its default when empty">
-        <TextInput mono value={cliModel} onChange={setCliModel} placeholder="its default" />
-      </Field>
+      {keyed ? (
+        <p>{h.login.describe ?? "It runs under voice's own key, minted for each attempt: the seat names no login."}</p>
+      ) : (
+        <Field label="login" required help={`${h.login.describe ?? ''}${h.login.setup ? ` On the node: ${h.login.setup}` : ''}`}>
+          <TextInput mono value={shownLogin} onChange={(v) => { setLogin(v); setLoginSet(true); }} required placeholder={loginEntry(h, 'work')} />
+        </Field>
+      )}
+      {keyed ? (
+        <Field label="model" required help="the voice model it calls: a catalog model's name, which the attempt's project may use">
+          <TextInput mono value={cliModel} onChange={setCliModel} required placeholder="a voice model" />
+        </Field>
+      ) : (
+        <Field label="model" help="the CLI's own name for its model; its default when empty">
+          <TextInput mono value={cliModel} onChange={setCliModel} placeholder="its default" />
+        </Field>
+      )}
       <Field label="name" required help="the catalog model attempts and requests name; never reused for a different model">
         <TextInput mono value={shownName} onChange={(v) => { setName(v); setNameSet(true); }} required />
       </Field>

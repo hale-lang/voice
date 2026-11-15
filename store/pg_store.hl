@@ -2002,6 +2002,21 @@ locus PgStore {
         return attempt_row(j);
     }
 
+    fn attempt_by_run_digest(digest: String) -> AttemptRow fallible(StoreError) {
+        if len(digest) == 0 { return AttemptRow { }; }
+        self.lock.enter();
+        let j = self.row(
+            "SELECT row_to_json(t) FROM (" + ATTEMPT_COLUMNS
+                + " WHERE a.run_digest = $1 AND a.state = 'running') t",
+            one_arg(digest),
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return attempt_row(j);
+    }
+
     fn attempts(project: String, limit: Int) -> AttemptRows fallible(StoreError) {
         self.lock.enter();
         let taken = self.attempt_list_locked(
@@ -2062,10 +2077,20 @@ locus PgStore {
         account: String,
         ran: String,
         concurrency: Int,
+        run_digest: String,
         at: Time
     ) -> Bool fallible(StoreError) {
         self.lock.enter();
-        let taken = self.start_attempt_locked(id, node, seat, account, ran, concurrency, at) or {
+        let taken = self.start_attempt_locked(
+            id,
+            node,
+            seat,
+            account,
+            ran,
+            concurrency,
+            run_digest,
+            at,
+        ) or {
             self.lock.leave();
             fail err;
         };
@@ -2080,6 +2105,7 @@ locus PgStore {
         account: String,
         ran: String,
         concurrency: Int,
+        run_digest: String,
         at: Time
     ) -> Bool fallible(StoreError) {
         self.begin() or raise;
@@ -2096,8 +2122,9 @@ locus PgStore {
         a.add(ran);
         a.add(to_string(concurrency));
         a.add(std::time::iso8601(at));
+        a.add(run_digest);
         let n = self.step(
-            "UPDATE attempt SET state = 'running', node = $2, seat = $3, account = $4, ran = $5, phase = 'starting', started_at = $7::timestamptz, reported_at = $7::timestamptz WHERE id = $1 AND state = 'queued' AND (SELECT count(*) FROM attempt r WHERE r.state = 'running' AND r.node = $2 AND r.seat = $3) < $6::int",
+            "UPDATE attempt SET state = 'running', node = $2, seat = $3, account = $4, ran = $5, run_digest = $8, phase = 'starting', started_at = $7::timestamptz, reported_at = $7::timestamptz WHERE id = $1 AND state = 'queued' AND (SELECT count(*) FROM attempt r WHERE r.state = 'running' AND r.node = $2 AND r.seat = $3) < $6::int",
             a,
         ) or raise;
         self.held = false;
@@ -2205,7 +2232,7 @@ locus PgStore {
         if row.has_ended { a.add(std::time::iso8601(row.ended_at)); } else { a.add_null(); }
         a.add(row.failure_kind);
         self.step(
-            "UPDATE attempt SET state = $2, phase = $3, ran = $4, base_sha = $5, head_sha = $6, summary = $7, failure = $8, failure_kind = $17, tokens_reported = $9::boolean, input_tokens = $10::bigint, output_tokens = $11::bigint, wall_ms = $12::bigint, events = $13::bigint, dropped = $14::bigint, reported_at = $15::timestamptz, ended_at = $16::timestamptz WHERE id = $1",
+            "UPDATE attempt SET state = $2, phase = $3, ran = $4, base_sha = $5, head_sha = $6, summary = $7, failure = $8, failure_kind = $17, tokens_reported = $9::boolean, input_tokens = $10::bigint, output_tokens = $11::bigint, wall_ms = $12::bigint, events = $13::bigint, dropped = $14::bigint, reported_at = $15::timestamptz, ended_at = $16::timestamptz, run_digest = CASE WHEN $2 IN ('done', 'failed', 'cancelled') THEN '' ELSE run_digest END WHERE id = $1",
             a,
         ) or raise;
     }
@@ -2240,7 +2267,7 @@ locus PgStore {
         a.add(std::time::iso8601(at));
         a.add(if state == "failed" { kind } else { "" });
         self.write(
-            "UPDATE attempt SET state = $2, failure = $3, failure_kind = $5, phase = '', ended_at = $4::timestamptz WHERE id = $1 AND state IN ('queued', 'running')",
+            "UPDATE attempt SET state = $2, failure = $3, failure_kind = $5, phase = '', ended_at = $4::timestamptz, run_digest = '' WHERE id = $1 AND state IN ('queued', 'running')",
             a,
         ) or raise;
         return self.attempt_locked(id) or raise;
@@ -2357,7 +2384,7 @@ locus PgStore {
         a.add(std::time::iso8601(at));
         a.add(kind);
         let all = self.rows(
-            "WITH w AS (UPDATE attempt SET state = 'failed', failure = $3, failure_kind = $5, phase = '', ended_at = $4::timestamptz WHERE state = 'running' AND CASE WHEN $1 <> '' THEN node = $1 ELSE reported_at < $2::timestamptz END RETURNING *) SELECT row_to_json(w) FROM w",
+            "WITH w AS (UPDATE attempt SET state = 'failed', failure = $3, failure_kind = $5, phase = '', ended_at = $4::timestamptz, run_digest = '' WHERE state = 'running' AND CASE WHEN $1 <> '' THEN node = $1 ELSE reported_at < $2::timestamptz END RETURNING *) SELECT row_to_json(w) FROM w",
             a,
         ) or raise;
         let mut out = AttemptRows { };

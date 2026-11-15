@@ -1,0 +1,355 @@
+// An attempt's own key (attempts.hl, projects.hl `attempt_context`): a
+// harness whose model calls go to voice (pi, its login `voice`) runs under
+// a key voice mints as a node claims the attempt. Its secret is in the
+// claim's answer alone, the store keeps only its digest, and it is the
+// attempt's project's, charged as the key that asked, for the caller
+// plane's inference alone: refused on the attempts API, the capabilities,
+// the admin and node planes. Its requests are the attempt's conversation.
+// It names nobody once the attempt ends (done, cancelled, its node lost) or
+// passes its deadline, or the key that asked is revoked; each attempt's
+// key is its own, and an attempt is started once.
+import ".." as api;
+import "../../store" as st;
+
+/// A link that publishes nothing: no node listens.
+locus Quiet {
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    fn offer(node: String, request_id: String, reply_to: String, msg: Bytes) -> api::Offer {
+        return Lost { };
+    }
+}
+
+locus Lost {
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "lost" }; }
+    fn next(wait: Duration) -> api::LinkMsg { return api::LinkMsg { kind: "lost" }; }
+    fn finish() { }
+}
+
+fn call(
+    e: api::DataPlane,
+    method: String,
+    path: String,
+    auth: String,
+    body: String
+) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: method,
+            path: path,
+            headers: "Authorization: Bearer " + auth + "\r\nContent-Type: application/json",
+            body: body,
+        },
+    );
+}
+
+fn expect(r: std::http::Response, status: Int, what: String) {
+    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+}
+
+fn str(body: String, name: String) -> String {
+    return std::json::find_string_field(body, name);
+}
+
+fn digest(secret: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(secret)));
+}
+
+/// Voice's harness definitions, pi among them.
+fn definitions() -> String {
+    let here = "harnesses";
+    return api::shipped_harnesses(if std::io::fs::file_exists(here) { here } else { "../" + here });
+}
+
+const CAPS: String = "{\"engines\": [{\"id\": \"coding\", \"kind\": \"harness\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"harness\"]}}, {\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": []}";
+
+const ASK: String = "{\"repo\": \"https://forge.example.com/team/app.git\", \"base\": \"main\", \"instruction\": \"add a HELLO.md\", \"harness\": \"pi\", \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}}";
+
+/// Claim the next attempt on `token`'s node: its start.
+fn claim(e: api::DataPlane, token: String, what: String) -> String {
+    let c = call(e, "POST", "/node/v1/attempts/claim", token, "{}");
+    expect(c, 200, what);
+    return std::json::find_field_raw(c.body, "attempt");
+}
+
+/// True when `secret` names a caller at all.
+fn names(e: api::DataPlane, secret: String) -> Bool {
+    return call(e, "GET", "/v1/models", secret, "").status == 200;
+}
+
+fn main() {
+    let e = api::DataPlane { link: Quiet { }, harnesses: definitions() };
+    std::test::assert(std::str::contains(e.harnesses, "\"id\": \"pi\""), "pi is read");
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: Quiet { } };
+    let seats = api::Seats { store: e.store, link: Quiet { } };
+    catalog.create(api::CatalogModelCreate { id: "pi-coder" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "qwen" }) or discard;
+    accounts.create(api::AccountCreate { id: "acct-a", name: "A" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let asker = keys.create(
+        api::KeyCreate { project: "work", name: "ci" },
+    ) or api::Key { status: api::KeyStatus::revoked };
+    let key = asker.secret;
+    let token = (
+        nodes.create(
+            api::NodeCreate { id: "node-a" },
+        ) or api::Node { status: api::NodeStatus::down }
+    ).enrollment_token;
+    // a pi seat names no login: the attempt brings voice's own key
+    let mut coder = api::SeatCreate {
+        node: "node-a",
+        id: "pi",
+        engine: "coding",
+        account: "acct-a",
+        config: std::json::Value::parse("{\"harness\": \"pi\", \"model\": \"qwen\"}")
+        or std::json::Value::null(),
+    };
+    push(coder.serves, st::SeatModel { model: "pi-coder" }) or discard;
+    seats.create(coder) or discard;
+    // a seat of a CLI under its own login that names none runs nothing
+    let mut loginless = api::SeatCreate {
+        node: "node-a",
+        id: "claude",
+        engine: "coding",
+        account: "acct-a",
+        config: std::json::Value::parse("{\"harness\": \"claude\"}") or std::json::Value::null(),
+    };
+    push(loginless.serves, st::SeatModel { model: "pi-coder" }) or discard;
+    seats.create(loginless) or discard;
+    let mut answer = api::SeatCreate {
+        node: "node-a",
+        id: "answer",
+        engine: "static",
+        account: "acct-a",
+        config: std::json::Value::parse("{\"text\": \"hi\"}") or std::json::Value::null(),
+    };
+    push(answer.serves, st::SeatModel { model: "qwen" }) or discard;
+    seats.create(answer) or discard;
+    let reg = "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+        + ", \"local\": " + LOCAL + "}";
+    let up = "\"seats\": [{\"id\": \"pi\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"claude\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"answer\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}]}";
+    let registered = call(e, "POST", "/node/v1/register", token, reg);
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(registered.body, "assignment"),
+        "version",
+    );
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/seats",
+            token,
+            "{\"assignment_version\": " + to_string(version) + ", " + up,
+        ),
+        204,
+        "its seats are up",
+    );
+
+    // minted as the node claims the attempt: the secret in the answer, its
+    // digest alone on the row
+    let blocked = str(
+        call(e, "POST", "/v1/attempts", key, std::str::replace(ASK, "\"pi\"", "\"claude\"")).body,
+        "id",
+    );
+    let id = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let start = claim(e, token, "claimed");
+    std::test::assert_eq_str(
+        str(start, "id"),
+        id,
+        "the claude attempt waits: its seat names no login",
+    );
+    std::test::assert_eq_str(str(start, "seat"), "pi", "on the pi seat");
+    std::test::assert_eq_str(str(start, "login"), "", "the seat names no login");
+    std::test::assert_eq_str(str(start, "model"), "qwen", "the voice model pi calls");
+    let secret = str(start, "credential");
+    std::test::assert(std::str::starts_with(secret, "vk-") && len(secret) > 40, "a key: " + start);
+    let row = e.store.attempt(id) or st::AttemptRow { };
+    std::test::assert_eq_str(row.run_digest, digest(secret), "the row keeps its digest");
+    std::test::assert(!std::str::contains(row.body, secret), "and not the secret");
+    let shown = call(e, "GET", "/v1/attempts/" + id, key, "").body;
+    std::test::assert(!std::str::contains(shown, secret), "the attempt never shows it");
+    let listed = call(e, "GET", "/admin/v1/attempts", e.store.operator_token("va-test") or "", "");
+    std::test::assert(!std::str::contains(listed.body, secret), "nor the operator's list");
+
+    // the attempt's project's, charged as the key that asked, its attempt named
+    let ctx = e.bearer.context("Bearer " + secret) or std::api::Context { };
+    std::test::assert_eq_str(ctx.caller.name, asker.id, "charged as the key that asked");
+    std::test::assert_eq_str(api::attempt_of(ctx), id, "the attempt it is the key of");
+    let plain = e.bearer.context("Bearer " + key) or std::api::Context { };
+    std::test::assert_eq_str(api::attempt_of(plain), "", "a project key is no attempt's");
+
+    // inference alone
+    expect(call(e, "GET", "/v1/models", secret, ""), 200, "the models it may call");
+    expect(call(e, "GET", "/v1/models/qwen", secret, ""), 200, "one of them");
+    let asked = call(
+        e,
+        "POST",
+        "/v1/chat/completions",
+        secret,
+        "{\"model\": \"qwen\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"prompt_cache_key\": \"pi-session\"}",
+    );
+    std::test::assert(
+        asked.status != 401 && asked.status != 403,
+        "a request it may make: " + asked.body,
+    );
+    expect(call(e, "POST", "/v1/attempts", secret, ASK), 403, "it starts no attempt");
+    expect(call(e, "GET", "/v1/attempts", secret, ""), 403, "it lists none");
+    expect(call(e, "GET", "/v1/attempts/" + id, secret, ""), 403, "it reads none, its own neither");
+    expect(call(e, "POST", "/v1/attempts/" + id + "/cancel", secret, ""), 403, "it cancels none");
+    expect(call(e, "GET", "/v1/capabilities", secret, ""), 403, "inference alone");
+    expect(call(e, "GET", "/admin/v1/attempts", secret, ""), 401, "no admin plane");
+    expect(call(e, "GET", "/admin/v1/harnesses", secret, ""), 401, "nor its harnesses");
+    std::test::assert(
+        call(e, "POST", "/node/v1/attempts/claim", secret, "{}").status >= 400,
+        "no node plane",
+    );
+
+    // its requests are the attempt's conversation, whatever the harness sent
+    let turns = e.store.usage_rows(
+        st::UsageQuery { project: "work", conversation: id, limit: 10 },
+    ) or st::UsageRows { };
+    std::test::assert(count(turns.rows) >= 1, "its request is in the ledger under the attempt");
+    for t in turns.rows {
+        std::test::assert_eq_str(t.key, asker.id, "as the key that asked");
+    }
+    let stray = e.store.usage_rows(
+        st::UsageQuery { project: "work", conversation: "pi-session", limit: 10 },
+    ) or st::UsageRows { };
+    std::test::assert_eq_int(count(stray.rows), 0, "not under the harness's own session");
+
+    // revoked as the attempt ends; the attempt's record counts none of the
+    // requests' tokens again
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + id + "/report",
+        token,
+        "{\"state\": \"done\", \"head_sha\": \"" + std::str::repeat("b", 40)
+            + "\", \"summary\": \"Add HELLO.md\", \"usage\": {\"input_tokens\": 500, \"output_tokens\": 50}, \"events\": []}",
+    );
+    std::test::assert(!names(e, secret), "done: the key names nobody");
+    std::test::assert_eq_str(
+        (e.store.attempt(id) or st::AttemptRow { }).run_digest,
+        "",
+        "its digest let go",
+    );
+    let record = e.store.usage(id) or st::UsageRow { };
+    std::test::assert(record.present, "the attempt's own record");
+    std::test::assert_eq_int(record.input_tokens, 0, "its requests' tokens not counted twice");
+    std::test::assert(
+        std::str::contains(record.record, "\"tokens\": \"requests\""),
+        "it says where they are: " + record.record,
+    );
+
+    // revoked as it is cancelled
+    let second = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let s2 = str(claim(e, token, "the second claimed"), "credential");
+    std::test::assert(s2 != secret, "each attempt's key is its own");
+    std::test::assert(names(e, s2), "the second's key holds while it runs");
+    expect(
+        call(e, "POST", "/v1/attempts/" + second + "/cancel", key, ""),
+        200,
+        "the caller cancels it",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/attempts/" + second + "/report",
+        token,
+        "{\"state\": \"cancelled\", \"events\": []}",
+    );
+    std::test::assert(!names(e, s2), "cancelled: the key names nobody");
+
+    // revoked as its node is lost; never started again, so never re-keyed
+    let third = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let s3 = str(claim(e, token, "the third claimed"), "credential");
+    std::test::assert(names(e, s3), "the third's key holds");
+    std::test::assert(
+        !(
+            e.store.start_attempt(
+                third,
+                "node-a",
+                "pi",
+                "acct-a",
+                "pi",
+                4,
+                digest("again"),
+                now(),
+            ) or true
+        ),
+        "a running attempt is not started again",
+    );
+    std::test::assert(names(e, s3), "its key is as it was");
+    let again = call(e, "POST", "/node/v1/register", token, reg);
+    std::test::assert(!names(e, s3), "its node restarted: the key names nobody");
+    std::test::assert_eq_str(
+        str(call(e, "GET", "/v1/attempts/" + third, key, "").body, "failure_kind"),
+        "node_lost",
+        "the attempt lost with its node",
+    );
+    let v2 = std::json::find_int_field(
+        std::json::find_field_raw(again.body, "assignment"),
+        "version",
+    );
+    call(
+        e,
+        "POST",
+        "/node/v1/seats",
+        token,
+        "{\"assignment_version\": " + to_string(v2) + ", " + up,
+    );
+
+    // the key that asked, revoked: the attempt's key names nobody
+    let fourth = str(call(e, "POST", "/v1/attempts", key, ASK).body, "id");
+    let s4 = str(claim(e, token, "the fourth claimed"), "credential");
+    std::test::assert(names(e, s4), "the fourth's key holds");
+    keys.revoke(api::KeyRef { project: "work", key: asker.id }) or discard;
+    std::test::assert(!names(e, s4), "the asking key revoked: the attempt's names nobody");
+    std::test::assert(len(fourth) > 0, "the fourth was made");
+
+    // past its deadline, though not yet failed: the key names nobody
+    let other = keys.create(
+        api::KeyCreate { project: "work", name: "late" },
+    ) or api::Key { status: api::KeyStatus::revoked };
+    let ago = std::time::time_from_unix(std::time::unix(now()) - 120);
+    e.store.insert_attempt(
+        st::AttemptRow {
+            id: "att_0000late",
+            project: "work",
+            key: other.id,
+            state: "queued",
+            body: ASK,
+            harness: "pi",
+            branch: "voice/attempt-att_0000late",
+            created_at: ago,
+            deadline_at: std::time::time_from_unix(std::time::unix(ago) + 60),
+        },
+    ) or discard;
+    std::test::assert(
+        e.store.start_attempt(
+            "att_0000late",
+            "node-a",
+            "pi",
+            "acct-a",
+            "pi",
+            4,
+            digest("vk-late"),
+            ago,
+        ) or false,
+        "started with a key",
+    );
+    std::test::assert(!names(e, "vk-late"), "past its deadline: the key names nobody");
+    std::test::assert_eq_str(
+        (e.store.attempt(blocked) or st::AttemptRow { }).state,
+        "queued",
+        "the claude attempt still waits for a seat with a login",
+    );
+}
+
+fn now() -> Time { return std::time::current(); }

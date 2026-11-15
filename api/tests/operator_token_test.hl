@@ -2,9 +2,9 @@
 // else. Over a real listener, a request to an admin row and to the admin
 // paths the data plane serves (the event stream, the route table) with no
 // token, with a wrong one and with a project key is refused, and with the
-// token admitted; the probes and the caller plane are not touched. Then the
-// token as a standalone api keeps it: minted once in the state directory,
-// mode 600, and read back the same.
+// token admitted; the caller plane is not touched, and the probes ignore
+// every credential. Then the token as a standalone api keeps it: minted
+// once in the state directory, mode 600, and read back the same.
 import ".." as api;
 import "../../store" as st;
 
@@ -155,9 +155,44 @@ locus Driver {
         let rt = call("GET", base + "/admin/v1/routes", right, "");
         std::test::assert_eq_int(rt.status, 503, "with the token, no brain wrote one: " + text(rt));
 
-        // ---- the probes take none
-        let live = call("GET", base + "/healthz", "", "");
-        std::test::assert_eq_int(live.status, 200, "liveness: " + text(live));
+        // ---- the probes ignore credentials: none, a project key, the
+        // operator token, a wrong token and garbage are answered alike
+        let held = [
+            "",
+            "Authorization: Bearer " + secret,
+            right,
+            wrong,
+            "Authorization: Bearer not-a-token",
+            "Authorization: Basic Zm9vOmJhcg==",
+            "Authorization: garbage",
+        ];
+        for path in ["/healthz", "/readyz"] {
+            let bare = call("GET", base + path, "", "");
+            std::test::assert_eq_int(bare.status, 200, path + " with no credential: " + text(bare));
+            std::test::assert_eq_str(
+                std::json::find_string_field(text(bare), "status"),
+                "ok",
+                path + " is ok: " + text(bare),
+            );
+            for h in held {
+                let got = call("GET", base + path, h, "");
+                std::test::assert_eq_int(
+                    got.status,
+                    bare.status,
+                    path + " with " + h + ": " + text(got),
+                );
+                std::test::assert_eq_str(text(got), text(bare), path + " answers alike with " + h);
+                let head = call("HEAD", base + path, h, "");
+                std::test::assert_eq_int(head.status, 200, "HEAD " + path + " with " + h);
+                std::test::assert_eq_int(len(head.body), 0, "HEAD " + path + " has no body");
+            }
+            let put = call("PUT", base + path, right, "");
+            std::test::assert_eq_int(put.status, 405, "PUT " + path + ": " + text(put));
+            std::test::assert(
+                std::str::contains(put.headers, "Allow: GET, HEAD"),
+                "Allow: " + put.headers,
+            );
+        }
         "operator.done" <- Done { ok: true };
     }
 }

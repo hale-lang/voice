@@ -30,6 +30,7 @@ export const FAILURE_WORDS: Record<FailureKind, string> = {
   repo_unavailable: 'repository unavailable',
   login_unavailable: 'login unavailable',
   sandbox_failed: 'sandbox failed',
+  backend_unavailable: 'no backend fits',
   bundle_too_large: 'bundle too large',
   node_lost: 'node lost',
   key_revoked: 'key revoked',

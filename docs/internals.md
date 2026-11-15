@@ -78,6 +78,7 @@ id"}}`. The rows are the contract: `hale api export` of the surface is
 | the change log | `GET /admin/v1/changes`, written by every admin write above |
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
 | coding attempts | `POST`, `GET /v1/attempts`, `GET .../{attempt}`, `.../cancel`, `.../transcript`, `.../events`, `.../bundle`; the operator's `/admin/v1/attempts` and `/admin/v1/harnesses`; the node's `/node/v1/attempts/claim`, `.../{attempt}/report`, `.../{attempt}/bundle` ([`api/attempts.hl`](../api/attempts.hl), [docs/coding-attempts.md](coding-attempts.md)) |
+| CLI recipes | `GET`, `POST /admin/v1/cli-recipes`; `GET`, `PUT`, `PATCH`, `DELETE .../{cli_recipe}`; `POST .../{cli_recipe}/duplicate`, on the data plane as the surface holds as many receivers as it may ([`api/cli_recipes.hl`](../api/cli_recipes.hl), [docs/coding-attempts.md](coding-attempts.md)) |
 
 Everything above reaches the configuration and the fleet's reports through
 the `Store` interface ([`store/store.hl`](../store/store.hl)). Given

@@ -780,7 +780,7 @@ locus Seats {
     /// and the config are taken as written and the seat carries the problem
     /// until the node connects and takes it or refuses it.
     fn create_read(c: SeatCreate) -> SeatRead fallible(CtlError) {
-        self.store.hold("nodes/" + c.node) or fail store_down(err);
+        self.store.hold("nodes/" + c.node + recipe_hold(c.config.text)) or fail store_down(err);
         let out = self.create_held(c) or {
             self.store.let_go();
             fail err;
@@ -814,6 +814,7 @@ locus Seats {
             push(row.data_classes.items, "internal") or discard;
         }
         self.check(row) or raise;
+        self.check_recipe(row) or raise;
         check_placed(row) or raise;
         if c.has_concurrency { placed_concurrency(row) or raise; }
         let held = self.store.seats() or fail store_down(err);
@@ -842,7 +843,9 @@ locus Seats {
 
     /// `updateSeat`: the fields the request sets; a new assignment.
     fn update_read(u: SeatUpdate) -> SeatRead fallible(CtlError) {
-        self.store.hold("nodes/" + u.node) or fail store_down(err);
+        self.store.hold(
+            "nodes/" + u.node + (if u.has_config { recipe_hold(u.config.text) } else { "" }),
+        ) or fail store_down(err);
         let out = self.update_held(u) or {
             self.store.let_go();
             fail err;
@@ -864,6 +867,7 @@ locus Seats {
         if u.has_enabled { row.enabled = u.enabled; }
         if u.has_config { row.config = config_text(u.config, false) or raise; }
         self.check(row) or raise;
+        if u.has_config || u.has_engine { self.check_recipe(row) or raise; }
         if u.has_serves || u.has_config { check_placed(row) or raise; }
         if u.has_concurrency { placed_concurrency(row) or raise; }
         let after = seat_view(self.store, row, n) or raise;
@@ -916,6 +920,41 @@ locus Seats {
         if s.concurrency < 1 { fail bad("`concurrency` is at least 1", "concurrency"); }
         let a = self.store.account(s.account) or fail store_down(err);
         if !a.present { fail bad("no account " + s.account, "account"); }
+        return true;
+    }
+
+    /// A harness seat's recipe, as its config names it: one voice has, with
+    /// a backend of the kind the seat runs (a container, unless it opts in
+    /// to the host). Held when a seat is made and when its config changes,
+    /// so a seat kept from before can still be disabled or repaired.
+    fn check_recipe(s: st::SeatRow) -> Bool fallible(CtlError) {
+        let f = self.store.fleet(s.node) or fail store_down(err);
+        let id = seat_recipe(engine_kind_of(f.capabilities, s.engine), s.config);
+        // a claude-cli seat runs voice's claude, which its config names not
+        if len(id) == 0 || std::json::string_field(s.config, "harness").kind != "string" {
+            return true;
+        }
+        if !is_slug(id) {
+            fail bad(
+                "`config.harness` is the id of the CLI recipe the seat runs",
+                "config.harness"
+            );
+        }
+        let r = self.store.cli_recipe(id) or fail store_down(err);
+        if !r.present { fail bad("voice has no CLI recipe " + id, "config.harness"); }
+        let backend = seat_backend(s.config);
+        if len(backend) == 0 {
+            fail bad(
+                "`config.backend` is `container`, the default, or `host`, which runs the CLI on the node's own machine with no sandbox",
+                "config.backend"
+            );
+        }
+        if !harness::has_backend(r.body, backend) {
+            fail bad(
+                "CLI recipe " + id + " has no " + backend + " backend for the seat to run it on",
+                "config.backend"
+            );
+        }
         return true;
     }
 
@@ -1237,6 +1276,28 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatRead falli
             push(v.problems, "node " + n.id + " does not offer engine " + s.engine) or discard;
         }
     }
+    // the CLI recipe a harness seat runs: there, enabled, and with a
+    // backend of the kind the seat runs
+    let id = seat_recipe(engine_kind_of(f.capabilities, s.engine), s.config);
+    if len(id) > 0 {
+        let r = store.cli_recipe(id) or fail store_down(err);
+        let backend = seat_backend(s.config);
+        if !r.present {
+            push(
+                v.problems,
+                "voice has no CLI recipe " + id + ": the seat runs no attempt",
+            ) or discard;
+        } else if !r.enabled {
+            push(v.problems, "CLI recipe " + id + " is disabled: the seat takes no new attempt")
+            or discard;
+        } else if len(backend) == 0 || !harness::has_backend(r.body, backend) {
+            push(
+                v.problems,
+                "CLI recipe " + id + " has no " + (if len(backend) > 0 { backend } else { "such" })
+                    + " backend: the seat takes no attempt",
+            ) or discard;
+        }
+    }
     let a = store.account(s.account) or fail store_down(err);
     if !a.present {
         push(v.problems, "no account " + s.account) or discard;
@@ -1250,6 +1311,21 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatRead falli
         }
     }
     return v;
+}
+
+/// The CLI recipe a seat of engine kind `kind` runs (attempts.hl,
+/// `seat_harness`), or its config's `harness` while its node has declared
+/// no engines to know its kind by; "" for none.
+fn seat_recipe(kind: String, config: String) -> String {
+    if len(kind) > 0 { return seat_harness(kind, config); }
+    return harness::text_of(config, "harness");
+}
+
+/// What a seat's write holds besides its node, when its config names a CLI
+/// recipe: the recipe, so it is not removed meanwhile.
+fn recipe_hold(config: String) -> String {
+    let id = harness::text_of(config, "harness");
+    return if harness::slug(id) { "\n" + st::CLI_RECIPE_HOLD + id } else { "" };
 }
 
 /// A seat's `config`: a JSON object. A create that leaves it out has `{}`.

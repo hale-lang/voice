@@ -2444,6 +2444,216 @@ locus PgStore {
         self.lock.leave();
     }
 
+    // ---- CLI recipes
+
+    fn cli_recipes() -> CliRecipeRows fallible(StoreError) {
+        self.lock.enter();
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (" + CLI_RECIPE_COLUMNS + " ORDER BY id) t",
+            db::Args { },
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        let mut out = CliRecipeRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) > 0 { push(out.rows, cli_recipe_row(line)) or discard; }
+        }
+        return out;
+    }
+
+    fn cli_recipe(id: String) -> CliRecipeRow fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(id);
+        let j = self.row(
+            "SELECT row_to_json(t) FROM (" + CLI_RECIPE_COLUMNS + " WHERE id = $1) t",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return cli_recipe_row(j);
+    }
+
+    fn put_shipped_cli_recipe(row: CliRecipeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.put_shipped_cli_recipe_locked(row) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn put_shipped_cli_recipe_locked(row: CliRecipeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        let held = self.conn.query_params("SELECT origin FROM cli_recipe WHERE id = $1", a);
+        if !held.ok {
+            self.rollback();
+            fail StoreError { message: held.err.kind + ": " + held.err.detail };
+        }
+        if len(std::str::trim(held.csv)) == 0 {
+            self.room(
+                "SELECT count(*) FROM cli_recipe",
+                db::Args { },
+                CLI_RECIPES_MAX,
+                "voice holds at most 64 CLI recipes",
+            ) or raise;
+        }
+        let w = db::Args { };
+        w.add(row.id);
+        w.add(row.body);
+        w.add(std::time::iso8601(row.updated_at));
+        // voice's own body, unless it is already that; never the operator's
+        self.step(
+            "INSERT INTO cli_recipe (id, body, origin, enabled, created_at, updated_at) VALUES ($1, $2::jsonb, 'shipped', true, $3::timestamptz, $3::timestamptz) ON CONFLICT (id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at WHERE cli_recipe.origin = 'shipped' AND cli_recipe.body IS DISTINCT FROM excluded.body",
+            w,
+        ) or raise;
+        let mine = self.conn.query_params("SELECT origin FROM cli_recipe WHERE id = $1", a);
+        if !mine.ok {
+            self.rollback();
+            fail StoreError { message: mine.err.kind + ": " + mine.err.detail };
+        }
+        self.held = false;
+        let st = self.conn.commit();
+        if !st.ok {
+            self.conn.rollback();
+            fail StoreError { message: "commit: " + st.err.detail };
+        }
+        return std::str::contains(mine.csv, "shipped");
+    }
+
+    fn insert_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.insert_cli_recipe_locked(row, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn insert_cli_recipe_locked(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        self.room(
+            "SELECT count(*) FROM cli_recipe",
+            db::Args { },
+            CLI_RECIPES_MAX,
+            "voice holds at most 64 CLI recipes",
+        ) or raise;
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.body);
+        a.add(if row.enabled { "true" } else { "false" });
+        a.add(std::time::iso8601(row.created_at));
+        a.add(std::time::iso8601(row.updated_at));
+        let n = self.step(
+            "INSERT INTO cli_recipe (id, body, origin, enabled, created_at, updated_at) VALUES ($1, $2::jsonb, 'operator', $3::boolean, $4::timestamptz, $5::timestamptz) ON CONFLICT (id) DO NOTHING",
+            a,
+        ) or raise;
+        if n == 0 {
+            self.rollback();
+            return false;
+        }
+        self.commit_with(change) or raise;
+        return true;
+    }
+
+    fn update_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(row.id);
+        a.add(row.body);
+        a.add(std::time::iso8601(row.updated_at));
+        let taken = self.change_one(
+            "UPDATE cli_recipe SET body = $2::jsonb, updated_at = $3::timestamptz WHERE id = $1 AND origin = 'operator'",
+            a,
+            change,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn enable_cli_recipe(
+        id: String,
+        enabled: Bool,
+        at: Time,
+        change: ChangeRow
+    ) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(id);
+        a.add(if enabled { "true" } else { "false" });
+        a.add(std::time::iso8601(at));
+        let taken = self.change_one(
+            "UPDATE cli_recipe SET enabled = $2::boolean, updated_at = $3::timestamptz WHERE id = $1",
+            a,
+            change,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn delete_cli_recipe(id: String, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.delete_cli_recipe_locked(id, change) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn delete_cli_recipe_locked(id: String, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        // a seat's write that names a recipe holds it as this does
+        // (`hold`), so no seat comes to name it between the check and the
+        // removal
+        self.step(
+            "SELECT pg_advisory_xact_lock(7204, hashtext($1))",
+            one_arg(CLI_RECIPE_HOLD + id),
+        ) or raise;
+        let n = self.step(
+            "DELETE FROM cli_recipe WHERE id = $1 AND origin = 'operator' AND NOT EXISTS (SELECT 1 FROM seat WHERE seat.config->>'harness' = $1)",
+            one_arg(id),
+        ) or raise;
+        if n == 0 {
+            self.rollback();
+            return false;
+        }
+        self.commit_with(change) or raise;
+        return true;
+    }
+
+    /// One statement that writes at most one row, and its change when it
+    /// wrote one: true then.
+    fn change_one(sql: String, a: db::Args, change: ChangeRow) -> Bool fallible(StoreError) {
+        self.begin() or raise;
+        let n = self.step(sql, a) or raise;
+        if n == 0 {
+            self.rollback();
+            return false;
+        }
+        self.commit_with(change) or raise;
+        return true;
+    }
+
     // ---- arrangements
 
     fn arrangement(id: String) -> ArrangementRow fallible(StoreError) {
@@ -4508,6 +4718,21 @@ fn one_arg(v: String) -> db::Args {
     let a = db::Args { };
     a.add(v);
     return a;
+}
+
+const CLI_RECIPE_COLUMNS: String = "SELECT id, body, origin, enabled, created_at, updated_at FROM cli_recipe";
+
+fn cli_recipe_row(j: String) -> CliRecipeRow {
+    if len(j) == 0 { return CliRecipeRow { }; }
+    return CliRecipeRow {
+        id: pg_text(j, "id"),
+        body: std::str::trim(std::json::find_field_raw(j, "body")),
+        origin: pg_text(j, "origin"),
+        enabled: std::json::find_bool_field(j, "enabled"),
+        created_at: pg_time(pg_text(j, "created_at")),
+        updated_at: pg_time(pg_text(j, "updated_at")),
+        present: true
+    };
 }
 
 const RUNTIME_COLUMNS: String = "SELECT id, body, created_at, removed_at FROM runtime";

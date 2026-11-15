@@ -1246,6 +1246,39 @@ interface Store {
     /// held since before `expired`.
     fn drop_attempt_bundles(id: String, expired: Time) fallible(StoreError);
 
+    // ---- CLI recipes (cli_recipes.hl)
+
+    /// Every CLI recipe, in the order of their ids.
+    fn cli_recipes() -> CliRecipeRows fallible(StoreError);
+    /// The CLI recipe `id`; `present` is false when there is none.
+    fn cli_recipe(id: String) -> CliRecipeRow fallible(StoreError);
+    /// One of voice's own recipes, as its file reads at the api's start:
+    /// added enabled, or its body replaced where voice's own holds the id
+    /// (enabled or not, as it was); the operator's of that id is left as it
+    /// is. No change is recorded: voice's files are not the operator's
+    /// change. True when the row is voice's own now.
+    fn put_shipped_cli_recipe(row: CliRecipeRow) -> Bool fallible(StoreError);
+    /// Add one of the operator's recipes; false, and nothing written, when
+    /// its id is taken.
+    fn insert_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError);
+    /// Replace the body of the operator's recipe `row.id` (and its
+    /// `updated_at`); false, and nothing written, when there is no
+    /// operator's recipe of that id: voice's own are read-only.
+    fn update_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError);
+    /// Enable or disable recipe `id`, voice's own or the operator's; false
+    /// when there is none.
+    fn enable_cli_recipe(
+        id: String,
+        enabled: Bool,
+        at: Time,
+        change: ChangeRow
+    ) -> Bool fallible(StoreError);
+    /// Remove the operator's recipe `id`, when no seat names it (its
+    /// config's `harness`); false, and nothing removed, when it is voice's
+    /// own, a seat names it, or there is none. The check and the removal are
+    /// one.
+    fn delete_cli_recipe(id: String, change: ChangeRow) -> Bool fallible(StoreError);
+
     /// The runtime row for `id`; `present` is false when there is none.
     fn runtime(id: String) -> RuntimeRow fallible(StoreError);
     fn runtimes() -> RuntimeRows fallible(StoreError);
@@ -1629,6 +1662,10 @@ locus MemoryStore {
         attempt_rows: AttemptRows = AttemptRows { };
         attempt_log: HeldEvents = HeldEvents { };
         bundle_rows: BundleRows = BundleRows { };
+        // CLI recipes, voice's own and the operator's, in the order of their
+        // ids: a store in memory starts with voice's own
+        // (`shipped_cli_recipe_rows`)
+        cli_recipe_rows: CliRecipeRows = CliRecipeRows { };
         window_rows: WindowTable = WindowTable { };
         // recorded requests, newest first, the last 200 (peek.hl)
         peek_rows: PeekRows = PeekRows { };
@@ -2811,6 +2848,120 @@ locus MemoryStore {
             }
         }
         self.bundle_rows = next;
+    }
+
+    // ---- CLI recipes
+
+    fn cli_recipes() -> CliRecipeRows fallible(StoreError) {
+        return self.cli_recipe_rows;
+    }
+
+    fn cli_recipe(id: String) -> CliRecipeRow fallible(StoreError) {
+        for r in self.cli_recipe_rows.rows {
+            if r.id == id { return r; }
+        }
+        return CliRecipeRow { };
+    }
+
+    /// The recipes with `row` in place of the one of its id, or added in
+    /// the order of the ids.
+    fn put_cli_recipe_row(row: CliRecipeRow) {
+        let mut next = CliRecipeRows { };
+        let mut placed = false;
+        for r in self.cli_recipe_rows.rows {
+            if r.id == row.id {
+                push(next.rows, row) or discard;
+                placed = true;
+            } else {
+                if !placed && row.id < r.id {
+                    push(next.rows, row) or discard;
+                    placed = true;
+                }
+                push(next.rows, r) or discard;
+            }
+        }
+        if !placed { push(next.rows, row) or discard; }
+        self.cli_recipe_rows = next;
+    }
+
+    fn put_shipped_cli_recipe(row: CliRecipeRow) -> Bool fallible(StoreError) {
+        let cur = self.cli_recipe(row.id) or CliRecipeRow { };
+        if cur.present {
+            if cur.origin != "shipped" { return false; }
+            if cur.body != row.body {
+                let mut r = cur;
+                r.body = row.body;
+                r.updated_at = row.updated_at;
+                self.put_cli_recipe_row(r);
+            }
+            return true;
+        }
+        if count(self.cli_recipe_rows.rows) >= CLI_RECIPES_MAX {
+            fail StoreError { kind: "full", message: "voice holds at most 64 CLI recipes" };
+        }
+        let mut r = row;
+        r.origin = "shipped";
+        r.enabled = true;
+        r.present = true;
+        self.put_cli_recipe_row(r);
+        return true;
+    }
+
+    fn insert_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        let cur = self.cli_recipe(row.id) or CliRecipeRow { };
+        if cur.present { return false; }
+        if count(self.cli_recipe_rows.rows) >= CLI_RECIPES_MAX {
+            fail StoreError { kind: "full", message: "voice holds at most 64 CLI recipes" };
+        }
+        let mut r = row;
+        r.origin = "operator";
+        r.present = true;
+        self.put_cli_recipe_row(r);
+        self.append(change);
+        return true;
+    }
+
+    fn update_cli_recipe(row: CliRecipeRow, change: ChangeRow) -> Bool fallible(StoreError) {
+        let cur = self.cli_recipe(row.id) or CliRecipeRow { };
+        if !cur.present || cur.origin != "operator" { return false; }
+        let mut r = cur;
+        r.body = row.body;
+        r.updated_at = row.updated_at;
+        self.put_cli_recipe_row(r);
+        self.append(change);
+        return true;
+    }
+
+    fn enable_cli_recipe(
+        id: String,
+        enabled: Bool,
+        at: Time,
+        change: ChangeRow
+    ) -> Bool fallible(StoreError) {
+        let cur = self.cli_recipe(id) or CliRecipeRow { };
+        if !cur.present { return false; }
+        let mut r = cur;
+        r.enabled = enabled;
+        r.updated_at = at;
+        self.put_cli_recipe_row(r);
+        self.append(change);
+        return true;
+    }
+
+    fn delete_cli_recipe(id: String, change: ChangeRow) -> Bool fallible(StoreError) {
+        let cur = self.cli_recipe(id) or CliRecipeRow { };
+        if !cur.present || cur.origin != "operator" { return false; }
+        let seats = self.seats() or SeatRows { };
+        for s in seats.rows {
+            if names_cli_recipe(s.config, id) { return false; }
+        }
+        let mut next = CliRecipeRows { };
+        for r in self.cli_recipe_rows.rows {
+            if r.id != id { push(next.rows, r) or discard; }
+        }
+        self.cli_recipe_rows = next;
+        self.append(change);
+        return true;
     }
 
     // ---- arrangements

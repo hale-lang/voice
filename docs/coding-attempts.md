@@ -8,24 +8,88 @@ passing") is one attempt. The attempt ends at commits: the caller fetches
 them as a git bundle, and pushing them and asking for a review are the
 caller's.
 
-Voice runs five CLIs, each a **harness definition** in
-[`harnesses/`](../harnesses/README.md): `claude` (Claude Code), `codex`
+Each CLI is a **CLI recipe** (a harness definition): voice ships five in
+[`harnesses/`](../harnesses/README.md), `claude` (Claude Code), `codex`
 (OpenAI Codex CLI), `agy` (Google Antigravity's CLI), `vibe` (Mistral
-Vibe) and `pi` (the pi coding agent). The first four call their vendors'
-models under the vendor's login; pi calls voice's own models, under a key
-voice mints for each attempt. A harness is data; the wrapper that runs it
-is the same for all of them. A future voice-native harness is one more definition, and a DNA leg
+Vibe) and `pi` (the pi coding agent), and the operator adds their own
+(below). The first four call their vendors' models under the vendor's
+login; pi calls voice's own models, under a key voice mints for each
+attempt. A recipe is data; the wrapper that runs it is the same for all of
+them. A future voice-native harness is one more definition, and a DNA leg
 is one more caller of the same API: neither changes the wrapper or the API.
 
-The contract is [`spec/openapi.yaml`](../spec/openapi.yaml), tag `attempts`
-(and `HarnessDefinition`), and `HarnessConfig` in
+The contract is [`spec/openapi.yaml`](../spec/openapi.yaml), tags `attempts`
+and `cli-recipes` (and `HarnessDefinition`), and `HarnessConfig` in
 [`spec/protocol.yaml`](../spec/protocol.yaml).
+
+## CLI recipes
+
+A recipe says where its CLI may run (its **backends**: a container voice
+builds, or the node's own machine), its argv and permission policy, how a
+login and a model reach it, and how its output is read
+([`harnesses/README.md`](../harnesses/README.md) has the fields). The api
+keeps every recipe in its store (`spec/store.md`, migration 43):
+
+- **Voice's own** (`origin` `shipped`) are the files in `harnesses/`, which
+  each api writes to the store as it starts. They are read-only: disable
+  one, or duplicate it into one of your own and edit that.
+- **The operator's** (`operator`) are made, edited (replaced whole, keeping
+  their id), enabled or disabled and removed on the admin plane:
+  `GET`, `POST /admin/v1/cli-recipes`; `GET`, `PUT`, `PATCH` (`{"enabled":
+  false}`), `DELETE /admin/v1/cli-recipes/{id}`; `POST
+  /admin/v1/cli-recipes/{id}/duplicate` (`{"id": ..., "name": ...}`).
+
+Every recipe is checked by the same rules whichever way it came; a refusal
+is 400 with the field at fault in `error.param` (`recipe.backends[1].detect.version`).
+A **disabled** recipe's seats take no new attempt, say so among their
+problems, and an attempt that asks for it is refused; one already running
+runs on. A recipe a seat names is never removed, only disabled: point its
+seats at another first. Each recipe in the list carries the seats that
+name it.
+
+## Where a CLI runs
+
+A recipe lists its backends in order. A **seat** runs a container by
+default; it runs on the host only when its config opts in, `"backend":
+"host"`, and the recipe has a backend of that kind (a seat is refused one
+that has none). As an attempt starts, its node runs the first backend of
+that kind it can run:
+
+- **`container`**, where the node has docker: the CLI installed on a base
+  image pinned by digest, built once per node, and run in a container of
+  the attempt's own behind its allow-list egress proxy ("Security", below).
+- **`host`**: the CLI on the node's own machine at the recipe's pinned
+  version. Its detect (an argv such as `claude --version`) finds one on the
+  node's PATH, used only when the version its pattern reads is the pin;
+  else its install puts that version in voice's own prefix,
+  `<data>/clis/<recipe>/<version>` (`npm install --global --prefix
+  $VOICE_CLI_PREFIX <package>@<pin>`, `uv tool install` with its
+  directories under the prefix), once per node, kept and shared by every
+  attempt of that version, and detect is asked again. An install never
+  writes system-wide and never runs as another user: its argv may run no
+  shell, `sudo` or `su`, and name no path outside the prefix (a check of
+  the argv as written, best effort; the prefix it is handed is the
+  contract). Detect and install run with no shell, a scrubbed environment
+  and a time limit.
+
+When none fits (no backend of the seat's kind, no docker for a container,
+no CLI at the pin on the host and no install that puts it there), the
+attempt fails `backend_unavailable`, saying what each backend found.
+
+**A host run has no sandbox and no egress filter.** It runs as the node's
+user, in the attempt's workspace, with a home and a temporary directory of
+its own and none of the node's environment but its PATH (voice's prefix
+first), its user, shell and language. The CLI's own permission policy is
+all that bounds it: it can read and write what the node's user can and
+reach any host; pi, which has no policy of its own, nothing at all. Opt a
+seat in only on a machine you would let that CLI loose on.
 
 ## A node that runs attempts
 
-A node runs attempts on a **harness engine**, which needs docker on the
-machine. Declare one in its capabilities file; one engine serves every CLI
-and every login:
+A node runs attempts on a **harness engine**. Its container runs need docker
+on the machine; a seat that opts in to the host needs none, only the CLI (or
+what its install uses: npm, uv). Declare one in its capabilities file; one
+engine serves every CLI and every login:
 
 ```json
 { "engines": [{ "id": "coding", "kind": "harness" }] }
@@ -38,14 +102,23 @@ after its own. Install never adds a harness engine itself, and a declared
 engine with an id install writes (`managed`, `claude`) gives way to
 install's, so name it something else ([adding a node](adding-a-node.md)).
 
-A **harness seat** on it names the definition it runs, the login it runs
-under, and optionally the CLI's own name for its model and hosts its
-attempts may reach besides the vendor's:
+A **harness seat** on it names the recipe it runs, the login it runs
+under, and optionally the CLI's own name for its model, hosts its attempts
+may reach besides the vendor's, and where it runs (`backend`, `container`
+unless it opts in to `host`):
 
 ```json
 { "id": "codex-work", "engine": "coding", "account": "openai-work",
   "serves": [{ "model": "codex-default" }],
   "config": { "harness": "codex", "login": "codex-work" } }
+```
+
+A seat that runs codex on the node's own machine, with no sandbox:
+
+```json
+{ "id": "codex-host", "engine": "coding", "account": "openai-work",
+  "serves": [{ "model": "codex-default" }],
+  "config": { "harness": "codex", "login": "codex-work", "backend": "host" } }
 ```
 
 A pi seat names no login, and its model is the voice model pi calls, a
@@ -58,7 +131,7 @@ catalog model's name:
 ```
 
 The admin UI's Models screen adds one (served by: a coding CLI's login),
-the same form for every CLI: the definition says how a login of it is made
+the same form for every CLI: the recipe says how a login of it is made
 and named. A seat runs at most its `concurrency` attempts at once; a node
 runs at most four in all. An older `claude-cli` engine is the claude
 harness under its former name: its seats run attempts too, `token_vault`
@@ -158,7 +231,7 @@ one: its evidence is final then, and the bundle is the result only after
 `failure_kind`, one of a fixed set a program maps onto its own disposition
 (`over_budget`, `past_deadline`, `harness_failed`, `no_changes`,
 `repo_unavailable`, `login_unavailable`, `sandbox_failed`,
-`bundle_too_large`, `node_lost`, `key_revoked`, `internal`; the contract's
+`backend_unavailable`, `bundle_too_large`, `node_lost`, `key_revoked`, `internal`; the contract's
 `AttemptFailureKind` says what each means).
 
 ## The run
@@ -169,13 +242,16 @@ The node asks the api for an attempt when it has a free slot
 
 1. It fetches `base` into a bare repository voice keeps, and clones it on
    the attempt's branch, `voice/attempt-<id>`, as the workspace.
-2. It builds the harness's image once per definition: its base image,
-   pinned by digest, with the CLI installed as the definition says.
-3. It runs the harness in a container of its own (below), the instruction
-   after the definition's short preamble, its output read as it comes into
-   the transcript, its summary and its usage.
-4. It commits what the harness left uncommitted, as `as`, in a container
-   with no network.
+2. It picks the recipe's backend ("Where a CLI runs"). For a container, it
+   builds the image once per recipe: its base image, pinned by digest, with
+   the CLI installed as the recipe says. For the host, it finds the CLI at
+   its pin, or installs it into voice's prefix.
+3. It runs the CLI, in a container of its own (below) or on the host, the
+   instruction after the recipe's short preamble, its output read as it
+   comes into the transcript, its summary and its usage.
+4. It commits what the harness left uncommitted, as `as`: in a container
+   with no network, or, on the host, with voice's own git (no hooks, no
+   fsmonitor).
 5. It takes the branch's commits into the bare repository, checks they
    build on the base, and exports them as a git bundle the api holds.
 
@@ -232,13 +308,27 @@ The node asks the api for an attempt when it has a free slot
 - **The workspace is the harness's.** Voice runs no git command of its own
   in it outside a container: the uncommitted work is committed in a
   container, and the commits are fetched out of it by voice into its own
-  repository, under no configuration of the workspace's.
+  repository, under no configuration of the workspace's. A host run is the
+  exception: its CLI already ran as the node's user, so voice commits what
+  it left with git on the host, hooks and fsmonitor off.
+- **The host backend.** A seat that opts in to the host gives up the
+  container and the egress proxy ("Where a CLI runs"). What stays: no
+  bypass flag, the CLI's own policy, its login by environment or a scratch
+  copy of a login directory in the run's own home (a vault login or
+  voice's key read by the run's shell from a private file, never an argv),
+  a home and temporary directory of the attempt's own, none of the node's
+  environment but its PATH, user and language, and everything removed when
+  it ends.
 
 ## Cleanup
 
 When an attempt ends (done, failed, cancelled, or past its deadline), its
 node removes its containers, its network and its directory: the workspace,
-the bare repository, the login's scratch copy and the bundle file. What
+the bare repository, the login's scratch copy and the bundle file. A host
+run's process group is stopped as the run ends, and its home and temporary
+directory go with the attempt's directory; the CLI installed in voice's
+prefix stays, pinned and shared, and a node that starts removes an install
+cut short. What
 remains is the attempt's row, its transcript (the last 2000 events), and its
 bundle in the api's store until the caller fetches it or a day passes. The
 harness images and the egress proxy's image stay, one per definition, built

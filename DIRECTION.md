@@ -132,14 +132,19 @@ start, because the MVP exists to prove them.
 - `axiom` **No bypass flags.** A seat that runs an agent CLI never passes the flag
   that skips its permissions. Each CLI runs under its own policy (allow
   lists, its sandbox mode), inside a container as the outer boundary, with
-  the worktree as the only thing it may write ([`node/`](./node/)).
+  the worktree as the only thing it may write ([`node/`](./node/)). A seat
+  the operator opts in to its node's own machine gives up that outer
+  boundary, and its CLI's own policy is all that bounds it; the flag is
+  never passed there either.
 - `axiom` **Logins stay with the official binaries.** Voice never extracts a
   token or calls a provider's backend on a subscription's behalf; the CLI
   holds its login on its node ([`node/`](./node/)).
 - `derived` **A harness is data; the wrapper is one.** An agentic coding
-  CLI is a harness definition ([`harnesses/`](./harnesses/README.md)), and
-  every one runs in the same wrapper: a container per attempt with only the
-  workspace mounted, its egress allowlisted, its login by environment or a
+  CLI is a CLI recipe ([`harnesses/`](./harnesses/README.md), and the
+  operator's own), and every one runs in the same wrapper: a container per
+  attempt with only the workspace mounted, its egress allowlisted (or, for a
+  seat opted in to the host, the node's own machine at the recipe's pinned
+  version, never installed system-wide), its login by environment or a
   per-login directory, everything it made removed when it ends
   ([`docs/coding-attempts.md`](./docs/coding-attempts.md)).
 - `derived` **A coding attempt ends at commits.** Voice runs the harness once

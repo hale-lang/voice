@@ -12,9 +12,14 @@
  */
 export type HarnessInfo = { id: string; name: string; login: { kind: string; entry?: string; setup?: string; describe?: string } };
 
-/** The login a seat of `h` names for `account`: the definition's suggested entry, filled in. */
+/** True when `h` runs under voice's own key, minted for each attempt: its seat names no login. */
+export function voiceKeyed(h: HarnessInfo): boolean {
+  return h.login.kind === 'voice';
+}
+
+/** The login a seat of `h` names for `account`: the definition's suggested entry, filled in; none under voice's own key. */
 export function loginEntry(h: HarnessInfo, account: string): string {
-  if (!account) return '';
+  if (!account || voiceKeyed(h)) return '';
   return (h.login.entry ?? `${h.id}-{account}`).replaceAll('{account}', account);
 }
 
@@ -82,9 +87,10 @@ export type AddWrites = {
 /**
  * A coding CLI's model, on a harness seat: the seat runs the CLI the
  * definition names under the login (a vault entry, or a login directory on
- * the node, as the definition says), with the CLI's own name for its model
- * (none for its default). It answers coding attempts; the claude harness
- * answers requests too. Flat-rate: no price.
+ * the node, as the definition says; none for a CLI under voice's own key,
+ * which each attempt brings), with the CLI's own name for its model (none
+ * for its default). It answers coding attempts; the claude harness answers
+ * requests too. Flat-rate: no price.
  */
 export function harnessWrites(a: { model: string; offer: Offer; account: string; harness: string; login: string; cliModel: string }): AddWrites {
   return {
@@ -97,7 +103,7 @@ export function harnessWrites(a: { model: string; offer: Offer; account: string;
       serves: [{ model: a.model }],
       concurrency: 1,
       enabled: true,
-      config: { harness: a.harness, login: a.login.trim(), ...(a.cliModel.trim() ? { model: a.cliModel.trim() } : {}) },
+      config: { harness: a.harness, ...(a.login.trim() ? { login: a.login.trim() } : {}), ...(a.cliModel.trim() ? { model: a.cliModel.trim() } : {}) },
     },
   };
 }

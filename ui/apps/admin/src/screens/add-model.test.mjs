@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, nodesOffering, noNodeOffers, priceOf, seatIdFor } from './add-model.ts';
+import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, nodesOffering, noNodeOffers, priceOf, seatIdFor, voiceKeyed } from './add-model.ts';
 
 const nodes = [
   { id: 'mac', status: 'up', capabilities: { engines: [{ id: 'managed', kind: 'managed' }, { id: 'claude', kind: 'claude-cli' }] } },
@@ -42,6 +42,15 @@ test("a coding CLI's model: a hosted model with no price, and a harness seat und
   });
   const named = harnessWrites({ model: 'claude-opus', offer: { node: 'mac', engine: 'claude' }, account: 'work', harness: 'claude', login: 'claude-token--work', cliModel: 'opus' });
   assert.deepEqual(named.seat.config, { harness: 'claude', login: 'claude-token--work', model: 'opus' }, "the CLI's own name for its model");
+});
+
+test("a CLI under voice's own key: its seat names no login, its model the voice model it calls", () => {
+  const pi = { id: 'pi', name: 'pi', login: { kind: 'voice' } };
+  assert.equal(voiceKeyed(pi), true);
+  assert.equal(voiceKeyed({ id: 'vibe', name: 'Vibe', login: { kind: 'env' } }), false);
+  assert.equal(loginEntry(pi, 'work'), '', 'no login to suggest');
+  const w = harnessWrites({ model: 'pi-qwen3-coder', offer: { node: 'gpu', engine: 'coding' }, account: 'local', harness: 'pi', login: '', cliModel: 'qwen3-coder' });
+  assert.deepEqual(w.seat.config, { harness: 'pi', model: 'qwen3-coder' });
 });
 
 test('an api model: priced, its endpoint and upstream name on an openai-compatible seat', () => {

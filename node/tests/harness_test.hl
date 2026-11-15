@@ -1,10 +1,12 @@
 // Harness definitions and the wrapper's argv (attempt.hl, lib/harness):
-// voice's four definitions and the test's fake are held to the rules, a
+// voice's five definitions and the test's fake are held to the rules, a
 // definition with a bypass flag is refused, and each renders the container
 // it runs in: the workspace mounted and nothing else of the machine, every
 // capability dropped, the attempt's own network, its model, and its login
-// only by name (a vault entry) or as the attempt's scratch copy (a login
-// directory), never its value.
+// only by name (a vault entry, or voice's own key) or as the attempt's
+// scratch copy (a login directory), never its value. A harness whose model
+// calls go to voice is handed the api's address, and its egress lets
+// through exactly the api's host and port; any other is as it was.
 import ".." as node;
 import "../../lib/harness" as harness;
 
@@ -17,18 +19,39 @@ fn definition(id: String) -> String {
     return std::str::trim(std::io::fs::read_file(path(here + id + ".json")) or "");
 }
 
+/// The key the api mints for a run under voice's own key, in these tests.
+const MINTED: String = "vk-0123456789abcdef0123456789abcdef01234567";
+
 /// An attempt's start, as the api answers a claim, for definition `def`.
 fn start(def: String, login: String, model: String) -> String {
+    return start_with(def, login, model, "");
+}
+
+/// The same, with the key minted for its run (`credential`), "" for none.
+fn start_with(def: String, login: String, model: String, credential: String) -> String {
     return "{\"attempt\": {\"id\": \"att_0123456789ab\", \"seat\": \"coder\", \"repo\": \"https://forge.example.com/team/app.git\", \"base\": \"main\", \"branch\": \"voice/attempt-att_0123456789ab\", \"instruction\": \"add a test\", \"model\": "
         + node::q(model) + ", \"login\": " + node::q(login)
         + ", \"budget_tokens\": 0, \"deadline\": 4102444800, \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}, \"egress\": [\"api.example.com\", \".example.org\"], \"harness\": "
-        + def + "}}";
+        + def + (if len(credential) > 0 { ", \"credential\": " + node::q(credential) } else { "" })
+        + "}}";
 }
 
 /// The argv `def` renders for an attempt in /home/op/node-data, its
 /// login `login`, its model `model`.
 fn argv_of(def: String, login: String, model: String) -> String {
-    let a = node::attempt_start(start(def, login, model));
+    return routed_argv(def, login, model, "", "");
+}
+
+/// The same for a run handed the key `credential` and voice's address
+/// `base_url` ("" for none).
+fn routed_argv(
+    def: String,
+    login: String,
+    model: String,
+    credential: String,
+    base_url: String
+) -> String {
+    let a = node::attempt_start(start_with(def, login, model, credential));
     std::test::assert_eq_str(a.problem, "", "the start is one the node runs");
     return node::docker_run_argv(
         harness::harness_def(def),
@@ -37,6 +60,7 @@ fn argv_of(def: String, login: String, model: String) -> String {
         "node-a",
         "1000:1000",
         "voice-harness-x:0123456789abcdef",
+        base_url,
     );
 }
 
@@ -103,7 +127,7 @@ fn contained(id: String, argv: String) {
 
 fn main() {
     // the definitions voice ships, and the e2e's fake, pass
-    let ids = "claude\ncodex\nagy\nvibe\nfake\n";
+    let ids = "claude\ncodex\nagy\nvibe\npi\nfake\n";
     let mut rest = ids;
     while len(rest) > 0 {
         let nl = std::str::index_of(rest, "\n");
@@ -207,6 +231,103 @@ fn main() {
         "the instruction read-only",
     );
 
+    // pi: voice's own key, by name; voice's address in the variable its
+    // definition names; its model by flag, the voice model it calls
+    let pi_def = definition("pi");
+    let pi = routed_argv(pi_def, "", "qwen3-coder", MINTED, "http://api.example:8080/v1");
+    contained("pi", pi);
+    std::test::assert(std::str::contains(pi, "\n-e\nVOICE_API_KEY\n"), "pi's key passed by name");
+    std::test::assert(!std::str::contains(pi, MINTED), "never by value: " + pi);
+    std::test::assert(
+        pair(pi, "-e", "VOICE_BASE_URL=http://api.example:8080/v1"),
+        "voice's address handed to pi",
+    );
+    std::test::assert(pair(pi, "--provider", "voice"), "pi's provider is voice");
+    std::test::assert(pair(pi, "--model", "qwen3-coder"), "the voice model pi calls");
+    std::test::assert(pair(pi, "-e", "PI_OFFLINE=1"), "pi's own network activity off");
+    let pi_run = node::harness_argv(
+        harness::harness_def(pi_def),
+        pi,
+        "/home/op/node-data/attempts/att_0123456789ab/secret/login",
+    );
+    std::test::assert(
+        std::str::starts_with(
+            pi_run,
+            "sh\n-c\nVOICE_API_KEY=\"$(cat \"$1\")\"; rm -f \"$1\"; export VOICE_API_KEY; shift; exec \"$@\"\nsh\n/home/op/node-data/attempts/att_0123456789ab/secret/login\ndocker\nrun\n",
+        ),
+        "voice's key read from its file by a shell",
+    );
+    std::test::assert(!std::str::contains(pi_run, MINTED), "the key in no argv");
+    // the key arrives in the start alone, and a start without one is refused
+    let keyed = node::attempt_start(start_with(pi_def, "", "qwen3-coder", MINTED));
+    std::test::assert_eq_str(keyed.credential, MINTED, "the key read from the start");
+    std::test::assert_eq_str(node::forget_credential(keyed).credential, "", "and let go");
+    std::test::assert(
+        std::str::contains(node::attempt_start(start(pi_def, "", "m")).problem, "no key"),
+        "a start for voice's key without one is refused",
+    );
+    // a harness whose calls go to its vendor gets no address, whatever is passed
+    std::test::assert_eq_str(
+        routed_argv(
+            definition("claude"),
+            "claude-token--work",
+            "sonnet",
+            "",
+            "http://api.example:8080/v1",
+        ),
+        claude,
+        "claude's container is as it was",
+    );
+    std::test::assert(!std::str::contains(claude, "BASE_URL"), "and names no address");
+
+    // the api as the node reaches it: its address, and its host and port
+    let route = node::api_route("http://api.example:8080/");
+    std::test::assert_eq_str(route.problem, "", "a host name is reachable");
+    std::test::assert_eq_str(route.base_url, "http://api.example:8080/v1", "the api's /v1");
+    std::test::assert_eq_str(route.host, "api.example", "its host");
+    std::test::assert_eq_int(route.port, 8080, "its port");
+    std::test::assert_eq_int(node::api_route("https://API.example").port, 443, "https's own port");
+    std::test::assert_eq_str(
+        node::api_route("https://API.example").host,
+        "api.example",
+        "the host as the filter names it",
+    );
+    std::test::assert_eq_str(
+        node::api_route("http://192.0.2.5:8080").base_url,
+        "http://192.0.2.5:8080/v1",
+        "an IPv4 address",
+    );
+    std::test::assert(
+        std::str::contains(node::api_route("http://127.0.0.1:8080").problem, "loopback"),
+        "the node's default, loopback, is refused",
+    );
+    std::test::assert(
+        std::str::contains(node::api_route("http://localhost:8080").problem, "loopback"),
+        "localhost too",
+    );
+    std::test::assert(
+        len(node::api_route("http://[::1]:8080").problem) > 0,
+        "and an address the filter cannot name",
+    );
+    std::test::assert_eq_str(
+        node::route_filter(route),
+        "^api\\.example:8080$\n^http://api\\.example:8080(/|$)\n",
+        "exactly the api's host and port, tunnelled or plain",
+    );
+    std::test::assert_eq_str(node::route_filter(node::ApiRoute { }), "", "none for no route");
+    std::test::assert(
+        std::str::ends_with(
+            node::egress_config(8080),
+            "ConnectPort 443\nConnectPort 80\nConnectPort 8080\n",
+        ),
+        "the proxy tunnels to the api's port: " + node::egress_config(8080),
+    );
+    std::test::assert_eq_str(
+        node::egress_config(443),
+        node::egress_config(0),
+        "a web port is one already",
+    );
+
     // a definition that skips the CLI's permissions is refused, whatever its form
     let claude_def = definition("claude");
     let bad = std::str::replace(claude_def, "\"acceptEdits\"", "\"bypassPermissions\"");
@@ -235,6 +356,38 @@ fn main() {
         std::str::contains(harness::harness_problem(auto), "bypass"),
         "auto-approve refused",
     );
+    // model calls go to voice exactly under voice's own key, on a wire voice serves
+    std::test::assert(
+        std::str::contains(
+            harness::harness_problem(
+                std::str::replace(pi_def, "\"kind\": \"voice\"", "\"kind\": \"env\""),
+            ),
+            "voice's own key",
+        ),
+        "voice's address for a CLI under its own login is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            harness::harness_problem(
+                std::str::replace(
+                    pi_def,
+                    "\"base_url_env\": \"VOICE_BASE_URL\"",
+                    "\"base_url_env\": null",
+                ),
+            ),
+            "base_url_env",
+        ),
+        "voice's key without voice's address is refused",
+    );
+    std::test::assert(
+        std::str::contains(
+            harness::harness_problem(
+                std::str::replace(pi_def, "\"openai-chat\"", "\"anthropic-messages\""),
+            ),
+            "a wire voice serves",
+        ),
+        "a wire voice does not serve is refused",
+    );
     let tag = std::str::replace(claude_def, "node@sha256:", "node:22@sha256:x");
     std::test::assert(len(harness::harness_problem(tag)) > 0, "an image by tag is refused");
 
@@ -250,15 +403,20 @@ fn main() {
     let bad_login = node::attempt_start(start(codex_def, "../other", ""));
     std::test::assert(len(bad_login.problem) > 0, "a login directory outside logins/ is refused");
 
-    // the egress filter: a host whole, or any under a domain
+    // the egress filter, on each request's URL: a host whole, or any under
+    // a domain, tunnelled to on 443 or 80, or asked plainly on 80
     std::test::assert_eq_str(
         node::egress_filter("api.example.com\n.example.org\n"),
-        "^api\\.example\\.com$\n^(.+\\.)?example\\.org$\n",
+        "^api\\.example\\.com:(443|80)$\n^http://api\\.example\\.com(:80)?(/|$)\n^([a-z0-9-]+\\.)*example\\.org:(443|80)$\n^http://([a-z0-9-]+\\.)*example\\.org(:80)?(/|$)\n",
         "the proxy's filter",
     );
     std::test::assert(
-        std::str::contains(node::egress_config(), "FilterDefaultDeny Yes"),
-        "everything else denied",
+        std::str::contains(node::egress_config(0), "FilterDefaultDeny Yes\nFilterURLs Yes\n"),
+        "everything else denied, by URL",
+    );
+    std::test::assert(
+        std::str::ends_with(node::egress_config(0), "ConnectPort 443\nConnectPort 80\n"),
+        "tunnels to the web's ports alone",
     );
 
     // an image is named for what it is built from

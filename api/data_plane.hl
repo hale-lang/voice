@@ -222,12 +222,12 @@ locus DataPlane {
             return self.infer(req, "chat") or raise;
         }
         if std::http::is_route(c, "GET", "/v1/models") {
-            let ctx = self.caller(req) or raise;
+            let ctx = self.inference_caller(req) or raise;
             let l = self.models.list(ctx) or raise;
             return caller_json(model_list_json(l));
         }
         if std::http::is_route(c, "GET", "/v1/models/:model") {
-            let ctx = self.caller(req) or raise;
+            let ctx = self.inference_caller(req) or raise;
             let m = self.models.get(
                 ModelRef { model: std::http::path_param(c.params, "model") },
                 ctx,
@@ -534,7 +534,18 @@ locus DataPlane {
 
     /// The caller of a caller-plane request: its project key, or the
     /// operator charged to the project `Voice-Project` names (operator_key.hl).
+    /// A running attempt's key is refused here: it calls inference alone
+    /// (`inference_caller`), so a harness cannot start or read attempts.
     fn caller(req: std::http::Request) -> std::api::Context fallible(ApiError) {
+        let ctx = caller_of(self.store, self.bearer, self.operator, req) or raise;
+        if len(attempt_of(ctx)) > 0 { fail attempt_key_refused(); }
+        return ctx;
+    }
+
+    /// The caller of an inference route (`/v1/responses`,
+    /// `/v1/chat/completions`, `/v1/models`): as `caller`, or a running
+    /// attempt's key (projects.hl, `attempt_context`).
+    fn inference_caller(req: std::http::Request) -> std::api::Context fallible(ApiError) {
         return caller_of(self.store, self.bearer, self.operator, req) or raise;
     }
 
@@ -545,8 +556,12 @@ locus DataPlane {
     /// statement at a time (store/pg_store.hl), and a request's limits are
     /// checked and counted with no wait between (`Inference.hold`).
     fn infer(req: std::http::Request, endpoint: String) -> std::http::Response fallible(ApiError) {
-        let ctx = self.caller(req) or raise;
+        let ctx = self.inference_caller(req) or raise;
         let mut r = read_inference(req.body, endpoint) or raise;
+        // a running attempt's request is a turn of the attempt: its usage is
+        // linked to it, and its turns keep to one seat and its cache
+        let attempt = attempt_of(ctx);
+        if len(attempt) > 0 { r.conversation = attempt; }
         // the hosted tool is the operator's, charged to a project: a project
         // key's request lists only its own tools (web_fetch.hl)
         if r.web_fetch && len(std::str::trim(std::http::header(req, VOICE_PROJECT))) == 0 {

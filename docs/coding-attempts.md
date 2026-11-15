@@ -8,11 +8,13 @@ passing") is one attempt. The attempt ends at commits: the caller fetches
 them as a git bundle, and pushing them and asking for a review are the
 caller's.
 
-Voice runs four CLIs, each a **harness definition** in
+Voice runs five CLIs, each a **harness definition** in
 [`harnesses/`](../harnesses/README.md): `claude` (Claude Code), `codex`
-(OpenAI Codex CLI), `agy` (Google Antigravity's CLI) and `vibe` (Mistral
-Vibe). A harness is data; the wrapper that runs it is the same for all of
-them. A future voice-native harness is one more definition, and a DNA leg
+(OpenAI Codex CLI), `agy` (Google Antigravity's CLI), `vibe` (Mistral
+Vibe) and `pi` (the pi coding agent). The first four call their vendors'
+models under the vendor's login; pi calls voice's own models, under a key
+voice mints for each attempt. A harness is data; the wrapper that runs it
+is the same for all of them. A future voice-native harness is one more definition, and a DNA leg
 is one more caller of the same API: neither changes the wrapper or the API.
 
 The contract is [`spec/openapi.yaml`](../spec/openapi.yaml), tag `attempts`
@@ -39,6 +41,15 @@ attempts may reach besides the vendor's:
   "config": { "harness": "codex", "login": "codex-work" } }
 ```
 
+A pi seat names no login, and its model is the voice model pi calls, a
+catalog model's name:
+
+```json
+{ "id": "pi-coder", "engine": "coding", "account": "local",
+  "serves": [{ "model": "pi-qwen3-coder" }],
+  "config": { "harness": "pi", "model": "qwen3-coder" } }
+```
+
 The admin UI's Models screen adds one (served by: a coding CLI's login),
 the same form for every CLI: the definition says how a login of it is made
 and named. A seat runs at most its `concurrency` attempts at once; a node
@@ -60,6 +71,23 @@ itself: it hands it to the official binary, which talks to its vendor.
 | `codex` | a ChatGPT plan's login, in `auth.json` under `CODEX_HOME` | one directory per login, `<data>/logins/<login>`; a run gets a scratch copy of `auth.json`, mounted as its `CODEX_HOME`, and codex's refresh of it is copied back | `CODEX_HOME=<data>/logins/<login> codex login --device-auth` | an empty `CODEX_HOME` is logged out while the default one is logged in: the directory is the login (`cli_auth_credentials_store="file"` keeps it off any keyring) |
 | `agy` | a Google account's sign-in, `.gemini/jetski-standalone-oauth-token` under `HOME` | one directory per login, `<data>/logins/<login>`; a run gets a scratch copy of the token file, mounted at its `~/.gemini` | `HOME=<data>/logins/<login> agy`, then sign in (a headless machine prints a link and asks for the code) | a fresh `HOME` is signed out (on macOS); on Linux, from the CLI's documentation only |
 | `vibe` | a Mistral API key (the one `vibe --setup` signs in for, or one from Mistral's console) | one vault entry per key, `mistral-key--<account>`, handed in `MISTRAL_API_KEY` | the key kept in the node's vault | the CLI's flags and reader run for real |
+| `pi` | no vendor's login: a voice key voice mints for each attempt (`login.kind` `voice`) | one key per attempt, nothing held on the node: handed to the node in the claim's answer and to pi in `VOICE_API_KEY` | nothing | pi's image, flags, provider and reader run for real in voice's container, against an OpenAI-compatible stub behind the attempt's proxy |
+
+pi's key is the attempt's project's: the project of the key, or of the
+operator token with `Voice-Project`, that asked for the attempt. It is good
+for the caller plane's inference alone (`/v1/responses`,
+`/v1/chat/completions`, `/v1/models`): the attempts API, the admin plane
+and the node plane refuse it, so a run cannot start or read attempts. Its
+requests are charged as the key that asked for the attempt, each a turn of
+the attempt's conversation (whatever session the CLI names), so they are in
+the ledger under the attempt; the attempt's own record counts none of
+their tokens again. It expires at the attempt's deadline and names nobody
+once the attempt is done, failed or cancelled, its node is lost, or the key
+that asked is revoked. The api keeps only its digest; an attempt is started
+once, so each run's key is its own. pi's model is the seat's `model` (or
+the engine name its `serves` gives the model asked for), named to pi as
+`--provider voice --model <name>`: pi accepts a name its provider does not
+list, so any voice model is usable without a new image.
 
 A login directory is shared by the seats that name it, but no run writes
 into it except the CLI's own credential file, copied back when the CLI
@@ -97,7 +125,9 @@ Chat's requests do; `/admin/v1/attempts` lists every project's.
 - `as` is the commits' author and committer, passed through unchanged; left
   out, `voice attempt <id>`.
 - `budget.tokens` stops the attempt once the harness's own output reports
-  more; `deadline` (four hours by default, at most a day) fails it if it has
+  more; pi reports none, so its budget is not enforced yet (its requests'
+  tokens are in the ledger under the attempt, unindexed by conversation,
+  and not summed while it runs); `deadline` (four hours by default, at most a day) fails it if it has
   not ended, queued or running.
 - An attempt is never refused for capacity: it queues until a harness seat
   that can run it has room, chosen as a request's seat is (its account one
@@ -151,6 +181,14 @@ The node asks the api for an attempt when it has a free slot
   `accept-edits` agent with a scoped bash allow list. A definition whose
   command holds a flag that skips permissions is refused, by the api and by
   the node.
+- **pi has no permission system.** pi runs its tools (read, bash, edit,
+  write, grep, find, ls) directly, with no approval step and no policy to
+  set: its container is its whole boundary. No host mount but the
+  workspace, every capability dropped, a network of its own whose only way
+  out is the allow-list proxy, no credential but its attempt's key, and
+  nothing pushed. Voice passes it no flag that widens anything: it loads no
+  extension but voice's provider, no project-local configuration
+  (`--no-approve`) and no MCP server.
 - **The container.** Only the workspace is mounted, and the login's scratch
   copy for a CLI that keeps its login in a directory; no host home, no
   docker socket, no other credential. It runs as the node's user with every
@@ -164,16 +202,25 @@ The node asks the api for an attempt when it has a free slot
   out. Its only way out is a proxy on that network (tinyproxy, pinned) that
   allows only the definition's vendor hosts, the common package registries
   (npm, PyPI, crates.io, the Go proxy, GitHub's release and download hosts)
-  and the seat's own `egress`, on ports 443 and 80; anything else is
+  and the seat's own `egress`, tunnelled to on ports 443 and 80 (asked
+  plainly on 80); the proxy matches each request's whole URL, so a port is
+  allowed for its host alone. For pi, whose model calls go to voice, it also
+  lets through exactly the api's host and port, as the node itself reaches
+  the api (`--api`): the node hands pi that address with `/v1` in
+  `VOICE_BASE_URL`. A node that reaches the api at a loopback address
+  (`127.0.0.1`, `localhost`, the node's default) gives the proxy nothing it
+  can reach: its pi attempts fail `sandbox_failed`, saying so; start it with
+  `--api` set to the machine's host name or address. Anything else is
   refused, and a direct connection has nowhere to go. The CLIs and the usual
   toolchains read `HTTPS_PROXY`. This holds on Linux and on Docker Desktop
   alike.
 - **Credentials.** A login from the vault is written by the sealed
   credential to a private file, which a shell reads into the docker client's
   environment and removes; `docker run` passes it by name, so it is never in
-  an argv. The caller hands voice no credential, and voice uses none of the node's
-  to fetch the repository (git runs with an empty home, no credential
-  helper and no ssh); it pushes nothing.
+  an argv; pi's attempt key, from the claim's answer, goes the same way
+  and the node keeps no copy. The caller hands voice no credential, and
+  voice uses none of the node's to fetch the repository (git runs with an
+  empty home, no credential helper and no ssh); it pushes nothing.
 - **The workspace is the harness's.** Voice runs no git command of its own
   in it outside a container: the uncommitted work is committed in a
   container, and the commits are fetched out of it by voice into its own
@@ -195,7 +242,13 @@ registered again or stopped reporting for ten minutes.
 ## Not yet
 
 Routing a harness's own model calls through voice (`base_url_env`,
-`protocol`) and injecting MCP servers (`mcp`) are fields of the definition
-that nothing uses yet. agy's and Vibe's subscription logins in a Linux
-container, and claude's and codex's real runs in one, are checked only as
-far as the table above says.
+`protocol`) is used by pi, whose model calls voice serves; claude and codex
+call their vendors under their logins and set neither. Injecting MCP
+servers (`mcp`) is a field of the definition that nothing uses yet. pi's
+output is read as plain text: its print mode writes only its final
+message, so its transcript is that message, its summary that message's
+last line, and its idle limit is the attempt's deadline; a reader of its
+`--mode json` stream is to come, as is a budget that counts the ledger.
+agy's and Vibe's subscription logins in a Linux container, and claude's
+and codex's real runs in one, are checked only as far as the table above
+says.

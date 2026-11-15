@@ -1374,8 +1374,10 @@ updates or deletes a row once written (a request's row is written once,
 when it ends, `Settle`), so the rollup has no change to follow. Rows are not
 pruned; were the ledger ever pruned, the hours stay, so totals outlive the
 rows they were summed from. An estimated input is written as 0 in
-`input_tokens` (the record says it, `input_tokens_estimated`), so the
-rollup's sums, as a summary's, count only what engines reported.
+`input_tokens` (the record says it, `input_tokens_estimated`), and an
+output voice counted as 0 in `output_tokens` and `reasoning_tokens`
+(`output_tokens_estimated`), so the rollup's sums, as a summary's, count
+only what engines reported.
 
 The migration sums the ledger written before it into the rollup in the
 same transaction that makes the trigger, whose lock on `usage` holds every

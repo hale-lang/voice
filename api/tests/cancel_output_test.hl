@@ -1,0 +1,314 @@
+// A stream its caller cancels once output has gone records what its seat
+// sent: the seat's first output in its timing, and its output tokens,
+// counted from the deltas that came and marked estimated. A stream
+// cancelled before any output records none, and one served whole records
+// its engine's count, unmarked.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+
+/// A link to a node whose seat's upstream streams `sse`, in process. With
+/// `caller` and `cut_after` set, the caller on that connection (its end of
+/// it) closes it once that many output deltas have come.
+locus Upstream {
+    params {
+        sse: String = "";
+        caller: Int = -1;
+        cut_after: Int = 0;
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, request_id: String, reply_to: String, msg: Bytes) -> api::Offer {
+        let body = std::str::from_bytes(msg);
+        let id = std::json::find_string_field(body, "request_id");
+        let run = node::compat_play(
+            id,
+            std::json::find_string_field(body, "model"),
+            "stub-7b",
+            std::str::trim(std::json::find_field_raw(body, "body")),
+            node::compat_config(
+                "{\"base_url\": \"http://upstream.test/v1\", \"model\": \"stub-7b\"}",
+            ),
+            200,
+            self.sse,
+        );
+        return Played {
+            script: run.script,
+            result: node::result_message(id, run, 3, 9),
+            caller: self.caller,
+            cut_after: self.cut_after,
+        };
+    }
+}
+
+/// One offer, played: its events, then its result; its caller gone (its end
+/// of the connection closed, unread) at the `cut_after`th output delta (0:
+/// never), so the api's write of that delta finds it gone.
+locus Played {
+    params {
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+        caller: Int = -1;
+        cut_after: Int = 0;
+        deltas: Int = 0;
+    }
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "accepted" }; }
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if std::str::starts_with(line, "pause ") || len(line) == 0 { continue; }
+            if std::str::contains(line, ".delta\"") {
+                self.deltas = self.deltas + 1;
+                if self.cut_after > 0 && self.deltas == self.cut_after {
+                    std::io::tcp::close_fd(self.caller);
+                }
+            }
+            return api::LinkMsg { kind: "event", json: line };
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn finish() { self.ended = true; }
+}
+
+/// An upstream's stream as llama-server sends it, a token a chunk: three
+/// of thinking, then `words` of answer, then its usage.
+fn chunks(words: Int) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    for t in ["Let", " me", " think"] {
+        out.append_str(
+            "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\""
+                + t + "\"}}]}\n\n",
+        );
+    }
+    let mut i = 0;
+    while i < words {
+        out.append_str(
+            "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" w"
+                + to_string(i) + "\"}}]}\n\n",
+        );
+        i = i + 1;
+    }
+    out.append_str(
+        "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":"
+            + to_string(words + 3) + ",\"total_tokens\":" + to_string(words + 14) + "}}\n\n",
+    );
+    out.append_str("data: [DONE]\n\n");
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+fn plane(e: api::DataPlane, path: String, token: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: path,
+            headers: "Authorization: Bearer " + token,
+            body: body,
+        },
+    );
+}
+
+const CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"reason\": null}";
+
+/// A node with one seat of `echo-1`, registered and reporting it up.
+fn bring_up(e: api::DataPlane, id: String) {
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    let made = nodes.create(api::NodeCreate { id: id }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let token = made.enrollment_token;
+    let mut sc = api::SeatCreate {
+        node: id,
+        id: "static",
+        engine: "static",
+        account: "static",
+        config: std::json::Value::parse("{\"text\": \"hello from voice\"}")
+        or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: "echo-1" }) or discard;
+    seats.create(sc) or {
+        std::test::assert(false, "a seat on " + id + ": " + api::ctl_problem(err).message);
+    };
+    let reg = plane(
+        e,
+        "/node/v1/register",
+        token,
+        "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS + ", \"local\": "
+            + LOCAL + "}",
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    let up = plane(
+        e,
+        "/node/v1/seats",
+        token,
+        "{\"assignment_version\": " + to_string(version)
+            + ", \"seats\": [{\"id\": \"static\", \"status\": \"up\", \"in_flight\": 0}]}",
+    );
+    std::test::assert_eq_int(up.status, 204, id + " reports its seat: " + up.body);
+}
+
+/// Stream `body` to `endpoint` through `out`; the request's usage record.
+fn streamed(
+    e: api::DataPlane,
+    key: String,
+    endpoint: String,
+    body: String,
+    out: api::EventStream
+) -> api::UsageRecord {
+    let ctx = e.bearer.context("Bearer " + key) or std::api::Context { };
+    let req = api::read_inference(body, endpoint) or api::InferenceRequest { };
+    e.inference.stream(req, ctx, out) or {
+        std::test::assert(false, endpoint + " streams: " + err.message);
+    };
+    // the newest request's
+    let usage = api::Usage { store: e.store };
+    let page = usage.list(api::UsageAsk { project: "work", limit: 1 }) or api::UsageList { };
+    let mut id = "";
+    for r in page.data { id = r.id; }
+    return usage.get(api::UsageRef { request_id: id }) or api::UsageRecord { id: "none" };
+}
+
+/// How a cut-off seat's output is counted: a token a delta, or a token per
+/// four characters when that is more; its engine's usage, when it came, as
+/// it is.
+fn counted() {
+    std::test::assert_eq_int(api::delivered_tokens(15, 30), 15, "a token a delta");
+    std::test::assert_eq_int(
+        api::delivered_tokens(2, 40),
+        10,
+        "a token per four characters, for chunks of several",
+    );
+    let sent = api::SeatOutput { deltas: 5, chars: 20, first_output_ms: 4 };
+    let none = api::cut_output(sent, 9, "{\"id\": \"r\", \"usage\": null}");
+    std::test::assert_eq_str(none.usage, "", "a response without usage reports none");
+    std::test::assert_eq_int(none.engine_ms, 9, "the seat had it until it was cut off");
+    let reported = api::cut_output(
+        sent,
+        9,
+        "{\"id\": \"r\", \"usage\": {\"input_tokens\": 7, \"output_tokens\": 9, \"output_tokens_details\": {\"reasoning_tokens\": 2}}}",
+    );
+    let t = api::cut_tokens("{\"input\": \"hi\"}", reported);
+    std::test::assert(
+        t.input == 7 && t.output == 9 && t.reasoning == 2 && !t.estimated && !t.output_estimated,
+        "an engine's usage that came is the count, unmarked",
+    );
+}
+
+fn main() {
+    counted();
+    let link = Upstream { sse: chunks(40) };
+    let e = api::DataPlane { link: link };
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    accounts.create(api::AccountCreate { id: "static", name: "Static" }) or discard;
+    projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+    let made = keys.create(
+        api::KeyCreate { project: "work", name: "ci" },
+    ) or api::Key { status: api::KeyStatus::revoked };
+    let key = made.secret;
+    bring_up(e, "laptop");
+
+    // cancelled after 15 chunks, on either endpoint: 3 of thinking and 12
+    // of answer, 15 tokens, the thinking's 3, marked estimated
+    for endpoint in ["chat", "responses"] {
+        // the caller's connection: the api's end streams, the caller's
+        // closes at the 15th delta
+        let listener = std::io::tcp::listen_socket("127.0.0.1", 0) or - 1;
+        let caller = std::io::tcp::connect(
+            "127.0.0.1",
+            std::io::tcp::__local_port(listener),
+        ) or - 1;
+        let api_side = std::io::tcp::__accept_one(listener);
+        std::test::assert(listener >= 0 && caller >= 0 && api_side >= 0, "a connection");
+        link.caller = caller;
+        link.cut_after = 15;
+        let out = api::EventStream { conn_fd: api_side };
+        let body = if endpoint == "chat" {
+            "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": true}"
+        } else {
+            "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}"
+        };
+        let g = streamed(e, key, endpoint, body, out);
+        std::io::tcp::close_fd(api_side);
+        std::io::tcp::close_fd(listener);
+        std::test::assert_eq_str(g.status, "cancelled", endpoint + ": cancelled: " + g.id);
+        std::test::assert_eq_int(
+            g.output_tokens,
+            15,
+            endpoint + ": its output counted, a token a chunk",
+        );
+        std::test::assert_eq_int(g.reasoning_tokens, 3, endpoint + ": of it the thinking's");
+        std::test::assert(g.output_tokens_estimated, endpoint + ": marked estimated");
+        std::test::assert(g.input_tokens_estimated, endpoint + ": as its input is");
+        let row = e.store.usage(g.id) or st::UsageRow { output_tokens: -1 };
+        std::test::assert_eq_int(
+            row.output_tokens + row.reasoning_tokens,
+            0,
+            endpoint + ": which the ledger's sums leave out",
+        );
+        std::test::assert(
+            g.timing.has_first_output_ms && g.timing.first_output_ms >= 0,
+            endpoint + ": its first output in its timing",
+        );
+        std::test::assert(
+            g.timing.has_engine_ms && g.timing.engine_ms >= g.timing.first_output_ms,
+            endpoint + ": and how long its seat had it",
+        );
+    }
+
+    // cancelled before any output: none counted, no first output
+    let early = api::EventStream { gone: true };
+    link.cut_after = 0;
+    let g = streamed(
+        e,
+        key,
+        "chat",
+        "{\"model\": \"echo-1\", \"messages\": [{\"role\": \"user\", \"content\": \"hi\"}], \"stream\": true}",
+        early,
+    );
+    std::test::assert_eq_str(g.status, "cancelled", "cancelled before output: " + g.id);
+    std::test::assert_eq_int(g.output_tokens, 0, "no output counted");
+    std::test::assert(!g.output_tokens_estimated, "and none estimated");
+    std::test::assert(!g.timing.has_first_output_ms, "no first output");
+
+    // served whole: its engine's count, unmarked
+    let whole = streamed(
+        e,
+        key,
+        "responses",
+        "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}",
+        api::EventStream { },
+    );
+    std::test::assert_eq_str(whole.status, "served", "served whole: " + whole.id);
+    std::test::assert_eq_int(whole.output_tokens, 43, "its engine's output count");
+    std::test::assert_eq_int(whole.input_tokens, 11, "and input count");
+    std::test::assert(
+        !whole.output_tokens_estimated && !whole.input_tokens_estimated,
+        "neither estimated",
+    );
+    std::test::assert_eq_int(whole.timing.first_output_ms, 3, "its node's first output");
+
+    let row = e.store.usage(whole.id) or st::UsageRow { };
+    std::test::assert_eq_int(row.output_tokens, 43, "which the ledger's sums count");
+}

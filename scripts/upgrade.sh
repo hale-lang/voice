@@ -211,7 +211,7 @@ INSERT INTO budget (project, allowance_micros, period, period_anchor) VALUES ('v
 INSERT INTO "limit" (scope, project, window_seconds, requests) VALUES ('project', 'voice-system', 60, 1);
 INSERT INTO "limit" (scope, key, window_seconds, requests) VALUES ('key', 'voice-system', 60, 1);
 SQL
-keys="SELECT string_agg(k::text, ';' ORDER BY k.id) FROM api_key k WHERE project <> 'voice-system'"
+keys="SELECT string_agg((to_jsonb(k) - 'annotate')::text, ';' ORDER BY k.id) FROM api_key k WHERE project <> 'voice-system'"
 before=$(q "$keys")
 migrate $((head - 33))
 test "$(q "SELECT count(*) FROM project WHERE id = 'voice-system'")" = 0

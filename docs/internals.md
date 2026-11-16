@@ -77,8 +77,6 @@ id"}}`. The rows are the contract: `hale api export` of the surface is
 | nodes and seats | `/admin/v1/nodes`, `.../{node}`, `.../{node}/token`, `.../{node}/seats`, `.../{node}/seats/{seat}` |
 | the change log | `GET /admin/v1/changes`, written by every admin write above |
 | the node plane | `/node/v1/register`, `assignment`, `heartbeat`, `seats`, `capabilities`, `local`, `quota`, `draining` (an enrollment token required) |
-| coding attempts | `POST`, `GET /v1/attempts`, `GET .../{attempt}`, `.../cancel`, `.../transcript`, `.../events`, `.../bundle`; the operator's `/admin/v1/attempts` and `/admin/v1/harnesses`; the node's `/node/v1/attempts/claim`, `.../{attempt}/report`, `.../{attempt}/bundle` ([`api/attempts.hl`](../api/attempts.hl), [docs/coding-attempts.md](coding-attempts.md)) |
-| CLI recipes | `GET`, `POST /admin/v1/cli-recipes`; `GET`, `PUT`, `PATCH`, `DELETE .../{cli_recipe}`; `POST .../{cli_recipe}/duplicate`, on the data plane as the surface holds as many receivers as it may ([`api/cli_recipes.hl`](../api/cli_recipes.hl), [docs/coding-attempts.md](coding-attempts.md)) |
 
 Everything above reaches the configuration and the fleet's reports through
 the `Store` interface ([`store/store.hl`](../store/store.hl)). Given
@@ -1318,14 +1316,19 @@ already there.
   node` script whose `node` sits beside it, and the capability format needs
   nothing new. Other CLI engines follow that shape.
 
-  **Coding attempts.** A `harness` engine runs agentic coding CLIs as data
-  (a harness definition, [`harnesses/`](../harnesses/README.md)) for coding
-  attempts: the node's plane claims one when one of its attempt slots
-  (`node/attempt.hl`, four threads) is free, and the slot runs it in a
-  container of its own, behind an egress proxy on a network of its own,
-  reports it to the api every couple of seconds, and removes everything it
-  made when it ends ([docs/coding-attempts.md](coding-attempts.md)). A
-  `claude-cli` engine is the claude harness under its older name.
+  **Coding harnesses run outside voice.** An agentic coding harness run on
+  a repository is a client of voice's API, run elsewhere (for a habitat, in
+  its organisms' legs): its model calls are requests like any other. Voice
+  once ran them itself, as coding attempts on a `harness` engine; store
+  migration 45 drops what the api kept of them, and a node starting where
+  they ran removes what they left, once (`node/leftovers.hl`): the
+  containers and networks labelled `net.hale-lang.voice.attempt.node=<its
+  id>`, and its data directory's `attempts/` and `clis/`; the images they
+  built, labelled
+  `net.hale-lang.voice.image=harness`, are the operator's to prune
+  (`docker image prune -a --filter label=net.hale-lang.voice.image=harness`).
+  A seat made for one is configuration, kept until the operator removes it:
+  no node offers its engine now, which its problems say.
 
   **One node, several logins (hale-lang/voice#2).** Two accounts on one CLI
   are two seats of one `claude-cli` engine (or two engines), each naming its

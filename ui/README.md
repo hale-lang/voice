@@ -123,18 +123,14 @@ One per part of the admin API, listed on the rail in layers
 route, `#/models/nodes/<node>`; a route from before the layers opens where
 its screen lives now): Overview; Models (Catalogue, Placements, Nodes,
 Recipes, Runtimes, Accounts, Routes, Requests, Live); Projects;
-Conversations (Chat, Conversations); Harness (Annotators, Tools,
-Attempts, CLI recipes); and apart, Changes and API.
+Conversations (Chat, Conversations); Harness (Annotators, Tools); and
+apart, Changes and API.
 
 - **Overview:** quota headroom per account, node health, spend against
   budget, recent usage.
 - **Route table:** per model, the ranked slots and why.
 - **Requests** and **Conversations:** the ledger, each a live table filtered and paged in the URL; a row opens the request or the conversation.
 - **Accounts:** quota windows, limits.
-- **CLI recipes:** the coding CLIs attempts run, voice's own (read-only:
-  disabled or duplicated) and the operator's, each with where it runs (a
-  container, the host) and the seats naming it; made and edited as a form
-  or as raw JSON, the api's refusal shown on its field.
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token
   rotation.
 - **Seats:** a form per engine, rendered from its `config_schema`.

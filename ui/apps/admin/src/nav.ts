@@ -25,8 +25,6 @@ export const PLACES = {
   conversations: ['conversations', 'history'],
   annotators: ['harness', 'annotators'],
   tools: ['harness', 'tools'],
-  attempts: ['harness', 'attempts'],
-  clis: ['harness', 'clis'],
   changes: ['changes'],
   api: ['api'],
 } as const satisfies Record<string, readonly string[]>;
@@ -63,8 +61,6 @@ export const NAV: { label?: string; system?: boolean; items: { screen: Screen; l
     items: [
       { screen: 'annotators', label: 'Annotators' },
       { screen: 'tools', label: 'Tools' },
-      { screen: 'attempts', label: 'Attempts' },
-      { screen: 'clis', label: 'CLI recipes' },
     ],
   },
   {
@@ -97,7 +93,14 @@ export function href(...parts: string[]): string {
 }
 
 /** The screens before the layers, as their URLs named them, each a screen of the same name but `usage`. */
-const OLD = new Set(['network', 'nodes', 'usage', 'routes', 'accounts', 'placements', 'recipes', 'runtimes', 'annotators', 'chat', 'tools', 'attempts']);
+const OLD = new Set(['network', 'nodes', 'usage', 'routes', 'accounts', 'placements', 'recipes', 'runtimes', 'annotators', 'chat', 'tools']);
+
+/**
+ * The screens of coding attempts and their CLI recipes, gone with them
+ * (coding harnesses run outside voice, as clients of its API): a route of
+ * theirs, under the Harness layer or from before it, opens the layer.
+ */
+const GONE = new Set(['attempts', 'clis']);
 
 /** A layer's own path: the URL of its first screen. */
 const LAYERS: Record<string, Screen> = Object.fromEntries(
@@ -124,6 +127,7 @@ export function resolve(path: readonly string[], query: URLSearchParams): { part
   // `#/models/<model>` was the catalogue's own; a model named as a screen
   // of the layer (`nodes`) is shadowed by it
   if (head === 'models') return moved(['models', ...rest], query);
+  if (GONE.has(head) || (head === 'harness' && GONE.has(rest[0] ?? ''))) return moved([LAYERS['harness']!], new URLSearchParams());
   if (Object.hasOwn(LAYERS, head)) return moved([LAYERS[head]!], query);
   if (head === 'usage') return moved(usageParts(rest, query), withoutView(query));
   if (OLD.has(head)) return moved([head, ...rest], query);

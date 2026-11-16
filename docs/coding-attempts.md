@@ -48,7 +48,10 @@ Every recipe is checked by the same rules whichever way it came; a refusal
 is 400 with the field at fault in `error.param` (`recipe.backends[1].detect.version`).
 A **disabled** recipe's seats take no new attempt, say so among their
 problems, and an attempt that asks for it is refused; one already running
-runs on. A recipe a seat names is never removed, only disabled: point its
+runs on. An attempt keeps what it started with: how its run is metered
+(whether its CLI's model calls go to voice, so the ledger counts them and
+the attempt's own record none of their tokens) and the recipe's sha256
+(`recipe_digest`). Editing or removing the recipe later changes neither. A recipe a seat names is never removed, only disabled: point its
 seats at another first. Each recipe in the list carries the seats that
 name it.
 

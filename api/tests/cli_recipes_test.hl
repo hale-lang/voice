@@ -96,6 +96,34 @@ fn refusal(seats: api::Seats, s: api::SeatCreate) -> String {
     return why;
 }
 
+/// A recipe run in a container, `login` its login and the fields that go
+/// with it.
+fn boxed(id: String, login: String) -> String {
+    return "{\"id\": " + api::jq(id)
+        + ", \"name\": \"Boxed\", \"version\": \"1.0.0\", \"backends\": [{\"kind\": \"container\", \"base\": \"docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc\", \"install\": \"apk add --no-cache git\"}], \"command\": [\"boxed\"], \"instruction\": {\"via\": \"stdin\"}, \"model\": {\"flag\": \"--model\"}, \"login\": "
+        + login
+        + ", \"env\": {}, \"reader\": \"text\", \"commits\": false, \"preamble\": \"Work in /work.\", \"egress\": []}";
+}
+
+const VENDOR_LOGIN: String = "{\"kind\": \"env\", \"env\": \"BOXED_KEY\"}";
+const VOICE_LOGIN: String = "{\"kind\": \"voice\", \"env\": \"VOICE_API_KEY\"}, \"base_url_env\": \"VOICE_BASE_URL\", \"protocol\": \"openai-chat\"";
+
+/// Attempt `id`, run on `token`'s node, ended reporting 100 tokens in and
+/// 50 out.
+fn end_with_usage(e: api::DataPlane, token: String, id: String) {
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/attempts/" + id + "/report",
+            token,
+            "{\"state\": \"failed\", \"failure\": \"the harness exited with code 1\", \"failure_kind\": \"harness_failed\", \"usage\": {\"input_tokens\": 100, \"output_tokens\": 50}, \"events\": []}",
+        ),
+        200,
+        "attempt " + id + " ended",
+    );
+}
+
 fn main() {
     let e = api::DataPlane { link: Quiet { }, harnesses: shipped() };
     let op = e.store.operator_token("va-test") or "";
@@ -381,4 +409,115 @@ fn main() {
     seats.remove(api::SeatRef { node: "node-a", seat: "coder" }) or discard;
     expect(call(e, "DELETE", "/admin/v1/cli-recipes/mine", op, ""), 200, "removed");
     expect(call(e, "GET", "/admin/v1/cli-recipes/mine", op, ""), 404, "gone");
+
+    // how an attempt's run is metered is fixed as it starts, whatever its
+    // recipe becomes: a CLI under its vendor's login has its own record
+    // count the tokens it reports; one under voice's key, none of them (the
+    // ledger has its calls)
+    expect(
+        call(e, "POST", "/admin/v1/cli-recipes", op, boxed("metered", VENDOR_LOGIN)),
+        201,
+        "a vendor's",
+    );
+    expect(
+        call(e, "POST", "/admin/v1/cli-recipes", op, boxed("routed", VOICE_LOGIN)),
+        201,
+        "voice's",
+    );
+    seats.create(seat("met", "{\"harness\": \"metered\", \"login\": \"met-key\"}")) or discard;
+    seats.create(seat("rt", "{\"harness\": \"routed\", \"model\": \"qwen\"}")) or discard;
+    let now_version = (
+        nodes.get(api::NodeRef { node: "node-a" }) or api::Node { status: api::NodeStatus::down }
+    ).assignment_version;
+    expect(
+        call(
+            e,
+            "POST",
+            "/node/v1/seats",
+            token,
+            "{\"assignment_version\": " + to_string(now_version)
+                + ", \"seats\": [{\"id\": \"met\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}, {\"id\": \"rt\", \"status\": \"up\", \"reason\": null, \"in_flight\": 0}]}",
+        ),
+        204,
+        "its seats are up",
+    );
+    // a vendor's login, edited to voice's key while it runs: still its tokens
+    let a1 = str(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"mine\"", "\"metered\""),
+        ).body,
+        "id",
+    );
+    let s1 = call(e, "POST", "/node/v1/attempts/claim", token, "{}");
+    expect(s1, 200, "claimed");
+    let handed = std::str::trim(
+        std::json::find_field_raw(std::json::find_field_raw(s1.body, "attempt"), "harness"),
+    );
+    expect(
+        call(e, "PUT", "/admin/v1/cli-recipes/metered", op, boxed("metered", VOICE_LOGIN)),
+        200,
+        "edited to voice's key",
+    );
+    end_with_usage(e, token, a1);
+    std::test::assert_eq_int(
+        (e.store.usage(a1) or st::UsageRow { }).input_tokens,
+        100,
+        "metered as it started: its own tokens",
+    );
+    let read1 = call(e, "GET", "/admin/v1/attempts/" + a1, op, "");
+    std::test::assert_eq_str(
+        str(read1.body, "recipe_digest"),
+        "sha256:" + std::hex::encode(std::crypto::sha256(std::bytes::from_string(handed))),
+        "and it names the recipe it started with",
+    );
+    // voice's key, edited to a vendor's while it runs: still none of them
+    let a2 = str(
+        call(e, "POST", "/v1/attempts", key, std::str::replace(ASK, "\"mine\"", "\"routed\"")).body,
+        "id",
+    );
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 200, "claimed");
+    expect(
+        call(e, "PUT", "/admin/v1/cli-recipes/routed", op, boxed("routed", VENDOR_LOGIN)),
+        200,
+        "edited to a vendor's login",
+    );
+    end_with_usage(e, token, a2);
+    std::test::assert_eq_int(
+        (e.store.usage(a2) or st::UsageRow { }).input_tokens,
+        0,
+        "metered as it started: the ledger's",
+    );
+    // removed while it runs: settled as it started
+    expect(
+        call(e, "PUT", "/admin/v1/cli-recipes/metered", op, boxed("metered", VENDOR_LOGIN)),
+        200,
+        "a vendor's again",
+    );
+    let a3 = str(
+        call(
+            e,
+            "POST",
+            "/v1/attempts",
+            key,
+            std::str::replace(ASK, "\"mine\"", "\"metered\""),
+        ).body,
+        "id",
+    );
+    expect(call(e, "POST", "/node/v1/attempts/claim", token, "{}"), 200, "claimed");
+    seats.remove(api::SeatRef { node: "node-a", seat: "met" }) or discard;
+    expect(
+        call(e, "DELETE", "/admin/v1/cli-recipes/metered", op, ""),
+        200,
+        "removed while it runs",
+    );
+    end_with_usage(e, token, a3);
+    std::test::assert_eq_int(
+        (e.store.usage(a3) or st::UsageRow { }).input_tokens,
+        100,
+        "settled as it started",
+    );
 }

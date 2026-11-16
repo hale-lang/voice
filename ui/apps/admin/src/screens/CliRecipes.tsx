@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Panel, Table, Loading, Unavailable, Missing, Kv, Mono, Status, Form, Field, TextInput, TextArea, NumberInput, Select, ListInput, Button, Confirm, when } from '@hale/components';
 import { useGet, type Schemas } from '../api/client';
 import { useWrite } from '../api/mutate';
@@ -7,6 +7,9 @@ import { go, href } from '../route';
 import { readout } from '../readout';
 import {
   HOST_WARNING,
+  argvCanon,
+  envCanon,
+  keepDraft,
   PROTOCOLS,
   READERS,
   backendLine,
@@ -193,6 +196,34 @@ function Duplicate({ from }: { from: CliRecipe }) {
   );
 }
 
+/**
+ * Lines edited as text: the operator's draft is kept as typed (a newline
+ * before the next argument, a variable's name before its `=`), and what it
+ * says goes to the recipe at once (`onText`); the recipe's own text replaces
+ * the draft only when the recipe changed from elsewhere.
+ */
+function LinesArea(props: { text: string; onText: (draft: string) => void; canon: (s: string) => string; rows: number }) {
+  const [draft, setDraft] = useState(props.text);
+  const latest = useRef(draft);
+  latest.current = draft;
+  const { text, canon } = props;
+  useEffect(() => {
+    const kept = keepDraft(latest.current, text, canon);
+    if (kept !== latest.current) setDraft(kept);
+  }, [text, canon]);
+  return (
+    <TextArea
+      mono
+      rows={props.rows}
+      value={draft}
+      onChange={(v) => {
+        setDraft(v);
+        props.onText(v);
+      }}
+    />
+  );
+}
+
 /** A form field at a recipe path, the api's refusal shown on it when it is this field's. */
 function At(props: { label: string; at: string; refused: string; message: string | null; required?: boolean; help?: string; children: ReactNode }) {
   return (
@@ -314,10 +345,10 @@ function RecipeEditor({ existing, done }: { existing?: CliRecipe; done?: () => v
                 ) : (
                   <>
                     <p className="c-wait" style={{ marginTop: 0 }}>{HOST_WARNING}</p>
-                    {at('detect', `backends[${i}].detect.command`, <TextArea mono rows={2} value={linesAt(recipe, ['backends', i, 'detect', 'command'])} onChange={(v) => set(['backends', i, 'detect', 'command'], linesOf(v))} />, { required: true, help: 'the argv that prints its version, one argument a line: run with no shell' })}
+                    {at('detect', `backends[${i}].detect.command`, <LinesArea rows={2} canon={argvCanon} text={linesAt(recipe, ['backends', i, 'detect', 'command'])} onText={(v) => set(['backends', i, 'detect', 'command'], linesOf(v))} />, { required: true, help: 'the argv that prints its version, one argument a line: run with no shell' })}
                     {at('version pattern', `backends[${i}].detect.version`, <TextInput mono value={textAt(recipe, ['backends', i, 'detect', 'version'])} onChange={(v) => set(['backends', i, 'detect', 'version'], v)} required placeholder="my-cli ([0-9.]+)" />, { required: true, help: 'matched against a line of what detect prints; its first group must be the pinned version' })}
-                    {at('install', `backends[${i}].install.command`, <TextArea mono rows={3} value={linesAt(recipe, ['backends', i, 'install', 'command'])} onChange={(v) => setRecipe((r) => withHostInstall(r, i, v))} />, { help: 'the argv that installs the pin into voice\'s prefix, one argument a line, naming it as $VOICE_CLI_PREFIX; never sudo, never system-wide. Empty: detect alone' })}
-                    {at('install variables', `backends[${i}].install.env`, <TextArea mono rows={2} value={envLinesAt(recipe, ['backends', i, 'install', 'env'])} onChange={(v) => { const env = envOf(v); set(['backends', i, 'install', 'env'], Object.keys(env).length ? env : undefined); }} />, { help: 'NAME=value, one a line, such as UV_TOOL_DIR=$VOICE_CLI_PREFIX/tools' })}
+                    {at('install', `backends[${i}].install.command`, <LinesArea rows={3} canon={argvCanon} text={linesAt(recipe, ['backends', i, 'install', 'command'])} onText={(v) => setRecipe((r) => withHostInstall(r, i, v))} />, { help: 'the argv that installs the pin into voice\'s prefix, one argument a line, naming it as $VOICE_CLI_PREFIX; never sudo, never system-wide. Empty: detect alone' })}
+                    {at('install variables', `backends[${i}].install.env`, <LinesArea rows={2} canon={envCanon} text={envLinesAt(recipe, ['backends', i, 'install', 'env'])} onText={(v) => { const env = envOf(v); set(['backends', i, 'install', 'env'], Object.keys(env).length ? env : undefined); }} />, { help: 'NAME=value, one a line, such as UV_TOOL_DIR=$VOICE_CLI_PREFIX/tools' })}
                   </>
                 )}
               </Panel>
@@ -328,7 +359,7 @@ function RecipeEditor({ existing, done }: { existing?: CliRecipe; done?: () => v
               <Button onClick={() => setRecipe((r) => ({ ...normalized(r), backends: [...backendsOf(r), newBackend('host')] as Json[] }))} disabled={backends.length >= 4}>add the host</Button>
             </p>
             <h3>What it runs</h3>
-            {at('command', 'command', <TextArea mono rows={6} value={linesAt(recipe, ['command'])} onChange={(v) => set(['command'], linesOf(v))} />, { required: true, help: 'its argv, one argument a line, its permission policy among it: never a flag that skips it. Paths are the container\'s (/work, /voice); a host run is handed its own' })}
+            {at('command', 'command', <LinesArea rows={6} canon={argvCanon} text={linesAt(recipe, ['command'])} onText={(v) => set(['command'], linesOf(v))} />, { required: true, help: 'its argv, one argument a line, its permission policy among it: never a flag that skips it. Paths are the container\'s (/work, /voice); a host run is handed its own' })}
             {at('instruction via', 'instruction.via', <Select value={via} onChange={(v) => set(['instruction'], v === 'file' ? { via: v, path: textAt(recipe, ['instruction', 'path']) || '/voice/instruction.md' } : { via: v })} options={[{ value: 'stdin' }, { value: 'argument', label: 'the last argument' }, { value: 'file', label: 'a file of /voice' }]} required />, { required: true })}
             {via === 'file' && at('instruction file', 'instruction.path', <TextInput mono value={textAt(recipe, ['instruction', 'path'])} onChange={(v) => set(['instruction', 'path'], v)} required />, { required: true })}
             {at('model by', 'model', <Select value={model.by} onChange={(v) => setRecipe((r) => withModel(r, v as 'flag' | 'env', modelBy(r).name))} options={[{ value: 'flag', label: 'a flag' }, { value: 'env', label: 'a variable' }]} required />, { required: true })}

@@ -115,6 +115,28 @@ export function envOf(text: string): Record<string, string> {
   return out;
 }
 
+/** What argv lines say, as the recipe keeps them: one argument a line, no blank ones. */
+export function argvCanon(text: string): string {
+  return linesOf(text).join('\n');
+}
+
+/** What variable lines say, as the recipe keeps them: `NAME=value` lines, a line with no `=` none. */
+export function envCanon(text: string): string {
+  return Object.entries(envOf(text))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+}
+
+/**
+ * The text a line editor shows: the operator's draft while it says what the
+ * recipe holds (`text`), half-typed lines and all (a newline before the next
+ * argument, a variable's name before its `=`); the recipe's own once it
+ * changed from elsewhere (the raw tab, a backend moved or removed).
+ */
+export function keepDraft(draft: string, text: string, canon: (s: string) => string): string {
+  return canon(draft) === text ? draft : text;
+}
+
 export type Backend = { kind: 'container' | 'host'; [k: string]: Json };
 
 /** A recipe's backends, the older `image` read as one container backend. */

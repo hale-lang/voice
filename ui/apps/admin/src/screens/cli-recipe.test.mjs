@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  argvCanon,
+  envCanon,
+  keepDraft,
   backendLine,
   backendsOf,
   blankRecipe,
@@ -133,4 +136,17 @@ test('a blank recipe has the shape the api asks for', () => {
   assert.equal(backendLine(b), 'container');
   assert.equal(b.reader, 'text');
   assert.deepEqual(b.instruction, { via: 'stdin' });
+});
+
+test('a draft is kept while it says what the recipe holds, half-typed lines and all', () => {
+  // Enter after an argument, before the next
+  assert.equal(keepDraft('codex\n', argvCanon('codex\n'), argvCanon), 'codex\n');
+  assert.equal(keepDraft('codex\n\nexec', 'codex\nexec', argvCanon), 'codex\n\nexec');
+  // a variable's name before its `=`
+  assert.equal(envCanon('U'), '');
+  assert.equal(keepDraft('U', '', envCanon), 'U');
+  assert.equal(keepDraft('A=1\nUV_TO', 'A=1', envCanon), 'A=1\nUV_TO');
+  // the recipe changed from elsewhere: its own text
+  assert.equal(keepDraft('codex\n', 'claude\n-p', argvCanon), 'claude\n-p');
+  assert.equal(keepDraft('A=1', 'B=2', envCanon), 'B=2');
 });

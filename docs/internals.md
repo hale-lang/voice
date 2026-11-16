@@ -1321,9 +1321,11 @@ already there.
   its organisms' legs): its model calls are requests like any other. Voice
   once ran them itself, as coding attempts on a `harness` engine; store
   migration 45 drops what the api kept of them, and a node starting where
-  they ran removes what they left, once (`node/leftovers.hl`): the
-  containers and networks labelled `net.hale-lang.voice.attempt.node=<its
-  id>`, and its data directory's `attempts/` and `clis/`; the images they
+  they ran removes what they left (`node/leftovers.hl`): the containers
+  and networks labelled `net.hale-lang.voice.attempt.node=<its id>`, then
+  its data directory's `attempts/` and `clis/`, which it keeps, and tries
+  again at its next start, while docker does not answer or refuses a
+  removal; the images they
   built, labelled
   `net.hale-lang.voice.image=harness`, are the operator's to prune
   (`docker image prune -a --filter label=net.hale-lang.voice.image=harness`).

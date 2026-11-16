@@ -2,27 +2,41 @@
 // they left voice: coding harnesses run outside it now, as clients of its
 // API. A node from before labelled every container and network an attempt
 // made with its own id, and ran attempts in `<data>/attempts`, with CLIs
-// installed on the host in `<data>/clis`. A starting node removes them once:
-// what carries voice's attempt label for this node, and those two
-// directories of its own data. No image is removed (an attempt's image
+// installed on the host in `<data>/clis`. A starting node removes them:
+// what carries voice's attempt label for this node, then those two
+// directories of its own data, which say there is still something to
+// remove until they are gone. No image is removed (an attempt's image
 // carries `net.hale-lang.voice.image=harness`, the operator's to prune).
 
 /// The label every container and network of an attempt carried, its node
 /// the value.
 const ATTEMPT_LABEL: String = "net.hale-lang.voice.attempt.node";
 
-/// What coding attempts left on this node, removed: once, while either
+/// What coding attempts left on this node, removed: while either
 /// directory is there (a node from before made `<data>/attempts` at every
 /// start), so a node that never ran one, or has removed what they left,
-/// asks docker nothing.
+/// asks docker nothing. The directories go last, once docker listed and
+/// removed every labelled container and network, so a start where docker
+/// does not answer, or a removal fails, leaves them, and the next start
+/// tries again. A machine with no docker had no container of an attempt
+/// (they ran on its host there): its directories go at once.
 fn remove_attempt_leftovers(node: String, data: String) {
     let runs = data + "/attempts";
     let clis = data + "/clis";
     if !std::io::fs::file_exists(runs) && !std::io::fs::file_exists(clis) { return; }
-    let containers = run_out("docker\nps\n-aq\n--filter\nlabel=" + ATTEMPT_LABEL + "=" + node);
-    remove_each("docker\nrm\n-f\n", containers);
-    let nets = run_out("docker\nnetwork\nls\n-q\n--filter\nlabel=" + ATTEMPT_LABEL + "=" + node);
-    remove_each("docker\nnetwork\nrm\n", nets);
+    if len(std::str::trim(run_out("sh\n-c\ncommand -v docker"))) > 0 {
+        let label = "label=" + ATTEMPT_LABEL + "=" + node;
+        let containers = docker_out("docker\nps\n-aq\n--filter\n" + label);
+        let removed = containers.ok && remove_all("docker\nrm\n-f\n", containers.out);
+        let nets = docker_out("docker\nnetwork\nls\n-q\n--filter\n" + label);
+        if !removed || !nets.ok || !remove_all("docker\nnetwork\nrm\n", nets.out) {
+            log_warn(
+                "what coding attempts left could not all be removed: docker did not answer, or refused a removal; the next start tries again",
+                std::log::kv("node", node),
+            );
+            return;
+        }
+    }
     run_out("rm\n-rf\n" + runs + "\n" + clis);
     log_info(
         "removed what coding attempts left: coding harnesses run outside voice now",
@@ -30,14 +44,24 @@ fn remove_attempt_leftovers(node: String, data: String) {
     );
 }
 
-/// `command` run for each id, a line each, in `ids`.
-@bounded_by(ids)
-fn remove_each(command: String, ids: String) {
-    let mut rest = ids;
-    while len(rest) > 0 {
-        let nl = std::str::index_of(rest, "\n");
-        let id = std::str::trim(if nl < 0 { rest } else { rest[0..nl] });
-        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
-        if len(id) > 0 { run_out(command + id); }
-    }
+/// A command's output, and whether it ran and exited 0.
+type DockerOut { out: String = ""; ok: Bool = false; }
+
+/// `argv` run: its stdout, `ok` only when it exited 0.
+fn docker_out(argv: String) -> DockerOut {
+    let o = std::process::run(argv) or std::process::ProcessOutput {
+        code: 1,
+        signal: 0,
+        stdout: "",
+        stderr: "",
+    };
+    return DockerOut { out: o.stdout, ok: o.code == 0 };
+}
+
+/// `command` run once on every id in `ids` (a line each), as docker's `rm`
+/// takes several: true when it exited 0, or there were none.
+fn remove_all(command: String, ids: String) -> Bool {
+    let listed = std::str::trim(ids);
+    if len(listed) == 0 { return true; }
+    return docker_out(command + listed).ok;
 }

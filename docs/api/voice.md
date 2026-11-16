@@ -218,6 +218,7 @@ client can pace itself instead of discovering the wall by failing.
 - [routes](#tag-routes) (2)
 - [tools](#tag-tools) (2)
 - [attempts](#tag-attempts) (14)
+- [cli-recipes](#tag-cli-recipes) (7)
 - [node](#tag-node) (13)
 - [health](#tag-health) (2)
 - [annotations](#tag-annotations) (12)
@@ -3676,16 +3677,15 @@ Responses:
 
 ### GET `/admin/v1/harnesses`
 
-**The harness definitions voice has** · `listHarnesses`
+**The enabled CLI recipes** · `listHarnesses`
 
 Authentication: operatorToken
 
 The agentic coding CLIs voice runs, each as data
-(`HarnessDefinition`): voice's own, in its `harnesses` directory,
-read at start and held to the rules (no bypass flag, a base image by
-digest, a login only by environment or a per-login directory). A
-harness seat names one by its id; the admin UI's seat form reads how
-each one's login is set up from here.
+(`HarnessDefinition`): the enabled CLI recipes (`listCliRecipes`),
+voice's own and the operator's, as they are. A harness seat names
+one by its id; the admin UI's seat form reads how each one's login
+is set up from here.
 
 Responses:
 
@@ -3694,6 +3694,301 @@ Responses:
 | 200 | The definitions. | `application/json` [HarnessList](#schema-harnesslist) |
 | 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+<a id="tag-cli-recipes"></a>
+
+## cli-recipes
+
+Admin plane. CLI recipes: the agentic coding CLIs coding attempts run, voice's own and the operator's, each where it may run (a container, or the node's own machine).
+
+### GET `/admin/v1/cli-recipes`
+
+**Every CLI recipe** · `listCliRecipes`
+
+Authentication: operatorToken
+
+Voice's own recipes (`origin` `shipped`: its `harnesses` directory,
+written to the store as each api starts, read-only) and the
+operator's (`operator`), in the order of their ids, each with the
+seats that name it.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The recipes. | `application/json` [CliRecipeList](#schema-clirecipelist) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/cli-recipes`
+
+**Make one of the operator's CLI recipes** · `createCliRecipe`
+
+Authentication: operatorToken
+
+A recipe of the operator's, held to the rules every recipe is
+(lib/harness): its backends (a container image pinned by digest
+with one install command; the host, with a detect whose version
+pattern reads the recipe's pinned `version`, and an install into
+voice's own prefix, never system-wide and never as another user),
+its argv with no flag that skips the CLI's permissions, its login
+only by environment or a per-login directory. A refusal is 400,
+naming the field at fault in `error.param` (`recipe.<field>`, as
+`recipe.backends[1].install.command`). An id voice or the operator
+holds is 409. Enabled as it is made.
+
+Request body
+
+`application/json`
+
+Schema: [HarnessDefinition](#schema-harnessdefinition)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
+| `name` | string | yes |  |  |
+| `version` | string |  | The CLI's version its backends install, pinned; a recipe with a host backend needs one. |  |
+| `backends` | array of [HarnessBackend](#schema-harnessbackend) |  | Where the CLI may run, in order. A seat runs the first of the kind it allows (a container, unless its config opts in to the host, `backend: host`) that its node can run: a container where the node has docker; the host where detect finds the CLI at the pinned version, or the backend's install puts it in voice's prefix. None fits: the attempt fails `backend_unavailable`. A recipe has `backends` or the older `image`, not both. | items ≥ 1; items ≤ 4 |
+| `image` | object |  | The older form of one container backend (`backends: [{"kind": "container", ...}]`), read as that. | deprecated |
+| `image.base` | string | yes | A base image by digest: `<image>@sha256:<64 hex>`. |  |
+| `image.install` | string | yes | The one shell command that installs the CLI on it, pinned to a version where the vendor publishes one. |  |
+| `files` | array of object |  | Files voice writes in the attempt's `/voice` for the run (read-only to the CLI), beside its instruction, each at most 64 KiB. | items ≤ 8 |
+| `files[].path` | string | yes | A file directly in `/voice`, not `instruction.md` or `message`. |  |
+| `files[].text` | string | yes |  |  |
+| `command` | array of string | yes | The CLI's argv, its permission policy among it. |  |
+| `instruction` | object | yes |  |  |
+| `instruction.via` | string, one of `stdin`, `argument`, `file` | yes |  |  |
+| `instruction.path` | string |  | For `file`: a file of `/voice`, mounted read-only. |  |
+| `model` | object | yes | How a model is named, by a flag or an environment variable. |  |
+| `model.flag` | string |  |  |  |
+| `model.env` | string |  |  |  |
+| `login` | object | yes | How a login reaches a run. `env`: a vault entry's value, in the variable `env`, read into the container's environment and never its argv. `home`: a directory per login on the node (`<data>/logins/<login>`), of which only `files` are copied into the attempt's scratch copy, mounted at `mount` (and copied back when the CLI refreshes them). `voice`: no vendor's login but a key voice mints for each attempt as a node claims it (`AttemptStart.credential`), handed in the variable `env` as an `env` login is: the attempt's project's, charged as the key that asked for the attempt, for the caller plane's inference alone (`/v1/responses`, `/v1/chat/completions`, `/v1/models`; any other route refuses it with 403), its requests the attempt's conversation, and naming nobody once the attempt ends or passes its deadline, or the key that asked stops holding (revoked, or a habitat tenant's whose member is rotated or removed). A seat of such a CLI names no login. |  |
+| `login.kind` | string, one of `env`, `home`, `voice` | yes |  |  |
+| `login.env` | string |  |  |  |
+| `login.mount` | string |  |  |  |
+| `login.from` | string |  |  |  |
+| `login.files` | array of string |  |  |  |
+| `login.entry` | string |  | The name voice suggests for a login of `{account}`: the vault entry or login directory a seat names. |  |
+| `login.setup` | string |  | How the operator makes a login, on the node. |  |
+| `login.describe` | string |  |  |  |
+| `env` | object |  |  |  |
+| `reader` | string, one of `text`, `claude-stream-json`, `codex-jsonl`, `agy-stream-json`, `vibe-streaming` | yes | How its output is read into the transcript, its summary and its usage. |  |
+| `usage_file` | string |  | A file of `/voice/out` the CLI writes its usage to, read after the run. |  |
+| `commits` | boolean | yes | The CLI commits its work itself; voice commits what is left either way. |  |
+| `nested_sandbox` | boolean |  | The CLI sandboxes its own commands with user namespaces (bubblewrap), which the container then allows. |  |
+| `preamble` | string | yes |  |  |
+| `egress` | array of string | yes | The vendor's hosts; a leading dot allows any host under it. |  |
+| `idle_seconds` | integer |  | How long it may write nothing before it has failed. |  |
+| `base_url_env` | string \| null |  | For a CLI whose model calls go to voice (its `login.kind` is `voice`, and only then): the variable the node puts voice's base URL in, the address the node itself calls the api at with `/v1` after it. The attempt's egress proxy then lets through exactly that host and port besides `egress`. An api the node reaches at a loopback address is one no container reaches: such an attempt fails `sandbox_failed`. Null for a CLI whose calls go to its vendor. |  |
+| `protocol` | string \| null, one of `openai-chat`, `openai-responses`, `null` |  | The wire a CLI whose model calls go to voice speaks, one voice serves at its `/v1`: `openai-chat` (`/v1/chat/completions`) or `openai-responses` (`/v1/responses`). Set with `base_url_env`, null with it. |  |
+| `mcp` | object \| null |  | An MCP configuration to inject. Not used yet. |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 201 | The recipe, made. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 409 | A resource with that id already exists. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### GET `/admin/v1/cli-recipes/{cli_recipe}`
+
+**One CLI recipe** · `getCliRecipe`
+
+Authentication: operatorToken
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `cli_recipe` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The recipe. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PUT `/admin/v1/cli-recipes/{cli_recipe}`
+
+**Replace one of the operator's CLI recipes** · `updateCliRecipe`
+
+Authentication: operatorToken
+
+The recipe, replaced whole by the body, held to the rules as
+`createCliRecipe`'s is; it keeps its id. Voice's own are read-only
+(409): duplicate one to edit it. An attempt already running runs
+on with the recipe it started with.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `cli_recipe` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [HarnessDefinition](#schema-harnessdefinition)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
+| `name` | string | yes |  |  |
+| `version` | string |  | The CLI's version its backends install, pinned; a recipe with a host backend needs one. |  |
+| `backends` | array of [HarnessBackend](#schema-harnessbackend) |  | Where the CLI may run, in order. A seat runs the first of the kind it allows (a container, unless its config opts in to the host, `backend: host`) that its node can run: a container where the node has docker; the host where detect finds the CLI at the pinned version, or the backend's install puts it in voice's prefix. None fits: the attempt fails `backend_unavailable`. A recipe has `backends` or the older `image`, not both. | items ≥ 1; items ≤ 4 |
+| `image` | object |  | The older form of one container backend (`backends: [{"kind": "container", ...}]`), read as that. | deprecated |
+| `image.base` | string | yes | A base image by digest: `<image>@sha256:<64 hex>`. |  |
+| `image.install` | string | yes | The one shell command that installs the CLI on it, pinned to a version where the vendor publishes one. |  |
+| `files` | array of object |  | Files voice writes in the attempt's `/voice` for the run (read-only to the CLI), beside its instruction, each at most 64 KiB. | items ≤ 8 |
+| `files[].path` | string | yes | A file directly in `/voice`, not `instruction.md` or `message`. |  |
+| `files[].text` | string | yes |  |  |
+| `command` | array of string | yes | The CLI's argv, its permission policy among it. |  |
+| `instruction` | object | yes |  |  |
+| `instruction.via` | string, one of `stdin`, `argument`, `file` | yes |  |  |
+| `instruction.path` | string |  | For `file`: a file of `/voice`, mounted read-only. |  |
+| `model` | object | yes | How a model is named, by a flag or an environment variable. |  |
+| `model.flag` | string |  |  |  |
+| `model.env` | string |  |  |  |
+| `login` | object | yes | How a login reaches a run. `env`: a vault entry's value, in the variable `env`, read into the container's environment and never its argv. `home`: a directory per login on the node (`<data>/logins/<login>`), of which only `files` are copied into the attempt's scratch copy, mounted at `mount` (and copied back when the CLI refreshes them). `voice`: no vendor's login but a key voice mints for each attempt as a node claims it (`AttemptStart.credential`), handed in the variable `env` as an `env` login is: the attempt's project's, charged as the key that asked for the attempt, for the caller plane's inference alone (`/v1/responses`, `/v1/chat/completions`, `/v1/models`; any other route refuses it with 403), its requests the attempt's conversation, and naming nobody once the attempt ends or passes its deadline, or the key that asked stops holding (revoked, or a habitat tenant's whose member is rotated or removed). A seat of such a CLI names no login. |  |
+| `login.kind` | string, one of `env`, `home`, `voice` | yes |  |  |
+| `login.env` | string |  |  |  |
+| `login.mount` | string |  |  |  |
+| `login.from` | string |  |  |  |
+| `login.files` | array of string |  |  |  |
+| `login.entry` | string |  | The name voice suggests for a login of `{account}`: the vault entry or login directory a seat names. |  |
+| `login.setup` | string |  | How the operator makes a login, on the node. |  |
+| `login.describe` | string |  |  |  |
+| `env` | object |  |  |  |
+| `reader` | string, one of `text`, `claude-stream-json`, `codex-jsonl`, `agy-stream-json`, `vibe-streaming` | yes | How its output is read into the transcript, its summary and its usage. |  |
+| `usage_file` | string |  | A file of `/voice/out` the CLI writes its usage to, read after the run. |  |
+| `commits` | boolean | yes | The CLI commits its work itself; voice commits what is left either way. |  |
+| `nested_sandbox` | boolean |  | The CLI sandboxes its own commands with user namespaces (bubblewrap), which the container then allows. |  |
+| `preamble` | string | yes |  |  |
+| `egress` | array of string | yes | The vendor's hosts; a leading dot allows any host under it. |  |
+| `idle_seconds` | integer |  | How long it may write nothing before it has failed. |  |
+| `base_url_env` | string \| null |  | For a CLI whose model calls go to voice (its `login.kind` is `voice`, and only then): the variable the node puts voice's base URL in, the address the node itself calls the api at with `/v1` after it. The attempt's egress proxy then lets through exactly that host and port besides `egress`. An api the node reaches at a loopback address is one no container reaches: such an attempt fails `sandbox_failed`. Null for a CLI whose calls go to its vendor. |  |
+| `protocol` | string \| null, one of `openai-chat`, `openai-responses`, `null` |  | The wire a CLI whose model calls go to voice speaks, one voice serves at its `/v1`: `openai-chat` (`/v1/chat/completions`) or `openai-responses` (`/v1/responses`). Set with `base_url_env`, null with it. |  |
+| `mcp` | object \| null |  | An MCP configuration to inject. Not used yet. |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The recipe, replaced. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 409 | A resource with that id already exists. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### PATCH `/admin/v1/cli-recipes/{cli_recipe}`
+
+**Enable or disable a CLI recipe** · `setCliRecipeEnabled`
+
+Authentication: operatorToken
+
+Voice's own or the operator's. A disabled recipe's seats take no new
+attempt, and say so among their problems; an attempt that asks for
+it is refused. One already running runs on.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `cli_recipe` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [CliRecipeEnabled](#schema-clirecipeenabled)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `enabled` | boolean | yes |  |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The recipe. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### DELETE `/admin/v1/cli-recipes/{cli_recipe}`
+
+**Remove one of the operator's CLI recipes** · `deleteCliRecipe`
+
+Authentication: operatorToken
+
+Removed when no seat names it (409 while one does: disable it
+instead, or point its seats at another). Voice's own are never
+removed (409): disable one instead.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `cli_recipe` | path | string | yes |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The recipe, as it was. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 409 | A resource with that id already exists. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
+### POST `/admin/v1/cli-recipes/{cli_recipe}/duplicate`
+
+**Copy a CLI recipe into one of the operator's** · `duplicateCliRecipe`
+
+Authentication: operatorToken
+
+A copy of the recipe (voice's own or the operator's) as one of the
+operator's, under the body's `id` and, when it gives one, `name`:
+how voice's own, which are read-only, are edited.
+
+Parameters:
+
+| Name | In | Type | Required | Description |
+|---|---|---|---|---|
+| `cli_recipe` | path | string | yes |  |
+
+Request body
+
+`application/json`
+
+Schema: [CliRecipeDuplicate](#schema-clirecipeduplicate)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes | The copy's id. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
+| `name` | string |  | The copy's name; the original's when left out. |  |
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 201 | The copy. | `application/json` [CliRecipe](#schema-clirecipe) |
+| 400 | The request is malformed or names an unsupported option. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 404 | No such resource. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 409 | A resource with that id already exists. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
 <a id="tag-node"></a>
 
@@ -5361,6 +5656,7 @@ Type: object
 | `transcript.events` | integer | yes | Events kept. |  |
 | `transcript.dropped` | integer | yes | The oldest events let go past the bound. |  |
 | `transcript_digest` | string \| null |  | The sha256 of the stored transcript, as `getAttemptTranscript` answers it, once the attempt ended; stable from then on. |  |
+| `recipe_digest` | string \| null |  | The sha256 of the CLI recipe it started with, as its node was handed it, once it started. A recipe edited or removed later changes neither this nor how the attempt is metered, which was fixed as it started. |  |
 | `bundle` | object \| null |  | The git bundle of its commits, while voice holds it. |  |
 | `bundle.url` | string | yes |  |  |
 | `bundle.bytes` | integer | yes |  |  |
@@ -5380,13 +5676,14 @@ Why an attempt failed, one value for each way voice fails one:
 - `no_changes`: the harness ran to its end and changed nothing on the branch.
 - `repo_unavailable`: `repo` could not be fetched, or `base` named no commit in it.
 - `login_unavailable`: the seat's login for its harness is missing on its node, or could not be handed to the harness (voice's own key included).
-- `sandbox_failed`: the attempt's container could not be made or run: no docker, an image that would not build, its network or egress proxy that would not start, or, for a harness whose model calls go to voice, a node that reaches the api at an address no container reaches (loopback).
+- `sandbox_failed`: the attempt's container could not be made or run: an image that would not build, its network or egress proxy that would not start, or, for a harness whose model calls go to voice, a node that reaches the api at an address no container reaches (loopback).
+- `backend_unavailable`: no backend of its CLI recipe of the kind its seat runs (a container, unless the seat opts in to the host) runs on its node: the recipe lists none, the node has no docker for a container, or on the host the CLI at the recipe's pinned version is neither found by detect nor put in voice's prefix by its install.
 - `bundle_too_large`: its commits' bundle is over 6 MiB, the most voice holds.
 - `node_lost`: its node stopped reporting it, registered again, or stopped while it ran.
 - `key_revoked`: its key was revoked, or its project archived, before a seat took it.
 - `internal`: voice itself failed (a step of its own, such as bundling the commits or making the workspace).
 
-Type: string, one of `over_budget`, `past_deadline`, `harness_failed`, `no_changes`, `repo_unavailable`, `login_unavailable`, `sandbox_failed`, `bundle_too_large`, `node_lost`, `key_revoked`, `internal`
+Type: string, one of `over_budget`, `past_deadline`, `harness_failed`, `no_changes`, `repo_unavailable`, `login_unavailable`, `sandbox_failed`, `backend_unavailable`, `bundle_too_large`, `node_lost`, `key_revoked`, `internal`
 
 <a id="schema-codingattemptlist"></a>
 
@@ -5420,13 +5717,19 @@ Type: object
 
 ### HarnessDefinition
 
-An agentic coding CLI as data, which voice's one wrapper runs: in a
-container of the attempt's own, with only the workspace mounted, its
+A CLI recipe: an agentic coding CLI as data, which voice's one
+wrapper runs where its backends say. In a container of the
+attempt's own (`container`), with only the workspace mounted, its
 egress through a proxy that lets through only `egress`, the
 registries, and the seat's own hosts (and voice's api, for a CLI
-whose model calls go to voice). Nothing in it skips the CLI's own
-permissions: a definition whose command holds a bypass flag is
-refused.
+whose model calls go to voice). On the node's own machine (`host`),
+for a seat that opts in to it: as the node's user, in the attempt's
+workspace, with a home of its own and none of the node's
+environment but its PATH, user and language; with **no sandbox and
+no egress filter**. Nothing in it skips the CLI's own permissions:
+a recipe whose command holds a bypass flag is refused. Paths in it
+are the container's (`/work`, `/voice`, `/home/voice`); a host run
+is handed the attempt's own directories in their place.
 
 Type: object
 
@@ -5434,10 +5737,14 @@ Type: object
 |---|---|---|---|---|
 | `id` | string | yes |  | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
 | `name` | string | yes |  |  |
-| `version` | string |  | The CLI's version the image installs. |  |
-| `image` | object | yes | What it runs in, built once on a node. |  |
+| `version` | string |  | The CLI's version its backends install, pinned; a recipe with a host backend needs one. |  |
+| `backends` | array of [HarnessBackend](#schema-harnessbackend) |  | Where the CLI may run, in order. A seat runs the first of the kind it allows (a container, unless its config opts in to the host, `backend: host`) that its node can run: a container where the node has docker; the host where detect finds the CLI at the pinned version, or the backend's install puts it in voice's prefix. None fits: the attempt fails `backend_unavailable`. A recipe has `backends` or the older `image`, not both. | items ≥ 1; items ≤ 4 |
+| `image` | object |  | The older form of one container backend (`backends: [{"kind": "container", ...}]`), read as that. | deprecated |
 | `image.base` | string | yes | A base image by digest: `<image>@sha256:<64 hex>`. |  |
 | `image.install` | string | yes | The one shell command that installs the CLI on it, pinned to a version where the vendor publishes one. |  |
+| `files` | array of object |  | Files voice writes in the attempt's `/voice` for the run (read-only to the CLI), beside its instruction, each at most 64 KiB. | items ≤ 8 |
+| `files[].path` | string | yes | A file directly in `/voice`, not `instruction.md` or `message`. |  |
+| `files[].text` | string | yes |  |  |
 | `command` | array of string | yes | The CLI's argv, its permission policy among it. |  |
 | `instruction` | object | yes |  |  |
 | `instruction.via` | string, one of `stdin`, `argument`, `file` | yes |  |  |
@@ -5465,6 +5772,89 @@ Type: object
 | `base_url_env` | string \| null |  | For a CLI whose model calls go to voice (its `login.kind` is `voice`, and only then): the variable the node puts voice's base URL in, the address the node itself calls the api at with `/v1` after it. The attempt's egress proxy then lets through exactly that host and port besides `egress`. An api the node reaches at a loopback address is one no container reaches: such an attempt fails `sandbox_failed`. Null for a CLI whose calls go to its vendor. |  |
 | `protocol` | string \| null, one of `openai-chat`, `openai-responses`, `null` |  | The wire a CLI whose model calls go to voice speaks, one voice serves at its `/v1`: `openai-chat` (`/v1/chat/completions`) or `openai-responses` (`/v1/responses`). Set with `base_url_env`, null with it. |  |
 | `mcp` | object \| null |  | An MCP configuration to inject. Not used yet. |  |
+
+<a id="schema-harnessbackend"></a>
+
+### HarnessBackend
+
+One place a recipe's CLI may run. `container`: an image built once on
+the node from `base`, pinned by digest, with `install`, one shell
+command. `host`: the node's own machine. `detect.command` is an argv
+(no shell) that prints the CLI's version, run on the node's PATH
+after voice's prefix; `detect.version` a pattern of one line whose
+first group, at its top level, must be the recipe's `version`
+(standard escapes; no `|` outside a group). `install`, left out to
+detect alone, puts that version in voice's own prefix,
+`<data>/clis/<recipe>/<version>`, handed to it as
+`VOICE_CLI_PREFIX` and wherever its argv or `env` names
+`$VOICE_CLI_PREFIX`: once per node, kept and shared, its `bin` first
+on the run's PATH. Never system-wide and never as another user: an
+argv that runs a shell, `sudo` or `su`, or names a path outside the
+prefix, is refused (a check of the argv as written, best effort; the
+prefix is the contract). Detect and install run with no shell, a
+scrubbed environment and a time limit.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `kind` | string, one of `container`, `host` | yes |  |  |
+| `base` | string |  | For `container`: a base image by digest, `<image>@sha256:<64 hex>`. |  |
+| `install` | string \| object |  | For `container`: the one shell command that installs the CLI on its base. For `host`: the argv that installs it into voice's prefix, and the variables it runs with. |  |
+| `detect` | object |  | For `host`: how the CLI is found at its pinned version. |  |
+| `detect.command` | array of string | yes |  | items ≥ 1 |
+| `detect.version` | string | yes |  |  |
+
+<a id="schema-clirecipe"></a>
+
+### CliRecipe
+
+A CLI recipe as voice holds it.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `object` | `"cli_recipe"` | yes |  |  |
+| `id` | string | yes |  |  |
+| `origin` | string, one of `shipped`, `operator` | yes | `shipped`: voice's own, from its files, read-only; `operator`: the operator's. |  |
+| `enabled` | boolean | yes | A disabled recipe's seats take no new attempt. |  |
+| `created_at` | string (date-time) | yes |  |  |
+| `updated_at` | string (date-time) | yes |  |  |
+| `seats` | array of string | yes | The seats that name it (`<node>/<seat>`); a recipe a seat names is never removed. |  |
+| `recipe` | [HarnessDefinition](#schema-harnessdefinition) | yes |  |  |
+
+<a id="schema-clirecipelist"></a>
+
+### CliRecipeList
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `object` | `"list"` | yes |  |  |
+| `data` | array of [CliRecipe](#schema-clirecipe) | yes |  | items ≤ 64 |
+
+<a id="schema-clirecipeenabled"></a>
+
+### CliRecipeEnabled
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `enabled` | boolean | yes |  |  |
+
+<a id="schema-clirecipeduplicate"></a>
+
+### CliRecipeDuplicate
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `id` | string | yes | The copy's id. | pattern `^[a-z0-9][a-z0-9-]{0,62}$` |
+| `name` | string |  | The copy's name; the original's when left out. |  |
 
 <a id="schema-harnesslist"></a>
 
@@ -5499,6 +5889,7 @@ Type: object
 | `attempt.credential` | string |  | For a CLI whose `login.kind` is `voice`: the key voice minted for this attempt's run, here and nowhere else (the store keeps its digest alone). The node hands it to the CLI as it hands a vault login, by name in the container's environment, never an argv, and keeps no copy. |  |
 | `attempt.budget_tokens` | integer | yes | 0 for none. |  |
 | `attempt.deadline` | integer | yes | Unix seconds. |  |
+| `attempt.backend` | string, one of `container`, `host` |  | Where the seat lets its recipe run: `container`, or `host` when its config opts in. The node runs the first backend of the recipe of that kind it can run. |  |
 | `attempt.as` | [CommitIdentity](#schema-commitidentity) | yes |  |  |
 | `attempt.egress` | array of string | yes |  |  |
 | `attempt.harness` | [HarnessDefinition](#schema-harnessdefinition) | yes |  |  |

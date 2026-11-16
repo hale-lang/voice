@@ -1,0 +1,382 @@
+// Attempts on the host backend (attempt.hl), end to end against an api in
+// process and a repository git daemon serves, with a stub CLI that a stub
+// install puts in voice's prefix: a seat that runs only in a container
+// fails a recipe with no container backend (`backend_unavailable`); a seat
+// that opts in to the host has the CLI installed into the prefix once,
+// found there by detect at its pinned version, run in the workspace with
+// its own home and none of the node's environment, voice's own key handed
+// by name and never in an argv, its work committed as the caller and
+// bundled; a login directory's scratch copy lives in the run's home and a
+// refresh is copied back; a CLI at another version, or an install that
+// fails, is no backend; and nothing of an attempt is left but the shared
+// install, which a node that starts keeps when it finished. Needs git and
+// git daemon; a machine with neither (an image's build) runs nothing.
+import ".." as node;
+
+/// A file of `body` at `path`, executable.
+fn script(path: String, body: String) {
+    std::io::fs::write_file(path, body) or discard;
+    node::run_out("chmod\n755\n" + path);
+}
+
+/// The stub CLI: its version, or a run that checks what it was handed,
+/// writes STUB.md and says so.
+const STUB_CLI: String = "#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"stubcli 1.2.3 (stub)\"; exit 0; fi\nfail() { echo \"stub: $1\" >&2; exit 9; }\ninstr=\"$(cat)\"\ncase \"$HOME\" in */run-home) ;; *) fail \"its home is not its own: $HOME\";; esac\ncase \"$PATH\" in */clis/*/1.2.3/bin:*) ;; *) fail \"voice's prefix is not first on its PATH: $PATH\";; esac\ncase \"$TMPDIR\" in */att_*/tmp) ;; *) fail \"its temporary directory is not the attempt's: $TMPDIR\";; esac\ncase \"$instr\" in *\"Work in $(pwd -P).\"*) ;; *) fail \"its preamble names no workspace of its own: $instr\";; esac\nif [ \"$STUB_MODE\" = voice ]; then\n  [ -n \"$STUB_KEY\" ] || fail \"no key in its environment\"\n  if ps -A -o args= | awk 'index($0, ENVIRON[\"STUB_KEY\"]) { found = 1 } END { exit found ? 0 : 1 }'; then fail \"the key is in an argv\"; fi\n  case \"$VOICE_BASE_URL\" in http://127.0.0.1:*/v1) ;; *) fail \"voice's address: $VOICE_BASE_URL\";; esac\nfi\nif [ \"$STUB_MODE\" = home ]; then\n  case \"$STUB_LOGIN\" in \"$HOME\"/.stub) ;; *) fail \"its login is not in its home: $STUB_LOGIN\";; esac\n  grep -q '^tok' \"$STUB_LOGIN/token\" || fail \"no login token\"\n  echo refreshed >> \"$STUB_LOGIN/token\"\nfi\necho \"hello from the stub\" > STUB.md\necho \"stub: wrote STUB.md\"\necho \"Added STUB.md\"\n";
+
+/// The stub install: the stub CLI into the prefix voice hands it, or a
+/// failure when asked.
+fn stub_install(cli: String) -> String {
+    return "#!/bin/sh\n[ \"$VOICE_CLI_PREFIX\" = \"$1\" ] || { echo \"the prefix is not handed in VOICE_CLI_PREFIX\" >&2; exit 2; }\n[ \"$2\" = fail ] && { echo \"the install failed\" >&2; exit 1; }\nmkdir -p \"$1/bin\" && cp \""
+        + cli + "\" \"$1/bin/stubcli\" && chmod 755 \"$1/bin/stubcli\"\n";
+}
+
+/// A host-only recipe of the stub: `id` at `version`, detected by
+/// `detect`, installed by `install` ("" for detect alone), under `login`.
+fn recipe(
+    id: String,
+    version: String,
+    detect: String,
+    install: String,
+    login: String,
+    mode: String
+) -> String {
+    return "{\"id\": " + node::q(id) + ", \"name\": \"Stub\", \"version\": " + node::q(version)
+        + ", \"backends\": [{\"kind\": \"host\", \"detect\": {\"command\": [" + node::q(detect)
+        + ", \"--version\"], \"version\": \"stubcli ([0-9.]+) \\\\(stub\\\\)\"}"
+        + (if len(install) > 0 { ", \"install\": {\"command\": " + install + "}" } else { "" })
+        + "}], \"command\": [\"stubcli\"], \"instruction\": {\"via\": \"stdin\"}, \"model\": {\"flag\": \"--model\"}, \"login\": "
+        + login + ", \"env\": {\"STUB_MODE\": " + node::q(mode)
+        + "}, \"reader\": \"text\", \"commits\": false, \"preamble\": \"Work in /work.\", \"egress\": []"
+        + (
+            if mode == "voice" {
+                ", \"base_url_env\": \"VOICE_BASE_URL\", \"protocol\": \"openai-chat\""
+            } else {
+                ""
+            }
+        ) + "}";
+}
+
+/// An attempt's start, as the api answers a claim: attempt `id` of recipe
+/// `def` on `repo`, its seat's backend `backend`, the key minted for it
+/// `key` ("" for none), under login `login`.
+fn start(
+    id: String,
+    repo: String,
+    def: String,
+    backend: String,
+    login: String,
+    key: String
+) -> String {
+    return "{\"attempt\": {\"id\": " + node::q(id) + ", \"seat\": \"coder\", \"repo\": "
+        + node::q(repo) + ", \"base\": \"main\", \"branch\": " + node::q("voice/attempt-" + id)
+        + ", \"instruction\": \"add a STUB.md\", \"model\": \"\", \"login\": " + node::q(login)
+        + ", \"budget_tokens\": 0, \"deadline\": "
+        + to_string(std::time::unix(std::time::current()) + 3600)
+        + ", \"backend\": " + node::q(backend)
+        + ", \"as\": {\"name\": \"Test Author\", \"email\": \"author@example.com\"}, \"egress\": [], \"harness\": "
+        + def + (if len(key) > 0 { ", \"credential\": " + node::q(key) } else { "" }) + "}}";
+}
+
+/// The node plane, as far as an attempt goes: each report taken (every
+/// one kept in `<ends>/<id>.log`, its end in `<ends>/<id>`), its bundle
+/// held (`<ends>/<id>.bundle`), the attempt still to run. Anything else is
+/// 404.
+locus Plane {
+    params { ends: String = ""; }
+    fn handle(req: std::http::Request) -> std::http::Response {
+        let pre = "/node/v1/attempts/";
+        if req.method == "POST" && std::str::starts_with(req.path, pre)
+            && std::str::ends_with(req.path, "/report")
+        {
+            let id = req.path[len(pre)..(len(req.path) - len("/report"))];
+            let log = std::io::fs::read_file(self.ends + "/" + id + ".log") or "";
+            std::io::fs::write_file(
+                self.ends + "/" + id + ".log",
+                log + req.body + "\n",
+            ) or discard;
+            if len(std::json::find_string_field(req.body, "state")) > 0 {
+                std::io::fs::write_file(self.ends + "/" + id, req.body) or discard;
+            }
+            return std::http::Response {
+                status: 200,
+                body: "{\"cancel\": false, \"state\": \"running\"}",
+            };
+        }
+        if req.method == "PUT" && std::str::starts_with(req.path, pre)
+            && std::str::ends_with(req.path, "/bundle")
+        {
+            let id = req.path[len(pre)..(len(req.path) - len("/bundle"))];
+            std::io::fs::write_file(
+                self.ends + "/" + id + ".bundle",
+                std::json::find_string_field(req.body, "bundle"),
+            ) or discard;
+            return std::http::Response { status: 204, body: "" };
+        }
+        return std::http::Response { status: 404, body: "no" };
+    }
+}
+
+fn git(args: String) -> std::process::ProcessOutput {
+    return std::process::run_with(
+        "git\n" + args,
+        std::process::SpawnOptions {
+            env: "GIT_CONFIG_NOSYSTEM=1\nGIT_CONFIG_GLOBAL=/dev/null\nGIT_TERMINAL_PROMPT=0",
+        },
+    ) or std::process::ProcessOutput { code: 127, signal: 0, stdout: "", stderr: "" };
+}
+
+main locus App {
+    params {
+        tmp: String = if std::env::var_exists("TMPDIR") && len(std::env::var("TMPDIR")) > 0 {
+            std::env::var("TMPDIR")
+        } else {
+            "/tmp"
+        };
+        made: String = self.tmp + "/voice-host-attempt-test-" + to_string(std::process::pid());
+        data: String = "";
+        srv: std::http::Server = std::http::Server {
+            port: 0,
+            handler: Plane { ends: self.made + "/ends" },
+        };
+        slot: node::Attempter = node::Attempter { };
+    }
+    placement {
+        srv: cooperative(pool = io) where async_io;
+        slot: pinned;
+    }
+
+    /// Run attempt `id` from `start` to its end; the end it reported.
+    fn run_one(id: String, start: String, api: String) -> String {
+        let r = node::AttemptRun { node: "node-a", data: self.data, api: api, token: "vn-test" };
+        r.go(start, self.slot);
+        return std::io::fs::read_file(self.made + "/ends/" + id) or "";
+    }
+
+    run() {
+        // no git, or no git daemon (an image's build): nothing to run
+        if git("--version").code != 0
+            || !std::io::fs::file_exists(std::str::trim(git("--exec-path").stdout) + "/git-daemon")
+        {
+            return;
+        }
+        node::run_out("mkdir\n-p\n" + self.made + "/ends");
+        // the node's data, by its own path, as the run's working directory reads it
+        self.data = std::str::trim(
+            node::run_out(
+                "sh\n-c\nmkdir -p \"$1/data\" && cd \"$1/data\" && pwd -P\nsh\n" + self.made,
+            ),
+        );
+        let ends = self.made + "/ends";
+        let api = "http://127.0.0.1:" + to_string(std::io::tcp::__local_port(self.srv.listen_fd));
+        // a repository git daemon serves
+        let seed = self.made + "/seed";
+        node::run_out("mkdir\n-p\n" + seed + "\n" + self.made + "/repos\n" + self.made + "/tools");
+        git("-C\n" + seed + "\ninit\n-q\n-b\nmain");
+        std::io::fs::write_file(seed + "/README.md", "# demo\n") or discard;
+        git("-C\n" + seed + "\nadd\nREADME.md");
+        git(
+            "-C\n" + seed
+                + "\n-c\nuser.name=seed\n-c\nuser.email=seed@example.com\ncommit\n-qm\ninit",
+        );
+        git("clone\n-q\n--bare\n" + seed + "\n" + self.made + "/repos/demo.git");
+        let port = 20000 + std::process::pid() % 20000;
+        let daemon = std::process::spawn(
+            "git\ndaemon\n--reuseaddr\n--base-path=" + self.made
+                + "/repos\n--export-all\n--listen=127.0.0.1\n--port="
+                + to_string(port) + "\n" + self.made + "/repos",
+        ) or {
+            node::run_out("rm\n-rf\n" + self.made);
+            return;
+        };
+        let repo = "git://127.0.0.1:" + to_string(port) + "/demo.git";
+        let mut tries = 0;
+        while tries < 100 && git("ls-remote\n" + repo).code != 0 {
+            std::time::sleep(100ms);
+            tries = tries + 1;
+        }
+        std::test::assert(tries < 100, "git daemon serves the repository");
+        // the stub CLI, and its install
+        let tools = self.made + "/tools";
+        script(tools + "/stubcli", STUB_CLI);
+        script(tools + "/stub-install", stub_install(tools + "/stubcli"));
+        let install = "[" + node::q(tools + "/stub-install") + ", \"$VOICE_CLI_PREFIX\"]";
+        let voice_login = "{\"kind\": \"voice\", \"env\": \"STUB_KEY\"}";
+        let stub = recipe("stubvoice", "1.2.3", "stubcli", install, voice_login, "voice");
+        let key = "vk-stub0123456789abcdef0123456789abcdef";
+
+        // a seat that runs only in a container: no backend of its recipe
+        let boxed = self.run_one(
+            "att_00boxed",
+            start("att_00boxed", repo, stub, "container", "", key),
+            api,
+        );
+        std::test::assert(
+            std::json::find_string_field(boxed, "failure_kind") == "backend_unavailable"
+                && std::str::contains(
+                    std::json::find_string_field(boxed, "failure"),
+                    "has no container backend",
+                ),
+            "a recipe with no container backend runs on no seat that runs only in one: " + boxed,
+        );
+
+        // a seat that opts in to the host: installed, detected, run
+        let first = self.run_one(
+            "att_00first",
+            start("att_00first", repo, stub, "host", "", key),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(first, "state"),
+            "done",
+            "a host run is done: " + first
+                + (std::io::fs::read_file(ends + "/att_00first.log") or ""),
+        );
+        let prefix = self.data + "/clis/stubvoice/1.2.3";
+        std::test::assert(
+            std::io::fs::file_exists(prefix + "/bin/stubcli")
+                && std::io::fs::file_exists(prefix + "/.voice-installed"),
+            "the install put the CLI in voice's prefix, finished",
+        );
+        let log = std::io::fs::read_file(ends + "/att_00first.log") or "";
+        std::test::assert(std::str::contains(log, "installing Stub 1.2.3"), "installed as it ran");
+        std::test::assert(
+            std::str::contains(log, "no sandbox and no egress filter"),
+            "and said where it ran",
+        );
+        std::test::assert(!std::str::contains(log, key), "the key is in no report");
+        // its commits: the caller's, building on the base
+        let bundle = std::text::base64::decode(
+            std::io::fs::read_file(ends + "/att_00first.bundle") or "",
+        );
+        std::io::fs::write_bytes(self.made + "/first.bundle", bundle) or discard;
+        std::test::assert_eq_int(
+            git(
+                "-C\n" + seed + "\nfetch\n-q\n" + self.made
+                    + "/first.bundle\nvoice/attempt-att_00first:refs/heads/got",
+            ).code,
+            0,
+            "its bundle applies on the base",
+        );
+        std::test::assert_eq_str(
+            std::str::trim(git("-C\n" + seed + "\nlog\n-1\n--format=%an <%ae>\ngot").stdout),
+            "Test Author <author@example.com>",
+            "committed as the caller",
+        );
+        std::test::assert_eq_str(
+            git("-C\n" + seed + "\nshow\ngot:STUB.md").stdout,
+            "hello from the stub\n",
+            "what the CLI left",
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(self.data + "/attempts/att_00first"),
+            "nothing of the attempt left",
+        );
+        // the next finds it installed
+        let again = self.run_one(
+            "att_00again",
+            start("att_00again", repo, stub, "host", "", key),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(again, "state"),
+            "done",
+            "again: " + again,
+        );
+        std::test::assert(
+            !std::str::contains(
+                std::io::fs::read_file(ends + "/att_00again.log") or "",
+                "installing",
+            ),
+            "the next attempt finds it installed",
+        );
+
+        // a login directory: its scratch copy in the run's home, a refresh
+        // copied back
+        node::run_out("mkdir\n-p\n" + self.data + "/logins/stub-login");
+        std::io::fs::write_file(self.data + "/logins/stub-login/token", "tok-1\n") or discard;
+        let home = recipe(
+            "stubhome",
+            "1.2.3",
+            "stubcli",
+            install,
+            "{\"kind\": \"home\", \"env\": \"STUB_LOGIN\", \"mount\": \"/home/voice/.stub\", \"from\": \"\", \"files\": [\"token\"]}",
+            "home",
+        );
+        let homed = self.run_one(
+            "att_00home",
+            start("att_00home", repo, home, "host", "stub-login", ""),
+            api,
+        );
+        std::test::assert_eq_str(
+            std::json::find_string_field(homed, "state"),
+            "done",
+            "a login directory: " + homed,
+        );
+        std::test::assert_eq_str(
+            std::io::fs::read_file(self.data + "/logins/stub-login/token") or "",
+            "tok-1\nrefreshed\n",
+            "its refresh is copied back",
+        );
+
+        // another version than the pin: no backend, saying what it found
+        let old = recipe(
+            "stubold",
+            "9.9.9",
+            prefix + "/bin/stubcli",
+            "",
+            voice_login,
+            "voice",
+        );
+        let older = self.run_one("att_00old", start("att_00old", repo, old, "host", "", key), api);
+        std::test::assert(
+            std::json::find_string_field(older, "failure_kind") == "backend_unavailable"
+                && std::str::contains(
+                    std::json::find_string_field(older, "failure"),
+                    "stubcli 1.2.3 (stub)",
+                ),
+            "a CLI at another version is no backend: " + older,
+        );
+        // an install that fails: no backend, and no prefix left
+        let failing = recipe(
+            "stubfail",
+            "1.2.3",
+            "stubcli",
+            "[" + node::q(tools + "/stub-install") + ", \"$VOICE_CLI_PREFIX\", \"fail\"]",
+            voice_login,
+            "voice",
+        );
+        let failed = self.run_one(
+            "att_00fail",
+            start("att_00fail", repo, failing, "host", "", key),
+            api,
+        );
+        std::test::assert(
+            std::json::find_string_field(failed, "failure_kind") == "backend_unavailable"
+                && std::str::contains(
+                    std::json::find_string_field(failed, "failure"),
+                    "the install failed",
+                ),
+            "an install that fails is no backend: " + failed,
+        );
+        std::test::assert(
+            !std::io::fs::file_exists(self.data + "/clis/stubfail/1.2.3"),
+            "and leaves no prefix",
+        );
+        // a node that starts keeps finished installs, and only them
+        node::run_out(
+            "mkdir\n-p\n" + self.data + "/clis/stubvoice/2.0.0\n" + self.data
+                + "/clis/stubvoice/1.2.3.lock",
+        );
+        node::clean_attempts("node-a-test-none", self.data);
+        std::test::assert(
+            std::io::fs::file_exists(prefix + "/bin/stubcli")
+                && !std::io::fs::file_exists(self.data + "/clis/stubvoice/2.0.0")
+                && !std::io::fs::file_exists(self.data + "/clis/stubvoice/1.2.3.lock"),
+            "a start keeps a finished install and removes one cut short",
+        );
+        std::process::kill(daemon) or discard;
+        node::run_out("rm\n-rf\n" + self.made);
+    }
+}
+
+fn main() { App { }; }

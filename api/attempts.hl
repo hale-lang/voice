@@ -1,6 +1,6 @@
 // Coding attempts (../spec/openapi.yaml, tag `attempts`): a caller asks
-// voice to run an agentic coding harness (a harness definition,
-// ../harnesses/) once on a repository: check out `repo` at `base`, run the
+// voice to run an agentic coding harness (a CLI recipe, cli_recipes.hl,
+// voice's own in ../harnesses/) once on a repository: check out `repo` at `base`, run the
 // harness with the instruction, and commit what it produced as the caller's
 // identity. It runs for minutes or hours, so it is asynchronous: created at
 // once and queued, started on a harness seat with room, reported by the
@@ -16,9 +16,11 @@
 // starts the oldest queued attempt one of the node's harness seats can run,
 // as a request is routed: the seat up and enabled, its account one the
 // caller's project and key may spend and not archived, its data class
-// `internal`, its harness and model the ones asked for, and fewer attempts
-// running on it than its concurrency (checked in the store, so two api
-// instances never start more).
+// `internal`, its harness and model the ones asked for, its recipe enabled
+// and with a backend of the kind the seat runs (a container, unless it opts
+// in to the host, which the node is handed as the attempt's `backend`), and
+// fewer attempts running on it than its concurrency (checked in the store,
+// so two api instances never start more).
 //
 // A harness whose model calls go to voice (its definition's login is
 // `voice`) runs under a key voice mints for the attempt as it starts it:
@@ -102,12 +104,17 @@ fn request_id_header() -> String {
     return "X-Request-Id: req_" + (random_hex(12) or "unnumbered");
 }
 
-/// The definition `id` among `defs` (a JSON list), "" when there is none.
-fn definition_of(defs: String, id: String) -> String {
-    let mut it = std::json::array_first(defs);
-    while !it.done {
-        if harness::text_of(it.element, "id") == id { return std::str::trim(it.element); }
-        it = std::json::array_next(it);
+/// The sha256 of recipe body `def`, as an attempt keeps the recipe it
+/// started with: `sha256:<hex>`.
+fn recipe_digest(def: String) -> String {
+    return "sha256:" + std::hex::encode(std::crypto::sha256(std::bytes::from_string(def)));
+}
+
+/// The body of recipe `id` among `rows` when it is enabled, "" when it is
+/// not, or there is none.
+fn enabled_recipe(rows: st::CliRecipeRows, id: String) -> String {
+    for r in rows.rows {
+        if r.id == id && r.enabled { return r.body; }
     }
     return "";
 }
@@ -182,6 +189,7 @@ fn attempt_json(a: st::AttemptRow) -> String {
         + jq(base + "/events") + ", \"events\": " + to_string(a.events - a.dropped)
         + ", \"dropped\": " + to_string(a.dropped) + "}, \"transcript_digest\": "
         + jstring_or_null(ended && len(a.transcript_digest) > 0, a.transcript_digest)
+        + ", \"recipe_digest\": " + jstring_or_null(len(a.recipe_digest) > 0, a.recipe_digest)
         + ", \"bundle\": "
         + (
             if a.has_bundle {
@@ -263,8 +271,8 @@ fn optional_string(body: String, name: String) -> String fallible(ApiError) {
 locus CodingAttempts {
     params {
         store: st::Store = st::MemoryStore { };
-        // voice's harness definitions, a JSON list (`shipped_harnesses`)
-        harnesses: String = "[]";
+        // the CLI recipes attempts run (cli_recipes.hl)
+        recipes: CliRecipes = CliRecipes { store: self.store };
     }
 
     /// The project a caller-plane request is scoped to: its key's.
@@ -294,8 +302,15 @@ locus CodingAttempts {
             );
         }
         let wanted = optional_string(body, "harness") or raise;
-        if len(wanted) > 0 && len(definition_of(self.harnesses, wanted)) == 0 {
-            fail invalid("voice has no harness " + wanted, "harness");
+        if len(wanted) > 0 {
+            let r = self.recipes.row(wanted) or fail metering_failed(err);
+            if !r.present { fail invalid("voice has no CLI recipe " + wanted, "harness"); }
+            if !r.enabled {
+                fail invalid(
+                    "CLI recipe " + wanted + " is disabled: its seats take no new attempt",
+                    "harness"
+                );
+            }
         }
         let model = optional_string(body, "model") or raise;
         if len(model) > 0 {
@@ -533,9 +548,14 @@ locus CodingAttempts {
         return taken_over();
     }
 
-    /// `listHarnesses`: the definitions voice has, as they are.
-    fn definitions() -> std::http::Response {
-        return json_answer(200, "{\"object\": \"list\", \"data\": " + self.harnesses + "}");
+    /// `listHarnesses`: the enabled CLI recipes, as they are.
+    fn definitions() -> std::http::Response fallible(ApiError) {
+        let rows = self.recipes.rows() or fail store_failed(err);
+        let out = st::JsonList { };
+        for r in rows.rows {
+            if r.enabled { out.add(r.body); }
+        }
+        return json_answer(200, "{\"object\": \"list\", \"data\": [" + out.text() + "]}");
     }
 
     // ---- the node plane
@@ -582,6 +602,7 @@ locus CodingAttempts {
         self.sweep(now);
         let f = self.store.fleet(node) or fail metering_failed(err);
         let all = self.store.seats() or fail metering_failed(err);
+        let recipes = self.recipes.rows() or fail metering_failed(err);
         // the queue, oldest first, a page at a time: the first attempt one
         // of this node's seats can run, however many older ones none can
         let mut offset = 0;
@@ -632,8 +653,13 @@ locus CodingAttempts {
                     let kind = engine_kind_of(f.capabilities, s.engine);
                     let h = seat_harness(kind, s.config);
                     if len(h) == 0 || (len(a.harness) > 0 && a.harness != h) { continue; }
-                    let def = definition_of(self.harnesses, h);
-                    if len(def) == 0 { continue; }
+                    // an enabled recipe, with a backend of the kind the seat
+                    // runs (a container, unless it opts in to the host)
+                    let def = enabled_recipe(recipes, h);
+                    let backend = seat_backend(s.config);
+                    if len(def) == 0 || len(backend) == 0 || !harness::has_backend(def, backend) {
+                        continue;
+                    }
                     // a CLI's own login is the seat's to name; voice's own is
                     // minted below
                     let kind = login_kind(def);
@@ -658,6 +684,10 @@ locus CodingAttempts {
                         h,
                         seat_concurrency(s),
                         if len(secret) > 0 { secret_digest(secret) } else { "" },
+                        // how its run is metered, and the recipe it runs,
+                        // fixed now: the recipe may change while it runs
+                        kind == "voice",
+                        recipe_digest(def),
                         now,
                     ) or fail metering_failed(err);
                     if started { return json_answer(200, self.start_json(a, s, def, secret)); }
@@ -712,7 +742,8 @@ locus CodingAttempts {
                     "0"
                 }
             )
-            + ", \"deadline\": " + to_string(std::time::unix(a.deadline_at)) + ", \"as\": "
+            + ", \"deadline\": " + to_string(std::time::unix(a.deadline_at)) + ", \"backend\": "
+            + jq(seat_backend(s.config)) + ", \"as\": "
             + std::str::trim(std::json::find_field_raw(a.body, "as")) + ", \"egress\": ["
             + egress.text() + "], \"harness\": " + def
             + (if len(secret) > 0 { ", \"credential\": " + jq(secret) } else { "" }) + "}}";
@@ -779,8 +810,9 @@ locus CodingAttempts {
         let model = if len(a.model) > 0 { a.model } else { a.ran };
         // a harness whose model calls went to voice has them in the ledger
         // already, each a request of the attempt's conversation: its own
-        // record counts none of their tokens again
-        let routed = login_kind(definition_of(self.harnesses, a.ran)) == "voice";
+        // record counts none of their tokens again. Whether they did is the
+        // attempt's, fixed as it started, whatever its recipe is now
+        let routed = a.routed;
         let input = if routed { 0 } else { a.input_tokens };
         let output = if routed { 0 } else { a.output_tokens };
         let served = "{\"model\": " + jq(model) + ", \"quantization\": null, \"node\": "

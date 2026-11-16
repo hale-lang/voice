@@ -1,38 +1,49 @@
 // A coding attempt, run (../spec/openapi.yaml, tag `attempts`): one run of
-// an agentic coding harness on a repository, the same wrapper for every
-// harness, which is data (lib/harness, ../harnesses/). The plane asks the
+// an agentic coding CLI on a repository, the same wrapper for every CLI
+// recipe, which is data (lib/harness, ../harnesses/). The plane asks the
 // api for an attempt when a slot is free (plane.hl, `claim`), and hands it
 // to a slot of its own, each its own thread (`ATTEMPT_SLOTS`), which:
 //
 //   1. checks out `repo` at `base` into the attempt's directory on the
 //      node, `attempts/<id>`: a bare repository voice keeps (`push.git`),
 //      and a clone of it on the attempt's branch, the workspace (`work`);
-//   2. builds the harness's image once per definition (its base, pinned
-//      by digest, with the CLI installed as the definition says), and
+//   2. picks where the CLI runs: the first backend of its recipe of the
+//      kind its seat runs (a container, or the host when the seat opts in)
+//      that this node can run (`pick_backend`), else `backend_unavailable`.
+//      For a container, it builds the recipe's image once (its base,
+//      pinned by digest, with the CLI installed as the recipe says), and
 //      starts the attempt's egress: a network of its own with no route
-//      out, and a proxy on it that lets through only the hosts the
-//      definition, the common package registries and the seat allow, and,
-//      for a harness whose model calls go to voice (`base_url_env`), the
-//      api's own host and port, as the node reaches it;
-//   3. runs the harness in a container of its own: the workspace mounted
-//      and nothing else of the machine (no home, no other credential), as
-//      the node's user, every capability dropped, its login in its
-//      environment (from the vault, read into the container's environment
-//      by a shell, never an argv) or a scratch copy of the login's
-//      directory, under the CLI's own permission policy (no bypass flag),
-//      its output read as it comes (readers.hl), within its idle and total
-//      limits;
-//   4. commits what the harness left uncommitted, as the caller's identity,
-//      in a container too, with no network, since the workspace's git
-//      configuration is the harness's to have written;
+//      out, and a proxy on it that lets through only the hosts the recipe,
+//      the common package registries and the seat allow, and, for a CLI
+//      whose model calls go to voice (`base_url_env`), the api's own host
+//      and port, as the node reaches it. For the host, it finds the CLI at
+//      the recipe's pinned version (`detect`), or installs that version
+//      into voice's own prefix, `clis/<recipe>/<version>`, once per node
+//      (`install`);
+//   3. runs the CLI: in a container of its own, the workspace mounted and
+//      nothing else of the machine (no home, no other credential), as the
+//      node's user, every capability dropped; or on the host, as the node's
+//      user in the workspace, with a home and a temporary directory of its
+//      own and none of the node's environment but its PATH, user and
+//      language, and no sandbox or egress filter. Either way its login is
+//      in its environment (from the vault, or voice's own key, read by a
+//      shell from a private file, never an argv) or a scratch copy of the
+//      login's directory, under the CLI's own permission policy (no bypass
+//      flag), its output read as it comes (readers.hl), within its idle and
+//      total limits;
+//   4. commits what the CLI left uncommitted, as the caller's identity, in
+//      a container with no network, since the workspace's git configuration
+//      is the CLI's to have written (on the host, where the CLI ran as the
+//      node's user already, with voice's own git, hooks and fsmonitor off);
 //   5. takes the branch's commits into the bare repository (a fetch from
 //      the workspace, run by voice outside the container under no
 //      configuration of the workspace's), and exports them from the
 //      base as a git bundle, which the api holds for the caller;
 //   6. removes everything it made, whatever happened: the containers, the
-//      network, and the attempt's directory with the workspace and the
-//      login's scratch copy, after copying back a login file the CLI
-//      refreshed.
+//      network, a host run's process group, and the attempt's directory
+//      with the workspace, the run's home and the login's scratch copy,
+//      after copying back a login file the CLI refreshed. A CLI installed
+//      in voice's prefix stays, shared by the attempts of its version.
 //
 // It reports to the api every couple of seconds (`reportAttempt`), which
 // answers whether to stop: a cancel, or the attempt no longer the node's.
@@ -103,6 +114,9 @@ type AttemptStart {
     email: String = "";
     egress: String = "";
     definition: String = "";
+    // where the seat lets its recipe run: `container`, or `host` when it
+    // opts in to the node's own machine
+    backend: String = "container";
     // the key voice minted for the run of a harness whose login is voice's
     // own: written to a private file for the run's shell, then forgotten
     credential: String = "";
@@ -131,8 +145,10 @@ fn attempt_start(start: String) -> AttemptStart {
         email: harness::text_of(as_, "email"),
         egress: harness::lines_of(std::json::find_field_raw(a, "egress")),
         definition: def,
+        backend: harness::text_of(a, "backend"),
         credential: harness::text_of(a, "credential"),
     };
+    if len(s.backend) == 0 { s.backend = "container"; }
     if !attempt_id(s.id) {
         s.problem = "the attempt's id is not one voice makes";
         return s;
@@ -143,6 +159,9 @@ fn attempt_start(start: String) -> AttemptStart {
         return s;
     }
     if std::str::starts_with(s.egress, "!") { s.problem = "its egress is not a list of hosts"; }
+    if s.backend != "container" && s.backend != "host" {
+        s.problem = "its seat's backend is not one voice runs (container or host)";
+    }
     let lower = std::str::lower(s.repo);
     if std::str::contains(s.repo, "\n")
         || !(std::str::starts_with(lower, "https://") || std::str::starts_with(lower, "http://")
@@ -396,6 +415,195 @@ fn harness_argv(def: harness::HarnessDef, run: String, secret: String) -> String
         + "; shift; exec \"$@\"\nsh\n" + secret + "\n" + run;
 }
 
+/// How long a host backend's detect may run, and its install, in seconds.
+const DETECT_S: Int = 30;
+const INSTALL_S: Int = 1200;
+
+/// The file an install leaves in voice's prefix once it has finished: a
+/// prefix without it is an install cut short, removed (`clean_clis`).
+const INSTALLED_MARK: String = ".voice-installed";
+
+/// Where voice installs recipe `def`'s CLI on the node,
+/// `<data>/clis/<id>/<version>`: shared by every attempt of that version,
+/// and kept.
+fn cli_prefix(data: String, def: harness::HarnessDef) -> String {
+    return data + "/clis/" + def.id + "/" + def.version;
+}
+
+/// A path of the container (`/work`, `/voice/out`, `/voice`, `/home/voice`)
+/// as a host run in `dir` has it: the attempt's own directories in their
+/// place. Any other path is as it is.
+fn host_path(dir: String, p: String) -> String {
+    if p == "/work" || std::str::starts_with(p, "/work/") { return dir + "/work" + p[5..len(p)]; }
+    if p == "/voice/out" || std::str::starts_with(p, "/voice/out/") {
+        return dir + "/out" + p[10..len(p)];
+    }
+    if p == "/voice" || std::str::starts_with(p, "/voice/") {
+        return dir + "/voice" + p[6..len(p)];
+    }
+    if p == "/home/voice" || std::str::starts_with(p, "/home/voice/") {
+        return dir + "/run-home" + p[11..len(p)];
+    }
+    return p;
+}
+
+/// An argument of a recipe's command, a path of the container in it (the
+/// whole argument, or a flag's value after `=`) as a host run has it.
+fn host_arg(dir: String, a: String) -> String {
+    if std::str::starts_with(a, "/") { return host_path(dir, a); }
+    let eq = std::str::index_of(a, "=");
+    if eq > 0 && std::str::starts_with(a[(eq + 1)..len(a)], "/") {
+        return a[0..(eq + 1)] + host_path(dir, a[(eq + 1)..len(a)]);
+    }
+    return a;
+}
+
+/// True for a byte of a word or a path: a letter, a digit, `_`, `-`, `.`
+/// or `/`.
+fn path_byte(b: Int) -> Bool {
+    return (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
+        || b == 45 || b == 46 || b == 47;
+}
+
+/// Text that names the workspace as `/work` (a recipe's preamble), naming
+/// a host run's workspace in `dir` instead.
+@bounded_by(text)
+fn host_text(dir: String, text: String) -> String {
+    let v = std::str::bytes_view(text);
+    let out = std::bytes::BytesBuilder { initial_cap: len(text) + 64 };
+    let mut from = 0;
+    let mut at = std::str::find(v, "/work", 0);
+    while at >= 0 {
+        let before = std::str::byte_at(v, at - 1);
+        let after = std::str::byte_at(v, at + 5);
+        if (at == 0 || !path_byte(before))
+            && (after < 0 || (!path_byte(after) || after == 46 || after == 47))
+        {
+            out.append_str(std::str::slice(v, from, at) + dir + "/work");
+            from = at + 5;
+        }
+        at = std::str::find(v, "/work", at + 5);
+    }
+    out.append_str(std::str::slice(v, from, v.n));
+    let b = out.snapshot() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// Where a host run in `dir` keeps its login directory's scratch copy: the
+/// login's mount, as a host run has it, when it is in the container's home
+/// (the run's own home then); else the attempt's `login` directory.
+fn host_login_dir(def: harness::HarnessDef, dir: String) -> String {
+    let m = host_path(dir, def.login_mount);
+    return if std::str::starts_with(m, dir + "/run-home/") { m } else { dir + "/login" };
+}
+
+/// The base URL a host run's harness calls voice at: the api as the node
+/// itself reaches it, with `/v1`. A loopback address is the node's own, so
+/// it serves here as it does not in a container.
+fn host_base_url(api: String) -> String {
+    let mut base = std::str::trim(api);
+    while std::str::ends_with(base, "/") {
+        base = base[0..(len(base) - 1)];
+    }
+    return base + "/v1";
+}
+
+/// The variables every host step of an attempt in `dir` runs with (detect,
+/// install and the run itself), and nothing else of the node's
+/// environment: `path` after voice's `prefix`'s bin, the node's user, shell
+/// and language (`node_env`, `NAME=value` lines), the attempt's own home
+/// and temporary directory, and the prefix.
+fn host_env(dir: String, prefix: String, path: String, node_env: String) -> String {
+    return "PATH=" + prefix + "/bin:" + path + "\nHOME=" + dir + "/run-home\nTMPDIR=" + dir
+        + "/tmp\nVOICE_CLI_PREFIX=" + prefix + "\nNO_COLOR=1\nTERM=dumb\n" + node_env;
+}
+
+/// What a host run of `def` for attempt `a` in `dir` is told: its
+/// preamble, naming the run's workspace, then the caller's instruction.
+fn host_instruction(def: harness::HarnessDef, a: AttemptStart, dir: String) -> String {
+    let text = host_text(dir, def.preamble) + "\n\n" + a.instruction;
+    return if def.via == "argument" { std::str::replace(text, "\n", " ") } else { text };
+}
+
+/// The host run's argv, newline-separated, from `def` for attempt `a` in
+/// `dir`: the recipe's command with the container's paths as the run has
+/// them, its model, and its instruction when it is an argument. Its login
+/// is never here (`harness_argv`, `host_run_env`).
+@unbounded
+fn host_run_argv(def: harness::HarnessDef, a: AttemptStart, dir: String) -> String {
+    let mut argv = "";
+    let mut rest = def.command;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        argv = argv + host_arg(dir, rest[0..nl]) + "\n";
+        rest = rest[(nl + 1)..len(rest)];
+    }
+    if len(a.model) > 0 && len(def.model_flag) > 0 {
+        argv = argv + def.model_flag + "\n" + a.model + "\n";
+    }
+    if def.via == "argument" { argv = argv + host_instruction(def, a, dir) + "\n"; }
+    return argv;
+}
+
+/// The host run's environment, `NAME=value` lines: `base` (`host_env`),
+/// the caller's identity for git, the recipe's own variables (a path of
+/// the container as the run has it), its model, voice's address for a
+/// harness whose model calls go to voice (`base_url`), and a login
+/// directory's scratch copy. A login from the vault, or voice's own key,
+/// is not here: the run's shell reads it from a private file
+/// (`harness_argv`).
+@unbounded
+fn host_run_env(
+    def: harness::HarnessDef,
+    a: AttemptStart,
+    dir: String,
+    base: String,
+    base_url: String
+) -> String {
+    let mut env = base + "GIT_AUTHOR_NAME=" + a.name + "\nGIT_AUTHOR_EMAIL=" + a.email
+        + "\nGIT_COMMITTER_NAME=" + a.name + "\nGIT_COMMITTER_EMAIL=" + a.email + "\n";
+    let mut rest = def.env;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = rest[0..nl];
+        rest = rest[(nl + 1)..len(rest)];
+        let eq = std::str::index_of(line, "=");
+        let value = line[(eq + 1)..len(line)];
+        env = env + line[0..(eq + 1)]
+            + (if std::str::starts_with(value, "/") { host_path(dir, value) } else { value })
+            + "\n";
+    }
+    if def.login_kind == "home" && len(def.login_env) > 0 {
+        env = env + def.login_env + "=" + host_login_dir(def, dir) + "\n";
+    }
+    if len(def.base_url_env) > 0 && len(base_url) > 0 {
+        env = env + def.base_url_env + "=" + base_url + "\n";
+    }
+    if len(a.model) > 0 && len(def.model_env) > 0 {
+        env = env + def.model_env + "=" + a.model + "\n";
+    }
+    return env;
+}
+
+/// How a node picks where an attempt's recipe runs: the backend, and
+/// voice's prefix for the recipe's version; or why none of its backends
+/// fits (`backend_unavailable`), or the attempt's stop.
+type BackendPick {
+    backend: harness::HarnessBackend = harness::HarnessBackend { };
+    why: String = "";
+    kind: String = "";
+}
+
+/// Why no backend of `def` of the kind the seat runs (`want`) is listed,
+/// for the attempt's failure.
+fn no_backend_of(def: harness::HarnessDef, want: String) -> String {
+    if want == "host" {
+        return "CLI recipe " + def.id + " has no host backend, which its seat opts in to";
+    }
+    return "CLI recipe " + def.id
+        + " has no container backend, and its seat runs only in a container: opt the seat in to the host (`backend: host`), with no sandbox, to run it there";
+}
+
 /// How one command went.
 type Ran {
     code: Int = -1;
@@ -552,7 +760,8 @@ locus AttemptRun {
     fn attempt(def: harness::HarnessDef, slot: Attempter) -> String {
         let made = run_out(
             "mkdir\n-m\n700\n-p\n" + self.dir + "/voice/out\n" + self.dir + "/out\n" + self.dir
-                + "/egress\n" + self.dir + "/secret\n" + self.dir + "/home",
+                + "/egress\n" + self.dir + "/secret\n" + self.dir + "/home\n" + self.dir
+                + "/run-home\n" + self.dir + "/tmp",
         );
         if !std::io::fs::file_exists(self.dir + "/secret") {
             return self.failed(
@@ -622,35 +831,66 @@ locus AttemptRun {
         self.git("-C\n" + self.dir + "/work\nconfig\nuser.name\n" + self.a.name, 60, slot);
         self.git("-C\n" + self.dir + "/work\nconfig\nuser.email\n" + self.a.email, 60, slot);
         self.report_now("", base_sha, "", "");
-        // 2. the images, and the attempt's egress: for a harness whose model
-        // calls go to voice, the api as the node reaches it
+        // 2. where it runs: the first backend of its recipe that the seat
+        // allows (a container, or the host when it opts in) and this node
+        // can run
         self.phase = "building";
-        let route = if len(def.base_url_env) > 0 { api_route(self.api) } else { ApiRoute { } };
-        if len(route.problem) > 0 {
-            return self.failed(route.problem, "sandbox_failed", base_sha, "", "");
-        }
-        let image = image_tag(
-            "voice-harness-" + harness::text_of(self.a.definition, "id"),
-            def.base,
-            def.install,
-        );
-        let built = self.ensure_image(image, def.base, def.install, slot);
-        if len(built) > 0 { return self.failed(built, "sandbox_failed", base_sha, "", ""); }
-        let proxy = image_tag("voice-egress", EGRESS_BASE, EGRESS_INSTALL);
-        let pbuilt = self.ensure_image(proxy, EGRESS_BASE, EGRESS_INSTALL, slot);
-        if len(pbuilt) > 0 { return self.failed(pbuilt, "sandbox_failed", base_sha, "", ""); }
-        if self.stopping(slot) { return self.stopped(base_sha, ""); }
-        let egress = self.start_egress(proxy, route, slot);
-        if len(egress) > 0 { return self.failed(egress, "sandbox_failed", base_sha, "", ""); }
-        // 3. the harness
-        let login = self.login_ready(def);
-        if len(login) > 0 { return self.failed(login, "login_unavailable", base_sha, "", ""); }
-        std::io::fs::write_file(
-            self.dir + "/voice/instruction.md",
-            instruction_of(def, self.a),
-        ) or discard;
+        let pick = self.pick_backend(def, slot);
+        if len(pick.why) > 0 { return self.failed(pick.why, pick.kind, base_sha, "", ""); }
+        let host = pick.backend.kind == "host";
         let user = to_string(std::process::uid()) + ":" + std::str::trim(run_out("id\n-g"));
-        let run = docker_run_argv(def, self.a, self.dir, self.node, user, image, route.base_url);
+        let mut image = "";
+        let mut base_url = "";
+        if host {
+            // the node's own machine: no image, no network of its own, no
+            // egress proxy; voice's api as the node reaches it
+            if len(def.base_url_env) > 0 { base_url = host_base_url(self.api); }
+            self.note(
+                "running on the host, as the node's user: no sandbox and no egress filter",
+            );
+        } else {
+            // the image, and the attempt's egress: for a harness whose model
+            // calls go to voice, the api as the node reaches it
+            let route = if len(def.base_url_env) > 0 { api_route(self.api) } else { ApiRoute { } };
+            if len(route.problem) > 0 {
+                return self.failed(route.problem, "sandbox_failed", base_sha, "", "");
+            }
+            image = image_tag(
+                "voice-harness-" + harness::text_of(self.a.definition, "id"),
+                pick.backend.base,
+                pick.backend.install,
+            );
+            let built = self.ensure_image(image, pick.backend.base, pick.backend.install, slot);
+            if len(built) > 0 { return self.failed(built, "sandbox_failed", base_sha, "", ""); }
+            let proxy = image_tag("voice-egress", EGRESS_BASE, EGRESS_INSTALL);
+            let pbuilt = self.ensure_image(proxy, EGRESS_BASE, EGRESS_INSTALL, slot);
+            if len(pbuilt) > 0 { return self.failed(pbuilt, "sandbox_failed", base_sha, "", ""); }
+            if self.stopping(slot) { return self.stopped(base_sha, ""); }
+            let egress = self.start_egress(proxy, route, slot);
+            if len(egress) > 0 { return self.failed(egress, "sandbox_failed", base_sha, "", ""); }
+            base_url = route.base_url;
+        }
+        // 3. the harness
+        let login = self.login_ready(def, host);
+        if len(login) > 0 { return self.failed(login, "login_unavailable", base_sha, "", ""); }
+        let told = if host {
+            host_instruction(def, self.a, self.dir)
+        } else {
+            instruction_of(def, self.a)
+        };
+        std::io::fs::write_file(self.dir + "/voice/instruction.md", told) or discard;
+        let wrote = self.write_files(def);
+        if len(wrote) > 0 { return self.failed(wrote, "internal", base_sha, "", ""); }
+        let run = if host {
+            host_run_argv(def, self.a, self.dir)
+        } else {
+            docker_run_argv(def, self.a, self.dir, self.node, user, image, base_url)
+        };
+        let env = if host {
+            host_run_env(def, self.a, self.dir, self.host_base_env(def), base_url)
+        } else {
+            ""
+        };
         let mut argv = run;
         if def.login_kind == "env" {
             let c = std::secret::Credential { vault: self.a.login };
@@ -676,7 +916,7 @@ locus AttemptRun {
         } else if def.login_kind == "voice" {
             // voice's own key for this run, from the claim's answer: into a
             // file of the attempt's private directory, read by the shell
-            // that starts docker and removed by it; the node keeps no copy
+            // that starts the run and removed by it; the node keeps no copy
             let key = self.a.credential;
             self.a = forget_credential(self.a);
             std::io::fs::write_file(self.dir + "/secret/login", key) or {
@@ -697,8 +937,14 @@ locus AttemptRun {
         );
         let ran = self.harness_run(
             argv,
-            if def.via == "stdin" { instruction_of(def, self.a) } else { "" },
+            if def.via == "stdin" { told } else { "" },
             def.idle_seconds,
+            if host {
+                std::process::SpawnOptions { cwd: self.dir + "/work", env: env, clear_env: true }
+            } else {
+                std::process::SpawnOptions { }
+            },
+            host,
             slot,
         );
         run_out("rm\n-f\n" + self.dir + "/secret/login");
@@ -706,7 +952,7 @@ locus AttemptRun {
             let name = def.usage_file[len("/voice/out/")..len(def.usage_file)];
             self.reader.read_usage_file(std::io::fs::read_file(self.dir + "/out/" + name) or "");
         }
-        self.copy_login_back(def);
+        self.copy_login_back(def, host);
         if ran.stopped && self.cancelled { return self.stopped(base_sha, ""); }
         // usage the harness reported last (its final output, or the file it
         // wrote on exit) is held to the budget as well
@@ -726,7 +972,11 @@ locus AttemptRun {
             self.dir + "/voice/message",
             title + "\n\n" + clip_lines(summary),
         ) or discard;
-        let commit = self.commit_left(image, user, slot);
+        let commit = if host {
+            self.commit_left_host(slot)
+        } else {
+            self.commit_left(image, user, slot)
+        };
         // 5. the branch's commits, taken and bundled
         let taken = self.git(
             "--git-dir\n" + push + "\nfetch\n--no-tags\n-q\n" + self.dir + "/work\nHEAD",
@@ -802,7 +1052,26 @@ locus AttemptRun {
     /// passes, reporting meanwhile; its stdout and the tail of its stderr.
     @unbounded
     fn exec(argv: String, input: String, timeout_s: Int, env: String, slot: Attempter) -> Ran {
-        let child = std::process::spawn_with(argv, std::process::SpawnOptions { env: env }) or {
+        return self.exec_with(
+            argv,
+            input,
+            timeout_s,
+            std::process::SpawnOptions { env: env },
+            slot,
+        );
+    }
+
+    /// `exec` under `opts` (a host step's working directory and its own
+    /// environment alone).
+    @unbounded
+    fn exec_with(
+        argv: String,
+        input: String,
+        timeout_s: Int,
+        opts: std::process::SpawnOptions,
+        slot: Attempter
+    ) -> Ran {
+        let child = std::process::spawn_with(argv, opts) or {
             return Ran { code: 127, err: "could not start " + first_line(argv), unstarted: true };
         };
         if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
@@ -834,9 +1103,24 @@ locus AttemptRun {
     /// container removed when the attempt stops, falls silent past its
     /// idle limit, or passes its budget.
     @unbounded
-    fn harness_run(argv: String, input: String, idle_s: Int, slot: Attempter) -> Ran {
-        let child = std::process::spawn_with(argv, std::process::SpawnOptions { }) or {
-            return Ran { code: 127, err: "docker could not be started", unstarted: true };
+    fn harness_run(
+        argv: String,
+        input: String,
+        idle_s: Int,
+        opts: std::process::SpawnOptions,
+        host: Bool,
+        slot: Attempter
+    ) -> Ran {
+        let child = std::process::spawn_with(argv, opts) or {
+            return Ran {
+                code: 127,
+                err: if host {
+                    "the CLI could not be started"
+                } else {
+                    "docker could not be started"
+                },
+                unstarted: true,
+            };
         };
         if len(input) > 0 { std::process::write_stdin(child, input) or discard; }
         std::process::close_stdin(child);
@@ -862,6 +1146,9 @@ locus AttemptRun {
                 raw = raw + (std::process::read_stdout(child) or "");
                 self.feed_rest(raw);
                 err = keep_tail(err + (std::process::read_stderr(child) or ""), 8192);
+                // what a host run left running in its process group goes
+                // with it
+                if host { stop_group(child.pid); }
                 return Ran { code: c, err: err };
             }
             if self.a.budget_tokens > 0 && self.reader.has_usage
@@ -877,7 +1164,11 @@ locus AttemptRun {
                 self.stop_kind = "harness_failed";
             }
             if self.stopping(slot) {
-                run_out("docker\nrm\n-f\n" + harness_name(self.a.id));
+                if host {
+                    stop_group(child.pid);
+                } else {
+                    run_out("docker\nrm\n-f\n" + harness_name(self.a.id));
+                }
                 std::process::kill(child) or discard;
                 return Ran { code: -1, err: err, stopped: true };
             }
@@ -1137,11 +1428,12 @@ locus AttemptRun {
     /// run alone; a login directory's files are copied into the attempt's
     /// scratch copy. "" when it is ready, else why not.
     @unbounded
-    fn login_ready(def: harness::HarnessDef) -> String {
+    fn login_ready(def: harness::HarnessDef, host: Bool) -> String {
         if def.login_kind != "home" { return ""; }
         let from = self.data + "/logins/" + self.a.login
             + (if len(def.login_from) > 0 { "/" + def.login_from } else { "" });
-        run_out("mkdir\n-m\n700\n" + self.dir + "/login");
+        let scratch = login_scratch(def, self.dir, host);
+        run_out("mkdir\n-m\n700\n-p\n" + scratch);
         let mut files = def.login_files;
         while len(files) > 0 {
             let nl = std::str::index_of(files, "\n");
@@ -1157,7 +1449,7 @@ locus AttemptRun {
                     + ")";
             }
             let c = std::process::run(
-                "cp\n-p\n" + from + "/" + f + "\n" + self.dir + "/login/" + f,
+                "cp\n-p\n" + from + "/" + f + "\n" + scratch + "/" + f,
             ) or std::process::ProcessOutput {
                 code: 1,
                 signal: 0,
@@ -1172,8 +1464,9 @@ locus AttemptRun {
     /// A login file the CLI refreshed in its scratch copy, put back in the
     /// login's directory (a new file, renamed over the old one).
     @unbounded
-    fn copy_login_back(def: harness::HarnessDef) {
+    fn copy_login_back(def: harness::HarnessDef, host: Bool) {
         if def.login_kind != "home" { return; }
+        let scratch = login_scratch(def, self.dir, host);
         let to = self.data + "/logins/" + self.a.login
             + (if len(def.login_from) > 0 { "/" + def.login_from } else { "" });
         let mut files = def.login_files;
@@ -1181,7 +1474,7 @@ locus AttemptRun {
             let nl = std::str::index_of(files, "\n");
             let f = files[0..nl];
             files = files[(nl + 1)..len(files)];
-            let mine = self.dir + "/login/" + f;
+            let mine = scratch + "/" + f;
             if std::io::fs::file_exists(mine) {
                 let same = std::process::run(
                     "cmp\n-s\n" + mine + "\n" + to + "/" + f,
@@ -1197,6 +1490,217 @@ locus AttemptRun {
                 }
             }
         }
+    }
+
+    /// Where the attempt's recipe runs: the first of its backends of the
+    /// kind its seat runs (`container`, or `host` when the seat opts in)
+    /// that this node can run. A container needs docker; the host, its
+    /// CLI at the recipe's pinned version, found by detect or put in
+    /// voice's prefix by the backend's install. None fits: why, and
+    /// `backend_unavailable`.
+    @unbounded
+    fn pick_backend(def: harness::HarnessDef, slot: Attempter) -> BackendPick {
+        let want = if self.a.backend == "host" { "host" } else { "container" };
+        let mut why = "";
+        let mut listed = false;
+        for b in def.backends {
+            if b.kind != want { continue; }
+            listed = true;
+            if b.kind == "container" {
+                if has_docker() { return BackendPick { backend: b }; }
+                why = why + "this node has no docker, which a container needs; ";
+            } else {
+                let found = self.detect(def, b);
+                if len(found) == 0 { return BackendPick { backend: b }; }
+                if len(b.install_argv) == 0 {
+                    why = why + found + " (and the backend installs nothing); ";
+                } else {
+                    let put = self.install(def, b, slot);
+                    if self.stopping(slot) {
+                        return BackendPick { why: self.stop, kind: self.stop_kind };
+                    }
+                    if len(put) > 0 {
+                        why = why + found + "; " + put + "; ";
+                    } else {
+                        let again = self.detect(def, b);
+                        if len(again) == 0 { return BackendPick { backend: b }; }
+                        why = why + "installed, but " + again + "; ";
+                    }
+                }
+            }
+        }
+        if !listed {
+            return BackendPick { why: no_backend_of(def, want), kind: "backend_unavailable" };
+        }
+        let said = std::str::trim(why);
+        return BackendPick {
+            why: "no " + want + " backend of CLI recipe " + def.id + " runs on this node: "
+                + (if std::str::ends_with(said, ";") { said[0..(len(said) - 1)] } else { said }),
+            kind: "backend_unavailable",
+        };
+    }
+
+    /// The node's own variables a host step keeps: its user, shell and
+    /// language.
+    fn node_env() -> String {
+        let mut out = "";
+        let names = "USER\nLOGNAME\nSHELL\nLANG\nLC_ALL\n";
+        let mut rest = names;
+        while len(rest) > 0 {
+            let nl = std::str::index_of(rest, "\n");
+            let n = rest[0..nl];
+            rest = rest[(nl + 1)..len(rest)];
+            if std::env::var_exists(n) && !std::str::contains(std::env::var(n), "\n") {
+                out = out + n + "=" + std::env::var(n) + "\n";
+            }
+        }
+        return out;
+    }
+
+    /// The variables every host step of the attempt runs with (`host_env`)
+    /// for recipe `def`.
+    fn host_base_env(def: harness::HarnessDef) -> String {
+        let path = if std::env::var_exists("PATH") && len(std::env::var("PATH")) > 0 {
+            std::env::var("PATH")
+        } else {
+            "/usr/local/bin:/usr/bin:/bin"
+        };
+        return host_env(self.dir, cli_prefix(self.data, def), path, self.node_env());
+    }
+
+    /// "" when host backend `b`'s detect finds the CLI at the recipe's
+    /// pinned version (on the node's PATH, after voice's prefix), else what
+    /// it found. It runs as an argv, with no shell, the host steps' own
+    /// environment and a time limit.
+    @unbounded
+    fn detect(def: harness::HarnessDef, b: harness::HarnessBackend) -> String {
+        let argv = harness::with_prefix(b.detect, cli_prefix(self.data, def));
+        let r = std::process::run_with(
+            argv,
+            std::process::SpawnOptions {
+                cwd: self.dir + "/run-home",
+                env: self.host_base_env(def),
+                clear_env: true,
+                timeout: DETECT_S * 1s,
+            },
+        ) or std::process::ProcessOutput { code: 127, signal: 0, stdout: "", stderr: "" };
+        if harness::version_detected(b.detect_version, def.version, r.stdout + "\n" + r.stderr) {
+            return "";
+        }
+        let said = first_line(r.stdout + "\n" + r.stderr);
+        return "detect (" + std::str::replace(std::str::trim(argv), "\n", " ") + ") found no "
+            + def.name + " " + def.version
+            + (
+                if r.code == 127 && len(said) == 0 {
+                    ": not on the node's PATH"
+                } else if len(said) > 0 {
+                    ", it said: " + said
+                } else {
+                    ", it exited " + to_string(r.code)
+                }
+            );
+    }
+
+    /// Recipe `def`'s CLI, at its pinned version, put in voice's prefix by
+    /// host backend `b`'s install, once per node: "" when it is there (put
+    /// now, or before), else why not. One install at a time of a version
+    /// (a lock directory beside it); an install cut short leaves no prefix.
+    @unbounded
+    fn install(def: harness::HarnessDef, b: harness::HarnessBackend, slot: Attempter) -> String {
+        let prefix = cli_prefix(self.data, def);
+        let mark = prefix + "/" + INSTALLED_MARK;
+        if std::io::fs::file_exists(mark) { return ""; }
+        run_out("mkdir\n-m\n700\n-p\n" + self.data + "/clis/" + def.id);
+        let lock = prefix + ".lock";
+        let until = std::time::monotonic_ns() + INSTALL_S * 1000000000;
+        while !locked(lock) {
+            if std::io::fs::file_exists(mark) { return ""; }
+            if self.stopping(slot) { return self.stop; }
+            if std::time::monotonic_ns() > until {
+                return "another attempt's install of " + def.name + " " + def.version
+                    + " did not finish";
+            }
+            std::time::sleep(1000ms);
+        }
+        if std::io::fs::file_exists(mark) {
+            run_out("rmdir\n" + lock);
+            return "";
+        }
+        run_out("rm\n-rf\n" + prefix);
+        run_out("mkdir\n-m\n700\n-p\n" + prefix);
+        self.note("installing " + def.name + " " + def.version + " into voice's prefix, " + prefix);
+        let r = self.exec_with(
+            harness::with_prefix(b.install_argv, prefix),
+            "",
+            INSTALL_S,
+            std::process::SpawnOptions {
+                cwd: prefix,
+                env: self.host_base_env(def) + harness::with_prefix(b.install_env, prefix),
+                clear_env: true,
+            },
+            slot,
+        );
+        if r.code != 0 || r.stopped {
+            run_out("rm\n-rf\n" + prefix);
+            run_out("rmdir\n" + lock);
+            if r.stopped && len(self.stop) > 0 { return self.stop; }
+            return "its install exited with code " + to_string(r.code) + tail_of(r.err);
+        }
+        std::io::fs::write_file(mark, def.id + " " + def.version + "\n") or discard;
+        run_out("rmdir\n" + lock);
+        return "";
+    }
+
+    /// The recipe's files, written in the attempt's /voice: "" when they
+    /// are, else why not.
+    @unbounded
+    fn write_files(def: harness::HarnessDef) -> String {
+        if len(def.files) == 0 { return ""; }
+        let mut it = std::json::array_first(def.files);
+        while !it.done {
+            let path = harness::text_of(it.element, "path");
+            let name = path[len("/voice/")..len(path)];
+            std::io::fs::write_file(
+                self.dir + "/voice/" + name,
+                std::json::find_string_field(it.element, "text"),
+            ) or {
+                return "the recipe's file " + path + " could not be written";
+            };
+            it = std::json::array_next(it);
+        }
+        return "";
+    }
+
+    /// Commit what a host run left in the workspace, as the caller: voice's
+    /// own git, with no hooks and no fsmonitor, under no configuration but
+    /// the workspace's own (which the CLI, as the node's user, could write;
+    /// it could as well run anything as that user). No failure when it
+    /// went, or there was nothing.
+    fn commit_left_host(slot: Attempter) -> Failure {
+        let r = self.exec_with(
+            "sh\n-c\nif [ -n \"$(git status --porcelain)\" ]; then git -c core.hooksPath=/dev/null -c core.fsmonitor=false add -A && git -c core.hooksPath=/dev/null -c core.fsmonitor=false commit -q --no-verify -F \"$1\"; fi\nsh\n"
+                + self.dir + "/voice/message",
+            "",
+            600,
+            std::process::SpawnOptions {
+                cwd: self.dir + "/work",
+                env: GIT_ENV + "\nHOME=" + self.dir + "/home\nXDG_CONFIG_HOME=" + self.dir
+                    + "/home\nGIT_AUTHOR_NAME=" + self.a.name + "\nGIT_AUTHOR_EMAIL=" + self.a.email
+                    + "\nGIT_COMMITTER_NAME=" + self.a.name + "\nGIT_COMMITTER_EMAIL="
+                    + self.a.email,
+            },
+            slot,
+        );
+        if r.stopped && len(self.stop) > 0 {
+            return Failure { why: self.stop, kind: self.stop_kind };
+        }
+        if r.code != 0 {
+            return Failure {
+                why: "what the harness left could not be committed: " + clip(r.err),
+                kind: "harness_failed",
+            };
+        }
+        return Failure { };
     }
 
     /// Commit what the harness left in the workspace, as the caller, in a
@@ -1325,6 +1829,76 @@ locus AttemptRun {
     }
 }
 
+/// Where a run of `def` in `dir` keeps its login directory's scratch copy:
+/// the attempt's `login` directory, mounted in a container; on the host,
+/// where the login's mount is as a host run has it (`host_login_dir`).
+fn login_scratch(def: harness::HarnessDef, dir: String, host: Bool) -> String {
+    return if host { host_login_dir(def, dir) } else { dir + "/login" };
+}
+
+/// Whether this node has docker, which a container backend needs: its
+/// client answers.
+fn has_docker() -> Bool {
+    let r = std::process::run("docker\n--version") or std::process::ProcessOutput {
+        code: 127,
+        signal: 0,
+        stdout: "",
+        stderr: "",
+    };
+    return r.code == 0;
+}
+
+/// Directory `path` made, as a lock: true when this call made it (no other
+/// holds it).
+fn locked(path: String) -> Bool {
+    std::io::fs::mkdir(path) or { return false; };
+    return true;
+}
+
+/// Everything left running in the process group a host run started
+/// (`pid`, its leader: every child voice spawns leads a group of its own),
+/// stopped.
+fn stop_group(pid: Int) {
+    if pid > 1 { run_out("kill\n-s\nKILL\n--\n-" + to_string(pid)); }
+}
+
+/// What installs of CLIs in voice's prefix left from before the node
+/// started, removed: a version whose install was cut short (no
+/// `INSTALLED_MARK`), and its lock. A finished install stays, shared by
+/// the attempts of that version.
+@unbounded
+fn clean_clis(data: String) {
+    let root = data + "/clis";
+    if !std::io::fs::file_exists(root) { return; }
+    let n = std::io::fs::list_dir_count(root) or 0;
+    let mut i = 0;
+    while i < n {
+        let recipe = std::io::fs::list_dir_at(root, i) or "";
+        i = i + 1;
+        if !harness::slug(recipe) { continue; }
+        let dir = root + "/" + recipe;
+        let m = std::io::fs::list_dir_count(dir) or 0;
+        let mut gone = "";
+        let mut j = 0;
+        while j < m {
+            let entry = std::io::fs::list_dir_at(dir, j) or "";
+            j = j + 1;
+            if len(entry) == 0
+                || std::str::starts_with(entry, ".")
+                || std::str::contains(entry, "/")
+            {
+                continue;
+            }
+            if std::str::ends_with(entry, ".lock")
+                || !std::io::fs::file_exists(dir + "/" + entry + "/" + INSTALLED_MARK)
+            {
+                gone = gone + dir + "/" + entry + "\n";
+            }
+        }
+        if len(gone) > 0 { run_out("rm\n-rf\n" + gone[0..(len(gone) - 1)]); }
+    }
+}
+
 /// The node's attempts left from before it started, removed: every
 /// container and network an attempt of this node made (by its label), and
 /// the directory attempts are run in. No attempt is running yet, so none
@@ -1336,6 +1910,7 @@ fn clean_attempts(node: String, data: String) {
     remove_each("docker\nnetwork\nrm\n", nets);
     if std::io::fs::file_exists(data + "/attempts") { run_out("rm\n-rf\n" + data + "/attempts"); }
     run_out("mkdir\n-m\n700\n-p\n" + data + "/attempts");
+    clean_clis(data);
 }
 
 /// `command` run for each id, a line each, in `ids`.

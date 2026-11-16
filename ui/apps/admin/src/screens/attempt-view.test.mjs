@@ -18,7 +18,7 @@ test('a label: the phase while it runs, why once it failed', () => {
   assert.equal(attemptLabel({ state: 'failed', phase: null, failure_kind: 'node_lost' }), 'failed · node lost');
   assert.equal(attemptLabel({ state: 'failed', phase: null, failure_kind: null }), 'failed');
   assert.equal(attemptLabel({ state: 'done', phase: null, failure_kind: null }), 'done');
-  assert.equal(Object.keys(FAILURE_WORDS).length, 11, 'a word for every kind the contract names');
+  assert.equal(Object.keys(FAILURE_WORDS).length, 12, 'a word for every kind the contract names');
 });
 
 test('a transcript, a line an event; a line cut short is passed over', () => {

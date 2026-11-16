@@ -1467,3 +1467,43 @@ as the key that asked for the attempt, the attempt their conversation.
 alter table attempt add column run_digest text not null default '';  -- sha256 of the key voice minted for its run while it runs, empty otherwise
 create unique index attempt_by_run_digest on attempt (run_digest) where run_digest <> '';
 ```
+
+### Migration 43: CLI recipes
+
+A **CLI recipe** is an agentic coding CLI as data (`openapi.yaml`,
+`HarnessDefinition`): where it may run (its backends: a container voice
+builds, or the node's own machine), its argv and permission policy, how a
+login and a model reach it, and how its output is read. Coding attempts run
+them; a harness seat names one by its id (its config's `harness`). One row
+per recipe, its body the recipe as lib/harness checked it. Voice's own are
+read from its `harnesses` directory at each start of the api and written
+here, `origin` `shipped`: added enabled, their bodies replaced as the files
+say, never an operator's of the same id; they are read-only, disabled or
+duplicated into one of the operator's. The operator's, `operator`, are
+made, edited and removed on the admin plane (`/admin/v1/cli-recipes`). A
+disabled recipe's seats take no new attempt. A recipe a seat names is never
+removed, only disabled. At most 64.
+
+Recipes change while attempts run, so an attempt keeps, as it starts, what it
+started with: whether its CLI's model calls go to voice (`routed`, its
+recipe's `login.kind` `voice`), which decides how its run is metered (the
+ledger counts those calls, and the attempt's own record none of their
+tokens), and the sha256 of the recipe it was handed (`recipe_digest`). It is
+settled by them whatever becomes of the recipe after: edited, disabled or
+removed. An attempt running as the store migrates is routed when it holds a
+run's key (migration 42), as only such an attempt does.
+
+```sql
+create table cli_recipe (
+  id         text primary key,
+  body       jsonb not null,                       -- the recipe, as lib/harness checked it
+  origin     text not null check (origin in ('shipped', 'operator')),
+  enabled    boolean not null default true,        -- a disabled recipe's seats take no new attempt
+  created_at timestamptz not null,
+  updated_at timestamptz not null
+);
+
+alter table attempt add column routed boolean not null default false;  -- its CLI's model calls go to voice, metered by the ledger: fixed as it starts
+alter table attempt add column recipe_digest text not null default '';  -- sha256 of the CLI recipe it started with, '' until it starts
+update attempt set routed = true where run_digest <> '';
+```

@@ -34,8 +34,10 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
     Metal, vLLM or llama.cpp on CUDA), as the operator places it;
   - `openai-compatible`: an endpoint that speaks the OpenAI API;
   - `harness`: an agentic coding CLI (Claude Code, Codex, Antigravity,
-    Vibe) under one login per seat, running coding attempts in a container
-    of their own ([`docs/coding-attempts.md`](./docs/coding-attempts.md));
+    Vibe, pi, or one of the operator's CLI recipes) under one login per
+    seat, running coding attempts in a container of their own, or on the
+    node's own machine where a seat opts in
+    ([`docs/coding-attempts.md`](./docs/coding-attempts.md));
     `claude-cli` is the claude harness under its older name, and also
     answers requests;
   - `static`: a canned answer, for trying voice and for tests.

@@ -2384,6 +2384,7 @@ fn main() {
     inventories(st::MemoryStore { }, "memory");
     flights(st::MemoryStore { }, "memory");
     attempts(st::MemoryStore { }, "memory");
+    cli_recipes(st::MemoryStore { }, "memory");
     peeks(st::MemoryStore { }, "memory");
     rollup(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
@@ -2427,6 +2428,8 @@ fn main() {
     flights(pg, "postgres");
     pg.conn.exec("TRUNCATE attempt CASCADE");
     attempts(pg, "postgres");
+    pg.conn.exec("TRUNCATE cli_recipe");
+    cli_recipes(pg, "postgres");
     pg.conn.exec("TRUNCATE peek");
     pg.conn.exec("DELETE FROM project WHERE id = 'peeky'");
     peeks(pg, "postgres");
@@ -2491,6 +2494,146 @@ fn report(events: Int, state: String) -> st::AttemptReport {
 /// than its concurrency, reported with a transcript kept bounded, ended,
 /// cancelled and failed (a failure with its kind, an end that is none
 /// without one), and a bundle held and let go.
+/// CLI recipes: voice's own, upserted and read-only; the operator's, made,
+/// edited and removed; either disabled; one a seat names never removed.
+fn cli_recipes(s: st::Store, label: String) {
+    let at = `2026-11-15T00:00:00Z`;
+    let later = `2026-11-15T01:00:00Z`;
+    let shipped = st::CliRecipeRow {
+        id: "claude",
+        body: "{\"id\": \"claude\", \"name\": \"Claude Code\"}",
+        created_at: at,
+        updated_at: at,
+    };
+    std::test::assert(s.put_shipped_cli_recipe(shipped) or false, label + ": voice's own is added");
+    let c = s.cli_recipe("claude") or st::CliRecipeRow { };
+    std::test::assert(
+        c.present && c.origin == "shipped" && c.enabled
+            && std::json::find_string_field(c.body, "name") == "Claude Code",
+        label + ": as voice's own, enabled",
+    );
+    s.enable_cli_recipe("claude", false, later, ch("update", "cli-recipes/claude")) or discard;
+    let mut next = shipped;
+    next.body = "{\"id\": \"claude\", \"name\": \"Claude Code, newer\"}";
+    next.updated_at = later;
+    std::test::assert(s.put_shipped_cli_recipe(next) or false, label + ": voice's own again");
+    let c2 = s.cli_recipe("claude") or st::CliRecipeRow { };
+    std::test::assert(
+        std::json::find_string_field(c2.body, "name") == "Claude Code, newer" && !c2.enabled,
+        label + ": its body replaced, disabled as the operator left it",
+    );
+    std::test::assert(
+        !(s.update_cli_recipe(next, ch("update", "cli-recipes/claude")) or true),
+        label + ": voice's own is read-only",
+    );
+    std::test::assert(
+        !(s.delete_cli_recipe("claude", ch("delete", "cli-recipes/claude")) or true),
+        label + ": and never removed",
+    );
+    let mine = st::CliRecipeRow {
+        id: "mine",
+        body: "{\"id\": \"mine\", \"name\": \"Mine\"}",
+        created_at: at,
+        updated_at: at,
+    };
+    std::test::assert(
+        s.insert_cli_recipe(mine, ch("create", "cli-recipes/mine")) or false,
+        label + ": the operator's is added",
+    );
+    std::test::assert(
+        !(s.insert_cli_recipe(mine, ch("create", "cli-recipes/mine")) or true),
+        label + ": its id is its own",
+    );
+    let mut theirs = mine;
+    theirs.body = "{\"id\": \"mine\", \"name\": \"Shipped\"}";
+    std::test::assert(
+        !(s.put_shipped_cli_recipe(theirs) or true),
+        label + ": voice's files never replace the operator's",
+    );
+    let mut edited = mine;
+    edited.body = "{\"id\": \"mine\", \"name\": \"Mine, edited\"}";
+    edited.updated_at = later;
+    std::test::assert(
+        s.update_cli_recipe(edited, ch("update", "cli-recipes/mine")) or false,
+        label + ": the operator's is edited",
+    );
+    let m = s.cli_recipe("mine") or st::CliRecipeRow { };
+    std::test::assert(
+        m.origin == "operator" && std::json::find_string_field(m.body, "name") == "Mine, edited",
+        label + ": and reads back edited",
+    );
+    let all = s.cli_recipes() or st::CliRecipeRows { };
+    std::test::assert(
+        count(all.rows) == 2 && (at(all.rows, 0) or st::CliRecipeRow { }).id == "claude"
+            && (at(all.rows, 1) or st::CliRecipeRow { }).id == "mine",
+        label + ": every recipe, in the order of their ids",
+    );
+    // a seat that names it holds it: on an account the store has (one the
+    // earlier rows left, which may fill the store's bound), or a new one
+    let held_accounts = s.accounts() or st::AccountRows { };
+    let account = if count(held_accounts.rows) > 0 {
+        (at(held_accounts.rows, 0) or st::AccountRow { }).id
+    } else {
+        "coding"
+    };
+    if account == "coding" {
+        s.insert_account(
+            st::AccountRow { id: "coding", name: "Coding", billing: "none", created_at: at },
+            ch("create", "accounts/coding"),
+        ) or discard;
+    }
+    let held_nodes = s.nodes() or st::NodeRows { };
+    let node = if count(held_nodes.rows) > 0 {
+        (at(held_nodes.rows, 0) or st::NodeRow { }).id
+    } else {
+        "coder"
+    };
+    if node == "coder" {
+        s.insert_node(
+            st::NodeRow { id: "coder", name: "coder", token_digest: "cc01", created_at: at },
+            ch("create", "nodes/coder"),
+        ) or discard;
+    }
+    let mut seat = st::SeatRow {
+        node: node,
+        id: "mine-seat",
+        engine: "coding",
+        account: account,
+        data_classes: names("internal", ""),
+        concurrency: 1,
+        config: "{\"harness\": \"mine\", \"login\": \"mine-login\"}",
+    };
+    push(seat.serves.items, st::SeatModel { model: "mine-default" }) or discard;
+    s.insert_seat(seat, ch("create", "nodes/coder/seats/mine-seat")) or discard;
+    std::test::assert(
+        !(s.delete_cli_recipe("mine", ch("delete", "cli-recipes/mine")) or true),
+        label + ": a recipe a seat names is not removed",
+    );
+    std::test::assert(
+        (s.cli_recipe("mine") or st::CliRecipeRow { }).present,
+        label + ": and is still there",
+    );
+    std::test::assert(
+        s.enable_cli_recipe("mine", false, later, ch("update", "cli-recipes/mine")) or false,
+        label + ": only disabled",
+    );
+    std::test::assert(
+        !(s.cli_recipe("mine") or st::CliRecipeRow { }).enabled,
+        label + ": disabled",
+    );
+    let held = s.seat(node, "mine-seat") or st::SeatRow { };
+    s.delete_seat(held, ch("delete", "nodes/coder/seats/mine-seat")) or discard;
+    std::test::assert(
+        s.delete_cli_recipe("mine", ch("delete", "cli-recipes/mine")) or false,
+        label + ": removed once no seat names it",
+    );
+    std::test::assert(!(s.cli_recipe("mine") or st::CliRecipeRow { }).present, label + ": gone");
+    std::test::assert(
+        !(s.enable_cli_recipe("nope", true, later, ch("update", "cli-recipes/nope")) or true),
+        label + ": no recipe to enable",
+    );
+}
+
 fn attempts(s: st::Store, label: String) {
     let now = t("2026-10-17T12:00:00Z");
     std::test::assert(
@@ -2534,7 +2677,18 @@ fn attempts(s: st::Store, label: String) {
 
     // a seat of concurrency 1 starts one
     std::test::assert(
-        s.start_attempt("att_1", "node-a", "coder", "acct", "fake", 1, "digest-1", now) or false,
+        s.start_attempt(
+            "att_1",
+            "node-a",
+            "coder",
+            "acct",
+            "fake",
+            1,
+            "digest-1",
+            true,
+            "sha256:r1",
+            now,
+        ) or false,
         label + ": started",
     );
     std::test::assert_eq_str(
@@ -2542,16 +2696,47 @@ fn attempts(s: st::Store, label: String) {
         "att_1",
         label + ": its run's key names it while it runs",
     );
+    let started = s.attempt("att_1") or st::AttemptRow { };
+    std::test::assert(
+        started.routed && started.recipe_digest == "sha256:r1",
+        label + ": how its run is metered, and its recipe, kept as it started",
+    );
     std::test::assert(
         !(s.attempt_by_run_digest("") or st::AttemptRow { }).present,
         label + ": no digest names nothing",
     );
     std::test::assert(
-        !(s.start_attempt("att_2", "node-a", "coder", "acct", "fake", 1, "", now) or true),
+        !(
+            s.start_attempt(
+                "att_2",
+                "node-a",
+                "coder",
+                "acct",
+                "fake",
+                1,
+                "",
+                false,
+                "",
+                now,
+            ) or true
+        ),
         label + ": the seat is full",
     );
     std::test::assert(
-        !(s.start_attempt("att_1", "node-a", "other", "acct", "fake", 1, "", now) or true),
+        !(
+            s.start_attempt(
+                "att_1",
+                "node-a",
+                "other",
+                "acct",
+                "fake",
+                1,
+                "",
+                false,
+                "",
+                now,
+            ) or true
+        ),
         label + ": started once",
     );
     let one = s.attempt("att_1") or st::AttemptRow { };
@@ -2634,7 +2819,18 @@ fn attempts(s: st::Store, label: String) {
         c.state == "cancelled" && c.failure_kind == "",
         label + ": a queued one ends at once, no failure",
     );
-    s.start_attempt("att_2", "node-a", "coder", "acct", "fake", 1, "digest-2", now) or discard;
+    s.start_attempt(
+        "att_2",
+        "node-a",
+        "coder",
+        "acct",
+        "fake",
+        1,
+        "digest-2",
+        true,
+        "",
+        now,
+    ) or discard;
     let asked = s.cancel_attempt("att_2", now) or st::AttemptRow { };
     std::test::assert(
         (s.attempt_by_run_digest("digest-2") or st::AttemptRow { }).present,
@@ -2685,7 +2881,7 @@ fn attempts(s: st::Store, label: String) {
         label + ": and read back",
     );
     s.insert_attempt(attempt_row("att_5", "work", now)) or discard;
-    s.start_attempt("att_5", "node-a", "coder", "acct", "fake", 1, "", now) or discard;
+    s.start_attempt("att_5", "node-a", "coder", "acct", "fake", 1, "", false, "", now) or discard;
     let mut over = report(0, "failed");
     over.failure = "over its budget";
     over.failure_kind = "over_budget";

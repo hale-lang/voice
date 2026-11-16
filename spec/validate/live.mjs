@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample', arrangement: 'live-sample' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample', arrangement: 'live-sample', cli_recipe: 'live-cli' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -35,6 +35,9 @@ await setup('/admin/v1/recipes', recipe('live-sample'));
 // placement below is served by one voice ships)
 const runtime = id => ({ id, license: { name: 'mit', url: 'https://opensource.org/license/mit' }, server: 'llama-server', formats: ['gguf'], accelerator: 'cuda', platforms: [{ os: 'linux', arch: 'arm64' }], artifact: { kind: 'container', image: 'ghcr.io/ggml-org/llama.cpp', digest: 'sha256:' + 'c'.repeat(64) } });
 await setup('/admin/v1/runtimes', runtime('live-sample'));
+// a CLI recipe of the operator's, run on the host (the one the delete removes)
+const cliRecipe = id => ({ id, name: 'Live CLI', version: '1.0.0', backends: [{ kind: 'container', base: 'docker.io/library/alpine@sha256:' + 'd'.repeat(64), install: 'apk add --no-cache git' }, { kind: 'host', detect: { command: ['live-cli', '--version'], version: 'live-cli ([0-9.]+)' }, install: { command: ['npm', 'install', '--global', '--prefix', '$VOICE_CLI_PREFIX', 'live-cli@1.0.0'] } }], command: ['live-cli', '--print'], instruction: { via: 'stdin' }, model: { flag: '--model' }, login: { kind: 'env', env: 'LIVE_KEY' }, env: {}, reader: 'text', commits: false, preamble: 'Work in /work.', egress: ['api.example'] });
+await setup('/admin/v1/cli-recipes', cliRecipe('live-cli'));
 await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
 await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
@@ -106,6 +109,10 @@ const bodies = {
   runAnnotation: {},
   createAttempt: { repo: 'https://forge.example.com/team/app.git', base: 'main', instruction: 'Add a test.', as: { name: 'Live', email: 'live@example.com' } },
   setToolSettings: { web_fetch: { enabled: true, max_calls: 4, denylist: ['192.0.2.0/24', 'admin.example.com'] } },
+  createCliRecipe: cliRecipe('live-cli-2'),
+  updateCliRecipe: { ...cliRecipe('live-cli'), name: 'Live CLI, edited' },
+  setCliRecipeEnabled: { enabled: false },
+  duplicateCliRecipe: { id: 'live-cli-3', name: 'Live CLI, copied' },
 };
 
 // the node plane: the node's enrollment token, and the bodies it sends

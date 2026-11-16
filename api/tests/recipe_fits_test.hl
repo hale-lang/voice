@@ -117,6 +117,27 @@ fn cell(f: api::RecipeFits, recipe: String, variant: String, nodes: String) -> a
     return api::TargetFit { };
 }
 
+/// A request granite's seat on gpu-box served now: `output` tokens in
+/// `ms` of generation.
+fn granite_served(id: String, output: Int, ms: Int) -> st::UsageRow {
+    return st::UsageRow {
+        id: id,
+        created_at: api::now_seconds(),
+        project: "p",
+        key: "k",
+        requested_model: "granite-4.0-h-tiny",
+        served_model: "granite-4.0-h-tiny",
+        node: "gpu-box",
+        seat: "gpu-box/granite",
+        status: "served",
+        output_tokens: output,
+        served: "{\"model\": \"granite-4.0-h-tiny\", \"node\": \"gpu-box\", \"seat\": \"gpu-box/granite\", \"account\": \"local\"}",
+        record: "{\"id\": \"" + id + "\", \"output_tokens\": " + to_string(output)
+            + ", \"timing\": {\"wall_ms\": 0, \"queue_ms\": 0, \"load_ms\": 0, \"first_output_ms\": 100, \"engine_ms\": "
+            + to_string(100 + ms) + "}}",
+    };
+}
+
 fn fit_node(f: api::RecipeFits, id: String) -> api::FitNode {
     for n in f.nodes {
         if n.node == id { return n; }
@@ -156,6 +177,16 @@ fn main() {
         caps(true, gb10_hw(), link_to("node-a", "198.51.100.2", "203.0.113.2")),
     );
     add_node(store, "static", caps(false, GPU_BOX, ""));
+    // a GPU voice knows no memory bandwidth for
+    add_node(
+        store,
+        "odd-box",
+        caps(
+            true,
+            "{\"os\": \"linux\", \"arch\": \"x86_64\", \"memory_bytes\": 64000000000, \"model_memory_bytes\": 60000000000, \"accelerators\": [{\"kind\": \"cuda\", \"name\": \"NVIDIA Mystery 9000\", \"memory_bytes\": 48000000000, \"unified\": false}], \"disk_free_bytes\": 500000000000}",
+            "",
+        ),
+    );
 
     // ---- the pair is listed, but judged on only once its link is checked --
     let before = placements.fits(api::RecipeAsk { }) or {
@@ -356,10 +387,79 @@ fn main() {
         "a node takes part in one placement across nodes at a time: " + rival.reason,
     );
 
+    // ---- how fast each would generate, one request at a time -------------
+    let oss = cell(g, "gpt-oss-20b", "gguf-mxfp4", "node-a");
+    std::test::assert(
+        oss.has_speed && oss.speed.kind == api::FitSpeedKind::estimated && oss.speed.low == 72
+            && oss.speed.high == 118 && oss.speed.bandwidth_low_gbps == 273
+            && oss.speed.accelerator == "NVIDIA GB10" && !oss.has_speed_unknown,
+        "gpt-oss-20b's GGUF on a Spark is estimated, 72 to 118 tok/s (llama.cpp's own Spark benchmark: 83): "
+            + to_string(oss.speed.low) + "-" + to_string(oss.speed.high),
+    );
+    let radeon = cell(g, "qwen3-0.6b", "gguf-q8_0", "gpu-box");
+    std::test::assert(
+        radeon.has_speed && radeon.speed.bandwidth_low_gbps == 432
+            && radeon.speed.bandwidth_high_gbps == 640,
+        "on gpu-box's card, from its family's least bandwidth to its most",
+    );
+    let fp8 = cell(g, "deepseek-v4-flash-0731", "safetensors-fp8", "node-a,node-b");
+    std::test::assert(
+        fp8.has_speed && fp8.speed.low == 21 && fp8.speed.high == 30
+            && fp8.speed.bandwidth_low_gbps == 546,
+        "across the pair, both nodes' bandwidth at a pair's efficiency: "
+            + to_string(fp8.speed.low) + "-" + to_string(fp8.speed.high),
+    );
+    let odd = cell(g, "qwen3-0.6b", "gguf-q8_0", "odd-box");
+    std::test::assert(
+        !odd.has_speed && odd.has_speed_unknown
+            && odd.speed_unknown == "unknown hardware: no memory bandwidth known for NVIDIA Mystery 9000",
+        "unknown hardware has no estimate: " + odd.speed_unknown,
+    );
+    let never = cell(g, "deepseek-v4-flash-0731", "gguf-q2_k_s", "gpu-box");
+    std::test::assert(
+        !never.has_speed && !never.has_speed_unknown,
+        "and what never fits there says nothing of speed",
+    );
+
+    // granite's seat on gpu-box serves: four requests are too few to say,
+    // five say it, measured beating the estimate; its other variant there
+    // is still estimated
+    let mut i = 0;
+    while i < 4 {
+        store.insert_usage(granite_served("g" + to_string(i), 200, 5000)) or discard;
+        i = i + 1;
+    }
+    store.insert_usage(granite_served("g-short", 10, 100)) or discard;
+    let four = cell(
+        placements.fits(api::RecipeAsk { }) or api::RecipeFits { },
+        "granite-4.0-h-tiny",
+        "gguf-q8_0",
+        "gpu-box",
+    );
+    std::test::assert(
+        four.has_speed && four.speed.kind == api::FitSpeedKind::estimated,
+        "four requests (and one too short to count) leave the estimate",
+    );
+    store.insert_usage(granite_served("g4", 300, 5000)) or discard;
+    let h = placements.fits(api::RecipeAsk { }) or api::RecipeFits { };
+    let five = cell(h, "granite-4.0-h-tiny", "gguf-q8_0", "gpu-box");
+    std::test::assert(
+        five.has_speed && five.speed.kind == api::FitSpeedKind::measured
+            && five.speed.requests == 5 && five.speed.tps == 40 && five.speed.high == 40
+            && five.speed.has_first_at && five.speed.bytes_per_token == 0,
+        "five say it: measured, 40 tok/s: " + to_string(five.speed.requests) + " "
+            + to_string(five.speed.tps),
+    );
+    std::test::assert(
+        cell(h, "granite-4.0-h-tiny", "gguf-q4_k_m", "gpu-box").speed.kind
+            == api::FitSpeedKind::estimated,
+        "its other variant there is still estimated",
+    );
+
     // ---- paged as listRecipes is ----------------------------------------
     let page = placements.fits(api::RecipeAsk { limit: 2 }) or api::RecipeFits { };
     std::test::assert(
-        count(page.data) == 2 && page.has_next_cursor && count(page.nodes) == 4,
+        count(page.data) == 2 && page.has_next_cursor && count(page.nodes) == 5,
         "a page of two recipes, every node with it",
     );
     let bad = placements.fits(api::RecipeAsk { cursor: "no-such-recipe" }) or {

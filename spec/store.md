@@ -1507,3 +1507,15 @@ alter table attempt add column routed boolean not null default false;  -- its CL
 alter table attempt add column recipe_digest text not null default '';  -- sha256 of the CLI recipe it started with, '' until it starts
 update attempt set routed = true where run_digest <> '';
 ```
+
+### Migration 44: a seat's requests
+
+The Recipes page shows how fast a variant generates where it has been
+placed (`TargetFit.speed`): measured from the ledger, the requests the
+placement's seat served (`served.seat`) since the placement was made, at
+most the last seven days, the newest 500 of them. This index reads one
+seat's rows, newest first, without scanning the ledger.
+
+```sql
+create index usage_by_served_seat on usage ((served->>'seat'), created_at desc);  -- a seat's requests, newest first: the speed a placement measured
+```

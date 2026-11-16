@@ -12,6 +12,7 @@ export type RecipeFits = Schemas['RecipeFits'];
 export type TargetFit = Schemas['TargetFit'];
 export type FitNode = Schemas['FitNode'];
 export type FitPair = Schemas['FitPair'];
+export type FitSpeed = Schemas['FitSpeed'];
 type RecipeSummary = Schemas['RecipeSummary'];
 type VariantSummary = Schemas['RecipeVariantSummary'];
 
@@ -52,6 +53,55 @@ export function whyOf(c: TargetFit): string {
 /** What is left of the room after placing it there now; null when it does not fit now. */
 export function headroomOf(c: TargetFit): number | null {
   return c.fits && c.held_bytes != null ? c.room_bytes - c.held_bytes : null;
+}
+
+// ---- speed: tokens a second, one request at a time ------------------------
+
+/** A number of tokens a second as said: whole, `<1` below one. */
+function tps(n: number): string {
+  return n < 1 ? '<1' : String(Math.round(n));
+}
+
+/**
+ * A cell's speed as it reads in the table: a measured one plainly (`42
+ * tok/s`), an estimate as one, with its range (`≈35–45 tok/s`); none ('')
+ * where there is neither.
+ */
+export function speedSaid(c: TargetFit | undefined): string {
+  const s = c?.speed;
+  if (!s) return '';
+  if (s.kind === 'measured') return `${tps(s.tps)} tok/s`;
+  return s.low === s.high ? `≈${tps(s.low)} tok/s` : `≈${tps(s.low)}–${tps(s.high)} tok/s`;
+}
+
+const GB = 1e9;
+
+/** A date, as the hover says it. */
+const day = (iso: string | undefined) => (iso ? iso.slice(0, 10) : '?');
+
+/** Its basis, for the hover: how it was measured or what it was estimated from; or why there is none. */
+export function speedWhy(c: TargetFit | undefined): string {
+  if (!c) return '';
+  const s = c.speed;
+  if (!s) return c.speed_unknown ? `No speed: ${c.speed_unknown}.` : '';
+  const one = 'One request at a time, generating: not the prompt’s reading, nor what a seat serves to many at once.';
+  if (s.kind === 'measured') {
+    const n = s.requests ?? 0;
+    return `Measured: the median of ${n} request${n === 1 ? '' : 's'} its seat here served whole, ${day(s.first_at)} to ${day(s.last_at)}; the middle half ${tps(s.low)}–${tps(s.high)} tok/s. Output tokens over generation time, past the first token. ${one}`;
+  }
+  const bw = s.bandwidth_low_gbps === s.bandwidth_high_gbps ? `${s.bandwidth_low_gbps}` : `${s.bandwidth_low_gbps}–${s.bandwidth_high_gbps}`;
+  const pair = c.nodes.length > 1 ? ' Across two nodes it is rougher: the link costs each token, calibrated on one model.' : '';
+  return `Estimated: ${bw} GB/s of memory bandwidth (${s.accelerator}) × ${s.efficiency_low}–${s.efficiency_high}% (the runtime's efficiency) ÷ ${((s.bytes_per_token ?? 0) / GB).toFixed(2)} GB of weights read a token.${pair} ${one}`;
+}
+
+/** The fastest of `cells` (all, or those of `scope`): a measured speed's median, an estimate's middle; null when none has one. */
+export function fastestOf(cells: Map<string, TargetFit>, scope?: Set<string>): number | null {
+  let best: number | null = null;
+  for (const [key, cell] of cells) {
+    if (scope && scope.size && !scope.has(key)) continue;
+    if (cell.speed && (best == null || cell.speed.tps > best)) best = cell.speed.tps;
+  }
+  return best;
 }
 
 /** One recipe variant, judged on every target. */
@@ -108,10 +158,11 @@ export function targetsOf(fits: RecipeFits): string[] {
 
 // ---- the view: sort and filters, kept in the URL --------------------------
 
-export type SortKey = 'fit' | 'memory' | 'headroom' | 'size' | 'name';
+export type SortKey = 'fit' | 'memory' | 'headroom' | 'speed' | 'size' | 'name';
 export const SORTS: { value: SortKey; label: string }[] = [
   { value: 'fit', label: 'fits now first' },
   { value: 'headroom', label: 'headroom on the best' },
+  { value: 'speed', label: 'speed, fastest first' },
   { value: 'memory', label: 'memory needed' },
   { value: 'size', label: 'size' },
   { value: 'name', label: 'name' },
@@ -223,6 +274,11 @@ function sortValue(row: FitRow, sort: SortKey, on: string[]): number {
       // the most headroom first when ascending: none (does not fit now) last
       const h = b && b.status === 'fits' ? headroomOf(b.cell) : null;
       return h == null ? Infinity : -h;
+    }
+    case 'speed': {
+      // the fastest first when ascending: none (no speed there) last
+      const f = fastestOf(row.cells, new Set(on));
+      return f == null ? Infinity : -f;
     }
     case 'fit': {
       const order: FitStatus[] = ['fits', 'placed', 'freed', 'never'];

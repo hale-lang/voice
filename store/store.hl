@@ -813,6 +813,104 @@ type UsageTotal {
 /// currency, at most `SUMMARY_GROUPS`, the first in that order.
 type UsageTotals { rows: bounded[UsageTotal; 1000]; }
 
+/// Which requests a placement's decode speed is measured from
+/// (`Store.decode_speeds`): those its seat served from `since` (and while
+/// the placement stood), whole, with at least `min_output` output tokens the
+/// engine counted, and a generation time; of each placement, the newest
+/// `per_seat`.
+type DecodeSpeedQuery {
+    since: Time = `1970-01-01T00:00:00Z`;
+    min_output: Int = 32;
+    per_seat: Int = 500;
+}
+
+/// What the seats of placements of one recipe variant on the same nodes
+/// generated at: each request's output tokens over its generation time
+/// (`timing.engine_ms` less `timing.first_output_ms`), in tokens a second,
+/// rounded: the 25th, 50th and 75th percentiles (the value at or past that
+/// share of them, as Postgres' `percentile_disc` takes it); how many, and
+/// the first and last of them.
+type DecodeSpeedRow {
+    recipe: String = "";
+    variant: String = "";
+    // the placement's nodes in byte order, a tab between
+    nodes: String = "";
+    requests: Int = 0;
+    p25_tps: Int = 0;
+    median_tps: Int = 0;
+    p75_tps: Int = 0;
+    first_at: Time = `1970-01-01T00:00:00Z`;
+    last_at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// By recipe, variant and nodes, in that order.
+type DecodeSpeedRows { rows: bounded[DecodeSpeedRow; 256]; }
+
+/// The most requests one group's speed is measured over in the memory
+/// store.
+const DECODE_SAMPLES: Int = 4096;
+
+/// The groups a decode speed is measured for, in order.
+type DecodeKeys { items: bounded[String; 256]; }
+
+/// `keys` with `key` in it, kept in byte order.
+fn decode_key_added(keys: DecodeKeys, key: String) -> DecodeKeys {
+    let mut out = DecodeKeys { };
+    let mut placed = false;
+    for x in keys.items {
+        if x == key { return keys; }
+        if !placed && key < x {
+            push(out.items, key) or discard;
+            placed = true;
+        }
+        push(out.items, x) or discard;
+    }
+    if !placed { push(out.items, key) or discard; }
+    return out;
+}
+
+/// Placement body `body`'s group: its recipe, variant and nodes, a newline
+/// between.
+fn decode_key(body: String) -> String {
+    return std::json::find_string_field(body, "recipe") + "\n"
+        + std::json::find_string_field(body, "variant") + "\n" + placement_nodes_key(body);
+}
+
+/// Placement body `body`'s nodes in byte order, a tab between.
+fn placement_nodes_key(body: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(body, "nodes"));
+    let mut a = "";
+    let mut b = "";
+    while !it.done {
+        let n = std::json::find_string_field("{\"n\": " + it.element + "}", "n");
+        if len(a) == 0 { a = n; } else if len(b) == 0 { b = n; }
+        it = std::json::array_next(it);
+    }
+    if len(b) == 0 { return a; }
+    return if b < a { b + "\t" + a } else { a + "\t" + b };
+}
+
+/// Request `r`'s decode rate in thousandths of a token a second, when `q`
+/// counts it; -1 when not.
+fn decode_milli(r: UsageRow, q: DecodeSpeedQuery) -> Int {
+    if r.status != "served" || r.output_tokens < q.min_output { return -1; }
+    if std::json::find_bool_field(r.record, "output_tokens_estimated") { return -1; }
+    let timing = std::json::find_field_raw(r.record, "timing");
+    if len(std::json::find_field_raw(timing, "first_output_ms")) == 0 { return -1; }
+    let gen = std::json::find_int_field(timing, "engine_ms")
+        - std::json::find_int_field(timing, "first_output_ms");
+    if gen <= 0 { return -1; }
+    return r.output_tokens * 1000000 / gen;
+}
+
+/// The value at or past share `num`/`den` of sorted `xs`' first `n`
+/// (`percentile_disc`), thousandths rounded to a whole.
+fn percentile_whole(xs: [Int; 4096], n: Int, num: Int, den: Int) -> Int {
+    let mut i = (num * n + den - 1) / den - 1;
+    if i < 0 { i = 0; }
+    return (xs[i] + 500) / 1000;
+}
+
 /// One hour of the rollup: what the ledger's rows of one project, key,
 /// model and currency made in it add up to (`usage_hourly`).
 type HourlyRow {
@@ -1374,6 +1472,10 @@ interface Store {
     fn usage_totals(q: UsageTotalsQuery) -> UsageTotals fallible(StoreError);
     /// The conversations the matching rows are turns of, as `q` asks.
     fn usage_conversations(q: ConversationQuery) -> ConversationRows fallible(StoreError);
+    /// What each recipe variant's placements on the same nodes generated
+    /// at, as `q` asks: read from the ledger by a placement's seat, never
+    /// the whole ledger.
+    fn decode_speeds(q: DecodeSpeedQuery) -> DecodeSpeedRows fallible(StoreError);
 
     /// The route table the brain last wrote (internal.yaml `RouteTable`),
     /// as JSON; "" when none has been.
@@ -2288,6 +2390,81 @@ locus MemoryStore {
             push(totals.rows, t) or discard;
         }
         return totals;
+    }
+
+    @unbounded
+    fn decode_speeds(q: DecodeSpeedQuery) -> DecodeSpeedRows fallible(StoreError) {
+        let since = std::time::unix(q.since);
+        // each group, by its recipe, variant and nodes, in that order
+        let mut keys = DecodeKeys { };
+        let mut i = 0;
+        while i < self.placement_order.len() {
+            let p = self.placement_rows.get(self.placement_order.get(i) or "") or PlacementRow { };
+            i = i + 1;
+            if p.removed && std::time::unix(p.removed_at) <= since { continue; }
+            keys = decode_key_added(keys, decode_key(p.body));
+        }
+        let mut out = DecodeSpeedRows { };
+        for key in keys.items {
+            let mut xs: [Int; 4096] = [0; 4096];
+            let mut n = 0;
+            let mut first = 0;
+            let mut last = 0;
+            let mut j = 0;
+            while j < self.placement_order.len() {
+                let p = self.placement_rows.get(
+                    self.placement_order.get(j) or "",
+                ) or PlacementRow { };
+                j = j + 1;
+                if p.removed && std::time::unix(p.removed_at) <= since { continue; }
+                if decode_key(p.body) != key { continue; }
+                let seat = std::json::find_string_field(p.body, "seat");
+                let from = if std::time::unix(p.created_at) > since {
+                    std::time::unix(p.created_at)
+                } else {
+                    since
+                };
+                // the seat's newest first, as many as `per_seat`
+                let mut taken = 0;
+                let mut k = self.usage_log.len();
+                while k > 0 && taken < q.per_seat && n < DECODE_SAMPLES {
+                    k = k - 1;
+                    let r = self.usage_log.get(k) or UsageRow { };
+                    let t = std::time::unix(r.created_at);
+                    if r.seat != seat || t < from { continue; }
+                    if p.removed && t >= std::time::unix(p.removed_at) { continue; }
+                    let m = decode_milli(r, q);
+                    if m < 0 { continue; }
+                    // kept sorted as it is added
+                    let mut at_i = n;
+                    while at_i > 0 && xs[at_i - 1] > m {
+                        xs[at_i] = xs[at_i - 1];
+                        at_i = at_i - 1;
+                    }
+                    xs[at_i] = m;
+                    n = n + 1;
+                    taken = taken + 1;
+                    if first == 0 || t < first { first = t; }
+                    if t > last { last = t; }
+                }
+            }
+            if n == 0 { continue; }
+            let a = std::str::index_of(key, "\n");
+            let rest = key[(a + 1)..len(key)];
+            let b = std::str::index_of(rest, "\n");
+            push(out.rows, DecodeSpeedRow {
+                recipe: key[0..a],
+                variant: rest[0..b],
+                nodes: rest[(b + 1)..len(rest)],
+                requests: n,
+                p25_tps: percentile_whole(xs, n, 1, 4),
+                median_tps: percentile_whole(xs, n, 1, 2),
+                p75_tps: percentile_whole(xs, n, 3, 4),
+                first_at: std::time::time_from_unix(first),
+                last_at: std::time::time_from_unix(last),
+            }) or discard;
+        }
+        return out;
     }
 
     fn usage(id: String) -> UsageRow fallible(StoreError) {

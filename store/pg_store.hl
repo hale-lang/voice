@@ -1749,6 +1749,57 @@ locus PgStore {
         return out;
     }
 
+    fn decode_speeds(q: DecodeSpeedQuery) -> DecodeSpeedRows fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.decode_speeds_locked(q) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    /// Each placement standing since `q.since` reads its seat's newest
+    /// rows through `usage_by_served_seat` (migration 44), at most
+    /// `q.per_seat`; its rows grouped by recipe, variant and nodes.
+    fn decode_speeds_locked(q: DecodeSpeedQuery) -> DecodeSpeedRows fallible(StoreError) {
+        let a = db::Args { };
+        a.add(std::time::iso8601(q.since));
+        a.add(to_string(q.min_output));
+        a.add(to_string(q.per_seat));
+        let first = "(x.record->'timing'->>'first_output_ms')::bigint";
+        let gen = "((x.record->'timing'->>'engine_ms')::bigint - " + first + ")";
+        let all = self.rows(
+            "SELECT row_to_json(t) FROM (SELECT recipe, variant, nodes, count(*) AS requests, (percentile_disc(0.25) WITHIN GROUP (ORDER BY milli) + 500) / 1000 AS p25, (percentile_disc(0.5) WITHIN GROUP (ORDER BY milli) + 500) / 1000 AS p50, (percentile_disc(0.75) WITHIN GROUP (ORDER BY milli) + 500) / 1000 AS p75, min(created_at) AS first_at, max(created_at) AS last_at FROM (SELECT p.body->>'recipe' AS recipe, p.body->>'variant' AS variant, array_to_string(ARRAY(SELECT n FROM jsonb_array_elements_text(p.body->'nodes') n ORDER BY n COLLATE \"C\"), E'\\t') AS nodes, u.created_at, u.milli FROM placement p CROSS JOIN LATERAL (SELECT x.created_at, x.output_tokens * 1000000 / "
+                + gen
+                + " AS milli FROM usage x WHERE x.served->>'seat' = p.body->>'seat' AND x.created_at >= greatest(p.created_at, $1::timestamptz) AND (p.removed_at IS NULL OR x.created_at < p.removed_at) AND x.status = 'served' AND x.output_tokens >= $2::bigint AND coalesce((x.record->>'output_tokens_estimated')::boolean, false) = false AND "
+                + gen
+                + " > 0 ORDER BY x.created_at DESC LIMIT $3::int) u WHERE p.removed_at IS NULL OR p.removed_at > $1::timestamptz) s GROUP BY recipe, variant, nodes ORDER BY recipe COLLATE \"C\", variant COLLATE \"C\", nodes COLLATE \"C\" LIMIT 256) t",
+            a,
+        ) or raise;
+        let mut out = DecodeSpeedRows { };
+        let v = std::str::bytes_view(all);
+        let mut start = 0;
+        while start < v.n {
+            let nl = line_end(v, start);
+            let line = std::str::trim(std::str::slice(v, start, nl));
+            start = nl + 1;
+            if len(line) == 0 { continue; }
+            push(out.rows, DecodeSpeedRow {
+                recipe: pg_text(line, "recipe"),
+                variant: pg_text(line, "variant"),
+                nodes: pg_text(line, "nodes"),
+                requests: std::json::find_int_field(line, "requests"),
+                p25_tps: std::json::find_int_field(line, "p25"),
+                median_tps: std::json::find_int_field(line, "p50"),
+                p75_tps: std::json::find_int_field(line, "p75"),
+                first_at: pg_time(pg_text(line, "first_at")),
+                last_at: pg_time(pg_text(line, "last_at"))
+            }) or discard;
+        }
+        return out;
+    }
+
     fn usage_conversations(c: ConversationQuery) -> ConversationRows fallible(StoreError) {
         self.lock.enter();
         let taken = self.usage_conversations_locked(c) or {

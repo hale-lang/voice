@@ -2387,6 +2387,7 @@ fn main() {
     cli_recipes(st::MemoryStore { }, "memory");
     peeks(st::MemoryStore { }, "memory");
     rollup(st::MemoryStore { }, "memory");
+    speeds(st::MemoryStore { }, "memory");
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -2439,6 +2440,166 @@ fn main() {
         ledger_unlike_rollup(pg),
         0,
         "postgres: the rollup the trigger kept is a fresh sum of the ledger, hour for hour",
+    );
+    pg.conn.exec("TRUNCATE usage, usage_hourly, placement RESTART IDENTITY");
+    speeds(pg, "postgres");
+}
+
+/// A request seat `seat` served at `when`: `output` tokens, its first at
+/// `first` ms and its end at `engine` ms (no first output when `first` is
+/// below 0), voice's estimate of them when `estimated`.
+fn decoded(
+    id: String,
+    when: String,
+    seat: String,
+    status: String,
+    output: Int,
+    first: Int,
+    engine: Int,
+    estimated: Bool
+) -> st::UsageRow {
+    let timing = "{\"wall_ms\": " + to_string(engine + 5) + ", \"queue_ms\": 0, \"load_ms\": 0"
+        + (
+            if first >= 0 {
+                ", \"first_output_ms\": " + to_string(first) + ", \"engine_ms\": "
+                    + to_string(engine)
+            } else {
+                ""
+            }
+        ) + "}";
+    return st::UsageRow {
+        id: id,
+        created_at: t(when),
+        project: "speedy",
+        key: "k1",
+        requested_model: "m",
+        served_model: "m",
+        node: seat[0..std::str::index_of(seat, "/")],
+        seat: seat,
+        status: status,
+        output_tokens: output,
+        served: "{\"model\": \"m\", \"node\": \"" + seat[0..std::str::index_of(seat, "/")]
+            + "\", \"seat\": \"" + seat + "\", \"account\": \"local\"}",
+        record: "{\"id\": \"" + id + "\", \"status\": \"" + status + "\", \"output_tokens\": "
+            + to_string(output) + ", \"timing\": " + timing
+            + (if estimated { ", \"output_tokens_estimated\": true" } else { "" }) + "}",
+    };
+}
+
+fn speed_placement(
+    s: st::Store,
+    id: String,
+    variant: String,
+    nodes: String,
+    seat: String,
+    from: String,
+    until: String
+) {
+    let body = "{\"id\": \"" + id + "\", \"recipe\": \"r\", \"variant\": \"" + variant
+        + "\", \"nodes\": " + nodes + ", \"seat\": \"" + seat + "\"}";
+    s.insert_placement(
+        st::PlacementRow { id: id, model: "m", body: body, created_at: t(from) },
+        ch("create", "placements/" + id),
+    ) or discard;
+    if len(until) > 0 {
+        s.remove_placement(
+            st::PlacementRow { id: id, removed_at: t(until) },
+            ch("delete", "placements/" + id),
+        ) or discard;
+    }
+}
+
+/// What a placement's seat generated at (`decode_speeds`): its requests
+/// served whole from the window's start and while it stood, its nodes in
+/// byte order whichever leads, every placement of one variant on the same
+/// nodes together; the median and quartiles as Postgres' percentile_disc
+/// takes them.
+fn speeds(s: st::Store, label: String) {
+    // p0 stood until p1 took its place, the same variant on the same two
+    // nodes led the other way; p2 was gone before the window
+    speed_placement(
+        s,
+        "p0",
+        "v",
+        "[\"node-a\", \"node-b\"]",
+        "node-a/p0",
+        "2026-10-17T08:00:00Z",
+        "2026-10-17T10:00:00Z",
+    );
+    speed_placement(
+        s,
+        "p1",
+        "v",
+        "[\"node-b\", \"node-a\"]",
+        "node-b/p1",
+        "2026-10-17T10:00:00Z",
+        "",
+    );
+    speed_placement(
+        s,
+        "p2",
+        "w",
+        "[\"node-a\"]",
+        "node-a/p2",
+        "2026-10-17T07:00:00Z",
+        "2026-10-17T08:00:00Z",
+    );
+    let rows = [
+        // before the window
+        decoded("s01", "2026-10-17T08:20:00Z", "node-a/p0", "served", 100, 0, 100, false),
+        // p0's, in the window: 80 tok/s
+        decoded("s02", "2026-10-17T09:00:00Z", "node-a/p0", "served", 80, 300, 1300, false),
+        // on p0's seat after it was removed
+        decoded("s03", "2026-10-17T10:30:00Z", "node-a/p0", "served", 100, 0, 100, false),
+        // p1's: 100, 100, 50, 120 tok/s
+        decoded("s04", "2026-10-17T10:10:00Z", "node-b/p1", "served", 100, 200, 1200, false),
+        decoded("s05", "2026-10-17T10:20:00Z", "node-b/p1", "served", 300, 100, 3100, false),
+        decoded("s06", "2026-10-17T10:40:00Z", "node-b/p1", "served", 50, 0, 1000, false),
+        decoded("s07", "2026-10-17T10:50:00Z", "node-b/p1", "served", 120, 500, 1500, false),
+        // not counted: cancelled, voice's estimate, too short, no first output
+        decoded("s08", "2026-10-17T11:00:00Z", "node-b/p1", "cancelled", 100, 0, 100, false),
+        decoded("s09", "2026-10-17T11:01:00Z", "node-b/p1", "served", 100, 0, 100, true),
+        decoded("s10", "2026-10-17T11:02:00Z", "node-b/p1", "served", 10, 0, 10, false),
+        decoded("s11", "2026-10-17T11:03:00Z", "node-b/p1", "served", 100, -1, 0, false),
+        // p2's, gone before the window
+        decoded("s12", "2026-10-17T07:30:00Z", "node-a/p2", "served", 100, 0, 1000, false),
+    ];
+    for r in rows {
+        s.insert_usage(r) or discard;
+    }
+    let got = s.decode_speeds(
+        st::DecodeSpeedQuery { since: t("2026-10-17T08:30:00Z"), min_output: 32, per_seat: 500 },
+    ) or {
+        std::test::assert(false, label + ": decode speeds: " + err.message);
+        return;
+    };
+    let one = at(got.rows, 0) or st::DecodeSpeedRow { };
+    std::test::assert(
+        count(got.rows) == 1 && one.recipe == "r" && one.variant == "v"
+            && one.nodes == "node-a\tnode-b",
+        label + ": one group, p0's and p1's together, its nodes in order: "
+            + to_string(count(got.rows)) + " " + one.variant + " " + one.nodes,
+    );
+    std::test::assert(
+        one.requests == 5 && one.p25_tps == 80 && one.median_tps == 100 && one.p75_tps == 100,
+        label + ": 50, 80, 100, 100 and 120 tok/s: " + to_string(one.requests) + " "
+            + to_string(one.p25_tps) + " " + to_string(one.median_tps) + " "
+            + to_string(one.p75_tps),
+    );
+    std::test::assert(
+        std::time::iso8601(one.first_at) == "2026-10-17T09:00:00Z"
+            && std::time::iso8601(one.last_at) == "2026-10-17T10:50:00Z",
+        label + ": from the first counted to the last: " + std::time::iso8601(one.first_at) + " "
+            + std::time::iso8601(one.last_at),
+    );
+    let few = s.decode_speeds(
+        st::DecodeSpeedQuery { since: t("2026-10-17T08:30:00Z"), min_output: 32, per_seat: 2 },
+    ) or st::DecodeSpeedRows { };
+    let newest = at(few.rows, 0) or st::DecodeSpeedRow { };
+    std::test::assert(
+        newest.requests == 3 && newest.median_tps == 80,
+        label + ": each seat's newest only (p0's 80, p1's 50 and 120): "
+            + to_string(newest.requests) + " " + to_string(newest.median_tps),
     );
 }
 

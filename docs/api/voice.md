@@ -5656,6 +5656,7 @@ Type: object
 | `transcript.events` | integer | yes | Events kept. |  |
 | `transcript.dropped` | integer | yes | The oldest events let go past the bound. |  |
 | `transcript_digest` | string \| null |  | The sha256 of the stored transcript, as `getAttemptTranscript` answers it, once the attempt ended; stable from then on. |  |
+| `recipe_digest` | string \| null |  | The sha256 of the CLI recipe it started with, as its node was handed it, once it started. A recipe edited or removed later changes neither this nor how the attempt is metered, which was fixed as it started. |  |
 | `bundle` | object \| null |  | The git bundle of its commits, while voice holds it. |  |
 | `bundle.url` | string | yes |  |  |
 | `bundle.bytes` | integer | yes |  |  |

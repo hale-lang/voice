@@ -9,8 +9,8 @@ import { tokens } from '../context';
 import { acceleratorName } from '../fleet-memory';
 import { usePlaceRecipe } from '../place';
 import {
-  CAPABILITIES, DEFAULT_VIEW, SORTS, STATUSES, STATUS_SAID, bestIn, choicesOf, downloadedOn, filterRows, headroomOf, queryOf, rowsOf, sortRows, statusOf, targetKey, targetSaid,
-  targetsOf, toggled, viewOf, whyOf, type FitNode, type FitRow, type FitStatus, type FitView, type RecipeFits, type TargetFit,
+  CAPABILITIES, DEFAULT_VIEW, SORTS, STATUSES, STATUS_SAID, bestIn, choicesOf, downloadedOn, filterRows, headroomOf, queryOf, rowsOf, sortRows, speedSaid, speedWhy, statusOf, targetKey,
+  targetSaid, targetsOf, toggled, viewOf, whyOf, type FitNode, type FitRow, type FitStatus, type FitView, type RecipeFits, type TargetFit,
 } from './recipe-fit';
 import s from './RecipeFit.module.css';
 
@@ -194,11 +194,28 @@ function Filters({ fits, rows, view, set }: { fits: RecipeFits; rows: FitRow[]; 
 const TONE: Record<FitStatus, Tone> = { fits: 'ok', placed: 'active', freed: 'wait', never: 'quiet' };
 const SHORT: Record<FitStatus, string> = { fits: 'fits', placed: 'placed', freed: 'if freed', never: 'never' };
 
-/** A cell's state, with why on hover. */
-function FitCell({ cell }: { cell: TargetFit | undefined }) {
+/** A cell's state, with why on hover; on a host the view is scoped to, how fast it generates there too. */
+function FitCell({ cell, speed }: { cell: TargetFit | undefined; speed: boolean }) {
   if (!cell) return <span className="faint">–</span>;
   const st = statusOf(cell);
-  return <Status tone={TONE[st]} label={SHORT[st]} title={whyOf(cell)} />;
+  return (
+    <span className={s.cell}>
+      <Status tone={TONE[st]} label={SHORT[st]} title={whyOf(cell)} />
+      {speed && <Speed cell={cell} />}
+    </span>
+  );
+}
+
+/**
+ * How fast a variant generates on a node or pair, one request at a time:
+ * measured plainly, an estimate muted and marked `≈`; its basis on hover.
+ * Nothing where neither is known, `?` where the hardware could take it but
+ * voice cannot say (its hover says why).
+ */
+function Speed({ cell, dash }: { cell: TargetFit | undefined; dash?: boolean }) {
+  const said = speedSaid(cell);
+  if (!said) return cell?.speed_unknown ? <span className="faint" title={speedWhy(cell)}>? tok/s</span> : dash ? <span className="faint">–</span> : null;
+  return <span className={cell?.speed?.kind === 'measured' ? s.speedMeasured : s.speedEstimated} title={speedWhy(cell)}>{said}</span>;
 }
 
 /** What a variant's seat carries, under the runtime it fits best with (or any it has). */
@@ -212,9 +229,21 @@ function Caps({ row }: { row: FitRow }) {
   return caps.length ? <span className={s.caps}>{caps.join(' · ')}</span> : <span className="faint">–</span>;
 }
 
+/** How fast each variant generates on `key`, the one host chosen. */
+function speedColumn(key: string): Column<FitRow> {
+  return {
+    key: 'speed',
+    header: <span title="tokens a second, one request at a time: measured where voice has served it there, else ≈ estimated from the hardware">Speed on {targetSaid(key)}</span>,
+    num: true,
+    render: (r) => <Speed cell={r.cells.get(key)} dash />,
+  };
+}
+
 /** Every variant shown, a recipe's together, its fit on each node and pair. */
 function FitTable({ fits, rows, view, selected, placer }: { fits: RecipeFits; rows: FitRow[]; view: FitView; selected?: string; placer: Placer }) {
   const targets = targetsOf(fits);
+  const chosen = view.on.filter((k) => targets.includes(k));
+  const only = chosen.length === 1 ? chosen[0] : undefined;
   const first = new Set<string>();
   const seen = new Set<string>();
   for (const r of rows) if (!seen.has(r.recipe.id)) { seen.add(r.recipe.id); first.add(r.key); }
@@ -236,7 +265,9 @@ function FitTable({ fits, rows, view, selected, placer }: { fits: RecipeFits; ro
       ) : <span className="faint">fits nowhere</span>),
     },
     { key: 'headroom', header: 'Headroom', num: true, render: (r) => { const h = r.best?.status === 'fits' ? headroomOf(r.best.cell) : null; return h == null ? <span className="faint">–</span> : bytes(h); } },
-    ...targets.map((t): Column<FitRow> => ({ key: `on:${t}`, header: <span className={view.on.includes(t) ? s.inScope : undefined}>{targetSaid(t)}</span>, render: (r) => <FitCell cell={r.cells.get(t)} /> })),
+    // one host chosen: how fast each variant generates there
+    ...(only ? [speedColumn(only)] : []),
+    ...targets.map((t): Column<FitRow> => ({ key: `on:${t}`, header: <span className={view.on.includes(t) ? s.inScope : undefined}>{targetSaid(t)}</span>, render: (r) => <FitCell cell={r.cells.get(t)} speed={view.on.includes(t)} /> })),
     { key: 'downloaded', header: 'Downloaded', render: (r) => { const on = downloadedOn(r); return on.length ? on.join(', ') : <span className="faint">–</span>; } },
     {
       key: 'place',
@@ -310,6 +341,7 @@ function TargetDetail({ cell: c, onPlace, disabled }: { cell: TargetFit; onPlace
         {c.runtime && <span className="muted">under <a href={href('runtimes', c.runtime)}><Mono>{c.runtime}</Mono></a></span>}
         {c.placed && <a href={href('placements', c.placed)}>as {c.placed}</a>}
         {c.downloaded && <Status tone="ok" label="downloaded" title="its files are on disk already: placing it loads them, with nothing to download" />}
+        <Speed cell={c} />
         {onPlace && <Button onClick={onPlace} disabled={disabled}>place here</Button>}
       </span>
       {c.runtime && (
@@ -368,6 +400,7 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
         rows={[
           { k: 'origin', v: r.origin === 'shipped' ? 'shipped with voice' : 'allowed by the operator' },
           { k: 'context', v: r.context_length ? `${r.context_length.toLocaleString()} tokens, made for` : '–' },
+          { k: 'parameters', v: r.parameters ? `${count(r.parameters)}${r.active_parameters ? `, ${count(r.active_parameters)} active a token` : ''}` : '– (no speed is estimated)' },
           { k: 'license', v: r.license.url ? <a href={r.license.url} target="_blank" rel="noreferrer">{r.license.name}</a> : r.license.name },
           ...(r.created_at ? [{ k: 'allowed', v: when(r.created_at) }] : []),
         ]}
@@ -414,6 +447,11 @@ function RecipeInspector({ recipe: r }: { recipe: Recipe }) {
   );
 }
 
+/** A count of parameters as a card says it: `21B`, `3.6B`, `350M`. */
+function count(n: number): string {
+  return n >= 1e9 ? `${+(n / 1e9).toFixed(1)}B` : `${+(n / 1e6).toFixed(0)}M`;
+}
+
 type VariantDraft = { id: string; format: Variant['format']; quantization: string; repo: string; revision: string; files: string; memory_gib: number | null };
 
 const blankVariant = (): VariantDraft => ({ id: '', format: 'safetensors', quantization: '', repo: '', revision: '', files: '', memory_gib: null });
@@ -446,6 +484,8 @@ function AllowRecipe() {
   const [licenseUrl, setLicenseUrl] = useState('');
   const [context, setContext] = useState<number | null>(null);
   const [kv, setKv] = useState<number | null>(null);
+  const [params, setParams] = useState<number | null>(null);
+  const [active, setActive] = useState<number | null>(null);
   const [variants, setVariants] = useState<VariantDraft[]>([blankVariant()]);
   const [bad, setBad] = useState<string | null>(null);
   const put = (i: number, d: Partial<VariantDraft>) => setVariants(variants.map((v, j) => (j === i ? { ...v, ...d } : v)));
@@ -475,6 +515,8 @@ function AllowRecipe() {
             variants: vs,
             ...(context ? { context_length: context } : {}),
             ...(kv ? { kv_bytes_per_token: kv } : {}),
+            ...(params ? { parameters: Math.round(params * 1e9) } : {}),
+            ...(params && active ? { active_parameters: Math.round(active * 1e9) } : {}),
           };
           const r = await w.write('post', '/admin/v1/recipes', { body });
           if (r && 'id' in r) go('recipes', r.id);
@@ -500,6 +542,12 @@ function AllowRecipe() {
         </Field>
         <Field label="KV bytes per token" help="what one more token of context costs in KV cache at 16 bits; sizes a seat's prompt cache">
           <NumberInput value={kv} onChange={setKv} min={1} step={1} />
+        </Field>
+        <Field label="parameters" help="the model's, as its card says them, in billions; what its speed is estimated from">
+          <NumberInput value={params} onChange={setParams} min={0.001} step={0.001} />
+        </Field>
+        <Field label="active parameters" help="for a mixture of experts, those one token is computed with, in billions; left empty for a dense model">
+          <NumberInput value={active} onChange={setActive} min={0.001} step={0.001} />
         </Field>
         {variants.map((v, i) => (
           <fieldset key={i}>

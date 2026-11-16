@@ -31,6 +31,7 @@ fn main() {
     );
     variant_bounds();
     context_length();
+    parameters();
     kv_cache();
     tool_call_parser();
     tokenizer_class();
@@ -259,6 +260,46 @@ fn main() {
         failed = api::ctl_class(err);
     };
     std::test::assert_eq_str(failed, "invalid", "nor named again");
+
+    // the operator says a model's parameters, and a token's of them
+    let moe = recipes.create(
+        api::RecipeCreate {
+            id: "mine-moe",
+            license: license(),
+            variants: variants("m.gguf", revision),
+            has_parameters: true,
+            parameters: 30500000000,
+            has_active_parameters: true,
+            active_parameters: 3300000000,
+        },
+    ) or blank();
+    let got = recipes.get(api::RecipeRef { recipe: "mine-moe" }) or blank();
+    std::test::assert(
+        moe.has_parameters && moe.parameters == 30500000000 && got.has_active_parameters
+            && got.active_parameters == 3300000000
+            && std::str::contains(
+                api::recipe_json(got),
+                "\"parameters\": 30500000000, \"active_parameters\": 3300000000",
+            ),
+        "a recipe's parameters are kept and read back",
+    );
+    failed = "";
+    recipes.create(
+        api::RecipeCreate {
+            id: "mine-bad",
+            license: license(),
+            variants: variants("m.gguf", revision),
+            has_active_parameters: true,
+            active_parameters: 3300000000,
+        },
+    ) or {
+        failed = api::ctl_class(err) + " " + api::ctl_problem(err).param;
+    };
+    std::test::assert_eq_str(
+        failed,
+        "invalid active_parameters",
+        "active parameters without all of them are refused",
+    );
 }
 
 /// The line of `lines` (one shipped recipe a line) that holds `text`.
@@ -321,6 +362,58 @@ fn context_length() {
             "!kv_bytes_per_token",
         ),
         "a negative kv_bytes_per_token is refused",
+    );
+}
+
+/// A recipe keeps its model's parameters, and those a token is computed
+/// with where fewer; it refuses active parameters as many as all of them,
+/// or without them; the recipes voice ships say theirs.
+fn parameters() {
+    let v = variants("m.gguf", "0123456789abcdef0123456789abcdef01234567").text;
+    let plain = api::recipe_body("moe", license(), 40960, 0, "", v);
+    let kept = api::recipe_parameters(plain, 21000000000, 3600000000);
+    std::test::assert(
+        std::str::contains(
+            kept,
+            "\"parameters\": 21000000000, \"active_parameters\": 3600000000, \"variants\": [",
+        )
+            && std::json::find_int_field(kept, "parameters") == 21000000000,
+        "a recipe keeps its parameters, before its variants: " + kept,
+    );
+    std::test::assert(
+        std::str::contains(
+            api::recipe_parameters(plain, 8000000000, 0),
+            "\"parameters\": 8000000000, \"variants\"",
+        )
+            && !std::str::contains(
+                api::recipe_parameters(plain, 8000000000, 0),
+                "active_parameters",
+            ),
+        "a dense model says no active parameters",
+    );
+    std::test::assert_eq_str(
+        api::recipe_parameters(plain, 0, 0),
+        plain,
+        "one that does not say has none",
+    );
+    std::test::assert(
+        std::str::starts_with(api::recipe_parameters(plain, 0, 3000000000), "!active_parameters")
+            && std::str::starts_with(
+                api::recipe_parameters(plain, 8000000000, 8000000000),
+                "!active_parameters",
+            )
+            && std::str::starts_with(api::recipe_parameters(plain, -1, 0), "!parameters"),
+        "active parameters need all of them, and are fewer",
+    );
+    let shipped = api::shipped_recipes(fixtures("../../../recipes"));
+    let oss = line_with(shipped, "\"id\": \"gpt-oss-20b\"");
+    let dense = line_with(shipped, "\"id\": \"qwen3-0.6b\"");
+    std::test::assert(
+        std::json::find_int_field(oss, "parameters") == 21000000000
+            && std::json::find_int_field(oss, "active_parameters") == 3600000000
+            && std::json::find_int_field(dense, "parameters") == 600000000
+            && !std::str::contains(dense, "active_parameters"),
+        "gpt-oss-20b ships 3.6B of 21B active; qwen3-0.6b is dense",
     );
 }
 

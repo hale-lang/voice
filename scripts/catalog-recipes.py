@@ -388,6 +388,32 @@ def kv_per_token(cfg):
     return per_token * layers
 
 
+# The model's parameters and, for a mixture of experts, those one token is computed with (`parameters`,
+# `active_parameters`), as each publisher's card says them; what the Recipes page estimates a variant's speed from
+# (api/speed.hl). A model not here gets neither, and no estimate: one taken for dense when it is a mixture of experts
+# would be estimated several times too slow. DeepSeek-V4-Flash-0731's card gives none; DeepSeek-V4-Flash's (the same
+# model, deepseek-ai/DeepSeek-V4-Flash) gives 284B and 13B. DeepSeek-R1-0528-Qwen3-8B's is Qwen3-8B's (its card:
+# "identical to that of Qwen3-8B"), MiMo-V2.6-Distill-Qwen-9B's Qwen3.5-9B's, granite's from the architecture table
+# on each card.
+PARAMETERS = {"Qwen/Qwen2.5-1.5B-Instruct": (1_540_000_000, None),
+              "Qwen/Qwen3-235B-A22B": (235_000_000_000, 22_000_000_000),
+              "Qwen/Qwen3-Coder-30B-A3B-Instruct": (30_500_000_000, 3_300_000_000),
+              "Qwen/Qwen3-Coder-Next": (80_000_000_000, 3_000_000_000),
+              "XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B": (9_000_000_000, None),
+              "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B": (8_200_000_000, None),
+              "deepseek-ai/DeepSeek-V4-Flash-0731": (284_000_000_000, 13_000_000_000),
+              "ibm-granite/granite-4.0-350m": (350_000_000, None),
+              "ibm-granite/granite-4.0-h-small": (32_000_000_000, 9_000_000_000),
+              "ibm-granite/granite-4.0-h-tiny": (7_000_000_000, 1_000_000_000),
+              "microsoft/Phi-4-mini-reasoning": (3_800_000_000, None),
+              "microsoft/Phi-mini-MoE-instruct": (7_600_000_000, 2_400_000_000),
+              "microsoft/Phi-tiny-MoE-instruct": (3_800_000_000, 1_100_000_000),
+              "nvidia/OpenReasoning-Nemotron-32B": (32_000_000_000, None),
+              "openai/gpt-oss-120b": (117_000_000_000, 5_100_000_000),
+              "openai/gpt-oss-20b": (21_000_000_000, 3_600_000_000),
+              "zai-org/GLM-4.7-Flash": (30_000_000_000, 3_000_000_000)}
+
+
 # What the pinned vLLM must be told to serve a model's safetensors weights, by architecture or model, as each such variant
 # says it (api/recipes.hl): the KV cache it keeps (`kv_cache_dtype`, --kv-cache-dtype), what a token of context
 # costs a seat in that cache (`kv_bytes_per_token`, the variant's own, which its memory_bytes counts and its
@@ -614,6 +640,11 @@ def resolve(model, quants, arches, tag, registry, types, limits):
         per_token = kv_per_token(cfg)
         if per_token:
             recipe["kv_bytes_per_token"] = per_token
+        total, active = PARAMETERS.get(model, (None, None))
+        if total:
+            recipe["parameters"] = total
+            if active:
+                recipe["active_parameters"] = active
         recipe["variants"] = variants
         size = len(api_json(recipe).encode())
         if size > limits["recipe"]:

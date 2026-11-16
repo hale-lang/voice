@@ -1824,6 +1824,8 @@ Schema: [RecipeCreate](#schema-recipecreate)
 | `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it, unless its variant gives its own (`RecipeVariant.kv_bytes_per_token`). | ≥ 1; ≤ 16777216 |
 | `contract` | string, one of `generative`, `decision` |  | What a catalog model made from it answers (`CatalogModel.contract`), unless the model says otherwise. Left out, `generative`. |  |
 | `variants` | array of [RecipeVariant](#schema-recipevariant) | yes |  | items ≥ 1; items ≤ 8 |
+| `parameters` | integer |  | The model's parameters, as its publisher's card says them. With `active_parameters` where a token is computed with fewer, it is what a variant's speed is estimated from (`TargetFit.speed`): a recipe without it has no estimate. Left out when not known. | ≥ 1; ≤ 100000000000000 |
+| `active_parameters` | integer |  | Of `parameters`, those one token is computed with, where fewer (a mixture of experts: its active experts and shared layers), as the card says them; fewer than `parameters`, and only with it. A token reads that share of a variant's weights. Left out for a dense model. | ≥ 1 |
 
 Responses:
 
@@ -6182,6 +6184,8 @@ Type: object
 | `kv_bytes_per_token` | integer |  | What one more token of context costs in KV cache, in bytes at 16 bits: the layers that keep every token (full attention, or MLA's latent), not the linear, recurrent or sliding-window ones. A placement sizes its seat's prompt cache by it, unless its variant gives its own (`RecipeVariant.kv_bytes_per_token`). | ≥ 1; ≤ 16777216 |
 | `contract` | string, one of `generative`, `decision` |  | What a catalog model made from it answers (`CatalogModel.contract`), unless the model says otherwise. Left out, `generative`. |  |
 | `variants` | array of [RecipeVariant](#schema-recipevariant) | yes |  | items ≥ 1; items ≤ 8 |
+| `parameters` | integer |  | The model's parameters, as its publisher's card says them. With `active_parameters` where a token is computed with fewer, it is what a variant's speed is estimated from (`TargetFit.speed`): a recipe without it has no estimate. Left out when not known. | ≥ 1; ≤ 100000000000000 |
+| `active_parameters` | integer |  | Of `parameters`, those one token is computed with, where fewer (a mixture of experts: its active experts and shared layers), as the card says them; fewer than `parameters`, and only with it. A token reads that share of a variant's weights. Left out for a dense model. | ≥ 1 |
 
 <a id="schema-recipe"></a>
 
@@ -6759,6 +6763,44 @@ Type: object
 | `reasoning` | boolean | yes | Its seat would play the model's reasoning back as reasoning under that runtime (`CatalogModel.reasoning`). |  |
 | `reason` | string | yes | Why it fits now, as a placement's fit says it, or why not. |  |
 | `empty_reason` | string |  | Why it does not fit even with nothing placed; left out when it does. |  |
+| `speed` | [FitSpeed](#schema-fitspeed) |  |  |  |
+| `speed_unknown` | string |  | Why it has no `speed` where the hardware could take it: the accelerator's memory bandwidth is not known (`unknown hardware`), its recipe gives no `parameters`, or its runtime's speed cannot be estimated. Left out with a `speed`, or where it never fits. |  |
+
+<a id="schema-fitspeed"></a>
+
+### FitSpeed
+
+How fast a variant generates on a node or a pair, one request at a
+time, in tokens a second. `measured`: voice has served it there:
+the median, over the requests its placements' seats served whole in
+the last 7 days (at least 5 of them, each of at least 32 output
+tokens its engine counted), of output tokens over generation time
+(`Timing.engine_ms` less `Timing.first_output_ms`). `estimated`:
+decode one request at a time is bound by memory bandwidth, so about
+efficiency × bandwidth ÷ the bytes read a token, the variant's
+weights in the share `RecipeCreate.active_parameters` is of
+`parameters`; bandwidth by the accelerator's name, efficiency the
+runtime's, calibrated on measured speeds (a pair's on one model,
+so rougher). Neither is the prompt's reading (prefill) nor what a
+seat serves to many at once.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `kind` | string, one of `measured`, `estimated` | yes |  |  |
+| `tps` | integer | yes | The median measured, or the estimate's middle. | ≥ 0 |
+| `low` | integer | yes | Measured, the 25th percentile; estimated, the low end (the least bandwidth and efficiency). | ≥ 0 |
+| `high` | integer | yes | Measured, the 75th percentile; estimated, the high end. | ≥ 0 |
+| `requests` | integer |  | Measured, how many requests; 0 for an estimate. | ≥ 0 |
+| `first_at` | string (date-time) |  | Measured, the first request's time; left out of an estimate. |  |
+| `last_at` | string (date-time) |  | Measured, the last request's time; left out of an estimate. |  |
+| `bandwidth_low_gbps` | integer |  | Estimated, the accelerators' memory bandwidth, in GB/s, both nodes' together across a pair; the least where the name a node reports covers more than one part (a chip's bins, a family's cards). 0 when measured. | ≥ 0 |
+| `bandwidth_high_gbps` | integer |  | Estimated, the most of that bandwidth; 0 when measured. | ≥ 0 |
+| `bytes_per_token` | integer |  | Estimated, the bytes of weights read for each token; 0 when measured. | ≥ 0 |
+| `efficiency_low` | integer |  | Estimated, the runtime's share of the bandwidth one request's decode reaches, in percent, at the least; 0 when measured. | ≥ 0; ≤ 100 |
+| `efficiency_high` | integer |  | Estimated, that share at the most; 0 when measured. | ≥ 0; ≤ 100 |
+| `accelerator` | string |  | Estimated, the accelerators read with, as each node reports it, `+` between a pair's; "" when measured. |  |
 
 <a id="schema-nodedownload"></a>
 

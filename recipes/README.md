@@ -20,7 +20,13 @@ end-to-end check. A recipe's `context_length` is the longest context the
 model is made for, from its config (`max_position_embeddings`). Its
 `memory_bytes` provides for 32768 tokens of context, which is the most a
 llama.cpp seat serves (`node/run.hl`, `SERVED_CONTEXT`); each seat reports
-the context its server took. A safetensors variant vLLM must be told how to
+the context its server took. A recipe gives its model's `parameters` and,
+for a mixture of experts, the `active_parameters` one token is computed with,
+as the publisher's card says them (`PARAMETERS` in the script): the Recipes
+page estimates a variant's generation speed from them (`api/speed.hl`), and
+a recipe without them has no estimate. DeepSeek-V4.1-Flash-1017's card gives
+none, so it has none; the Jev-Style decision models answer decisions, not
+tokens. A safetensors variant vLLM must be told how to
 serve says so (`VLLM_SERVES` in the script): DeepSeek-V4's fp8 weights are
 served from an fp8 KV cache alone (`kv_cache_dtype`), at what a token costs
 in it (`kv_bytes_per_token`, the variant's own, which the fit takes over the

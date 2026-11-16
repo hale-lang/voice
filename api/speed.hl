@@ -1,0 +1,361 @@
+// How fast a variant generates on a node or a pair, one request at a time
+// (`TargetFit.speed`, fits.hl): measured, where voice has served it there,
+// else estimated from the hardware.
+//
+// Measured: the decode rate of the requests the variant's seat served there
+// over the last `MEASURED_DAYS` days (store `decode_speeds`): each request's
+// output tokens over its generation time (`timing.engine_ms` less
+// `timing.first_output_ms`, so reading the prompt and a cold start are not
+// counted), the median of them, once at least `MEASURED_MIN` requests say
+// it. Only requests served whole, their output counted by the engine (not
+// voice's estimate), of at least `MEASURED_MIN_OUTPUT` tokens (a few tokens'
+// time is mostly noise).
+//
+// Estimated: generating a token one request at a time is bound by memory
+// bandwidth, since every weight the token is computed with is read once for
+// it. So tokens a second are about
+//
+//     efficiency × memory bandwidth ÷ bytes read a token
+//
+// where the bytes read a token are the variant's weights (its files) in the
+// share of the model's parameters one token is computed with: all of them
+// for a dense model, the active experts and the shared layers for a mixture
+// of experts (the recipe's `active_parameters` of its `parameters`). A
+// recipe that gives no parameters has no estimate: an MoE taken for dense
+// would be estimated several times too slow. Bandwidth is the accelerator's,
+// from `BANDWIDTHS` by the name its node reports; a name not there has no
+// estimate. Efficiency is the runtime's, from `efficiency_of`. A pair splits
+// the weights between two nodes (tensor parallelism), so it reads with both
+// nodes' bandwidth, at an efficiency of its own: the link between them
+// costs each token a round of messages. It is single-request decode: not the
+// prompt's reading (prefill), nor what a seat serves to many at once.
+
+/// `FitSpeed.kind`: measured on voice's own requests, or estimated from the
+/// hardware.
+type FitSpeedKind = enum { measured, estimated };
+
+/// `FitSpeed`: tokens a second, one request at a time.
+type FitSpeed {
+    kind: FitSpeedKind = FitSpeedKind::estimated;
+    // the median measured, or the estimate's middle; and its range: the
+    // middle half of the requests measured, or the estimate's low and high
+    tps: Int = 0;
+    low: Int = 0;
+    high: Int = 0;
+    // measured: how many requests, the first's and the last's time
+    requests: Int = 0;
+    has_first_at: Bool = false;
+    first_at: Time = `1970-01-01T00:00:00Z`;
+    has_last_at: Bool = false;
+    last_at: Time = `1970-01-01T00:00:00Z`;
+    // estimated: the accelerators' memory bandwidth together, in GB/s
+    // (their low and high where the name a node reports covers more than
+    // one), the bytes read a token, and the runtime's efficiency, in percent
+    bandwidth_low_gbps: Int = 0;
+    bandwidth_high_gbps: Int = 0;
+    bytes_per_token: Int = 0;
+    efficiency_low: Int = 0;
+    efficiency_high: Int = 0;
+    // the accelerators it reads with, each node's, `+` between
+    accelerator: String = "";
+}
+
+/// A speed, or why there is none ("" when there is one).
+type SpeedJudged { speed: FitSpeed = FitSpeed { }; why: String = ""; }
+
+/// The measured window, in days; the fewest requests that say a speed; the
+/// fewest output tokens a request counts with; the most of a seat's
+/// requests read, newest first.
+const MEASURED_DAYS: Int = 7;
+const MEASURED_MIN: Int = 5;
+const MEASURED_MIN_OUTPUT: Int = 32;
+const MEASURED_PER_SEAT: Int = 500;
+
+/// Memory bandwidth, in GB/s, by the accelerator's name as a node reports
+/// it (node/hardware.hl): `nvidia-smi`'s name for an NVIDIA GPU, the
+/// machine's chip (`machdep.cpu.brand_string`) on a Mac, and for an AMD card
+/// the first name `lspci` lists for its chip, which is its family's (an RX
+/// 9070 XT says `Radeon RX 9070`). A line a name: `name\tlow\thigh`, low and
+/// high apart where one name covers parts of more than one bandwidth (a
+/// chip's bins, a family's cards, a card's memory options). Matched whole,
+/// ignoring case: a name not here is unknown hardware, never a guess.
+///
+/// Sources: NVIDIA's own specifications for each product (the DGX Spark's
+/// GB10: 273 GB/s of LPDDR5x, nvidia.com/en-us/products/workstations/dgx-spark);
+/// Apple's chips as llama.cpp's Apple Silicon benchmark lists them, from
+/// Apple's and Wikipedia's variants of each chip
+/// (github.com/ggml-org/llama.cpp/discussions/4167); AMD's Radeon RX 9000
+/// series (amd.com; en.wikipedia.org/wiki/Radeon_RX_9000_series: 640 GB/s
+/// the 9070 and 9070 XT, 432 the 9070 GRE). Processors alone have none:
+/// their bandwidth is the machine's memory channels', which no node reports,
+/// and voice serves a generative model on none.
+const BANDWIDTHS: String = "
+nvidia gb10\t273\t273
+nvidia geforce rtx 5090\t1792\t1792
+nvidia geforce rtx 5080\t960\t960
+nvidia geforce rtx 5070 ti\t896\t896
+nvidia geforce rtx 5070\t672\t672
+nvidia geforce rtx 5060 ti\t448\t448
+nvidia geforce rtx 4090\t1008\t1008
+nvidia geforce rtx 4080 super\t736\t736
+nvidia geforce rtx 4080\t717\t717
+nvidia geforce rtx 4070 ti super\t672\t672
+nvidia geforce rtx 4070 ti\t504\t504
+nvidia geforce rtx 4070 super\t504\t504
+nvidia geforce rtx 4070\t480\t504
+nvidia geforce rtx 4060 ti\t288\t288
+nvidia geforce rtx 4060\t272\t272
+nvidia geforce rtx 3090 ti\t1008\t1008
+nvidia geforce rtx 3090\t936\t936
+nvidia geforce rtx 3080 ti\t912\t912
+nvidia geforce rtx 3080\t760\t912
+nvidia geforce rtx 3070\t448\t448
+nvidia geforce rtx 3060\t240\t360
+nvidia rtx pro 6000 blackwell workstation edition\t1792\t1792
+nvidia rtx pro 6000 blackwell max-q workstation edition\t1792\t1792
+nvidia rtx pro 6000 blackwell server edition\t1792\t1792
+nvidia rtx 6000 ada generation\t960\t960
+nvidia rtx 5000 ada generation\t576\t576
+nvidia rtx 4000 ada generation\t360\t360
+nvidia rtx a6000\t768\t768
+nvidia rtx a5000\t768\t768
+nvidia rtx a4000\t448\t448
+nvidia l40s\t864\t864
+nvidia l40\t864\t864
+nvidia l4\t300\t300
+nvidia a100-sxm4-80gb\t2039\t2039
+nvidia a100 80gb pcie\t1935\t1935
+nvidia a100-sxm4-40gb\t1555\t1555
+nvidia a100-pcie-40gb\t1555\t1555
+nvidia h100 80gb hbm3\t3350\t3350
+nvidia h100 pcie\t2000\t2000
+nvidia h100 nvl\t3900\t3900
+nvidia h200\t4800\t4800
+nvidia h200 nvl\t4800\t4800
+nvidia b200\t8000\t8000
+apple m1\t68\t68
+apple m1 pro\t200\t200
+apple m1 max\t400\t400
+apple m1 ultra\t800\t800
+apple m2\t100\t100
+apple m2 pro\t200\t200
+apple m2 max\t400\t400
+apple m2 ultra\t800\t800
+apple m3\t100\t100
+apple m3 pro\t150\t150
+apple m3 max\t300\t400
+apple m3 ultra\t800\t800
+apple m4\t120\t120
+apple m4 pro\t273\t273
+apple m4 max\t410\t546
+apple m5\t154\t154
+apple m5 pro\t307\t307
+apple m5 max\t460\t614
+apple m5 ultra\t1228\t1228
+apple m6\t154\t170
+amd radeon rx 9070\t432\t640
+";
+
+/// An accelerator's memory bandwidth, in GB/s, low and high; 0 and 0 when
+/// its name is not in `BANDWIDTHS`.
+type Bandwidth { low: Int = 0; high: Int = 0; }
+
+/// The memory bandwidth of the accelerator named `name` (`BANDWIDTHS`).
+fn bandwidth_of(name: String) -> Bandwidth {
+    let key = std::str::lower(std::str::trim(name));
+    if len(key) == 0 { return Bandwidth { }; }
+    let at = std::str::index_of(BANDWIDTHS, "\n" + key + "\t");
+    if at < 0 { return Bandwidth { }; }
+    let rest = BANDWIDTHS[(at + len(key) + 2)..len(BANDWIDTHS)];
+    let nl = std::str::index_of(rest, "\n");
+    let line = if nl >= 0 { rest[0..nl] } else { rest };
+    let tab = std::str::index_of(line, "\t");
+    if tab < 0 { return Bandwidth { }; }
+    return Bandwidth {
+        low: std::str::parse_int(line[0..tab]) or 0,
+        high: std::str::parse_int(line[(tab + 1)..len(line)]) or 0,
+    };
+}
+
+/// A runtime's decode efficiency, in percent of the bandwidth, low and
+/// high; or why it has none.
+type Efficiency { low: Int = 0; high: Int = 0; why: String = ""; }
+
+/// The share of memory bandwidth server `server` turns into one request's
+/// decode, on `parts` nodes. Calibrated as each says; each is the share
+/// the formula above needs to give what was measured, the bytes a token
+/// read as it counts them.
+///
+/// - `llama-server`, one node: 55 to 90%. llama.cpp's own benchmark of a
+///   DGX Spark (benches/dgx-spark in ggml-org/llama.cpp, at b7946, `tg32`)
+///   gives voice's shipped GGUFs 59% (gpt-oss-120b MXFP4, 58.7 tok/s), 64%
+///   (gpt-oss-20b, 83.4), 57% (GLM-4.7-Flash Q8_0, 48.7) and 79%
+///   (Qwen3-Coder-30B-A3B Q8_0, 61.1), and a dense 7B Q8_0 87% (29.4);
+///   its Apple Silicon benchmark (discussions/4167) 60 to 90% for a dense
+///   7B at Q8_0 on M1 to M6, less on an Ultra (two dies) at 4 bits.
+/// - `vllm`, one node: 40 to 75%. Not measured on one node yet: below
+///   llama-server's (vLLM pays its own scheduling for each step) and above
+///   its pair's, which pays the link besides. A measured seat replaces it.
+/// - `vllm`, a pair: 30 to 42% of the two nodes' bandwidth together.
+///   Measured on two DGX Sparks linked by ConnectX-7 (runtimes/README.md,
+///   and as #157 served it): DeepSeek-V4-Flash-0731 fp8 at 25.5 to 26.0
+///   tok/s, 36% of the 71 tok/s two GB10s would read it at. Rougher than
+///   one node's: one model measured.
+/// - `tensorfold`: none. It drafts tokens ahead and checks them in one step
+///   (its DSpark and MTP heads), so how fast it goes is how often a draft
+///   holds, not one read of the weights a token: 66 tok/s on prose and 116
+///   on code, measured on the same two Sparks with the same weights.
+/// - `decision`: none: a decision model answers a decision, not tokens.
+fn efficiency_of(server: String, parts: Int) -> Efficiency {
+    if server == "llama-server" && parts == 1 { return Efficiency { low: 55, high: 90 }; }
+    if server == "vllm" && parts == 1 { return Efficiency { low: 40, high: 75 }; }
+    if server == "vllm" && parts == 2 { return Efficiency { low: 30, high: 42 }; }
+    if server == "tensorfold" {
+        return Efficiency { why: "it drafts tokens ahead, so only a measured speed says how fast" };
+    }
+    if server == "decision" {
+        return Efficiency { why: "a decision model answers decisions, not tokens" };
+    }
+    return Efficiency { why: "no estimate for " + server + " on " + to_string(parts) + " nodes" };
+}
+
+/// The bytes variant `v` reads a token: its weights (its files) in the
+/// share of the model's parameters a token is computed with; 0 when the
+/// recipe does not say its parameters.
+fn bytes_per_token(recipe: Recipe, v: String) -> Int {
+    if !recipe.has_parameters || recipe.parameters <= 0 { return 0; }
+    let mut weights = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(v, "files"));
+    while !it.done {
+        weights = weights + std::json::find_int_field(it.element, "bytes");
+        it = std::json::array_next(it);
+    }
+    if !recipe.has_active_parameters || recipe.parameters < 1000000 { return weights; }
+    // weights / parameters × active, in that order of size: weights are at
+    // most a few hundred GB and active parameters a few hundred billion, so
+    // multiplying first would overflow
+    return (weights / 1000) * (recipe.active_parameters / 1000) / (recipe.parameters / 1000000);
+}
+
+/// The name of the first accelerator of kind `on` in hardware `hw`, "" for
+/// none.
+fn accelerator_named(hw: String, on: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(hw, "accelerators"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "kind") == on {
+            return std::json::find_string_field(it.element, "name");
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// Variant `v` of `recipe`, served by `server` on accelerator kind `on` of
+/// each of the nodes of `j`, estimated (or why not).
+fn estimate_speed(
+    recipe: Recipe,
+    v: String,
+    server: String,
+    on: String,
+    j: Judging
+) -> SpeedJudged {
+    let parts = count(j.hw);
+    let eff = efficiency_of(server, parts);
+    if len(eff.why) > 0 { return SpeedJudged { why: eff.why }; }
+    let per_token = bytes_per_token(recipe, v);
+    if per_token <= 0 {
+        return SpeedJudged { why: "its recipe does not say its parameters" };
+    }
+    let mut out = FitSpeed {
+        kind: FitSpeedKind::estimated,
+        bytes_per_token: per_token,
+        efficiency_low: eff.low,
+        efficiency_high: eff.high,
+    };
+    for hw in j.hw {
+        let name = accelerator_named(hw, on);
+        let bw = bandwidth_of(name);
+        if bw.high <= 0 {
+            return SpeedJudged {
+                why: "unknown hardware: no memory bandwidth known for "
+                    + (if len(name) > 0 { name } else { "its " + on + " accelerator" }),
+            };
+        }
+        out.accelerator = if len(out.accelerator) > 0 {
+            out.accelerator + " + " + name
+        } else {
+            name
+        };
+        out.bandwidth_low_gbps = out.bandwidth_low_gbps + bw.low;
+        out.bandwidth_high_gbps = out.bandwidth_high_gbps + bw.high;
+    }
+    // GB/s × percent ÷ bytes: tokens a second, rounded
+    out.low = rate(out.bandwidth_low_gbps * eff.low, per_token);
+    out.high = rate(out.bandwidth_high_gbps * eff.high, per_token);
+    out.tps = rate(
+        (out.bandwidth_low_gbps + out.bandwidth_high_gbps) * (eff.low + eff.high) / 4,
+        per_token,
+    );
+    return SpeedJudged { speed: out };
+}
+
+/// `gbps_pct` (GB/s times a percentage) over `bytes` a token: tokens a
+/// second, rounded.
+fn rate(gbps_pct: Int, bytes: Int) -> Int {
+    if bytes <= 0 { return 0; }
+    // GB/s × 10^9 ÷ 100 = 10^7 bytes a second for each unit
+    return (gbps_pct * 10000000 + bytes / 2) / bytes;
+}
+
+/// A placement's measured speed (store `decode_speeds`) as a `FitSpeed`.
+fn measured_speed(row: st::DecodeSpeedRow) -> FitSpeed {
+    return FitSpeed {
+        kind: FitSpeedKind::measured,
+        tps: row.median_tps,
+        low: row.p25_tps,
+        high: row.p75_tps,
+        requests: row.requests,
+        has_first_at: true,
+        first_at: row.first_at,
+        has_last_at: true,
+        last_at: row.last_at,
+    };
+}
+
+/// The measured speed of variant `variant` of `recipe` on exactly `set`,
+/// from `rows`, when enough requests say it; `requests` 0 when none does.
+fn measured_on(
+    rows: st::DecodeSpeedRows,
+    recipe: String,
+    variant: String,
+    set: NodeSet
+) -> FitSpeed {
+    let key = sorted_nodes(set);
+    for r in rows.rows {
+        if r.recipe == recipe
+            && r.variant == variant
+            && r.nodes == key
+            && r.requests >= MEASURED_MIN
+        {
+            return measured_speed(r);
+        }
+    }
+    return FitSpeed { };
+}
+
+/// `set`'s nodes in byte order, a tab between: how the store keys a
+/// placement's nodes (`DecodeSpeedRow.nodes`).
+fn sorted_nodes(set: NodeSet) -> String {
+    let a = at(set.items, 0) or "";
+    let b = at(set.items, 1) or "";
+    if len(b) == 0 { return a; }
+    return if b < a { b + "\t" + a } else { a + "\t" + b };
+}
+
+/// The server of runtime `id` of `rts`, "" for none.
+fn runtime_server(rts: RuntimeList, id: String) -> String {
+    for r in rts.data {
+        if r.id == id { return r.server; }
+    }
+    return "";
+}

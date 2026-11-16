@@ -1,0 +1,248 @@
+// How fast a variant generates, one request at a time (speed.hl): measured
+// where voice has served it there, enough times; else estimated from the
+// accelerator's memory bandwidth, the bytes a token reads (all the weights
+// of a dense model, the active share of a mixture of experts) and the
+// runtime's efficiency; else none, and why: an MoE whose recipe gives no
+// parameters, unknown hardware, a runtime that drafts ahead.
+import ".." as api;
+import "../../store" as st;
+
+/// A recipe with `parameters`, `active` of them a token's where above 0.
+fn recipe(parameters: Int, active: Int) -> api::Recipe {
+    return api::Recipe {
+        id: "r",
+        has_parameters: parameters > 0,
+        parameters: parameters,
+        has_active_parameters: active > 0,
+        active_parameters: active,
+    };
+}
+
+/// A variant whose weights are `bytes`, in two files.
+fn variant(bytes: Int) -> String {
+    return "{\"id\": \"v\", \"files\": [{\"path\": \"config.json\", \"bytes\": 0}, {\"path\": \"model.gguf\", \"bytes\": "
+        + to_string(bytes) + "}]}";
+}
+
+/// Nodes whose accelerators of kind `kind` are named `a` (and `b`, a pair).
+fn on(kind: String, a: String, b: String) -> api::Judging {
+    let mut j = api::Judging { };
+    j = api::judging_add(j, "node-a", hw(kind, a), 0);
+    if len(b) > 0 { j = api::judging_add(j, "node-b", hw(kind, b), 0); }
+    return j;
+}
+
+fn hw(kind: String, name: String) -> String {
+    return "{\"os\": \"linux\", \"arch\": \"arm64\", \"memory_bytes\": 130000000000, \"accelerators\": [{\"kind\": \""
+        + kind + "\", \"name\": \"" + name
+        + "\", \"memory_bytes\": 130000000000, \"unified\": true}]}";
+}
+
+fn said(s: api::FitSpeed) -> String {
+    return to_string(s.low) + "-" + to_string(s.high) + " (" + to_string(s.tps) + ") at "
+        + to_string(s.bytes_per_token) + " B/token";
+}
+
+fn decode_row(variant: String, nodes: String, requests: Int, median: Int) -> st::DecodeSpeedRow {
+    return st::DecodeSpeedRow {
+        recipe: "r",
+        variant: variant,
+        nodes: nodes,
+        requests: requests,
+        p25_tps: median - 5,
+        median_tps: median,
+        p75_tps: median + 5,
+        first_at: `2026-11-10T09:00:00Z`,
+        last_at: `2026-11-16T09:00:00Z`,
+    };
+}
+
+fn pair(a: String, b: String) -> api::NodeSet {
+    let mut s = api::NodeSet { };
+    push(s.items, a) or discard;
+    if len(b) > 0 { push(s.items, b) or discard; }
+    return s;
+}
+
+fn main() {
+    // ---- the bandwidth table -------------------------------------------
+    let gb10 = api::bandwidth_of("NVIDIA GB10");
+    std::test::assert(gb10.low == 273 && gb10.high == 273, "a DGX Spark's GB10 reads 273 GB/s");
+    std::test::assert(
+        api::bandwidth_of("  nvidia geforce rtx 4090 ").high == 1008,
+        "a name matches whole, whatever its case and spaces around it",
+    );
+    std::test::assert(
+        api::bandwidth_of("NVIDIA GeForce RTX 4090 Laptop GPU").high == 0
+            && api::bandwidth_of("NVIDIA GeForce RTX").high == 0
+            && api::bandwidth_of("").high == 0,
+        "a name not in the table is not known, never the nearest one",
+    );
+    let max = api::bandwidth_of("Apple M4 Max");
+    std::test::assert(
+        max.low == 410 && max.high == 546,
+        "a chip binned two ways is both: the M4 Max reads 410 or 546 GB/s",
+    );
+    let radeon = api::bandwidth_of("AMD Radeon RX 9070");
+    std::test::assert(
+        radeon.low == 432 && radeon.high == 640,
+        "the name an AMD card reports is its family's, 9070 GRE to 9070 XT",
+    );
+
+    // ---- a dense model: every weight read a token -----------------------
+    let dense = api::estimate_speed(
+        recipe(8000000000, 0),
+        variant(8000000000),
+        "llama-server",
+        "cuda",
+        on("cuda", "NVIDIA GB10", ""),
+    );
+    std::test::assert(
+        dense.why == "" && dense.speed.kind == api::FitSpeedKind::estimated
+            && dense.speed.bytes_per_token == 8000000000
+            && dense.speed.bandwidth_low_gbps == 273
+            && dense.speed.efficiency_low == 55 && dense.speed.efficiency_high == 90
+            && dense.speed.low == 19 && dense.speed.high == 31 && dense.speed.tps == 25
+            && dense.speed.accelerator == "NVIDIA GB10",
+        "8 GB of dense weights on a GB10 under llama-server: 273 GB/s at 55 to 90%: "
+            + said(dense.speed),
+    );
+
+    // ---- a mixture of experts: its active share -------------------------
+    let moe = api::estimate_speed(
+        recipe(21000000000, 3600000000),
+        variant(12000000000),
+        "llama-server",
+        "cuda",
+        on("cuda", "NVIDIA GB10", ""),
+    );
+    std::test::assert(
+        moe.why == "" && moe.speed.bytes_per_token == 2057142857 && moe.speed.low == 73
+            && moe.speed.high == 119 && moe.speed.tps == 96,
+        "gpt-oss-20b's 12 GB read 3.6B of 21B parameters a token: " + said(moe.speed),
+    );
+    let binned = api::estimate_speed(
+        recipe(21000000000, 3600000000),
+        variant(12000000000),
+        "llama-server",
+        "metal",
+        on("metal", "Apple M4 Max", ""),
+    );
+    std::test::assert(
+        binned.speed.bandwidth_low_gbps == 410 && binned.speed.bandwidth_high_gbps == 546
+            && binned.speed.low == 110 && binned.speed.high == 239,
+        "a chip of two bins: from the lesser's low to the greater's high: " + said(binned.speed),
+    );
+    let unsaid = api::estimate_speed(
+        recipe(0, 0),
+        variant(12000000000),
+        "llama-server",
+        "cuda",
+        on("cuda", "NVIDIA GB10", ""),
+    );
+    std::test::assert(
+        !unsaid.speed.has_first_at && unsaid.speed.tps == 0
+            && unsaid.why == "its recipe does not say its parameters",
+        "a recipe that gives no parameters has no estimate, rather than a dense one: "
+            + unsaid.why,
+    );
+
+    // ---- unknown hardware ----------------------------------------------
+    let unknown = api::estimate_speed(
+        recipe(8000000000, 0),
+        variant(8000000000),
+        "llama-server",
+        "vulkan",
+        on("vulkan", "Intel Arc A770", ""),
+    );
+    std::test::assert(
+        unknown.why == "unknown hardware: no memory bandwidth known for Intel Arc A770",
+        "an accelerator the table does not have has no estimate: " + unknown.why,
+    );
+
+    // ---- a pair: both nodes' bandwidth, at a pair's efficiency -------------
+    let both = api::estimate_speed(
+        recipe(284000000000, 13000000000),
+        variant(166898508212),
+        "vllm",
+        "cuda",
+        on("cuda", "NVIDIA GB10", "NVIDIA GB10"),
+    );
+    std::test::assert(
+        both.why == "" && both.speed.bandwidth_low_gbps == 546 && both.speed.efficiency_low == 30
+            && both.speed.efficiency_high == 42 && both.speed.low == 21 && both.speed.high == 30
+            && both.speed.tps == 26 && both.speed.accelerator == "NVIDIA GB10 + NVIDIA GB10",
+        "DeepSeek-V4-Flash's fp8 across two GB10s under vLLM, as measured (26 tok/s): "
+            + said(both.speed),
+    );
+    let half_known = api::estimate_speed(
+        recipe(284000000000, 13000000000),
+        variant(166898508212),
+        "vllm",
+        "cuda",
+        on("cuda", "NVIDIA GB10", "NVIDIA Mystery"),
+    );
+    std::test::assert(
+        std::str::starts_with(half_known.why, "unknown hardware"),
+        "a pair with one node unknown has none: " + half_known.why,
+    );
+
+    // ---- runtimes with no estimate --------------------------------------
+    std::test::assert(
+        std::str::contains(
+            api::estimate_speed(
+                recipe(284000000000, 13000000000),
+                variant(184000000000),
+                "tensorfold",
+                "cuda",
+                on("cuda", "NVIDIA GB10", "NVIDIA GB10"),
+            ).why,
+            "drafts tokens ahead",
+        ),
+        "TensorFold drafts ahead: only a measured speed says how fast",
+    );
+    std::test::assert(
+        len(
+            api::estimate_speed(
+                recipe(2000000000, 0),
+                variant(2000000000),
+                "decision",
+                "metal",
+                on("metal", "Apple M4", ""),
+            ).why,
+        ) > 0,
+        "a decision model has no speed in tokens",
+    );
+    std::test::assert(
+        std::str::contains(
+            api::estimate_speed(
+                recipe(8000000000, 0),
+                variant(8000000000),
+                "llama-server",
+                "cuda",
+                on("cuda", "NVIDIA GB10", "NVIDIA GB10"),
+            ).why,
+            "no estimate for llama-server on 2 nodes",
+        ),
+        "nor a runtime on more nodes than it was calibrated on",
+    );
+
+    // ---- measured beats estimated, once enough requests say it -------------
+    let mut rows = st::DecodeSpeedRows { };
+    push(rows.rows, decode_row("v", "node-a\tnode-b", 5, 48)) or discard;
+    push(rows.rows, decode_row("few", "node-a", 4, 90)) or discard;
+    let m = api::measured_on(rows, "r", "v", pair("node-b", "node-a"));
+    std::test::assert(
+        m.kind == api::FitSpeedKind::measured && m.requests == 5 && m.tps == 48 && m.low == 43
+            && m.high == 53 && m.has_first_at && m.has_last_at,
+        "five requests on the pair, whichever node leads: measured, 48 tok/s",
+    );
+    std::test::assert(
+        api::measured_on(rows, "r", "few", pair("node-a", "")).requests == 0,
+        "four are too few: the estimate stands",
+    );
+    std::test::assert(
+        api::measured_on(rows, "r", "v", pair("node-a", "")).requests == 0,
+        "the pair's measure is not one node's",
+    );
+}

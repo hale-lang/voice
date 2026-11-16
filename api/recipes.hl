@@ -36,6 +36,13 @@ type RecipeCreate {
     // what a model made from it answers (decision.hl); left out, generative
     has_contract: Bool = false;
     contract: ModelContract = ModelContract::generative;
+    // the model's parameters, as its card says them, and of them those one
+    // token is computed with, where fewer (a mixture of experts): what a
+    // speed is estimated from (speed.hl); left out when not known
+    has_parameters: Bool = false;
+    parameters: Int = 0;
+    has_active_parameters: Bool = false;
+    active_parameters: Int = 0;
 }
 
 /// Where a recipe or a runtime came from (`Recipe.origin`, `Runtime.origin`).
@@ -63,6 +70,10 @@ type Recipe {
     origin: Origin = Origin::operator;
     has_created_at: Bool = false;
     created_at: Time = `1970-01-01T00:00:00Z`;
+    has_parameters: Bool = false;
+    parameters: Int = 0;
+    has_active_parameters: Bool = false;
+    active_parameters: Int = 0;
 }
 
 /// `RecipeVariantSummary`: a variant as `listRecipes` lists it, its files
@@ -215,13 +226,18 @@ locus Recipes {
     }
 
     fn create_in_gate(c: RecipeCreate) -> Recipe fallible(CtlError) {
-        let body = recipe_body(
+        let plain = recipe_body(
             c.id,
             c.license,
             if c.has_context_length { c.context_length } else { 0 },
             if c.has_kv_bytes_per_token { c.kv_bytes_per_token } else { 0 },
             if c.has_contract { model_contract_name(c.contract) } else { "" },
             c.variants.text,
+        );
+        let body = recipe_parameters(
+            plain,
+            if c.has_parameters { c.parameters } else { 0 },
+            if c.has_active_parameters { c.active_parameters } else { 0 },
         );
         if std::str::starts_with(body, "!") {
             fail bad(refusal_message(body), recipe_param(body));
@@ -367,7 +383,11 @@ fn recipe_view(
         ) or raise,
         origin: origin,
         has_created_at: dated,
-        created_at: at
+        created_at: at,
+        has_parameters: std::json::find_int_field(body, "parameters") > 0,
+        parameters: std::json::find_int_field(body, "parameters"),
+        has_active_parameters: std::json::find_int_field(body, "active_parameters") > 0,
+        active_parameters: std::json::find_int_field(body, "active_parameters")
     };
 }
 
@@ -450,6 +470,10 @@ fn recipe_json(r: Recipe) -> String {
         + ", \"url\": "
         + jq(r.license.url) + "}" + context_field(r.has_context_length, r.context_length)
         + kv_field(r.has_kv_bytes_per_token, r.kv_bytes_per_token)
+        + parameters_fields(
+            if r.has_parameters { r.parameters } else { 0 },
+            if r.has_active_parameters { r.active_parameters } else { 0 },
+        )
         + ", \"contract\": " + jq(model_contract_name(r.contract))
         + ", \"variants\": " + r.variants.text + ", \"origin\": "
         + jq(origin_name(r.origin)) + ", \"created_at\": "
@@ -530,6 +554,40 @@ const KV_PER_TOKEN_MAX: Int = 16777216;
 fn kv_field(known: Bool, n: Int) -> String {
     if !known { return ""; }
     return ", \"kv_bytes_per_token\": " + to_string(n);
+}
+
+/// The most parameters a recipe may say a model has: 100 trillion.
+const PARAMETERS_MAX: Int = 100000000000000;
+
+/// Recipe `body` (`recipe_body`'s) with the model's parameters, and those
+/// one token is computed with, where known (0 when not); or
+/// `!<param>\t<problem>`. Active parameters are fewer than all of them,
+/// and said only with them: a model with none fewer leaves them out.
+fn recipe_parameters(body: String, parameters: Int, active: Int) -> String {
+    if std::str::starts_with(body, "!") { return body; }
+    if parameters < 0 || parameters > PARAMETERS_MAX {
+        return "!parameters\t`parameters` is 1 to 100000000000000";
+    }
+    if active < 0 || (active > 0 && (parameters == 0 || active >= parameters)) {
+        return "!active_parameters\t`active_parameters` is fewer than `parameters`, which it needs";
+    }
+    let fields = parameters_fields(parameters, active);
+    if len(fields) == 0 { return body; }
+    let at = std::str::index_of(body, ", \"variants\": [");
+    if at < 0 { return body; }
+    let out = body[0..at] + fields + body[at..len(body)];
+    if len(out) > RECIPE_MAX {
+        return "!variants\ta recipe is at most 48 KiB (" + to_string(len(out)) + " bytes)";
+    }
+    return out;
+}
+
+/// `, "parameters": n` and `, "active_parameters": m` where known, "" when
+/// not.
+fn parameters_fields(parameters: Int, active: Int) -> String {
+    if parameters <= 0 { return ""; }
+    return ", \"parameters\": " + to_string(parameters)
+        + (if active > 0 { ", \"active_parameters\": " + to_string(active) } else { "" });
 }
 
 /// `, "context_length": n` when it is known, "" when not.

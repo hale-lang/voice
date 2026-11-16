@@ -11,8 +11,6 @@ type AdminEvent = Schemas['AdminEvent'];
 const ADMIN_TOPICS: Record<string, string> = {
   UsageRecorded: 'usage',
   ChangeMade: 'change',
-  AnnotationKept: 'annotation',
-  AnnotationStepTaken: 'annotation_step',
   NodeMoved: 'node',
   RequestsInFlight: 'request',
 };

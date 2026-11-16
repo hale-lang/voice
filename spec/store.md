@@ -770,6 +770,8 @@ update placement set body = jsonb_set(body, '{fit}', (select jsonb_agg(case when
 
 ### Migration 23: annotate
 
+(Dropped by migration 46, with the tables and columns below, as the annotators left voice.)
+
 A project or a key may annotate: after each request it sends is answered,
 voice asks a decision model the questions of the **annotators** in force for
 it, and keeps each answer with its probability. `annotate` follows the
@@ -880,6 +882,8 @@ insert into annotation_rule (id, body, builtin) values ('form-kept', '{"name": "
 
 ### Migration 24: a system key per project, and conversations' titles
 
+(Its `conversation_title` table and the title annotator are dropped by migration 46, as the annotators left voice; the system keys stay.)
+
 The requests voice makes for a project (its annotations, its conversations'
 titles) are the project's own, under its system key, `<project>-system`:
 made with every project, an existing one here, it is internal, so no token
@@ -922,6 +926,8 @@ insert into annotator_version (annotator, version, body) values ('conversation-t
 ```
 
 ### Migration 25: an annotation queued, read by any instance, its steps told
+
+(Dropped by migration 46, with its tables and columns, as the annotators left voice.)
 
 An annotation is no longer read on the answered request's coroutine: the
 request is answered, and if its project or key annotates and an annotator
@@ -978,6 +984,8 @@ create index annotation_step_by_at on annotation_step (at);
 ```
 
 ### Migration 26: an agent's turn annotated once, and titles that are titles
+
+(Dropped by migration 46, with its table, as the annotators left voice.)
 
 An agent client (a coding CLI) sends one request a step: the same ask,
 followed by its tool calls and their output. Its annotation is the
@@ -1549,4 +1557,31 @@ drop table attempt_bundle;
 drop table attempt_event;
 drop table attempt;
 drop table cli_recipe;
+```
+
+### Migration 46: the annotators leave voice
+
+Voice no longer annotates requests: no decision model is asked about a
+request once it is answered, and no conversation is titled. The
+annotators, their versions and rules, the annotations with their answers,
+held inputs, steps and turns, and the conversations' titles (migrations
+23 to 26) are dropped with their indexes, and so are the project's and
+the key's `annotate` columns. Each project's system key stays: the ledger
+keeps the requests voice made under it, apart from its callers', and the
+hourly rollup counts them. Recorded requests (`peek`, migration 16) stay:
+they are the operator's own reading of what a project sent, not the
+annotators'.
+
+```sql
+drop table annotation_answer;
+drop table annotation_input;
+drop table annotation;
+drop table annotation_step;
+drop table annotation_turn;
+drop table conversation_title;
+drop table annotator_version;
+drop table annotator;
+drop table annotation_rule;
+alter table project drop column annotate;
+alter table api_key drop column annotate;
 ```

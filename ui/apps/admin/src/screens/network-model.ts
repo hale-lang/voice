@@ -229,8 +229,8 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   }
   for (const [id, by] of givenBy) vertices.get(id)!.details.push(['Aliases', by.join(', ')]);
   for (const r of fleet.usage) {
-    // voice's own request for a project (its system key's: an annotation, a
-    // title), drawn apart and dotted: project → its system key → the model,
+    // voice's own request for a project (its system key's: an annotation
+    // or a title, when voice annotated requests), drawn apart and dotted: project → its system key → the model,
     // never through the project's own flow
     if ((r as { internal?: boolean }).internal) {
       const members: string[] = [];
@@ -238,7 +238,7 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
       const project = entityId('project', r.project);
       if (!vertices.has(project)) add({ id: project, name: r.project, kind: 'project', state: 'observed', active: 0, details: [['Project', r.project]] });
       const key = entityId('system', r.key);
-      if (!vertices.has(key)) add({ id: key, name: r.key, kind: 'system', state: 'internal', active: 0, details: [['System key', r.key], ['Meaning', "Voice's own requests for the project (annotations, titles): kept out of its usage, its limits and its flow."]] });
+      if (!vertices.has(key)) add({ id: key, name: r.key, kind: 'system', state: 'internal', active: 0, details: [['System key', r.key], ['Meaning', "Voice's own requests for the project: kept out of its usage, its limits and its flow."]] });
       const target = r.served?.model ?? r.requested_model;
       const model = entityId('model', target);
       if (!vertices.has(model)) add({ id: model, name: target, kind: 'model', state: 'observed', active: 0, details: [['Model', target], ['Evidence', 'Asked by a system key.']] });

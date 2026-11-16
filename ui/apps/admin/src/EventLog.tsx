@@ -159,7 +159,7 @@ export function EventLog() {
           }}
         >
           {lines.length === 0 ? (
-            <div className={s.empty}>listening… requests, annotations, nodes and changes show here as they happen</div>
+            <div className={s.empty}>listening… requests, nodes and changes show here as they happen</div>
           ) : (
             lines.map((l) => (
               <div
@@ -229,64 +229,6 @@ function lineOf(e: AdminEvent): Line | null {
         replayed,
       };
     }
-    case 'annotation': {
-      const a = e.data;
-      // queued: its steps tell it as they happen (`annotation_step`)
-      if (a.status === 'pending') return null;
-      const pick = (q: string) => a.answers.find((x) => x.question === q)?.answer;
-      const task = pick('task');
-      const outcome = pick('outcome');
-      const flags = a.answers.filter((x) => x.answer === 'true' && x.probability >= 0.5).map((x) => x.question.replace(/_/g, '-'));
-      const said = [task && outcome ? `${task} → ${outcome.replace(/_/g, ' ')}` : (task ?? outcome), ...flags.slice(0, 3)].filter(Boolean).join(' · ');
-      const tokens = a.runs.reduce((n, r) => n + r.input_tokens, 0);
-      const not = a.status !== 'annotated';
-      return {
-        key: `annotation:${e.id}`,
-        at,
-        tag: not ? '◌ unread' : '◇ read',
-        tone: not ? 'warn' : 'note',
-        text: not
-          ? `${a.project} · not annotated: ${a.reason}`
-          : `${a.project} · ${said || `${a.answers.length} answers`}${a.title ? ` · “${a.title}”` : ''} · ${a.runs.length} run${a.runs.length === 1 ? '' : 's'}, ${count(tokens)} tok`,
-        detail: a.conversation ?? a.request_id,
-        open: () => go('requests', a.request_id),
-        replayed,
-      };
-    }
-    case 'annotation_step': {
-      const st = e.data;
-      const short = st.request_id.length > 14 ? `${st.request_id.slice(0, 12)}…` : st.request_id;
-      const tone: Line['tone'] = st.step === 'queued' || st.step === 'started' || st.step === 'skipped'
-        ? 'quiet'
-        : st.step === 'waiting' || st.step === 'not_annotated' || (st.step === 'done' && st.reason)
-          ? 'warn'
-          : st.step === 'kept' ? 'ok' : 'note';
-      const said = st.step === 'started'
-        ? `${st.stage} stage started · ${st.model}`
-        : st.step === 'done'
-          ? `${st.stage} done${st.model ? ` · ${st.model}` : ''} · ${count(st.input_tokens)} tok · ${st.ms} ms${st.reason ? ` · ${st.reason}` : ''}`
-          : st.step === 'waiting'
-            ? `${st.stage} ${st.reason}`
-            : st.step === 'skipped'
-              ? `${st.stage} skipped${st.reason ? ` · ${st.reason}` : ''}`
-              : st.step === 'titled'
-                ? `titled “${st.title}”`
-                : st.step === 'kept'
-                  ? 'annotated'
-                  : st.step === 'not_annotated'
-                    ? `not annotated · ${st.reason}`
-                    : `queued${st.reason ? ` · ${st.reason}` : ''}`;
-      return {
-        key: `step:${e.id}`,
-        at,
-        tag: '◇ annotate',
-        tone,
-        text: `${short} · ${said}`,
-        detail: st.conversation || st.project,
-        open: () => go('requests', st.request_id),
-        replayed,
-      };
-    }
     default:
       return null;
   }
@@ -301,8 +243,9 @@ function landing(r: UsageRecord | UsageRecordSummary, at: number, replayed: bool
   const secs = t.wall_ms / 1000;
   const rate = t.first_output_ms != null && t.engine_ms != null && t.engine_ms > t.first_output_ms && r.output_tokens > 0 ? ` · ${((1000 * r.output_tokens) / (t.engine_ms - t.first_output_ms)).toFixed(0)} tok/s` : '';
   const failed = !FINE.has(r.status);
-  // voice's own request for the project (its system key's): an annotation's
-  // stage or a title, quiet beside the project's own
+  // voice's own request for the project (its system key's, from when voice
+  // annotated requests): an annotation's stage or a title, quiet beside
+  // the project's own
   const said = 'metadata' in r ? (r.metadata as Record<string, unknown> | null)?.side : r.side;
   const side = r.internal ? String(said ?? 'internal') : '';
   return {

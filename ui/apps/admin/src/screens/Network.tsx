@@ -90,7 +90,7 @@ export function Network(_: ScreenProps) {
         <button aria-pressed={source === 'demo'} onClick={() => chooseSource('demo')}>Demo fleet</button>
         <button aria-pressed={context} onClick={toggleContext} title="each request's conversation, repository and metadata beside its project">Request context</button>
         <label className={s.retiredChoice} title="api instances that no longer beat (each redeploy retires one), faint, with the requests they admitted: while any of those is in view, always, or never (their requests then flow from the project straight to the host)">Retired api instances<select value={retired} onChange={e => chooseRetired(e.target.value as RetiredMode)}>{RETIRED_MODES.map(([mode, label]) => <option key={mode} value={mode}>{label}{mode === 'in-view' ? ' (default)' : ''}</option>)}</select></label>
-        <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project (annotations, titles), under its system key: dotted, apart from the project's flow">Internal runs</button>
+        <button aria-pressed={internal} onClick={() => setInternal(!internal)} title="voice's own requests for each project, under its system key: dotted, apart from the project's flow">Internal runs</button>
       </div>
     </header>
     {source === 'api' && failure ? <Unavailable what="Network" detail={failure.error?.message} /> : source === 'api' && pending ? <Loading what="the fleet" /> :

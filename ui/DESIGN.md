@@ -120,8 +120,7 @@ right ones comparable.
 - **Usage.** Two tables, switched in place: each request, or each
   conversation its requests are turns of, filterable by every field the API
   filters by and paged, the view in the URL. Tabular numerals,
-  right-aligned, units muted. Annotations are read in a request or a
-  conversation opened, not across the ledger.
+  right-aligned, units muted.
 - **Accounts.** Windows, limits, the seats that spend it, and whether it is
   exhausted and until when.
 - **Nodes.** Capabilities as declared, its load against its capacity (the

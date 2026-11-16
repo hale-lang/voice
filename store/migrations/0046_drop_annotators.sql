@@ -1,0 +1,11 @@
+drop table annotation_answer;
+drop table annotation_input;
+drop table annotation;
+drop table annotation_step;
+drop table annotation_turn;
+drop table conversation_title;
+drop table annotator_version;
+drop table annotator;
+drop table annotation_rule;
+alter table project drop column annotate;
+alter table api_key drop column annotate;

@@ -71,13 +71,12 @@ locus Projects {
         }
         check_name(c.name) or raise;
         check_limits(c.limits, "project,model", "limits") or raise;
+        if c.has_annotate && c.annotate { fail annotate_removed(); }
         let mut row = st::ProjectRow {
             id: c.id,
             name: c.name,
             peek_set: c.has_peek,
             peek: c.peek,
-            annotate_set: c.has_annotate,
-            annotate: c.annotate,
             models: restriction_of(c.has_models, c.models),
             accounts: accounts_restriction(c.has_accounts, c.accounts) or raise,
             created_at: now_seconds()
@@ -114,14 +113,6 @@ locus Projects {
                 row.inherits = true;
                 row.accounts = st::Restriction { any: false };
             }
-        }
-        // turned on, it has a decision model to ask (annotate.hl): the one
-        // its `decide` names, its own or, a child, its parent's
-        if c.has_annotate && c.annotate {
-            annotating_ready(self.store, row) or {
-                if c.has_parent { self.store.let_go(); }
-                fail err;
-            };
         }
         let v = self.view(row) or {
             self.store.let_go();
@@ -237,22 +228,13 @@ locus Projects {
             row.name = u.name;
         }
         if u.has_owners { row.owners.items = u.owners; }
+        if u.has_annotate && u.annotate { fail annotate_removed(); }
         if u.has_peek {
             row.peek_set = true;
             row.peek = u.peek;
         } else if u.clear_peek {
             row.peek_set = false;
             row.peek = false;
-        }
-        if u.has_annotate {
-            if row.internal && u.annotate {
-                fail bad(row.id + " is retired, and annotates nothing", "annotate");
-            }
-            row.annotate_set = true;
-            row.annotate = u.annotate;
-        } else if u.clear_annotate {
-            row.annotate_set = false;
-            row.annotate = false;
         }
         if u.has_data_classes { row.data_classes.items = u.data_classes; }
         if u.has_aliases { row.aliases = aliases_json(self.store, u.aliases, "aliases") or raise; }
@@ -299,11 +281,6 @@ locus Projects {
         // when it inherits
         let spending = as_in_force(self.store, row) or fail store_down(err);
         self.keys_within(spending) or raise;
-        // turned on, it has a decision model to ask (annotate.hl), the one
-        // its `decide` names as this change leaves it
-        if u.has_annotate && u.annotate {
-            annotating_ready(self.store, row) or raise;
-        }
         let after = self.view(row) or raise;
         self.store.update_project(
             row,
@@ -638,9 +615,6 @@ locus Projects {
             has_peek: r.peek_set,
             peek: r.peek,
             peeks: peeks(self.store, r.peek_set, r.peek, r.parent) or false,
-            has_annotate: r.annotate_set,
-            annotate: r.annotate,
-            annotates: annotates(self.store, r) or false,
             internal: r.internal
         };
         v.models = r.models.names.items;
@@ -733,7 +707,7 @@ locus Keys {
                 "name"
             );
         }
-        if c.annotate { annotating_ready(self.store, p) or raise; }
+        if c.annotate { fail annotate_removed(); }
         let models = restriction_of(c.has_models, c.models);
         let accounts = accounts_restriction(c.has_accounts, c.accounts) or raise;
         within(p.models, models, "models") or raise;
@@ -758,8 +732,7 @@ locus Keys {
             created_at: now,
             expires: c.has_expires_at,
             expires_at: c.expires_at,
-            peek: c.peek,
-            annotate: c.annotate
+            peek: c.peek
         };
         row.limits.items = c.limits;
         let mut v = key_view(row, now);
@@ -823,7 +796,7 @@ locus Keys {
         // what makes it the key voice's own requests go by never does
         if k.internal
             && (
-                u.has_name || u.has_peek || u.has_annotate || u.has_expires_at || u.clear_expires_at
+                u.has_name || u.has_peek || u.has_expires_at || u.clear_expires_at
             )
         {
             fail bad(
@@ -832,8 +805,6 @@ locus Keys {
                     "name"
                 } else if u.has_peek {
                     "peek"
-                } else if u.has_annotate {
-                    "annotate"
                 } else {
                     "expires_at"
                 }
@@ -856,13 +827,7 @@ locus Keys {
             k.name = u.name;
         }
         if u.has_peek { k.peek = u.peek; }
-        if u.has_annotate {
-            if u.annotate && !k.annotate {
-                let kp = self.project_of(k.project) or raise;
-                annotating_ready(self.store, kp) or raise;
-            }
-            k.annotate = u.annotate;
-        }
+        if u.has_annotate && u.annotate { fail annotate_removed(); }
         if u.has_models || u.clear_models {
             let models = restriction_of(u.has_models, u.models);
             within(p.models, models, "models") or raise;
@@ -987,7 +952,7 @@ locus KeyBearer {
         }
         if key_status(k, now_seconds()) != KeyStatus::active { fail invalid_key(); }
         let p = self.store.project(k.project) or fail metering_failed(err);
-        // voice's own project's requests are voice's alone (annotate.hl): no
+        // voice's own project's requests are voice's alone: no
         // caller's token names a key of it, whichever way the key was made
         if !p.present || p.archived || p.internal || k.internal { fail invalid_key(); }
         let now = now_seconds();
@@ -1029,7 +994,6 @@ fn key_view(k: st::KeyRow, now: Time) -> Key {
         has_revoked_at: k.revoked,
         revoked_at: k.revoked_at,
         peek: k.peek,
-        annotate: k.annotate,
         internal: k.internal
     };
     v.models = k.models.names.items;
@@ -1122,15 +1086,12 @@ fn entropy_failed(message: String) -> ApiError {
     };
 }
 
-/// Refused with why, when `p` cannot have its annotators' questions asked
-/// (annotate.hl): its `decide`, its own or its parent's, names no decision
-/// model, or no seat serving it is up on an account it may spend.
-fn annotating_ready(store: st::Store, p: st::ProjectRow) fallible(CtlError) {
-    let r = annotate_readiness(store, p) or fail store_down(err);
-    if !r.decide.ready {
-        fail clash(
-            "annotate needs a decision model it can be read by: " + r.decide.problem
-                + "; set it on Projects (aliases) and place it, then turn annotate on"
-        );
-    }
+/// Annotating, asked for: voice no longer annotates requests. A body that
+/// turns `annotate` on is refused naming the removal; `false` or `null`
+/// asks for what is so, and is read past.
+fn annotate_removed() -> CtlError {
+    return bad(
+        "`annotate` was removed: voice no longer annotates requests (no annotators, rules or conversation titles)",
+        "annotate",
+    );
 }

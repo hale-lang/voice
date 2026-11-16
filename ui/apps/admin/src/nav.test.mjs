@@ -24,8 +24,7 @@ test('every screen has a route of its own, which opens it with its item', () => 
     projects: '#/projects',
     chat: '#/conversations/chat',
     conversations: '#/conversations/history',
-    annotators: '#/harness/annotators',
-    tools: '#/harness/tools',
+    tools: '#/conversations/tools',
     changes: '#/changes',
     api: '#/api',
   };
@@ -51,7 +50,7 @@ test('the deep links the screens write open on their new routes', () => {
     [['requests', 'resp_1'], '#/models/requests/resp_1'],
     [['conversations', 'conv 7'], '#/conversations/history/conv%207'],
     [['chat', 'c1'], '#/conversations/chat/c1'],
-    [['annotators', 'rules', 'r1'], '#/harness/annotators/rules/r1'],
+    [['tools', 'web_fetch'], '#/conversations/tools/web_fetch'],
     [['projects', 'work'], '#/projects/work'],
     [['api', 'schema', 'Model'], '#/api/schema/Model'],
     [['changes', 'ch1'], '#/changes/ch1'],
@@ -79,8 +78,7 @@ test('every route from before the layers opens where its screen lives now, its q
     ['#/runtimes/llama', '#/models/runtimes/llama', ['runtimes', 'llama']],
     ['#/chat', '#/conversations/chat', ['chat']],
     ['#/chat/c1', '#/conversations/chat/c1', ['chat', 'c1']],
-    ['#/annotators/rules/r1', '#/harness/annotators/rules/r1', ['annotators', 'rules', 'r1']],
-    ['#/tools', '#/harness/tools', ['tools']],
+    ['#/tools', '#/conversations/tools', ['tools']],
     // Usage, by its view, or by what it opened
     ['#/usage', '#/models/requests', ['requests']],
     ['#/usage?view=requests&status=failed', '#/models/requests?status=failed', ['requests']],
@@ -90,12 +88,19 @@ test('every route from before the layers opens where its screen lives now, its q
     ['#/usage/c/conv-7?view=requests', '#/conversations/history/conv-7', ['conversations', 'conv-7']],
     // a layer's own path opens its first screen
     ['#/conversations', '#/conversations/chat', ['chat']],
-    ['#/harness', '#/harness/annotators', ['annotators']],
-    // the screens coding attempts had are gone: theirs open the Harness layer
-    ['#/harness/attempts', '#/harness/annotators', ['annotators']],
-    ['#/harness/attempts/a1?project=work', '#/harness/annotators', ['annotators']],
-    ['#/harness/clis/claude', '#/harness/annotators', ['annotators']],
-    ['#/attempts/a1', '#/harness/annotators', ['annotators']],
+    // the Harness layer is gone: its tools are Conversations', and the
+    // screens of coding attempts and of the annotators, and the layer's
+    // own path, open the overview
+    ['#/harness/tools', '#/conversations/tools', ['tools']],
+    ['#/harness/tools?x=1', '#/conversations/tools?x=1', ['tools']],
+    ['#/harness', '#/', []],
+    ['#/harness/annotators', '#/', []],
+    ['#/harness/annotators/rules/r1?project=work', '#/', []],
+    ['#/annotators/rules/r1', '#/', []],
+    ['#/harness/attempts', '#/', []],
+    ['#/harness/attempts/a1?project=work', '#/', []],
+    ['#/harness/clis/x', '#/', []],
+    ['#/attempts/a1', '#/', []],
   ];
   for (const [old, now, parts] of moved) {
     const r = open(old);
@@ -112,7 +117,7 @@ test('the routes that kept their place stay, and an unknown one is left as it is
   assert.deepEqual(open('#/nowhere/x'), { parts: ['nowhere', 'x'], query: '', redirect: null });
 });
 
-test('the rail: Overview, the Models layer, Projects, Conversations, Harness, and the system links apart', () => {
+test('the rail: Overview, the Models layer, Projects, Conversations, and the system links apart', () => {
   const rail = railOf('');
   assert.deepEqual(
     rail.map((g) => [g.label ?? null, !!g.apart, g.items.map((it) => it.label)]),
@@ -120,8 +125,7 @@ test('the rail: Overview, the Models layer, Projects, Conversations, Harness, an
       [null, false, ['Overview']],
       ['Models', false, ['Catalogue', 'Placements', 'Nodes', 'Recipes', 'Runtimes', 'Accounts', 'Routes', 'Requests', 'Live']],
       [null, false, ['Projects']],
-      ['Conversations', false, ['Chat', 'Conversations']],
-      ['Harness', false, ['Annotators', 'Tools']],
+      ['Conversations', false, ['Chat', 'Conversations', 'Tools']],
       [null, true, ['Changes', 'API']],
     ],
   );

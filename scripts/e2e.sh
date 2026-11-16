@@ -34,10 +34,9 @@ UPSTREAM_PORT=${UPSTREAM_PORT:-14296}
 NATS_PORT=${NATS_PORT:-14222}
 ORG_PORT=${ORG_PORT:-14298}
 NERVES_PORT=${NERVES_PORT:-14297}
-# the upstreams of the cancel and the annotation cases: ports of their own,
-# never one of the stubs' above (UPSTREAM_PORT + 1 is NERVES_PORT)
+# the upstreams of the cancel cases: ports of their own, never one of the
+# stubs' above (UPSTREAM_PORT + 1 is NERVES_PORT)
 NOHEAD_PORT=${NOHEAD_PORT:-14300}
-DECIDE_PORT=${DECIDE_PORT:-14301}
 KEPT_PORT=${KEPT_PORT:-14302}
 # the tool-argument case's strict upstream
 STRICT_PORT=${STRICT_PORT:-14304}
@@ -296,8 +295,8 @@ printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
 echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
-# every project has its own system key for the requests voice makes for it
-# (annotate.hl): listed with its keys, internal, and no token names it
+# every project has its own system key for the requests voice makes for it:
+# listed with its keys, internal, and no token names it
 curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects" \
   | python3 -c 'import json,sys; print("\n".join(p["id"] for p in json.load(sys.stdin)["data"] if p["status"] == "active"))' >"$work/projects.txt"
 while read -r pid; do
@@ -658,85 +657,6 @@ ids = [r["id"] for r in json.load(sys.stdin)["data"]]
 assert os.environ["FAIL_ID"] in ids, ids
 ' || { echo "the failed row is not listed"; exit 1; }
 echo "a call a double cannot read reached the caller repaired and recorded so; its conversation is served again on both wires; a request every seat failed is a failed row"
-
-# annotations queued on NATS: four requests of a project that annotates,
-# their annotations at once on a decision seat that takes one at a time, each stage a
-# message to the queue group; a stage that finds the seat busy waits and is
-# read again, so every one ends annotated, its steps kept in order. A
-# project that does not annotate writes no row.
-python3 scripts/decide-upstream.py "$DECIDE_PORT" "$work/decide-upstream.log" 400 &
-pids+=($!)
-for i in $(seq 1 50); do (echo > "/dev/tcp/127.0.0.1/$DECIDE_PORT") 2>/dev/null && break; sleep 0.1; done
-post /admin/v1/models '{"id": "jev-2b", "contract": "decision"}' >/dev/null
-dtoken=$(post /admin/v1/nodes '{"id": "decider"}' | field enrollment_token)
-post /admin/v1/nodes/decider/seats '{"id": "decide", "engine": "openai-compatible", "account": "static", "serves": [{"model": "jev-2b"}], "config": {"base_url": "http://127.0.0.1:'"$DECIDE_PORT"'", "model": "jev-2b"}}' >/dev/null
-echo '{"engines": [{"id": "openai-compatible", "kind": "openai-compatible"}]}' >"$work/decider-caps.json"
-node/node --id decider --api "$api" --token "$dtoken" --data "$work/decider-data" --capabilities "$work/decider-caps.json" --port "$((QUIET_PORT + 2))" --readings-port "$((QUIET_PORT + 1002))" >"$work/decider.log" 2>&1 &
-pids+=($!)
-for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/decider/seats/decide" 2>/dev/null | field status 2>/dev/null)" = "up" ] && break; sleep 0.2; done
-routed decider/decide
-post /admin/v1/projects '{"id": "noted", "name": "Noted", "peek": true, "annotate": true, "aliases": [{"name": "decide", "model": "jev-2b"}, {"name": "general", "model": "echo-1"}]}' >/dev/null
-nkey=$(post /admin/v1/projects/noted/keys '{"name": "e2e"}' | field secret)
-# a request of the annotation case: its JSON answer on stdout, or, on any
-# status but 2xx, the status, the answer and the logs that explain it
-ask_json() { # <bearer> <body>
-  local out code
-  out=$(curl -sS --max-time 60 -o "$work/ask.out" -w '%{http_code}' -X POST "$api/v1/responses" -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$2") || true
-  code=$out
-  if [ "${code:0:1}" != 2 ]; then
-    echo "a request of the annotation case was answered $code: $(head -c 600 "$work/ask.out")"
-    echo "--- api"; tail -60 "$work/api.log"; echo "--- node"; tail -30 "$work/node.log"
-    exit 1
-  fi
-  cat "$work/ask.out"
-}
-# the cases before leave the shared static seat reconfigured or still
-# serving a stream its caller left: start from it up, applied and idle
-wait_for up
-for i in $(seq 1 100); do
-  [ "$(curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["in_flight"])')" = "0" ] && break
-  sleep 0.1
-done
-ask_json "$key" '{"model": "echo-1", "input": "not annotated"}' >"$work/quiet.json"
-quiet_id=$(field id <"$work/quiet.json")
-# the four asked one after another (the chat seat takes one at a time):
-# each answered at once, their annotations then
-# queued together on the one-at-a-time decision seat
-for n in 1 2 3 4; do
-  ask_json "$nkey" '{"model": "echo-1", "prompt_cache_key": "conv-'"$n"'", "input": "write a sort, number '"$n"'"}' >"$work/noted-$n.json"
-  field id <"$work/noted-$n.json" >"$work/noted-$n.id"
-done
-# each answered within a minute, or the case fails with what the api said
-wait_ids() {
-  for n in 1 2 3 4; do
-    for i in $(seq 1 1200); do [ -s "$work/noted-$n.id" ] && break; sleep 0.1; done
-    [ -s "$work/noted-$n.id" ] || { echo "request $n of the four was not answered"; tail -40 "$work/api.log"; tail -20 "$work/decider.log"; exit 1; }
-  done
-}
-wait_ids
-for i in $(seq 1 120); do
-  settled=0
-  for n in 1 2 3 4; do
-    st=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-$n.id")" 2>/dev/null | field status 2>/dev/null || true)
-    [ "$st" = annotated ] && settled=$((settled + 1))
-    [ "$st" = not_annotated ] && { echo "a queued annotation was not made: $(curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-$n.id")")"; tail -20 "$work/api.log"; exit 1; }
-  done
-  [ "$settled" = 4 ] && break
-  sleep 0.5
-done
-[ "$settled" = 4 ] || { echo "four queued annotations did not all settle: $settled annotated"; tail -20 "$work/api.log"; exit 1; }
-python3 - "$work/decide-upstream.log" <<'PY' || { echo "the decision seat did not take them one at a time"; cat "$work/decide-upstream.log"; exit 1; }
-import json, sys
-asked = [json.loads(l) for l in open(sys.argv[1])]
-assert len(asked) >= 8, len(asked)
-PY
-curl -fsS -H @"$work/admin.h" "$api/admin/v1/annotations/$(cat "$work/noted-1.id")/steps" | python3 -c '
-import json, sys
-steps = [s["step"] for s in json.load(sys.stdin)["data"]]
-assert steps[0] == "queued" and steps[-1] == "kept" and "done" in steps, steps
-' || { echo "the steps were not kept in order"; exit 1; }
-[ "$(curl -s -o /dev/null -w '%{http_code}' -H @"$work/admin.h" "$api/admin/v1/annotations/$quiet_id")" = 404 ] || { echo "a request of a project that does not annotate has an annotation"; exit 1; }
-echo "four annotations queued at once on a one-at-a-time decision seat, all annotated, their steps kept; a project that does not annotate wrote none"
 
 # the node's local API is the machine's own tools': a request that names
 # another host, or that a web page sent, is refused, and a write takes the

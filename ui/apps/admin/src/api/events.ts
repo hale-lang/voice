@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react';
 import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { Schemas } from './client';
 import { forgetOperatorToken, useOperatorToken } from './token';
-import { addSteps, type Step } from './steps';
 import { ARRANGEMENTS, FITS, RECIPE_READS, changeReads } from './fleet-reads';
 import { paceWait } from '../usage-totals';
 
@@ -46,22 +45,16 @@ export const AFFECTS: Record<string, string[]> = {
   // a node joining, leaving or registering again: the
   // saved arrangements say whether the fleet changed since they were
   // planned, and the fits are judged against it
-  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness', ARRANGEMENTS, FITS],
-  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements', '/admin/v1/projects/{project}/annotate-readiness'],
-  account: ['/admin/v1/accounts', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
+  node: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/placements', ARRANGEMENTS, FITS],
+  seat: ['/admin/v1/nodes', '/admin/v1/routes', '/admin/v1/models', '/admin/v1/placements'],
+  account: ['/admin/v1/accounts', '/admin/v1/routes'],
   usage: ['/admin/v1/usage', '/admin/v1/usage/summary', '/admin/v1/projects'],
   // the log, and the resource the change names (`target`), below
   // a project's routes too: an alias, a model or a seat changed
-  change: ['/admin/v1/changes', '/admin/v1/routes', '/admin/v1/projects/{project}/annotate-readiness'],
+  change: ['/admin/v1/changes', '/admin/v1/routes'],
   // a request a seat is serving: told to listeners (the Network view), no
   // query changes until its usage is recorded
   request: [],
-  // a request annotated: its annotation, the searches over them, the
-  // conversations' titles (and the conversations listed with them), and
-  // the annotators' counts
-  annotation: ['/admin/v1/annotations', '/admin/v1/conversations', '/admin/v1/usage/conversations', '/admin/v1/annotators'],
-  // a step of one: told to the step store (steps.ts), no query read again
-  annotation_step: [],
 };
 
 export { RECIPE_READS };
@@ -118,7 +111,6 @@ export function deliver(qc: QueryClient, event: AdminEvent) {
   } else if (event.type === 'usage' && flights.some((f) => f.id === event.data.id)) {
     setFlights(flights.filter((f) => f.id !== event.data.id));
   }
-  if (event.type === 'annotation_step') addSteps([event.data as Step]);
   for (const listener of listeners) listener(event);
   if (event.type === 'reset') { refresh(qc, COVERED); return; }
   const paths = [...(AFFECTS[event.type] ?? [])];

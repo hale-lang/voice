@@ -138,13 +138,6 @@ export function conversationsQuery(v: UsageView, from: string) {
   };
 }
 
-/** The requests view's filters as `runAnnotations` matches requests by them (`UsageMatch`). */
-export function matchOf(v: UsageView, from: string): Schemas['UsageMatch'] {
-  const pairs = pairsOf(v.metadata);
-  const { metadata, ...rest } = requestsQuery(v, from);
-  return { ...rest, ...(metadata && pairs ? { metadata: Object.fromEntries(pairs) } : {}) };
-}
-
 /**
  * Rows held on screen, and a fresh first page: the fresh rows on top, in
  * their order, and the held ones after that the fresh ones do not

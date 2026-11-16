@@ -9,7 +9,6 @@ import { toneOf } from '../tone';
 import { LimitsEditor, limitsForWrite, type Limit } from '../LimitsEditor';
 import { describeLimit } from './Accounts';
 import { Aliases } from './Aliases';
-import { AnnotateRoutes } from '../readiness';
 import { isRetiredSystem, listedProjects } from '../projects-listed';
 import { WINDOWS, DEFAULT_WINDOW, windowFrom, totalsBy, breakdown, sumOf, capped, tokensSaid, NO_TOTALS, TOTALS_GROUPS, type Totals, type UsageWindow } from '../usage-totals';
 
@@ -291,36 +290,7 @@ function ProjectInspector({ project: p, usageWindow, from }: { project: Project;
               </>
             ),
           },
-          p.internal
-            ? {
-                k: 'annotate',
-                v: <span className="muted">retired: voice's old project for its own requests, which each project's own system key makes now</span>,
-              }
-            : {
-                k: 'annotate',
-                v: (
-                  <>
-                    {p.annotates ? (
-                      <span className="c-wait">
-                        each request read by its <Mono>decide</Mono> model, under <Mono>{p.id}-system</Mono>
-                      </span>
-                    ) : (
-                      <span className="muted">off</span>
-                    )}
-                    {p.annotate == null && p.parent ? <span className="muted"> · {p.parent}'s</span> : null}{' '}
-                    {p.status !== 'archived' && (
-                      <Select
-                        value={p.annotate == null ? (p.parent ? 'parent' : 'off') : p.annotate ? 'on' : 'off'}
-                        onChange={async (v) => { await w.write('patch', '/admin/v1/projects/{project}', { params: { path: { project: p.id } }, body: { annotate: v === 'parent' ? null : v === 'on' } }); }}
-                        options={[...(p.parent ? [{ value: 'parent', label: `${p.parent}'s` }] : []), { value: 'on', label: 'on' }, { value: 'off', label: 'off' }]}
-                      />
-                    )}
-                    {p.annotates && <span className="muted"> · kept apart from this project's usage and limits</span>}
-                    {w.error && /decision model/.test(w.error) && <div className="c-fail">{w.error}</div>}
-                    <AnnotateRoutes project={p.id} />
-                  </>
-                ),
-              },
+          ...(p.internal ? [{ k: 'retired', v: <span className="muted">voice's old project for its own requests, which each project's own system key makes now</span> }] : []),
           { k: 'name', v: p.name },
           { k: 'owners', v: p.owners.join(', ') },
           { k: 'data classes', v: p.data_classes.join(', ') },
@@ -502,18 +472,6 @@ function Keys({ project }: { project: Project }) {
                 k.status === 'active' && !k.internal ? (
                   <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { peek: !k.peek } }); }} disabled={w.busy}>
                     {k.peek ? 'recording · stop' : project.peeks ? 'by the project' : 'peek'}
-                  </Button>
-                ) : (
-                  <span className="faint">–</span>
-                ),
-            },
-            {
-              key: 'annotate',
-              header: 'Annotate',
-              render: (k) =>
-                k.status === 'active' && !project.internal && !k.internal ? (
-                  <Button onClick={async () => { await w.write('patch', '/admin/v1/projects/{project}/keys/{key}', { params: { path: { project: project.id, key: k.id } }, body: { annotate: !k.annotate } }); }} disabled={w.busy}>
-                    {k.annotate ? 'annotating · stop' : project.annotates ? 'by the project' : 'annotate'}
                   </Button>
                 ) : (
                   <span className="faint">–</span>

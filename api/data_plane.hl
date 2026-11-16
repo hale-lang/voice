@@ -53,25 +53,6 @@ locus DataPlane {
             pulse: self.pulse,
             governed: self.governed,
         };
-        // asks a decision model about each request whose project or key
-        // annotates, as requests of its project's system key (annotate.hl)
-        annotator: AnnotationRunner = AnnotationRunner {
-            store: self.store,
-            inference: Inference {
-                instance: self.instance,
-                store: self.store,
-                link: self.link,
-                held: self.held,
-                first: self.first_s * 1s,
-                idle: self.idle_s * 1s,
-                pulse: self.pulse,
-                governed: self.governed,
-                // a stage that finds every seat busy is answered at once
-                // and waits in the annotate queue, which backs off on its
-                // own: callers come first
-                wait: 0s,
-            },
-        };
         nodes: Nodes = Nodes { store: self.store, link: self.link };
         node_plane: NodePlane = NodePlane { store: self.store, link: self.link };
         // grafted, the nodes' account on the habitat's broker (lib/broker),
@@ -85,23 +66,12 @@ locus DataPlane {
         hub_port: Int = 8085;
         // it carries the admin events (`AdminFeed`): an api with a database
         hub_admin: Bool = false;
-        // the annotate queue (annotate.hl): each stage of a queued
-        // annotation published to `<root>.annotate`, which every api
-        // instance's conn (main.hl) takes in one queue group, so one reads
-        // each; with no url (in process), each is read here at once
-        publisher: CorePublisher = CorePublisher { };
-        // the wire subject the conn hands over undecoded (`NatsInbound`)
-        annotate_subject: String = "";
-        // the stages being read on this instance now, at most
-        // `ANNOTATE_WORKERS`: callers always come first
-        reading: Int = 0;
         // liveness and readiness (health.hl)
         probes: Probes = Probes { store: self.store };
     }
 
     bus {
         publish NodeObserved;
-        subscribe nats::NatsInbound as on_inbound;
     }
 
     /// A node's report, recorded, told to the hub (hub.hl) as the node now
@@ -248,7 +218,7 @@ locus DataPlane {
                     + ", \"topics\": [\"NodeObserved\", \"InstanceBeat\""
                     + (
                         if self.hub_admin {
-                            ", \"UsageRecorded\", \"ChangeMade\", \"AnnotationKept\", \"AnnotationStepTaken\", \"NodeMoved\", \"RequestsInFlight\""
+                            ", \"UsageRecorded\", \"ChangeMade\", \"NodeMoved\", \"RequestsInFlight\""
                         } else {
                             ""
                         }
@@ -371,31 +341,6 @@ locus DataPlane {
             return no_content();
         }
 
-        // annotations read now, one request or many (annotate.hl)
-        if std::http::is_route(c, "POST", "/admin/v1/annotation-runs") {
-            if !self.operator.admits(std::http::header(req, "Authorization")) {
-                return operator_refusal();
-            }
-            return self.run_annotations(req, "") or raise;
-        }
-        if std::http::is_route(c, "POST", "/admin/v1/annotations/:request_id/run") {
-            if !self.operator.admits(std::http::header(req, "Authorization")) {
-                return operator_refusal();
-            }
-            return self.run_annotations(
-                req,
-                std::http::path_param(c.params, "request_id"),
-            ) or raise;
-        }
-
-        // annotations of past requests, from their recordings (annotate.hl)
-        if std::http::is_route(c, "POST", "/admin/v1/annotation-backfills") {
-            if !self.operator.admits(std::http::header(req, "Authorization")) {
-                return operator_refusal();
-            }
-            return self.backfill(req) or raise;
-        }
-
         // events
         if std::http::is_route(c, "GET", "/admin/v1/events") {
             if !self.operator.admits(std::http::header(req, "Authorization")) {
@@ -445,383 +390,17 @@ locus DataPlane {
         if r.stream {
             // the standard event stream, on this connection (stream.hl)
             let out = EventStream { conn_fd: req.conn_fd };
-            let streamed = self.inference.stream(r, ctx, out) or raise;
-            if !out.job.present { return streamed; }
-            // annotated (annotate.hl): queued once the stream has ended;
-            // read by whichever instance takes its stages, the caller
-            // waiting for none of it
-            if req.conn_fd >= 0 { out.close(); }
-            self.queue_annotation(out.job, "", 0, "");
-            return if req.conn_fd < 0 { streamed } else { taken_over() };
+            return self.inference.stream(r, ctx, out) or raise;
         }
         let s = if endpoint == "chat" {
             self.inference.chat(r, ctx) or raise
         } else {
             self.inference.respond(r, ctx) or raise
         };
-        let answer = served_answer(
+        return served_answer(
             s,
             if endpoint == "chat" { chat_completion_json(s) } else { response_json(s) },
         );
-        if !s.job.present { return answer; }
-        if req.conn_fd < 0 {
-            self.queue_annotation(s.job, "", 0, "");
-            return answer;
-        }
-        // annotated: the caller is answered, as the Server would (it closes
-        // every connection after its answer), then the annotation queued
-        let conn = std::io::tcp::Stream { conn_fd: req.conn_fd, owns_fd: false };
-        std::http::write_response(conn, answer);
-        std::io::tcp::close_fd(req.conn_fd);
-        self.queue_annotation(s.job, "", 0, "");
-        return taken_over();
-    }
-
-    /// `backfillAnnotations`: the recorded requests it keeps, counted and
-    /// answered at once, then asked about one by one on this connection's
-    /// own coroutine, as requests of each one's project's system key.
-    fn backfill(req: std::http::Request) -> std::http::Response fallible(ApiError) {
-        let b = AnnotationBackfill::api_decode(req.body) or {
-            fail invalid(
-                "the body is an AnnotationBackfill (`" + err.field + "` is " + err.kind + ")",
-                err.field
-            );
-        };
-        let a = if b.version > 0 {
-            self.store.annotator_version(b.annotator, b.version) or fail metering_failed(err)
-        } else {
-            self.store.annotator(b.annotator) or fail metering_failed(err)
-        };
-        if !a.present || a.removed {
-            fail ApiError {
-                status: 404,
-                kind: "not_found",
-                code: ErrorCode::not_found,
-                message: "no annotator " + b.annotator
-                    + (if b.version > 0 { " at version " + to_string(b.version) } else { "" }),
-                has_param: true,
-                param: "annotator",
-            };
-        }
-        let from = if len(b.from) > 0 {
-            rfc3339(b.from) or fail invalid("`from` is an RFC 3339 time", "from")
-        } else {
-            now_seconds()
-        };
-        let to = if len(b.to) > 0 {
-            rfc3339(b.to) or fail invalid("`to` is an RFC 3339 time", "to")
-        } else {
-            now_seconds()
-        };
-        // the slice chosen before the newest 200 of it are taken
-        let kept = self.store.recorded(
-            b.project,
-            b.key,
-            len(b.from) > 0,
-            from,
-            len(b.to) > 0,
-            to,
-            200,
-        ) or fail metering_failed(err);
-        let answer = std::http::Response {
-            status: 202,
-            content_type: "application/json",
-            body: "{\"queued\": " + to_string(count(kept.rows)) + "}",
-        };
-        // answered first, the connection closed, as the Server would; with
-        // no connection (in process), answered once asked
-        if req.conn_fd >= 0 {
-            let conn = std::io::tcp::Stream { conn_fd: req.conn_fd, owns_fd: false };
-            std::http::write_response(conn, answer);
-            std::io::tcp::close_fd(req.conn_fd);
-        }
-        for p in kept.rows {
-            let whole = self.store.peek(p.request_id) or st::PeekRow { };
-            if !whole.present { continue; }
-            let u = self.store.usage(p.request_id) or st::UsageRow { };
-            let dc = std::json::find_string_field(u.record, "data_class");
-            self.queue_annotation(
-                AnnotationJob {
-                    request_id: whole.request_id,
-                    project: whole.project,
-                    key: whole.key,
-                    conversation: std::json::find_string_field(u.record, "conversation"),
-                    created_at: whole.created_at,
-                    model: whole.model,
-                    data_class: if len(dc) > 0 { dc } else { "internal" },
-                    input: whole.input,
-                    output: whole.output,
-                    present: true,
-                },
-                a.id,
-                a.version,
-                "backfill of " + a.id,
-            );
-        }
-        return if req.conn_fd >= 0 { taken_over() } else { answer };
-    }
-
-    /// `j` queued (annotate.hl), and each stage it owes asked: published
-    /// on the annotate queue, or, in process (no queue), read here at once.
-    @unbounded
-    fn queue_annotation(j: AnnotationJob, only: String, version: Int, why: String) -> String {
-        let stages = self.annotator.queue(j, only, version, why);
-        // a request stage first: the stages that read its answers are
-        // asked when it is read (`Worked.then`), never polled for
-        let first = if std::str::contains(" " + stages + " ", " request ") {
-            "request"
-        } else {
-            stages
-        };
-        self.ask_stages(j.request_id, first);
-        return stages;
-    }
-
-    /// Each stage of `stages` (a space between) of a request asked.
-    fn ask_stages(request_id: String, stages: String) {
-        let mut rest = stages;
-        while len(rest) > 0 {
-            let sp = std::str::index_of(rest, " ");
-            let stage = if sp < 0 { rest } else { rest[0..sp] };
-            rest = if sp < 0 { "" } else { rest[(sp + 1)..len(rest)] };
-            if len(stage) > 0 {
-                self.ask_stage(AnnotateAsk { request_id: request_id, stage: stage, attempt: 0 });
-            }
-        }
-    }
-
-    /// One stage asked: on the annotate queue for whichever instance takes
-    /// it; in process (no queue), read now, once, and the stages it hands
-    /// on asked after it.
-    @unbounded
-    fn ask_stage(a: AnnotateAsk) {
-        if len(self.publisher.url) == 0 {
-            let w = self.annotator.work(a);
-            if len(w.then) > 0 { self.ask_stages(a.request_id, w.then); }
-            return;
-        }
-        self.publisher.send("annotate", std::bytes::from_string(AnnotateAsk::api_encode(a)));
-    }
-
-    /// A stage taken from the annotate queue: read when a reader is free;
-    /// the stages it hands on asked; asked again after its wait when no
-    /// seat was free (an attempt counted), or when what it reads is not
-    /// given yet (none counted), until its deadline.
-    @unbounded
-    fn on_inbound(m: nats::Inbound) {
-        if len(self.annotate_subject) == 0 || m.subject != self.annotate_subject { return; }
-        let a = AnnotateAsk::api_decode(std::str::from_bytes(m.data)) or {
-            log_warn("an annotate message is not one", std::log::kv("error", err.kind));
-            return;
-        };
-        while self.reading >= ANNOTATE_WORKERS { std::time::sleep(250ms); }
-        self.reading = self.reading + 1;
-        let w = self.annotator.work(a);
-        self.reading = self.reading - 1;
-        if len(w.then) > 0 { self.ask_stages(a.request_id, w.then); }
-        if !w.wait { return; }
-        std::time::sleep(w.after_ms * 1ms);
-        self.ask_stage(
-            AnnotateAsk {
-                request_id: a.request_id,
-                stage: a.stage,
-                attempt: if w.dependent { a.attempt } else { a.attempt + 1 },
-            },
-        );
-    }
-
-    /// `runAnnotations` (`POST /admin/v1/annotation-runs`) and
-    /// `runAnnotation` (`POST /admin/v1/annotations/{request_id}/run`): each
-    /// request named queued now, for every annotator in force or the one
-    /// named, read from its held text, else its recording. Answered at
-    /// once: each request queued, or refused and why.
-    @unbounded
-    fn run_annotations(
-        req: std::http::Request,
-        one: String
-    ) -> std::http::Response fallible(ApiError) {
-        let body = if len(std::str::trim(req.body)) == 0 { "{}" } else { req.body };
-        let b = AnnotationRunAsk::api_decode(body) or {
-            fail invalid(
-                "the body is an AnnotationRunAsk (`" + err.field + "` is " + err.kind + ")",
-                err.field
-            );
-        };
-        let mut ids = AnnotationRunAsk { };
-        if len(one) > 0 {
-            if b.has_matching {
-                fail invalid(
-                    "the path names the request; `matching` is not taken here",
-                    "matching"
-                );
-            }
-            push(ids.request_ids, one) or discard;
-        } else if b.has_matching {
-            if count(b.request_ids) > 0 {
-                fail invalid(
-                    "name the requests in `request_ids` or match them with `matching`, not both",
-                    "matching"
-                );
-            }
-            let matched = self.matching_ids(b.matching) or raise;
-            ids.request_ids = matched.request_ids;
-        } else {
-            ids.request_ids = b.request_ids;
-        }
-        if count(ids.request_ids) == 0 && !b.has_matching {
-            fail invalid(
-                "name at least one request in `request_ids`, or match them with `matching`",
-                "request_ids"
-            );
-        }
-        if len(b.annotator) > 0 {
-            let a = if b.version > 0 {
-                self.store.annotator_version(b.annotator, b.version) or fail metering_failed(err)
-            } else {
-                self.store.annotator(b.annotator) or fail metering_failed(err)
-            };
-            if !a.present || a.removed {
-                fail ApiError {
-                    status: 404,
-                    kind: "not_found",
-                    code: ErrorCode::not_found,
-                    message: "no annotator " + b.annotator,
-                    has_param: true,
-                    param: "annotator",
-                };
-            }
-        }
-        let mut out = AnnotationRunList { };
-        let mut queued = 0;
-        for id in ids.request_ids {
-            let r = self.run_one(id, b.annotator, b.version) or fail metering_failed(err);
-            if r.queued { queued = queued + 1; }
-            push(out.data, r) or discard;
-        }
-        // one request named: refused as itself
-        if len(one) > 0 && queued == 0 {
-            let r = at(out.data, 0) or AnnotationRunOutcome { };
-            let unknown = r.reason == "unknown";
-            fail ApiError {
-                status: if unknown { 404 } else { 409 },
-                kind: if unknown { "not_found" } else { "conflict" },
-                code: if unknown { ErrorCode::not_found } else { ErrorCode::conflict },
-                message: r.message,
-            };
-        }
-        return std::http::Response {
-            status: 202,
-            content_type: "application/json",
-            body: AnnotationRunList::api_encode(out),
-        };
-    }
-
-    /// The newest `RUN_MAX` requests `m` matches, as `listUsage` filters
-    /// them: the ids a run named by its filters annotates.
-    fn matching_ids(m: UsageMatch) -> AnnotationRunAsk fallible(ApiError) {
-        let mut q = usage_query_of(
-            UsageAsk {
-                project: m.project,
-                key: m.key,
-                model: m.model,
-                account: m.account,
-                conversation: m.conversation,
-                metadata: if m.metadata.text == "null" { "" } else { m.metadata.text },
-                from: m.from,
-                to: m.to,
-                include_internal: m.include_internal,
-                status: m.status,
-            },
-            false,
-        ) or {
-            let p = ctl_problem(err);
-            fail invalid(
-                p.message,
-                if len(p.param) > 0 { "matching." + p.param } else { "matching" }
-            );
-        };
-        q.limit = RUN_MAX;
-        let rows = self.store.usage_rows(q) or fail metering_failed(err);
-        let mut out = AnnotationRunAsk { };
-        for r in rows.rows {
-            push(out.request_ids, r.id) or discard;
-        }
-        return out;
-    }
-
-    /// One request queued for annotation now, or why not.
-    @unbounded
-    fn run_one(
-        id: String,
-        annotator: String,
-        version: Int
-    ) -> AnnotationRunOutcome fallible(st::StoreError) {
-        let u = self.store.usage(id) or raise;
-        if !u.present {
-            return AnnotationRunOutcome {
-                request_id: id,
-                reason: "unknown",
-                message: "voice has no record of request " + id,
-            };
-        }
-        let project = std::json::find_string_field(u.record, "project");
-        let key = std::json::find_string_field(u.record, "key");
-        let p = self.store.project(project) or raise;
-        let k = self.store.key(key) or raise;
-        let annotating = (annotates(self.store, p) or false) || (k.annotate && !p.internal);
-        if !annotating || k.internal {
-            return AnnotationRunOutcome {
-                request_id: id,
-                reason: "not_annotating",
-                project: project,
-                key: key,
-                message: "annotation is off for project " + project + " and key " + key,
-            };
-        }
-        let held = self.store.annotation_input(id) or raise;
-        let whole = if held.present { st::PeekRow { } } else { self.store.peek(id) or raise };
-        if !held.present && !whole.present {
-            return AnnotationRunOutcome {
-                request_id: id,
-                reason: "no_text",
-                project: project,
-                key: key,
-                message: "request " + id
-                    + " has no recorded text to read: a request is recorded when its project or key peeks",
-            };
-        }
-        let dc = std::json::find_string_field(u.record, "data_class");
-        let stages = self.queue_annotation(
-            AnnotationJob {
-                request_id: id,
-                project: project,
-                key: key,
-                conversation: std::json::find_string_field(u.record, "conversation"),
-                created_at: u.created_at,
-                model: if held.present { held.model } else { whole.model },
-                data_class: if held.present {
-                    held.data_class
-                } else {
-                    if len(dc) > 0 { dc } else { "internal" }
-                },
-                input: if held.present { held.input } else { whole.input },
-                output: if held.present { held.output } else { whole.output },
-                present: true,
-            },
-            annotator,
-            version,
-            if len(annotator) > 0 { "run of " + annotator } else { "run" },
-        );
-        if len(stages) == 0 {
-            return AnnotationRunOutcome {
-                request_id: id,
-                reason: "no_annotator",
-                project: project,
-                key: key,
-                message: "no annotator applies to request " + id,
-            };
-        }
-        return AnnotationRunOutcome { request_id: id, queued: true, project: project, key: key };
     }
 
     /// The node an enrollment token names.
@@ -836,11 +415,6 @@ fn last_event(req: std::http::Request) -> String {
     if len(id) > 0 { return id; }
     let after = query_all(req.path, "after");
     return at(after.items, 0) or "";
-}
-
-/// What a handler returns when it has answered on its connection itself.
-fn taken_over() -> std::http::Response {
-    return std::http::Response { status: 200, body: "", takeover_raw: true };
 }
 
 /// A JSON answer.

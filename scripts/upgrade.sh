@@ -48,6 +48,12 @@
 # an attempt's ledger record, the attempts' tables and the recipes' are
 # gone, and the ledger and its rollup keep the record.
 #
+# Then the annotators leaving voice (migration 46): on a store at migration
+# 45 holding annotators, rules, annotations with their answers, steps and
+# turns, a conversation's title, and a project and a key that annotate,
+# those tables and the `annotate` columns are gone; the project, its key,
+# its system key and the ledger's record of voice's own request stay.
+#
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -319,3 +325,28 @@ test "$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablen
 test "$(q "SELECT record->>'endpoint' FROM usage WHERE id = 'att_1'")" = attempt
 test "$(q "SELECT requests || ':' || output_tokens FROM usage_hourly WHERE key = 'k_work' AND model = 'fake-1'")" = "1:5"
 echo "migration 45 drops the attempts' and the CLI recipes' tables, and the ledger keeps an attempt's record: $(tail -1 "$work/migrate.log")"
+
+# the annotators leave voice (migration 46): what they kept is dropped, and
+# the projects, their keys and the ledger stay
+store_at 45
+own
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+UPDATE project SET annotate = true WHERE id = 'work';
+UPDATE api_key SET annotate = true WHERE id = 'k_work';
+INSERT INTO annotator (id, version, body) VALUES ('tone', 1, '{}');
+INSERT INTO annotator_version (annotator, version, body) VALUES ('tone', 1, '{}');
+INSERT INTO annotation (request_id, project, key, created_at, status) VALUES ('a_1', 'work', 'k_work', now(), 'annotated');
+INSERT INTO annotation_answer (request_id, project, key, created_at, annotator, version, stage, question, answer) VALUES ('a_1', 'work', 'k_work', now(), 'tone', 1, 'request', 'q', 'yes');
+INSERT INTO annotation_input (request_id, input, output) VALUES ('a_1', '{}', '{}');
+INSERT INTO annotation_step (request_id, project, at, step) VALUES ('a_1', 'work', now(), 'kept');
+INSERT INTO annotation_turn (project, conversation, user_hash, request_id, at) VALUES ('work', 'c', 'h', 'a_1', now());
+INSERT INTO conversation_title (project, conversation, title, annotator, version, made_at) VALUES ('work', 'c', 'A title', 'conversation-title', 2, now());
+INSERT INTO usage (id, created_at, project, key, requested_model, status, output_tokens, record) VALUES
+  ('a_vs', '2026-11-03T09:00:00Z', 'work', 'work-system', 'decide', 'served', 3, '{"metadata": {"annotates": "a_1", "side": "request"}}');
+SQL
+migrate $((head - 45))
+test "$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('annotator', 'annotator_version', 'annotation_rule', 'annotation', 'annotation_answer', 'annotation_input', 'annotation_step', 'annotation_turn', 'conversation_title')")" = 0
+test "$(q "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' AND column_name = 'annotate'")" = 0
+test "$(q "SELECT string_agg(id, ',' ORDER BY id) FROM api_key WHERE project = 'work'")" = "k_work,work-system"
+test "$(q "SELECT record->'metadata'->>'annotates' FROM usage WHERE id = 'a_vs'")" = a_1
+echo "migration 46 drops the annotators' tables and the annotate columns, and the projects, their keys and the ledger stay: $(tail -1 "$work/migrate.log")"

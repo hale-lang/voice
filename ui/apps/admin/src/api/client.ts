@@ -83,7 +83,6 @@ export function describe(error: unknown, status: number): string {
 
 /** A request's recording, as `getPeek` answers it. */
 export type Peek = Schemas['Peek'];
-export type Annotation = Schemas['Annotation'];
 
 /**
  * The recordings of `ids`, each read once and kept, as `useGetOnce` reads
@@ -125,32 +124,6 @@ export function useUsageRecords(ids: string[]) {
         },
         staleTime: Infinity,
         refetchInterval: false as const,
-        retry: false,
-      };
-    }),
-  });
-}
-
-/**
- * The annotations of `ids` (annotate.hl), each read once and kept: a
- * request not annotated (its project and key do not annotate, or it is not
- * read yet) answers 404, which is `null` here, not an error.
- */
-export function useAnnotations(ids: string[]) {
-  const refetchInterval = useRefetchInterval();
-  return useQueries({
-    queries: ids.map((id) => {
-      const init = { params: { path: { request_id: id } } };
-      return {
-        queryKey: ['/admin/v1/annotations/{request_id}', init] as const,
-        queryFn: async (): Promise<Annotation | null> => {
-          const r = await api.GET('/admin/v1/annotations/{request_id}', init);
-          if (r.response.status === 404) return null;
-          if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
-          return r.data;
-        },
-        staleTime: 30_000,
-        refetchInterval,
         retry: false,
       };
     }),
@@ -291,18 +264,6 @@ export function useRecipeFits() {
       return { ...first, data, next_cursor: null };
     },
   });
-}
-
-/** The conversations' titles read at most, the newest first: five pages. */
-const TITLE_PAGES = 5;
-
-/** Conversations' titles, the newest written first, a page at a time to `TITLE_PAGES`. */
-export function useConversationTitles() {
-  return useAllPages<Schemas['ConversationTitle']>('/admin/v1/conversations', async (cursor) => {
-    const r = await api.GET('/admin/v1/conversations', { params: { query: cursor ? { cursor } : {} } });
-    if (r.error !== undefined || r.data === undefined) throw new Error(describe(r.error, r.response.status));
-    return r.data;
-  }, TITLE_PAGES);
 }
 
 type TotalsQuery = NonNullable<paths['/admin/v1/usage/totals']['get']['parameters']['query']>;

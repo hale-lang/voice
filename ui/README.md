@@ -123,8 +123,9 @@ One per part of the admin API, listed on the rail in layers
 route, `#/models/nodes/<node>`; a route from before the layers opens where
 its screen lives now): Overview; Models (Catalogue, Placements, Nodes,
 Recipes, Runtimes, Accounts, Routes, Requests, Live); Projects;
-Conversations (Chat, Conversations); Harness (Annotators, Tools); and
-apart, Changes and API.
+Conversations (Chat, Conversations, Tools: the hosted tools Chat offers);
+and apart, Changes and API. A route of the Harness layer from before opens
+the overview, its Tools under Conversations.
 
 - **Overview:** quota headroom per account, node health, spend against
   budget, recent usage.

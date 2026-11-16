@@ -209,7 +209,7 @@ refuses so, the request waits for a slot on this instance, in arrival
 order among the requests that may go to the same seats, offered again when an attempt here ends or
 every 250 ms, its caller looked for meanwhile, until its `voice.deadline`
 (`504 deadline_exceeded`) or for 60 s (`429 no_capacity`, `Retry-After`).
-The annotator's requests wait for none: its queue backs off on its own. Chat Completions messages are converted to
+Chat Completions messages are converted to
 the standard's input items (content parts, tool calls and tool results),
 and what has no standard form is refused `400 unsupported`. The api serves
 its callers one at a time, and opens a NATS connection for each attempt.
@@ -264,8 +264,7 @@ and its output, once a seat had sent some, voice's count of it
 one a seat began and did not finish (`cancelled`, `failed` after output),
 one every seat it was offered failed (the `502`, `failed`, its `attempts`
 each seat's error, `served` the last seat tried), one that waited for a
-slot and none freed in time (`no_capacity`, `deadline_exceeded`; not the
-annotator's, which wait for none and which its queue asks again), and one
+slot and none freed in time (`no_capacity`, `deadline_exceeded`), and one
 whose caller went away while it was offered (`cancelled`). A request
 refused before it was offered (its key, its model, a rate limit, its body:
 `401`, `404`, `429 rate_limited`, `400`) has no row. The row holds the whole `UsageRecord` beside the columns a read
@@ -1316,6 +1315,15 @@ already there.
   (`docker image prune -a --filter label=net.hale-lang.voice.image=harness`).
   A seat made for one is configuration, kept until the operator removes it:
   no node offers its engine now, which its problems say.
+
+  **Nor does voice annotate requests.** Voice once asked a decision
+  model about each request of a project or key that annotated, off its
+  path, and titled conversations, under each project's system key; store
+  migration 46 drops what the api kept of it (annotators, rules,
+  annotations, their steps and turns, conversations' titles, the
+  `annotate` settings). A request body that turns `annotate` on is refused
+  naming the removal. Each project's system key stays, and the ledger
+  keeps the requests voice made under it, apart from its callers'.
 
   **Agent CLIs run outside voice too.** Voice once ran the claude CLI as a
   seat's engine (`claude-cli`), under a Claude account's token the node's

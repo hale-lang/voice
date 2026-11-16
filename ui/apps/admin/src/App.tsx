@@ -19,7 +19,6 @@ import { Api } from './screens/Api';
 import { Recipes } from './screens/Recipes';
 import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
-import { Annotators } from './screens/Annotators';
 import { Chat } from './screens/Chat';
 import { Tools } from './screens/Tools';
 import { useAdminEvents } from './api/events';
@@ -43,7 +42,6 @@ const SCREENS: Record<ScreenKey, (p: ScreenProps) => ReactNode> = {
   network: Network,
   projects: Projects,
   chat: Chat,
-  annotators: Annotators,
   tools: Tools,
   changes: Changes,
   api: Api,

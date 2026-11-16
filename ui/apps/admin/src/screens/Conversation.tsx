@@ -1,8 +1,6 @@
 import { useMemo, useState, type ReactNode } from 'react';
 import { Loading, Unavailable, Mono, Button, count, when } from '@hale/components';
-import { useAllUsage, useAnnotations, usePeeks, type Annotation, type UsageRecordSummary } from '../api/client';
-import { AnnotationLine, AnnotationsPanel, Runs } from '../annotation';
-import { useTitles } from '../titles';
+import { useAllUsage, usePeeks, type UsageRecordSummary } from '../api/client';
 import { href } from '../route';
 import { inputTokens } from '../input-tokens';
 import { Fold, ItemView, texts, parse, type Item } from '../peek';
@@ -25,16 +23,12 @@ export function ConversationView({ conversation }: { conversation: string }) {
   const turns = all.slice(Math.max(0, all.length - shown));
   const hidden = all.length - turns.length;
   const peeks = usePeeks(turns.map((t) => t.id));
-  // what each turn was and did, for a project or key that annotates
-  const notes = useAnnotations(turns.map((t) => t.id));
-  const noteOf = new Map(turns.map((t, i) => [t.id, notes[i]?.data ?? null] as const));
   const loaded = peeks.every((p) => !p.isPending);
   const read = useMemo(
     () => (loaded ? thread(turns, peeks.map((p) => (p.data ? p.data : null)), hidden > 0) : null),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [loaded, turns.map((t) => t.id).join(','), hidden],
   );
-  const titleOf = useTitles();
   const name = conversation;
   if (q.isPending) return <Loading what="the conversation" />;
   if (q.isError) return <Unavailable what="The conversation" detail={q.error.message} />;
@@ -44,13 +38,12 @@ export function ConversationView({ conversation }: { conversation: string }) {
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-1)' }}>
-        {titleOf(name, all[all.length - 1]!.project) ? <span title={name}>{titleOf(name, all[all.length - 1]!.project)}</span> : <Mono>{name}</Mono>}
+        <Mono>{name}</Mono>
       </h2>
       <p className="muted" style={{ marginTop: 0 }}>
         {all.length} turn{all.length === 1 ? '' : 's'}
         {q.data.truncated ? ' (the latest 2000)' : ''} · {last.project} · {last.served?.model ?? last.requested_model} · {count(all.reduce((n, t) => n + (t.input_tokens_estimated ? 0 : t.input_tokens), 0))} in · {count(all.reduce((n, t) => n + t.output_tokens, 0))} out · {when(first.created_at)} → {when(last.created_at)}
       </p>
-      {[...noteOf.values()].some(Boolean) && <AnnotationsPanel slice={{ conversation }} title="This conversation's annotations" />}
       {!read ? (
         <Loading what="what was said" />
       ) : (
@@ -82,7 +75,7 @@ export function ConversationView({ conversation }: { conversation: string }) {
               </p>
             )}
             {read.turns.map((t) => (
-              <TurnView key={t.record.id} turn={t} threads={read.threads.length} note={noteOf.get(t.record.id) ?? null} />
+              <TurnView key={t.record.id} turn={t} threads={read.threads.length} />
             ))}
           </section>
         </div>
@@ -112,7 +105,7 @@ function threadHue(k: number): number {
   return (190 + k * 137) % 360;
 }
 
-function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; note: Annotation | null }) {
+function TurnView({ turn: t, threads }: { turn: Turn; threads: number }) {
   const r = t.record;
   return (
     <div className={`${s.turn} ${threads > 1 && t.thread >= 0 ? s.threaded : ''}`} style={{ ['--hue' as string]: threadHue(Math.max(0, t.thread)) }}>
@@ -122,14 +115,7 @@ function TurnView({ turn: t, threads, note }: { turn: Turn; threads: number; not
         <span>{r.served?.seat ?? r.requested_model}</span>
         <span>{inputTokens(r)} in · {count(r.output_tokens)} out</span>
         {r.status !== 'served' && <span className="c-wait">{r.status}</span>}
-        {note && <AnnotationLine a={note} />}
       </a>
-      {note && note.runs.length > 0 && (
-        <div className={s.runs}>
-          <span className="faint">annotations</span>
-          <Runs runs={note.runs} project={note.project} />
-        </div>
-      )}
       {!t.recorded ? (
         <p className="faint">Not recorded: peek was off for it, or it is past seven days.</p>
       ) : (

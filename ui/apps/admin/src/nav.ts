@@ -23,8 +23,7 @@ export const PLACES = {
   projects: ['projects'],
   chat: ['conversations', 'chat'],
   conversations: ['conversations', 'history'],
-  annotators: ['harness', 'annotators'],
-  tools: ['harness', 'tools'],
+  tools: ['conversations', 'tools'],
   changes: ['changes'],
   api: ['api'],
 } as const satisfies Record<string, readonly string[]>;
@@ -54,12 +53,6 @@ export const NAV: { label?: string; system?: boolean; items: { screen: Screen; l
     items: [
       { screen: 'chat', label: 'Chat' },
       { screen: 'conversations', label: 'Conversations' },
-    ],
-  },
-  {
-    label: 'Harness',
-    items: [
-      { screen: 'annotators', label: 'Annotators' },
       { screen: 'tools', label: 'Tools' },
     ],
   },
@@ -93,14 +86,17 @@ export function href(...parts: string[]): string {
 }
 
 /** The screens before the layers, as their URLs named them, each a screen of the same name but `usage`. */
-const OLD = new Set(['network', 'nodes', 'usage', 'routes', 'accounts', 'placements', 'recipes', 'runtimes', 'annotators', 'chat', 'tools']);
+const OLD = new Set(['network', 'nodes', 'usage', 'routes', 'accounts', 'placements', 'recipes', 'runtimes', 'chat', 'tools']);
 
 /**
- * The screens of coding attempts and their CLI recipes, gone with them
- * (coding harnesses run outside voice, as clients of its API): a route of
- * theirs, under the Harness layer or from before it, opens the layer.
+ * The screens that left voice with what they showed: coding attempts and
+ * their CLI recipes (coding harnesses run outside voice, as clients of its
+ * API) and the annotators (voice no longer annotates requests). A route of
+ * theirs, under the Harness layer they were in or from before it, opens
+ * the overview. The layer went with them: its one other screen, the
+ * hosted tools' settings, is Chat's, beside it under Conversations.
  */
-const GONE = new Set(['attempts', 'clis']);
+const GONE = new Set(['attempts', 'clis', 'annotators']);
 
 /** A layer's own path: the URL of its first screen. */
 const LAYERS: Record<string, Screen> = Object.fromEntries(
@@ -127,7 +123,8 @@ export function resolve(path: readonly string[], query: URLSearchParams): { part
   // `#/models/<model>` was the catalogue's own; a model named as a screen
   // of the layer (`nodes`) is shadowed by it
   if (head === 'models') return moved(['models', ...rest], query);
-  if (GONE.has(head) || (head === 'harness' && GONE.has(rest[0] ?? ''))) return moved([LAYERS['harness']!], new URLSearchParams());
+  if (head === 'harness') return rest[0] === 'tools' ? moved(['tools', ...rest.slice(1)], query) : moved([], new URLSearchParams());
+  if (GONE.has(head)) return moved([], new URLSearchParams());
   if (Object.hasOwn(LAYERS, head)) return moved([LAYERS[head]!], query);
   if (head === 'usage') return moved(usageParts(rest, query), withoutView(query));
   if (OLD.has(head)) return moved([head, ...rest], query);

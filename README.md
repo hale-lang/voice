@@ -238,8 +238,8 @@ screens in layers:
   **Placements**, **Nodes** (and **Arrange**), **Recipes**, **Runtimes**,
   **Accounts**, **Routes** (the route table), **Requests** (the ledger,
   each request, filtered by project, key, model, status and time, paged,
-  the filters kept in the URL; one opened shows its annotation and its
-  recording, for a project or key that **peeks**: kept seven days) and
+  the filters kept in the URL; one opened shows its recording, for a
+  project or key that **peeks**: kept seven days) and
   **Live** (the fleet as a graph, lit while each request runs, the api
   instances live over the hub);
 - **Projects** (subprojects, keys, limits, budgets, peek; each project's
@@ -248,9 +248,9 @@ screens in layers:
 - **Conversations**: **Chat** (talk to a model as a project's caller, with
   the hosted **web fetch** where its model takes tool calls) and
   **Conversations** (the ledger by conversation; one opened reads as one,
-  its context beside the back and forth);
-- **Harness**: **Annotators** and **Tools** (web fetch on or off, its
-  limits and its denylist, [docs/internals.md](docs/internals.md));
+  its context beside the back and forth) and **Tools** (web fetch on or
+  off, its limits and its denylist,
+  [docs/internals.md](docs/internals.md));
 - and apart, **Changes** (every admin change, field by field) and **API**
   (the contract);
 - an event log docked at the foot of every screen: requests taking off and

@@ -9,7 +9,6 @@ import {
   metadataPairs,
   requestsQuery,
   conversationsQuery,
-  matchOf,
   mergeFresh,
   appended,
   conversationKey,
@@ -69,10 +68,6 @@ test('metadata pairs: one as written, several as an object, a malformed one none
   assert.deepEqual(requestsQuery({ ...NO_VIEW, metadata: 'oops' }, ''), {});
 });
 
-test('a run matches the requests as the list filters them, its metadata an object', () => {
-  assert.deepEqual(matchOf({ ...NO_VIEW, status: 'cancelled', metadata: 'team=search, run=7' }, 'T'), { status: 'cancelled', from: 'T', metadata: { team: 'search', run: '7' } });
-  assert.deepEqual(matchOf({ ...NO_VIEW, metadata: 'oops' }, ''), {});
-});
 
 const id = (r) => r.id;
 

@@ -6,17 +6,13 @@ import { api, describe, useGet, USAGE_PAGE, type UsageRecord, type UsageRecordSu
 import { useRefetchInterval } from '../api/live';
 import { subscribeFlights, type Flight } from '../api/events';
 import { useWrite } from '../api/mutate';
-import { useLastStep, stepLabel, settles } from '../api/steps';
 import type { ScreenProps } from '../App';
 import { readout } from '../readout';
 import { PeekSection } from '../peek';
-import { AnnotationSection, RefusedSummary } from '../annotation';
-import { refusalLine } from '../refusal';
 import { inputTokens } from '../input-tokens';
 import { listedProjects } from '../projects-listed';
 import { ConversationView } from './Conversation';
 import { href } from '../route';
-import { ConversationName } from '../titles';
 import {
   viewOf,
   viewHref,
@@ -25,7 +21,6 @@ import {
   metadataPairs,
   requestsQuery,
   conversationsQuery,
-  matchOf,
   mergeFresh,
   appended,
   conversationKey,
@@ -42,16 +37,11 @@ import {
   type ConversationUsage,
 } from './usage-view';
 
-/** The most requests one run annotates (`runAnnotations`). */
-const RUN_MAX = 500;
-
-type RunOutcome = Schemas['AnnotationRunOutcome'];
-
 /**
  * The ledger two ways, a screen each (nav.ts): every request, or every
  * conversation its requests are turns of. The filters are the URL's
  * query, so a link keeps them; a row opens the request, or the
- * conversation, in the inspector, which shows its annotations. Each table
+ * conversation, in the inspector. Each table
  * is live: a new request (or a conversation active again) rises to the
  * top as the events say, and the pages loaded below it stay.
  */
@@ -156,21 +146,9 @@ function Requests({ view, from, selected, open }: { view: UsageView; from: strin
   const totals = useGet('/admin/v1/usage/summary', { params: { query: { group_by: ['internal'], ...query } } });
   const matching = totals.data?.data.reduce((n, g) => n + g.requests, 0);
   const spent = totals.data ? spend(totals.data.data) : null;
-  // the requests chosen to annotate: kept across pages, let go when the
-  // filters change; or every one the filters match, which the run itself
-  // finds (`runAnnotations` `matching`)
-  const [chosen, setChosenIds] = useState<Set<string>>(new Set());
-  const [allMatching, setAllMatching] = useState(false);
-  const setChosen = (ids: Set<string>) => {
-    setChosenIds(ids);
-    setAllMatching(false);
-  };
-  const said = JSON.stringify(query);
-  useEffect(() => setChosen(new Set()), [said]);
   const rows = list.rows ?? [];
   return (
     <Panel title="Requests" readout={readout(list.first, matching != null ? `${count(matching)} matching` : null, spent)}>
-      <Annotate match={matchOf(view, from)} chosen={chosen} setChosen={setChosen} allMatching={allMatching} setAllMatching={setAllMatching} pageIds={rows.map((r) => r.id)} matching={matching} />
       {list.rows === null ? (
         list.first.isError ? <Unavailable what="Usage" detail={list.first.error.message} /> : <Loading what="usage" />
       ) : (
@@ -182,24 +160,6 @@ function Requests({ view, from, selected, open }: { view: UsageView; from: strin
             selectedKey={selected}
             onSelect={open}
             columns={[
-              {
-                key: 'pick',
-                header: <PageBox ids={rows.map((r) => r.id)} chosen={chosen} setChosen={setChosen} all={allMatching} />,
-                render: (r) => (
-                  <input
-                    type="checkbox"
-                    aria-label={`choose ${r.id}`}
-                    checked={allMatching || chosen.has(r.id)}
-                    onClick={(e) => e.stopPropagation()}
-                    onChange={(e) => {
-                      const n = new Set(chosen);
-                      if (e.target.checked) n.add(r.id);
-                      else n.delete(r.id);
-                      setChosen(n);
-                    }}
-                  />
-                ),
-              },
               { key: 'when', header: 'Time', render: (r) => <span className="muted" title={when(r.created_at)}>{ago(r.created_at)}</span> },
               {
                 key: 'id',
@@ -213,7 +173,6 @@ function Requests({ view, from, selected, open }: { view: UsageView; from: strin
                         tool args repaired
                       </div>
                     )}
-                    <StepMark id={r.id} />
                   </>
                 ),
               },
@@ -225,7 +184,7 @@ function Requests({ view, from, selected, open }: { view: UsageView; from: strin
                     <Mono>{r.project}</Mono> <span className="muted">{r.key}</span>
                     {r.conversation && (
                       <div className="faint">
-                        <ConversationName conversation={r.conversation} project={r.project} />
+                        <Mono>{r.conversation}</Mono>
                       </div>
                     )}
                   </>
@@ -289,7 +248,7 @@ function Conversations({ view, from, selected, open }: { view: UsageView; from: 
             selectedKey={chosen ? conversationKey(chosen) : undefined}
             onSelect={open}
             columns={[
-              { key: 'title', header: 'Conversation', render: (c) => (c.title ? <span title={c.conversation}>{c.title}</span> : <Mono>{c.conversation}</Mono>) },
+              { key: 'conversation', header: 'Conversation', render: (c) => <Mono>{c.conversation}</Mono> },
               { key: 'project', header: 'Project / keys', render: (c) => <><Mono>{c.project}</Mono> <span className="muted">{c.keys.join(', ')}</span></> },
               { key: 'models', header: 'Models', render: (c) => c.models.join(', ') },
               { key: 'requests', header: 'Requests', num: true, render: (c) => count(c.requests) },
@@ -390,89 +349,8 @@ function Filters({ view: v, set }: { view: UsageView; set: (next: Partial<UsageV
         <Select value={v.since} onChange={(since) => set({ since })} options={SINCE} />
       </Labelled>
       {!requests && <Checkbox checked={v.failures} onChange={(failures) => set({ failures })} label="only those with a failed request" />}
-      <Checkbox checked={v.internal} onChange={(internal) => set({ internal })} label="show internal: voice's own requests for each project (annotations, titles)" />
+      <Checkbox checked={v.internal} onChange={(internal) => set({ internal })} label="show internal: voice's own requests for each project, under its system key" />
       {filtered(v) && <Button onClick={() => set({ ...NO_VIEW, tab: v.tab })}>clear</Button>}
-    </div>
-  );
-}
-
-/** The page's requests, chosen or let go at once. */
-function PageBox({ ids, chosen, setChosen, all: matching }: { ids: string[]; chosen: Set<string>; setChosen: (s: Set<string>) => void; all: boolean }) {
-  const all = matching || (ids.length > 0 && ids.every((id) => chosen.has(id)));
-  return (
-    <input
-      type="checkbox"
-      aria-label="choose the requests shown"
-      checked={all}
-      ref={(el) => { if (el) el.indeterminate = !all && ids.some((id) => chosen.has(id)); }}
-      onChange={(e) => {
-        const n = new Set(matching ? ids : chosen);
-        for (const id of ids) {
-          if (e.target.checked) n.add(id);
-          else n.delete(id);
-        }
-        setChosen(n);
-      }}
-    />
-  );
-}
-
-/** A request's annotation as its steps tell it, while this view watches: its last step. */
-function StepMark({ id }: { id: string }) {
-  const step = useLastStep(id);
-  if (!step) return null;
-  return <div className={settles(step) ? (step.step === 'kept' ? 'faint' : 'c-wait') : 'faint'} title={step.reason || undefined}>{stepLabel(step)}</div>;
-}
-
-/**
- * The chosen requests annotated now (`runAnnotations`): every annotator in
- * force for each, or the one picked. The chosen are named, those shown or
- * not, or are every request the filters match, which the run finds itself
- * (`matching`: the newest `RUN_MAX`, the most one run takes); each comes
- * back queued, or refused and why, and those refused are said in one
- * line. Each queued one's steps show on its row as they happen.
- */
-function Annotate({ match, chosen, setChosen, allMatching, setAllMatching, pageIds, matching }: { match: Schemas['UsageMatch']; chosen: Set<string>; setChosen: (s: Set<string>) => void; allMatching: boolean; setAllMatching: (all: boolean) => void; pageIds: string[]; matching: number | undefined }) {
-  const annotators = useGet('/admin/v1/annotators');
-  const [annotator, setAnnotator] = useState('');
-  const [outcomes, setOutcomes] = useState<RunOutcome[] | null>(null);
-  const w = useWrite();
-  const allPage = pageIds.length > 0 && pageIds.every((id) => chosen.has(id));
-  const selected = allMatching ? Math.min(matching ?? 0, RUN_MAX) : chosen.size;
-  async function run() {
-    const which = allMatching ? { matching: match } : { request_ids: [...chosen].slice(0, RUN_MAX) };
-    const r = await w.write('post', '/admin/v1/annotation-runs', { body: { ...which, ...(annotator ? { annotator } : {}) } });
-    if (r) setOutcomes(r.data);
-  }
-  const refused = outcomes?.filter((o) => !o.queued) ?? [];
-  const queued = outcomes ? outcomes.length - refused.length : 0;
-  if (!chosen.size && !allMatching && !outcomes) return null;
-  return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)', alignItems: 'center', margin: 'var(--space-2) 0' }} aria-label="annotate the chosen requests">
-      <span><b>{count(selected)}</b> selected{allMatching ? ', every one matching' : ''}</span>
-      {!allMatching && allPage && matching != null && matching > chosen.size && (
-        <Button onClick={() => setAllMatching(true)}>
-          select all {count(Math.min(matching, RUN_MAX))} matching{matching > RUN_MAX ? ` (of ${count(matching)}, the newest the most one run takes)` : ''}
-        </Button>
-      )}
-      <Select
-        value={annotator}
-        onChange={setAnnotator}
-        options={[{ value: '', label: 'every annotator in force' }, ...(annotators.data?.data ?? []).filter((a) => a.enabled).map((a) => ({ value: a.id, label: a.id }))]}
-      />
-      <Button tone="primary" onClick={() => void run()} disabled={w.busy || !selected}>Annotate selected</Button>
-      {selected > 0 && <Button onClick={() => { setChosen(new Set()); setOutcomes(null); }}>clear</Button>}
-      {w.error && <span className="c-fail">{w.error}</span>}
-      {outcomes && (
-        <span className="muted" aria-label="annotate outcome">
-          {count(queued)} queued
-          {refused.length > 0 && (
-            <span className="c-wait" title={refused.map((o) => `${o.request_id}: ${refusalLine(o)}`).join('\n')}>
-              {' '}· {count(refused.length)} not queued: <RefusedSummary outcomes={refused} />
-            </span>
-          )}
-        </span>
-      )}
     </div>
   );
 }
@@ -503,7 +381,7 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'requested', v: <>{r.requested_model}{r.requested_account ? <span className="muted"> on {r.requested_account}</span> : null}</> },
           { k: 'served', v: r.served ? <><Mono>{r.served.seat}</Mono> · {r.served.model}{r.served.quantization ? ` (${r.served.quantization})` : ''} · {r.served.engine}</> : '–' },
           { k: 'account', v: r.served?.account ?? '–' },
-          { k: 'conversation', v: r.conversation ? <><ConversationName conversation={r.conversation} project={r.project} mono /> <a href={href('conversations', r.conversation)}>read it</a></> : <span className="faint">none</span> },
+          { k: 'conversation', v: r.conversation ? <><Mono>{r.conversation}</Mono> <a href={href('conversations', r.conversation)}>read it</a></> : <span className="faint">none</span> },
           { k: 'data class', v: r.data_class ?? '–' },
           { k: 'tokens', v: `${inputTokens(r)} in (${count(r.cached_input_tokens ?? 0)} cached, ${count(r.cache_write_input_tokens ?? 0)} written) · ${count(r.output_tokens)} out (${count(r.reasoning_tokens ?? 0)} reasoning)` },
           { k: 'price', v: micros(r.price_micros, r.currency) },
@@ -513,7 +391,6 @@ function RecordInspector({ record: r }: { record: UsageRecord }) {
           { k: 'metadata', v: <Metadata of={r.metadata} /> },
         ]}
       />
-      <AnnotationSection id={r.id} />
       <PeekSection id={r.id} />
     </>
   );

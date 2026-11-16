@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { MaybeOptionalInit, FetchResponse } from 'openapi-fetch';
 import type { PathsWithMethod, RequiredKeysOf } from 'openapi-typescript-helpers';
-import { api, describe } from './client';
+import { api, describe, paramOf } from './client';
 import type { paths } from './schema';
 
 type Method = 'post' | 'put' | 'patch' | 'delete';
@@ -18,12 +18,15 @@ type Data<P extends keyof paths, M extends Method> = Extract<FetchResponse<paths
 export function useWrite() {
   const qc = useQueryClient();
   const [error, setError] = useState<string | null>(null);
+  // the field the last refusal named, as the api named it
+  const [param, setParam] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<string | null>(null);
 
   async function write<M extends Method, P extends PathsWithMethod<paths, M>>(method: M, path: P, ...init: InitParam<MaybeOptionalInit<paths[P], M>>): Promise<Data<P, M> | null> {
     setBusy(true);
     setError(null);
+    setParam(null);
     setPending(null);
     try {
       const fn = { post: api.POST, put: api.PUT, patch: api.PATCH, delete: api.DELETE }[method] as (p: P, ...i: unknown[]) => Promise<{ data?: unknown; error?: unknown; response: Response }>;
@@ -34,6 +37,7 @@ export function useWrite() {
       const r = await fn(path, 'body' in given ? given : { ...given, body: {} });
       if (r.error !== undefined) {
         setError(describe(r.error, r.response.status));
+        setParam(paramOf(r.error));
         return null;
       }
       if (r.response.status === 202) {
@@ -89,5 +93,5 @@ export function useWrite() {
     }
   }
 
-  return { write, createFresh, error, busy, pending, clear: () => setError(null) };
+  return { write, createFresh, error, param, busy, pending, clear: () => { setError(null); setParam(null); } };
 }

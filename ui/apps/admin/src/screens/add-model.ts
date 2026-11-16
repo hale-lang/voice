@@ -6,11 +6,35 @@
  */
 
 /**
- * A harness definition as the add form reads it (`HarnessDefinition`): its
- * id and name, and how a login of it is made and named. Every CLI is the same
- * form; what differs is the definition's data.
+ * A CLI recipe as the add form reads it (`HarnessDefinition`): its id and
+ * name, how a login of it is made and named, and where it may run (its
+ * backends, or the older `image`, one container). Every CLI is the same
+ * form; what differs is the recipe's data.
  */
-export type HarnessInfo = { id: string; name: string; login: { kind: string; entry?: string; setup?: string; describe?: string } };
+export type HarnessInfo = {
+  id: string;
+  name: string;
+  login: { kind: string; entry?: string; setup?: string; describe?: string };
+  backends?: { kind: string }[];
+  image?: unknown;
+};
+
+/** Where recipe `h` may run: `container`, `host`, or both, in its order. */
+export function recipeKinds(h: HarnessInfo): ('container' | 'host')[] {
+  if (h.image) return ['container'];
+  const out: ('container' | 'host')[] = [];
+  for (const b of h.backends ?? []) if ((b.kind === 'container' || b.kind === 'host') && !out.includes(b.kind)) out.push(b.kind);
+  return out;
+}
+
+/**
+ * Whether a seat of `h` runs on the host: when the operator opts in
+ * (`optIn`) and `h` has a host backend, or when `h` runs nowhere else.
+ */
+export function runsOnHost(h: HarnessInfo, optIn: boolean): boolean {
+  const kinds = recipeKinds(h);
+  return kinds.includes('host') && (optIn || !kinds.includes('container'));
+}
 
 /** True when `h` runs under voice's own key, minted for each attempt: its seat names no login. */
 export function voiceKeyed(h: HarnessInfo): boolean {
@@ -48,7 +72,7 @@ export function nodesOffering(nodes: NodeEngines[], ...kinds: string[]): Offer[]
 /** What to do when no node offers an engine of `kind`, in plain words. */
 export function noNodeOffers(kind: 'harness' | 'openai-compatible'): string {
   return kind === 'harness'
-    ? "no node offers a harness engine: declare one in a node's capabilities file: { \"id\": \"coding\", \"kind\": \"harness\" } on a node with docker"
+    ? "no node offers a harness engine: declare one in a node's capabilities file: { \"id\": \"coding\", \"kind\": \"harness\" } (docker on the node for container runs)"
     : "no node offers openai-compatible: declare an engine of that kind in a node's capabilities file";
 }
 
@@ -86,13 +110,14 @@ export type AddWrites = {
 
 /**
  * A coding CLI's model, on a harness seat: the seat runs the CLI the
- * definition names under the login (a vault entry, or a login directory on
- * the node, as the definition says; none for a CLI under voice's own key,
- * which each attempt brings), with the CLI's own name for its model (none
- * for its default). It answers coding attempts; the claude harness answers
- * requests too. Flat-rate: no price.
+ * recipe names under the login (a vault entry, or a login directory on the
+ * node, as the recipe says; none for a CLI under voice's own key, which each
+ * attempt brings), with the CLI's own name for its model (none for its
+ * default), in a container, or on the node's own machine when `host` (no
+ * sandbox). It answers coding attempts; the claude harness answers requests
+ * too. Flat-rate: no price.
  */
-export function harnessWrites(a: { model: string; offer: Offer; account: string; harness: string; login: string; cliModel: string }): AddWrites {
+export function harnessWrites(a: { model: string; offer: Offer; account: string; harness: string; login: string; cliModel: string; host?: boolean }): AddWrites {
   return {
     model: { id: a.model, owned_by: a.harness, kind: 'hosted', price: null },
     node: a.offer.node,
@@ -103,7 +128,12 @@ export function harnessWrites(a: { model: string; offer: Offer; account: string;
       serves: [{ model: a.model }],
       concurrency: 1,
       enabled: true,
-      config: { harness: a.harness, ...(a.login.trim() ? { login: a.login.trim() } : {}), ...(a.cliModel.trim() ? { model: a.cliModel.trim() } : {}) },
+      config: {
+        harness: a.harness,
+        ...(a.login.trim() ? { login: a.login.trim() } : {}),
+        ...(a.cliModel.trim() ? { model: a.cliModel.trim() } : {}),
+        ...(a.host ? { backend: 'host' } : {}),
+      },
     },
   };
 }

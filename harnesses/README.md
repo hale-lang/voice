@@ -6,7 +6,9 @@ each `HarnessDefinition` in [`spec/openapi.yaml`](../spec/openapi.yaml).
 These files, one per CLI, `<id>.json`, are voice's own: the api reads them at
 start (`--harnesses`, this directory by default) and writes them to its store
 as `shipped` recipes, read-only. The operator adds recipes of their own, and
-duplicates voice's into ones they can edit, on the admin plane
+duplicates voice's into ones they can edit, in the admin UI (Harness, CLI
+recipes: a form for the common fields and backends, the whole recipe as JSON
+for the rest, each refusal shown on its field) or on the admin plane
 (`/admin/v1/cli-recipes`, tag `cli-recipes`); either kind can be disabled, and
 a recipe a seat names is never removed. Every recipe, whichever way it came,
 is held to the same rules (lib/harness): its backends as below, its command

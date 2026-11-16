@@ -34,7 +34,12 @@ keeps every recipe in its store (`spec/store.md`, migration 43):
   each api writes to the store as it starts. They are read-only: disable
   one, or duplicate it into one of your own and edit that.
 - **The operator's** (`operator`) are made, edited (replaced whole, keeping
-  their id), enabled or disabled and removed on the admin plane:
+  their id), enabled or disabled and removed in the admin UI's CLI recipes
+  screen (Harness layer, `#/harness/clis`): a form for the common fields,
+  a card for each backend (a container's base and install; the host's
+  detect, version pattern, install and its variables), and the whole recipe
+  as JSON for the rest, each refusal shown on the field it names. The same
+  on the admin plane:
   `GET`, `POST /admin/v1/cli-recipes`; `GET`, `PUT`, `PATCH` (`{"enabled":
   false}`), `DELETE /admin/v1/cli-recipes/{id}`; `POST
   /admin/v1/cli-recipes/{id}/duplicate` (`{"id": ..., "name": ...}`).
@@ -134,8 +139,11 @@ catalog model's name:
 ```
 
 The admin UI's Models screen adds one (served by: a coding CLI's login),
-the same form for every CLI: the recipe says how a login of it is made
-and named. A seat runs at most its `concurrency` attempts at once; a node
+the same form for every CLI: it picks an enabled recipe, and the recipe
+says how a login of it is made and named. For a recipe with a host
+backend, a checkbox opts the seat in to the host, with the warning that a
+host run has no sandbox; a recipe that runs only on the host opts in by
+itself. A seat runs at most its `concurrency` attempts at once; a node
 runs at most four in all. An older `claude-cli` engine is the claude
 harness under its former name: its seats run attempts too, `token_vault`
 their login, and keep answering requests as before. A seat of the claude

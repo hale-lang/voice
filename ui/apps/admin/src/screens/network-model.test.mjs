@@ -59,7 +59,7 @@ test('large fleets stay bounded and never retain dangling edges', () => {
 import { filterFleet } from './network-filters.ts';
 test('combined host and backend filters retain only matching seat neighborhoods', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
-  const result = filterFleet(fleet, { host: 'host-4', engine: 'claude-cli', account: 'claude-work' });
+  const result = filterFleet(fleet, { host: 'host-4', engine: 'anthropic', account: 'claude-work' });
   assert.deepEqual(result.nodes.map(n => n.id), ['host-4']);
   assert.deepEqual(result.accounts.map(a => a.id), ['claude-work']);
   assert(result.usage.every(r => !r.served || r.served.node === 'host-4'));
@@ -247,7 +247,7 @@ test('a routed request follows one project-to-API-to-host-to-seat-to-account-to-
 });
 
 
-test('the demo fleet places CLI accounts on host-2/host-4 and MLX capacity on its Mac-like hosts', () => {
+test('the demo fleet places hosted API accounts on host-2/host-4 and MLX capacity on its Mac-like hosts', () => {
   const fleet = demoFleet(0,1_800_000_000_000);
   for (const node of fleet.nodes) for (const seat of node.seats) {
     if (seat.account !== 'local') assert(['host-4','host-2'].includes(node.id));

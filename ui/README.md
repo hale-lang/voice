@@ -99,7 +99,7 @@ becomes labeled context automatically, without pretending it is infrastructure.
 
 The labeled demo fleet runs seven projects over three repository labels,
 illustrative model aliases, and claude-personal, claude-work, openai, agy, vibe
-plus local accounts. host-2 and host-4 carry the CLI accounts and small local
+plus local accounts. host-2 and host-4 carry the hosted API accounts and small local
 models; host-1, host-3, host-5 and host-6 carry MLX model tiers of 64 to 512 GB;
 gpu-a and gpu-b, cabled, serve one model placed across both. These are
 illustrative serving alternatives, not simultaneous loaded-weight claims.
@@ -135,11 +135,10 @@ apart, Changes and API.
   rotation.
 - **Seats:** a form per engine, rendered from its `config_schema`.
 - **Models:** every model, however it is served, in one list: its source
-  read off what serves it (a placement: local; a `claude-cli` seat: a
-  subscription; an `openai-compatible` seat: an api; `static`: a test), the
-  account it spends, where it is served, its state and why, context, tools
-  and reasoning, price or flat-rate, and load. A row opens its placement or
-  its seat. "Add a model" places a local one, or makes a Claude
-  subscription's or a remote API's catalog model and seat.
+  read off what serves it (a placement: local; an `openai-compatible`
+  seat: an api; `static`: a test), the account it spends, where it is
+  served, its state and why, context, tools and reasoning, price, and load.
+  A row opens its placement or its seat. "Add a model" places a local one,
+  or makes a remote API's catalog model and seat.
 - **Projects and keys:** budgets, limits, a key's secret shown once.
 - **Changes:** the audit log.

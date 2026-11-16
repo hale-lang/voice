@@ -1538,8 +1538,11 @@ ledger keeps the records attempts settled (`endpoint` `attempt`): it is
 append-only, and its hourly rollup counts them. A seat on a `harness`
 engine is configuration, kept: no node offers that engine now, which its
 problems say, and the operator removes it. A `claude-cli` seat the admin
-UI made with `harness: claude` in its config keeps serving: its node reads
-the token's entry from its `login`.
+UI made with `harness: claude` in its config kept serving then: its node
+read the token's entry from its `login`. (The claude-cli engine has since
+been removed with no migration, as it kept nothing of its own in the
+store: such a seat is configuration like a harness seat, and its problems
+say no node offers its engine.)
 
 ```sql
 drop table attempt_bundle;

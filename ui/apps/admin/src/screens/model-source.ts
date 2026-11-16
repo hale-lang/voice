@@ -5,14 +5,13 @@
  * the placements of it.
  *
  * - a placement's seat (a managed engine): `local`, weights on voice's nodes;
- * - a `claude-cli` seat: `subscription`, a CLI under an account's login;
  * - an `openai-compatible` seat: `api`, a remote endpoint with a key;
  * - a `static` seat: `static`, voice's test engine.
  */
-export type Source = 'local' | 'subscription' | 'api' | 'static';
+export type Source = 'local' | 'api' | 'static';
 
 /** The order sources are listed in, when several serve one model. */
-const ORDER: Source[] = ['local', 'subscription', 'api', 'static'];
+const ORDER: Source[] = ['local', 'api', 'static'];
 
 /** A seat as a node's summary carries it, as far as a model's source reads it. */
 export type SeatInfo = {
@@ -37,7 +36,6 @@ export function seatSource(s: SeatInfo, kindOf: EngineKindOf): Source | undefine
   if (s.placement) return 'local';
   const kind = kindOf(s.node, s.engine);
   if (kind === 'managed') return 'local';
-  if (kind === 'claude-cli') return 'subscription';
   if (kind === 'openai-compatible') return 'api';
   if (kind === 'static') return 'static';
   return undefined;
@@ -56,8 +54,6 @@ export type ModelSource = {
   nodes: string[];
   /** Requests in flight on its seats, as their nodes last reported. */
   inFlight: number;
-  /** Served on a subscription alone: flat-rate, whatever its price says. */
-  flatRate: boolean;
   target: Target;
 };
 
@@ -95,7 +91,6 @@ export function modelSource(
     accounts,
     nodes,
     inFlight: seats.reduce((n, s) => n + (s.in_flight ?? 0), 0),
-    flatRate: sources.length === 1 && sources[0] === 'subscription',
     target,
   };
 }

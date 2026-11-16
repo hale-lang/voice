@@ -1,38 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { apiWrites, claudeWrites, freshSeatId, nodesOffering, noNodeOffers, priceOf, seatIdFor, tokenEntry } from './add-model.ts';
+import { apiWrites, freshSeatId, nodesOffering, noNodeOffers, priceOf, seatIdFor } from './add-model.ts';
 
 const nodes = [
-  { id: 'mac', status: 'up', capabilities: { engines: [{ id: 'managed', kind: 'managed' }, { id: 'claude', kind: 'claude-cli' }] } },
+  { id: 'mac', status: 'up', capabilities: { engines: [{ id: 'managed', kind: 'managed' }, { id: 'lab', kind: 'openai-compatible' }] } },
   { id: 'box', status: 'up', capabilities: { engines: [{ id: 'ollama', kind: 'openai-compatible' }] } },
-  { id: 'old', status: 'revoked', capabilities: { engines: [{ id: 'claude', kind: 'claude-cli' }] } },
+  { id: 'old', status: 'revoked', capabilities: { engines: [{ id: 'ollama', kind: 'openai-compatible' }] } },
   { id: 'new', status: 'pending', capabilities: null },
 ];
 
 test('the nodes that offer an engine of a kind, each with its engine', () => {
-  assert.deepEqual(nodesOffering(nodes, 'claude-cli'), [{ node: 'mac', engine: 'claude' }]);
-  assert.deepEqual(nodesOffering(nodes, 'openai-compatible'), [{ node: 'box', engine: 'ollama' }]);
+  assert.deepEqual(nodesOffering(nodes, 'openai-compatible'), [{ node: 'mac', engine: 'lab' }, { node: 'box', engine: 'ollama' }]);
+  assert.deepEqual(nodesOffering(nodes, 'managed'), [{ node: 'mac', engine: 'managed' }]);
   assert.deepEqual(nodesOffering(nodes, 'static'), []);
 });
 
 test('no node offering an engine says what to do', () => {
-  assert.equal(noNodeOffers('claude-cli'), 'no node offers claude-cli: install the claude CLI and place the node again');
-  assert.match(noNodeOffers('openai-compatible'), /^no node offers openai-compatible: /);
-});
-
-test('the token entry is the one the install keeps', () => {
-  assert.equal(tokenEntry('work'), 'claude-token--work');
-});
-
-test('a Claude subscription: a hosted model with no price, and a claude-cli seat under the token', () => {
-  const w = claudeWrites({ model: 'claude-opus', offer: { node: 'mac', engine: 'claude' }, account: 'work', vault: 'claude-token--work', cliModel: 'opus' });
-  assert.deepEqual(w, {
-    model: { id: 'claude-opus', owned_by: 'anthropic', kind: 'hosted', price: null },
-    node: 'mac',
-    seat: { id: 'claude-opus', engine: 'claude', account: 'work', serves: [{ model: 'claude-opus' }], concurrency: 1, enabled: true, config: { token_vault: 'claude-token--work', model: 'opus' } },
-  });
-  const dflt = claudeWrites({ model: 'claude', offer: { node: 'mac', engine: 'claude' }, account: 'work', vault: 'claude-token--work', cliModel: '' });
-  assert.deepEqual(dflt.seat.config, { token_vault: 'claude-token--work' }, "the CLI's default names no model");
+  assert.match(noNodeOffers(), /^no node offers openai-compatible: /);
 });
 
 test('an api model: priced, its endpoint and upstream name on an openai-compatible seat', () => {

@@ -21,18 +21,18 @@ export const demoProjectColor = (project: string) => PROJECT_COLORS[Math.max(0, 
 /** Explicitly synthetic, local-only fixture. Model names are illustrative catalog aliases. */
 export function demoFleet(tick: number, now: number): Fleet {
   // Demo fleet: four Mac-like hosts of 64 to 512 GB serving MLX tiers, two
-  // hosts with the CLI accounts and small local models, and a cabled pair of
+  // hosts with hosted API accounts and small local models, and a cabled pair of
   // GPU hosts (below). Catalog entries are alternatives,
   // not a claim that all weights are loaded at once; q4 names denote demo quantizations.
   const definitions = [
     ['host-1', [['mlx', 'local', ['qwen-235b-q4', 'llama-70b']]]],
-    ['host-2', [['claude-cli', 'claude-personal', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['agy', 'agy', ['gemini-pro', 'gemini-flash', 'gemini-flash-lite', 'gemini-thinking']], ['vibe', 'vibe', ['devstral', 'codestral', 'mistral-large', 'mistral-small']], ['llama-cpp', 'local', ['llama-8b', 'qwen-7b']]]],
+    ['host-2', [['anthropic', 'claude-personal', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['google', 'agy', ['gemini-pro', 'gemini-flash', 'gemini-flash-lite', 'gemini-thinking']], ['mistral', 'vibe', ['devstral', 'codestral', 'mistral-large', 'mistral-small']], ['llama-cpp', 'local', ['llama-8b', 'qwen-7b']]]],
     ['host-3', [['mlx', 'local', ['qwen-32b', 'qwen-coder-32b']]]],
-    ['host-4', [['claude-cli', 'claude-work', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['codex-cli', 'openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['llama-cpp', 'local', ['llama-3b', 'qwen-7b']]]],
+    ['host-4', [['anthropic', 'claude-work', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['openai', 'openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['llama-cpp', 'local', ['llama-3b', 'qwen-7b']]]],
     ['host-5', [['mlx', 'local', ['deepseek-r1-q4', 'qwen-235b-q4']], ['mlx', 'local', ['llama-70b']]]],
     ['host-6', [['mlx', 'local', ['llama-70b', 'qwen-coder-32b']]]],
   ] as const;
-  const names = { 'host-1': 'Host 1 · 256 GB unified memory', 'host-2': 'Host 2 · CLIs and small local models', 'host-3': 'Host 3 · 64 GB unified memory', 'host-4': 'Host 4 · CLIs and small local models', 'host-5': 'Host 5 · 512 GB unified memory', 'host-6': 'Host 6 · 128 GB unified memory' };
+  const names = { 'host-1': 'Host 1 · 256 GB unified memory', 'host-2': 'Host 2 · hosted APIs and small local models', 'host-3': 'Host 3 · 64 GB unified memory', 'host-4': 'Host 4 · hosted APIs and small local models', 'host-5': 'Host 5 · 512 GB unified memory', 'host-6': 'Host 6 · 128 GB unified memory' };
   const nodes: NodeSummary[] = definitions.map(([id, slots], index) => {
     const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
     return { id, name: names[id], status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };

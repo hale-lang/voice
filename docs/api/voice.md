@@ -82,10 +82,10 @@ operator, through an API.
   network with NATS. The operator creates it here, which issues an
   enrollment token, then starts the node with that token and the api's
   address. The node registers itself on start; one live node per id.
-- A node **offers engines**: the static engine, or a CLI logged in to one
-  login. Its operator lists them, with the node's hard limits, in a file
-  on the machine, and the node declares them when it connects. Logins
-  never leave the machine.
+- A node **offers engines**: the static engine, the managed engine, or
+  an upstream under a key. Its operator lists them, with the node's hard
+  limits, in a file on the machine, and the node declares them when it
+  connects. Keys never leave the machine.
 - A **seat** is configured here, on a node: one of the node's engines,
   spending one account, serving some catalog models. The coordinator
   sends every node its seats as an assignment; the node runs them,
@@ -133,9 +133,10 @@ The API is the same in every phase; only what stands behind it changes.
   end to end: configuration, routing, keys, projects, limits, budgets,
   usage records and both streaming formats. Tokens are counted from the
   fixed text and priced at the model's configured price.
-- **v1: agent CLIs.** Seats wrap the CLIs of the operator's own accounts
-  (`claude -p`, `codex exec`), with engines `claude-cli` and `codex-cli`,
-  and report the usage and quota windows the CLIs return.
+- **v1: upstreams.** Seats proxy to a server speaking the
+  chat-completions wire (`openai-compatible`): a hosted API under a
+  metered key, or a local server. Agent CLIs run outside voice, as
+  clients of this API: no seat runs one.
 - **Later: local engines.** llama.cpp server, MLX and vLLM seats, with
   routing by memory fit, load and weights on disk.
 
@@ -4460,7 +4461,7 @@ Type: object
 | `voice.available` | boolean | yes | True when at least one enabled seat on a connected node serves it, spending an account this key may spend, and its account has headroom. |  |
 | `voice.contract` | string, one of `generative`, `decision` |  | What it answers (`CatalogModel.contract`); a decision model answers only a structured request. |  |
 | `voice.capabilities` | object |  | What a seat that could serve this key carries through to the model. |  |
-| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server or TensorFold (which reads DeepSeek's DSML calls itself), one under vLLM whose variant names its tool-call parser (`RecipeVariant.tool_call_parser`), or the static engine's tool-call drill. False under vLLM for a variant that names none, and for the claude CLI. |  |
+| `voice.capabilities.tools` | boolean | yes | A request's `tools` reach the model and come back as tool calls: an openai-compatible seat, a managed seat under llama-server or TensorFold (which reads DeepSeek's DSML calls itself), one under vLLM whose variant names its tool-call parser (`RecipeVariant.tool_call_parser`), or the static engine's tool-call drill. False under vLLM for a variant that names none. |  |
 
 <a id="schema-modellist"></a>
 
@@ -4963,7 +4964,7 @@ Type: [CatalogModelCreate](#schema-catalogmodelcreate) & object
 | `seats` | array of string | yes | Seats that serve this model, written `<node>/<seat>`. |  |
 | `available` | boolean | yes | As on `/v1/models`. |  |
 | `tools` | boolean | yes | An enabled seat that serves it carries a request's `tools` through to the model, ready now or not (as `/v1/models`' `voice.capabilities.tools` says of the seats a key could use). |  |
-| `reasoning` | boolean | yes | An enabled seat that serves it plays the model's reasoning back as reasoning (a `reasoning` output item, `reasoning_content` on chat completions) when the model reasons: an openai-compatible seat, which relays its upstream's; a managed seat under llama-server, or under vLLM whose variant names a `reasoning_parser`. The claude CLI and the static engine answer text alone. |  |
+| `reasoning` | boolean | yes | An enabled seat that serves it plays the model's reasoning back as reasoning (a `reasoning` output item, `reasoning_content` on chat completions) when the model reasons: an openai-compatible seat, which relays its upstream's; a managed seat under llama-server, or under vLLM whose variant names a `reasoning_parser`. The static engine answers text alone. |  |
 | `served_context_length` | integer |  | The least context, in tokens, a seat that could serve it now took (`SeatView.context`); left out when none has said. Less than `context_length` when its seats serve less than the model is made for. | ≥ 1 |
 | `created_at` | string (date-time) | yes |  |  |
 
@@ -8094,7 +8095,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `model` | string | yes | A catalog model id. |  |
-| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
+| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `qwen3:8b` for `qwen3-8b`. |  |
 
 <a id="schema-fetchprogress"></a>
 
@@ -8113,9 +8114,10 @@ Type: object
 
 ### Engine
 
-One engine the node offers: a kind of engine with the login it runs
-under. Two logins for one CLI are two engines. How the login is held
-is local to the node and is never declared.
+One engine the node offers: a kind of engine with what it runs
+against, an upstream and its key for one. Two upstreams of one kind
+are two engines. How a key is held is local to the node and is never
+declared.
 
 Whether a seat carries `tools` is derived from its kind and its
 config, not declared: an `openai-compatible` seat does; a `managed`
@@ -8131,10 +8133,10 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
-| `kind` | string | yes | What runs: `static`, `openai-compatible`, `claude-cli`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). Coding harnesses run outside voice, as clients of its API: no engine runs them. |  |
+| `kind` | string | yes | What runs: `static`, `openai-compatible`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). Coding harnesses and agent CLIs run outside voice, as clients of its API: no engine runs them. |  |
 | `description` | string |  |  |  |
 | `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
-| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
+| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the managed engine's `ManagedConfig`. |  |
 
 <a id="schema-linkport"></a>
 
@@ -8350,7 +8352,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes |  |  |
-| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), its server is loading the model or starting again after it ended (`reason` says why and which attempt), or, for the leader of a model across two nodes, it waits for its follower to join. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, a managed seat's file did not verify, or its server keeps ending (it is still started again every few minutes). `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
+| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), its server is loading the model or starting again after it ended (`reason` says why and which attempt), or, for the leader of a model across two nodes, it waits for its follower to join. `down`: the engine cannot serve, e.g. a managed seat's file did not verify, or its server keeps ending (it is still started again every few minutes). `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
 | `reason` | string \| null |  |  |  |
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |

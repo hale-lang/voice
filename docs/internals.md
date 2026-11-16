@@ -856,10 +856,11 @@ already exercised by the one. See [In Hale](#in-hale).
   never holds the credential.
 - **Node:** one machine running voice's node software. Created on the
   coordinator, which issues its enrollment token.
-- **Engine:** what a node offers: a kind (`static`, `openai-compatible`, `claude-cli`, ...) with
-  the login it runs under. Listed by the node's operator in a capabilities
-  file on the machine, with the node's hard limits, because only the
-  machine holds the login. Two logins for one CLI are two engines.
+- **Engine:** what a node offers: a kind (`static`, `openai-compatible`,
+  `managed`) with what it runs against, an upstream and its key for one.
+  Listed by the node's operator in a capabilities file on the machine,
+  with the node's hard limits, because only the machine holds the key.
+  Two upstreams of one kind are two engines.
 - **Seat:** one of a node's engines, spending one account, serving some
   models. Configured on the coordinator and sent to the node as its
   assignment; the node refuses a seat outside what it offers. Several seats
@@ -1141,9 +1142,10 @@ that dies with its api instance is recorded as abandoned by the brain.
   environment or a log; `voice-api admin-token` prints it. The api is
   published on the host's address under a habitat placement, so nothing of
   the admin plane rests on loopback. OIDC principals come later.
-- **Provider credentials** stay with the engines on their nodes. A CLI
-  engine's login is named in the node's capabilities file and never
-  declared; voice never reads it.
+- **Provider credentials** stay with the engines on their nodes. A key is
+  a vault entry on the node, named by a seat's config (`api_key_vault`) or
+  the capabilities file (`hub_token_vault`), and never declared; the
+  coordinator never reads it.
 - **The coordinator cannot widen a node.** It assigns seats only within the
   engines and limits the node declared, and the node refuses anything else,
   so a compromised coordinator cannot make a machine run what its operator
@@ -1296,26 +1298,9 @@ already there.
   Responses API's `function_call` items. Which seats carry tools is derived,
   not declared: an openai-compatible seat does, a managed seat under
   llama-server or under vLLM with its variant's `tool_call_parser`, a
-  static seat only as its `tool_call` drill, and a claude-cli seat never. A node refuses a `serve`
+  static seat only as its `tool_call` drill. A node refuses a `serve`
   carrying `tools` for a seat that does not before any event (`refused`,
   which is a seat failure), so the coordinator offers it to the next seat.
-  The claude-cli engine (node/claude.hl) runs `claude -p --output-format
-  stream-json --verbose --include-partial-messages` as a child process, the
-  prompt on its stdin and no tools allowed, and plays its `text_delta`
-  events as the standard's events as they arrive (a finished message stands
-  in when no partial events come); the result line's `usage` is the run's
-  usage and its cost is 0, the seat being flat-rate. A missing binary (exit
-  127), a nonzero exit or an error result before output, 300 s of silence or
-  no output fails the seat, and cancelling the request kills the child.
-  The `claude` it starts is the one on the service's PATH, which the install
-  writes with the directory of the CLI it found for the node's account (its
-  login shell's, `~/.local/bin`, `~/.claude/local`, then the system's) first:
-  the install offers the engine only when it found one, so the engine it
-  declares and the program the node runs are the same. A PATH, not an
-  absolute path in the engine: an npm-installed CLI is a `#!/usr/bin/env
-  node` script whose `node` sits beside it, and the capability format needs
-  nothing new. Other CLI engines follow that shape.
-
   **Coding harnesses run outside voice.** An agentic coding harness run on
   a repository is a client of voice's API, run elsewhere (for a habitat, in
   its organisms' legs): its model calls are requests like any other. Voice
@@ -1332,29 +1317,16 @@ already there.
   A seat made for one is configuration, kept until the operator removes it:
   no node offers its engine now, which its problems say.
 
-  **One node, several logins (hale-lang/voice#2).** Two accounts on one CLI
-  are two seats of one `claude-cli` engine (or two engines), each naming its
-  own vault entry. The login is the long-lived OAuth token `claude
-  setup-token` prints, one per account, and nothing else about the account
-  is shared: there is no config directory per login to point at, because
-  with a token in the environment the CLI needs none, and the child runs
-  from the seat's own fresh private directory (the one holding the token file, removed when the run ends; never a shared one) with `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and
-  `CLAUDE_CONFIG_DIR` removed from its environment, so nothing ambient can
-  outrank the seat's login. The token is never revealed into a value (hale's
-  `@sealed` rule): the sealed credential writes it to a 0600 file in a fresh
-  private directory, a shell reads it into `CLAUDE_CODE_OAUTH_TOKEN` and
-  removes the file, and the CLI is exec'd from there; the argv names the
-  file, never the token. The directory is removed when the run ends. The
-  node's operator provisions each token in the vault out of band; voice
-  holds none.
-
-  **The prompt is a caller's, so the CLI is locked down.** It starts with
-  `--tools ""` (no built-in tool), `--permission-mode dontAsk`,
-  `--strict-mcp-config --mcp-config '{"mcpServers":{}}'` (no MCP server) and
-  `--setting-sources ""` (the CLI accepts an empty list, so none of the
-  operator's user, project or local settings, hooks or CLAUDE.md load). The
-  empty values are written in the wrapper shell, since the newline-separated
-  argv cannot carry an empty element.
+  **Agent CLIs run outside voice too.** Voice once ran the claude CLI as a
+  seat's engine (`claude-cli`), under a Claude account's token the node's
+  install kept in its vault. Like a coding harness, an agent CLI is a client
+  of voice's API now, run elsewhere. A node's capabilities file that still
+  declares a `claude-cli` engine is refused at start, with why; `node
+  install` drops the engine as it writes the file again, and removes the
+  `claude-token--<account>` entries an install from before kept in the
+  node's vault. A `claude-cli` seat is configuration, kept until the
+  operator removes it: no node offers its engine now, which its problems
+  say (`node <id> does not offer engine <engine>`).
 - The admin API serves `/node/v1` on loopback: status, capabilities, local
   controls. It answers only a request whose `Host` is its loopback
   authority and that carries nothing a web page adds (an `Origin`,
@@ -1371,8 +1343,8 @@ already there.
   a token), the node started with that token and a capabilities file, its
   seat, a project and a key.
 - **Personal:** the api, the brain, Postgres and NATS on a machine that
-  stays up, with a node on each machine whose CLIs are logged in, one engine
-  per login and a seat on each.
+  stays up, with a node on each machine that serves models, its placed
+  models and upstreams its seats.
 - **Scaled out:** several api instances behind a load balancer that also
   terminates TLS and sends traffic only to instances whose `/readyz` is ok,
   the brain with a standby on another machine, and nodes anywhere.
@@ -1380,5 +1352,5 @@ already there.
 | Deployment | Runs |
 |---|---|
 | MVP ([`compose.yaml`](../compose.yaml)) | `postgres`, `nats`, `api`, `brain`; each node native on its host |
-| Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine with logins |
+| Personal | `api`, `brain`, `postgres` and `nats` on one machine; a `node` on each machine that serves models |
 | Scaled out | `api` behind a load balancer, `brain` with a standby, `postgres`, `nats`, and `node` anywhere |

@@ -23,8 +23,8 @@ the coordinator runs on included.
   them before installing.)
 - A GPU for most models: NVIDIA on Linux (with its driver and container
   toolkit), Apple silicon on macOS. A Linux host without one is still a
-  node: it serves a CPU runtime (a decision model's `decision-*-cpu`), an
-  upstream or a Claude seat, and a placement is judged against the
+  node: it serves a CPU runtime (a decision model's `decision-*-cpu`) or an
+  upstream, and a placement is judged against the
   hardware the node declares, so nothing that needs a GPU is put on it.
 - The node program for the revision the api runs. A habitat installs the
   one published for that commit (`node/install.sh`, with the revision as
@@ -64,14 +64,11 @@ It:
 - records the node on the api, or finds it there, and keeps its enrollment
   token in `~/.voice/vault` (mode 600); the operator token is used for that
   alone and kept nowhere;
-- keeps each Claude account's token the habitat hands over in the node's
-  vault as `claude-token--<account>`, and removes one no longer handed over
-  (below);
+- removes the Claude accounts' tokens (`claude-token--<account>`) an
+  install from before kept in the node's vault: no node runs the claude
+  CLI now;
 - writes `~/.voice/node-data/capabilities.json`: the managed engine, which
-  runs the models placed on the node, and the claude CLI when the vault holds
-  a Claude account's token and the node's account has `claude` (below); and,
-  on a machine it
-  shares, the memory left for models (`hardware.model_memory_bytes`, never
+  runs the models placed on the node; and, on a machine it shares, the memory left for models (`hardware.model_memory_bytes`, never
   more than the machine's less a sixteenth kept for its system, at least
   4 GiB, which the node holds to however the file says it): in a
   habitat, the machine's less what the habitat said its own services may
@@ -81,14 +78,13 @@ It:
   what its operator declared in the file is kept as it is: the links
   (`links`, below), every other engine, such as an `openai-compatible`
   engine for a server on the machine, after install's own and in the order
-  written, and any other entry. Install's own engines, `managed`
-  and the claude CLI's (`claude`, kind `claude-cli`), are written afresh:
-  the claude engine goes when the machine no longer has the CLI, and a
-  declared engine of an id install writes gives way to install's. Install
-  adds no engine of its own finding, and drops one the node could not run
-  (no usable id, a kind it does not run, a `harness` engine from before
-  coding harnesses left voice among them, an id declared twice), as it does
-  unusable links, and the `max_in_flight` an install from before wrote;
+  written, and any other entry. Install's own engine, `managed`, is
+  written afresh, and a declared engine of that id gives way to it.
+  Install adds no engine of its own finding, and drops one the node could
+  not run (no usable id, a kind it does not run, a `harness` or
+  `claude-cli` engine from before coding harnesses and agent CLIs left
+  voice among them, an id declared twice), as it does unusable links, and
+  the `max_in_flight` an install from before wrote;
 - copies the node program to `~/.voice/bin/voice-node`;
 - installs and starts the service: a LaunchDaemon on macOS
   (`/Library/LaunchDaemons/voice-node-<id>.plist`, label `voice-node-<id>`, so a
@@ -104,34 +100,6 @@ It:
 It prints no secret. Running it again changes nothing that is already right;
 a node whose enrollment token is gone is given a new one. Exit codes: 0
 installed, 2 a bad argument, 1 failed, with one line saying why.
-
-### Claude accounts
-
-A claude seat runs `claude -p` as one Claude subscription. Each
-subscription's token is a long-lived `claude setup-token`, one per account,
-labelled with the voice account it bills:
-
-```sh
-claude setup-token                                   # once per subscription, as that account
-hale dna secret set claude-token --member work       # the token, for voice's account `work`
-hale habitat organism place voice node --host node-a  # hands the node every member
-```
-
-The seat names its account's token: `{"engine": "claude", "account": "work",
-"config": {"token_vault": "claude-token--work"}}`. Adding an account later
-is setting another member and placing the node again. By hand, put the
-token in `~/.voice/vault/claude-token--<account>` (mode 600) before
-installing.
-
-The claude CLI is the node's account's own, found where that account
-installs it, in order: what its login shell finds (`command -v claude`,
-given 5 s), `~/.local/bin/claude` (Claude Code's native installer),
-`~/.claude/local/claude` (an older install), then the system's directories
-(`/opt/homebrew/bin`, `/usr/local/bin`, `/usr/bin`, `/bin`). The install
-prints the one it found, and the service's PATH (the LaunchDaemon's and the
-unit's) puts its directory first, so the `claude` the node starts is that
-one. With no CLI, or no token, the node offers no claude engine. Installing
-the CLI later is placing the node again.
 
 The node finds NATS where the api tells it when it registers (the api's
 `--node-nats`), so the machine needs a route to that address as well as to

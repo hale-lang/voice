@@ -32,8 +32,8 @@ locus RefusingApi {
 }
 
 fn main() {
-    claude_tokens_kept();
-    claude_found();
+    claude_tokens_dropped();
+    service_path_is_the_system_s();
     declared_engines_kept();
     let api = FakeApi { };
     let fresh = node::enroll(api, "new", false);
@@ -58,32 +58,31 @@ fn main() {
     );
 
     std::test::assert_eq_str(
-        node::capabilities_problem(node::node_capabilities(false, -1, "")),
+        node::capabilities_problem(node::node_capabilities(-1, "")),
         "",
         "the managed engine alone",
     );
     std::test::assert(
-        !std::str::contains(node::node_capabilities(false, -1, ""), "max_in_flight"),
+        !std::str::contains(node::node_capabilities(-1, ""), "max_in_flight"),
         "and no cap of the node's own: its capacity is its seats'",
     );
-    let both = node::node_capabilities(true, -1, "");
     std::test::assert(
-        node::capabilities_problem(both) == "" && std::str::contains(both, "\"claude-cli\""),
-        "and the claude CLI when the machine holds its login",
+        !std::str::contains(node::node_capabilities(-1, ""), "claude"),
+        "and no claude-cli engine, which no node runs now",
     );
-    let shared = node::node_capabilities(false, 120000000000, "");
+    let shared = node::node_capabilities(120000000000, "");
     std::test::assert(
         node::capabilities_problem(shared) == "" && node::held_back(shared) == 120000000000,
         "the memory left for models, where some of the machine is another's: " + shared,
     );
     std::test::assert(
-        !std::str::contains(both, "hardware"),
+        !std::str::contains(node::node_capabilities(-1, ""), "hardware"),
         "and none said when it is all the node's",
     );
     // the links its operator declared are the machine's: written again as
     // they were, and an unusable list is not carried over
     let declared = "{\"max_in_flight\": 4, \"engines\": [], \"links\": [{\"peer\": \"node-b\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"198.51.100.1\", \"hca\": \"rocep1s0f0\"}], \"gid_index\": 3}]}";
-    let kept = node::node_capabilities(false, -1, declared);
+    let kept = node::node_capabilities(-1, declared);
     std::test::assert(
         node::capabilities_problem(kept) == ""
             && std::str::contains(kept, "\"links\": [{\"peer\": \"node-b\""),
@@ -204,136 +203,40 @@ fn main() {
     std::test::assert_eq_str(node::home_in_passwd(""), "", "no account, no home");
 }
 
-/// The Claude accounts' tokens the habitat hands over are kept in the
-/// node's vault under their labels, and one no longer handed over goes.
-fn claude_tokens_kept() {
+/// The Claude accounts' tokens an install from before kept in the node's
+/// vault for its claude-cli seats go, and the vault's other entries stay.
+fn claude_tokens_dropped() {
     let root = "/tmp/voice-install-test-" + to_string(std::time::monotonic_ns());
-    let handed = root + "/handed";
     let vault = root + "/vault";
-    node::run_out("mkdir\n-p\n" + handed + "\n" + vault);
-    std::io::fs::write_file(handed + "/secret-dna_ab12-claude-token--work", "tok-work") or discard;
-    std::io::fs::write_file(
-        handed + "/secret-dna_ab12-claude-token--personal-1",
-        "tok-p1",
-    ) or discard;
-    std::io::fs::write_file(vault + "/claude-token--gone", "tok-gone") or discard;
+    node::run_out("mkdir\n-p\n" + vault);
+    std::io::fs::write_file(vault + "/claude-token--work", "tok-work") or discard;
+    std::io::fs::write_file(vault + "/claude-token--personal-1", "tok-p1") or discard;
+    std::io::fs::write_file(vault + "/claude-token--", "not one") or discard;
     std::io::fs::write_file(vault + "/node-x-enrollment", "vn-x") or discard;
-    node::keep_handed_tokens(
-        handed,
-        "secret-dna_ab12-claude-token--personal-1\nsecret-dna_ab12-claude-token--work\n",
-        vault,
+    std::io::fs::write_file(vault + "/hf-token", "hf") or discard;
+    node::drop_claude_tokens(vault);
+    std::test::assert(
+        !std::io::fs::file_exists(vault + "/claude-token--work")
+            && !std::io::fs::file_exists(vault + "/claude-token--personal-1"),
+        "every account's token goes",
     );
     std::test::assert(
-        node::claude_labels(vault) == "personal-1\nwork\n",
-        "the handed accounts are kept, by label",
-    );
-    std::test::assert(
-        (std::io::fs::read_file(vault + "/claude-token--work") or "") == "tok-work",
-        "a token is kept as handed",
-    );
-    std::test::assert(
-        !std::io::fs::file_exists(vault + "/claude-token--gone"),
-        "an account no longer handed over goes",
-    );
-    std::test::assert(
-        std::io::fs::file_exists(vault + "/node-x-enrollment"),
+        std::io::fs::file_exists(vault + "/node-x-enrollment")
+            && std::io::fs::file_exists(vault + "/hf-token")
+            && std::io::fs::file_exists(vault + "/claude-token--"),
         "the vault's other entries stay",
     );
+    node::drop_claude_tokens(vault);
     std::test::assert(
-        std::str::starts_with(
-            node::run_out("ls\n-l\n" + vault + "/claude-token--work"),
-            "-rw-------",
-        ),
-        "a kept token is private",
+        std::io::fs::file_exists(vault + "/node-x-enrollment"),
+        "and running it again changes nothing",
     );
     node::run_out("rm\n-rf\n" + root);
 }
 
-/// The claude CLI is looked for where the node's account installs it, in
-/// order, and the service's PATH reaches the one found first.
-fn claude_found() {
-    let root = "/tmp/voice-install-claude-" + to_string(std::time::monotonic_ns());
-    let home = root + "/home";
-    let sys = root + "/sys";
-    let login = root + "/login";
-    node::run_out(
-        "mkdir\n-p\n" + home + "/.local/bin\n" + home + "/.claude/local\n" + sys + "\n" + login,
-    );
-    let empty = sys + ":" + root + "/none";
-    std::test::assert_eq_str(
-        node::find_claude("", home, empty),
-        "",
-        "no claude anywhere, none found",
-    );
-    std::io::fs::write_file(sys + "/claude", "#!/bin/sh\n") or discard;
-    std::test::assert_eq_str(
-        node::find_claude("", home, empty),
-        "",
-        "a file it cannot run is not the CLI",
-    );
-    node::run_out("chmod\n755\n" + sys + "/claude");
-    std::test::assert_eq_str(
-        node::find_claude("", home, empty),
-        sys + "/claude",
-        "the system's directories, last",
-    );
-    std::io::fs::write_file(home + "/.claude/local/claude", "#!/bin/sh\n") or discard;
-    node::run_out("chmod\n755\n" + home + "/.claude/local/claude");
-    std::test::assert_eq_str(
-        node::find_claude("", home, empty),
-        home + "/.claude/local/claude",
-        "an older install's ~/.claude/local before them",
-    );
-    std::io::fs::write_file(home + "/.local/bin/claude", "#!/bin/sh\n") or discard;
-    node::run_out("chmod\n755\n" + home + "/.local/bin/claude");
-    std::test::assert_eq_str(
-        node::find_claude("", home, empty),
-        home + "/.local/bin/claude",
-        "the native installer's ~/.local/bin before that",
-    );
-    std::io::fs::write_file(login + "/claude", "#!/bin/sh\n") or discard;
-    node::run_out("chmod\n755\n" + login + "/claude");
-    std::test::assert_eq_str(
-        node::find_claude("welcome back\n" + login + "/claude\n", home, empty),
-        login + "/claude",
-        "what the account's login shell finds, first, past what its profile printed",
-    );
-    std::test::assert_eq_str(
-        node::find_claude("claude: aliased\n", home, empty),
-        home + "/.local/bin/claude",
-        "a login shell's answer that is no program is passed over",
-    );
-    std::test::assert_eq_str(
-        node::find_claude(root + "/gone/claude", home, empty),
-        home + "/.local/bin/claude",
-        "and one that is not there",
-    );
-
-    let vault = root + "/vault";
-    node::run_out("mkdir\n-p\n" + vault);
-    let cli = home + "/.local/bin/claude";
-    std::test::assert(!node::offers_claude(vault, cli), "the CLI without a token offers no engine");
-    std::io::fs::write_file(vault + "/claude-token--work", "tok") or discard;
-    std::test::assert(!node::offers_claude(vault, ""), "nor a token without the CLI");
-    std::test::assert(node::offers_claude(vault, cli), "both, the claude-cli engine");
-
-    let system = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-    std::test::assert_eq_str(
-        node::service_path("", system),
-        system,
-        "no claude, the system's PATH",
-    );
-    std::test::assert_eq_str(
-        node::service_path("/Users/op/.local/bin/claude", system),
-        "/Users/op/.local/bin:" + system,
-        "the claude CLI's directory first",
-    );
-    std::test::assert_eq_str(
-        node::service_path("/usr/local/bin/claude", system),
-        "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin",
-        "ahead of a system directory with another claude",
-    );
-
+/// The service runs the node with the system's program directories on its
+/// PATH, where docker and the rest are found.
+fn service_path_is_the_system_s() {
     let s = node::Service {
         name: "voice-node-mac",
         user: "op",
@@ -345,24 +248,23 @@ fn claude_found() {
         data: "/Users/op/.voice/node-data",
         capabilities: "/Users/op/.voice/node-data/capabilities.json",
         vault_dir: "/Users/op/.voice/vault",
-        path: node::service_path("/Users/op/.local/bin/claude", system),
+        path: node::SYSTEM_PATH,
         log: "/Users/op/.voice/node-mac.log",
     };
     std::test::assert(
         std::str::contains(
             node::launchd_daemon_plist(s),
-            "<key>PATH</key><string>/Users/op/.local/bin:/opt/homebrew/bin:",
+            "<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:",
         ),
-        "the LaunchDaemon runs the node with the claude CLI's directory first on PATH",
+        "the LaunchDaemon runs the node with the system's PATH",
     );
     std::test::assert(
         std::str::contains(
             node::systemd_unit(s),
-            "Environment=\"PATH=/Users/op/.local/bin:/opt/homebrew/bin:",
+            "Environment=\"PATH=/opt/homebrew/bin:/usr/local/bin:",
         ),
         "and so does the systemd unit",
     );
-    node::run_out("rm\n-rf\n" + root);
 }
 
 /// An install writes the capabilities file again over the one it had: the
@@ -375,12 +277,11 @@ fn declared_engines_kept() {
     let had = "{\"max_in_flight\": 4, \"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}, "
         + drill + ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}, " + custom
         + "], \"hardware\": {\"model_memory_bytes\": 1}, \"links\": [{\"peer\": \"node-b\", \"ports\": [{\"ifname\": \"enp1s0f0np0\", \"address\": \"198.51.100.1\"}]}], \"site\": {\"rack\": 2}}";
-    let again = node::node_capabilities(true, 120000000000, had);
+    let again = node::node_capabilities(120000000000, had);
     std::test::assert_eq_str(
         node::top_value(again, "engines"),
-        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}, "
-            + drill + ", " + custom + "]",
-        "a re-install keeps a declared static engine and a custom one, as written, after its own, each once",
+        "[{\"id\": \"managed\", \"kind\": \"managed\"}, " + drill + ", " + custom + "]",
+        "a re-install keeps a declared static engine and a custom one, as written, after its own, each once, and drops the claude-cli engine of a node from before",
     );
     std::test::assert_eq_str(node::capabilities_problem(again), "", "and the node runs it");
     std::test::assert(
@@ -401,17 +302,19 @@ fn declared_engines_kept() {
         "and the cap an install from before wrote is not: " + again,
     );
     std::test::assert_eq_str(
-        node::node_capabilities(true, 120000000000, again),
+        node::node_capabilities(120000000000, again),
         again,
         "installing again changes nothing that is already right",
     );
 
-    let gone = node::node_capabilities(false, -1, had);
-    std::test::assert_eq_str(
-        node::top_value(gone, "engines"),
-        "[{\"id\": \"managed\", \"kind\": \"managed\"}, " + drill + ", " + custom + "]",
-        "the claude CLI's engine is install's: it goes when the machine no longer has the CLI",
+    std::test::assert(
+        std::str::contains(
+            node::capabilities_problem(had),
+            "kind claude-cli is no longer run",
+        ),
+        "a node from before, not installed again, says why it does not start",
     );
+    let gone = node::node_capabilities(-1, had);
     std::test::assert(
         !std::str::contains(gone, "hardware"),
         "and so does memory no longer held back",
@@ -419,36 +322,31 @@ fn declared_engines_kept() {
 
     let clash = "{\"engines\": [{\"id\": \"managed\", \"kind\": \"static\", \"text\": \"x\"}, {\"id\": \"claude\", \"kind\": \"openai-compatible\"}]}";
     std::test::assert_eq_str(
-        node::top_value(node::node_capabilities(true, -1, clash), "engines"),
-        "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}]",
-        "a declared engine whose id install writes gives way to install's",
-    );
-    std::test::assert_eq_str(
-        node::top_value(node::node_capabilities(false, -1, clash), "engines"),
+        node::top_value(node::node_capabilities(-1, clash), "engines"),
         "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"claude\", \"kind\": \"openai-compatible\"}]",
-        "and is kept while install writes no engine of that id",
+        "a declared engine whose id install writes gives way to install's, and one of another id is kept",
     );
 
-    let unusable = "{\"engines\": [{\"id\": \"Bad Id\", \"kind\": \"static\"}, {\"id\": \"gpu\", \"kind\": \"warp-drive\"}, {\"id\": \"coding\", \"kind\": \"harness\"}, \"coding\", {\"id\": \"twin\", \"kind\": \"openai-compatible\"}, {\"id\": \"twin\", \"kind\": \"static\"}]}";
+    let unusable = "{\"engines\": [{\"id\": \"Bad Id\", \"kind\": \"static\"}, {\"id\": \"gpu\", \"kind\": \"warp-drive\"}, {\"id\": \"coding\", \"kind\": \"harness\"}, {\"id\": \"claude\", \"kind\": \"claude-cli\"}, \"coding\", {\"id\": \"twin\", \"kind\": \"openai-compatible\"}, {\"id\": \"twin\", \"kind\": \"static\"}]}";
     std::test::assert_eq_str(
-        node::top_value(node::node_capabilities(false, -1, unusable), "engines"),
+        node::top_value(node::node_capabilities(-1, unusable), "engines"),
         "[{\"id\": \"managed\", \"kind\": \"managed\"}, {\"id\": \"twin\", \"kind\": \"openai-compatible\"}]",
-        "an engine the node could not run is not carried over, a harness engine from before among them",
+        "an engine the node could not run is not carried over, a harness or claude-cli engine from before among them",
     );
 
     let fresh = "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}]}";
     std::test::assert_eq_str(
-        node::node_capabilities(false, -1, ""),
+        node::node_capabilities(-1, ""),
         fresh,
         "no file: the managed engine alone, and no engine of install's finding",
     );
     std::test::assert_eq_str(
-        node::node_capabilities(false, -1, "{\"engines\": [" + drill + ", "),
+        node::node_capabilities(-1, "{\"engines\": [" + drill + ", "),
         fresh,
         "and a file that is no JSON object is as none",
     );
     std::test::assert_eq_str(
-        node::node_capabilities(false, -1, "{\"engines\": " + drill + "}"),
+        node::node_capabilities(-1, "{\"engines\": " + drill + "}"),
         fresh,
         "as are engines that are no list",
     );

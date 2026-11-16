@@ -10,9 +10,8 @@ what the request used against the project, the key and the account that pays.
 It speaks the OpenAI-compatible `/v1/chat/completions` and `/v1/responses`,
 streamed or not, and serves many requests at once.
 
-A seat is a hosted model under one of your accounts (an agent CLI logged in
-per account, or any OpenAI-compatible endpoint) or a model voice runs itself
-on your own GPUs, pinned to the byte.
+A seat is a hosted model under one of your accounts (any OpenAI-compatible
+endpoint) or a model voice runs itself on your own GPUs, pinned to the byte.
 
 Voice is written in [Hale](https://github.com/hale-lang/hale).
 
@@ -20,7 +19,7 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
 
 ```
  caller ──HTTP──▶ api ──NATS──▶ node ──▶ seat (an engine under an account)
-                   │  ▲                   managed, openai-compatible, claude-cli, static
+                   │  ▲                   managed, openai-compatible, static
                    ▼  │
                  Postgres ◀── brain (ranks seats into the route table)
 ```
@@ -33,13 +32,12 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
   - `managed`: a local model voice fetches, verifies and runs (llama.cpp on
     Metal, vLLM or llama.cpp on CUDA), as the operator places it;
   - `openai-compatible`: an endpoint that speaks the OpenAI API;
-  - `claude-cli`: Claude Code, logged in as one account per seat;
   - `static`: a canned answer, for trying voice and for tests.
 - **brain** turns the state of the fleet into a ranked route table.
 
-Coding harnesses (Claude Code, Codex and the like, run as agents on a
-repository) are not run by voice: they run outside it, as clients of its
-API, and their model calls are requests like any other.
+Coding harnesses and agent CLIs (Claude Code, Codex and the like) are not
+run by voice: they run outside it, as clients of its API, and their model
+calls are requests like any other.
 
 A request is checked against its key, its project's limits and budget, sent
 to a seat over NATS, streamed back, and metered. A conversation's turns (its

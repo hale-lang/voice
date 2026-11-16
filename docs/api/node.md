@@ -15,7 +15,7 @@ other node implementations plug into; this document is only voice's own
 node, and a node written elsewhere need not serve it.
 
 What stays on the machine is what only the machine can decide: which
-engines it offers, with which logins (the capabilities file), and local
+engines it offers, with which keys (the capabilities file), and local
 controls that pause it or its seats. It has no in-flight cap of its
 own: it serves each seat up to the seat's concurrency.
 This API reads them, sets the local controls, and reports the node's
@@ -68,29 +68,24 @@ token.)
 
 Written by the node's operator, and the only configuration edited on the
 machine besides local controls. Nothing is discovered: the node offers
-exactly the engines listed, each with the login it runs under. It is
-`Capabilities` from the protocol plus, per engine, a `local` object the
-node never declares (where the login is kept, and similar). Each CLI
-keeps several logins apart in its own way (docs/internals.md, "One node,
-several logins"): a `claude-cli` engine's login is not in this file at
-all, it is a token in the node's vault that its seats name. A file from
-before that declares the node's own cap (`max_in_flight`) is read past.
+exactly the engines listed. It is `Capabilities` from the protocol plus,
+per engine, a `local` object the node never declares (where a token is
+kept, and similar). A file from before that declares the node's own cap
+(`max_in_flight`) is read past.
 
 ```json
 {
   "engines": [
     { "id": "static", "kind": "static" },
-    { "id": "ollama", "kind": "openai-compatible" },
-    { "id": "claude-work", "kind": "claude-cli" },
-    { "id": "claude-personal", "kind": "claude-cli" }
+    { "id": "ollama", "kind": "openai-compatible" }
   ]
 }
 ```
 
-Coding harnesses (agentic coding CLIs) do not run on a node: they run
-outside voice, as clients of its API. A file from before that declares
-a `harness` engine is refused at start; `node install` drops it as it
-writes the file again.
+Coding harnesses and agent CLIs do not run on a node: they run outside
+voice, as clients of its API. A file from before that declares a
+`harness` or `claude-cli` engine is refused at start; `node install`
+drops it as it writes the file again.
 
 A `managed` engine takes the models the coordinator places on the
 node (openapi.yaml `Placement`): the node fetches each one's weights
@@ -114,24 +109,24 @@ accelerators and free disk under the data directory) and declares it
 with the engines.
 
 The node fills in each engine's `config_schema` and `models` from its
-kind. The kinds this build runs are `static`, `claude-cli` (a seat that runs
-`claude -p` under a token the vault holds; see `ClaudeCliConfig` in the
-protocol) and `openai-compatible`
-(a seat that proxies to a chat-completions server: its seat config names
+kind. The kinds this build runs are `static`, `managed` and
+`openai-compatible` (a seat that proxies to a chat-completions server: its seat config names
 `base_url`, `model`, an optional `api_key_vault` and a price per million
 tokens, 0 for a local server; see `OpenAICompatibleConfig` in the
 protocol). The `openai-compatible` kind carries tools (a request's
 `tools` go upstream, its tool calls come back); `managed` does under
 llama-server or TensorFold, and under vLLM when the seat's variant names a
-`tool_call_parser`; `static` does only as
-its `tool_call` drill and `claude-cli` never, and a request with `tools`
-is refused there so the coordinator tries another seat. When the file changes, the node declares its capabilities again,
-and the coordinator re-checks the assignment against them.
+`tool_call_parser`; `static` does only as its `tool_call` drill, and a
+request with `tools` is refused where it is not carried so the
+coordinator tries another seat. When the file changes, the node
+declares its capabilities again, and the coordinator re-checks the
+assignment against them.
 
 ## Credentials
 
-Voice holds no provider credentials. An engine that needs a login uses
-its own, on this machine, named in the engine's `local` object. It is
+Voice holds no provider credentials. An engine that needs a key uses
+its own, on this machine, named in the engine's `local` object or the
+seat's config (`api_key_vault`). It is
 never declared to the coordinator and never returned by this API.
 
 ## Contents
@@ -424,7 +419,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `model` | string | yes | A catalog model id. |  |
-| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `sonnet` for `claude-sonnet-5`. |  |
+| `as` | string \| null |  | The engine's own name for it, when that differs, e.g. `qwen3:8b` for `qwen3-8b`. |  |
 
 <a id="schema-seat"></a>
 
@@ -470,7 +465,7 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | string | yes |  |  |
-| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), its server is loading the model or starting again after it ended (`reason` says why and which attempt), or, for the leader of a model across two nodes, it waits for its follower to join. `down`: the engine cannot serve, e.g. its CLI is missing or logged out, a managed seat's file did not verify, or its server keeps ending (it is still started again every few minutes). `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
+| `status` | string, one of `starting`, `fetching`, `up`, `down`, `disabled`, `paused`, `refused` | yes | `fetching`: a managed seat whose weights or runtime the node is fetching and verifying; `progress` says how far. `starting`, for a managed seat: its node is readying the inputs its variant's prepare step makes (`reason` says the step and how far), its server is loading the model or starting again after it ended (`reason` says why and which attempt), or, for the leader of a model across two nodes, it waits for its follower to join. `down`: the engine cannot serve, e.g. a managed seat's file did not verify, or its server keeps ending (it is still started again every few minutes). `paused`: a local control holds it. `refused`: the seat is outside the node's capabilities, e.g. an engine it does not offer or a config its engine rejects; `reason` says which. |  |
 | `reason` | string \| null |  |  |  |
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
@@ -480,9 +475,10 @@ Type: object
 
 ### Engine
 
-One engine the node offers: a kind of engine with the login it runs
-under. Two logins for one CLI are two engines. How the login is held
-is local to the node and is never declared.
+One engine the node offers: a kind of engine with what it runs
+against, an upstream and its key for one. Two upstreams of one kind
+are two engines. How a key is held is local to the node and is never
+declared.
 
 Whether a seat carries `tools` is derived from its kind and its
 config, not declared: an `openai-compatible` seat does; a `managed`
@@ -498,10 +494,10 @@ Type: object
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
 | `id` | [Slug](#schema-slug) | yes | Unique on the node; seats name it. |  |
-| `kind` | string | yes | What runs: `static`, `openai-compatible`, `claude-cli`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). Coding harnesses run outside voice, as clients of its API: no engine runs them. |  |
+| `kind` | string | yes | What runs: `static`, `openai-compatible`, or `managed`: a model the coordinator placed on the node, whose weights and runtime the node fetches and verifies itself (`ManagedConfig`). Coding harnesses and agent CLIs run outside voice, as clients of its API: no engine runs them. |  |
 | `description` | string |  |  |  |
 | `models` | array \| null |  | The engine's own names for the models it can run, when it knows them. Null when any name may be tried. |  |
-| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the claude-cli engine's `ClaudeCliConfig`, the managed engine's `ManagedConfig`. |  |
+| `config_schema` | object | yes | JSON Schema of the `config` a seat on this engine takes. The coordinator checks seats against it, and a UI renders it as a form. The static engine's is `StaticConfig`, the openai-compatible engine's `OpenAICompatibleConfig`, the managed engine's `ManagedConfig`. |  |
 
 <a id="schema-accelerator"></a>
 

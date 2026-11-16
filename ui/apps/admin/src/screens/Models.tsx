@@ -9,7 +9,7 @@ import { ContextWindow } from '../context';
 import { NamedByList, useAliasesByModel } from '../aliases';
 import { modelState } from './placement-state';
 import { modelSource, sourceLabel, type EngineKindOf, type ModelSource, type SeatInfo } from './model-source';
-import { CLAUDE_MODELS, apiWrites, claudeWrites, freshSeatId, noNodeOffers, nodesOffering, priceOf, tokenEntry, type AddWrites, type Offer } from './add-model';
+import { apiWrites, freshSeatId, noNodeOffers, nodesOffering, priceOf, type AddWrites, type Offer } from './add-model';
 
 /**
  * What the Models screen reads besides the catalog: every node's seats (a
@@ -48,9 +48,8 @@ function Availability({ m, short }: { m: CatalogModel; short?: boolean }) {
   return <span className={st.state === 'starting' ? 'c-wait' : 'c-fail'}>{st.label}: {st.detail}</span>;
 }
 
-/** A price, or `flat-rate` for a model a subscription alone serves. */
-function priceText(m: CatalogModel, src: ModelSource | undefined) {
-  if (src?.flatRate) return 'flat-rate';
+/** A price, or free. */
+function priceText(m: CatalogModel) {
   return m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} · ${micros(m.price.output_per_mtok_micros, m.price.currency)}` : <span className="faint">free</span>;
 }
 
@@ -62,9 +61,8 @@ function carries(m: CatalogModel): string {
 
 /**
  * Models: every model voice serves, however it is served, in one list. Each
- * row's source is read off what serves it: a placement (local), a claude-cli
- * seat (a subscription), an openai-compatible seat (an api) or the static
- * engine (a test). A row opens its placement or its seat; its name opens the
+ * row's source is read off what serves it: a placement (local), an
+ * openai-compatible seat (an api) or the static engine (a test). A row opens its placement or its seat; its name opens the
  * model itself.
  */
 export function Models({ route, setInspector }: ScreenProps) {
@@ -108,10 +106,10 @@ export function Models({ route, setInspector }: ScreenProps) {
             { key: 'avail', header: 'Status', render: (m) => <Availability m={m} short /> },
             { key: 'ctx', header: 'Context', num: true, render: (m) => <ContextWindow served={m.served_context_length} native={m.context_length} /> },
             { key: 'carries', header: 'Carries', render: carries },
-            { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => priceText(m, sources.get(m.id)) },
+            { key: 'price', header: 'Price / Mtok in · out', num: true, render: (m) => priceText(m) },
             { key: 'load', header: 'In flight', num: true, render: (m) => sources.get(m.id)?.inFlight ?? '–' },
           ]}
-          empty="No models. Add one: place a local model, or serve a Claude subscription or a remote API."
+          empty="No models. Add one: place a local model, or serve a remote API."
         />
         <p style={{ marginBottom: 0 }}>
           <Button onClick={() => go('models', 'new')} tone="primary">add a model</Button>
@@ -127,24 +125,23 @@ function sourceText(src: ModelSource | undefined, contract: CatalogModel['contra
   return <span className={src.sources.length ? undefined : 'faint'}>{words}{contract === 'decision' ? ' · decisions' : ''}</span>;
 }
 
-type Path = 'local' | 'subscription' | 'api';
+type Path = 'local' | 'api';
 
 /**
  * Adding a model, by how it is to be served: a local model from a recipe,
- * then placed; a Claude subscription, a claude-cli seat under the account's
- * token on a node whose capabilities offer the CLI; or a remote API, an
- * openai-compatible seat on a node offering that engine. Each with the admin
- * API as it is: the catalog model, then its seat.
+ * then placed; or a remote API, an openai-compatible seat on a node
+ * offering that engine, with the admin API as it is: the catalog model,
+ * then its seat.
  */
 function AddModel() {
-  const [path, setPath] = useState<Path>('subscription');
+  const [path, setPath] = useState<Path>('local');
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-3)' }}>Add a model</h2>
-      <Field label="served by" help="local: weights on voice's nodes, placed; a Claude subscription: the claude CLI under an account's login, flat-rate; a remote API: an OpenAI-compatible endpoint with a key, metered">
-        <Select value={path} onChange={(v) => setPath(v as Path)} options={[{ value: 'local', label: 'local (a recipe, placed)' }, { value: 'subscription', label: 'a Claude subscription' }, { value: 'api', label: 'a remote API' }]} />
+      <Field label="served by" help="local: weights on voice's nodes, placed; a remote API: an OpenAI-compatible endpoint with a key, metered">
+        <Select value={path} onChange={(v) => setPath(v as Path)} options={[{ value: 'local', label: 'local (a recipe, placed)' }, { value: 'api', label: 'a remote API' }]} />
       </Field>
-      {path === 'local' ? <ModelForm local /> : path === 'subscription' ? <AddClaude /> : <AddApi />}
+      {path === 'local' ? <ModelForm local /> : <AddApi />}
     </>
   );
 }
@@ -174,58 +171,6 @@ async function addBoth(w: ReturnType<typeof useWrite>, writes: AddWrites, catalo
   return null;
 }
 
-function AddClaude() {
-  const w = useWrite();
-  const catalog = useGet('/admin/v1/models');
-  const accounts = useGet('/admin/v1/accounts');
-  const nodes = useNodes();
-  const { offers, ready } = useOffers('claude-cli');
-  const [node, setNode] = useState('');
-  const [account, setAccount] = useState('');
-  const [vault, setVault] = useState('');
-  const [vaultSet, setVaultSet] = useState(false);
-  const [cliModel, setCliModel] = useState('opus');
-  const [name, setName] = useState('');
-  const [nameSet, setNameSet] = useState(false);
-  const [refused, setRefused] = useState<string | null>(null);
-  const offer = offers.find((o) => o.node === node) ?? (offers.length === 1 ? offers[0] : undefined);
-  const shownVault = vaultSet ? vault : account ? tokenEntry(account) : '';
-  const shownName = nameSet ? name : `claude-${cliModel || 'default'}`;
-  if (!ready) return <Loading what="the nodes' engines" />;
-  if (offers.length === 0) return <p className="c-fail">{noNodeOffers('claude-cli')}.</p>;
-  return (
-    <Form
-      error={refused ?? w.error}
-      onSubmit={async () => {
-        if (!offer) return;
-        setRefused(await addBoth(w, claudeWrites({ model: shownName, offer, account, vault: shownVault, cliModel }), catalog.data?.data ?? [], nodes.data?.data ?? []));
-      }}
-      actions={
-        <>
-          <Button type="submit" tone="primary" disabled={w.busy || !offer || !account || !shownVault || !shownName}>add</Button>
-          <Button onClick={() => go('models')}>cancel</Button>
-        </>
-      }
-    >
-      <Field label="node" required help="one whose capabilities offer the claude CLI (its install does when the vault holds a Claude token)">
-        <Select value={offer?.node ?? ''} onChange={setNode} options={offers.map((o) => ({ value: o.node, label: `${o.node} · ${o.engine}` }))} required empty={offers.length === 1 ? undefined : ''} />
-      </Field>
-      <Field label="account" required help="the subscription it spends: flat-rate, its windows the only cap">
-        <Select value={account} onChange={setAccount} options={(accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => ({ value: a.id, label: `${a.id} · ${a.billing}` }))} required empty="" />
-      </Field>
-      <Field label="token's vault entry" required help="where the node's vault holds the account's token: the install keeps it as claude-token--<account>">
-        <TextInput mono value={shownVault} onChange={(v) => { setVault(v); setVaultSet(true); }} required placeholder="claude-token--work" />
-      </Field>
-      <Field label="Claude model" help="the CLI's own alias for it">
-        <Select value={cliModel} onChange={setCliModel} options={CLAUDE_MODELS} />
-      </Field>
-      <Field label="name" required help="what callers name; never reused for a different model">
-        <TextInput mono value={shownName} onChange={(v) => { setName(v); setNameSet(true); }} required />
-      </Field>
-    </Form>
-  );
-}
-
 function AddApi() {
   const w = useWrite();
   const catalog = useGet('/admin/v1/models');
@@ -246,7 +191,7 @@ function AddApi() {
   const offer = offers.find((o) => o.node === node) ?? (offers.length === 1 ? offers[0] : undefined);
   const shownName = nameSet ? name : upstream.split('/').pop() ?? '';
   if (!ready) return <Loading what="the nodes' engines" />;
-  if (offers.length === 0) return <p className="c-fail">{noNodeOffers('openai-compatible')}.</p>;
+  if (offers.length === 0) return <p className="c-fail">{noNodeOffers()}.</p>;
   return (
     <Form
       error={refused ?? w.error}
@@ -406,7 +351,7 @@ function ModelInspector({ model: m }: { model: CatalogModel }) {
           { k: 'context', v: m.context_length ? `${m.context_length.toLocaleString()} tokens, made for` : '–' },
           { k: 'served', v: m.served_context_length ? <ContextWindow served={m.served_context_length} native={m.context_length} /> : <span className="faint">no seat has said</span> },
           { k: 'max output', v: m.max_output_tokens?.toLocaleString() ?? '–' },
-          { k: 'price', v: src?.flatRate ? 'flat-rate: the subscription is its cap' : m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },
+          { k: 'price', v: m.price ? `${micros(m.price.input_per_mtok_micros, m.price.currency)} in · ${micros(m.price.output_per_mtok_micros, m.price.currency)} out, per Mtok` : 'free' },
           { k: 'available', v: <Availability m={m} /> },
           { k: 'seats', v: m.seats.length ? m.seats.map((s) => <div key={s}><a href={href('nodes', s.split('/')[0] ?? '', s.split('/')[1] ?? '')}><Mono>{s}</Mono></a></div>) : 'none' },
           { k: 'named by', v: <NamedByList names={named.get(m.id)} /> },

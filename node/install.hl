@@ -5,14 +5,12 @@
 //
 // `install` adds a node and nothing else: it records the node on the api
 // (the operator token, the habitat's or from a file, is used for that
-// alone), keeps its
-// enrollment token in the node's vault, writes the capabilities voice
-// decides (the managed engine, which runs the models placed on the node,
-// and the claude CLI when the vault holds a Claude account's token, which
-// the habitat hands over, keep_claude_tokens), keeping what its operator
-// declared there (other engines, links), copies the node program where the service runs it, and installs and starts the service
-// as the account that ran it with sudo. Models come to the node through
-// placements, never through its install. It prints no secret, and running
+// alone), keeps its enrollment token in the node's vault, writes the
+// capabilities voice decides (the managed engine, which runs the models
+// placed on the node), keeping what its operator declared there (other
+// engines, links), copies the node program where the service runs it, and
+// installs and starts the service as the account that ran it with sudo.
+// Models come to the node through placements, never through its install. It prints no secret, and running
 // it again changes nothing that is already right.
 //
 // This file is the commands' own output: what they print is their product,
@@ -86,19 +84,18 @@ fn reason_of(r: Reply) -> String {
 @unbounded
 fn quote(s: String) -> String { return "\"" + std::json::escape_string(s) + "\""; }
 
-/// The capabilities voice decides for a node: the managed engine, the
-/// claude CLI when the machine holds its login, and, when some of the
-/// machine is another's, the memory left for models (`model_memory`, -1
-/// for all of it); with what its operator declared in the file it had
-/// (`existing`, "" for none), which is the machine's and never voice's to
-/// decide: its other engines (`kept_engines`), its links (`kept_links`) and
-/// any other entry (`kept_entries`), each written again as it was.
+/// The capabilities voice decides for a node: the managed engine, and,
+/// when some of the machine is another's, the memory left for models
+/// (`model_memory`, -1 for all of it); with what its operator declared in
+/// the file it had (`existing`, "" for none), which is the machine's and
+/// never voice's to decide: its other engines (`kept_engines`), its links
+/// (`kept_links`) and any other entry (`kept_entries`), each written again
+/// as it was.
 @unbounded
-fn node_capabilities(claude: Bool, model_memory: Int, existing: String) -> String {
-    let declared = kept_engines(existing, claude);
+fn node_capabilities(model_memory: Int, existing: String) -> String {
+    let declared = kept_engines(existing);
     let links = kept_links(existing);
     return "{\"engines\": [{\"id\": \"managed\", \"kind\": \"managed\"}"
-        + (if claude { ", {\"id\": \"claude\", \"kind\": \"claude-cli\"}" } else { "" })
         + (if len(declared) > 0 { ", " + declared } else { "" }) + "]"
         + (
             if model_memory >= 0 {
@@ -112,41 +109,28 @@ fn node_capabilities(claude: Bool, model_memory: Int, existing: String) -> Strin
         + "}";
 }
 
-/// Whether an engine is one install writes itself, by its id and kind:
-/// the managed engine, and the claude CLI's when the machine holds its
-/// login. An entry of either in the file is install's, written again or
-/// dropped as the machine now has it, never kept beside it.
-fn installs_engine(id: String, kind: String) -> Bool {
-    return (id == "managed" && kind == "managed") || (id == "claude" && kind == "claude-cli");
-}
-
 /// The engines a capabilities file declares besides install's own, each
 /// entry as the file writes it, in order, joined by ", "; "" for none, and
-/// for a file that is no JSON object. Install writes its own engines
-/// (`installs_engine`) afresh, so an entry of theirs is not kept, nor one
-/// whose id install writes now (`managed`, and `claude` when the machine
-/// holds its login): install's entry wins. Nor is one the node could not
-/// run, as an unusable link is not: one without an id matching
-/// ^[a-z0-9][a-z0-9-]{0,62}$, of a kind this build does not run, or whose
-/// id an entry before it has (a `harness` engine from before among them:
-/// coding harnesses run outside voice now). Install adds none of its own
-/// finding: an openai-compatible engine, say, is the operator's to declare.
+/// for a file that is no JSON object. Install writes its own engine,
+/// `managed`, afresh, so an entry of that id is not kept: install's entry
+/// wins. Nor is one the node could not run, as an unusable link is not: one
+/// without an id matching ^[a-z0-9][a-z0-9-]{0,62}$, of a kind this build
+/// does not run, or whose id an entry before it has (a `harness` or
+/// `claude-cli` engine from before among them: coding harnesses and agent
+/// CLIs run outside voice now). Install adds none of its own finding: an
+/// openai-compatible engine, say, is the operator's to declare.
 @unbounded
-fn kept_engines(file: String, claude: Bool) -> String {
+fn kept_engines(file: String) -> String {
     if !std::json::valid_object(file) { return ""; }
     let engines = top_value(file, "engines");
     if !std::str::starts_with(engines, "[") { return ""; }
-    let mut seen = "\nmanaged\n" + (if claude { "claude\n" } else { "" });
+    let mut seen = "\nmanaged\n";
     let mut out = "";
     let mut it = std::json::array_first_span(engines);
     while !it.done {
         let id = std::json::iter_find_string_field(it, engines, "id");
         let kind = std::json::iter_find_string_field(it, engines, "kind");
-        if is_slug(id)
-            && runs_kind(kind)
-            && !installs_engine(id, kind)
-            && !std::str::contains(seen, "\n" + id + "\n")
-        {
+        if is_slug(id) && runs_kind(kind) && !std::str::contains(seen, "\n" + id + "\n") {
             seen = seen + id + "\n";
             out = out + (if len(out) > 0 { ", " } else { "" }) + std::json::iter_substring(
                 it,
@@ -240,98 +224,9 @@ fn on_loopback(url: String) -> Bool {
     return host == "localhost" || host == "127.0.0.1";
 }
 
-/// The system's own program directories, the service's PATH past the
-/// claude CLI's (docker and the rest are found here).
+/// The service's PATH: the system's own program directories, where docker
+/// and the rest are found.
 const SYSTEM_PATH: String = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
-/// True when the node offers the claude-cli engine: its vault holds a
-/// Claude account's token and its account has the CLI (`cli`, found).
-@unbounded
-fn offers_claude(vault: String, cli: String) -> Bool {
-    return len(cli) > 0 && len(claude_labels(vault)) > 0;
-}
-
-/// The claude CLI the node's account runs, as an absolute path; "" when it
-/// has none. Looked for where that account installs it, in order: what its
-/// login shell finds (`login`, that lookup's output), `~/.local/bin` (the
-/// native installer's), `~/.claude/local` (an older install's), then the
-/// `system` directories. Never root's: the node runs as its account.
-@unbounded
-fn find_claude(login: String, home: String, system: String) -> String {
-    // a login shell's profile may print before it
-    let found = std::str::trim(last_line(login));
-    if std::str::starts_with(found, "/") && executable(found) { return found; }
-    let mut dirs = home + "/.local/bin:" + home + "/.claude/local:" + system + ":";
-    while len(dirs) > 0 {
-        let at = std::str::index_of(dirs, ":");
-        let dir = dirs[0..at];
-        dirs = dirs[(at + 1)..len(dirs)];
-        if std::str::starts_with(dir, "/") && executable(dir + "/claude") {
-            return dir + "/claude";
-        }
-    }
-    return "";
-}
-
-/// True when `file` is a file the node can run.
-@unbounded
-fn executable(file: String) -> Bool {
-    let o = std::process::run("sh\n-c\n[ -f \"$0\" ] && [ -x \"$0\" ]\n" + file) or {
-        return false;
-    };
-    return o.code == 0;
-}
-
-/// The service's PATH: the claude CLI's directory first, so the `claude`
-/// the node starts is the one the install found, then `system` without it.
-@unbounded
-fn service_path(claude: String, system: String) -> String {
-    let slash = last_slash(claude);
-    if slash <= 0 { return system; }
-    let dir = claude[0..slash];
-    let mut out = dir;
-    let mut rest = system + ":";
-    while len(rest) > 0 {
-        let at = std::str::index_of(rest, ":");
-        let d = rest[0..at];
-        rest = rest[(at + 1)..len(rest)];
-        if len(d) > 0 && d != dir { out = out + ":" + d; }
-    }
-    return out;
-}
-
-/// How long the account's login shell may take to say where its claude is.
-const LOGIN_LOOKUP_MS: Int = 5000;
-
-/// Where `user`'s login shell finds `claude`: that shell's own PATH, with
-/// its profile, as `user` (`sudo -i`, the install being root). Bounded, its
-/// stdin closed, so a profile that waits cannot hold the install; "" when
-/// it finds none, fails or takes too long.
-@unbounded
-fn login_claude(user: String) -> String {
-    let c = std::process::spawn_with(
-        "sudo\n-n\n-u\n" + user + "\n-i\nsh\n-c\ncommand -v claude",
-        std::process::SpawnOptions { },
-    ) or std::process::Child { };
-    if c.pid <= 0 { return ""; }
-    std::process::close_stdin(c);
-    let began = std::time::monotonic_ns();
-    let mut out = "";
-    while true {
-        out = out + (std::process::read_stdout(c) or "");
-        let code = std::process::try_wait(c) or - 1;
-        if code != -2 {
-            out = out + (std::process::read_stdout(c) or "");
-            return if code == 0 { out } else { "" };
-        }
-        if (std::time::monotonic_ns() - began) / 1000000 > LOGIN_LOOKUP_MS {
-            std::process::kill(c) or discard;
-            return "";
-        }
-        std::time::sleep(20ms);
-    }
-    return "";
-}
 
 /// The service's name, the same on both: the systemd unit
 /// (`voice-node-<id>.service`) and the launchd label.
@@ -375,15 +270,9 @@ fn install() {
     }
     run_out("chmod\n600\n" + vault + "/" + enrollment);
 
-    // the Claude accounts' tokens the habitat handed over, kept in the
-    // node's vault, since the habitat's copy is gone once this returns
-    keep_claude_tokens(vault);
-    // the claude CLI the node's account runs, from its own install
-    // locations; the service's PATH reaches it first, so the program the
-    // node starts is the one found here
-    let cli = find_claude(login_claude(a.user), a.home, SYSTEM_PATH);
-    let path = service_path(cli, SYSTEM_PATH);
-    let claude = offers_claude(vault, cli);
+    // what a node from before kept for its claude-cli seats, which no
+    // node runs now: the Claude accounts' tokens
+    drop_claude_tokens(vault);
     // the memory left for models, where some of the machine is another's
     let model_memory = model_memory_for(machine_memory(os_of(run_out("uname\n-s"))), api);
     // what its operator declared there (engines, links, anything else) is
@@ -391,7 +280,7 @@ fn install() {
     let existing = std::io::fs::read_file(data + "/capabilities.json") or "";
     std::io::fs::write_file(
         data + "/capabilities.json",
-        node_capabilities(claude, model_memory, existing),
+        node_capabilities(model_memory, existing),
     ) or fail_install(
         "the capabilities file could not be written",
     );
@@ -418,10 +307,9 @@ fn install() {
         capabilities: data + "/capabilities.json",
         port: std::str::parse_int(option("--port", "8081")) or 8081,
         vault_dir: vault,
-        path: path,
+        path: SYSTEM_PATH,
         log: voice + "/node-" + id + ".log"
     };
-    if len(cli) > 0 { println("claude CLI: " + cli); }
     let start = !flag_given("--no-start");
     if mac {
         std::io::fs::write_file(daemon_plist_path(s.name), launchd_daemon_plist(s)) or fail_install(
@@ -546,77 +434,33 @@ fn env_text(name: String) -> String {
     return std::str::trim(std::env::var(name));
 }
 
-/// The prefix a Claude account's token has in the node's vault: its
-/// label, voice's account id, follows (`claude-token--work`), the entry a
-/// claude seat names as its `token_vault`.
+/// The prefix a Claude account's token had in the node's vault, kept there
+/// by an install from before for a claude-cli seat; its label, voice's
+/// account id, followed (`claude-token--work`).
 const CLAUDE_TOKEN_PREFIX: String = "claude-token--";
 
-/// Keep the Claude accounts' tokens the habitat handed over in the node's
-/// vault: each member of `[dna.secrets.claude-token]` (`HALE_SECRET_CLAUDE_TOKEN`,
-/// its entries' names one a line, each `…-claude-token--<label>` in
-/// `HALE_VAULT_DIR`), copied as `claude-token--<label>` (600), and a token
-/// of an account no longer handed over removed: placing the node again is
-/// how its accounts change. Copied by `cp`, so no token is ever a value
-/// here. Installed by hand, with nothing handed over, the vault's tokens
-/// are left as they are.
-fn keep_claude_tokens(vault: String) {
-    let dir = env_text("HALE_VAULT_DIR");
-    if len(dir) == 0 || !std::env::var_exists("HALE_SECRET_CLAUDE_TOKEN") { return; }
-    keep_handed_tokens(dir, std::env::var("HALE_SECRET_CLAUDE_TOKEN"), vault);
-}
-
-/// `keep_claude_tokens` over what was handed over: the habitat's vault
-/// directory `dir`, and `handed`, its members' entries one a line.
+/// Remove the Claude accounts' tokens an install from before kept in the
+/// node's vault (`vault`): nothing on the node reads them since the
+/// claude-cli engine was removed, and a token is not left where nothing
+/// uses it. Removed by `rm`, so no token is ever a value here.
 // once per install, as `install` is
 @unbounded
-fn keep_handed_tokens(dir: String, handed: String, vault: String) {
-    let mut kept = "\n";
-    let mut rest = handed + "\n";
-    while len(rest) > 0 {
-        let nl = std::str::index_of(rest, "\n");
-        let entry = std::str::trim(rest[0..nl]);
-        rest = rest[(nl + 1)..len(rest)];
-        let at = std::str::index_of(entry, "-" + CLAUDE_TOKEN_PREFIX);
-        if at < 0 { continue; }
-        let label = entry[(at + 1 + len(CLAUDE_TOKEN_PREFIX))..len(entry)];
-        if !is_slug(label) {
-            log_warn("a Claude token's label is not an account id", std::log::kv("label", label));
-            continue;
-        }
-        let to = vault + "/" + CLAUDE_TOKEN_PREFIX + label;
-        run_out("cp\n-f\n" + dir + "/" + entry + "\n" + to);
-        run_out("chmod\n600\n" + to);
-        kept = kept + label + "\n";
-    }
-    let had = claude_labels(vault);
-    let mut left = had;
-    while len(left) > 0 {
-        let nl = std::str::index_of(left, "\n");
-        let label = left[0..nl];
-        left = left[(nl + 1)..len(left)];
-        if !std::str::contains(kept, "\n" + label + "\n") {
-            run_out("rm\n-f\n" + vault + "/" + CLAUDE_TOKEN_PREFIX + label);
-        }
-    }
-}
-
-/// The labels of the Claude tokens in the node's vault, one a line.
-// once per install, as `install` is
-@unbounded
-fn claude_labels(vault: String) -> String {
-    let mut out = "";
+fn drop_claude_tokens(vault: String) {
     let mut rest = run_out("ls\n-1\n" + vault);
     while len(rest) > 0 {
         let nl = std::str::index_of(rest, "\n");
         let name = if nl < 0 { rest } else { rest[0..nl] };
         rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
-        if std::str::starts_with(name, CLAUDE_TOKEN_PREFIX)
-            && len(name) > len(CLAUDE_TOKEN_PREFIX)
-        {
-            out = out + name[len(CLAUDE_TOKEN_PREFIX)..len(name)] + "\n";
-        }
+        if claude_token(name) { run_out("rm\n-f\n" + vault + "/" + name); }
     }
-    return out;
+}
+
+/// True when the vault entry `name` is a Claude account's token an install
+/// from before kept (`CLAUDE_TOKEN_PREFIX`, then a label).
+fn claude_token(name: String) -> Bool {
+    return std::str::starts_with(name, CLAUDE_TOKEN_PREFIX)
+        && len(name) > len(CLAUDE_TOKEN_PREFIX)
+        && !std::str::contains(name, "/");
 }
 
 /// The account a node is installed for: the one that ran the command with

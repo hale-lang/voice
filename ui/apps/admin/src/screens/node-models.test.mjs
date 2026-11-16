@@ -9,11 +9,11 @@ const download = (recipe, variant, complete, placed = null) => ({ recipe, varian
 test('a node leads with what its seats serve, a placement named, then what its disk holds alone', () => {
   const rows = nodeModels(
     'node-a',
-    [seat('ds', ['deepseek']), seat('claude', ['sonnet'], 'up', 'claude-cli')],
+    [seat('ds', ['deepseek']), seat('api', ['sonnet'], 'up', 'openai-compatible')],
     [placement('ds', 'deepseek', ['node-b', 'node-a'], 'deepseek-v4.1-flash-1017', 'exl3'), placement('elsewhere', 'tiny', ['node-f'], 'qwen3-0.6b', 'gguf')],
     [download('deepseek-v4.1-flash-1017', 'exl3', true, 'ds'), download('qwen3-coder-next', 'gguf-q8_0', false)],
   );
-  assert.deepEqual(rows.map((r) => r.key), ['seat ds', 'seat claude', 'held qwen3-coder-next gguf-q8_0']);
+  assert.deepEqual(rows.map((r) => r.key), ['seat ds', 'seat api', 'held qwen3-coder-next gguf-q8_0']);
   assert.equal(rows[0].placement?.id, 'ds');
   assert.equal(rows[0].part, 'follower', 'node-b leads the pair; node-a runs the other half');
   assert.equal(heldSaid(rows[0].download), 'whole');

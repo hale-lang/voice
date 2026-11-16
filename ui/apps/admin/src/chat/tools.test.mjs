@@ -5,7 +5,7 @@ import { webFetchOffered } from './tools.ts';
 const on = { web_fetch: { enabled: true, max_calls: 8, timeout_ms: 15000, max_bytes: 2097152, max_chars: 40000, denylist: [] } };
 const off = { web_fetch: { ...on.web_fetch, enabled: false } };
 const tools = { id: 'qwen3-8b', voice: { capabilities: { tools: true } } };
-const plain = { id: 'claude-cli', voice: { capabilities: { tools: false } } };
+const plain = { id: 'echo-1', voice: { capabilities: { tools: false } } };
 
 test('the web fetch toggle shows when the tool is on and the model takes tool calls', () => {
   assert.equal(webFetchOffered(on, tools), true);

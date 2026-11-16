@@ -61,7 +61,7 @@ code conforms to them.
 - `axiom` **The node decides what is possible; the coordinator decides what runs.**
   A node's operator lists, in a file on the machine
   ([`node.yaml`](./spec/node.yaml)), the engines it offers
-  (the static engine, or a CLI with the login it runs under) and its hard
+  (the static engine, the managed engine, or an upstream with its key) and its hard
   limits. The node declares them when it connects, with the machine's
   hardware as it measures it (platform, memory, accelerators, free disk),
   of which the file can hold memory back from models but never add. **A seat** is one of
@@ -129,17 +129,15 @@ start, because the MVP exists to prove them.
 
 ## Agents
 
-- `axiom` **No bypass flags.** A seat that runs an agent CLI never passes the flag
-  that skips its permissions. Each CLI runs under its own policy (allow
-  lists, its sandbox mode), inside a container as the outer boundary, with
-  the worktree as the only thing it may write ([`node/`](./node/)).
+- `axiom` **No bypass flags.** Voice never passes the flag that skips an
+  agent CLI's permissions; it runs no agent CLI at all.
 - `axiom` **Logins stay with the official binaries.** Voice never extracts a
-  token or calls a provider's backend on a subscription's behalf; the CLI
-  holds its login on its node ([`node/`](./node/)).
-- `derived` **Coding harnesses are clients.** Voice serves models; it does
-  not run agentic coding harnesses on repositories. A harness runs outside
-  voice (for a habitat, in its organisms' legs), as a client of its API,
-  its model calls requests like any other.
+  token or calls a provider's backend on a subscription's behalf; a
+  subscription's login stays with its CLI, which runs outside voice.
+- `derived` **Coding harnesses and agent CLIs are clients.** Voice serves
+  models; it runs no agentic coding harness and no agent CLI. One runs
+  outside voice (for a habitat, in its organisms' legs), as a client of its
+  API, its model calls requests like any other.
 
 ## Process model
 
@@ -198,11 +196,11 @@ changes.
    piece is set up through the APIs: a model, an account, the node, its seat,
    a project and a key. This proves configuration, routing, keys, projects,
    limits, budgets, usage records and streaming end to end without a model.
-2. **v1.** Seats wrap the operator's own agent CLIs, several accounts at
-   once: `claude -p` on each Claude account, `codex exec`, and others. They
-   report the usage and quota windows the CLIs return, so usage across every
-   account is visible in one place. The CLIs are a starting point, not a
-   design constraint.
+2. **v1.** The operator's own tooling routes through voice. Agent CLIs and
+   coding harnesses (`claude`, `codex`, and others) run outside it, in the
+   legs of a DNA organization, as clients of its API: their model calls are
+   requests like any other, so usage across every project is visible in one
+   place. Voice runs no CLI itself.
 3. **Later.** Local engines (llama.cpp server, MLX, vLLM) join as seats, with
    routing by memory fit, load and weights on disk.
 
@@ -228,8 +226,6 @@ tooling through voice and see how many tokens each project uses.
 - **Default data class.** Requests default to `internal`. A seat that
   forwards to a hosted provider must be allowed to carry `internal`, or the
   default must change.
-- **Several logins per CLI on one node.** How each CLI keeps them apart:
-  [hale-lang/voice#2](https://github.com/hale-lang/voice/issues/2).
 - **Caller-defined tools.** A backend that cannot return tool calls should
   refuse caller tools with a clear error.
 - **License.** Not chosen yet.

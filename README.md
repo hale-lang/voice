@@ -20,7 +20,7 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
 
 ```
  caller ──HTTP──▶ api ──NATS──▶ node ──▶ seat (an engine under an account)
-                   │  ▲                   managed, openai-compatible, harness, claude-cli, static
+                   │  ▲                   managed, openai-compatible, claude-cli, static
                    ▼  │
                  Postgres ◀── brain (ranks seats into the route table)
 ```
@@ -33,15 +33,13 @@ Voice is written in [Hale](https://github.com/hale-lang/hale).
   - `managed`: a local model voice fetches, verifies and runs (llama.cpp on
     Metal, vLLM or llama.cpp on CUDA), as the operator places it;
   - `openai-compatible`: an endpoint that speaks the OpenAI API;
-  - `harness`: an agentic coding CLI (Claude Code, Codex, Antigravity,
-    Vibe, pi, or one of the operator's CLI recipes) under one login per
-    seat, running coding attempts in a container of their own, or on the
-    node's own machine where a seat opts in
-    ([`docs/coding-attempts.md`](./docs/coding-attempts.md));
-    `claude-cli` is the claude harness under its older name, and also
-    answers requests;
+  - `claude-cli`: Claude Code, logged in as one account per seat;
   - `static`: a canned answer, for trying voice and for tests.
 - **brain** turns the state of the fleet into a ranked route table.
+
+Coding harnesses (Claude Code, Codex and the like, run as agents on a
+repository) are not run by voice: they run outside it, as clients of its
+API, and their model calls are requests like any other.
 
 A request is checked against its key, its project's limits and budget, sent
 to a seat over NATS, streamed back, and metered. A conversation's turns (its
@@ -253,9 +251,8 @@ screens in layers:
   the hosted **web fetch** where its model takes tool calls) and
   **Conversations** (the ledger by conversation; one opened reads as one,
   its context beside the back and forth);
-- **Harness**: **Annotators**, **Tools** (web fetch on or off, its limits
-  and its denylist, [docs/internals.md](docs/internals.md)) and
-  **Attempts**;
+- **Harness**: **Annotators** and **Tools** (web fetch on or off, its
+  limits and its denylist, [docs/internals.md](docs/internals.md));
 - and apart, **Changes** (every admin change, field by field) and **API**
   (the contract);
 - an event log docked at the foot of every screen: requests taking off and
@@ -303,8 +300,7 @@ end-to-end run over Postgres and NATS, a fresh clone as a graft takes it, and th
 ## Status
 
 Running: configuration, the caller's endpoints (streamed and not, many at
-once), coding attempts on four agentic coding CLIs, the node plane, the
-brain, agent-CLI, OpenAI-compatible and managed local seats, usage metering and the ledger, peek recordings, the admin event
+once), the node plane, the brain, agent-CLI, OpenAI-compatible and managed local seats, usage metering and the ledger, peek recordings, the admin event
 stream and the live hub, and voice as a habitat organism (a provider of
 models to the habitat's other organisms, each a project under the habitat's).
 
@@ -314,7 +310,5 @@ models to the habitat's other organisms, each a project under the habitat's).
   request path, state, security, failure and deployment.
 - [`docs/adding-a-node.md`](./docs/adding-a-node.md): a Mac or a Linux
   machine joining as a node, in one command.
-- [`docs/coding-attempts.md`](./docs/coding-attempts.md): running agentic
-  coding CLIs on repositories, their logins, the sandbox and cleanup.
 - [`DIRECTION.md`](./DIRECTION.md): where voice is going.
 - [`FRICTION.md`](./FRICTION.md): what writing voice in Hale has run into.

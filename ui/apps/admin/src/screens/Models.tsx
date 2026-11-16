@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Checkbox, Button, Confirm, micros, when } from '@hale/components';
+import { Panel, Table, Status, Loading, Unavailable, Missing, Kv, Mono, Form, Field, TextInput, NumberInput, Select, Button, Confirm, micros, when } from '@hale/components';
 import { useGet, useNodes, useNodesWhole, useRecipes, type CatalogModel, type Node, type NodeSummary, type Placement } from '../api/client';
 import { useWrite } from '../api/mutate';
 import type { ScreenProps } from '../App';
@@ -9,8 +9,7 @@ import { ContextWindow } from '../context';
 import { NamedByList, useAliasesByModel } from '../aliases';
 import { modelState } from './placement-state';
 import { modelSource, sourceLabel, type EngineKindOf, type ModelSource, type SeatInfo } from './model-source';
-import { apiWrites, harnessKinds, harnessWrites, freshSeatId, loginEntry, noNodeOffers, nodesOffering, priceOf, recipeKinds, runsOnHost, voiceKeyed, type AddWrites, type HarnessInfo, type Offer } from './add-model';
-import { HOST_WARNING } from './cli-recipe';
+import { CLAUDE_MODELS, apiWrites, claudeWrites, freshSeatId, noNodeOffers, nodesOffering, priceOf, tokenEntry, type AddWrites, type Offer } from './add-model';
 
 /**
  * What the Models screen reads besides the catalog: every node's seats (a
@@ -132,9 +131,8 @@ type Path = 'local' | 'subscription' | 'api';
 
 /**
  * Adding a model, by how it is to be served: a local model from a recipe,
- * then placed; a coding CLI's login, a harness seat under the account's
- * login on a node whose capabilities offer a harness engine, as the
- * harness's definition describes it; or a remote API, an
+ * then placed; a Claude subscription, a claude-cli seat under the account's
+ * token on a node whose capabilities offer the CLI; or a remote API, an
  * openai-compatible seat on a node offering that engine. Each with the admin
  * API as it is: the catalog model, then its seat.
  */
@@ -143,19 +141,19 @@ function AddModel() {
   return (
     <>
       <h2 style={{ marginBottom: 'var(--space-3)' }}>Add a model</h2>
-      <Field label="served by" help="local: weights on voice's nodes, placed; a coding CLI: its official CLI under an account's login, flat-rate, for coding attempts (and requests, for claude); a remote API: an OpenAI-compatible endpoint with a key, metered">
-        <Select value={path} onChange={(v) => setPath(v as Path)} options={[{ value: 'local', label: 'local (a recipe, placed)' }, { value: 'subscription', label: "a coding CLI's login" }, { value: 'api', label: 'a remote API' }]} />
+      <Field label="served by" help="local: weights on voice's nodes, placed; a Claude subscription: the claude CLI under an account's login, flat-rate; a remote API: an OpenAI-compatible endpoint with a key, metered">
+        <Select value={path} onChange={(v) => setPath(v as Path)} options={[{ value: 'local', label: 'local (a recipe, placed)' }, { value: 'subscription', label: 'a Claude subscription' }, { value: 'api', label: 'a remote API' }]} />
       </Field>
-      {path === 'local' ? <ModelForm local /> : path === 'subscription' ? <AddHarness /> : <AddApi />}
+      {path === 'local' ? <ModelForm local /> : path === 'subscription' ? <AddClaude /> : <AddApi />}
     </>
   );
 }
 
-/** The nodes offering an engine of one of `kinds`, as the add forms read them. */
-function useOffers(...kinds: string[]): { offers: Offer[]; ready: boolean } {
+/** The nodes offering an engine of `kind`, as the add forms read them. */
+function useOffers(kind: string): { offers: Offer[]; ready: boolean } {
   const f = useFleet();
   const allRead = f.nodes.isSuccess && f.declared.length === (f.nodes.data?.data.length ?? 0);
-  return { offers: nodesOffering(f.declared, ...kinds), ready: allRead };
+  return { offers: nodesOffering(f.declared, kind), ready: allRead };
 }
 
 /** The catalog model, then its seat; a model already in the catalog that nothing serves is kept, not made again. */
@@ -176,90 +174,52 @@ async function addBoth(w: ReturnType<typeof useWrite>, writes: AddWrites, catalo
   return null;
 }
 
-/**
- * One form for every coding CLI: the recipe (it says how a login of it is
- * made and named, and where it may run), the node and engine that run it,
- * the account it spends, its login, the CLI's own name for its model, and,
- * for a recipe that can run on the host, whether the seat opts in to it.
- */
-function AddHarness() {
+function AddClaude() {
   const w = useWrite();
   const catalog = useGet('/admin/v1/models');
   const accounts = useGet('/admin/v1/accounts');
-  const defs = useGet('/admin/v1/cli-recipes');
   const nodes = useNodes();
-  const [harness, setHarness] = useState('');
-  const [hostOptIn, setHostOptIn] = useState(false);
-  // the enabled recipes: a disabled one's seats take no attempt
-  const list: HarnessInfo[] = (defs.data?.data ?? []).filter((r) => r.enabled).map((r) => r.recipe as unknown as HarnessInfo);
-  const h = list.find((d) => d.id === harness) ?? list[0];
-  const { offers, ready } = useOffers(...harnessKinds(h?.id ?? ''));
+  const { offers, ready } = useOffers('claude-cli');
   const [node, setNode] = useState('');
   const [account, setAccount] = useState('');
-  const [login, setLogin] = useState('');
-  const [loginSet, setLoginSet] = useState(false);
-  const [cliModel, setCliModel] = useState('');
+  const [vault, setVault] = useState('');
+  const [vaultSet, setVaultSet] = useState(false);
+  const [cliModel, setCliModel] = useState('opus');
   const [name, setName] = useState('');
   const [nameSet, setNameSet] = useState(false);
   const [refused, setRefused] = useState<string | null>(null);
-  if (defs.isPending || !ready) return <Loading what="the CLI recipes and the nodes' engines" />;
-  if (!h) return <p className="c-fail">voice has no enabled CLI recipe: enable one, or make one, in <a href={href('clis')}>CLI recipes</a>.</p>;
   const offer = offers.find((o) => o.node === node) ?? (offers.length === 1 ? offers[0] : undefined);
-  // a CLI under voice's own key names no login, and its model is the voice model it calls
-  const keyed = voiceKeyed(h);
-  const shownLogin = keyed ? '' : loginSet ? login : loginEntry(h, account);
-  const shownName = nameSet ? name : `${h.id}-${cliModel.trim() || 'default'}`;
-  const kinds = recipeKinds(h);
-  const host = runsOnHost(h, hostOptIn);
+  const shownVault = vaultSet ? vault : account ? tokenEntry(account) : '';
+  const shownName = nameSet ? name : `claude-${cliModel || 'default'}`;
+  if (!ready) return <Loading what="the nodes' engines" />;
+  if (offers.length === 0) return <p className="c-fail">{noNodeOffers('claude-cli')}.</p>;
   return (
     <Form
       error={refused ?? w.error}
       onSubmit={async () => {
         if (!offer) return;
-        setRefused(await addBoth(w, harnessWrites({ model: shownName, offer, account, harness: h.id, login: shownLogin, cliModel, host }), catalog.data?.data ?? [], nodes.data?.data ?? []));
+        setRefused(await addBoth(w, claudeWrites({ model: shownName, offer, account, vault: shownVault, cliModel }), catalog.data?.data ?? [], nodes.data?.data ?? []));
       }}
       actions={
         <>
-          <Button type="submit" tone="primary" disabled={w.busy || !offer || !account || (keyed ? !cliModel.trim() : !shownLogin) || !shownName}>add</Button>
+          <Button type="submit" tone="primary" disabled={w.busy || !offer || !account || !shownVault || !shownName}>add</Button>
           <Button onClick={() => go('models')}>cancel</Button>
         </>
       }
     >
-      <Field label="CLI recipe" required help="the coding CLI, as its recipe runs it, under its own permission policy (CLI recipes)">
-        <Select value={h.id} onChange={(v) => { setHarness(v); setNameSet(false); setLoginSet(false); setHostOptIn(false); }} options={list.map((d) => ({ value: d.id, label: `${d.id} · ${d.name}` }))} required />
+      <Field label="node" required help="one whose capabilities offer the claude CLI (its install does when the vault holds a Claude token)">
+        <Select value={offer?.node ?? ''} onChange={setNode} options={offers.map((o) => ({ value: o.node, label: `${o.node} · ${o.engine}` }))} required empty={offers.length === 1 ? undefined : ''} />
       </Field>
-      {kinds.includes('host') && kinds.includes('container') && (
-        <Checkbox checked={hostOptIn} onChange={setHostOptIn} label="run it on the node's own machine (the host), not in a container" />
-      )}
-      {kinds.includes('host') && !kinds.includes('container') && <p className="faint">This recipe runs only on the host.</p>}
-      {host && <p className="c-wait">{HOST_WARNING}</p>}
-      {offers.length === 0 ? (
-        <p className="c-fail">{noNodeOffers('harness')}.</p>
-      ) : (
-        <Field label="node" required help="one whose capabilities offer a harness engine">
-          <Select value={offer?.node ?? ''} onChange={setNode} options={offers.map((o) => ({ value: o.node, label: `${o.node} · ${o.engine}` }))} required empty={offers.length === 1 ? undefined : ''} />
-        </Field>
-      )}
       <Field label="account" required help="the subscription it spends: flat-rate, its windows the only cap">
         <Select value={account} onChange={setAccount} options={(accounts.data?.data ?? []).filter((a) => a.status === 'active').map((a) => ({ value: a.id, label: `${a.id} · ${a.billing}` }))} required empty="" />
       </Field>
-      {keyed ? (
-        <p>{h.login.describe ?? "It runs under voice's own key, minted for each attempt: the seat names no login."}</p>
-      ) : (
-        <Field label="login" required help={`${h.login.describe ?? ''}${h.login.setup ? ` On the node: ${h.login.setup}` : ''}`}>
-          <TextInput mono value={shownLogin} onChange={(v) => { setLogin(v); setLoginSet(true); }} required placeholder={loginEntry(h, 'work')} />
-        </Field>
-      )}
-      {keyed ? (
-        <Field label="model" required help="the voice model it calls: a catalog model's name, which the attempt's project may use">
-          <TextInput mono value={cliModel} onChange={setCliModel} required placeholder="a voice model" />
-        </Field>
-      ) : (
-        <Field label="model" help="the CLI's own name for its model; its default when empty">
-          <TextInput mono value={cliModel} onChange={setCliModel} placeholder="its default" />
-        </Field>
-      )}
-      <Field label="name" required help="the catalog model attempts and requests name; never reused for a different model">
+      <Field label="token's vault entry" required help="where the node's vault holds the account's token: the install keeps it as claude-token--<account>">
+        <TextInput mono value={shownVault} onChange={(v) => { setVault(v); setVaultSet(true); }} required placeholder="claude-token--work" />
+      </Field>
+      <Field label="Claude model" help="the CLI's own alias for it">
+        <Select value={cliModel} onChange={setCliModel} options={CLAUDE_MODELS} />
+      </Field>
+      <Field label="name" required help="what callers name; never reused for a different model">
         <TextInput mono value={shownName} onChange={(v) => { setName(v); setNameSet(true); }} required />
       </Field>
     </Form>

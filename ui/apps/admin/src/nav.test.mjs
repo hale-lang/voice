@@ -26,8 +26,6 @@ test('every screen has a route of its own, which opens it with its item', () => 
     conversations: '#/conversations/history',
     annotators: '#/harness/annotators',
     tools: '#/harness/tools',
-    attempts: '#/harness/attempts',
-    clis: '#/harness/clis',
     changes: '#/changes',
     api: '#/api',
   };
@@ -54,9 +52,6 @@ test('the deep links the screens write open on their new routes', () => {
     [['conversations', 'conv 7'], '#/conversations/history/conv%207'],
     [['chat', 'c1'], '#/conversations/chat/c1'],
     [['annotators', 'rules', 'r1'], '#/harness/annotators/rules/r1'],
-    [['attempts', 'a1'], '#/harness/attempts/a1'],
-    [['clis', 'claude'], '#/harness/clis/claude'],
-    [['clis', 'new'], '#/harness/clis/new'],
     [['projects', 'work'], '#/projects/work'],
     [['api', 'schema', 'Model'], '#/api/schema/Model'],
     [['changes', 'ch1'], '#/changes/ch1'],
@@ -86,7 +81,6 @@ test('every route from before the layers opens where its screen lives now, its q
     ['#/chat/c1', '#/conversations/chat/c1', ['chat', 'c1']],
     ['#/annotators/rules/r1', '#/harness/annotators/rules/r1', ['annotators', 'rules', 'r1']],
     ['#/tools', '#/harness/tools', ['tools']],
-    ['#/attempts/a1', '#/harness/attempts/a1', ['attempts', 'a1']],
     // Usage, by its view, or by what it opened
     ['#/usage', '#/models/requests', ['requests']],
     ['#/usage?view=requests&status=failed', '#/models/requests?status=failed', ['requests']],
@@ -97,6 +91,11 @@ test('every route from before the layers opens where its screen lives now, its q
     // a layer's own path opens its first screen
     ['#/conversations', '#/conversations/chat', ['chat']],
     ['#/harness', '#/harness/annotators', ['annotators']],
+    // the screens coding attempts had are gone: theirs open the Harness layer
+    ['#/harness/attempts', '#/harness/annotators', ['annotators']],
+    ['#/harness/attempts/a1?project=work', '#/harness/annotators', ['annotators']],
+    ['#/harness/clis/claude', '#/harness/annotators', ['annotators']],
+    ['#/attempts/a1', '#/harness/annotators', ['annotators']],
   ];
   for (const [old, now, parts] of moved) {
     const r = open(old);
@@ -122,7 +121,7 @@ test('the rail: Overview, the Models layer, Projects, Conversations, Harness, an
       ['Models', false, ['Catalogue', 'Placements', 'Nodes', 'Recipes', 'Runtimes', 'Accounts', 'Routes', 'Requests', 'Live']],
       [null, false, ['Projects']],
       ['Conversations', false, ['Chat', 'Conversations']],
-      ['Harness', false, ['Annotators', 'Tools', 'Attempts', 'CLI recipes']],
+      ['Harness', false, ['Annotators', 'Tools']],
       [null, true, ['Changes', 'API']],
     ],
   );

@@ -33,12 +33,6 @@
 #     annotation, step, turn or title, a budget spent, a change, a child, an
 #     annotator naming it), it stays, archived, its key revoked.
 #
-# Then coding attempts that ended before migration 38: each failed one is
-# given the kind of failure its text names where voice wrote that text
-# itself (one of each, and a node's text before its exit's), `internal`
-# for a text voice did not write (a harness's own), and a done or
-# cancelled one none.
-#
 # Then the ledger's hourly rollup (migration 40): on a store at migration
 # 39 with a ledger, the migration's backfill is what the ledger sums to,
 # hour for hour (failures counted, a system key's rows their own, another
@@ -48,6 +42,11 @@
 # Then when a seat's state began (migration 41): a seat's state from
 # before takes the time of its last report as its `since`, and a state an
 # api from before writes after it, with none, begins now.
+#
+# Then coding attempts leaving voice (migration 45): on a store at
+# migration 44 holding attempts, their events and bundles, CLI recipes and
+# an attempt's ledger record, the attempts' tables and the recipes' are
+# gone, and the ledger and its rollup keep the record.
 #
 # Needs api/api built, psql, curl and python3.
 set -euo pipefail
@@ -255,55 +254,6 @@ test "$(q "SELECT p.status || ':' || p.internal || ':' || k.status FROM project 
 test "$(q "SELECT count(*) FROM api_key WHERE internal AND id LIKE '%-system'")" = 2
 echo "where anything was recorded under it, it stays, archived, its key revoked"
 
-# coding attempts' failure kinds (migration 38), from the text of each
-# failure an api or a node from before wrote
-store_at 37
-psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
-CREATE TEMP TABLE want (id text, state text, failure text, kind text);
-INSERT INTO want VALUES
-  ('a01', 'failed', 'its deadline passed before a seat took it', 'past_deadline'),
-  ('a02', 'failed', 'it passed its deadline', 'past_deadline'),
-  ('a03', 'failed', 'the harness used more than its budget of 1000 tokens', 'over_budget'),
-  ('a04', 'failed', 'its project or key is no longer active', 'key_revoked'),
-  ('a05', 'failed', 'its node stopped reporting it', 'node_lost'),
-  ('a06', 'failed', 'its node restarted while it ran', 'node_lost'),
-  ('a07', 'failed', 'the node stopped while it ran', 'node_lost'),
-  ('a08', 'failed', 'the harness made no change', 'no_changes'),
-  ('a09', 'failed', 'the repository could not be fetched at main: fatal: unable to access', 'repo_unavailable'),
-  ('a10', 'failed', 'the base is not a commit', 'repo_unavailable'),
-  ('a11', 'failed', 'login work holds no auth.json on this node: set it up as the harness says (codex login)', 'login_unavailable'),
-  ('a12', 'failed', 'login work''s auth.json could not be copied', 'login_unavailable'),
-  ('a13', 'failed', 'the node''s vault holds no login claude-work for this seat', 'login_unavailable'),
-  ('a14', 'failed', 'the login could not be written privately for the harness', 'login_unavailable'),
-  ('a15', 'failed', 'this node has no docker: attempts run in a container', 'sandbox_failed'),
-  ('a16', 'failed', 'the image voice-harness-fake:0123 could not be built: no space left', 'sandbox_failed'),
-  ('a17', 'failed', 'the attempt''s network could not be made: daemon down', 'sandbox_failed'),
-  ('a18', 'failed', 'the attempt''s egress proxy could not start: conflict', 'sandbox_failed'),
-  ('a19', 'failed', 'the attempt''s egress proxy could not join its network: gone', 'sandbox_failed'),
-  ('a20', 'failed', 'the harness exited with code 125: docker: invalid reference format', 'sandbox_failed'),
-  ('a21', 'failed', 'the harness exited with code 127: docker could not be started', 'sandbox_failed'),
-  ('a22', 'failed', 'the commits'' bundle is over 6 MiB, the most voice holds', 'bundle_too_large'),
-  ('a23', 'failed', 'the harness exited with code 1: Error: rate limited', 'harness_failed'),
-  ('a24', 'failed', 'the harness was silent for more than 900 s', 'harness_failed'),
-  ('a25', 'failed', 'the workspace''s commits could not be taken: fatal: bad object', 'harness_failed'),
-  ('a26', 'failed', 'the harness''s commits do not build on the base', 'harness_failed'),
-  ('a27', 'failed', 'what the harness left could not be committed: fatal: index.lock', 'harness_failed'),
-  ('a28', 'failed', 'the commits could not be bundled: fatal: bad revision', 'internal'),
-  ('a29', 'failed', 'the api did not take the bundle (500)', 'internal'),
-  ('a30', 'failed', 'its harness is not one this node runs: no image', 'internal'),
-  ('a31', 'failed', 'I could not finish: the tests fail', 'internal'),
-  ('a32', 'done', '', ''),
-  ('a33', 'cancelled', 'cancelled before it started', '');
-INSERT INTO attempt (id, project, key, state, body, branch, failure, created_at, deadline_at)
-  SELECT id, 'work', 'k_work', state, '{}', 'voice/attempt-' || id, failure, now(), now() FROM want;
-CREATE TABLE wanted_kinds AS SELECT * FROM want;
-SQL
-migrate $((head - 37))
-bad=$(q "SELECT string_agg(w.id || ': ' || a.failure_kind || ' for ' || w.kind, '; ' ORDER BY w.id) FROM wanted_kinds w JOIN attempt a ON a.id = w.id WHERE a.failure_kind <> w.kind")
-[ -z "$bad" ] || { echo "a failed attempt from before has the wrong kind: $bad" >&2; exit 1; }
-test "$(q "SELECT count(*) FROM attempt")" = 33
-echo "attempts that failed before migration 38 have the kind their failure names, internal when voice did not write it; none when they did not fail"
-
 # the ledger's hourly rollup (migration 40), backfilled from the ledger an
 # api from before wrote
 store_at 39
@@ -350,3 +300,22 @@ test "$(q "SELECT count(*) FROM seat_state WHERE since = reported_at")" = 2
 q "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('mini', 'late', 'starting', 0, now())" >/dev/null
 test "$(q "SELECT count(*) FROM seat_state WHERE seat = 'late' AND now() - since < interval '1 minute'")" = 1
 echo "migration 41 gives each seat's state from before the time of its last report as its since: $(tail -1 "$work/migrate.log")"
+
+# coding attempts leave voice (migration 45): what they kept is dropped,
+# and the ledger keeps the record an attempt settled
+store_at 44
+psql -q -v ON_ERROR_STOP=1 "$DATABASE_URL" >/dev/null <<'SQL'
+INSERT INTO attempt (id, project, key, state, body, branch, failure, failure_kind, created_at, deadline_at, ended_at) VALUES
+  ('att_1', 'work', 'k_work', 'done', '{}', 'voice/attempt-att_1', '', '', now(), now(), now()),
+  ('att_2', 'work', 'k_work', 'failed', '{}', 'voice/attempt-att_2', 'it passed its deadline', 'past_deadline', now(), now(), now());
+INSERT INTO attempt_event (attempt, seq, at, kind, text) VALUES ('att_1', 1, now(), 'text', 'done');
+INSERT INTO attempt_bundle (attempt, bundle, bytes, created_at) VALUES ('att_1', 'UEFDSw==', 4, now());
+INSERT INTO cli_recipe (id, body, origin, created_at, updated_at) VALUES ('claude', '{}', 'shipped', now(), now());
+INSERT INTO usage (id, created_at, project, key, requested_model, status, output_tokens, record) VALUES
+  ('att_1', '2026-11-03T09:00:00Z', 'work', 'k_work', 'fake-1', 'served', 5, '{"endpoint": "attempt"}');
+SQL
+migrate $((head - 44))
+test "$(q "SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('attempt', 'attempt_event', 'attempt_bundle', 'cli_recipe')")" = 0
+test "$(q "SELECT record->>'endpoint' FROM usage WHERE id = 'att_1'")" = attempt
+test "$(q "SELECT requests || ':' || output_tokens FROM usage_hourly WHERE key = 'k_work' AND model = 'fake-1'")" = "1:5"
+echo "migration 45 drops the attempts' and the CLI recipes' tables, and the ledger keeps an attempt's record: $(tail -1 "$work/migrate.log")"

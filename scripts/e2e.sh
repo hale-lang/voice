@@ -39,7 +39,7 @@ NERVES_PORT=${NERVES_PORT:-14297}
 NOHEAD_PORT=${NOHEAD_PORT:-14300}
 DECIDE_PORT=${DECIDE_PORT:-14301}
 KEPT_PORT=${KEPT_PORT:-14302}
-# the tool-argument case's strict upstream (14303 is the attempts case's git daemon)
+# the tool-argument case's strict upstream
 STRICT_PORT=${STRICT_PORT:-14304}
 work=$(mktemp -d)
 container=""
@@ -49,6 +49,9 @@ cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   if [ -n "$container" ]; then docker stop "$container" >/dev/null 2>&1 || true; fi
   docker stop "$org_container" >/dev/null 2>&1 || true
+  # the strays the leftovers case made, by their own names
+  docker rm -f "voice-e2e-stray-$$" "voice-e2e-other-$$" >/dev/null 2>&1 || true
+  docker network rm "voice-e2e-stray-$$" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -105,12 +108,8 @@ fi
 # measures, not what glibc's heap kept of earlier requests (its threshold
 # otherwise rises to the largest block freed, up to 32 MiB, and freed
 # blocks stay resident to be reused, or not, as they fit)
-# the harness definitions voice ships, and the fake harness the attempts
-# case runs (scripts/e2e-harnesses)
-mkdir "$work/harnesses"
-cp harnesses/*.json scripts/e2e-harnesses/fake.json "$work/harnesses/"
 GLIBC_TUNABLES=glibc.malloc.mmap_threshold=1048576 HALE_DNA_NATS_ORG=zzorg HALE_DNA_NATS_URL_APP="nats://127.0.0.1:${NERVES_PORT}" HALE_DNA_NATS_USER_APP=app-voice HALE_DNA_NATS_VAULT_APP=nats-zzorg-app-voice HALE_VAULT_DIR="$work/vault" HALE_SECRET_TENANT_KEY_FAMILY=secret-dna_e2e-tenant-key-- HALE_DNA_HABITAT_NAME=e2e \
-  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 --harnesses "$work/harnesses" "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
+  api/api --port "$API_PORT" --nats "$NATS_URL" --seat-first-s 30 --seat-idle-s 10 "${store[@]}" --state "$work/state" >"$work/api.log" 2>&1 &
 api_pid=$!
 pids+=($api_pid)
 for i in $(seq 1 50); do curl -fsS "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
@@ -286,28 +285,6 @@ curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -
 [ "$(ask_tenant)" != 200 ] || { echo "a tenant narrowed to no account was served"; exit 1; }
 curl -fsS -X PATCH -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a" -H 'content-type: application/json' -d '{"inherits": true}' >/dev/null
 [ "$(ask_tenant)" = 200 ] || { echo "a tenant set to inherit again was not served: $(cat "$work/tenant.out")"; exit 1; }
-# a pi attempt the tenant starts runs under a key voice mints for it (a
-# node enrolled for it claims it here by hand): the key calls inference as
-# long as the tenant holds the key that asked, and names nobody once the
-# tenant's member is rotated or removed (api/projects.hl, attempt_context)
-post /admin/v1/models '{"id": "pi-e2e"}' >/dev/null
-pitoken=$(post /admin/v1/nodes '{"id": "keyer"}' | field enrollment_token)
-post /admin/v1/nodes/keyer/seats '{"id": "pi", "engine": "coding", "account": "static", "concurrency": 2, "serves": [{"model": "pi-e2e"}], "config": {"harness": "pi", "model": "echo-1"}}' >/dev/null
-piv=$(curl -fsS -X POST "$api/node/v1/register" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' \
-  -d '{"protocol": 2, "version": "e2e", "capabilities": {"engines": [{"id": "coding", "kind": "harness", "models": null, "config_schema": {"type": "object", "required": ["harness"]}}]}, "local": {"paused": false, "paused_seats": []}}' \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["assignment"]["version"])')
-curl -fsS -X POST "$api/node/v1/seats" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' \
-  -d '{"assignment_version": '"$piv"', "seats": [{"id": "pi", "status": "up", "reason": null, "in_flight": 0}]}' >/dev/null
-pi_attempt() {
-  [ "$(tenant /v1/attempts "$1" -H 'content-type: application/json' -d '{"repo": "https://forge.example.com/team/app.git", "base": "main", "instruction": "add a HELLO.md", "harness": "pi"}')" = 202 ] \
-    || { echo "the tenant's pi attempt was refused: $(cat "$work/tenant.out")"; exit 1; }
-  curl -fsS -X POST "$api/node/v1/attempts/claim" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' -d '{}' \
-    | python3 -c 'import json,sys; a=json.load(sys.stdin)["attempt"]; assert a["harness"]["id"] == "pi" and a["login"] == "" and a["model"] == "echo-1", a; print(a["id"], a["credential"])'
-}
-read -r pi1 pikey1 <<<"$(pi_attempt "$tenant_key")"
-[ "$(tenant /v1/models "$pikey1")" = 200 ] || { echo "an attempt's key was refused on /v1/models: $(cat "$work/tenant.out")"; exit 1; }
-[ "$(tenant /v1/attempts "$pikey1")" = 403 ] || { echo "an attempt's key listed attempts"; exit 1; }
-! grep -qF "$pikey1" "$work/api.log" || { echo "the api logged an attempt's key"; exit 1; }
 # renamed by the operator, it is still the tenant's: rotated, the old value
 # stops and the new one serves; removed, it stops
 tkey=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/projects/e2e-organism-a/keys" | python3 -c 'import json,sys; print([k for k in json.load(sys.stdin)["data"] if not k["internal"]][0]["id"])')
@@ -316,16 +293,8 @@ tenant_new=$(openssl rand -hex 16)
 printf '%s' "$tenant_new" >"$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_key")" = 401 ] || { echo "a rotated tenant key's old value still works"; exit 1; }
 [ "$(tenant /v1/models "$tenant_new")" = 200 ] || { echo "a rotated tenant key's new value was refused"; exit 1; }
-[ "$(tenant /v1/models "$pikey1")" = 401 ] || { echo "an attempt's key still works once the tenant's key that asked was rotated"; exit 1; }
-read -r pi2 pikey2 <<<"$(pi_attempt "$tenant_new")"
-[ "$(tenant /v1/models "$pikey2")" = 200 ] || { echo "the rotated tenant's attempt key was refused: $(cat "$work/tenant.out")"; exit 1; }
 rm -f "$work/vault/secret-dna_e2e-tenant-key--organism-a"
 [ "$(tenant /v1/models "$tenant_new")" = 401 ] || { echo "a removed tenant's key still works"; exit 1; }
-[ "$(tenant /v1/models "$pikey2")" = 401 ] || { echo "an attempt's key still works once its tenant was removed"; exit 1; }
-for a in "$pi1" "$pi2"; do
-  curl -fsS -X POST "$api/node/v1/attempts/$a/report" -H "Authorization: Bearer $pitoken" -H 'content-type: application/json' -d '{"state": "failed", "failure": "an e2e check", "events": []}' >/dev/null
-done
-echo "a tenant's pi attempt runs under a key voice minted for it, which names nobody once the tenant's key is rotated or removed"
 echo "a tenant's key: a child of the habitat's project, inheriting its accounts live; narrowed and inheriting again; renamed, rotated and removed"
 # every project has its own system key for the requests voice makes for it
 # (annotate.hl): listed with its keys, internal, and no token names it
@@ -997,117 +966,35 @@ echo "a request to a seat at capacity waited $(python3 -c 'import json,sys; prin
 curl -H @"$work/admin.h" -fsS -X PATCH "$api/admin/v1/nodes/laptop/seats/static" -H 'content-type: application/json' -d '{"config": {"text": "hello from voice", "chunk_chars": 8}}' >/dev/null
 wait_for up
 
-# coding attempts (api/attempts.hl, node/attempt.hl): a node with a harness
-# engine runs the fake harness (scripts/e2e-harnesses/fake.json) on a
-# repository served by git daemon. The attempt ends with a bundle that
-# applies on its base and reproduces its head, committed as the caller's
-# identity, its transcript's digest the stored transcript's, its usage in
-# the ledger; a slow one is cancelled; and nothing is left on the node:
-# no container, no network, no workspace. A node that starts removes what
-# an attempt of its own left before.
-GITD_PORT=${GITD_PORT:-14303}
+# what coding attempts left on a node from before (node/leftovers.hl): a
+# container and a network with voice's attempt label for the node, and its
+# `attempts` and `clis` directories, removed as it starts; a container
+# labelled for another node is not its to remove
 CODER_PORT=${CODER_PORT:-18110}
-mkdir -p "$work/repos" "$work/seed"
-git -C "$work/seed" init -q -b main
-echo "# demo" >"$work/seed/README.md"
-git -C "$work/seed" add README.md
-git -C "$work/seed" -c user.name=seed -c user.email=seed@example.com commit -qm init
-git clone -q --bare "$work/seed" "$work/repos/demo.git"
-git daemon --reuseaddr --base-path="$work/repos" --export-all --listen=127.0.0.1 --port="$GITD_PORT" "$work/repos" >"$work/gitd.log" 2>&1 &
-pids+=($!)
-printf 'e2e-fake-login-%s' "$RANDOM$RANDOM" >"$work/vault/e2e-fake-login"
-chmod 600 "$work/vault/e2e-fake-login"
-post /admin/v1/models '{"id": "fake-1"}' >/dev/null
-post /admin/v1/accounts '{"id": "coder", "name": "Coder"}' >/dev/null
 coder_token=$(post /admin/v1/nodes '{"id": "coder"}' | field enrollment_token)
-post /admin/v1/nodes/coder/seats '{"id": "fake", "engine": "fake", "account": "coder", "serves": [{"model": "fake-1"}], "config": {"harness": "fake", "login": "e2e-fake-login"}}' >/dev/null
-echo '{"engines": [{"id": "fake", "kind": "harness"}]}' >"$work/coder-caps.json"
-start_coder() {
-  HALE_VAULT_DIR="$work/vault" node/node --id coder --api "$api" --token "$coder_token" --data "$work/coder-data" --capabilities "$work/coder-caps.json" --port "$CODER_PORT" --readings-port "$((CODER_PORT + 1000))" >>"$work/coder.log" 2>&1 &
-  coder_pid=$!
-  pids+=($coder_pid)
-  # its own API answers once it started (and removed what attempts left)
-  for i in $(seq 1 100); do curl -fsS "http://127.0.0.1:${CODER_PORT}/node/v1/status" >/dev/null 2>&1 && break; sleep 0.2; done
-  for i in $(seq 1 100); do [ "$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/nodes/coder/seats/fake" | field status)" = "up" ] && break; sleep 0.2; done
-}
-start_coder
-printf '%s' "$key" >"$work/key"
-attempt() { curl -fsS -X POST "$api/v1/attempts" -H "authorization: Bearer $key" -H 'content-type: application/json' -d "$1" | field id; }
-attempt_state() { curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key" | field state; }
-until_ended() { for i in $(seq 1 600); do case $(attempt_state "$1") in done|failed|cancelled) return 0;; esac; sleep 0.5; done; echo "attempt $1 did not end"; tail -20 "$work/coder.log"; exit 1; }
+echo '{"engines": [{"id": "static", "kind": "static"}]}' >"$work/coder-caps.json"
 left_on_coder() {
   docker ps -aq --filter label=net.hale-lang.voice.attempt.node=coder
   docker network ls -q --filter label=net.hale-lang.voice.attempt.node=coder
-  ls -A "$work/coder-data/attempts"
+  ls -d "$work/coder-data/attempts" "$work/coder-data/clis" 2>/dev/null || true
 }
-# the node reports an attempt's end before it removes what the attempt
-# made (node/attempt.hl, `finish`): what is left once it ended, after the
-# node has had its time to remove it
-left_after_end() {
-  for i in $(seq 1 40); do [ -z "$(left_on_coder)" ] && return 0; sleep 0.5; done
-  left_on_coder
-}
-done_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"leave-uncommitted: add FAKE.md\", \"as\": {\"name\": \"E2E Author\", \"email\": \"e2e@example.com\"}}")
-until_ended "$done_id"
-curl -fsS "$api/v1/attempts/$done_id" -H "authorization: Bearer $key" >"$work/attempt.json"
-curl -fsS "$api/v1/attempts/$done_id/transcript" -H "authorization: Bearer $key" >"$work/transcript.jsonl"
-curl -fsS "$api/v1/attempts/$done_id/bundle" -H "authorization: Bearer $key" -o "$work/attempt.bundle"
-(cd spec/validate && node attempt.mjs ../../build/openapi.bundled.json "$api" "$work/key" "$done_id")
-git -C "$work/seed" bundle verify -q "$work/attempt.bundle"
-git -C "$work/seed" fetch -q "$work/attempt.bundle" "voice/attempt-$done_id:refs/heads/attempt"
-python3 - "$work/attempt.json" "$work/transcript.jsonl" "$(git -C "$work/seed" rev-parse main)" "$(git -C "$work/seed" rev-parse attempt)" "$(git -C "$work/seed" log -1 --format='%an <%ae>' attempt)" <<'PY'
-import hashlib, json, sys
-a = json.load(open(sys.argv[1]))
-transcript = open(sys.argv[2], 'rb').read()
-base, head, author = sys.argv[3], sys.argv[4], sys.argv[5]
-assert a["state"] == "done", a
-assert a["failure_kind"] is None and a["failure"] is None, "done is no failure"
-assert a["base_sha"] == base, (a["base_sha"], base)
-assert a["head_sha"] == head, ("the bundle reproduces head_sha", a["head_sha"], head)
-assert author == "E2E Author <e2e@example.com>", author
-assert a["summary"] == "Added FAKE.md", a["summary"]
-assert a["transcript_digest"] == "sha256:" + hashlib.sha256(transcript).hexdigest(), "the digest is the stored transcript's"
-assert a["served"]["seat"] == "fake" and a["served"]["account"] == "coder", a["served"]
-assert a["usage"]["reported"] is False and a["usage"]["input_tokens"] is None, "nothing invented for a harness that reports none"
-PY
-curl -H @"$work/admin.h" -fsS "$api/admin/v1/usage/$done_id" | python3 -c 'import json,sys; u=json.load(sys.stdin); assert u["endpoint"] == "attempt" and u["conversation"] == u["id"], u'
-[ "$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/attempts/$done_id/bundle" -H "authorization: Bearer $key")" = 404 ] || { echo "a bundle is fetched once"; exit 1; }
-left=$(left_after_end); [ -z "$left" ] || { echo "an attempt left something on its node: $left"; exit 1; }
-echo "an attempt ran the fake harness: its bundle applies on its base and reproduces $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["head_sha"][:12])' "$work/attempt.json"), committed as the caller; nothing is left on the node"
-slow_id=$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"slow: add FAKE.md\"}")
-for i in $(seq 1 600); do curl -fsS "$api/v1/attempts/$slow_id/transcript" -H "authorization: Bearer $key" | grep -q 'taking my time' && break; sleep 0.5; done
-curl -fsS -X POST "$api/v1/attempts/$slow_id/cancel" -H "authorization: Bearer $key" >/dev/null
-until_ended "$slow_id"
-[ "$(attempt_state "$slow_id")" = cancelled ] || { echo "a cancelled attempt is cancelled"; exit 1; }
-[ "$(curl -fsS "$api/v1/attempts/$slow_id" -H "authorization: Bearer $key" | field failure_kind)" = None ] || { echo "a cancel is no failure"; exit 1; }
-left=$(left_after_end); [ -z "$left" ] || { echo "a cancelled attempt left something on its node: $left"; exit 1; }
-echo "a running attempt is cancelled: its container is removed, and nothing is left on the node"
-# each way an attempt fails names its kind: a repository that cannot be
-# fetched, a harness that fails or changes nothing, and a deadline passed
-# while it runs
-failure_kind() { curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key" | field failure_kind; }
-failed_as() {
-  until_ended "$1"
-  [ "$(attempt_state "$1")" = failed ] && [ "$(failure_kind "$1")" = "$2" ] || { echo "attempt $1 is not failed as $2: $(curl -fsS "$api/v1/attempts/$1" -H "authorization: Bearer $key")"; exit 1; }
-  left=$(left_after_end); [ -z "$left" ] || { echo "a failed attempt left something on its node: $left"; exit 1; }
-}
-failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/missing.git\", \"base\": \"main\", \"instruction\": \"add FAKE.md\"}")" repo_unavailable
-failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"give-up: add FAKE.md\"}")" harness_failed
-failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"no-change: add FAKE.md\"}")" no_changes
-soon=$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=20)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
-failed_as "$(attempt "{\"repo\": \"git://127.0.0.1:${GITD_PORT}/demo.git\", \"base\": \"main\", \"instruction\": \"slow: add FAKE.md\", \"deadline\": \"$soon\"}")" past_deadline
-echo "a failed attempt names its kind: repo_unavailable, harness_failed, no_changes and past_deadline, each as it happened"
-# a node that starts removes what its attempts left: a container and a
-# network with its label, and a workspace
+stray_image=docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+docker network create --internal --label net.hale-lang.voice.attempt.node=coder "voice-e2e-stray-$$" >/dev/null
+docker create --label net.hale-lang.voice.attempt.node=coder --name "voice-e2e-stray-$$" "$stray_image" true >/dev/null
+docker create --label net.hale-lang.voice.attempt.node=not-coder --name "voice-e2e-other-$$" "$stray_image" true >/dev/null
+mkdir -p "$work/coder-data/attempts/att_0000stray/work" "$work/coder-data/clis/pi/1.5.2"
+[ -n "$(left_on_coder)" ] || { echo "the strays were not made"; exit 1; }
+node/node --id coder --api "$api" --token "$coder_token" --data "$work/coder-data" --capabilities "$work/coder-caps.json" --port "$CODER_PORT" --readings-port "$((CODER_PORT + 1000))" >>"$work/coder.log" 2>&1 &
+coder_pid=$!
+pids+=($coder_pid)
+# its own API answers once it started, which is after the removal
+for i in $(seq 1 100); do curl -fsS "http://127.0.0.1:${CODER_PORT}/node/v1/status" >/dev/null 2>&1 && break; sleep 0.2; done
+[ -z "$(left_on_coder)" ] || { echo "a starting node left what attempts left: $(left_on_coder)"; exit 1; }
+[ -n "$(docker ps -aq --filter name="voice-e2e-other-$$")" ] || { echo "a starting node removed another node's container"; exit 1; }
+docker rm -f "voice-e2e-other-$$" >/dev/null
 kill "$coder_pid"
 wait "$coder_pid" 2>/dev/null || true
-docker network create --internal --label net.hale-lang.voice.attempt.node=coder "voice-e2e-stray-$$" >/dev/null
-docker create --label net.hale-lang.voice.attempt.node=coder --name "voice-e2e-stray-$$" docker.io/library/alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc true >/dev/null
-mkdir -p "$work/coder-data/attempts/att_0000stray/work"
-[ -n "$(left_on_coder)" ] || { echo "the strays were not made"; exit 1; }
-start_coder
-[ -z "$(left_on_coder)" ] || { echo "a starting node left an attempt's leftovers: $(left_on_coder)"; exit 1; }
-echo "a starting node removes its attempts' leftovers: containers and networks by label, workspaces by path"
+echo "a starting node removes what coding attempts left: its containers and networks by voice's label, its attempts and clis directories by path, and nothing of another node's"
 
 # the node's own API, with its seat, against node.yaml
 (cd spec/validate && node node-live.mjs ../../build/node.bundled.json "http://127.0.0.1:${NODE_PORT}" "$work/node-data/admin.token")

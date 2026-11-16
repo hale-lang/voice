@@ -21,9 +21,7 @@ import { Runtimes } from './screens/Runtimes';
 import { Placements } from './screens/Placements';
 import { Annotators } from './screens/Annotators';
 import { Chat } from './screens/Chat';
-import { Attempts } from './screens/Attempts';
 import { Tools } from './screens/Tools';
-import { CliRecipes } from './screens/CliRecipes';
 import { useAdminEvents } from './api/events';
 import { useHub, useHubCarriesAdmin } from './api/hub';
 import { setEventsLive } from './api/live';
@@ -47,8 +45,6 @@ const SCREENS: Record<ScreenKey, (p: ScreenProps) => ReactNode> = {
   chat: Chat,
   annotators: Annotators,
   tools: Tools,
-  attempts: Attempts,
-  clis: CliRecipes,
   changes: Changes,
   api: Api,
 };

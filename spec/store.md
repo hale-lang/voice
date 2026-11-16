@@ -1241,6 +1241,8 @@ create table tool_settings (
 
 ### Migration 37: coding attempts
 
+(Dropped by migration 45, with the tables below, as coding attempts left voice.)
+
 An **attempt** is one run of an agentic coding harness on a repository
 (`openapi.yaml`, `CodingAttempt`): a caller asks for it (`createAttempt`), an api
 instance starts it on a harness seat with room (`start_attempt`, under an
@@ -1308,6 +1310,8 @@ create table attempt_bundle (
 ```
 
 ### Migration 38: an attempt's failure kind
+
+(Dropped by migration 45, with its table, as coding attempts left voice.)
 
 A failed attempt names why for a program as well as for a person
 (`openapi.yaml`, `CodingAttempt.failure_kind`, `AttemptFailureKind`):
@@ -1453,6 +1457,8 @@ update seat_state set since = reported_at;
 
 ### Migration 42: the key of an attempt's run
 
+(Dropped by migration 45, with its table, as coding attempts left voice.)
+
 A harness whose model calls go to voice (its definition's `login.kind` is
 `voice`) runs under a key voice mints for the attempt as a node claims it:
 the attempt's project's, for the caller plane's inference routes alone. The
@@ -1469,6 +1475,8 @@ create unique index attempt_by_run_digest on attempt (run_digest) where run_dige
 ```
 
 ### Migration 43: CLI recipes
+
+(Dropped by migration 45, with the tables it made and changed, as coding attempts left voice.)
 
 A **CLI recipe** is an agentic coding CLI as data (`openapi.yaml`,
 `HarnessDefinition`): where it may run (its backends: a container voice
@@ -1518,4 +1526,24 @@ seat's rows, newest first, without scanning the ledger.
 
 ```sql
 create index usage_by_served_seat on usage ((served->>'seat'), created_at desc);  -- a seat's requests, newest first: the speed a placement measured
+```
+
+### Migration 45: coding attempts leave voice
+
+Voice no longer runs coding harnesses: a harness is a client of voice's
+API, run outside it, and its model calls are requests like any other.
+Coding attempts, their transcripts and bundles, and the CLI recipes they
+ran (migrations 37, 38, 42 and 43) are dropped with their indexes. The
+ledger keeps the records attempts settled (`endpoint` `attempt`): it is
+append-only, and its hourly rollup counts them. A seat on a `harness`
+engine is configuration, kept: no node offers that engine now, which its
+problems say, and the operator removes it. A `claude-cli` seat the admin
+UI made with `harness: claude` in its config keeps serving: its node reads
+the token's entry from its `login`.
+
+```sql
+drop table attempt_bundle;
+drop table attempt_event;
+drop table attempt;
+drop table cli_recipe;
 ```

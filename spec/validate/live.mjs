@@ -14,7 +14,7 @@ const [bundlePath, base, tokenFile] = process.argv.slice(2);
 const operator = { authorization: `Bearer ${fs.readFileSync(tokenFile, 'utf8').trim()}` };
 const spec = JSON.parse(fs.readFileSync(bundlePath, 'utf8'));
 const ajv = new Ajv2020({ strict: false, allErrors: true }); addFormats(ajv); ajv.addKeyword('discriminator');
-const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample', arrangement: 'live-sample', cli_recipe: 'live-cli' };
+const sample = { project: 'work', key: 'k_ci', model: 'echo-1', account: 'claude-work', node: 'laptop', peer: 'laptop', seat: 'static', request_id: 'resp_01j8z3q4v7m2k9x0', recipe: 'live-sample', placement: 'live-sample', runtime: 'live-sample', annotator: 'live-sample', rule: 'live-sample', arrangement: 'live-sample' };
 let fails = 0, n = 0;
 const fail = (l, m) => { fails++; console.log('FAIL', l, m); };
 const strip = s => { const c = structuredClone(s); delete c.$schema; return c; };
@@ -35,9 +35,6 @@ await setup('/admin/v1/recipes', recipe('live-sample'));
 // placement below is served by one voice ships)
 const runtime = id => ({ id, license: { name: 'mit', url: 'https://opensource.org/license/mit' }, server: 'llama-server', formats: ['gguf'], accelerator: 'cuda', platforms: [{ os: 'linux', arch: 'arm64' }], artifact: { kind: 'container', image: 'ghcr.io/ggml-org/llama.cpp', digest: 'sha256:' + 'c'.repeat(64) } });
 await setup('/admin/v1/runtimes', runtime('live-sample'));
-// a CLI recipe of the operator's, run on the host (the one the delete removes)
-const cliRecipe = id => ({ id, name: 'Live CLI', version: '1.0.0', backends: [{ kind: 'container', base: 'docker.io/library/alpine@sha256:' + 'd'.repeat(64), install: 'apk add --no-cache git' }, { kind: 'host', detect: { command: ['live-cli', '--version'], version: 'live-cli ([0-9.]+)' }, install: { command: ['npm', 'install', '--global', '--prefix', '$VOICE_CLI_PREFIX', 'live-cli@1.0.0'] } }], command: ['live-cli', '--print'], instruction: { via: 'stdin' }, model: { flag: '--model' }, login: { kind: 'env', env: 'LIVE_KEY' }, env: {}, reader: 'text', commits: false, preamble: 'Work in /work.', egress: ['api.example'] });
-await setup('/admin/v1/cli-recipes', cliRecipe('live-cli'));
 await setup('/admin/v1/accounts', { id: 'claude-work', name: 'Claude (work)', provider: 'anthropic', billing: 'subscription' });
 await setup('/admin/v1/projects', { id: 'work', name: 'Work', owners: ['operator@example.com'], data_classes: ['public', 'internal'], budget: { allowance_micros: 50000000, period: 'month' } });
 const key = await setup('/admin/v1/projects/work/keys', { name: 'ci' });
@@ -107,12 +104,7 @@ const bodies = {
   // a request no ledger holds: the run answers it refused, by why
   runAnnotations: { request_ids: ['resp_01j8z3q4v7m2k9x0'] },
   runAnnotation: {},
-  createAttempt: { repo: 'https://forge.example.com/team/app.git', base: 'main', instruction: 'Add a test.', as: { name: 'Live', email: 'live@example.com' } },
   setToolSettings: { web_fetch: { enabled: true, max_calls: 4, denylist: ['192.0.2.0/24', 'admin.example.com'] } },
-  createCliRecipe: cliRecipe('live-cli-2'),
-  updateCliRecipe: { ...cliRecipe('live-cli'), name: 'Live CLI, edited' },
-  setCliRecipeEnabled: { enabled: false },
-  duplicateCliRecipe: { id: 'live-cli-3', name: 'Live CLI, copied' },
 };
 
 // the node plane: the node's enrollment token, and the bodies it sends
@@ -131,9 +123,6 @@ const nodeBodies = {
   reportInventory: { blobs: [{ sha256: 'a'.repeat(64), bytes: 4920000000 }, { sha256: 'b'.repeat(64), bytes: 1000 }] },
   // no check holds a rank of this node's: what it reports is dropped
   reportLinkCheck: { id: 'lc-live', ok: true, bus_bytes_per_second: 0 },
-  // no attempt runs on this node: a report of one is answered, and it is told to stop
-  reportAttempt: { events: [] },
-  putAttemptBundle: { bytes: 4, bundle: 'UEFDSw==' },
   nodeDraining: { reason: 'live check' },
 };
 
@@ -155,11 +144,6 @@ const refusals = {
   runAnnotation: { json: [404, 'not_found'] },
   // no two nodes here are cabled to each other: a node's link to itself is refused
   checkNodeLink: { json: [422, 'invalid_request', 'Invalid'] },
-  // the attempt created here is cancelled before it runs: it made no commits
-  getAttemptBundle: { json: [404, 'not_found'] },
-  getAnyAttemptBundle: { json: [404, 'not_found'] },
-  // nor does this node run it, so it holds no bundle of it
-  putAttemptBundle: { json: [404, 'not_found'] },
 };
 
 // the query an operation needs to be answered at all
@@ -171,10 +155,7 @@ for (const [p, item] of Object.entries(spec.paths)) for (const [m, op] of Object
   (m === 'delete' ? last : calls).push([p, m, op]);
 }
 for (const [p, m, op] of [...calls, ...last]) {
-  // what answers with nothing here, where nothing waits for it: no attempt
-  // is queued for this node's seats when it asks for one
-  const empty = { claimAttempt: '204' };
-  const code = empty[op.operationId] ?? Object.keys(op.responses).find(c => c.startsWith('2'));
+  const code = Object.keys(op.responses).find(c => c.startsWith('2'));
   const url = base + p.replace(/\{(\w+)\}/g, (_, k) => sample[k]) + (queries[op.operationId] ?? '');
   const content = op.responses[code].content;
   // each plane's credential; an operation that takes none (the probes) is sent none
@@ -224,29 +205,7 @@ for (const [p, m, op] of [...calls, ...last]) {
     n++;
     const body = ['post', 'put'].includes(m) ? JSON.stringify(nodeBodies[op.operationId] ?? {}) : undefined;
     const r = await fetch(url, { method: m.toUpperCase(), body, headers: body ? { 'content-type': 'application/json', ...who } : who });
-    const expected = String(refusals[op.operationId]?.json?.[0] ?? code);
-    if (String(r.status) !== expected) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${expected}`);
-    continue;
-  }
-  // a transcript is JSON Lines, a bundle binary: neither JSON nor a stream
-  const other = Object.keys(content).find((t) => t !== 'application/json' && t !== 'text/event-stream');
-  if (other) {
-    n++;
-    const label = `${op.operationId} ${m.toUpperCase()} ${url.slice(base.length)}`;
-    const r = await fetch(url, { headers: who });
-    const text = await r.text();
-    const refusal = refusals[op.operationId]?.json;
-    if (refusal) {
-      if (r.status !== refusal[0] || JSON.parse(text)?.error?.code !== refusal[1]) fail(label, `${r.status} ${text.slice(0, 120)}`);
-      continue;
-    }
-    if (String(r.status) !== code) { fail(label, `status ${r.status} != ${code}: ${text.slice(0, 120)}`); continue; }
-    if (!(r.headers.get('content-type') || '').startsWith(other)) fail(label, `content-type ${r.headers.get('content-type')} != ${other}`);
-    if (p.startsWith('/v1/') && !r.headers.get('x-request-id')) fail(label, 'no X-Request-Id');
-    if (other === 'application/jsonl') {
-      const f = ajv.compile(strip(content[other].schema));
-      for (const l of text.split('\n').filter(Boolean)) if (!f(JSON.parse(l))) fail(label, JSON.stringify(f.errors.slice(0, 3)));
-    }
+    if (String(r.status) !== code) fail(`${op.operationId} ${m.toUpperCase()} ${p}`, `status ${r.status} != ${code}`);
     continue;
   }
   const variants = content['application/json'] ? (content['text/event-stream'] ? [false, true] : [false]) : [true];
@@ -283,8 +242,6 @@ for (const [p, m, op] of [...calls, ...last]) {
       if (!f(j)) fail(label, JSON.stringify(f.errors.slice(0, 3)));
       // a rotation retires the token the node plane presents
       if (op.operationId === 'rotateNodeToken') nodeAuth = { authorization: `Bearer ${j.enrollment_token}` };
-      // the attempt the attempts' reads, cancel and bundle name
-      if (op.operationId === 'createAttempt') sample.attempt = j.id;
     } else {
       const f = ajv.compile(strip(content[want].schema));
       const datas = text.split('\n\n').map(b => b.split('\n').find(l => l.startsWith('data: '))).filter(Boolean).map(l => l.slice(6));

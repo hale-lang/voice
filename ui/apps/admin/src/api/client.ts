@@ -81,16 +81,6 @@ export function describe(error: unknown, status: number): string {
   return `${status}`;
 }
 
-/**
- * The field a refusal names (`error.param` on the data plane, a variant's
- * `param` on the rows), or null when it names none.
- */
-export function paramOf(error: unknown): string | null {
-  const body = (error ?? {}) as Record<string, unknown>;
-  const problem = (body.error ?? Object.values(body).find((v) => v && typeof v === 'object' && 'message' in (v as object))) as { param?: unknown } | undefined;
-  return typeof problem?.param === 'string' && problem.param ? problem.param : null;
-}
-
 /** A request's recording, as `getPeek` answers it. */
 export type Peek = Schemas['Peek'];
 export type Annotation = Schemas['Annotation'];

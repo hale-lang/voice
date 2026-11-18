@@ -98,11 +98,13 @@ without a serving seat do not acquire downstream execution arrows. Metadata beyo
 becomes labeled context automatically, without pretending it is infrastructure.
 
 The labeled demo fleet runs seven projects over three repository labels,
-illustrative model aliases, and claude-personal, claude-work, openai, agy, vibe
-plus local accounts. host-2 and host-4 carry the hosted API accounts and small local
-models; host-1, host-3, host-5 and host-6 carry MLX model tiers of 64 to 512 GB;
-gpu-a and gpu-b, cabled, serve one model placed across both. These are
-illustrative serving alternatives, not simultaneous loaded-weight claims.
+three model aliases, and what voice serves: three hosted OpenAI-compatible
+accounts (openai, hosted-a, hosted-b; metered) and local. host-2 and host-4
+carry the hosted accounts and a small local model each; host-1, host-3, host-5
+and host-6, Mac-like hosts of 64 to 512 GB, run placements of voice's recipes
+under llama-server and the decision engine; gpu-a and gpu-b, cabled, serve one
+model placed across both under TensorFold, and one of its own under vLLM.
+Hosted model names are illustrative.
 Three staggered workers simulate up to three distinct projects
 in flight. Their colored paths stay lit until completion; occupancy is derived
 from those same requests. In-flight records appear separately from completed usage.

@@ -4,6 +4,10 @@
 
 One inference endpoint in front of many model backends.
 
+![The admin UI's Network view: simulated requests flowing from projects through the api, hosts and seats to the accounts that pay and the models that serve them](docs/images/network.gif)
+
+*Requests flowing project → api → host → seat → account → model, in the admin UI's Network view (simulated).*
+
 A caller names a model and presents a project key. Voice picks a seat that
 can serve the model, enforces the project's limits and budget, and records
 what the request used against the project, the key and the account that pays.

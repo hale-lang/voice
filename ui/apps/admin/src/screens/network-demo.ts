@@ -9,46 +9,55 @@ const PROJECTS = [
 ] as const;
 // Names two projects give models: their requests for those models ask by the name.
 const ALIASES: Record<string, { name: string; model: string }[]> = {
-  product: [{ name: 'coding', model: 'qwen-coder-32b' }],
-  research: [{ name: 'reasoning', model: 'deepseek-r1-q4' }],
-  infrastructure: [{ name: 'big', model: 'deepseek-v4' }],
+  product: [{ name: 'coding', model: 'qwen3-coder-30b-a3b-instruct' }],
+  research: [{ name: 'reasoning', model: 'gpt-oss-120b' }],
+  infrastructure: [{ name: 'big', model: 'deepseek-v4.1-flash-1017' }],
 };
 export const DEMO_TICK_MS = 1800;
 // each project's path colour: the theme's vivid tokens, so the paths follow the theme
 const PROJECT_COLORS = ['lime', 'cyan', 'magenta', 'orange', 'violet', 'mint', 'pink'].map((c) => `var(--color-vivid-${c})`);
 export const demoProjectColor = (project: string) => PROJECT_COLORS[Math.max(0, PROJECTS.findIndex(([id]) => id === project))]!;
 
-/** Explicitly synthetic, local-only fixture. Model names are illustrative catalog aliases. */
+/** Explicitly synthetic, local-only fixture. Hosted model names are illustrative; local ones are voice's recipes. */
 export function demoFleet(tick: number, now: number): Fleet {
-  // Demo fleet: four Mac-like hosts of 64 to 512 GB serving MLX tiers, two
-  // hosts with hosted API accounts and small local models, and a cabled pair of
-  // GPU hosts (below). Catalog entries are alternatives,
-  // not a claim that all weights are loaded at once; q4 names denote demo quantizations.
-  const definitions = [
-    ['host-1', [['mlx', 'local', ['qwen-235b-q4', 'llama-70b']]]],
-    ['host-2', [['anthropic', 'claude-personal', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['google', 'agy', ['gemini-pro', 'gemini-flash', 'gemini-flash-lite', 'gemini-thinking']], ['mistral', 'vibe', ['devstral', 'codestral', 'mistral-large', 'mistral-small']], ['llama-cpp', 'local', ['llama-8b', 'qwen-7b']]]],
-    ['host-3', [['mlx', 'local', ['qwen-32b', 'qwen-coder-32b']]]],
-    ['host-4', [['anthropic', 'claude-work', ['sonnet', 'haiku', 'opus', 'sonnet-thinking']], ['openai', 'openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['llama-cpp', 'local', ['llama-3b', 'qwen-7b']]]],
-    ['host-5', [['mlx', 'local', ['deepseek-r1-q4', 'qwen-235b-q4']], ['mlx', 'local', ['llama-70b']]]],
-    ['host-6', [['mlx', 'local', ['llama-70b', 'qwen-coder-32b']]]],
-  ] as const;
-  const names = { 'host-1': 'Host 1 · 256 GB unified memory', 'host-2': 'Host 2 · hosted APIs and small local models', 'host-3': 'Host 3 · 64 GB unified memory', 'host-4': 'Host 4 · hosted APIs and small local models', 'host-5': 'Host 5 · 512 GB unified memory', 'host-6': 'Host 6 · 128 GB unified memory' };
-  const nodes: NodeSummary[] = definitions.map(([id, slots], index) => {
-    const seats: SeatSummary[] = slots.map(([engine, account, models], j) => ({ id: `seat-${j + 1}`, ref: `${id}/seat-${j + 1}`, node: id, engine, account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: index === 4 && j === 1 ? 'paused' : 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: index === 4 && j === 1 ? 'Paused by the machine operator.' : null }));
-    return { id, name: names[id], status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() };
+  // Demo fleet: four Mac-like hosts of 64 to 512 GB running voice's recipes
+  // under llama-server and the decision engine, two hosts with hosted
+  // OpenAI-compatible accounts and a small local model each, and a cabled
+  // pair of GPU hosts (below). Every local model is a placement: voice
+  // fetches its pinned weights and runs it on the host's GPU.
+  const at = new Date(now - 3600000).toISOString();
+  const nodeOf = (id: string, name: string, seats: SeatSummary[]): NodeSummary => ({ id, name, status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() });
+  const hosted = (node: string, account: string, models: readonly string[]): SeatSummary => ({ id: account, ref: `${node}/${account}`, node, engine: 'openai-compatible', account, data_classes: ['internal'], serves: models.map(model => ({ model })), status: 'up', in_flight: 0, concurrency: 3, enabled: true, problems: [], reason: null });
+  const placed = (model: string, nodes: string[], variant: string, runtime: string, follower = false): Placement => ({ id: model, model, nodes, account: 'local', recipe: model, variant, runtime, chosen_by: 'coordinator', leader: nodes[0]!, seat: `${nodes[0]}/${model}`, ...(follower ? { follower_seat: `${nodes[1]}/${model}` } : {}), fit: [], created_at: at });
+  const seatOf = (p: Placement, ref: string, paused = false): SeatSummary => ({ id: p.id, ref, node: ref.split('/')[0]!, engine: 'managed', account: p.account, data_classes: ['internal'], serves: [{ model: p.model }], status: paused ? 'paused' : 'up', in_flight: 0, concurrency: 4, enabled: true, problems: [], reason: paused ? 'Paused by the machine operator.' : null, placement: p.id, runtime: p.runtime, variant: p.variant });
+  const metal = 'llama-server-b11913-metal';
+  // each host's hosted accounts, then the models placed on it alone
+  const definitions: [string, string, [string, readonly string[]][], [string, string, string][]][] = [
+    ['host-1', 'Host 1 · 128 GB unified memory', [], [['gpt-oss-120b', 'gguf-mxfp4', metal], ['jev-style-2b-decision-v3', 'mlx-8bit', 'decision-0.3.0-mlx']]],
+    ['host-2', 'Host 2 · hosted APIs and a small local model', [['hosted-a', ['glm-4.7', 'kimi-k2', 'qwen3-coder-480b']]], [['qwen2.5-1.5b-instruct', 'gguf-q8_0', metal]]],
+    ['host-3', 'Host 3 · 64 GB unified memory', [], [['qwen3-coder-30b-a3b-instruct', 'gguf-q8_0', metal], ['granite-4.0-h-tiny', 'gguf-q8_0', metal]]],
+    ['host-4', 'Host 4 · hosted APIs and a small local model', [['openai', ['gpt-codex', 'gpt-mini', 'gpt-reasoning', 'gpt-fast']], ['hosted-b', ['deepseek-v4', 'qwen3-max', 'minimax-m2']]], [['granite-4.0-350m', 'gguf-q8_0', metal]]],
+    ['host-5', 'Host 5 · 512 GB unified memory', [], [['qwen3-235b-a22b', 'gguf-q8_0', metal], ['glm-4.7-flash', 'gguf-q8_0', metal]]],
+    ['host-6', 'Host 6 · 128 GB unified memory', [], [['qwen3-coder-next', 'gguf-q8_0', metal]]],
+  ];
+  const placements: Placement[] = [];
+  const nodes = definitions.map(([id, name, accounts, local]) => {
+    const own = local.map(([model, variant, runtime]) => placed(model, [id], variant, runtime));
+    placements.push(...own);
+    // host-5's second model is paused by its machine's operator
+    return nodeOf(id, name, [...accounts.map(([account, models]) => hosted(id, account, models)), ...own.map((p, j) => seatOf(p, p.seat, id === 'host-5' && j === 1))]);
   });
   // two GPU hosts cabled together: one model placed across both (its
   // leader's seat takes the requests, its follower's computes half of each),
   // and a model of its own beside it on the first
-  const placements = pairPlacements(now);
-  const seatOf = (p: Placement, node: string, ref: string): SeatSummary => ({ id: p.id, ref, node, engine: 'managed', account: p.account, data_classes: ['internal'], serves: [{ model: p.model }], status: 'up', in_flight: 0, concurrency: 4, enabled: true, problems: [], reason: null, placement: p.id, runtime: p.runtime, variant: p.variant });
-  const [pair, alone] = placements as [Placement, Placement];
-  for (const [id, name] of [['gpu-a', 'GPU A · 128 GB unified, cabled to GPU B'], ['gpu-b', 'GPU B · 128 GB unified, cabled to GPU A']] as const) {
-    const seats = id === 'gpu-a' ? [seatOf(pair, id, pair.seat), seatOf(alone, id, alone.seat)] : [seatOf(pair, id, pair.follower_seat!)];
-    nodes.push({ id, name, status: 'up', seats, in_flight: 0, assignment_version: 7, applied_version: 7, last_heartbeat_at: new Date(now - 2000).toISOString(), created_at: new Date(now - 86400000).toISOString() });
-  }
+  const pair = placed('deepseek-v4.1-flash-1017', ['gpu-a', 'gpu-b'], 'exl3-2.5bpw', 'tensorfold-0.7.5', true);
+  const alone = placed('gpt-oss-20b', ['gpu-a'], 'safetensors-mxfp4', 'vllm-26.09');
+  placements.push(pair, alone);
+  nodes.push(nodeOf('gpu-a', 'GPU A · 128 GB unified, cabled to GPU B', [seatOf(pair, pair.seat), seatOf(alone, alone.seat)]));
+  nodes.push(nodeOf('gpu-b', 'GPU B · 128 GB unified, cabled to GPU A', [seatOf(pair, pair.follower_seat!)]));
   const projects = PROJECTS.map(([id]) => ({ id, name: id, status: 'active' as const, owners: [], data_classes: ['internal' as const], created_at: new Date(now - 86400000).toISOString(), aliases: ALIASES[id] ?? [], resolved_aliases: (ALIASES[id] ?? []).map(a => ({ ...a, from: id })) }));
-  const accounts = ['claude-personal', 'claude-work', 'openai', 'agy', 'vibe', 'local'].map((id, index) => ({ id, name: id, provider: id.startsWith('claude-') ? 'anthropic' : id === 'openai' ? 'openai' : null, billing: id === 'local' ? 'none' as const : 'subscription' as const, status: 'active' as const, seats: nodes.flatMap((n) => n.seats.filter((s) => s.account === id).map((s) => s.ref)), windows: id === 'local' ? [] : [{ name: 'five_hour', used_percent: [34, 62, 29, 47, 18][index]!, observed_at: new Date(now).toISOString() }], created_at: new Date(now - 86400000).toISOString() }));
+  // hosted accounts pay per token (metered) and report no windows; local pays nothing
+  const accounts = ['openai', 'hosted-a', 'hosted-b', 'local'].map((id) => ({ id, name: id, provider: id === 'local' ? null : id, billing: id === 'local' ? 'none' as const : 'metered' as const, status: 'active' as const, seats: nodes.flatMap((n) => n.seats.filter((s) => s.account === id).map((s) => s.ref)), windows: [], created_at: new Date(now - 86400000).toISOString() }));
   const fleet: Fleet = { nodes, accounts, projects, placements, usage: [] };
   fleet.usage = Array.from({ length: 77 }, (_, i) => ({ ...demoRequest(fleet, i, now - (77 - i) * 1000), id: `demo-seed-${i}` }));
   for (const { record } of demoInFlight(fleet, tick, now)) {
@@ -57,15 +66,6 @@ export function demoFleet(tick: number, now: number): Fleet {
     node.in_flight!++; seat.in_flight++;
   }
   return fleet;
-}
-
-/** The demo's placements on its cabled pair of GPU hosts: one across both, one on the first alone. */
-function pairPlacements(now: number): Placement[] {
-  const at = new Date(now - 3600000).toISOString();
-  return [
-    { id: 'deepseek-v4', model: 'deepseek-v4', nodes: ['gpu-a', 'gpu-b'], account: 'local', recipe: 'deepseek-v4', variant: 'fp8', runtime: 'tensorfold-0.7', chosen_by: 'coordinator', leader: 'gpu-a', seat: 'gpu-a/deepseek-v4', follower_seat: 'gpu-b/deepseek-v4', fit: [], created_at: at },
-    { id: 'gpt-oss-20b', model: 'gpt-oss-20b', nodes: ['gpu-a'], account: 'local', recipe: 'gpt-oss-20b', variant: 'mxfp4', runtime: 'vllm-26.09', chosen_by: 'coordinator', leader: 'gpu-a', seat: 'gpu-a/gpt-oss-20b', fit: [], created_at: at },
-  ];
 }
 
 export function demoRequest(fleet: Fleet, sequence: number, now: number): FleetRequest {

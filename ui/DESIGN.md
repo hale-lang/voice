@@ -245,8 +245,8 @@ Dragging or arrow keys pin entities; Escape releases a focused pin, Reset layout
 clears pins. Reduced motion keeps static evidence. Narrow screens scroll the
 shared graph horizontally.
 
-The synthetic demo exposes seven projects, three repository labels and 24 model
-aliases. Up to three distinct projects run concurrently, each with a stable path
+The synthetic demo exposes seven projects, three repository labels and 21
+models. Up to three distinct projects run concurrently, each with a stable path
 color and an in-flight selector. Seat and host occupancy derive from that schedule;
 completed usage is emitted only when a worker finishes. Demo controls freeze both
 the schedule and animation, and the chosen data source survives page reloads.

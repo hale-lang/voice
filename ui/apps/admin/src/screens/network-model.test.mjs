@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
 import { buildGraph, entityId, edgeId, requestEdges, requestVertices, requestContext, relatedRequests, matchingRequests, graphKinds, requestFlowEdges, layoutGraph, resizeLayout, topologyKey, provisional, pairsOf, hullOf, liveInstances, retiredMode, RETIRED } from './network-model.ts';
 import { demoFleet, demoRequest, demoInFlight, demoCompletions, demoContext, demoInstances } from './network-demo.ts';
 
 test('graph relationships come from configuration or usage, never all-to-all guesses', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
   const graph = buildGraph(fleet);
-  const model = entityId('model', 'sonnet');
-  const account = entityId('account', fleet.nodes.find(n => n.id === 'host-4').seats.find(s => s.ref === 'host-4/seat-1').account);
+  const model = entityId('model', 'gpt-codex');
+  const account = entityId('account', fleet.nodes.find(n => n.id === 'host-4').seats.find(s => s.ref === 'host-4/openai').account);
   assert(graph.edges.some((e) => e.id === edgeId(model, account) && e.kind === 'offers'));
   assert(!graph.edges.some((e) => e.id === edgeId(model, entityId('account', 'local'))));
   const noUsage = buildGraph({ ...fleet, usage: [] });
@@ -59,11 +60,11 @@ test('large fleets stay bounded and never retain dangling edges', () => {
 import { filterFleet } from './network-filters.ts';
 test('combined host and backend filters retain only matching seat neighborhoods', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
-  const result = filterFleet(fleet, { host: 'host-4', engine: 'anthropic', account: 'claude-work' });
+  const result = filterFleet(fleet, { host: 'host-4', engine: 'openai-compatible', account: 'hosted-b' });
   assert.deepEqual(result.nodes.map(n => n.id), ['host-4']);
-  assert.deepEqual(result.accounts.map(a => a.id), ['claude-work']);
+  assert.deepEqual(result.accounts.map(a => a.id), ['hosted-b']);
   assert(result.usage.every(r => !r.served || r.served.node === 'host-4'));
-  assert.equal(filterFleet(fleet, { host: 'host-4', engine: 'mlx' }).nodes.length, 0);
+  assert.equal(filterFleet(fleet, { host: 'host-1', engine: 'openai-compatible' }).nodes.length, 0);
 });
 test('policy defaults and idle filtering follow the seat contract', () => {
   const fleet = demoFleet(0, 1_800_000_000_000);
@@ -118,7 +119,7 @@ test('caller metadata cannot spoof API instance identity; missing context stays 
   const graph = buildGraph({ ...fleet, usage: [record] }, { context: true });
   assert.equal(requestContext(record).apiInstance, undefined);
   assert(!graph.vertices.some(v => v.kind === 'api' || v.kind === 'repository'));
-  assert.deepEqual([...requestVertices(record, graph)].sort(), [`project:${record.project}`, `model:${record.requested_model}`, 'context:apiInstance:spoofed', 'context:api_instance:spoofed'].sort());
+  assert.deepEqual([...requestVertices(record, graph)].sort(), [`project:${record.project}`, `model:${record.resolved_model}`, 'context:apiInstance:spoofed', 'context:api_instance:spoofed'].sort());
   assert.equal(requestFlowEdges(record, graph).size, 0);
 });
 test('repository and API filters intersect on the same request, not a shared model', () => {
@@ -232,9 +233,9 @@ test('simulated work never exceeds three distinct projects and occupancy matches
   }
   assert.equal(peak,3);
   assert.equal(projects.size,7);
-  assert.deepEqual([...accounts].sort(),['agy','claude-personal','claude-work','local','openai','vibe']);
-  assert.equal(models.size,23);
-  assert(models.has('deepseek-v4'), 'the pair serves too');
+  assert.deepEqual([...accounts].sort(),['hosted-a','hosted-b','local','openai']);
+  assert.equal(models.size,19);
+  assert(models.has('deepseek-v4.1-flash-1017'), 'the pair serves too');
 });
 test('a routed request follows one project-to-API-to-host-to-seat-to-account-to-model branch', () => {
   const fleet = demoFleet(0,1_800_000_000_000), record = fleet.usage[1];
@@ -247,13 +248,26 @@ test('a routed request follows one project-to-API-to-host-to-seat-to-account-to-
 });
 
 
-test('the demo fleet places hosted API accounts on host-2/host-4 and MLX capacity on its Mac-like hosts', () => {
+test('the demo fleet is what voice serves: hosted OpenAI-compatible accounts on host-2/host-4, and the rest placements of its own recipes', () => {
   const fleet = demoFleet(0,1_800_000_000_000);
+  const shipped = (dir) => new Map(readdirSync(new URL(`../../../../../${dir}/`, import.meta.url)).filter(f => f.endsWith('.json')).map(f => [f.slice(0, -5), JSON.parse(readFileSync(new URL(`../../../../../${dir}/${f}`, import.meta.url), 'utf8'))]));
+  const recipes = shipped('recipes'), runtimes = shipped('runtimes');
+  for (const account of fleet.accounts) {
+    assert.deepEqual(account.windows, [], `${account.id} reports no windows`);
+    assert.equal(account.billing, account.id === 'local' ? 'none' : 'metered', account.id);
+  }
+  const placed = new Map(fleet.placements.flatMap(p => [[p.seat, p], ...(p.follower_seat ? [[p.follower_seat, p]] : [])]));
   for (const node of fleet.nodes) for (const seat of node.seats) {
-    if (seat.account !== 'local') assert(['host-4','host-2'].includes(node.id));
-    if (['host-4','host-2'].includes(node.id) && seat.account === 'local') assert(seat.serves.every(s => ['llama-3b','llama-8b','qwen-7b'].includes(s.model)));
-    if (node.id.startsWith('gpu-')) assert.equal(seat.engine,'managed');
-    else if (!['host-4','host-2'].includes(node.id)) assert.equal(seat.engine,'mlx');
+    if (seat.account !== 'local') {
+      assert(['host-4','host-2'].includes(node.id), seat.ref);
+      assert.equal(seat.engine, 'openai-compatible', seat.ref);
+      continue;
+    }
+    assert.equal(seat.engine, 'managed', seat.ref);
+    const p = placed.get(seat.ref);
+    assert(p, `${seat.ref} is a placement's seat`);
+    assert(recipes.get(p.recipe)?.variants.some(v => v.id === p.variant), `${p.recipe} ships ${p.variant}`);
+    assert(runtimes.has(p.runtime), `${p.runtime} ships`);
   }
 });
 

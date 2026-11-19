@@ -263,7 +263,7 @@ screens in layers:
 ## Developing
 
 With the [Hale toolchain](https://github.com/hale-lang/hale) at the release
-voice pins (`[dna] toolchain` in [`hale.toml`](./hale.toml), v0.35.0; the
+voice pins (`[dna] toolchain` in [`hale.toml`](./hale.toml), v0.36.0; the
 Dockerfile and CI use the same):
 
 ```sh

@@ -302,7 +302,7 @@ end-to-end run over Postgres and NATS, a fresh clone as a graft takes it, and th
 ## Status
 
 Running: configuration, the caller's endpoints (streamed and not, many at
-once), the node plane, the brain, agent-CLI, OpenAI-compatible and managed local seats, usage metering and the ledger, peek recordings, the admin event
+once), the node plane, the brain, OpenAI-compatible, managed local and static seats, usage metering and the ledger, peek recordings, the admin event
 stream and the live hub, and voice as a habitat organism (a provider of
 models to the habitat's other organisms, each a project under the habitat's).
 
@@ -313,4 +313,5 @@ models to the habitat's other organisms, each a project under the habitat's).
 - [`docs/adding-a-node.md`](./docs/adding-a-node.md): a Mac or a Linux
   machine joining as a node, in one command.
 - [`DIRECTION.md`](./DIRECTION.md): where voice is going.
-- [`FRICTION.md`](./FRICTION.md): what writing voice in Hale has run into.
+- [`FRICTION.md`](./FRICTION.md): what writing voice in Hale runs into that
+  is still open in Hale.

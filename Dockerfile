@@ -12,7 +12,7 @@
 # programs come from the layer cache. BuildKit runs the stages in parallel.
 
 # the release hale.toml declares ([dna] toolchain); CI checks they agree
-ARG HALE_VERSION=v0.36.0
+ARG HALE_VERSION=v0.36.1
 
 # The admin UI, built once and served by the api from its own origin. Its
 # dependencies are installed from the manifests alone, so a change to the

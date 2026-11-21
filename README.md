@@ -82,6 +82,29 @@ docker compose exec api voice-api admin-token
 
 The UI asks for it once and keeps it in the browser.
 
+## Nightly builds
+
+Releases (`v*` tags) are what to run. A nightly is for a fix needed before
+the next release: once a day, when main has moved and its CI is green, the
+images CI built for main's head are tagged
+`ghcr.io/hale-lang/voice:nightly-YYYYMMDD` (and `:nightly`, the newest) and
+`ghcr.io/hale-lang/voice-node:nightly-YYYYMMDD-darwin-arm64`, and a
+pre-release `nightly-YYYY-MM-DD` names the commit, the image digests and
+what changed ([`.github/workflows/nightly.yml`](.github/workflows/nightly.yml)).
+The last 14 pre-releases are kept (the image tags stay). In a checkout of
+that commit, compose pulls that image rather than building:
+
+```sh
+HALE_DNA_REVISION=nightly-YYYYMMDD docker compose up -d
+```
+
+A node takes the nightly's full commit sha, from its pre-release, as
+`HALE_DNA_REVISION` ([docs/adding-a-node.md](docs/adding-a-node.md)).
+
+The same workflow builds and tests voice with hale's newest nightly and
+publishes nothing from it; when that fails, it says so in an issue on
+hale-lang/hale.
+
 ## On one Mac
 
 [`scripts/voice-local`](./scripts/voice-local) puts all of it on one Mac on

@@ -1,0 +1,492 @@
+# Nightly builds. Releases (`v*` tags) are what to run; a nightly is main's
+# newest tested commit, for a fix needed before the next release. Once a
+# day, a little after hale's own nightly, two jobs, neither waiting on the
+# other:
+#
+# publish: when main has moved since the newest nightly-* pre-release and
+#   both ci.yml and image.yml passed for its head, the images image.yml
+#   built for that commit are tagged again, not rebuilt, their digests kept
+#   and checked: ghcr.io/hale-lang/voice:nightly-YYYYMMDD and :nightly,
+#   ghcr.io/hale-lang/voice-node:nightly-YYYYMMDD-darwin-arm64 and
+#   :nightly-darwin-arm64. A GitHub pre-release nightly-YYYY-MM-DD at that
+#   commit, never marked latest, says what it holds. A nightly is published
+#   once: a second run the same day publishes nothing. The newest 14
+#   nightly-* pre-releases are kept, with their tags; older ones are
+#   deleted, and nothing else is. Registry tags are not pruned: GHCR drops
+#   a tag only by deleting the image version under it, which would take the
+#   commit's own <sha> tag, the one compose and node/install.sh pull by.
+#
+# hale-canary: voice checked, built and tested with hale's newest nightly-*
+#   release, publishing nothing. A failure fails the job, and, with the
+#   HALE_ISSUES_TOKEN secret (voice's own token cannot write to another
+#   repository), is reported on hale-lang/hale in one issue, found by its
+#   title, commented on each failing day rather than opened again; a pass
+#   while that issue is open says so there. A pull request that changes
+#   this workflow or the hale action runs the canary's steps on voice's own
+#   hale and reports nothing.
+
+name: nightly
+
+on:
+  schedule:
+    - cron: "37 8 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/nightly.yml
+      - .github/actions/hale/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/hale-lang/voice
+  NODE_ARTIFACT: ghcr.io/hale-lang/voice-node
+  # the OCI client the darwin node is tagged with, and its release's sha256
+  ORAS_VERSION: 1.3.6
+  ORAS_SHA256: 66fb0ad7206f3f6fa77ed5b552049d364ccf4b50b1684554f731f76302b52ca0
+  # how many nightly-* pre-releases are kept
+  KEEP: 14
+
+jobs:
+  publish:
+    name: publish
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    permissions:
+      contents: write
+      packages: write
+      actions: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Which commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          day=$(date -u +%Y-%m-%d)
+          tag="nightly-$day"
+          sha=$(git rev-parse HEAD)
+          short=${sha:0:12}
+          {
+            echo "day=$day"
+            echo "compact=${day//-/}"
+            echo "tag=$tag"
+            echo "sha=$sha"
+            echo "short=$short"
+          } >> "$GITHUB_OUTPUT"
+          none() {
+            echo "::$1 title=nightly::$2"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            printf '## No nightly\n\n%s\n' "$2" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          prev=$(gh release list --limit 100 --json tagName,isPrerelease,isDraft \
+            --jq '[.[] | select(.isPrerelease and (.isDraft | not) and (.tagName | test("^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$"))) | .tagName] | sort | last // ""')
+          prev_sha=""
+          if [ -n "$prev" ]; then
+            prev_sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$prev" --jq .sha)
+          fi
+          echo "prev=$prev" >> "$GITHUB_OUTPUT"
+          echo "prev_sha=$prev_sha" >> "$GITHUB_OUTPUT"
+          [ "$prev_sha" != "$sha" ] || none notice "main ($short) has not moved since $prev."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            none notice "$tag is already out; main's head ($short) goes in the next one."
+          fi
+          at=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha 2>/dev/null || true)
+          if [ -n "$at" ] && [ "$at" != "$sha" ]; then
+            none warning "the tag $tag exists at ${at:0:12}, with no release, not at main's head ($short); nothing published."
+          fi
+          # what CI says of main's head: both workflows finished and green,
+          # waited on for up to 45 minutes, or nothing is published
+          state() {
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$1/runs?head_sha=$sha&branch=main&event=push&per_page=1" \
+              --jq '(.workflow_runs[0] // {}) | "\(.status // "none") \(.conclusion // "none")"'
+          }
+          deadline=$(( $(date +%s) + 45 * 60 ))
+          while :; do
+            read -r ci_status ci_result <<< "$(state ci.yml)"
+            read -r image_status image_result <<< "$(state image.yml)"
+            [ "$ci_status" = completed ] && [ "$image_status" = completed ] && break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              none notice "ci.yml ($ci_status) and image.yml ($image_status) have not both finished for main's head ($short); an untested commit is never published."
+            fi
+            sleep 60
+          done
+          if [ "$ci_result" != success ] || [ "$image_result" != success ]; then
+            none warning "main is not green at $short (ci.yml: $ci_result, image.yml: $image_result); nothing published."
+          fi
+          echo "go=true" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.pick.outputs.go == 'true'
+      - uses: docker/login-action@v3
+        if: steps.pick.outputs.go == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: The OCI client, checked against its release's sha256
+        if: steps.pick.outputs.go == 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          name="oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$name" "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/$name"
+          echo "$ORAS_SHA256  $RUNNER_TEMP/$name" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/oras" && tar xzf "$RUNNER_TEMP/$name" -C "$RUNNER_TEMP/oras" oras
+          echo "$RUNNER_TEMP/oras" >> "$GITHUB_PATH"
+          echo "$TOKEN" | "$RUNNER_TEMP/oras/oras" login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag what image.yml built for it, not rebuilt
+        id: tag
+        if: steps.pick.outputs.go == 'true'
+        env:
+          SHA: ${{ steps.pick.outputs.sha }}
+          COMPACT: ${{ steps.pick.outputs.compact }}
+        run: |
+          set -euo pipefail
+          digest() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
+          manifest=$(digest "$IMAGE:$SHA")
+          node=$(oras resolve "$NODE_ARTIFACT:$SHA-darwin-arm64")
+          for d in "$manifest" "$node"; do
+            [[ $d =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest for $SHA: '$d'"; exit 1; }
+          done
+          docker buildx imagetools create -t "$IMAGE:nightly-$COMPACT" -t "$IMAGE:nightly" "$IMAGE@$manifest"
+          oras tag "$NODE_ARTIFACT@$node" "nightly-$COMPACT-darwin-arm64" nightly-darwin-arm64
+          # each new tag names the very manifest CI tested
+          for t in "nightly-$COMPACT" nightly; do
+            got=$(digest "$IMAGE:$t")
+            [ "$got" = "$manifest" ] || { echo "::error::$IMAGE:$t is $got, not $manifest"; exit 1; }
+          done
+          for t in "nightly-$COMPACT-darwin-arm64" nightly-darwin-arm64; do
+            got=$(oras resolve "$NODE_ARTIFACT:$t")
+            [ "$got" = "$node" ] || { echo "::error::$NODE_ARTIFACT:$t is $got, not $node"; exit 1; }
+          done
+          echo "image=$manifest" >> "$GITHUB_OUTPUT"
+          echo "node=$node" >> "$GITHUB_OUTPUT"
+
+      - name: The pre-release
+        if: steps.pick.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.pick.outputs.sha }}
+          SHORT: ${{ steps.pick.outputs.short }}
+          DAY: ${{ steps.pick.outputs.day }}
+          COMPACT: ${{ steps.pick.outputs.compact }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          PREV: ${{ steps.pick.outputs.prev }}
+          PREV_SHA: ${{ steps.pick.outputs.prev_sha }}
+          IMAGE_DIGEST: ${{ steps.tag.outputs.image }}
+          NODE_DIGEST: ${{ steps.tag.outputs.node }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          hale=$(sed -n 's/^toolchain *= *"\(v[^"]*\)".*/\1/p' hale.toml | head -1)
+          # the commits since the previous nightly, or since the newest release
+          from="" since=""
+          if [ -n "$PREV_SHA" ] && git merge-base --is-ancestor "$PREV_SHA" "$SHA"; then
+            from=$PREV_SHA since=$PREV
+          elif last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$SHA" 2>/dev/null); then
+            from=$(git rev-parse "$last^{commit}") since=$last
+          fi
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "A nightly build of voice: main at [\`$SHORT\`]($repo/commit/$SHA), after ci.yml and image.yml passed for it. Releases (\`v*\`) are what to run; a nightly is for a fix needed before the next one."
+            echo
+            echo "- commit: \`$SHA\`"
+            echo "- built with hale $hale (\`[dna] toolchain\` in hale.toml)"
+            echo "- \`$IMAGE:nightly-$COMPACT\` (the same as \`:$SHA\`): \`$IMAGE_DIGEST\`"
+            echo "- \`$NODE_ARTIFACT:nightly-$COMPACT-darwin-arm64\` (the same as \`:$SHA-darwin-arm64\`): \`$NODE_DIGEST\`"
+            echo
+            echo '```sh'
+            echo "HALE_DNA_REVISION=nightly-$COMPACT docker compose up -d"
+            echo "sudo HALE_DNA_REVISION=$SHA sh node/install.sh install --id <id> --api <url> --operator-token-file <file>"
+            echo '```'
+            echo
+            if [ -n "$from" ]; then
+              n=$(git rev-list --count --no-merges "$from..$SHA")
+              echo "### Since $since ($n commits)"
+              echo
+              git log --no-merges -n 200 --format="- [\`%h\`]($repo/commit/%H) %s" "$from..$SHA"
+              [ "$n" -le 200 ] || echo "- and $((n - 200)) more"
+            fi
+          } > "$notes"
+          gh release create "$TAG" --target "$SHA" --prerelease --latest=false \
+            --title "nightly $DAY" --notes-file "$notes"
+          # it is a pre-release, at that commit
+          at=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$TAG" --jq .sha)
+          [ "$at" = "$SHA" ] || { echo "::error::$TAG is at $at, not $SHA"; exit 1; }
+          [ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" = true ] \
+            || { echo "::error::$TAG is not a pre-release"; exit 1; }
+          {
+            echo "## $TAG"
+            echo
+            cat "$notes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the newest nightlies
+        if: steps.pick.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          old=$(gh release list --limit 200 --json tagName,isPrerelease,isDraft \
+            --jq '.[] | select(.isPrerelease and (.isDraft | not)) | .tagName' \
+            | grep -E '^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort -r | tail -n "+$((KEEP + 1))" || true)
+          [ -n "$old" ] || exit 0
+          printf '\n### Pruned (the newest %s are kept)\n\n' "$KEEP" >> "$GITHUB_STEP_SUMMARY"
+          for t in $old; do
+            # a nightly's own pre-release and tag, nothing else
+            [[ $t =~ ^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || exit 1
+            gh release delete "$t" --yes --cleanup-tag
+            echo "- $t" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # Run what ci.yml's process jobs run that a hale release can change, on
+  # Linux: `hale check --workspace`, `hale verify` on every package,
+  # `hale build` on every program, `hale test` on api, node and store, and
+  # the api's surface bundle against the committed one. Left to ci.yml:
+  # format, the brain's and decide's tests, the live contract checks, the
+  # node's install, macOS, end to end over Postgres and NATS, compose.
+  hale-canary:
+    name: hale canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      ISSUE_REPO: hale-lang/hale
+      ISSUE_TITLE: "downstream nightly: voice fails on hale nightly"
+      LOGS: ${{ github.workspace }}/../canary-logs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Which hale
+        id: hale
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOGS"
+          none() {
+            echo "::notice title=hale canary::$1"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            printf '## hale canary\n\nNothing tested: %s\n' "$1" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          }
+          if [ "$EVENT" = pull_request ]; then
+            # a change to this workflow, run on voice's own hale; never reported
+            tag=$(sed -n 's/^toolchain *= *"\(v[^"]*\)".*/\1/p' hale.toml | head -1)
+            report=false
+          else
+            tag=$(gh release list -R "$ISSUE_REPO" --limit 100 --json tagName,isPrerelease,isDraft \
+              --jq '[.[] | select(.isDraft | not) | .tagName | select(test("^nightly-[0-9]{4}-[0-9]{2}-[0-9]{2}$"))] | sort | last // ""')
+            [ -n "$tag" ] || none "$ISSUE_REPO has published no nightly-* release yet."
+            report=true
+          fi
+          # the tarball and checksum hale's installer fetches for this platform
+          assets=$(gh release view "$tag" -R "$ISSUE_REPO" --json assets --jq '.assets[].name')
+          for a in "hale-$tag-x86_64-unknown-linux-gnu.tar.gz" "hale-$tag-x86_64-unknown-linux-gnu.tar.gz.sha256"; do
+            grep -qxF "$a" <<< "$assets" || none "hale $tag has no $a."
+          done
+          {
+            echo "run=true"
+            echo "tag=$tag"
+            echo "report=$report"
+          } >> "$GITHUB_OUTPUT"
+
+      # downloaded, its sha256 checked, as hale's installer does
+      - name: Install hale ${{ steps.hale.outputs.tag }}
+        id: install
+        if: steps.hale.outputs.run == 'true'
+        uses: ./.github/actions/hale
+        with:
+          version: ${{ steps.hale.outputs.tag }}
+      - name: Its version
+        id: version
+        if: steps.hale.outputs.run == 'true'
+        run: echo "version=$(hale --version | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: hale check --workspace
+        id: check
+        if: steps.hale.outputs.run == 'true'
+        run: hale check --workspace . 2>&1 | tee "$LOGS/check.log"
+      - name: hale verify, every package
+        id: verify
+        if: steps.hale.outputs.run == 'true'
+        run: |
+          for p in api store brain decide node; do
+            echo "== hale verify $p"
+            hale verify "$p" || exit 1
+          done 2>&1 | tee "$LOGS/verify.log"
+      - name: hale build, every program
+        id: build
+        if: steps.hale.outputs.run == 'true'
+        run: |
+          for p in api brain decide node; do
+            echo "== hale build $p"
+            hale build "$p" || exit 1
+          done 2>&1 | tee "$LOGS/build.log"
+      - name: hale test, api, node and store
+        id: test
+        if: steps.hale.outputs.run == 'true'
+        run: |
+          for p in api node store; do
+            echo "== hale test $p"
+            hale test "$p" || exit 1
+          done 2>&1 | tee "$LOGS/test.log"
+      - name: The api's surface bundle is the committed one
+        id: bundle
+        if: steps.hale.outputs.run == 'true'
+        run: |
+          {
+            hale api export --surface Voice --check api/bundle api
+            fresh=$(mktemp -d)
+            hale api export --surface Voice --out "$fresh/bundle" api >/dev/null
+            diff -r "$fresh/bundle" api/bundle
+          } 2>&1 | tee "$LOGS/bundle.log"
+
+      - name: What failed
+        id: failed
+        if: failure() && steps.hale.outputs.run == 'true'
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: |
+          set -euo pipefail
+          id=$(jq -r '[to_entries[] | select(.value.outcome == "failure") | .key] | first // ""' <<< "$STEPS")
+          case "$id" in
+            install) step="installing hale" ;;
+            version) step="hale --version" ;;
+            check) step="hale check --workspace" ;;
+            verify) step="hale verify" ;;
+            build) step="hale build" ;;
+            test) step="hale test" ;;
+            bundle) step="the api's surface bundle (hale api export --check)" ;;
+            *) step="${id:-unknown}" ;;
+          esac
+          excerpt="$RUNNER_TEMP/excerpt.txt"
+          if [ -s "$LOGS/$id.log" ]; then
+            # the last of what it printed, its colours stripped
+            sed -e 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOGS/$id.log" | tail -n 60 | cut -c1-300 > "$excerpt"
+          else
+            echo "(no output kept for this step: see the run)" > "$excerpt"
+          fi
+          echo "step=$step" >> "$GITHUB_OUTPUT"
+          echo "excerpt=$excerpt" >> "$GITHUB_OUTPUT"
+
+      - name: Tell hale it fails
+        if: failure() && steps.hale.outputs.report == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.HALE_ISSUES_TOKEN }}
+          TAG: ${{ steps.hale.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          STEP: ${{ steps.failed.outputs.step }}
+          EXCERPT: ${{ steps.failed.outputs.excerpt }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice title=hale canary::HALE_ISSUES_TOKEN is not set: nothing reported on $ISSUE_REPO (this job still fails)"
+            exit 0
+          fi
+          body="$RUNNER_TEMP/issue.md"
+          {
+            echo "[hale-lang/voice](https://github.com/hale-lang/voice) does not build or pass its tests with hale's nightly."
+            echo
+            echo "- hale: $TAG (\`${VERSION:-unknown}\`)"
+            echo "- voice: hale-lang/voice@$GITHUB_SHA"
+            echo "- failing step: $STEP"
+            echo "- run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo "~~~~text"
+            cat "${EXCERPT:-/dev/null}" 2>/dev/null || true
+            echo "~~~~"
+            echo
+            echo "Reported by voice's hale canary (.github/workflows/nightly.yml in hale-lang/voice): one issue, commented on each nightly that fails, and noted when voice passes again."
+          } > "$body"
+          # the title compared in gh's jq, from the environment
+          # shellcheck disable=SC2016
+          num=$(gh issue list -R "$ISSUE_REPO" --state open --search "\"$ISSUE_TITLE\" in:title" --json number,title \
+            --jq '[.[] | select(.title == $ENV.ISSUE_TITLE) | .number] | first // ""')
+          if [ -n "$num" ]; then
+            gh issue comment "$num" -R "$ISSUE_REPO" --body-file "$body" >/dev/null
+            echo "commented on $ISSUE_REPO#$num"
+          else
+            gh issue create -R "$ISSUE_REPO" --title "$ISSUE_TITLE" --body-file "$body"
+          fi
+
+      - name: Tell hale it passes again
+        if: success() && steps.hale.outputs.run == 'true' && steps.hale.outputs.report == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.HALE_ISSUES_TOKEN }}
+          TAG: ${{ steps.hale.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice title=hale canary::HALE_ISSUES_TOKEN is not set: nothing said on $ISSUE_REPO"
+            exit 0
+          fi
+          # the title compared in gh's jq, from the environment
+          # shellcheck disable=SC2016
+          num=$(gh issue list -R "$ISSUE_REPO" --state open --search "\"$ISSUE_TITLE\" in:title" --json number,title \
+            --jq '[.[] | select(.title == $ENV.ISSUE_TITLE) | .number] | first // ""')
+          [ -n "$num" ] || exit 0
+          # once: not again while the last word there is already a pass
+          count=$(gh api "repos/$ISSUE_REPO/issues/$num" --jq .comments)
+          last=""
+          if [ "$count" -gt 0 ]; then
+            last=$(gh api "repos/$ISSUE_REPO/issues/$num/comments?per_page=1&page=$count" --jq '.[0].body // ""')
+          fi
+          case "$last" in "voice passes on hale "*) exit 0 ;; esac
+          gh issue comment "$num" -R "$ISSUE_REPO" >/dev/null --body \
+            "voice passes on hale $TAG (\`${VERSION:-unknown}\`) at hale-lang/voice@$GITHUB_SHA: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          echo "commented on $ISSUE_REPO#$num"
+
+      - name: Summary
+        if: always() && steps.hale.outputs.run == 'true'
+        env:
+          TAG: ${{ steps.hale.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          STATUS: ${{ job.status }}
+          STEP: ${{ steps.failed.outputs.step }}
+          EXCERPT: ${{ steps.failed.outputs.excerpt }}
+        run: |
+          {
+            echo "## hale canary"
+            echo
+            echo "- hale: $TAG (\`${VERSION:-unknown}\`)"
+            echo "- voice: \`$GITHUB_SHA\`"
+            if [ "$STATUS" = success ]; then
+              echo "- result: passed"
+            else
+              echo "- result: **failed** at $STEP"
+              if [ -n "$EXCERPT" ] && [ -s "$EXCERPT" ]; then
+                echo
+                echo "~~~~text"
+                cat "$EXCERPT"
+                echo "~~~~"
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

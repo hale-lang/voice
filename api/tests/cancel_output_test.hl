@@ -8,12 +8,13 @@ import "../../node" as node;
 import "../../store" as st;
 
 /// A link to a node whose seat's upstream streams `sse`, in process. With
-/// `caller` and `cut_after` set, the caller on that connection (its end of
-/// it) closes it once that many output deltas have come.
+/// `caller`, `api_side` and `cut_after` set, the caller on that connection
+/// (its end of it) closes it once that many output deltas have come.
 locus Upstream {
     params {
         sse: String = "";
         caller: Int = -1;
+        api_side: Int = -1;
         cut_after: Int = 0;
     }
     fn place() -> String { return "nats://nats.test:4222"; }
@@ -38,6 +39,7 @@ locus Upstream {
             script: run.script,
             result: node::result_message(id, run, 3, 9),
             caller: self.caller,
+            api_side: self.api_side,
             cut_after: self.cut_after,
         };
     }
@@ -45,7 +47,11 @@ locus Upstream {
 
 /// One offer, played: its events, then its result; its caller gone (its end
 /// of the connection closed, unread) at the `cut_after`th output delta (0:
-/// never), so the api's write of that delta finds it gone.
+/// never), so the api's write of that delta finds it gone. A close with
+/// unread data resets the connection, but the reset reaches the api's end
+/// (`api_side`) a moment later, and a write before it is taken: that delta
+/// is held until the api's end has it, or the api would write on and count
+/// as many more as came while it travelled.
 locus Played {
     params {
         script: String = "";
@@ -53,6 +59,7 @@ locus Played {
         result: String = "";
         ended: Bool = false;
         caller: Int = -1;
+        api_side: Int = -1;
         cut_after: Int = 0;
         deltas: Int = 0;
     }
@@ -69,6 +76,12 @@ locus Played {
                 self.deltas = self.deltas + 1;
                 if self.cut_after > 0 && self.deltas == self.cut_after {
                     std::io::tcp::close_fd(self.caller);
+                    let until = std::time::monotonic() + 5s;
+                    let mut gone = api::caller_gone(self.api_side);
+                    while !gone && std::time::monotonic() < until {
+                        gone = api::caller_gone(self.api_side);
+                    }
+                    std::test::assert(gone, "the api's end has the caller's reset");
                 }
             }
             return api::LinkMsg { kind: "event", json: line };
@@ -242,6 +255,7 @@ fn main() {
         let api_side = std::io::tcp::__accept_one(listener);
         std::test::assert(listener >= 0 && caller >= 0 && api_side >= 0, "a connection");
         link.caller = caller;
+        link.api_side = api_side;
         link.cut_after = 15;
         let out = api::EventStream { conn_fd: api_side };
         let body = if endpoint == "chat" {

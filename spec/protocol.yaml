@@ -166,6 +166,66 @@ info:
     `heart.<id>.reply.…`, `heart.<id>.route`), and a request's reply inbox is
     under the inbox prefix handed over, or under the same prefix. A node
     learns its subject at registration (`nats.subject`), so it follows.
+
+    ## Pulling: protocol 3
+
+    Protocol 3 is queue routing (`docs/design/queue-routing.md`): a seat
+    pulls its work from queues on JetStream instead of being offered it by
+    `serve`. Its channels and messages are below, each marked
+    `x-voice-protocol: 3`; everything else here is protocol 2, which
+    protocol 3 keeps. The coordinator does not serve protocol 3 yet: it
+    registers a node of protocol 2 alone (`Registration.protocol`) and
+    offers every request with `serve`.
+
+    - **Tickets.** The api admits a request as it does today and publishes
+      a `Ticket` for each attempt into the stream `VOICE_WORK`
+      (`internal.yaml`, "The work stream"), on one of the work subjects:
+      - `voice.work.m.<model>.<class>.<need>`, for a model served under one
+        provider account;
+      - `voice.work.p.<model>.<provider>.<class>.<need>`, for a model served
+        under more than one, `<provider>` one provider account the request
+        may spend (today's `account`);
+      - `voice.work.s.<node>.<seat>`, a seat's own queue, for a
+        conversation's turn the api judged that seat may serve.
+
+      `m` and `p` are a model's two shapes, which the brain decides and
+      writes on the board (`internal.yaml`, `Board.models`), and `s` marks a
+      seat's own queue. A **partition** is a subject of the first two
+      shapes: the requests the same seats may serve. `<model>` is the
+      catalog model the request is served as, after aliases; `<class>` its
+      data class; `<need>` `tools` when the request lists tools, else
+      `any`. Ids become tokens by percent-encoding `.`, `*`, `>`, `%`,
+      whitespace and every byte outside printable ASCII, each as `%` and
+      two upper-case hex digits (`glm-4.7-flash` is `glm-4%2E7-flash`).
+
+      An attempt goes into the stream as one or two **copies**: `shared`,
+      on a partition, and, for a conversation's turn, `seat`, on its home
+      seat's own queue. Each copy's `Nats-Msg-Id` is
+      `<request_id>.<attempt>.<copy>`, the same for every publish of that
+      copy, so the stream keeps a copy sent again once and never takes one
+      copy for the other. Its `Nats-TTL` is the ticket's own wait, to
+      `wait_until`.
+    - **Claims.** A seat with a free slot, by the node's own count, pulls a
+      ticket from the queues its plan names and claims its request from the
+      api instance that holds the caller: a `Claim`, as a NATS request to
+      `<reply_to>.claim`. The api grants each attempt once, whichever copy
+      was claimed: a `Grant` (the `serve` message, body and all) to the
+      first claim, and a `Decline` to any other. A repeat of the granted
+      claim itself (the same seat and the same copy, its answer lost) is
+      granted again. The node acks the ticket on either answer, except a
+      `Decline` for `ineligible`, which it puts back at once for a seat that
+      may serve it; it runs a grant as it runs an accepted `serve`, its
+      events, `alive` and result as above.
+    - **Plans.** The brain publishes each node's `ConsumePlan` on
+      `voice.node.<node>.consume` when it changes and every 30 s: per seat,
+      held with a reason, or the queues to consume, in order. A node with no
+      plan consumes, for each seat, its own queue and the partitions its
+      assignment makes it eligible for, in both shapes (the `p` ones under
+      its own provider account); a ticket it may not serve is declined
+      `ineligible` at the claim.
+
+    The subject routes a ticket; the claim decides who serves it. Grafted,
+    the work subjects are under the broker's prefix as every other.
   contact:
     url: https://github.com/hale-lang/voice
 
@@ -219,6 +279,57 @@ channels:
       reply_to: { $ref: '#/components/parameters/reply_to' }
     messages:
       result: { $ref: '#/components/messages/result' }
+  workModel:
+    address: voice.work.m.{model}.{class}.{need}
+    description: A partition of a model served under one provider account.
+    x-voice-protocol: 3
+    parameters:
+      model: { $ref: '#/components/parameters/model' }
+      class: { $ref: '#/components/parameters/class' }
+      need: { $ref: '#/components/parameters/need' }
+    messages:
+      ticket: { $ref: '#/components/messages/ticket' }
+  workProvider:
+    address: voice.work.p.{model}.{provider}.{class}.{need}
+    description: A partition of a model served under more than one provider account, under one of them.
+    x-voice-protocol: 3
+    parameters:
+      model: { $ref: '#/components/parameters/model' }
+      provider: { $ref: '#/components/parameters/provider' }
+      class: { $ref: '#/components/parameters/class' }
+      need: { $ref: '#/components/parameters/need' }
+    messages:
+      ticket: { $ref: '#/components/messages/ticket' }
+  workSeat:
+    address: voice.work.s.{node}.{seat}
+    description: A seat's own queue, for a conversation's turn the api judged it may serve.
+    x-voice-protocol: 3
+    parameters:
+      node: { $ref: '#/components/parameters/node' }
+      seat: { $ref: '#/components/parameters/seat' }
+    messages:
+      ticket: { $ref: '#/components/messages/ticket' }
+  claim:
+    address: '{reply_to}.claim'
+    x-voice-protocol: 3
+    parameters:
+      reply_to: { $ref: '#/components/parameters/reply_to' }
+    messages:
+      claim: { $ref: '#/components/messages/claim' }
+  claimReply:
+    address: null
+    description: The NATS reply inbox of a `claim` request.
+    x-voice-protocol: 3
+    messages:
+      grant: { $ref: '#/components/messages/grant' }
+      decline: { $ref: '#/components/messages/decline' }
+  consume:
+    address: voice.node.{node}.consume
+    x-voice-protocol: 3
+    parameters:
+      node: { $ref: '#/components/parameters/node' }
+    messages:
+      consumePlan: { $ref: '#/components/messages/consumePlan' }
 
 operations:
   receiveAssign:
@@ -249,13 +360,48 @@ operations:
     action: send
     channel: { $ref: '#/channels/result' }
     summary: How a request ended. Exactly one per request, always last.
+  receiveModelTicket:
+    action: receive
+    channel: { $ref: '#/channels/workModel' }
+    summary: A ticket pulled from a partition, by a seat with a free slot.
+  receiveProviderTicket:
+    action: receive
+    channel: { $ref: '#/channels/workProvider' }
+    summary: A ticket pulled from a partition, by a seat with a free slot.
+  receiveSeatTicket:
+    action: receive
+    channel: { $ref: '#/channels/workSeat' }
+    summary: A ticket pulled from the seat's own queue, before any partition.
+  sendClaim:
+    action: send
+    channel: { $ref: '#/channels/claim' }
+    summary: Claim a ticket's request for a seat; granted once per attempt, or declined.
+    reply:
+      channel: { $ref: '#/channels/claimReply' }
+      address:
+        location: '$message.header#/replyTo'
+  receiveConsumePlan:
+    action: receive
+    channel: { $ref: '#/channels/consume' }
+    summary: Which queues each of the node's seats consumes, in order, or why it is held.
 
 components:
   parameters:
     node:
       description: The node's id.
     reply_to:
-      description: The reply subject prefix a `serve` named.
+      description: The reply subject prefix a `serve` or a ticket named.
+    seat:
+      description: The seat's id on its node.
+    model:
+      description: The catalog model a request is served as, after aliases, as a token.
+    provider:
+      description: A provider account's id (today's `account`), as a token.
+    class:
+      description: A data class, as a token.
+    need:
+      description: '`tools` when the request lists tools, else `any`.'
+      enum: [tools, any]
 
   messages:
     assign:
@@ -279,6 +425,26 @@ components:
     result:
       name: result
       payload: { $ref: '#/components/schemas/Result' }
+    ticket:
+      name: ticket
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/Ticket' }
+    claim:
+      name: claim
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/Claim' }
+    grant:
+      name: grant
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/Serve' }
+    decline:
+      name: decline
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/Decline' }
+    consumePlan:
+      name: consume_plan
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/ConsumePlan' }
 
   schemas:
     RequestId:
@@ -1187,6 +1353,186 @@ components:
             the request). Null for
             `accepted`, and left out by a node that does not say: read as
             `unavailable`.
+
+    # ---- protocol 3: pulling ----------------------------------------------
+
+    Ticket:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        A request waiting for a seat, as the api publishes it into the work
+        stream: what eligibility needs and where to claim it, never its
+        body, which stays in the memory of the api instance that holds the
+        caller. Under 1 KiB. An attempt's two copies differ only in `copy`.
+        Times are in UTC (`2026-11-26T10:00:00.25Z`).
+      required: [request_id, attempt, reply_to, instance, model, provider_account, data_class, need, endpoint, conversation, enqueued_at, wait_until, copy, avoid, size]
+      properties:
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        attempt:
+          type: integer
+          minimum: 1
+          description: |
+            The attempt, from 1. A retry before output is a new attempt,
+            with a ticket of its own.
+        reply_to:
+          type: string
+          description: |
+            The attempt's subject prefix, as `Serve.reply_to`: the claim goes
+            to `<reply_to>.claim`, and the events and the result as for
+            `serve`.
+        instance:
+          type: string
+          description: The api instance that holds the caller.
+        model:
+          type: string
+          description: The catalog model the request is served as, after aliases.
+        provider_account:
+          type: [string, 'null']
+          description: |
+            The provider account (today's `account`) of the attempt's
+            partition, in the `p` shape; null in the `m` shape.
+        data_class:
+          type: string
+          description: The request's data class.
+        need:
+          type: string
+          enum: [tools, any]
+          description: '`tools` when the request lists tools, else `any`.'
+        endpoint:
+          type: string
+          enum: [responses, decision]
+          description: What the request's body is, as `Serve.endpoint`.
+        conversation:
+          type: [string, 'null']
+          pattern: '^[0-9a-f]{32}$'
+          description: |
+            32 hex digits of a hash of the request's affinity key (its
+            `prompt_cache_key`, or the key voice derives from its opening);
+            null when it has none. A node keeps, per seat, the
+            conversations its tickets carried.
+        enqueued_at:
+          type: string
+          format: date-time
+          description: When the attempt's first copy was published.
+        wait_until:
+          type: string
+          format: date-time
+          description: |
+            When the request stops waiting for a seat: its
+            `voice.deadline`, or 60 s from admission, at most 10 minutes
+            (`internal.yaml`, `WorkStream.max_age`). A node acks and drops
+            a ticket past it, never claims it.
+        copy:
+          type: string
+          enum: [shared, seat]
+          description: |
+            `shared`, on a partition; `seat`, on the home seat's own queue,
+            for a conversation's turn. The copy's `Nats-Msg-Id` is
+            `<request_id>.<attempt>.<copy>`.
+        avoid:
+          type: array
+          maxItems: 8
+          description: |
+            The seats that failed this request, `<node>/<seat>`. A seat named
+            here puts the ticket back, with a delay, for another.
+          items: { type: string }
+        size:
+          type: integer
+          minimum: 0
+          description: |
+            Voice's estimate of the input, a token per four characters, as
+            `input_tokens_estimated`.
+
+    Claim:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        A seat's claim on a ticket's request, a NATS request to
+        `<reply_to>.claim` from the slot that pulled it, answered within
+        2 s with a `Grant` or a `Decline`. The api grants an attempt once,
+        whichever copy was claimed; `copy` serves only to recognize a
+        repeat of the granted claim, which is granted again.
+      required: [request_id, attempt, copy, seat]
+      properties:
+        request_id: { $ref: '#/components/schemas/RequestId' }
+        attempt:
+          type: integer
+          minimum: 1
+        copy:
+          type: string
+          enum: [shared, seat]
+        seat:
+          type: string
+          description: The claiming seat, `<node>/<seat>`.
+
+    Decline:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        The api's answer to a claim it does not grant. A grant is the
+        `serve` message (`Serve`); `type` tells the two apart.
+      required: [type, reason]
+      properties:
+        type: { type: string, const: decline }
+        reason:
+          type: string
+          enum: [taken, gone, avoided, ineligible]
+          description: |
+            `taken`: another claim was granted this attempt. `gone`: the
+            request is over (answered, its caller left, or its wait
+            ended). `avoided`: the seat failed this request before.
+            `ineligible`: the seat's provider account or data class is not
+            one the request may use, from the configuration the api read at
+            admission. The node acks the ticket on every decline but
+            `ineligible`, which it puts back at once for a seat that may
+            serve it.
+
+    ConsumePlan:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        Which queues each of the node's seats consumes, from the brain, on
+        `<root>.node.<node>.consume`: published when it changes and every
+        30 s, since core NATS delivers it at most once. The node pulls on
+        the newest it was given until another comes, and on its own
+        eligibility while it has none.
+      required: [version, seats]
+      properties:
+        version:
+          type: integer
+          minimum: 0
+          description: |
+            Milliseconds of Postgres's clock, and always above the version
+            before it, as the board's (`internal.yaml`, `Board.version`): a
+            node ignores a plan older than the one it holds.
+        seats:
+          type: array
+          maxItems: 16
+          items: { $ref: '#/components/schemas/SeatPlan' }
+
+    SeatPlan:
+      type: object
+      x-voice-protocol: 3
+      description: One seat's plan, held with its reason, or the queues it consumes in order.
+      required: [seat, hold, consume]
+      properties:
+        seat:
+          type: string
+          description: The seat's id on this node.
+        hold:
+          type: [string, 'null']
+          description: |
+            Why the seat pulls nothing (its node draining, its provider
+            account exhausted, a pair's follower down, ...); null when it
+            consumes.
+        consume:
+          type: array
+          maxItems: 64
+          description: |
+            The work subjects it pulls from, whole, in order: its own queue
+            first, then partitions. A seat with free slots sweeps them in
+            order. Empty when it is held.
+          items: { type: string }
 
     # ---- the node plane's bodies (openapi.yaml refers to these) -----------
 

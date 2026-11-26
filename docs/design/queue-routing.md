@@ -1,6 +1,8 @@
 # Queue routing
 
-Proposed, 2026-11-26. Not implemented.
+Implementation status: phase 1: groundwork merged (#255); stream, node pull, api tickets, controller pending.
+
+Proposed, 2026-11-26.
 
 Requests reach seats through work queues on NATS JetStream instead of
 through the route table. The api admits a request as it does today and

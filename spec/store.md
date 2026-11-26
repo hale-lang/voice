@@ -450,6 +450,44 @@ on conflict (id) do update
 returning version;
 ```
 
+### The board
+
+Queue routing's successor of the route table (`docs/design/queue-routing.md`;
+`internal.yaml`, `Board`), not read on a request's path yet: one row, each
+model's shape, each queue's reading and each seat's plan, versioned as the
+route table is. The working brain writes it each tick in the same
+transaction as node liveness; `body` is the board's `models`, `queues` and
+`seats`. The route table stays until the push path goes, and a migration
+then drops it.
+
+```sql
+insert into board (id, version, at, body)
+values (true, (extract(epoch from now()) * 1000)::bigint, now(), $board)
+on conflict (id) do update
+  set version = greatest(board.version + 1, (extract(epoch from now()) * 1000)::bigint),
+      at = now(), body = excluded.body
+returning version;
+```
+
+### Where a conversation is
+
+The seat a conversation's last turn was granted to, so its next turn goes
+first to the seat whose engine holds its prompt cache. A conversation is 32
+hex digits of a hash of the request's affinity key (`protocol.yaml`,
+`Ticket.conversation`), never the key itself. The api writes the row when
+it grants an attempt, and reads it at admission, one row by its key; a
+seat's node will correct its rows by the conversations it reports its
+engine holds, and old rows will be pruned by age. Neither is read on a
+request's path yet.
+
+```sql
+-- at the grant
+insert into seat_conversation (conversation, seat, at) values ($conversation, $seat, now())
+on conflict (conversation) do update set seat = excluded.seat, at = excluded.at;
+-- at admission
+select seat, at from seat_conversation where conversation = $conversation;
+```
+
 ## Migrations
 
 The schema above is migration 1 of the shared store seed, registered with
@@ -1584,4 +1622,27 @@ drop table annotator;
 drop table annotation_rule;
 alter table project drop column annotate;
 alter table api_key drop column annotate;
+```
+
+### Migration 47: the board, and where a conversation is
+
+Queue routing's two tables (The board, Where a conversation is): the
+brain's versioned board, which replaces the route table once the push path
+goes, and each conversation's seat, by the hash of its key. Nothing reads
+either on a request's path yet; the route table stays.
+
+```sql
+create table board (
+  id      boolean primary key default true check (id),
+  version bigint not null,
+  at      timestamptz not null,
+  body    jsonb not null
+);
+
+create table seat_conversation (
+  conversation text primary key check (length(conversation) = 32 and conversation !~ '[^0-9a-f]'),  -- 32 hex digits of a hash of the affinity key
+  seat         text not null,         -- <node>/<seat> its last turn was granted to
+  at           timestamptz not null
+);
+create index seat_conversation_by_seat on seat_conversation (seat, at);
 ```

@@ -1327,6 +1327,76 @@ locus PgStore {
         ) or raise;
     }
 
+    // ---- the board, and where a conversation is (store.md)
+
+    fn board() -> String fallible(StoreError) {
+        self.lock.enter();
+        let taken = self.row(
+            "SELECT (jsonb_build_object('version', version, 'at', to_char(at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')) || body)::text FROM board",
+            db::Args { },
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return taken;
+    }
+
+    fn put_board(body: String) -> Int fallible(StoreError) {
+        if !std::json::valid_object(body) {
+            fail StoreError { message: "the board is not one JSON object" };
+        }
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(body);
+        let written = self.row(
+            "WITH w AS (" + BOARD_WRITE
+                + ") SELECT json_build_object('version', version)::text FROM w",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return std::json::find_int_field(written, "version");
+    }
+
+    fn seat_conversation(conversation: String) -> SeatConversationRow fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(conversation);
+        let line = self.row(
+            "SELECT row_to_json(t) FROM (SELECT conversation, seat, at FROM seat_conversation WHERE conversation = $1) t",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        if len(line) == 0 { return SeatConversationRow { }; }
+        return SeatConversationRow {
+            present: true,
+            conversation: pg_text(line, "conversation"),
+            seat: pg_text(line, "seat"),
+            at: pg_time(pg_text(line, "at")),
+        };
+    }
+
+    fn put_seat_conversation(conversation: String, seat: String) fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(conversation);
+        a.add(seat);
+        self.write(
+            "INSERT INTO seat_conversation (conversation, seat, at) VALUES ($1, $2, now()) ON CONFLICT (conversation) DO UPDATE SET seat = excluded.seat, at = excluded.at",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
     // ---- the operator token
 
     fn operator_token(fresh: String) -> String fallible(StoreError) {
@@ -2872,6 +2942,10 @@ fn usage_row(line: String) -> UsageRow {
         present: true
     };
 }
+
+/// The board's write (store.md, "The board"): its version the store's
+/// clock in milliseconds, and always above the one before.
+const BOARD_WRITE: String = "INSERT INTO board (id, version, at, body) VALUES (true, (extract(epoch FROM now()) * 1000)::bigint, now(), $1::jsonb) ON CONFLICT (id) DO UPDATE SET version = greatest(board.version + 1, (extract(epoch FROM now()) * 1000)::bigint), at = now(), body = EXCLUDED.body RETURNING version";
 
 /// A timestamptz as Postgres writes it in UTC (`...+00:00`), as a `Time`.
 fn pg_time(text: String) -> Time {

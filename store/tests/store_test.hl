@@ -1777,6 +1777,104 @@ fn rollup(s: st::Store, label: String) {
     std::test::assert(same, label + ": the totals are what a scan of the ledger sums");
 }
 
+/// 32 hex digits of the sha256 of `key`: a conversation as the store
+/// keeps it.
+fn hashed(key: String) -> String {
+    return std::hex::encode(std::crypto::sha256(std::bytes::from_string(key)))[0..32];
+}
+
+/// The board (store.md, "The board"): none until the brain writes one;
+/// then the last written, its version always above the one before, even
+/// within one millisecond of the store's clock.
+fn boards(s: st::Store, label: String) {
+    std::test::assert_eq_str(s.board() or "?", "", label + ": no board until one is written");
+    let first = s.put_board(
+        "{\"models\": [{\"model\": \"echo-1\", \"shape\": \"m\"}], \"queues\": [], \"seats\": []}",
+    ) or {
+        std::test::assert(false, label + ": a board is written: " + err.message);
+        return;
+    };
+    let read = s.board() or "";
+    let models = std::json::array_first(std::json::find_field_raw(read, "models"));
+    std::test::assert(
+        first > 0 && std::json::find_int_field(read, "version") == first
+            && std::str::ends_with(std::json::find_string_field(read, "at"), "Z")
+            && std::json::find_string_field(models.element, "shape") == "m"
+            && std::str::trim(std::json::find_field_raw(read, "queues")) == "[]",
+        label + ": and reads back with its version and time: " + read,
+    );
+    let second = s.put_board(
+        "{\"models\": [{\"model\": \"echo-1\", \"shape\": \"p\"}], \"queues\": [], \"seats\": []}",
+    ) or 0;
+    let again = s.board() or "";
+    let changed = std::json::array_first(std::json::find_field_raw(again, "models"));
+    std::test::assert(
+        second > first && std::json::find_int_field(again, "version") == second
+            && std::json::find_string_field(changed.element, "shape") == "p",
+        label + ": a board written again replaces it, at a later version: "
+            + to_string(first) + " then " + to_string(second),
+    );
+    let mut refused = "";
+    s.put_board("[1]") or {
+        refused = err.message;
+        0
+    };
+    std::test::assert(len(refused) > 0, label + ": a board that is not an object is refused");
+    std::test::assert(
+        std::json::find_int_field(s.board() or "", "version") == second,
+        label + ": and the board is as it was",
+    );
+}
+
+/// Where a conversation is (store.md): the seat its last turn was granted
+/// to, by the hash of its key.
+fn conversation_seats(s: st::Store, label: String) {
+    let c = hashed("conversation-1");
+    let none = s.seat_conversation(c) or st::SeatConversationRow { present: true };
+    std::test::assert(!none.present, label + ": a conversation no seat was granted is nowhere");
+    s.put_seat_conversation(c, "spark/coder") or {
+        std::test::assert(false, label + ": a conversation's seat is written: " + err.message);
+        return;
+    };
+    let got = s.seat_conversation(c) or st::SeatConversationRow { };
+    std::test::assert(
+        got.present && got.conversation == c && got.seat == "spark/coder"
+            && std::time::unix(got.at) > std::time::unix(std::time::current()) - 3600,
+        label + ": and read back, with when: " + got.seat,
+    );
+    s.put_seat_conversation(c, "flare/coder") or discard;
+    let moved = s.seat_conversation(c) or st::SeatConversationRow { };
+    std::test::assert(
+        moved.present && moved.seat == "flare/coder",
+        label + ": its next turn granted elsewhere moves it: " + moved.seat,
+    );
+    let other = s.seat_conversation(hashed("conversation-2")) or st::SeatConversationRow { };
+    std::test::assert(!other.present, label + ": another conversation is still nowhere");
+    let mut refused = false;
+    s.put_seat_conversation("conversation-1", "spark/coder") or { refused = true; };
+    std::test::assert(refused, label + ": a key that is not a hash is refused");
+}
+
+/// The memory store keeps the newest conversations, the oldest forgotten
+/// first.
+fn conversations_kept() {
+    let s = st::MemoryStore { };
+    let mut i = 0;
+    while i <= st::SEAT_CONVERSATIONS_KEPT {
+        s.put_seat_conversation(hashed("c" + to_string(i)), "spark/coder") or discard;
+        i = i + 1;
+    }
+    let oldest = s.seat_conversation(hashed("c0")) or st::SeatConversationRow { };
+    let second = s.seat_conversation(hashed("c1")) or st::SeatConversationRow { };
+    let newest = s.seat_conversation(
+        hashed("c" + to_string(st::SEAT_CONVERSATIONS_KEPT)),
+    ) or st::SeatConversationRow { };
+    std::test::assert(
+        !oldest.present && second.present && newest.present,
+        "memory: past its most, the oldest conversation is forgotten",
+    );
+}
+
 fn main() {
     std::test::assert_eq_str(
         st::parse_dsn("postgres://u:p@db:5433/v?sslmode=disable").problem,
@@ -1857,6 +1955,9 @@ fn main() {
     peeks(st::MemoryStore { }, "memory");
     rollup(st::MemoryStore { }, "memory");
     speeds(st::MemoryStore { }, "memory");
+    boards(st::MemoryStore { }, "memory");
+    conversation_seats(st::MemoryStore { }, "memory");
+    conversations_kept();
     if !std::env::var_exists("VOICE_TEST_DATABASE_URL") { return; }
     let pg = st::PgStore { url: std::env::var("VOICE_TEST_DATABASE_URL") };
     std::test::assert(pg.ready(), "the test database answers");
@@ -1898,6 +1999,9 @@ fn main() {
     );
     pg.conn.exec("TRUNCATE usage, usage_hourly, placement RESTART IDENTITY");
     speeds(pg, "postgres");
+    pg.conn.exec("TRUNCATE board, seat_conversation");
+    boards(pg, "postgres");
+    conversation_seats(pg, "postgres");
 }
 
 /// A request seat `seat` served at `when`: `output` tokens, its first at

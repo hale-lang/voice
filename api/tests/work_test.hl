@@ -1,0 +1,427 @@
+// Queue routing's wire (lib/work; spec/protocol.yaml, "Pulling: protocol
+// 3"): the work subjects with their ids as tokens, each copy's message id
+// and each queue's consumer, and every message of protocol 3 read back as
+// it was written; a message that is not one is refused, saying what is
+// wrong.
+import "../../lib/work" as work;
+
+fn t(text: String) -> Time {
+    return std::time::parse_time(text) or `1970-01-01T00:00:00Z`;
+}
+
+fn ticket() -> work::Ticket {
+    let mut tk = work::Ticket {
+        request_id: "req_01",
+        attempt: 2,
+        reply_to: "voice.reply.api-1.req_01.2",
+        instance: "api-1",
+        model: "glm-4.7-flash",
+        provider_account: "work",
+        data_class: "internal",
+        need: "tools",
+        endpoint: "responses",
+        conversation: "0123456789abcdef0123456789abcdef",
+        enqueued_at: t("2026-11-26T10:00:00.25Z"),
+        wait_until: t("2026-11-26T10:01:00.25Z"),
+        copy: "seat",
+        size: 3000,
+    };
+    push(tk.avoid, "spark/coder") or discard;
+    push(tk.avoid, "flare/coder") or discard;
+    return tk;
+}
+
+/// The message refused, its error saying `says`.
+fn refused_ticket(json: String, says: String, what: String) {
+    let mut message = "";
+    work::ticket_of(json) or {
+        message = err.message;
+        work::Ticket { }
+    };
+    std::test::assert(
+        len(message) > 0 && std::str::contains(message, says),
+        "a ticket " + what + " is refused: " + message,
+    );
+}
+
+fn refused_claim(json: String, says: String, what: String) {
+    let mut message = "";
+    work::claim_of(json) or {
+        message = err.message;
+        work::Claim { }
+    };
+    std::test::assert(
+        len(message) > 0 && std::str::contains(message, says),
+        "a claim " + what + " is refused: " + message,
+    );
+}
+
+fn refused_answer(json: String, says: String, what: String) {
+    let mut message = "";
+    work::answer_of(json) or {
+        message = err.message;
+        work::ClaimAnswer { }
+    };
+    std::test::assert(
+        len(message) > 0 && std::str::contains(message, says),
+        "an answer " + what + " is refused: " + message,
+    );
+}
+
+fn refused_plan(json: String, says: String, what: String) {
+    let mut message = "";
+    work::consume_plan_of(json) or {
+        message = err.message;
+        work::ConsumePlan { }
+    };
+    std::test::assert(
+        len(message) > 0 && std::str::contains(message, says),
+        "a plan " + what + " is refused: " + message,
+    );
+}
+
+fn subjects() {
+    std::test::assert_eq_str(work::token("glm-4.7-flash"), "glm-4%2E7-flash", "a dot is encoded");
+    std::test::assert_eq_str(
+        work::token("a*b>c%d e\tf"),
+        "a%2Ab%3Ec%25d%20e%09f",
+        "wildcards, the escape itself and whitespace too",
+    );
+    std::test::assert_eq_str(work::token("café"), "caf%C3%A9", "and each byte past ASCII");
+    std::test::assert_eq_str(work::token("qwen3-8b_q4"), "qwen3-8b_q4", "a slug is itself");
+    std::test::assert_eq_str(
+        work::model_subject("voice", "glm-4.7-flash", "internal", "any"),
+        "voice.work.m.glm-4%2E7-flash.internal.any",
+        "a model served under one provider account",
+    );
+    std::test::assert_eq_str(
+        work::provider_subject("heart.abc", "gpt-oss-120b", "work", "internal", "tools"),
+        "heart.abc.work.p.gpt-oss-120b.work.internal.tools",
+        "a model served under several, grafted",
+    );
+    std::test::assert_eq_str(
+        work::seat_subject("voice", "spark", "coder"),
+        "voice.work.s.spark.coder",
+        "a seat's own queue",
+    );
+    std::test::assert_eq_str(work::work_subjects("voice"), "voice.work.>", "the stream's");
+    std::test::assert_eq_str(
+        work::consume_subject("voice", "spark"),
+        "voice.node.spark.consume",
+        "a node's plan",
+    );
+    std::test::assert_eq_str(
+        work::claim_subject("voice.reply.api-1.req_01.2"),
+        "voice.reply.api-1.req_01.2.claim",
+        "a claim",
+    );
+    std::test::assert_eq_str(
+        work::message_id("req_01", 2, "shared"),
+        "req_01.2.shared",
+        "a copy's message id",
+    );
+    std::test::assert(
+        work::message_id("req_01", 2, "seat") != work::message_id("req_01", 2, "shared"),
+        "an attempt's two copies have two ids, so the stream keeps both",
+    );
+    let name = work::consumer_name("voice.work.m.glm-4%2E7-flash.internal.any");
+    std::test::assert(
+        len(name) == 18 && std::str::starts_with(name, "w_")
+            && name == work::consumer_name("voice.work.m.glm-4%2E7-flash.internal.any")
+            && name != work::consumer_name("voice.work.m.glm-4%2E7-flash.internal.tools"),
+        "a consumer is named from its subject alone: " + name,
+    );
+    std::test::assert_eq_str(
+        work::consumer_name("abc"),
+        "w_ba7816bf8f01cfea",
+        "w_ and 16 hex digits of its sha256",
+    );
+    std::test::assert(
+        work::STREAM_MAX_AGE_MS == 600000 && work::STREAM_DUPLICATE_WINDOW_MS == 120000
+            && work::STREAM_MAX_MSGS_PER_SUBJECT == 1024 && work::STREAM_ALLOW_MSG_TTL
+            && work::CONSUMER_ACK_WAIT_MS == 10000 && work::CONSUMER_MAX_ACK_PENDING == 1024
+            && work::CONSUMER_MAX_DELIVER == 0 && work::PROTOCOL_PULL == 3,
+        "the stream's and consumers' settings are internal.yaml's, in pond's units",
+    );
+}
+
+fn tickets() {
+    let tk = ticket();
+    let json = work::ticket_json(tk);
+    std::test::assert(len(json) < 1024, "a ticket is under 1 KiB: " + to_string(len(json)));
+    let back = work::ticket_of(json) or {
+        std::test::assert(false, "a ticket reads back: " + err.message);
+        return;
+    };
+    std::test::assert(
+        back.request_id == "req_01" && back.attempt == 2
+            && back.reply_to == "voice.reply.api-1.req_01.2" && back.instance == "api-1"
+            && back.model == "glm-4.7-flash" && back.provider_account == "work"
+            && back.data_class == "internal" && back.need == "tools"
+            && back.endpoint == "responses"
+            && back.conversation == "0123456789abcdef0123456789abcdef" && back.copy == "seat"
+            && back.size == 3000,
+        "a ticket reads back as it was written: " + json,
+    );
+    std::test::assert(
+        std::time::nanos(back.enqueued_at) == std::time::nanos(tk.enqueued_at)
+            && std::time::nanos(back.wait_until) == std::time::nanos(tk.wait_until),
+        "its times to the millisecond",
+    );
+    std::test::assert(
+        count(back.avoid) == 2 && (at(back.avoid, 1) or "") == "flare/coder",
+        "and the seats it avoids, in order",
+    );
+    std::test::assert_eq_str(work::ticket_json(back), json, "written again, the same");
+
+    // the m shape, and a request with no conversation: null, both
+    let mut plain = ticket();
+    plain.provider_account = "";
+    plain.conversation = "";
+    plain.copy = "shared";
+    let none = work::Ticket { };
+    plain.avoid = none.avoid;
+    let pj = work::ticket_json(plain);
+    std::test::assert(
+        std::str::contains(pj, "\"provider_account\": null")
+            && std::str::contains(pj, "\"conversation\": null")
+            && std::str::contains(pj, "\"avoid\": []"),
+        "no provider account and no conversation are null: " + pj,
+    );
+    let pb = work::ticket_of(pj) or work::Ticket { request_id: "refused" };
+    std::test::assert(
+        pb.request_id == "req_01" && pb.provider_account == "" && pb.conversation == ""
+            && count(pb.avoid) == 0,
+        "and read back as none",
+    );
+
+    // malformed
+    refused_ticket("[1]", "not one JSON object", "that is not an object");
+    refused_ticket("{\"request_id\": ", "not one JSON object", "that is not JSON");
+    refused_ticket(
+        std::str::replace(json, "\"request_id\": \"req_01\", ", ""),
+        "`request_id`",
+        "with no request id",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"attempt\": 2", "\"attempt\": 0"),
+        "`attempt` is at least 1",
+        "of attempt 0",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"attempt\": 2", "\"attempt\": 2.5"),
+        "`attempt` is a required integer",
+        "of an attempt that is no integer",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"attempt\": 2", "\"attempt\": \"2\""),
+        "`attempt` is a required integer",
+        "of an attempt as a string",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"need\": \"tools\"", "\"need\": \"vision\""),
+        "`need` is one of tools, any",
+        "with a need there is not",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"copy\": \"seat\"", "\"copy\": \"both\""),
+        "`copy` is one of shared, seat",
+        "of a copy there is not",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"endpoint\": \"responses\"", "\"endpoint\": \"chat\""),
+        "`endpoint`",
+        "for an endpoint there is not",
+    );
+    refused_ticket(
+        std::str::replace(json, "0123456789abcdef0123456789abcdef", "0123456789ABCDEF"),
+        "`conversation` is 32 lower-case hex digits",
+        "whose conversation is not a hash",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"provider_account\": \"work\"", "\"provider_account\": \"\""),
+        "`provider_account`",
+        "whose provider account is empty",
+    );
+    refused_ticket(
+        std::str::replace(json, ", \"provider_account\": \"work\"", ""),
+        "`provider_account`",
+        "with no provider account, not even null",
+    );
+    refused_ticket(
+        std::str::replace(json, "2026-11-26T10:01:00.25Z", "tomorrow"),
+        "`wait_until` is a time",
+        "whose wait ends at no time",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"size\": 3000", "\"size\": -1"),
+        "`size` is at least 0",
+        "of a negative size",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"spark/coder\"", "\"spark\""),
+        "`avoid` is a list of seats",
+        "avoiding a seat that is not `<node>/<seat>`",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"spark/coder\"", "3"),
+        "`avoid` is a list of seats",
+        "avoiding a number",
+    );
+    refused_ticket(
+        std::str::replace(
+            json,
+            "\"avoid\": [\"spark/coder\", \"flare/coder\"]",
+            "\"avoid\": [\"a/1\", \"a/2\", \"a/3\", \"a/4\", \"a/5\", \"a/6\", \"a/7\", \"a/8\", \"a/9\"]",
+        ),
+        "`avoid` holds at most 8",
+        "avoiding more seats than a request has attempts",
+    );
+    refused_ticket(
+        std::str::replace(json, "\"avoid\": [\"spark/coder\", \"flare/coder\"]", "\"avoid\": null"),
+        "`avoid` is a required list",
+        "whose avoid is null",
+    );
+}
+
+fn claims() {
+    let c = work::Claim { request_id: "req_01", attempt: 2, copy: "shared", seat: "spark/coder" };
+    let json = work::claim_json(c);
+    let back = work::claim_of(json) or {
+        std::test::assert(false, "a claim reads back: " + err.message);
+        return;
+    };
+    std::test::assert(
+        back.request_id == "req_01" && back.attempt == 2 && back.copy == "shared"
+            && back.seat == "spark/coder",
+        "a claim reads back as it was written: " + json,
+    );
+    refused_claim("\"claim\"", "not one JSON object", "that is not an object");
+    refused_claim(
+        std::str::replace(json, "\"spark/coder\"", "\"coder\""),
+        "`seat` is `<node>/<seat>`",
+        "by a seat with no node",
+    );
+    refused_claim(
+        std::str::replace(json, "\"spark/coder\"", "\"a/b/c\""),
+        "`seat` is `<node>/<seat>`",
+        "by a seat of two slashes",
+    );
+    refused_claim(
+        std::str::replace(json, "\"copy\": \"shared\"", "\"copy\": null"),
+        "`copy` is one of",
+        "of no copy",
+    );
+    refused_claim(
+        std::str::replace(json, "\"attempt\": 2", "\"attempt\": -3"),
+        "`attempt` is at least 1",
+        "of a negative attempt",
+    );
+
+    // the answers: a grant is the serve message, whole; a decline its reason
+    let serve = "{\"type\": \"serve\", \"request_id\": \"req_01\", \"reply_to\": \"r\", \"seat\": \"coder\", \"model\": \"m\", \"body\": {\"input\": \"hi\"}}";
+    let g = work::answer_of(serve) or work::ClaimAnswer { reason: "refused" };
+    std::test::assert(
+        g.granted && g.serve == serve && g.reason == "",
+        "a grant is the serve message, body and all",
+    );
+    for reason in ["taken", "gone", "avoided", "ineligible"] {
+        let d = work::answer_of(work::decline_json(reason)) or work::ClaimAnswer {
+            granted: true,
+        };
+        std::test::assert(!d.granted && d.reason == reason, "a decline for " + reason);
+    }
+    refused_answer(
+        work::decline_json("busy"),
+        "`reason` is one of",
+        "declining for no reason it has",
+    );
+    refused_answer("{\"type\": \"decline\"}", "`reason`", "declining with no reason");
+    refused_answer(
+        "{\"request_id\": \"req_01\", \"outcome\": \"accepted\"}",
+        "a `serve` or a `decline`",
+        "that is a serve's ack",
+    );
+    refused_answer("", "not one JSON object", "that is empty");
+}
+
+fn plans() {
+    let mut coder = work::SeatPlan { seat: "coder" };
+    push(coder.consume, "voice.work.s.spark.coder") or discard;
+    push(coder.consume, "voice.work.m.qwen3-coder-next.internal.tools") or discard;
+    push(coder.consume, "voice.work.m.qwen3-coder-next.internal.any") or discard;
+    let held = work::SeatPlan { seat: "chat", hold: "its provider account is exhausted" };
+    let mut p = work::ConsumePlan { version: 1795687200250 };
+    push(p.seats, coder) or discard;
+    push(p.seats, held) or discard;
+    let json = work::consume_plan_json(p);
+    let back = work::consume_plan_of(json) or {
+        std::test::assert(false, "a plan reads back: " + err.message);
+        return;
+    };
+    let first = at(back.seats, 0) or work::SeatPlan { };
+    let second = at(back.seats, 1) or work::SeatPlan { };
+    std::test::assert(
+        back.version == 1795687200250 && count(back.seats) == 2 && first.seat == "coder"
+            && first.hold == "" && count(first.consume) == 3
+            && (at(first.consume, 0) or "") == "voice.work.s.spark.coder"
+            && (at(first.consume, 2) or "") == "voice.work.m.qwen3-coder-next.internal.any",
+        "a plan reads back, each seat's queues in order: " + json,
+    );
+    std::test::assert(
+        second.seat == "chat" && second.hold == "its provider account is exhausted"
+            && count(second.consume) == 0,
+        "and a held seat with its reason",
+    );
+    std::test::assert_eq_str(work::consume_plan_json(back), json, "written again, the same");
+
+    refused_plan("{\"version\": 1}", "`seats` is a required list", "with no seats");
+    refused_plan("{\"seats\": []}", "`version`", "with no version");
+    refused_plan(
+        "{\"version\": 1, \"seats\": [{\"seat\": \"a\", \"hold\": \"draining\", \"consume\": [\"voice.work.s.n.a\"]}]}",
+        "a held seat consumes nothing",
+        "whose held seat consumes",
+    );
+    refused_plan(
+        "{\"version\": 1, \"seats\": [{\"seat\": \"a\", \"hold\": null}]}",
+        "`consume`",
+        "whose seat names no queues",
+    );
+    refused_plan(
+        "{\"version\": 1, \"seats\": [{\"seat\": \"a\", \"hold\": null, \"consume\": [1]}]}",
+        "`consume` is a list of subjects",
+        "whose seat's queues are not subjects",
+    );
+    let mut many = "";
+    let mut i = 0;
+    while i < 65 {
+        many = many + (if i > 0 { ", " } else { "" }) + "\"voice.work.s.n.s" + to_string(i)
+            + "\"";
+        i = i + 1;
+    }
+    refused_plan(
+        "{\"version\": 1, \"seats\": [{\"seat\": \"a\", \"hold\": null, \"consume\": [" + many
+            + "]}]}",
+        "`consume` holds at most 64",
+        "whose seat consumes more than 64 queues",
+    );
+    let mut seats = "";
+    i = 0;
+    while i < 17 {
+        seats = seats + (if i > 0 { ", " } else { "" }) + "{\"seat\": \"s" + to_string(i)
+            + "\", \"hold\": null, \"consume\": []}";
+        i = i + 1;
+    }
+    refused_plan(
+        "{\"version\": 1, \"seats\": [" + seats + "]}",
+        "`seats` holds at most 16",
+        "of more seats than a node has",
+    );
+}
+
+fn main() {
+    subjects();
+    tickets();
+    claims();
+    plans();
+}

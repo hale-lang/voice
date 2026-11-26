@@ -239,6 +239,23 @@ type FlightRow {
 
 type FlightRows { rows: bounded[FlightRow; 100]; }
 
+/// A conversation's seat (store.md, "Where a conversation is"):
+/// `conversation` 32 hex digits of a hash of its key, `seat` the
+/// `<node>/<seat>` its last turn was granted to, at `at`.
+type SeatConversationRow {
+    present: Bool = false;
+    conversation: String = "";
+    seat: String = "";
+    at: Time = `1970-01-01T00:00:00Z`;
+}
+
+/// The memory store's conversations: the most it keeps, the oldest
+/// forgotten first. A conversation forgotten is a turn that goes where a
+/// new conversation would.
+const SEAT_CONVERSATIONS_KEPT: Int = 1024;
+
+type SeatConversationRows { rows: bounded[SeatConversationRow; 1024]; }
+
 /// The days a recorded request is kept.
 const PEEK_DAYS: Int = 7;
 
@@ -815,6 +832,20 @@ type ConversationGroups { rows: bounded[ConversationRow; 1000]; }
 /// The most keys, and models, a conversation's row names.
 const CONVERSATION_NAMES: Int = 4;
 
+/// True when `s` is a conversation as the store keeps it: 32 lower-case
+/// hex digits.
+fn conversation_hash(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    if v.n != 32 { return false; }
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
 /// True for a status a request failed with: any but served and incomplete.
 fn failed_status(status: String) -> Bool {
     return status != "served" && status != "incomplete";
@@ -1054,6 +1085,20 @@ interface Store {
     /// as JSON; "" when none has been.
     fn route_table() -> String fallible(StoreError);
 
+    /// The board the brain last wrote (internal.yaml `Board`, store.md
+    /// "The board"), as JSON; "" when none has been.
+    fn board() -> String fallible(StoreError);
+    /// Write the board: `body` its `models`, `queues` and `seats`, as one
+    /// JSON object. Its version is the store's clock in milliseconds, and
+    /// always above the one before; the version written.
+    fn put_board(body: String) -> Int fallible(StoreError);
+
+    /// The seat `conversation` (32 hex digits of a hash of its key) was
+    /// last granted to; `present` false for none.
+    fn seat_conversation(conversation: String) -> SeatConversationRow fallible(StoreError);
+    /// `conversation`'s turn was granted to `seat` (`<node>/<seat>`), now.
+    fn put_seat_conversation(conversation: String, seat: String) fallible(StoreError);
+
     /// The operator token, the admin plane's one credential (api/operator.hl):
     /// the one kept, or `fresh` kept now when none is, so every api over the
     /// store answers to the same token. "" when none is kept and `fresh` is
@@ -1242,6 +1287,12 @@ locus MemoryStore {
         habitat_grant: String = "";
         // the hosted tools' settings, "" for none set
         tool_settings: String = "";
+        // the board, "" until one is written: its body, version and time
+        board_body: String = "";
+        board_version: Int = 0;
+        board_at: Time = `1970-01-01T00:00:00Z`;
+        // each conversation's seat, oldest first
+        conversation_rows: SeatConversationRows = SeatConversationRows { };
     }
 
     fn kind() -> String { return "memory"; }
@@ -2045,6 +2096,66 @@ locus MemoryStore {
 
     /// No brain writes to the memory store.
     fn route_table() -> String fallible(StoreError) { return ""; }
+
+    fn board() -> String fallible(StoreError) {
+        if len(self.board_body) == 0 { return ""; }
+        let head = "{\"version\": " + to_string(self.board_version) + ", \"at\": \""
+            + std::time::iso8601(self.board_at) + "\"";
+        let rest = std::str::trim(self.board_body[1..len(self.board_body)]);
+        return head + (if rest == "}" { "}" } else { ", " + rest });
+    }
+
+    fn put_board(body: String) -> Int fallible(StoreError) {
+        if !std::json::valid_object(body) {
+            fail StoreError { message: "the board is not one JSON object" };
+        }
+        let now = std::time::current();
+        let ms = std::time::nanos(now) / 1000000;
+        self.board_version = if ms > self.board_version { ms } else { self.board_version + 1 };
+        self.board_at = now;
+        self.board_body = std::str::trim(body);
+        return self.board_version;
+    }
+
+    fn seat_conversation(conversation: String) -> SeatConversationRow fallible(StoreError) {
+        for r in self.conversation_rows.rows {
+            if r.conversation == conversation { return r; }
+        }
+        return SeatConversationRow { };
+    }
+
+    fn put_seat_conversation(conversation: String, seat: String) fallible(StoreError) {
+        if !conversation_hash(conversation) {
+            fail StoreError {
+                message: "a conversation is 32 lower-case hex digits: " + conversation,
+            };
+        }
+        let mut held = false;
+        for r in self.conversation_rows.rows {
+            if r.conversation == conversation { held = true; }
+        }
+        // the rest, oldest first, but the oldest when the store is full
+        let mut drop = !held && count(self.conversation_rows.rows) >= SEAT_CONVERSATIONS_KEPT;
+        let mut next = SeatConversationRows { };
+        for r in self.conversation_rows.rows {
+            if r.conversation == conversation { continue; }
+            if drop {
+                drop = false;
+                continue;
+            }
+            push(next.rows, r) or discard;
+        }
+        push(
+            next.rows,
+            SeatConversationRow {
+                present: true,
+                conversation: conversation,
+                seat: seat,
+                at: std::time::current(),
+            },
+        ) or discard;
+        self.conversation_rows = next;
+    }
 
     fn operator_token(fresh: String) -> String fallible(StoreError) {
         if len(self.operator) == 0 { self.operator = fresh; }

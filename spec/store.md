@@ -1648,3 +1648,15 @@ create table seat_conversation (
 );
 create index seat_conversation_by_seat on seat_conversation (seat, at);
 ```
+
+### Migration 48: the protocol a node registered with
+
+Queue routing's step (d) (docs/design/queue-routing.md, Migration): the
+api queues a request when every seat that could serve it is on a node of
+protocol 3, so it keeps the protocol each node last registered with. A
+node registered before this migration has none (null, which is not 3)
+until it registers again, and its seats' requests are offered as before.
+
+```sql
+alter table node_state add column protocol integer;  -- the protocol the node last registered with (2 or 3); null before migration 48
+```

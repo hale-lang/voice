@@ -186,7 +186,7 @@ hearts on one broker do not collide), over `<root>.work.>`:
 | per-message TTL | the ticket's own wait (`Nats-TTL`; NATS 2.11, as Compose runs) | an expired ticket leaves the depth the brain reads |
 | max messages per subject | 1024, a voice constant | a partition's backlog is bounded; past it the publish is refused and the caller answered `429 no_capacity` at once |
 | discard | new | a full partition refuses the newcomer, not the oldest waiter |
-| duplicate window | 2 min | a ticket published again after a reconnect is kept once (`Nats-Msg-Id`) |
+| duplicate window | 2 min | a copy of a ticket published again (a lost ack, a reconnect) is kept once (`Nats-Msg-Id`); the window is the stream's, whatever the subject |
 
 A ticket is under 1 KiB; the 16 MiB `max_payload`
 (`deploy/nats/nats.conf`) is for bodies, which never enter the stream.
@@ -215,11 +215,20 @@ All on the node seam, so in [`protocol.yaml`](../../spec/protocol.yaml):
   subject's, in the `p` shape; null in the `m` shape), `data_class`,
   `need`, `endpoint` (`responses` or `decision`), `conversation` (32 hex
   of a hash of the affinity key, or null), `enqueued_at`, `wait_until`,
-  `avoid` (seats that failed this request), `size` (voice's estimate of
-  the input, a token per four characters, as `input_tokens_estimated`).
-  Its `Nats-Msg-Id` is `<request_id>.<attempt>`.
+  `copy` (`shared` or `seat`), `avoid` (seats that failed this request),
+  `size` (voice's estimate of the input, a token per four characters, as
+  `input_tokens_estimated`).
+  It goes into the stream as one or two **copies**: `shared`, on a
+  partition, and, for a conversation's turn, `seat`, on the home seat's
+  own queue (The window). Each copy has a `Nats-Msg-Id` of its own,
+  `<request_id>.<attempt>.<copy>`, and keeps it for every publish of that
+  copy. Dedupe is per stream, not per subject, so two copies under one
+  id would be stored once: the shared copy of a turn would be dropped as
+  a duplicate of its seat copy, and the turn stranded on a busy seat.
 - **`Claim`**, a NATS request from the node to `<reply_to>.claim`:
-  `request_id`, `attempt`, `seat` (`<node>/<seat>`).
+  `request_id`, `attempt`, `copy`, `seat` (`<node>/<seat>`). The api
+  grants each attempt once, whichever copy was claimed; `copy` serves only
+  to recognize a repeat (Delivery).
 - **`Grant`**, the api's answer: today's `Serve` message, body and all; or
   **`Decline`**, with `reason` `taken` (another seat has it), `gone`
   (answered, its caller left, or its wait ended), `avoided`, or
@@ -236,14 +245,15 @@ and the protocol becomes version 3.
 ## A request, end to end
 
 1. **Admit**, as today: the key, the model and its aliases, the provider
-   account it names (`voice.account`), the data class, the rate limits (`hold`, `api/admission.hl`); the
-   budget's reservation when it lands (store.md, "Reserve").
+   account it names (`voice.account`), the data class, the rate limits
+   (`hold`, `api/admission.hl`); the budget's reservation when it lands
+   (store.md, "Reserve").
 2. **Choose a partition.** In the `m` shape there is one: the model, its
    class and need. In the `p` shape, the provider accounts the request may
    spend (the key's and the project's lists, or the one it names) that a
    seat of the model runs under give its eligible partitions (`allowed`,
-   applied to partitions instead of seats). The api picks one (Choosing a partition), or a seat's own queue first for a
-   conversation. If the board says nothing consumes any of them: `503
+   applied to partitions instead of seats). The api picks one (Choosing a
+   partition), or a seat's own queue first for a conversation. If the board says nothing consumes any of them: `503
    no_eligible_seat` at once, with the reason `unmet` gives today.
 3. **Publish** the ticket on the attempt's connection and wait for the
    stream's ack (`js_publish_id`). A full partition is `429 no_capacity`.
@@ -278,10 +288,13 @@ runs the engine as a slot runs an accepted `serve` today
   which is put back at once for a seat that may serve it.
 - **Redelivery.** A ticket pulled and not acked within the ack wait (the
   node died or lost NATS between pull and grant) goes to another puller.
-  The api dedupes by `request_id` and `attempt`: if the first claim was
-  granted, the next is `taken`; if it never reached the api, the next is
-  granted. A claim is idempotent per seat, so a seat whose answer was lost
-  claims again and gets the same grant.
+  The api dedupes by `request_id` and `attempt`, across copies: if the
+  first claim was granted, the next is `taken`; if it never reached the
+  api, the next is granted. Only a repeat of the granted claim itself
+  (the same seat and the same copy, its answer lost) gets the grant
+  again. The home seat consumes the shared partition too, so it may pull
+  both copies of its own turn; the second is `taken` like any other, and
+  no seat is ever granted an attempt twice.
 - **A seat that dies between grant and ack.** The ticket comes back and
   every claim on it is `taken`; the api's wait for that seat's first
   output fails the attempt (120 s at most, as for a seat that accepted and
@@ -296,12 +309,16 @@ runs the engine as a slot runs an accepted `serve` today
   comes after the ack, under the api's timers as today. The ack wait
   bounds pull, claim and ack, milliseconds on the private network; 10 s
   leaves room for a claim's 2 s timeout and one retry.
-- **A publish whose ack is lost** is sent again with the same
-  `Nats-Msg-Id`, kept once within the duplicate window.
-- **Cancelled and expired requests.** Nothing is deleted: the api
-  declines every later claim (`gone`), and the TTL removes a ticket no
-  seat pulled. Deleting it by sequence (the publish ack gives it) would
-  keep the depth exact sooner; optional, and pond work.
+- **A publish whose ack is lost** is sent again with that copy's own
+  `Nats-Msg-Id`, kept once within the duplicate window. Two message ids
+  serve two copies; one grant serves one attempt. The message id keeps
+  the stream from storing a copy twice; it never decides who serves.
+- **Cancelled, expired and granted requests.** Nothing is deleted: the
+  api declines every later claim on any copy (`gone`, or `taken` once
+  granted), and the TTL removes a copy no seat pulled. A turn's other copy
+  is left behind the same way once one is granted. Deleting a copy by its
+  sequence (each copy's publish ack gives its own) would keep the depth
+  exact sooner; optional, and pond work.
 - **A model nothing serves.** No eligible seat: `503 no_eligible_seat` at
   admission, as today. Seats eligible but none consuming (down, held,
   draining): refused by the board, as the empty route table refuses it
@@ -380,15 +397,18 @@ new `conversations_held`):
   evicted least-recently-used under pressure, so not a count; the node
   reports its last 32 (`VLLM_MAX_SEQS`) as a floor.
 - **Hosted upstreams**: none. A provider's prompt cache belongs to the
-  provider account, not the seat, so such a turn goes straight to the shared partition.
+  provider account, not the seat, so such a turn goes straight to the
+  shared partition.
 
 ### The window
 
 The api publishes the turn's ticket to the home seat's own queue, which
-that seat pulls before any shared partition. With no claim within `W`, it
-publishes a second ticket for the same attempt to the shared partition;
-the first claim of either wins, the other is declined `taken`, and nothing
-is withdrawn from the stream.
+that seat pulls before any shared partition: the `seat` copy,
+`<request_id>.<attempt>.seat`. With no claim within `W`, it publishes the
+`shared` copy of the same attempt, `<request_id>.<attempt>.shared`, to the
+shared partition; its own message id is what lets the stream keep it.
+The first claim on either copy is granted, any other on either is
+declined `taken`, and nothing is withdrawn from the stream.
 
 ```
 W    = min( miss / 2,  10 s,  (wait_until − now) / 2 )
@@ -575,7 +595,7 @@ board, `seat_conversation`, and the migration dropping `route_table`.
 | JetStream alone (core NATS up) | The publish meets no responder: `503` at once. No fallback to offering a seat directly: a second path kept for outages is a second path to keep working. |
 | A node, from NATS | Its pulls stop, so it takes no new work (today: an offer, 5 s without an ack, the next seat). Tickets it pulled and had not acked come back after the ack wait. What it was serving fails by the api's timers: retried elsewhere before output, failed after. |
 | A node, from the api only | Missed heartbeats mark it down after 15 s; the brain holds its seats, and it stops pulling once the plan reaches it over NATS. |
-| The stream lost | The brain recreates the stream and consumers on its next tick and publishes a reset on `<root>.queues.reset` (outside the stream's subjects); each api instance publishes again the tickets of its requests not yet granted, under their own message ids. Granted requests are out of the stream and run on. Postgres holds what is in flight (`in_flight`; `request` once reservations land), not what waits: only the waiting request's instance knows it, and it republishes. |
+| The stream lost | The brain recreates the stream and consumers on its next tick and publishes a reset on `<root>.queues.reset` (outside the stream's subjects); each api instance publishes again every copy of its requests not yet granted, each under that copy's own message id. Granted requests are out of the stream and run on. Postgres holds what is in flight (`in_flight`; `request` once reservations land), not what waits: only the waiting request's instance knows it, and it republishes. |
 | An api instance | Its callers' connections end with it, and nobody else can answer them: a caller's HTTP connection is to one instance. Its unclaimed tickets are orphans: a claim meets no responder at once, and the seat acks and pulls the next; the TTL clears the rest. What it granted runs to a result nobody reads, as today. The brain reclaims its rows, as today. A stop it is told of (SIGTERM) answers its unclaimed callers `503` with `Retry-After: 1` and serves what it has granted. |
 | A provider account's quota | The brain holds its seats until the window resets; the api leaves its partitions out; a request that named it is `503 no_capacity` with `Retry-After`, as today. |
 | Postgres | Nothing is served and nothing is configured, as today. |
@@ -583,8 +603,8 @@ board, `seat_conversation`, and the migration dropping `route_table`.
 ## Observability
 
 - **`GET /admin/v1/queues`**, the board as the brain last wrote it: per
-  partition, its shape, model, provider account (`p`), class and need, depth, oldest ticket's
-  age, waiting pulls, ack pending and consuming seats; per seat, its plan
+  partition, its shape, model, provider account (`p`), class and need,
+  depth, oldest ticket's age, waiting pulls, ack pending and consuming seats; per seat, its plan
   (held and why, or partitions in order), concurrency, in flight and
   conversations held. Read from the store, as `getRoutes` is.
 - **The admin UI.** The Routes screen (`ui/apps/admin/src/screens/Routes.tsx`)
@@ -718,8 +738,8 @@ fitted to a node or pair by the fit a placement is judged by
 (`api/downloads.hl`: a reload, not a download), under a provider account
 active, not exhausted and within its limits. Loading a model under a
 second provider account changes its shape, which the brain handles as
-any change of shape (Subjects and the stream). A load's cost is known in part: on a DGX
-Spark serving gpt-oss-120b, vLLM started in 17.96 s with its compiled
+any change of shape (Subjects and the stream). A load's cost is known
+in part: on a DGX Spark serving gpt-oss-120b, vLLM started in 17.96 s with its compiled
 graphs kept and 46.15 s without, and read 65 GB of weights in 6.82 s with
 fastsafetensors (internals.md, "A node's data directory").
 

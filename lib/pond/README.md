@@ -5,7 +5,7 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
 
 - `realtime/nats/`: `adapter.hl`, `client.hl`, `jetstream.hl`, `log.hl`,
   `proto.hl`, `pull.hl`, `state.hl` and `types.hl` of pond's
-  `realtime/nats` at main `843c5d3` (2026-11-26, pond #39 merged), the
+  `realtime/nats` at main `0e1501f` (2026-11-26, pond #40 merged), the
   test fake (`fake.hl`) not taken. Pond's main has what voice used to
   carry on top of `v0.9.0`: `NatsConn`'s `untyped` prefix and the
   `NatsInbound` topic, `NatsPublisher`, `max_ack_pending`, and voice's
@@ -16,13 +16,15 @@ Copied verbatim from where each says, sources only (not tests or examples). Pond
   `js_stream_update`, `ConsumerSpec.max_deliver`, `js_consumer_delete`,
   `NatsError.code`, the non-blocking `JsPuller`, `js_nak`, `js_term`,
   `js_meta`, `js_publish_headers` with `with_header`, `js_stream_info`,
-  `js_consumer_info` and the stream-message calls. The api (`api/link.hl`,
-  and the organization's events: `api/main.hl`), the node
+  `js_consumer_info` and the stream-message calls; and `StreamInfo.created_ns`
+  (pond #40), the stream's creation time, which the brain tells as the
+  work stream's incarnation (spec/internal.yaml `QueuesReset`), once a
+  patch of voice's own. The api (`api/link.hl`, its tickets and claims:
+  `api/queue.hl`, and the organization's events: `api/main.hl`), the node
   (`node/session.hl`) and the brain (its route table's version,
-  `brain/main.hl`; the work stream, `brain/work.hl`) import it. One change
-  of voice's own, marked `voice:`, for pond: `StreamInfo.created_ns`
-  (`state.hl`), the stream's creation time, which the brain tells as the
-  work stream's incarnation (spec/internal.yaml `QueuesReset`).
+  `brain/main.hl`; the work stream, `brain/work.hl`) import it. Voice's
+  copy carries no change of its own. Its build warns that `NatsInbound`
+  has no subscriber (hale-lang/hale#2207); the warning is harmless.
 - `pq/` and `db/`: taken from hale v0.24.0's `dna/core/pond/`, which is
   pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
   with hale's changes since (among them a password from a `std::secret`

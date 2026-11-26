@@ -1,0 +1,473 @@
+// The work stream and its queues' consumers (docs/design/queue-routing.md,
+// "The stream" and "Consumers"; internal.yaml `WorkStream`, `WorkConsumer`
+// and `QueuesReset`), which the working brain keeps. Nothing publishes a
+// ticket or pulls one yet: requests are served through the route table.
+//
+// Each tick the working brain reads the seats configured to serve
+// (`WORK_READ`), works out the queues they make (`partitions`) and hands
+// them to the keeper (`WorkKeeper`), a pinned locus with a NATS connection
+// of its own, so the tick never waits on NATS. A standby hands it nothing,
+// and its keeper never dials. Given the queues, the keeper makes sure of
+// the stream and of one consumer per queue (`upkeep`), a JetStream request
+// each, every tick: the stream's settings brought up to date where NATS
+// changes them in place, the stream made again where it cannot, and the
+// new stream's incarnation told on `<root>.queues.reset` whenever the
+// keeper created it. A consumer for a queue no seat makes any longer is
+// left as it is: deleting one waits for the controller (step (e)).
+//
+// NATS or JetStream not answering is said once, and the keeper tries again
+// on the next tick; the route table is written meanwhile, as ever.
+
+import "../lib/work" as work;
+
+/// JetStream's refusals the keeper acts on (its `err_code`): no such
+/// stream; a stream of that name with other settings; settings an update
+/// cannot change in place (storage, retention to or from a work queue).
+const NO_STREAM: Int = 10059;
+const STREAM_NAME_IN_USE: Int = 10058;
+const UPDATE_REFUSED: Int = 10052;
+
+/// The seats configured to serve, whether or not they are up: enabled, on
+/// a node not revoked. Per seat, its provider account, the catalog models
+/// it serves (a model the catalog no longer holds is left out), its data
+/// classes, its engine's kind (the node's declared capabilities, null for
+/// a node that never registered) and the part of its config that says
+/// whether it carries tools (`work::carries_tools`), and its rank in a
+/// pair (null for none).
+const WORK_READ: String = "SELECT row_to_json(t) FROM (SELECT s.node, s.id, s.account, coalesce((SELECT jsonb_agg(m->'model') FROM jsonb_array_elements(s.serves) m WHERE EXISTS (SELECT 1 FROM catalog_model c WHERE c.id = m->>'model' AND c.removed_at IS NULL)), '[]'::jsonb) AS models, s.data_classes, (SELECT e->>'kind' FROM jsonb_array_elements(ns.capabilities->'engines') e WHERE e->>'id' = s.engine LIMIT 1) AS kind, jsonb_strip_nulls(jsonb_build_object('runtime', jsonb_build_object('server', s.config->'runtime'->'server'), 'variant', jsonb_build_object('tool_call_parser', s.config->'variant'->'tool_call_parser'), 'tool_call', s.config->'tool_call')) AS tools, (s.config->'cluster'->>'rank')::int AS cluster_rank FROM seat s JOIN node n ON n.id = s.node LEFT JOIN node_state ns ON ns.node = s.node WHERE s.enabled AND n.status <> 'revoked' ORDER BY s.node, s.id) t";
+
+// ---- the stream's and the consumers' settings -----------------------------
+
+/// The work stream under `root`, as lib/work sets it.
+fn stream_spec(root: String) -> nats::StreamSpec {
+    return nats::StreamSpec {
+        name: work::stream_name(root),
+        subjects: work::work_subjects(root),
+        retention: work::STREAM_RETENTION,
+        storage: work::STREAM_STORAGE,
+        max_age_ms: work::STREAM_MAX_AGE_MS,
+        max_msgs_per_subject: work::STREAM_MAX_MSGS_PER_SUBJECT,
+        discard: work::STREAM_DISCARD,
+        discard_new_per_subject: work::STREAM_DISCARD_NEW_PER_SUBJECT,
+        duplicate_window_ms: work::STREAM_DUPLICATE_WINDOW_MS,
+        allow_msg_ttl: work::STREAM_ALLOW_MSG_TTL,
+    };
+}
+
+/// The durable pull consumer of the queue on `subject`, as lib/work sets
+/// it: filtered on that one subject, shared by every seat that consumes
+/// it.
+fn consumer_spec(subject: String) -> nats::ConsumerSpec {
+    return nats::ConsumerSpec {
+        durable: work::consumer_name(subject),
+        filter: subject,
+        deliver: work::CONSUMER_DELIVER_POLICY,
+        ack_wait_ms: work::CONSUMER_ACK_WAIT_MS,
+        max_ack_pending: work::CONSUMER_MAX_ACK_PENDING,
+        max_deliver: work::CONSUMER_MAX_DELIVER,
+    };
+}
+
+// ---- the queues -----------------------------------------------------------
+
+/// A model's provider accounts among the seats that serve it: the first
+/// one, and whether there is another.
+type Shape {
+    model: String = "";
+    account: String = "";
+    several: Bool = false;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus Shapes { capacity { pool rows of Shape indexed_by model; } }
+
+type Taken { subject: String = ""; present: Bool = false; }
+
+@form(hashmap)
+locus TakenSubjects { capacity { pool rows of Taken indexed_by subject; } }
+
+/// Whether a row of `WORK_READ` makes queues: a pair's follower (rank
+/// other than 0) serves nothing itself, so it makes none.
+fn makes_queues(row: String) -> Bool {
+    return std::json::string_field(row, "cluster_rank").kind != "number"
+        || std::json::find_int_field(row, "cluster_rank") == 0;
+}
+
+/// The queues the seats of `rows` (`WORK_READ`, one a line) make under
+/// `root`, each once, one a line. A model's queues are in the `m` shape
+/// when its seats run under one provider account and in the `p` shape,
+/// one per account, when they run under more; for each data class a seat
+/// carries, `any`, and `tools` too when the seat carries tools. Each seat
+/// also has its own queue. Read from configuration alone, never from which
+/// seats are up, so a model's shape changes only when its seats do.
+@bounded_by(rows)
+fn partitions(root: String, rows: String) -> String {
+    let shapes = Shapes { };
+    let lines = std::str::bytes_view(rows);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let row = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(row) > 0 && makes_queues(row) {
+            let account = st::pg_text(row, "account");
+            let mut it = std::json::array_first(std::json::find_field_raw(row, "models"));
+            while !it.done {
+                let model = json_string(it.element);
+                let s = shapes.get(model) or Shape { };
+                if !s.present {
+                    shapes.set(Shape { model: model, account: account, present: true });
+                } else if !s.several && s.account != account {
+                    shapes.set(
+                        Shape { model: model, account: s.account, several: true, present: true },
+                    );
+                }
+                it = std::json::array_next(it);
+            }
+        }
+    }
+    let taken = TakenSubjects { };
+    let mut text = "";
+    start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let row = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(row) > 0 && makes_queues(row) {
+            let account = st::pg_text(row, "account");
+            let tools = work::carries_tools(
+                st::pg_text(row, "kind"),
+                std::json::find_field_raw(row, "tools"),
+            );
+            let classes = std::json::find_field_raw(row, "data_classes");
+            let mut m = std::json::array_first(std::json::find_field_raw(row, "models"));
+            while !m.done {
+                let model = json_string(m.element);
+                let s = shapes.get(model) or Shape { };
+                let mut c = std::json::array_first(classes);
+                while !c.done {
+                    let class = json_string(c.element);
+                    text = text
+                        + taken_once(taken, queue(root, model, s.several, account, class, "any"));
+                    if tools {
+                        text = text
+                            + taken_once(
+                                taken,
+                                queue(root, model, s.several, account, class, "tools"),
+                            );
+                    }
+                    c = std::json::array_next(c);
+                }
+                m = std::json::array_next(m);
+            }
+            text = text
+                + taken_once(
+                    taken,
+                    work::seat_subject(root, st::pg_text(row, "node"), st::pg_text(row, "id")),
+                );
+        }
+    }
+    return text;
+}
+
+/// One queue of a model: in the `p` shape under `account`, else the `m`.
+fn queue(
+    root: String,
+    model: String,
+    several: Bool,
+    account: String,
+    class: String,
+    need: String
+) -> String {
+    return if several {
+        work::provider_subject(root, model, account, class, need)
+    } else {
+        work::model_subject(root, model, class, need)
+    };
+}
+
+/// `subject` and a line break the first time, "" after. `taken` holds a
+/// subject once, and lives for one `partitions`.
+@bounded_by(taken)
+fn taken_once(taken: TakenSubjects, subject: String) -> String {
+    let t = taken.get(subject) or Taken { };
+    if t.present { return ""; }
+    taken.set(Taken { subject: subject, present: true });
+    return subject + "\n";
+}
+
+/// A JSON string's text, "" for anything else.
+fn json_string(raw: String) -> String {
+    let e = std::str::trim(raw);
+    if len(e) < 2 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+        return "";
+    }
+    return std::json::unescape_string(e[1..(len(e) - 1)]);
+}
+
+// ---- keeping them ---------------------------------------------------------
+
+/// The queues the working brain wants kept, one a line, for the keeper.
+type Wanted { subjects: String = ""; }
+
+/// From the brain's tick to its keeper, in the process only.
+topic WorkWanted { payload: Wanted; subject: "voice.brain.work_wanted"; }
+
+/// How one pass of `upkeep` went.
+type Upkeep {
+    // the stream was missing and is created, or had settings an update
+    // cannot change and is made again (`replaced`); or brought up to date
+    created: Bool = false;
+    replaced: Bool = false;
+    updated: Bool = false;
+    // the stream's creation time, in ms (0 when the pass did not read it)
+    incarnation: Int = 0;
+    // a new incarnation still to be told on `<root>.queues.reset`
+    owed: Bool = false;
+    // told on this pass
+    told: Bool = false;
+    // consumers in place, and refused
+    consumers: Int = 0;
+    refused: Int = 0;
+    // what failed, "" when nothing did: the step, and what NATS said, by
+    // that call's own result (never the client's `last_error`, which keeps
+    // a failure after later calls succeed)
+    step: String = "";
+    kind: String = "";
+    code: Int = 0;
+    detail: String = "";
+}
+
+/// `u`, failed at `step` with `e`.
+fn failed_at(u: Upkeep, step: String, e: nats::NatsError) -> Upkeep {
+    let mut out = u;
+    out.step = step;
+    out.kind = e.kind;
+    out.code = e.code;
+    out.detail = e.detail;
+    return out;
+}
+
+/// Whether `e` is JetStream's refusal `code`.
+fn refused_with(e: nats::NatsError, code: Int) -> Bool {
+    return e.kind == "jetstream" && e.code == code;
+}
+
+/// One pass over the connection `c`: the work stream under `root` made
+/// sure of, then a consumer for each queue of `subjects` (one a line), then
+/// the stream's new incarnation told on `<root>.queues.reset` while one is
+/// `owed` (a pass that created the stream owes one; a pass that fails
+/// before telling it keeps owing it). A consumer JetStream refuses is
+/// counted and the rest are made; any other failure ends the pass.
+@bounded_by(subjects)
+fn upkeep(c: nats::NatsClient, root: String, subjects: String, owed: Bool) -> Upkeep {
+    let spec = stream_spec(root);
+    let mut out = Upkeep { owed: owed };
+    let none = nats::NatsError { };
+    let mut e = none;
+    let info = nats::js_stream_info(c, spec.name) or {
+        e = err;
+        nats::StreamInfo { }
+    };
+    let mut missing = false;
+    if len(e.kind) > 0 {
+        if !refused_with(e, NO_STREAM) { return failed_at(out, "reading the work stream", e); }
+        e = none;
+        missing = true;
+    } else {
+        out.incarnation = info.created_ns / 1000000;
+        // the same settings: nothing to do; others: brought up to date, or,
+        // where NATS cannot change them in place, the stream made again
+        nats::js_stream_create_with(c, spec) or { e = err; };
+        if len(e.kind) > 0 {
+            if !refused_with(e, STREAM_NAME_IN_USE) {
+                return failed_at(out, "making sure of the work stream", e);
+            }
+            e = none;
+            nats::js_stream_update(c, spec) or { e = err; };
+            if len(e.kind) == 0 {
+                out.updated = true;
+            } else if refused_with(e, UPDATE_REFUSED) {
+                e = none;
+                nats::js_stream_delete(c, spec.name) or { e = err; };
+                if len(e.kind) > 0 {
+                    return failed_at(out, "deleting the work stream to make it again", e);
+                }
+                out.replaced = true;
+                missing = true;
+            } else {
+                return failed_at(out, "updating the work stream", e);
+            }
+        }
+    }
+    if missing {
+        nats::js_stream_create_with(c, spec) or { e = err; };
+        if len(e.kind) > 0 { return failed_at(out, "creating the work stream", e); }
+        out.created = true;
+        out.owed = true;
+        let made = nats::js_stream_info(c, spec.name) or {
+            e = err;
+            nats::StreamInfo { }
+        };
+        if len(e.kind) > 0 { return failed_at(out, "reading the new work stream", e); }
+        out.incarnation = made.created_ns / 1000000;
+    }
+    let mut refusal = none;
+    let lines = std::str::bytes_view(subjects);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let subject = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(subject) > 0 {
+            nats::js_consumer_create(c, spec.name, consumer_spec(subject)) or { e = err; };
+            if len(e.kind) == 0 {
+                out.consumers = out.consumers + 1;
+            } else if e.kind == "jetstream" {
+                out.refused = out.refused + 1;
+                if len(refusal.kind) == 0 { refusal = e; }
+                e = none;
+            } else {
+                return failed_at(out, "making a queue's consumer", e);
+            }
+        }
+    }
+    if out.owed && out.incarnation > 0 {
+        let reset = std::bytes::from_string(work::reset_json(out.incarnation));
+        c.pub_msg(work::reset_subject(root), "", reset) or { e = err; };
+        if len(e.kind) == 0 { c.flush() or { e = err; }; }
+        if len(e.kind) > 0 { return failed_at(out, "telling the work stream's incarnation", e); }
+        out.owed = false;
+        out.told = true;
+    }
+    if len(refusal.kind) > 0 { return failed_at(out, "making a queue's consumer", refusal); }
+    return out;
+}
+
+/// Keeps the work stream and its consumers, on a thread of its own: each
+/// `WorkWanted` from the working brain's tick is one pass (`upkeep`), the
+/// newest replacing one not begun yet. It dials only once it is handed
+/// work, and drops its connection after any failure other than a
+/// JetStream refusal, dialling again on the next pass. Trouble is said
+/// once while it lasts, and its end once.
+locus WorkKeeper {
+    params {
+        // voice's own NATS (grafted, the habitat's broker: its account, the
+        // vault entry of its password, its subjects' root and its inbox);
+        // with none (`url` ""), nothing is kept
+        url: String = "";
+        user: String = "";
+        vault: String = "";
+        root: String = "voice";
+        inbox: String = "_INBOX";
+        timeout: Duration = 2s;
+        client: nats::NatsClient = nats::NatsClient { };
+        credential: std::secret::Credential = std::secret::Credential { };
+        connected: Bool = false;
+        // the newest queues handed over, and whether a pass is due for them
+        wanted: String = "";
+        due: Bool = false;
+        // a new incarnation not told yet
+        owed: Bool = false;
+        // the trouble last said ("" none), and the consumers last said
+        trouble: String = "";
+        consumers: Int = -1;
+    }
+    bus { subscribe WorkWanted as on_wanted; }
+
+    birth() {
+        self.client.url = self.url;
+        self.client.user = self.user;
+        self.client.name = "voice-brain-work";
+        self.client.timeout = self.timeout;
+        self.client.inbox_prefix = self.inbox;
+        self.credential = std::secret::Credential { vault: self.vault };
+    }
+
+    @bounded_by(w)
+    fn on_wanted(w: Wanted) {
+        self.wanted = w.subjects;
+        self.due = true;
+    }
+
+    // @unbounded: the keeper's loop, for the process's life; between
+    // passes it sleeps, and the bus hands a new `WorkWanted` over there.
+    @unbounded
+    run() {
+        while !self.draining {
+            if self.due && len(self.url) > 0 {
+                self.due = false;
+                self.pass();
+            } else {
+                std::time::sleep(20ms);
+            }
+        }
+    }
+
+    fn pass() {
+        if !self.connected {
+            if !self.client.open_as(self.credential) {
+                self.trouble_is("dial", "NATS does not answer: " + self.client.last_error);
+                return;
+            }
+            self.connected = true;
+        }
+        let u = upkeep(self.client, self.root, self.wanted, self.owed);
+        self.owed = u.owed;
+        let stream = std::log::kv("stream", work::stream_name(self.root));
+        if u.created {
+            log_info(
+                if u.replaced {
+                    "the work stream made again: its settings could not change in place"
+                } else {
+                    "the work stream created"
+                },
+                fields2(stream, std::log::kv("incarnation", to_string(u.incarnation))),
+            );
+        }
+        if u.updated { log_info("the work stream's settings brought up to date", stream); }
+        if u.told {
+            log_info(
+                "the work stream's new incarnation told",
+                fields2(
+                    std::log::kv("subject", work::reset_subject(self.root)),
+                    std::log::kv("incarnation", to_string(u.incarnation)),
+                ),
+            );
+        }
+        if len(u.step) > 0 {
+            if u.kind != "jetstream" {
+                self.client.close();
+                self.connected = false;
+            }
+            self.trouble_is(
+                u.step + " " + u.kind + " " + to_string(u.code),
+                u.step + ": " + u.kind + ": " + u.detail,
+            );
+            return;
+        }
+        self.trouble_is("", "");
+        if u.consumers != self.consumers {
+            log_info(
+                "the work queues' consumers are in place",
+                fields2(stream, std::log::kv("queues", to_string(u.consumers))),
+            );
+            self.consumers = u.consumers;
+        }
+    }
+
+    /// Say trouble once while it is the same (`key`), and its end once.
+    fn trouble_is(key: String, what: String) {
+        if key == self.trouble { return; }
+        if len(key) > 0 {
+            log_warn(
+                "the work stream is not kept: " + what + "; trying again each tick",
+                std::log::kv("nats", self.url),
+            );
+        } else {
+            log_info("the work stream is kept again", std::log::kv("nats", self.url));
+        }
+        self.trouble = key;
+    }
+}

@@ -1,4 +1,5 @@
-// The brain: keeps the route table (../docs/internals.md, "The route table").
+// The brain: keeps the route table (../docs/internals.md, "The route table"),
+// and queue routing's work stream and its consumers (work.hl).
 //
 // It shares nothing with the api but Postgres. Only one brain works at a
 // time: it holds a Postgres advisory lock on its connection, and a second
@@ -17,9 +18,12 @@
 // thread of its own, so the tick never waits on NATS. The binding keeps
 // only the newest version (pond's `Delivery::Latest`): one that NATS
 // cannot take now is replaced by the next, and the newest is told once
-// NATS is back. Per-tick work runs in a method, so each tick's memory is
-// reclaimed. It needs Postgres 14 or newer (`idle_session_timeout`), and
-// says so and stops on an older one.
+// NATS is back. Then it reads the seats configured to serve and hands the
+// queues they make to its keeper (work.hl `WorkKeeper`), pinned on a thread
+// of its own with a NATS connection of its own, which keeps the work stream
+// and a consumer per queue; a standby hands it nothing. Per-tick work runs
+// in a method, so each tick's memory is reclaimed. It needs Postgres 14 or
+// newer (`idle_session_timeout`), and says so and stops on an older one.
 
 import "../lib/logfmt" as logfmt;
 import "../store" as st;
@@ -51,14 +55,22 @@ main locus Brain {
         said: String = "";
         // the last trouble writing the table, said once
         trouble: String = "";
+        // the root of voice's subjects: `voice`, grafted the broker's
+        root: String = "voice";
+        // the last trouble reading the seats' queues, said once
+        work_trouble: String = "";
         // tells NATS each version, on its own thread: grafted, as the
         // habitat broker's account, its subjects under the broker's root;
         // with no NATS (`url` ""), it dials nothing and tells no one
         route_conn: nats::NatsConn = nats::NatsConn { };
+        // keeps the work stream and its consumers, on its own thread with
+        // its own connection, from the queues each tick hands it (work.hl)
+        keeper: WorkKeeper = WorkKeeper { };
     }
 
     placement {
         route_conn: pinned;
+        keeper: pinned;
     }
 
     bindings {
@@ -67,6 +79,7 @@ main locus Brain {
 
     bus {
         publish RouteWritten;
+        publish WorkWanted;
     }
 
     birth() {
@@ -150,6 +163,38 @@ main locus Brain {
         // the pinned connection tells NATS; the tick never waits on it
         RouteWritten <- Version { version: version };
         self.trouble_is("");
+        self.want_work();
+    }
+
+    /// The queues the seats configured to serve make, handed to the keeper,
+    /// which keeps their stream and consumers on its own thread. A lost
+    /// connection drops the lock; any other failure is said once and tried
+    /// again next tick.
+    fn want_work() {
+        let none = db::Args { };
+        let rows = self.conn.query_params(WORK_READ, none);
+        if !rows.ok {
+            if rows.err.kind == "io" {
+                self.drop("the seats' queues: " + rows.err.detail);
+                return;
+            }
+            self.work_trouble_is("the seats' queues could not be read: " + rows.err.detail);
+            return;
+        }
+        self.work_trouble_is("");
+        WorkWanted <- Wanted { subjects: partitions(self.root, rows.csv) };
+    }
+
+    /// Say trouble reading the seats' queues, or its end, once each time it
+    /// changes.
+    fn work_trouble_is(what: String) {
+        if what == self.work_trouble { return; }
+        if len(what) > 0 {
+            log_warn(what, "");
+        } else {
+            log_info("the seats' queues are read again", "");
+        }
+        self.work_trouble = what;
     }
 
     /// Node liveness and the route table; the table's new version, or -1
@@ -430,6 +475,7 @@ fn main() {
     Brain {
         database: database,
         nats: b.url,
+        root: b.root,
         route_conn: nats::NatsConn {
             url: b.url,
             user: b.user,
@@ -440,6 +486,14 @@ fn main() {
             // wait that grows to 30 s
             reconnect_max_ms: 30000,
             credential: std::secret::Credential { vault: b.vault },
+        },
+        keeper: WorkKeeper {
+            url: b.url,
+            user: b.user,
+            vault: b.vault,
+            root: b.root,
+            inbox: b.inbox,
+            timeout: 2s,
         },
     };
 }

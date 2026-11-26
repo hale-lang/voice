@@ -679,6 +679,10 @@ wait_for up
 
 # with a database: the brain's route table, and a standby that takes over
 if [ -n "${DATABASE_URL:-}" ]; then
+  # whether the work stream holds the consumer named $1 (JetStream's API,
+  # on voice's own NATS)
+  work_stream_has() { python3 scripts/nats-request.py "${NATS_URL#nats://}" "\$JS.API.CONSUMER.INFO.VOICE_WORK.$1" | grep -q '"durable_name"'; }
+  own_consumer=$(python3 -c 'import hashlib; print("w_" + hashlib.sha256(b"voice.work.s.laptop.static").hexdigest()[:16])')
   brain/brain --database "$DATABASE_URL" --nats "$NATS_URL" >"$work/brain1.log" 2>&1 &
   first=$!
   pids+=($first)
@@ -688,6 +692,16 @@ if [ -n "${DATABASE_URL:-}" ]; then
   for i in $(seq 1 50); do grep -q 'standing by' "$work/brain2.log" && break; sleep 0.2; done
   grep -q 'standing by' "$work/brain2.log" || { echo "the second brain did not stand by"; cat "$work/brain2.log"; exit 1; }
   echo "one brain works, the other stands by"
+  if [ "${E2E_BROKER:-}" != grafted ]; then
+    # the working brain keeps the work stream, and a consumer for each
+    # queue the seats configured to serve make: laptop/static's own among
+    # them (queue routing; nothing is served through them yet)
+    for i in $(seq 1 50); do work_stream_has "$own_consumer" && break; sleep 0.2; done
+    work_stream_has "$own_consumer" || { echo "the working brain made no work stream with laptop/static's queue"; cat "$work/brain1.log"; exit 1; }
+    python3 scripts/nats-request.py "${NATS_URL#nats://}" '$JS.API.STREAM.INFO.VOICE_WORK' | python3 -c 'import json, sys; c = json.load(sys.stdin)["config"]; sys.exit(0 if c["retention"] == "workqueue" and c["discard"] == "new" and c.get("discard_new_per_subject") and c["max_msgs_per_subject"] == 1024 else 1)' \
+      || { echo "the work stream's settings are not internal.yaml's"; exit 1; }
+    echo "the working brain keeps the work stream and its queues' consumers"
+  fi
   (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static echo-1 "$work/admin.token")
   kill "$first"
   for i in $(seq 1 50); do grep -q 'working' "$work/brain2.log" && break; sleep 0.2; done
@@ -704,10 +718,26 @@ if [ -n "${DATABASE_URL:-}" ]; then
   before=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   kill -STOP "$second"
   t0=$(date +%s)
+  if [ "${E2E_BROKER:-}" != grafted ]; then
+    # the work stream lost while the working brain is stopped: the standby,
+    # its lock not yet freed (10 s), makes nothing, and makes it once it works
+    python3 scripts/nats-request.py "${NATS_URL#nats://}" '$JS.API.STREAM.DELETE.VOICE_WORK' >/dev/null
+    sleep 3
+    ! work_stream_has "$own_consumer" || { echo "a standby brain made the work stream"; cat "$work/brain3.log"; exit 1; }
+    ! grep -q 'work stream' "$work/brain3.log" || { echo "a standby brain kept the work stream"; cat "$work/brain3.log"; exit 1; }
+    echo "a standby brain leaves the work stream alone"
+  fi
   for i in $(seq 1 150); do grep -q 'working' "$work/brain3.log" && break; sleep 0.2; done
   kill -CONT "$second"
   grep -q 'working' "$work/brain3.log" || { echo "the standby did not take over from a stopped brain"; cat "$work/brain3.log"; exit 1; }
   echo "the standby took over from a stopped brain in $(( $(date +%s) - t0 )) s"
+  if [ "${E2E_BROKER:-}" != grafted ]; then
+    for i in $(seq 1 50); do work_stream_has "$own_consumer" && break; sleep 0.2; done
+    work_stream_has "$own_consumer" || { echo "the brain that took over did not make the work stream again"; cat "$work/brain3.log"; exit 1; }
+    grep -q 'the work stream created' "$work/brain3.log" && grep -q "the work stream's new incarnation told" "$work/brain3.log" \
+      || { echo "the brain that took over did not say it made the stream and told its incarnation"; cat "$work/brain3.log"; exit 1; }
+    echo "the brain that took over made the work stream again, its queues' consumers with it, and told its new incarnation"
+  fi
   sleep 1.5
   after=$(curl -H @"$work/admin.h" -fsS "$api/admin/v1/routes" | field version)
   [ "$after" -gt "$before" ] || { echo "the route table's version went from $before to $after"; exit 1; }
@@ -726,10 +756,13 @@ if [ -n "${DATABASE_URL:-}" ]; then
   [ $(( after - before )) -ge 3000 ] || { echo "with NATS not answering the table went from $before to $after in 5 s"; cat "$work/brain4.log"; exit 1; }
   ! grep -q 'dropping' "$work/brain4.log" || { echo "the brain dropped its lock"; cat "$work/brain4.log"; exit 1; }
   echo "with NATS not answering, the table advanced $(( after - before )) ms in 5 s and the brain kept the lock"
+  [ "$(grep -c 'the work stream is not kept' "$work/brain4.log")" = 1 ] || { echo "the work stream's trouble was not said once"; cat "$work/brain4.log"; exit 1; }
+  echo "and said once that it keeps no work stream"
   # a NATS that takes the connection and then never answers a PING: the
-  # brain's NATS connection drops a version it has not had confirmed in 2 s
-  # and dials again after 1, 2, 4, 8 s (lib/pond, `latest_confirm_ms`), so
-  # the wait between dials grows past 8 s; a dial alone does not reset it
+  # brain's NATS connection (`voice-brain`; its keeper's, `voice-brain-work`,
+  # dials each tick) drops a version it has not had confirmed in 2 s and
+  # dials again after 1, 2, 4, 8 s (lib/pond, `latest_confirm_ms`), so the
+  # wait between dials grows past 8 s; a dial alone does not reset it
   kill "${pids[${#pids[@]}-1]}" 2>/dev/null || true
   : >"$work/silent.log"
   python3 scripts/silent-nats.py "$SILENT_PORT" "$work/silent.log" &
@@ -738,7 +771,7 @@ if [ -n "${DATABASE_URL:-}" ]; then
   env $(broker_at "nats://127.0.0.1:$SILENT_PORT") brain/brain --database "$DATABASE_URL" --nats "nats://127.0.0.1:$SILENT_PORT" >"$work/brain5.log" 2>&1 &
   pids+=($!)
   sleep 30
-  spacing=$(python3 -c 'import sys; t=[float(l) for l in open(sys.argv[1]) if l.strip()]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
+  spacing=$(python3 -c 'import sys; t=[float(l.split()[0]) for l in open(sys.argv[1]) if l.split()[1:] == ["voice-brain"]]; print(" ".join("%.0f" % (b - a) for a, b in zip(t, t[1:])))' "$work/silent.log")
   # the first wait is not a backoff: the brain dials at start but writes
   # nothing until it holds the lock (it may stand by first), so that dial
   # lasts as long as standing by took, plus the 2 s it gives an unconfirmed

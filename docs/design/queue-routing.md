@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork merged (#255), decisions recorded (#256); stream, node pull, api tickets, controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257; node pull, api tickets, controller pending.
 
 Proposed, 2026-11-26.
 
@@ -190,7 +190,7 @@ stream's name cannot carry the root's dots. Its settings:
 | max age | the longest wait voice allows (Open question 7) | no ticket outlives any request's wait |
 | per-message TTL | the ticket's own wait (`Nats-TTL`; NATS 2.11, as Compose runs) | an expired ticket leaves the depth the brain reads |
 | max messages per subject | 1024, a voice constant | a partition's backlog is bounded; past it the publish is refused and the caller answered `429 no_capacity` at once |
-| discard | new | a full partition refuses the newcomer, not the oldest waiter |
+| discard | new, per subject | a full partition refuses the newcomer (`10077`), not the oldest waiter, while the others take theirs |
 | duplicate window | 2 min | a copy of a ticket published again (a lost ack, a reconnect) is kept once (`Nats-Msg-Id`); the window is the stream's, whatever the subject |
 
 A ticket is under 1 KiB; the 16 MiB `max_payload`
@@ -668,9 +668,10 @@ plan and standing pulls (step (c)). `openapi.yaml`: `getQueues` replaces
 
 ## Pond: what JetStream support there is
 
-The vendored copy ([`lib/pond/realtime/nats/jetstream.hl`](../../lib/pond/realtime/nats/jetstream.hl);
-pond `v0.9.0` with hale's changes and `max_ack_pending`,
-[`lib/pond/README.md`](../../lib/pond/README.md)) has:
+Voice's copy is pond's main at `843c5d3` since step (b) (#257;
+[`lib/pond/README.md`](../../lib/pond/README.md)), which closes every gap
+below (pond #37, #38, #39). Before it, the vendored copy (pond `v0.9.0`
+with hale's changes and `max_ack_pending`) had:
 
 - `js_stream_create(name, subjects)`: file storage over the subjects and
   nothing else, so limits retention, no age, count or size bound, the
@@ -686,9 +687,10 @@ pond `v0.9.0` with hale's changes and `max_ack_pending`,
   `no_messages`.
 - `js_ack`: `+ACK` on the message's reply subject.
 
-Only the teller uses it, on the organization's nerves (`api/teller.hl`).
+Only the teller used it, on the organization's nerves (`api/teller.hl`).
 Voice's own NATS runs JetStream since #255 (`deploy/nats/nats.conf`: its
-store in Compose's `nats` volume), which nothing uses yet.
+store in Compose's `nats` volume), on which the brain keeps the work
+stream and its consumers since step (b).
 
 The gaps this design needs closed, each by a pull request to pond:
 
@@ -726,9 +728,10 @@ The gaps this design needs closed, each by a pull request to pond:
 Voice's three local patches, marked `voice:` in its copy (`NatsPublisher`
 logging through `std::log`, `NatsClient.inbox_prefix`, and the
 latest-value write's liveness), are on pond's main already, with the older
-pieces voice relies on. So voice re-vendors once, to pond's main after
-those three pull requests merge, and its copy then carries no patch of
-its own. Outside pond: grafted, the heart's broker account needs
+pieces voice relies on. So voice re-vendored once, to pond's main after
+those three pull requests merged, and dropped them; its copy carries one
+patch of its own, `StreamInfo.created_ns` (the stream's creation time,
+which the incarnation is), for pond. Outside pond: grafted, the heart's broker account needs
 JetStream with limits and the nodes' account permission to pull from the
 work consumers and ack (`compose.yaml`'s header).
 

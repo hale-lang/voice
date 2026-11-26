@@ -718,8 +718,9 @@ lock every second, and takes over when the first one's session ends: its
 connection drops, its host stops answering TCP keepalives (about 11 s), or
 it says nothing for 10 s, as a stopped process does (`idle_session_timeout`,
 so voice needs Postgres 14 or newer; the brain says so and stops on an
-older one). The brain's NATS notice runs on a thread of its own, so an
-address that never answers costs the tick nothing.
+older one). The brain's NATS notice and its keeper of the work stream each
+run on a thread of their own, so an address that never answers costs the
+tick nothing.
 Each second the one that works:
 
 - reclaims what dead api instances held (an instance whose heartbeat is
@@ -731,7 +732,28 @@ Each second the one that works:
   and the route table (`route_table`, spec/store.md, "The route table"),
   its version from Postgres's clock and never below the one before it;
 - publishes that version on `voice.route`
-  ([`internal.yaml`](../spec/internal.yaml)), saying once if it cannot.
+  ([`internal.yaml`](../spec/internal.yaml)), saying once if it cannot;
+- keeps queue routing's work stream and its consumers
+  ([`brain/work.hl`](../brain/work.hl);
+  [`docs/design/queue-routing.md`](design/queue-routing.md), "The stream"
+  and "Consumers"), which nothing publishes to or pulls from yet. It reads
+  the seats configured to serve (enabled, on a node not revoked, a pair's
+  leader and not its follower; whether they are up never counts) and the
+  queues they make: per catalog model they serve, data class and need
+  (`any`, and `tools` for a seat that carries tools), in the `m` shape for
+  a model under one provider account and the `p` shape, one queue per
+  account, under several; and each seat's own. It hands them to its keeper,
+  on a thread of its own with a NATS connection of its own, which makes
+  sure of the stream (`VOICE_WORK`, or `VOICE_WORK_` and 12 hex digits of
+  the root's sha256 grafted; internal.yaml `WorkStream`): its settings
+  brought up to date where NATS changes them in place, the stream deleted
+  and made again where it cannot (err_code 10052), and, whenever the keeper
+  created the stream, its incarnation (its creation time in ms) told on
+  `voice.queues.reset`. Then one durable pull consumer per queue
+  (`WorkConsumer`), each a JetStream request, every tick. A consumer for a
+  queue no seat makes any longer stays; deleting it comes with the
+  controller. NATS or JetStream not answering is said once and tried again
+  next tick; the table is written meanwhile. A standby keeps nothing.
 
 A tick at the bounds (256 seats each serving 16 of 256 models) computes the
 table in milliseconds. `GET /admin/v1/routes` reads the table from Postgres, and so does the
@@ -748,7 +770,8 @@ The store, its rows and its migrations are the seed
 ```sh
 hale build brain
 brain/brain --database postgres://voice:voice@127.0.0.1:5432/voice --nats nats://127.0.0.1:4222
-hale test brain     # VOICE_TEST_DATABASE_URL=... for the Postgres half
+hale test brain     # VOICE_TEST_DATABASE_URL=... for the Postgres half,
+                    # VOICE_TEST_NATS_URL=... (JetStream) for the work stream
 ```
 
 ## The admin UI
@@ -822,7 +845,9 @@ and what it travels over. A tool reads the table as it is written.
 - **The brain** keeps the route table. It reads what the api instances write
   (seat states, heartbeats, quota windows, configuration) and decides
   which seats should take the next requests for each model. There is exactly
-  one, it is not on the request path, and it talks to nothing but Postgres.
+  one, it is not on the request path, and it talks to nothing but Postgres
+  and NATS (the table's version, and queue routing's work stream, which it
+  keeps on JetStream).
 - **A node** runs on each machine that has engines, on the private network.
   It offers the engines its operator listed on the machine, runs the seats
   the coordinator assigns it within them, registers and reports over the

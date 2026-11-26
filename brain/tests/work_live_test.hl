@@ -1,0 +1,177 @@
+// The work stream and its consumers kept on a JetStream-enabled NATS, when
+// VOICE_TEST_NATS_URL names one (CI's end-to-end job runs one): a stream
+// of the same name whose settings cannot change in place is made again and
+// its new incarnation told on `<root>.queues.reset`; a consumer per queue,
+// with internal.yaml's settings; a second pass changes nothing and tells
+// nothing; a full queue refuses its newcomer (10077) while another takes
+// its own; and a stream found gone is created again and told. Each run
+// works under a root of its own, so its stream is its own, and deletes it
+// at the end.
+import ".." as brain;
+import "../../lib/work" as work;
+import "../../lib/pond/realtime/nats" as nats;
+
+fn reply(c: nats::NatsClient, api: String) -> String {
+    let r = c.request(api, b"", 2s) or nats::NatsMsg { };
+    return std::str::from_bytes(r.data);
+}
+
+/// The incarnation the next message on `listener` tells, -1 for none
+/// within `wait`.
+fn told(listener: nats::NatsClient, subject: String, wait: Duration) -> Int {
+    if !listener.read_msg(wait) { return -1; }
+    std::test::assert_eq_str(listener.last.subject, subject, "told on the reset subject");
+    let body = std::str::from_bytes(listener.last.data);
+    std::test::assert(std::json::valid_object(body), "a reset is one JSON object: " + body);
+    return std::json::find_int_field(body, "incarnation");
+}
+
+/// The consumer of the queue on `subject` in stream `name` is internal.yaml's
+/// `WorkConsumer`.
+fn consumer_is(c: nats::NatsClient, name: String, subject: String) {
+    let durable = work::consumer_name(subject);
+    let cc = std::json::find_field_raw(
+        reply(c, "$JS.API.CONSUMER.INFO." + name + "." + durable),
+        "config",
+    );
+    std::test::assert(
+        std::json::find_string_field(cc, "durable_name") == durable
+            && std::json::find_string_field(cc, "filter_subject") == subject
+            && std::json::find_string_field(cc, "ack_policy") == "explicit"
+            && std::json::find_string_field(cc, "deliver_policy") == "all"
+            && std::json::find_int_field(cc, "ack_wait") == 10000000000
+            && std::json::find_int_field(cc, "max_ack_pending") == 1024
+            && std::json::find_int_field(cc, "max_deliver") == -1,
+        "the consumer of " + subject + " is internal.yaml's WorkConsumer: " + cc,
+    );
+}
+
+fn passed(u: brain::Upkeep, what: String) {
+    std::test::assert(len(u.step) == 0, what + ": " + u.step + ": " + u.kind + " " + u.detail);
+}
+
+fn main() {
+    if !std::env::var_exists("VOICE_TEST_NATS_URL") { return; }
+    let url = std::env::var("VOICE_TEST_NATS_URL");
+    let c = nats::NatsClient { url: url, name: "work-live-test", timeout: 2s };
+    std::test::assert(c.open(), "the test NATS answers: " + c.last_error);
+    let listener = nats::NatsClient { url: url, name: "work-live-listener", timeout: 2s };
+    std::test::assert(listener.open(), "and takes a second connection");
+    let rand = std::os::getrandom(6) or std::bytes::from_string("fixed");
+    let root = "test.p1b" + std::hex::encode(rand);
+    let name = work::stream_name(root);
+    std::test::assert(
+        std::str::starts_with(name, "VOICE_WORK_") && len(name) == 23,
+        "a root of its own: " + name,
+    );
+    let reset = work::reset_subject(root);
+    listener.sub_to(reset, "") or {
+        std::test::assert(false, "the listener subscribes: " + err.detail);
+        return;
+    };
+    listener.flush() or discard;
+
+    // a stream of that name over the same subjects, kept until a limit
+    // removes them: a work queue cannot be made of it in place
+    nats::js_stream_create(c, name, work::work_subjects(root)) or {
+        std::test::assert(false, "the old stream: " + err.detail);
+        return;
+    };
+    let subjects = brain::partitions(
+        root,
+        "{\"node\": \"laptop\", \"id\": \"a\", \"account\": \"local\", \"models\": [\"echo-1\"], \"data_classes\": [\"internal\"], \"kind\": \"managed\", \"tools\": {\"runtime\": {\"server\": \"llama-server\"}}, \"cluster_rank\": null}",
+    );
+    let any = root + ".work.m.echo-1.internal.any";
+    let tools = root + ".work.m.echo-1.internal.tools";
+    let own = root + ".work.s.laptop.a";
+    std::test::assert_eq_str(subjects, any + "\n" + tools + "\n" + own + "\n", "three queues");
+
+    let first = brain::upkeep(c, root, subjects, false);
+    passed(first, "the first pass");
+    std::test::assert(
+        first.replaced && first.created && !first.updated && first.told && !first.owed,
+        "a stream whose retention cannot change in place (10052) is made again, and told",
+    );
+    let info = nats::js_stream_info(c, name) or nats::StreamInfo { };
+    std::test::assert(
+        first.incarnation > 0 && first.incarnation == info.created_ns / 1000000,
+        "the incarnation is the new stream's creation time in ms: "
+            + to_string(first.incarnation),
+    );
+    std::test::assert_eq_int(
+        told(listener, reset, 2s),
+        first.incarnation,
+        "the reset tells that incarnation",
+    );
+    let config = std::json::find_field_raw(reply(c, "$JS.API.STREAM.INFO." + name), "config");
+    std::test::assert(
+        std::json::find_string_field(config, "retention") == "workqueue"
+            && std::json::find_string_field(config, "storage") == "file"
+            && std::json::find_string_field(config, "discard") == "new"
+            && std::json::find_bool_field(config, "discard_new_per_subject")
+            && std::json::find_int_field(config, "max_msgs_per_subject") == 1024
+            && std::json::find_int_field(config, "max_age") == 600000000000
+            && std::json::find_int_field(config, "duplicate_window") == 120000000000
+            && std::json::find_bool_field(config, "allow_msg_ttl"),
+        "the stream is internal.yaml's WorkStream: " + config,
+    );
+    std::test::assert_eq_int(first.consumers, 3, "a consumer per queue");
+    std::test::assert_eq_int(info.consumers, 3, "and the stream has those three");
+    consumer_is(c, name, any);
+    consumer_is(c, name, tools);
+    consumer_is(c, name, own);
+
+    // a second pass: nothing to do, nothing told
+    let second = brain::upkeep(c, root, subjects, false);
+    passed(second, "the second pass");
+    std::test::assert(
+        !second.created && !second.replaced && !second.updated && !second.told
+            && second.consumers == 3 && second.incarnation == first.incarnation,
+        "a second pass changes nothing",
+    );
+    std::test::assert_eq_int(told(listener, reset, 500ms), -1, "and tells nothing");
+    let again = nats::js_stream_info(c, name) or nats::StreamInfo { };
+    std::test::assert(
+        again.created_ns == info.created_ns && again.consumers == 3,
+        "the same stream, the same consumers",
+    );
+
+    // a full queue refuses its newcomer; another queue takes its own
+    let mut i = 0;
+    let mut stored = 0;
+    while i < work::STREAM_MAX_MSGS_PER_SUBJECT {
+        let ack = nats::js_publish(c, any, b"{}") or nats::PubAck { seq: -1 };
+        if ack.seq > 0 { stored = stored + 1; }
+        i = i + 1;
+    }
+    std::test::assert_eq_int(stored, 1024, "a queue takes 1024 tickets");
+    let mut code = 0;
+    nats::js_publish(c, any, b"{}") or {
+        code = err.code;
+        nats::PubAck { }
+    };
+    std::test::assert_eq_int(code, 10077, "the 1025th is refused, the queue full");
+    let other = nats::js_publish(c, tools, b"{}") or nats::PubAck { seq: -1 };
+    std::test::assert(other.seq > 0, "while another queue takes its own");
+    let full = nats::js_stream_info(c, name) or nats::StreamInfo { };
+    std::test::assert_eq_int(full.messages, 1025, "and no waiting ticket was dropped");
+
+    // the stream lost: the next pass creates it again, with its consumers,
+    // and tells its new incarnation
+    nats::js_stream_delete(c, name) or discard;
+    let third = brain::upkeep(c, root, subjects, false);
+    passed(third, "the pass after the stream was lost");
+    std::test::assert(
+        third.created && !third.replaced && third.told && third.consumers == 3,
+        "a stream found gone is created again, its consumers with it",
+    );
+    std::test::assert(
+        third.incarnation > 0 && third.incarnation != first.incarnation,
+        "a new incarnation",
+    );
+    std::test::assert_eq_int(told(listener, reset, 2s), third.incarnation, "told");
+
+    nats::js_stream_delete(c, name) or discard;
+    listener.close();
+    c.close();
+}

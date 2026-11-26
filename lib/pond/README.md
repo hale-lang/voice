@@ -3,27 +3,26 @@
 Copied verbatim from where each says, sources only (not tests or examples). Pond is Apache-2.0
 (`LICENSE`, beside this file).
 
-- `realtime/nats/`: `adapter.hl`, `client.hl`, `jetstream.hl`, `proto.hl`,
-  `types.hl` and `log.hl` of pond's `realtime/nats` at `v0.9.0`
-  (`81500c0`), merged with what hale's copy of it (hale v0.25.1's
-  `dna/core/pond/realtime/nats`, pond at `ef90234`) changed and pond does
-  not have yet: `NatsConn`'s `untyped` prefix and the `NatsInbound` topic
-  (hale-lang/hale#987, with `Outbound.ack`), `NatsPublisher`
-  (hale-lang/hale#986), and `max_ack_pending` on a JetStream consumer;
-  the test fake is not taken. The api (`api/link.hl`, and the
-  organization's events: `api/main.hl`), the node (`node/session.hl`) and
-  the brain (its route table's version, `brain/main.hl`) import it.
-  Changes of voice's own, marked `voice:`: `NatsPublisher` (`adapter.hl`)
-  logs through `std::log` rather than printing bare;
-  `NatsClient.inbox_prefix` (`client.hl`) puts a request's reply inbox
-  under a prefix of the caller's (`_INBOX` by default), for the habitat's
-  broker account, whose subjects are one prefix; and a latest-value write
-  (`Delivery::Latest`) the server has not confirmed in
-  `latest_confirm_ms` drops the connection, dialled again after a wait
-  that doubles from 1 s to `latest_backoff_max_ms`, reset only by a
-  confirmed write, so a server that takes the connection and goes silent
-  is not written to forever (`adapter.hl`). All three are for pond. Pond's
-  own bounded dial (`NatsConn.timeout`, `connect_within`) replaced voice's.
+- `realtime/nats/`: `adapter.hl`, `client.hl`, `jetstream.hl`, `log.hl`,
+  `proto.hl`, `pull.hl`, `state.hl` and `types.hl` of pond's
+  `realtime/nats` at main `843c5d3` (2026-11-26, pond #39 merged), the
+  test fake (`fake.hl`) not taken. Pond's main has what voice used to
+  carry on top of `v0.9.0`: `NatsConn`'s `untyped` prefix and the
+  `NatsInbound` topic, `NatsPublisher`, `max_ack_pending`, and voice's
+  three patches (`NatsPublisher` logging through `std::log`,
+  `NatsClient.inbox_prefix`, and the latest-value write's liveness), all
+  upstreamed (pond issues #31 and #33, merged in #32 and #34); with it, JetStream's work queues (pond
+  #37, #38, #39): `StreamSpec` with `js_stream_create_with` and
+  `js_stream_update`, `ConsumerSpec.max_deliver`, `js_consumer_delete`,
+  `NatsError.code`, the non-blocking `JsPuller`, `js_nak`, `js_term`,
+  `js_meta`, `js_publish_headers` with `with_header`, `js_stream_info`,
+  `js_consumer_info` and the stream-message calls. The api (`api/link.hl`,
+  and the organization's events: `api/main.hl`), the node
+  (`node/session.hl`) and the brain (its route table's version,
+  `brain/main.hl`; the work stream, `brain/work.hl`) import it. One change
+  of voice's own, marked `voice:`, for pond: `StreamInfo.created_ns`
+  (`state.hl`), the stream's creation time, which the brain tells as the
+  work stream's incarnation (spec/internal.yaml `QueuesReset`).
 - `pq/` and `db/`: taken from hale v0.24.0's `dna/core/pond/`, which is
   pond's `pq` and `db` at `01b8643` (2026-08-12), `db` unchanged and `pq`
   with hale's changes since (among them a password from a `std::secret`
@@ -46,4 +45,5 @@ under `lib/`, a directory vendored by hand, not `vendor/`, which
 `hale fetch` owns; nothing is fetched at build.
 
 Refresh one by copying its files again and updating the commit here;
-`hale verify api` and `hale verify node` must stay clean.
+`hale verify api`, `hale verify node` and `hale verify brain` must stay
+clean.

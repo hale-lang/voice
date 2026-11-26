@@ -1,6 +1,7 @@
 // A slot of the node's: one request served on its seat at a time, while the
-// node's other slots serve theirs (session.hl hands each accepted `serve`
-// to a free slot). The node runs `SLOTS` of them, each its own thread
+// node's other slots serve theirs (session.hl hands each accepted `serve`,
+// and each ticket a seat pulled, to a free slot; the slot claims a ticket's
+// request first). The node runs `SLOTS` of them, each its own thread
 // (main.hl), so two seats, or two requests on one seat of concurrency 2,
 // are served at once: enough for a seat whose runtime batches (TensorFold's
 // and vLLM's 32, lib/concurrency) beside others. A slot publishes the request's events and result on
@@ -16,13 +17,22 @@ import "../lib/pond/realtime/nats" as nats;
 /// than that. A node's capacity is its seats' concurrency.
 const SLOTS: Int = 40;
 
-/// A request handed to a slot: the `serve` message, what the session knows
-/// of its seat, and the broker to answer on.
+/// A request handed to a slot: the `serve` message, or a ticket to claim
+/// first (pull.hl), what the session knows of its seat, and the broker to
+/// answer on.
 type ServeWork {
     slot: Int = 0;
     request_id: String = "";
     reply_to: String = "";
     msg: String = "";
+    // a ticket the seat pulled, to claim (its JSON; "" for a `serve`), the
+    // subject it is acknowledged on (`$JS.ACK.…`), and the seat that
+    // claims it, `<node>/<seat>`
+    ticket: String = "";
+    ack: String = "";
+    claimant: String = "";
+    // a ticket's request, granted: `msg` is the grant, served as a `serve`
+    granted: Bool = false;
     seat: String = "";
     engine: String = "";
     // the seat's engine kind, config and (managed) server's endpoint, and
@@ -34,6 +44,8 @@ type ServeWork {
     nats_url: String = "";
     nats_user: String = "";
     nats_pass: String = "";
+    // where a claim's answer comes (pull.hl `inbox_of`)
+    inbox: String = "_INBOX";
 }
 
 topic ServeJob { payload: ServeWork; keyed_by slot; }
@@ -63,6 +75,11 @@ type ServeReport {
     output_tokens: Int = 0;
     first_ms: Int = -1;
     elapsed_ms: Int = 0;
+    // a ticket's claim: granted, a decline's reason (taken, gone, avoided,
+    // ineligible), no_responders, or unanswered; "" for a `serve`. And the
+    // ticket's copy's message id.
+    claim: String = "";
+    message_id: String = "";
 }
 
 topic ServeDone { payload: ServeReport; }
@@ -116,7 +133,7 @@ locus Server {
     fn step() {
         if self.waiting {
             self.waiting = false;
-            self.serve(self.work);
+            if len(self.work.ticket) > 0 { self.claim(self.work); } else { self.serve(self.work); }
         } else {
             self.tend();
             std::time::sleep(5ms);
@@ -163,6 +180,8 @@ locus Server {
     fn reach(w: ServeWork) -> Bool {
         // a connection the broker closed while the slot was idle is found so
         self.tend();
+        // where a claim's answer comes: read for each request, not at a dial
+        self.client.inbox_prefix = w.inbox;
         if self.client.connected
             && self.client.url == w.nats_url
             && self.client.user == w.nats_user
@@ -175,6 +194,133 @@ locus Server {
         self.client.user = w.nats_user;
         self.client.pass = w.nats_pass;
         return self.client.open();
+    }
+
+    /// Claim the request of the ticket `w` holds from the api instance that
+    /// holds its caller (`<reply_to>.claim`), and serve it once granted:
+    /// the ticket acknowledged at the grant, before any output, then served
+    /// as a `serve` is. A decline acknowledges it (`taken`, `gone`), or puts
+    /// it back for another seat: at once when the seat is `ineligible`,
+    /// after a delay when it is `avoided`. A claim nothing answers (no
+    /// responders) is the caller's instance gone: acknowledged and dropped.
+    /// One unanswered within the claim's wait, twice, goes back at once.
+    @unbounded
+    fn claim(w: ServeWork) {
+        self.serving = w.request_id;
+        self.cancelled = false;
+        let mut done = ServeReport {
+            slot: w.slot,
+            request_id: w.request_id,
+            seat: w.seat,
+            engine: w.engine,
+            claim: "unanswered",
+        };
+        if !self.reach(w) {
+            log_error(
+                "a slot could not reach NATS to claim a ticket",
+                fields2(
+                    std::log::kv("request", w.request_id),
+                    std::log::kv("why", self.client.last_error),
+                ),
+            );
+            self.serving = "";
+            ServeDone <- done;
+            return;
+        }
+        let ticket = nats::NatsMsg { reply: w.ack };
+        let t = work::ticket_of(w.ticket) or {
+            // the session read it before handing it over: not reached
+            nats::js_ack(self.client, ticket) or discard;
+            self.serving = "";
+            ServeDone <- done;
+            return;
+        };
+        done.message_id = work::message_id(t.request_id, t.attempt, t.copy);
+        let body = std::bytes::from_string(
+            work::claim_json(
+                work::Claim {
+                    request_id: t.request_id,
+                    attempt: t.attempt,
+                    copy: t.copy,
+                    seat: w.claimant,
+                },
+            ),
+        );
+        let subject = work::claim_subject(t.reply_to);
+        let mut answer = "";
+        let mut why = "timeout";
+        let mut tries = 0;
+        while tries < 2 && why == "timeout" {
+            why = "";
+            let r = self.client.request(subject, body, work::CLAIM_WAIT_MS * 1ms) or {
+                why = err.kind;
+                nats::NatsMsg { }
+            };
+            if len(why) == 0 { answer = std::str::from_bytes(r.data); }
+            tries = tries + 1;
+        }
+        if why == "no_responders" {
+            // the caller's instance is gone: nobody can be served the answer
+            done.claim = "no_responders";
+            nats::js_ack(self.client, ticket) or discard;
+        } else if len(why) > 0 {
+            // for another seat, at once: the api grants an attempt once,
+            // whichever seat claims it
+            log_warn(
+                "a claim went unanswered: its ticket is put back",
+                fields2(std::log::kv("request", t.request_id), std::log::kv("why", why)),
+            );
+            nats::js_nak(self.client, ticket, 0) or discard;
+        } else {
+            let a = work::answer_of(answer) or {
+                log_warn(
+                    "a claim's answer is neither a grant nor a decline: its ticket is put back",
+                    fields2(
+                        std::log::kv("request", t.request_id),
+                        std::log::kv("why", err.message),
+                    ),
+                );
+                nats::js_nak(self.client, ticket, 0) or discard;
+                self.serving = "";
+                ServeDone <- done;
+                return;
+            };
+            if a.granted {
+                // accepted: acknowledged before any output, then served
+                nats::js_ack(self.client, ticket) or {
+                    log_warn(
+                        "a granted ticket could not be acknowledged: it comes back, and is declined as taken",
+                        fields2(
+                            std::log::kv("request", t.request_id),
+                            std::log::kv("why", err.kind + ": " + err.detail),
+                        ),
+                    );
+                };
+                // served on the slot's next turn, as a `serve` is
+                let mut g = w;
+                g.msg = a.serve;
+                let id = std::json::find_string_field(a.serve, "request_id");
+                if len(id) > 0 { g.request_id = id; }
+                let reply_to = std::json::find_string_field(a.serve, "reply_to");
+                g.reply_to = if len(reply_to) > 0 { reply_to } else { t.reply_to };
+                g.ticket = "";
+                g.granted = true;
+                self.work = g;
+                self.waiting = true;
+                return;
+            }
+            done.claim = a.reason;
+            if a.reason == "ineligible" {
+                nats::js_nak(self.client, ticket, 0) or discard;
+            } else if a.reason == "avoided" {
+                nats::js_nak(self.client, ticket, AVOID_DELAY_MS) or discard;
+            } else {
+                nats::js_ack(self.client, ticket) or discard;
+            }
+        }
+        self.serving = "";
+        self.cancelled = false;
+        ServeDone <- done;
     }
 
     /// A look at the bus, where a `cancel` for this request arrives.
@@ -203,7 +349,13 @@ locus Server {
         self.serving = id;
         self.cancelled = false;
         self.looked = std::time::monotonic_ns();
-        let mut done = ServeReport { slot: w.slot, request_id: id, seat: w.seat, engine: w.engine };
+        let mut done = ServeReport {
+            slot: w.slot,
+            request_id: id,
+            seat: w.seat,
+            engine: w.engine,
+            claim: if w.granted { "granted" } else { "" },
+        };
         if !self.reach(w) {
             log_error(
                 "a slot could not reach NATS to answer a request",

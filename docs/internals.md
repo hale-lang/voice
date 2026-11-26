@@ -654,6 +654,44 @@ other seat's is what its operator set. Core NATS delivers an `assign` at most on
 its assignment each time it is on NATS again, and the api sends the
 assignment again to a node whose heartbeat says it is behind.
 
+The node also pulls its work, queue routing's phase 1
+([`design/queue-routing.md`](./design/queue-routing.md)): it registers
+`protocol: 3`, and each seat that may serve pulls tickets from its queues
+on the work stream the brain keeps ([`node/pull.hl`](../node/pull.hl)).
+Nothing publishes a ticket yet, so a node pulls and finds nothing: the api
+offers every request with `serve` until it queues, and the node answers
+`serve` exactly as before, one count of its slots (`busy`) covering both.
+A seat pulls only while it has a free slot by that count, and never while
+it is not `up`, while its plan holds it, or as a pair's follower (rank 1),
+whose leader pulls for the pair. What it consumes is its part of the
+brain's last `ConsumePlan` on `<root>.node.<node>.consume` (a plan older
+than the one held is read past), or, with none, every queue its assignment
+makes it eligible for: its own queue, then, per model it serves and data
+class it carries, the `m` partition and the `p` one under its own provider
+account, `any`, and `tools` when it carries them (`lib/work`
+`carries_tools`, the rule it serves by). With free slots it sweeps its
+queues in order, one pull at a time that takes what is there for at most
+its free slots (`no_wait`); once every queue was found empty it holds a
+standing pull of one ticket on each, waiting 30 s, so an idle node costs a
+pull per queue each 30 s. A ticket that arrives past its free slots (a
+standing pull of another queue answered too) is put back at once. The
+pulls are pond's `JsPuller`s on the session's own connection (at most 128,
+across the node's seats), so none holds a thread; a pull the server
+refuses (no consumer for a queue in the shape the brain did not choose, no
+stream) is tried again after 1 s, doubled to 5 s, and one never answered (a
+permission the node lacks) the same to 30 s. A
+ticket a seat may take goes to a free slot as a `serve` does; the slot
+claims its request on `<reply_to>.claim` with its own connection (2 s,
+once more on no answer), acknowledges the ticket at the grant, before any
+output, and serves it as an accepted `serve`. A decline of `taken` or
+`gone` is acknowledged; `ineligible` puts it back at once for another
+seat (and the same seat pulling it again within 10 s puts it back after
+1 s); `avoided`, and a ticket whose `avoid` names the seat, after 1 s. A
+claim nothing answers is the caller's instance gone: acknowledged and
+dropped. A ticket past its `wait_until` is acknowledged and dropped
+unclaimed. Each seat's pulls (state, plan version, queues) are on the
+heartbeat and the seats' report (`SeatState.pull`) and in `/node/v1/status`.
+
 The node's calls to the api's node plane run on a thread of their own
 (`Plane`), apart from the NATS session (`Session`): the api serves one
 caller at a time, so a heartbeat can wait for as long as a request holds

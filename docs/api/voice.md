@@ -3039,7 +3039,7 @@ Schema: [Registration](#schema-registration)
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
-| `protocol` | `2` | yes | This document's version. |  |
+| `protocol` | integer, one of `2`, `3` | yes | This document's version the node speaks: 3, a node that pulls and still answers `serve`; 2, one from before. The coordinator registers both for one release, then refuses 2. |  |
 | `version` | string | yes | The node software's version. |  |
 | `capabilities` | [schemas-Capabilities](#schema-schemas-capabilities) | yes |  |  |
 | `local` | [LocalControls](#schema-localcontrols) | yes |  |  |
@@ -7051,7 +7051,7 @@ Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
-| `protocol` | `2` | yes | This document's version. |  |
+| `protocol` | integer, one of `2`, `3` | yes | This document's version the node speaks: 3, a node that pulls and still answers `serve`; 2, one from before. The coordinator registers both for one release, then refuses 2. |  |
 | `version` | string | yes | The node software's version. |  |
 | `capabilities` | [schemas-Capabilities](#schema-schemas-capabilities) | yes |  |  |
 | `local` | [LocalControls](#schema-localcontrols) | yes |  |  |
@@ -7103,7 +7103,7 @@ Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
-| `protocol` | `2` | yes |  |  |
+| `protocol` | integer, one of `2`, `3` | yes | The protocol the node registered under, its own. |  |
 | `heartbeat_interval_ms` | integer | yes |  | ≥ 1000 |
 | `nats` | object | yes |  |  |
 | `nats.url` | string | yes | Where NATS is, from the node's side of the private network. |  |
@@ -7111,6 +7111,22 @@ Type: object
 | `nats.user` | string |  | Grafted into a DNA habitat, the nodes' account on its broker, which may subscribe on `heart.<id>.node.>` and publish on `heart.<id>.reply.>` and `heart.<id>._INBOX.>`; absent standalone. |  |
 | `nats.password` | string |  | That account's password, present with `user` alone; the answer is sent `Cache-Control: no-store`. |  |
 | `assignment` | [Assignment](#schema-assignment) | yes |  |  |
+
+<a id="schema-seatpull"></a>
+
+### SeatPull
+
+How a seat pulls, from a node of protocol 3: on its heartbeat, its
+seats' report and its status; left out by a node of protocol 2.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `state` | string, one of `pulling`, `waiting`, `full`, `held`, `off` | yes | `pulling`: it has a free slot and sweeps its queues. `waiting`: it has a free slot and found every queue empty, and holds a standing pull on each. `full`: every slot it may take is serving or claiming. `held`: its plan holds it (`reason`). `off`: it pulls nothing: it is not `up`, a pair's follower, or its node is not on NATS (`reason`). |  |
+| `reason` | string \| null | yes | Why it is held or off; null otherwise. |  |
+| `plan_version` | integer \| null | yes | The version of the plan it follows (`ConsumePlan.version`), null while it pulls on its own eligibility (no plan, or one that does not name it). |  |
+| `queues` | array of string | yes | The work subjects it consumes, in the order it sweeps them; empty when it is held. | items ≤ 64 |
 
 <a id="schema-seatstate"></a>
 
@@ -7128,6 +7144,7 @@ Type: object
 | `progress` | [FetchProgress](#schema-fetchprogress) |  |  |  |
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
 | `in_flight` | integer | yes |  | ≥ 0 |
+| `pull` | [SeatPull](#schema-seatpull) |  |  |  |
 
 <a id="schema-heartbeat"></a>
 

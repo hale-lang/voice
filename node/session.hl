@@ -5,9 +5,17 @@
 // where NATS is, its subject, its assignment. Then it holds NATS on its
 // subject: an `assign` replaces the assignment, a `serve` is answered at
 // once (accepted or refused) and then served on its seat, the events and
-// the result on the reply subject the request named, and a `cancel` stops
-// the request it names. Every time it is on NATS again it asks the plane
+// the result on the reply subject the request named, a `cancel` stops
+// the request it names, and a `consume` is the brain's plan of which
+// queues each seat pulls. Every time it is on NATS again it asks the plane
 // to read the assignment, since an `assign` sent while it was not is lost.
+//
+// On the same connection each seat with a free slot pulls tickets from its
+// queues on the work stream (pull.hl), and a ticket it pulled is handed to
+// a free slot as a `serve` is, which claims its request and serves it once
+// granted (serve.hl). One count, `busy`, covers both: a slot serving a
+// `serve` is not pulled for, and a slot claiming a ticket refuses a
+// `serve` as a busy one does.
 //
 // It makes no call to the api: those wait on the api, which serves its
 // callers one at a time, and a session waiting there could not answer a
@@ -48,6 +56,10 @@ locus Session {
         // request id, tab-separated (serve.hl)
         busy: String = "";
         client: nats::NatsClient = nats::NatsClient { name: "voice-node" };
+        // the root of the subjects it is under (`voice`, or a habitat's
+        // broker's prefix), and its seats' pulls (pull.hl)
+        root: String = "";
+        pulls: Pulls = Pulls { };
         // the seats' readings, scraped with the runtime's (readings.hl)
         readings: std::metrics::Registry = std::metrics::Registry { namespace: "voice_node" };
         // the seats last read out, so one withdrawn reads as down
@@ -78,6 +90,12 @@ locus Session {
         while !self.draining {
             self.step();
         }
+        // no ticket is pulled any more: the pulls' inboxes go, so the
+        // server drops their open pulls
+        if self.client.connected {
+            self.pulls.close_all(self.client);
+            self.client.flush() or discard;
+        }
         // no hand-off follows: the slots may return once they hold nothing
         SessionStopped <- Stopping { at: std::time::monotonic_ns() };
     }
@@ -93,6 +111,9 @@ locus Session {
         if self.client.connected {
             // short, so a slot freed (on the bus) is told soon
             if self.client.read_msg(20ms) { self.on_message(); }
+            if self.pulls.look(self.client, self.seats, self.busy, std::time::monotonic_ns()) {
+                self.loaded();
+            }
             std::time::sleep(1ms);
         } else {
             std::time::sleep(500ms);
@@ -117,6 +138,9 @@ locus Session {
         }
         if j.subject != self.subject { self.subscribed = false; }
         self.subject = j.subject;
+        self.root = root_of(j.subject, self.id);
+        self.client.inbox_prefix = inbox_of(self.root);
+        self.pulls.place(self.client, self.id, self.root);
         self.local = j.local;
         self.joined = true;
         self.adopt(j.assignment);
@@ -134,6 +158,7 @@ locus Session {
     fn on_local(l: LocalText) {
         self.local = l.local;
         self.seats = apply_assignment(self.assignment, self.capabilities, self.local);
+        self.pulls.configure(self.client, self.seats, self.assignment, self.capabilities);
         // a managed seat the controls released is fetched now
         self.schedule();
         self.overlay();
@@ -153,6 +178,8 @@ locus Session {
         if len(self.nats_url) == 0 { return; }
         if !self.client.connected {
             self.subscribed = false;
+            // a new connection: the old one's pulls went with it
+            self.pulls.reset();
             if !self.client.open() {
                 self.nats_state = "connecting";
                 self.last_error = "NATS unreachable at " + self.nats_url + ": "
@@ -188,6 +215,7 @@ locus Session {
             jobs: std::str::trim(std::json::find_field_raw(assignment, "link_checks")),
         };
         self.seats = apply_assignment(assignment, self.capabilities, self.local);
+        self.pulls.configure(self.client, self.seats, assignment, self.capabilities);
         // the fetches kept are the assignment's seats' alone
         let mut kept = FetchStates { };
         for f in self.fetches.items {
@@ -276,16 +304,23 @@ locus Session {
     fn applied() {
         SeatsApplied <- AppliedSeats {
             version: self.seats.version,
-            states: states_json(self.seats, self.busy),
+            states: states_json(self.seats, self.busy, self.pulls.seats),
         };
         self.report();
     }
 
-    /// One message on the node's subject.
+    /// One message on the node's subject, or on a pull's inbox.
     fn on_message() {
+        let puller = self.pulls.owner(self.client.last);
+        if puller >= 0 {
+            self.on_pulled(puller);
+            return;
+        }
         let subject = self.client.last.subject;
         let body = std::str::from_bytes(self.client.last.data);
-        if subject == self.subject + ".assign" {
+        if subject == self.subject + ".consume" {
+            self.on_plan(body);
+        } else if subject == self.subject + ".assign" {
             let a = std::str::trim(std::json::find_field_raw(body, "assignment"));
             if std::json::find_int_field(a, "version") > self.seats.version { self.adopt(a); }
         } else if subject == self.subject + ".serve" {
@@ -318,7 +353,7 @@ locus Session {
             refusal = "seat " + seat.id + " is " + seat.status
                 + (if len(seat.reason) > 0 { ": " + seat.reason } else { "" });
         } else if request_has_tools(std::str::trim(std::json::find_field_raw(msg, "body")))
-            && !seat_carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
+            && !work::carries_tools(engine_kind(self.capabilities, seat.engine), seat.config)
         {
             refusal = "seat " + seat.id + " does not carry tools: its engine answers text only";
         } else if len(at_capacity(self.busy, seat, slots)) > 0 {
@@ -357,14 +392,99 @@ locus Session {
             nats_url: self.client.url,
             nats_user: self.client.user,
             nats_pass: self.client.pass,
+            inbox: self.client.inbox_prefix,
         };
+        // a slot fewer to pull for
+        self.pulls.dirty = true;
         self.loaded();
     }
 
-    /// A slot is free again: its request is read out, and the load told.
+    /// The brain's plan of which queues each seat consumes: taken when it
+    /// is newer than the one held, and the pulls follow it.
+    fn on_plan(body: String) {
+        let p = work::consume_plan_of(body) or {
+            log_warn("a plan that is not one was read past", std::log::kv("why", err.message));
+            return;
+        };
+        if !self.pulls.adopt_plan(p) { return; }
+        self.pulls.configure(self.client, self.seats, self.assignment, self.capabilities);
+        log_info("the brain's plan taken", std::log::kv("version", to_string(p.version)));
+        self.loaded();
+    }
+
+    /// What puller `i` was sent: a ticket for its seat, handed to a free
+    /// slot to claim, or put back or dropped (pull.hl `verdict`); or word
+    /// of its pull, which `Pulls` keeps.
+    @unbounded
+    fn on_pulled(i: Int) {
+        let now = std::time::monotonic_ns();
+        let got = self.pulls.take(i, self.client.last, now);
+        if got.kind != "msg" { return; }
+        let seat = seat_of(self.seats, self.pulls.seat_at(i));
+        let consumed = self.pulls.consumed(i);
+        let ticket = std::str::from_bytes(got.msg.data);
+        let claimant = self.id + "/" + seat.id;
+        let kind = engine_kind(self.capabilities, seat.engine);
+        let v = verdict(
+            ticket,
+            claimant,
+            len(pull_off_reason(seat)) == 0 && consumed,
+            free_for(self.busy, seat, SLOTS),
+            work::carries_tools(kind, seat.config),
+            self.pulls.ineligible_for(seat.id, now),
+            std::time::current(),
+        );
+        if v == "extra" {
+            nats::js_nak(self.client, got.msg, 0) or discard;
+            return;
+        }
+        if v == "avoid" {
+            nats::js_nak(self.client, got.msg, AVOID_DELAY_MS) or discard;
+            return;
+        }
+        if v != "claim" {
+            // late, or malformed: its request is over, or it is none
+            nats::js_ack(self.client, got.msg) or discard;
+            return;
+        }
+        let slot = free_slot(self.busy, SLOTS);
+        if slot < 0 {
+            nats::js_nak(self.client, got.msg, 0) or discard;
+            return;
+        }
+        let id = std::json::find_string_field(ticket, "request_id");
+        self.busy = self.busy + to_string(slot) + "\t" + seat.id + "\t" + id + "\n";
+        ServeJob <- ServeWork {
+            slot: slot,
+            request_id: id,
+            reply_to: std::json::find_string_field(ticket, "reply_to"),
+            ticket: ticket,
+            ack: got.msg.reply,
+            claimant: claimant,
+            seat: seat.id,
+            engine: seat.engine,
+            kind: kind,
+            config: seat.config,
+            endpoint: seat.endpoint,
+            key: seat.key,
+            nats_url: self.client.url,
+            nats_user: self.client.user,
+            nats_pass: self.client.pass,
+            inbox: self.client.inbox_prefix,
+        };
+        self.pulls.dirty = true;
+        self.loaded();
+    }
+
+    /// A slot is free again: its request is read out, and the load told;
+    /// its seat sweeps its queues again.
     @unbounded
     fn on_done(d: ServeReport) {
         self.busy = busy_without(self.busy, d.slot);
+        self.pulls.freed(d.seat);
+        if d.claim == "ineligible" {
+            self.pulls.declined(d.seat, d.message_id, std::time::monotonic_ns());
+        }
         if d.ok {
             self.read_run(
                 d.seat,
@@ -383,7 +503,7 @@ locus Session {
     fn loaded() {
         LoadChanged <- Load {
             in_flight: busy_count(self.busy),
-            states: states_json(self.seats, self.busy),
+            states: states_json(self.seats, self.busy, self.pulls.seats),
         };
         self.report();
     }
@@ -406,7 +526,7 @@ locus Session {
         let body = "{\"coordinator\": " + coordinator + ", \"assignment_version\": "
             + (if self.seats.version >= 0 { to_string(self.seats.version) } else { "null" })
             + ", \"in_flight\": " + to_string(busy_count(self.busy)) + ", \"seats\": "
-            + status_seats(self.assignment, self.seats, self.busy) + "}";
+            + status_seats(self.assignment, self.seats, self.busy, self.pulls.seats) + "}";
         std::io::fs::write_file(self.data + "/session.json", body) or discard;
         self.read_out();
     }
@@ -481,7 +601,7 @@ locus Session {
 
 /// The assigned seats, each with its state on this node (node.yaml
 /// `NodeStatus.seats`).
-fn status_seats(assignment: String, seats: NodeSeats, busy: String) -> String {
+fn status_seats(assignment: String, seats: NodeSeats, busy: String, pulls: SeatPulls) -> String {
     let out = std::bytes::BytesBuilder { initial_cap: 1024 };
     let mut any = false;
     let mut it = std::json::array_first(std::json::find_field_raw(assignment, "seats"));
@@ -493,7 +613,7 @@ fn status_seats(assignment: String, seats: NodeSeats, busy: String) -> String {
         out.append_str(
             s[0..(len(s) - 1)] + ", \"status\": " + q(st.status) + ", \"reason\": "
                 + (if len(st.reason) > 0 { q(st.reason) } else { "null" }) + ", \"in_flight\": "
-                + to_string(seat_busy(busy, st.id)) + "}",
+                + to_string(seat_busy(busy, st.id)) + pull_field(pulls, st.id) + "}",
         );
         it = std::json::array_next(it);
     }

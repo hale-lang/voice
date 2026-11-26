@@ -1,0 +1,506 @@
+// The node's pulls on a JetStream-enabled NATS, when VOICE_TEST_NATS_URL
+// names one (CI's end-to-end job runs one): the node's session and slots
+// pull from the work stream as lib/work sets it up, and a fake api instance
+// answers their claims. A ticket is pulled, claimed, granted, served by the
+// static engine and acknowledged; a decline of `taken` or `gone` is
+// acknowledged; one of `ineligible` is put back at once and taken by the
+// node's other seat; one of `avoided` is put back after a delay; a claim
+// nothing answers is acknowledged and dropped; a seat at its concurrency
+// pulls nothing until it is free; and a plan from the brain switches a
+// seat's queues and holds another, an older plan read past. Each run works
+// under a root of its own, so its stream is its own, and deletes it at the
+// end.
+import ".." as node;
+import "../../lib/work" as work;
+import "../../lib/pond/realtime/nats" as nats;
+
+const NODE: String = "p1c";
+
+const CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+
+/// Two seats of `echo`, of one at a time each, and `slow`, whose first
+/// output takes 2 s.
+const ASSIGNMENT: String = "{\"version\": 1, \"max_in_flight\": 3, \"seats\": [{\"id\": \"s1\", \"engine\": \"static\", \"account\": \"local\", \"serves\": [{\"model\": \"echo\"}], \"data_classes\": [\"internal\"], \"concurrency\": 1, \"enabled\": true, \"config\": {\"text\": \"hello\"}}, {\"id\": \"s2\", \"engine\": \"static\", \"account\": \"local\", \"serves\": [{\"model\": \"echo\"}], \"data_classes\": [\"internal\"], \"concurrency\": 1, \"enabled\": true, \"config\": {\"text\": \"hello\"}}, {\"id\": \"slow\", \"engine\": \"static\", \"account\": \"local\", \"serves\": [{\"model\": \"slow\"}], \"data_classes\": [\"internal\"], \"concurrency\": 1, \"enabled\": true, \"config\": {\"text\": \"slowly\", \"first_output_ms\": 2000}}], \"link_checks\": []}";
+
+fn ms() -> Int { return std::time::monotonic_ns() / 1000000; }
+
+fn note(file: String, line: String) {
+    std::io::fs::write_file_append(file, line + "\n") or discard;
+}
+
+/// A fake api instance: it answers the claims on the requests under
+/// `<root>.reply.`, by the request id's first letter: `g`, `c` and `p`
+/// granted; `t` taken; `x` gone; `i` ineligible for the first seat that
+/// claims it and granted to another; `a` avoided once, then granted. Each
+/// claim and each result is a line of `file`.
+locus FakeApi {
+    params {
+        url: String = "";
+        root: String = "";
+        file: String = "";
+        client: nats::NatsClient = nats::NatsClient { name: "p1c-fake-api" };
+        // the first seat that claimed each request, `rid seat` a line
+        first: String = "";
+    }
+
+    run() {
+        self.client.url = self.url;
+        if !self.client.open() {
+            note(self.file, "unreachable " + self.client.last_error);
+            return;
+        }
+        self.client.sub_to(self.root + ".reply.>", "") or discard;
+        self.client.flush() or discard;
+        note(self.file, "ready");
+        while !self.draining {
+            if self.client.read_msg(20ms) { self.on_msg(); }
+        }
+    }
+
+    @unbounded
+    fn on_msg() {
+        let subject = self.client.last.subject;
+        let reply = self.client.last.reply;
+        let body = std::str::from_bytes(self.client.last.data);
+        if std::str::ends_with(subject, ".claim") {
+            let c = work::claim_of(body) or {
+                note(self.file, "bad-claim " + body);
+                return;
+            };
+            let answer = self.answer(c);
+            self.client.pub_msg(reply, "", std::bytes::from_string(answer)) or discard;
+            note(self.file, "claim " + c.request_id + " " + c.seat + " " + to_string(ms()));
+        } else if std::str::ends_with(subject, ".result") {
+            note(
+                self.file,
+                "result " + std::json::find_string_field(body, "request_id") + " "
+                    + std::json::find_string_field(body, "outcome"),
+            );
+        }
+    }
+
+    @unbounded
+    fn answer(c: work::Claim) -> String {
+        let rid = c.request_id;
+        let kind = rid[0..1];
+        let grant = "{\"type\": \"serve\", \"request_id\": " + node::q(rid) + ", \"seat\": "
+            + node::q(c.seat) + ", \"model\": " + node::q(if kind == "c" { "slow" } else { "echo" })
+            + ", \"body\": {\"model\": \"echo\", \"input\": \"hi\"}, \"reply_to\": "
+            + node::q(self.root + ".reply." + rid) + "}";
+        if kind == "t" { return work::decline_json("taken"); }
+        if kind == "x" { return work::decline_json("gone"); }
+        let seen = std::str::contains(self.first, rid + " ");
+        if kind == "i" {
+            if !seen {
+                self.first = self.first + rid + " " + c.seat + "\n";
+                return work::decline_json("ineligible");
+            }
+            if std::str::contains(self.first, rid + " " + c.seat + "\n") {
+                return work::decline_json("ineligible");
+            }
+        }
+        if kind == "a" && !seen {
+            self.first = self.first + rid + " " + c.seat + "\n";
+            return work::decline_json("avoided");
+        }
+        return grant;
+    }
+}
+
+/// The seats' states as the node's heartbeat last carried them.
+locus Beats {
+    params { file: String = ""; }
+    bus { subscribe node::LoadChanged as on_load; }
+    fn on_load(l: node::Load) {
+        std::io::fs::write_file(self.file, l.states) or discard;
+    }
+}
+
+/// True once `file` holds `needle`, within `wait_ms`.
+fn within(file: String, needle: String, wait_ms: Int) -> Bool {
+    let until = ms() + wait_ms;
+    while ms() < until {
+        if std::str::contains(std::io::fs::read_file(file) or "", needle) { return true; }
+        std::time::sleep(20ms);
+    }
+    return std::str::contains(std::io::fs::read_file(file) or "", needle);
+}
+
+/// The claims on request `rid` the fake api answered, `<seat> <ms>` a line.
+@unbounded
+fn claims(file: String, rid: String) -> String {
+    let mut out = "";
+    let text = std::io::fs::read_file(file) or "";
+    let v = std::str::bytes_view(text);
+    let mut at = 0;
+    while at < v.n {
+        let nl = node::line_end(v, at);
+        let line = std::str::slice(v, at, nl);
+        at = nl + 1;
+        if std::str::starts_with(line, "claim " + rid + " ") {
+            out = out + line[(len(rid) + 7)..len(line)] + "\n";
+        }
+    }
+    return out;
+}
+
+/// The `k`th (from 0) of `lines`' space-separated fields on line `n`.
+@unbounded
+fn field(lines: String, n: Int, k: Int) -> String {
+    let mut i = 0;
+    for row in std::str::split(lines, "\n") {
+        if i == n {
+            let mut j = 0;
+            for part in std::str::split(row, " ") {
+                if j == k { return part; }
+                j = j + 1;
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+/// Seat `seat`'s `pull` in the node's status (`<data>/session.json`).
+fn pull_of(data: String, seat: String) -> String {
+    let status = std::io::fs::read_file(data + "/session.json") or "";
+    let mut it = std::json::array_first(std::json::find_field_raw(status, "seats"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "id") == seat {
+            return std::str::trim(std::json::find_field_raw(it.element, "pull"));
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// True once seat `seat`'s pull in the status holds `needle`, within
+/// `wait_ms`.
+fn pull_within(data: String, seat: String, needle: String, wait_ms: Int) -> Bool {
+    let until = ms() + wait_ms;
+    while ms() < until {
+        if std::str::contains(pull_of(data, seat), needle) { return true; }
+        std::time::sleep(20ms);
+    }
+    return std::str::contains(pull_of(data, seat), needle);
+}
+
+main locus App {
+    params {
+        url: String = "";
+        root: String = "";
+        data: String = "";
+        c: nats::NatsClient = nats::NatsClient { name: "p1c-live-test", timeout: 2s };
+        api: FakeApi = FakeApi { };
+        beats: Beats = Beats { };
+        session: node::Session = node::Session { };
+        servers: node::Server = node::Server { };
+    }
+    bus { publish node::PlaneJoined; }
+    placement {
+        api: pinned;
+        session: pinned;
+        // the slots the seats' three requests at once are served on
+        servers: pinned(replicas = 4);
+    }
+
+    run() {
+        self.scenarios();
+        nats::js_stream_delete(self.c, work::stream_name(self.root)) or discard;
+    }
+
+    /// Queue `subject`'s consumer as JetStream says it.
+    fn queue(subject: String) -> nats::ConsumerInfo {
+        return nats::js_consumer_info(
+            self.c,
+            work::stream_name(self.root),
+            work::consumer_name(subject),
+        ) or nats::ConsumerInfo { name: "unread" };
+    }
+
+    /// True once queue `subject` holds nothing, pending or unacknowledged,
+    /// within `wait_ms`.
+    fn drained(subject: String, wait_ms: Int) -> Bool {
+        let until = ms() + wait_ms;
+        while ms() < until {
+            let q = self.queue(subject);
+            if q.name != "unread" && q.num_pending == 0 && q.num_ack_pending == 0 { return true; }
+            std::time::sleep(50ms);
+        }
+        return false;
+    }
+
+    /// A ticket for request `rid` of `model` on `subject`, its claims to
+    /// `reply_to`.
+    fn ticket(subject: String, rid: String, model: String, reply_to: String) {
+        let now = std::time::unix(std::time::current());
+        let t = work::Ticket {
+            request_id: rid,
+            attempt: 1,
+            reply_to: reply_to,
+            instance: "fake",
+            model: model,
+            data_class: "internal",
+            enqueued_at: std::time::time_from_unix(now),
+            wait_until: std::time::time_from_unix(now + 60),
+        };
+        nats::js_publish_id(
+            self.c,
+            subject,
+            work::message_id(rid, 1, "shared"),
+            std::bytes::from_string(work::ticket_json(t)),
+        ) or { std::test::assert(false, "ticket " + rid + " published: " + err.detail); };
+    }
+
+    fn plan(json: String) {
+        self.c.pub_msg(
+            self.root + ".node." + NODE + ".consume",
+            "",
+            std::bytes::from_string(json),
+        ) or discard;
+        self.c.flush() or discard;
+    }
+
+    @unbounded
+    fn scenarios() {
+        let log = self.data + "/api.log";
+        let reply = self.root + ".reply.";
+        let echo = work::model_subject(self.root, "echo", "internal", "any");
+        let slow = work::model_subject(self.root, "slow", "internal", "any");
+        let planned_x = work::model_subject(self.root, "planned-x", "internal", "any");
+        let planned_y = work::model_subject(self.root, "planned-y", "internal", "any");
+        self.c.url = self.url;
+        std::test::assert(self.c.open(), "the test NATS answers: " + self.c.last_error);
+        let stream = work::stream_name(self.root);
+        nats::js_stream_create_with(
+            self.c,
+            nats::StreamSpec {
+                name: stream,
+                subjects: work::work_subjects(self.root),
+                retention: work::STREAM_RETENTION,
+                storage: work::STREAM_STORAGE,
+                max_age_ms: work::STREAM_MAX_AGE_MS,
+                max_msgs_per_subject: work::STREAM_MAX_MSGS_PER_SUBJECT,
+                discard: work::STREAM_DISCARD,
+                discard_new_per_subject: work::STREAM_DISCARD_NEW_PER_SUBJECT,
+                duplicate_window_ms: work::STREAM_DUPLICATE_WINDOW_MS,
+                allow_msg_ttl: work::STREAM_ALLOW_MSG_TTL,
+            },
+        ) or {
+            std::test::assert(false, "the work stream: " + err.detail);
+            return;
+        };
+        // the `m` queues and the seats' own; the `p` ones are left out, as
+        // the brain makes one shape only: their pulls are refused, and wait
+        for subject in [
+            echo,
+            slow,
+            planned_x,
+            planned_y,
+            work::seat_subject(self.root, NODE, "s1"),
+            work::seat_subject(self.root, NODE, "s2"),
+            work::seat_subject(self.root, NODE, "slow"),
+        ] {
+            nats::js_consumer_create(
+                self.c,
+                stream,
+                nats::ConsumerSpec {
+                    durable: work::consumer_name(subject),
+                    filter: subject,
+                    deliver: work::CONSUMER_DELIVER_POLICY,
+                    ack_wait_ms: work::CONSUMER_ACK_WAIT_MS,
+                    max_ack_pending: work::CONSUMER_MAX_ACK_PENDING,
+                    max_deliver: work::CONSUMER_MAX_DELIVER,
+                },
+            ) or { std::test::assert(false, "the consumer of " + subject + ": " + err.detail); };
+        }
+        std::test::assert(within(log, "ready", 5000), "the fake api is on NATS");
+        node::PlaneJoined <- node::Joined {
+            nats_url: self.url,
+            subject: self.root + ".node." + NODE,
+            assignment: ASSIGNMENT,
+            local: "{}",
+        };
+        std::test::assert(
+            pull_within(self.data, "s2", "\"state\": \"waiting\"", 10000),
+            "the seats find their queues empty and wait on them: " + pull_of(self.data, "s2"),
+        );
+        std::test::assert(
+            std::str::contains(pull_of(self.data, "s1"), "\"plan_version\": null")
+                && std::str::contains(pull_of(self.data, "s1"), node::q(echo)),
+            "with no plan, on its own eligibility: " + pull_of(self.data, "s1"),
+        );
+
+        // granted: claimed, acknowledged, served, its result told
+        self.ticket(echo, "g1", "echo", reply + "g1");
+        std::test::assert(
+            within(log, "result g1 served", 5000),
+            "g1 served: " + (std::io::fs::read_file(log) or ""),
+        );
+        std::test::assert(
+            std::str::starts_with(claims(log, "g1"), NODE + "/s"),
+            "claimed by a seat of the node: " + claims(log, "g1"),
+        );
+        std::test::assert(self.drained(echo, 2000), "g1 acknowledged");
+
+        // taken, and gone: acknowledged, never served
+        self.ticket(echo, "t1", "echo", reply + "t1");
+        self.ticket(echo, "x1", "echo", reply + "x1");
+        std::test::assert(
+            within(log, "claim t1 ", 3000) && within(log, "claim x1 ", 3000),
+            "t1 and x1 claimed",
+        );
+        std::test::assert(
+            self.drained(echo, 2000),
+            "a ticket declined taken or gone is acknowledged",
+        );
+        std::time::sleep(300ms);
+        std::test::assert(
+            !within(log, "result t1", 0) && !within(log, "result x1", 0)
+                && field(claims(log, "t1"), 1, 0) == "" && field(claims(log, "x1"), 1, 0) == "",
+            "and never claimed again nor served",
+        );
+
+        // ineligible: put back at once, and the other seat takes it
+        self.ticket(echo, "i1", "echo", reply + "i1");
+        std::test::assert(within(log, "result i1 served", 5000), "i1 served: " + claims(log, "i1"));
+        let i1 = claims(log, "i1");
+        std::test::assert(
+            field(i1, 0, 0) != field(i1, 1, 0) && len(field(i1, 1, 0)) > 0,
+            "by the other seat: " + i1,
+        );
+        let i1_gap = (std::str::parse_int(field(i1, 1, 1)) or 0)
+            - (std::str::parse_int(field(i1, 0, 1)) or 0);
+        std::test::assert(i1_gap < 800, "put back at once: " + to_string(i1_gap) + " ms");
+        std::test::assert(self.drained(echo, 2000), "i1 acknowledged once granted");
+
+        // avoided: put back after a delay
+        self.ticket(echo, "a1", "echo", reply + "a1");
+        std::test::assert(within(log, "result a1 served", 6000), "a1 served: " + claims(log, "a1"));
+        let a1 = claims(log, "a1");
+        let a1_gap = (std::str::parse_int(field(a1, 1, 1)) or 0)
+            - (std::str::parse_int(field(a1, 0, 1)) or 0);
+        std::test::assert(
+            a1_gap >= 900,
+            "put back after a delay: " + to_string(a1_gap) + " ms: " + a1,
+        );
+        std::test::assert(self.drained(echo, 2000), "a1 acknowledged once granted");
+
+        // no responders: the caller's instance is gone, the ticket dropped
+        self.ticket(echo, "n1", "echo", self.root + ".gone.n1");
+        std::time::sleep(500ms);
+        let n1 = self.queue(echo);
+        std::test::assert(
+            n1.num_pending == 0 && n1.num_ack_pending == 0 && n1.delivered_stream_seq > 0,
+            "a claim nothing answers is acknowledged and dropped: pending "
+                + to_string(n1.num_pending) + ", unacknowledged " + to_string(n1.num_ack_pending),
+        );
+
+        // a seat at its concurrency pulls nothing until it is free
+        self.ticket(slow, "c1", "slow", reply + "c1");
+        std::test::assert(within(log, "claim c1 ", 3000), "c1 claimed");
+        std::test::assert(
+            pull_within(self.data, "slow", "\"state\": \"full\"", 2000),
+            "slow is full: " + pull_of(self.data, "slow"),
+        );
+        self.ticket(slow, "c2", "slow", reply + "c2");
+        std::time::sleep(800ms);
+        let held = self.queue(slow);
+        std::test::assert(
+            !within(log, "claim c2 ", 0) && held.num_pending == 1 && held.num_ack_pending == 0,
+            "c2 waits in the queue while slow serves c1: pending " + to_string(held.num_pending)
+                + ", unacknowledged " + to_string(held.num_ack_pending),
+        );
+        std::test::assert(within(log, "result c1 served", 5000), "c1 served");
+        std::test::assert(within(log, "result c2 served", 6000), "then c2");
+        let c1_done = std::str::index_of(std::io::fs::read_file(log) or "", "result c1 ");
+        let c2_claimed = std::str::index_of(std::io::fs::read_file(log) or "", "claim c2 ");
+        std::test::assert(c2_claimed > c1_done, "claimed once c1 was done");
+
+        // a plan: s1 consumes planned-x alone, s2 is held, slow (unnamed)
+        // pulls on its own eligibility
+        self.plan(
+            "{\"version\": 5, \"seats\": [{\"seat\": \"s1\", \"hold\": null, \"consume\": ["
+                + node::q(planned_x)
+                + "]}, {\"seat\": \"s2\", \"hold\": \"testing a hold\", \"consume\": []}]}",
+        );
+        std::test::assert(
+            pull_within(self.data, "s1", "\"plan_version\": 5", 3000),
+            "s1 follows the plan: " + pull_of(self.data, "s1"),
+        );
+        std::test::assert(
+            std::str::contains(
+                pull_of(self.data, "s1"),
+                "\"queues\": [" + node::q(planned_x) + "]",
+            ),
+            "its queues are the plan's: " + pull_of(self.data, "s1"),
+        );
+        std::test::assert(
+            pull_within(
+                self.data,
+                "s2",
+                "\"state\": \"held\", \"reason\": \"testing a hold\"",
+                3000,
+            ),
+            "s2 is held: " + pull_of(self.data, "s2"),
+        );
+        std::test::assert(
+            std::str::contains(pull_of(self.data, "slow"), "\"plan_version\": null"),
+            "slow, not named, on its own eligibility: " + pull_of(self.data, "slow"),
+        );
+        std::test::assert(
+            within(self.data + "/beats", "\"plan_version\": 5", 2000),
+            "the heartbeat carries the plan's version",
+        );
+        self.ticket(planned_x, "p1", "echo", reply + "p1");
+        std::test::assert(within(log, "result p1 served", 5000), "p1 served from planned-x");
+        std::test::assert_eq_str(
+            field(claims(log, "p1"), 0, 0),
+            NODE + "/s1",
+            "by s1, which consumes it",
+        );
+        // an older plan is read past
+        self.plan("{\"version\": 4, \"seats\": []}");
+        std::time::sleep(300ms);
+        std::test::assert(
+            std::str::contains(pull_of(self.data, "s1"), "\"plan_version\": 5"),
+            "an older plan read past: " + pull_of(self.data, "s1"),
+        );
+        // the next switches s1 to planned-y
+        self.plan(
+            "{\"version\": 6, \"seats\": [{\"seat\": \"s1\", \"hold\": null, \"consume\": ["
+                + node::q(planned_y)
+                + "]}, {\"seat\": \"s2\", \"hold\": \"testing a hold\", \"consume\": []}]}",
+        );
+        std::test::assert(
+            pull_within(self.data, "s1", "\"plan_version\": 6", 3000),
+            "s1 follows the new plan: " + pull_of(self.data, "s1"),
+        );
+        self.ticket(planned_x, "p2", "echo", reply + "p2");
+        self.ticket(planned_y, "p3", "echo", reply + "p3");
+        std::test::assert(within(log, "result p3 served", 5000), "p3 served from planned-y");
+        std::time::sleep(500ms);
+        std::test::assert(!within(log, "claim p2 ", 0), "planned-x is no longer pulled");
+        let x = self.queue(planned_x);
+        std::test::assert_eq_int(x.num_pending, 1, "p2 waits there");
+    }
+}
+
+fn main() {
+    if !std::env::var_exists("VOICE_TEST_NATS_URL") { return; }
+    let url = std::env::var("VOICE_TEST_NATS_URL");
+    let rand = std::os::getrandom(6) or std::bytes::from_string("fixed");
+    let root = "test.p1c" + std::hex::encode(rand);
+    let data = node::run_out("mktemp\n-d");
+    let dir = std::str::trim(data);
+    App {
+        url: url,
+        root: root,
+        data: dir,
+        api: FakeApi { url: url, root: root, file: dir + "/api.log" },
+        beats: Beats { file: dir + "/beats" },
+        session: node::Session { id: NODE, data: dir, capabilities: CAPS },
+    };
+    node::run_out("rm\n-rf\n" + dir);
+}

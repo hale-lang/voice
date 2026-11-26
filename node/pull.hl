@@ -1,0 +1,872 @@
+// The node's pulls (docs/design/queue-routing.md; spec/protocol.yaml,
+// "Pulling: protocol 3"). Each seat that may serve pulls tickets from the
+// queues it consumes on the work stream, only while it has a free slot by
+// the node's own count (`busy`, session.hl), and a slot claims each ticket's
+// request from the api instance that holds its caller (serve.hl).
+//
+// What a seat consumes is its part of the brain's last `ConsumePlan`
+// (`<root>.node.<node>.consume`), or, with none, every queue its assignment
+// makes it eligible for (`eligible_queues`): its own queue, then, for each
+// model it serves and data class it carries, the `m` partition and the `p`
+// one under its own provider account, `any`, and `tools` when it carries
+// them. A queue a seat may not serve from is declined `ineligible` at the
+// claim; the subject routes, the claim decides.
+//
+// How a seat pulls (`pulls_due`): with free slots it sweeps its queues in
+// order, one `no_wait` pull at a time for as many tickets as it has free
+// slots, so a backlog is taken in its plan's order and never beyond them;
+// once every queue was found empty it holds a standing pull of one ticket
+// on each, waiting `STAND_MS`, and the first ticket to arrive is served.
+// Standing pulls may bring more tickets than the seat has free slots: the
+// extras are put back at once (`js_nak`, no delay). A pair's follower, a
+// seat not up and a seat its plan holds pull nothing.
+//
+// The pulls are pond's `JsPuller`s on the session's own connection, each a
+// queue of one seat, so a pull never holds a thread: what the server sends
+// back arrives through the session's read loop.
+
+import "../lib/work" as work;
+import "../lib/pond/realtime/nats" as nats;
+
+/// The most queues the node pulls from at once, across its seats: the
+/// pullers it holds. A seat's own queue and its first partitions come
+/// first; past it a queue is not pulled, and the node says so.
+const PULLS_MAX: Int = 128;
+/// How long a standing pull waits for a ticket before it is made again:
+/// long, so a node with nothing to do costs a pull per queue this often.
+const STAND_MS: Int = 30000;
+/// A ticket that avoids the seat that pulled it, or one the api declined it
+/// as ineligible for and it pulled again, goes back with this delay, for
+/// another seat to take meanwhile.
+const AVOID_DELAY_MS: Int = 1000;
+/// After a pull the server refused (no consumer, as for a queue in the
+/// shape the brain did not choose, or no stream): the first wait before
+/// the next, doubled each time, to the most, so a consumer the brain makes
+/// is pulled from within seconds.
+const RETRY_MIN_MS: Int = 1000;
+const REFUSED_MAX_MS: Int = 5000;
+/// After a pull the server never answered (a permission the node lacks, a
+/// server gone): the same, to a longer most.
+const SILENT_MAX_MS: Int = 30000;
+/// How often the pulls are looked at with nothing new to say: what an
+/// expired wait or a refusal's retry needs.
+const LOOK_MS: Int = 250;
+
+/// One queue one seat consumes, pulled by the puller of the same index.
+/// `seat` "" is a puller nothing uses.
+type PullSlot {
+    seat: String = "";
+    subject: String = "";
+    // its place in the seat's queues
+    order: Int = 0;
+    // a pull open on it: "" none, "sweep" (no_wait) or "stand" (it waits)
+    open: String = "";
+    // found empty since the seat's sweep began
+    empty: Bool = false;
+    // no pull before this (monotonic ns), after refusals in a row
+    retry_at: Int = 0;
+    refusals: Int = 0;
+}
+
+type PullSlots { items: bounded[PullSlot; 128]; }
+
+/// What one seat consumes, and how its pulls go (spec/protocol.yaml
+/// `SeatPull`).
+type SeatPull {
+    seat: String = "";
+    // the queues it consumes, in order
+    queues: bounded[String; 64];
+    // the plan it follows: its version, -1 for none (its own eligibility)
+    plan_version: Int = -1;
+    // held by its plan, why
+    hold: String = "";
+    // pulling | waiting | full | held | off, and why for held and off
+    state: String = "off";
+    reason: String = "";
+    // a ticket the api declined `ineligible` for this seat, and until
+    // when (monotonic ns) pulling it again puts it back with a delay
+    ineligible: String = "";
+    ineligible_until: Int = 0;
+}
+
+type SeatPulls { items: bounded[SeatPull; 16]; }
+
+/// A pull to open: on the puller `slot`, standing for one ticket, or a
+/// sweep for `batch`.
+type PullOrder { slot: Int = -1; batch: Int = 0; stand: Bool = false; }
+
+type PullOrders { items: bounded[PullOrder; 64]; }
+
+// ---- what a seat consumes -------------------------------------------------
+
+/// The root of the subjects under which `subject`, the node `node`'s own
+/// (`<root>.node.<node>`), is; "" when it is not one.
+fn root_of(subject: String, node: String) -> String {
+    let tail = ".node." + node;
+    if len(subject) <= len(tail) || !std::str::ends_with(subject, tail) { return ""; }
+    return subject[0..(len(subject) - len(tail))];
+}
+
+/// The inbox prefix the node's requests and pulls answer on: NATS's own
+/// under voice's own root; under a habitat's broker, under its root, the
+/// only place the nodes' account may receive.
+fn inbox_of(root: String) -> String {
+    return if len(root) == 0 || root == work::DEFAULT_ROOT { "_INBOX" } else { root + "._INBOX" };
+}
+
+/// A JSON string's text, "" for anything else.
+fn json_text(raw: String) -> String {
+    let e = std::str::trim(raw);
+    if len(e) < 2 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+        return "";
+    }
+    return std::json::unescape_string(e[1..(len(e) - 1)]);
+}
+
+/// `subject` added to `out` once, while it holds fewer than 64.
+fn add_queue(out: work::Subjects, subject: String) -> work::Subjects {
+    for s in out.items {
+        if s == subject { return out; }
+    }
+    let mut next = out;
+    push(next.items, subject) or discard;
+    return next;
+}
+
+/// The queues the seat `seat` (its assignment's JSON) of node `node`
+/// consumes under `root` with no plan, `kind` its engine's kind: its own
+/// queue, then, for each model it serves and data class it carries (by
+/// default `internal`), the `m` partition and the `p` one under its own
+/// provider account, `any`, and `tools` too when it carries them; at most
+/// 64, each once. Both shapes, since only the brain knows a model's.
+@bounded_by(seat)
+fn eligible_queues(root: String, node: String, seat: String, kind: String) -> work::Subjects {
+    let id = std::json::find_string_field(seat, "id");
+    let account = std::json::find_string_field(seat, "account");
+    let config = std::str::trim(std::json::find_field_raw(seat, "config"));
+    let tools = work::carries_tools(kind, config);
+    let mut classes = std::str::trim(std::json::find_field_raw(seat, "data_classes"));
+    if !std::str::starts_with(classes, "[") { classes = "[\"internal\"]"; }
+    let mut out = work::Subjects { };
+    out = add_queue(out, work::seat_subject(root, node, id));
+    let mut m = std::json::array_first(std::json::find_field_raw(seat, "serves"));
+    while !m.done {
+        let model = std::json::find_string_field(std::str::trim(m.element), "model");
+        let mut c = std::json::array_first(classes);
+        while len(model) > 0 && !c.done {
+            let class = json_text(c.element);
+            if len(class) > 0 {
+                out = add_queue(out, work::model_subject(root, model, class, "any"));
+                if tools { out = add_queue(out, work::model_subject(root, model, class, "tools")); }
+                if len(account) > 0 {
+                    out = add_queue(
+                        out,
+                        work::provider_subject(root, model, account, class, "any"),
+                    );
+                    if tools {
+                        out = add_queue(
+                            out,
+                            work::provider_subject(root, model, account, class, "tools"),
+                        );
+                    }
+                }
+            }
+            c = std::json::array_next(c);
+        }
+        m = std::json::array_next(m);
+    }
+    return out;
+}
+
+/// What seat `seat` (its assignment's JSON) consumes: its part of `plan`
+/// when the node has one (`planned`) that names it, held or its queues in
+/// order; else its own eligibility (`eligible_queues`).
+fn seat_pull_of(
+    root: String,
+    node: String,
+    seat: String,
+    kind: String,
+    plan: work::ConsumePlan,
+    planned: Bool
+) -> SeatPull {
+    let id = std::json::find_string_field(seat, "id");
+    if planned {
+        for p in plan.seats {
+            if p.seat == id {
+                return SeatPull {
+                    seat: id,
+                    queues: p.consume,
+                    plan_version: plan.version,
+                    hold: p.hold,
+                };
+            }
+        }
+    }
+    let q = eligible_queues(root, node, seat, kind);
+    return SeatPull { seat: id, queues: q.items };
+}
+
+// ---- whether, and how much, a seat pulls ----------------------------------
+
+/// Why seat `s` pulls nothing whatever its slots, "" when it may pull: it
+/// is not up (paused, fetching, starting, down...), or it is a pair's
+/// follower, whose leader (rank 0) serves the pair and pulls for it.
+fn pull_off_reason(s: NodeSeat) -> String {
+    if len(s.id) == 0 { return "not assigned"; }
+    if s.status != "up" { return "the seat is " + s.status; }
+    if rank_of(s.config) != 0 { return "the follower of a pair: its leader pulls"; }
+    return "";
+}
+
+/// How many more requests seat `s` may take: its concurrency less what it
+/// serves and claims (`busy`), within what the node's `slots` have free.
+fn free_for(busy: String, s: NodeSeat, slots: Int) -> Int {
+    let node_free = slots - busy_count(busy);
+    let seat_free = s.concurrency - seat_busy(busy, s.id);
+    let free = if node_free < seat_free { node_free } else { seat_free };
+    return if free > 0 { free } else { 0 };
+}
+
+/// The pulls seat `seat` opens now, with `free` slots, among `slots` (the
+/// node's pulls) at monotonic `now`: none without a free slot, or while a
+/// sweep of its is open; else a sweep of the first of its queues in order
+/// not found empty, with no pull open and not waiting out a refusal, for
+/// `free` tickets; else, every queue found empty, a standing pull of one
+/// ticket on each that has no pull open.
+fn pulls_due(slots: PullSlots, seat: String, free: Int, now: Int) -> PullOrders {
+    let mut out = PullOrders { };
+    if free <= 0 { return out; }
+    let mut sweep = -1;
+    let mut sweep_order = 0;
+    let mut i = 0;
+    for p in slots.items {
+        if p.seat == seat {
+            if p.open == "sweep" { return out; }
+            if len(p.open) == 0 && !p.empty && p.retry_at <= now
+                && (sweep < 0 || p.order < sweep_order)
+            {
+                sweep = i;
+                sweep_order = p.order;
+            }
+        }
+        i = i + 1;
+    }
+    if sweep >= 0 {
+        push(out.items, PullOrder { slot: sweep, batch: free }) or discard;
+        return out;
+    }
+    i = 0;
+    for p in slots.items {
+        if p.seat == seat && len(p.open) == 0 && p.empty && p.retry_at <= now {
+            push(out.items, PullOrder { slot: i, batch: 1, stand: true }) or discard;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Whether seat `seat` found its queues empty and holds a standing pull on
+/// each, at `now`: a queue whose pulls are refused (no consumer, in the
+/// shape the brain did not choose) is passed over, tried again or not.
+fn waits_on_all(slots: PullSlots, seat: String, now: Int) -> Bool {
+    let mut any = false;
+    for p in slots.items {
+        if p.seat == seat {
+            if p.open == "stand" {
+                any = true;
+            } else if p.refusals == 0 && (len(p.open) > 0 || p.retry_at <= now) {
+                return false;
+            }
+        }
+    }
+    return any;
+}
+
+/// How long to wait after `refusals` refusals in a row, in ms: from
+/// `RETRY_MIN_MS`, doubled each time, to `most`.
+fn retry_ms(refusals: Int, most: Int) -> Int {
+    let mut ms = RETRY_MIN_MS;
+    let mut k = 1;
+    while k < refusals && ms < most {
+        ms = ms * 2;
+        k = k + 1;
+    }
+    return if ms < most { ms } else { most };
+}
+
+/// What the node does with `ticket` (its JSON), pulled for the seat `claimant`
+/// (`<node>/<seat>`) with `free` slots, which may pull (`may`) and carries
+/// tools or not (`tools`), at `now`; `ineligible` the message id of a
+/// ticket the api last declined this seat as ineligible for, still
+/// remembered:
+/// - "claim": a slot claims it;
+/// - "extra": no free slot, or a seat that pulls no more: put back at once;
+/// - "avoid": it avoids this seat, or the seat is ineligible for it: put
+///   back after `AVOID_DELAY_MS`;
+/// - "late": past its wait: acked and dropped, its request over;
+/// - "malformed": not a ticket: acked and dropped.
+fn verdict(
+    ticket: String,
+    claimant: String,
+    may: Bool,
+    free: Int,
+    tools: Bool,
+    ineligible: String,
+    now: Time
+) -> String {
+    let t = work::ticket_of(ticket) or { return "malformed"; };
+    if !may || free <= 0 { return "extra"; }
+    if std::time::nanos(t.wait_until) <= std::time::nanos(now) { return "late"; }
+    for a in t.avoid {
+        if a == claimant { return "avoid"; }
+    }
+    if t.need == "tools" && !tools { return "avoid"; }
+    if len(ineligible) > 0 && work::message_id(t.request_id, t.attempt, t.copy) == ineligible {
+        return "avoid";
+    }
+    return "claim";
+}
+
+// ---- what the status and the heartbeat say --------------------------------
+
+/// A list of strings as JSON.
+fn strings_json(items: bounded[String; 64]) -> String {
+    let mut out = "[";
+    let mut first = true;
+    for s in items {
+        out = out + (if first { "" } else { ", " }) + q(s);
+        first = false;
+    }
+    return out + "]";
+}
+
+/// A seat's pulls as the heartbeat and the status say them
+/// (protocol.yaml `SeatPull`).
+fn seat_pull_json(p: SeatPull) -> String {
+    return "{\"state\": " + q(p.state) + ", \"reason\": "
+        + (if len(p.reason) > 0 { q(p.reason) } else { "null" }) + ", \"plan_version\": "
+        + (if p.plan_version >= 0 { to_string(p.plan_version) } else { "null" })
+        + ", \"queues\": " + strings_json(p.queues) + "}";
+}
+
+/// `, "pull": {...}` for seat `id` when `pulls` holds it, "" when not.
+fn pull_field(pulls: SeatPulls, id: String) -> String {
+    for p in pulls.items {
+        if p.seat == id { return ", \"pull\": " + seat_pull_json(p); }
+    }
+    return "";
+}
+
+// ---- the pullers ----------------------------------------------------------
+
+/// The node's pulls: a pool of pond's `JsPuller`s, each pulling one queue
+/// of one seat on the session's connection, and what each seat consumes.
+/// Held by the session (session.hl), on its thread: it reads what the
+/// pullers are sent and hands each ticket to a slot.
+locus Pulls {
+    params {
+        ps: [nats::JsPuller; 128] = [
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+            nats::JsPuller { },
+        ];
+        // each puller's queue, by the same index
+        slots: PullSlots = PullSlots { };
+        // what each seat consumes, and how its pulls go
+        seats: SeatPulls = SeatPulls { };
+        node: String = "";
+        root: String = "";
+        stream: String = "";
+        // the last plan, once there is one
+        plan: work::ConsumePlan = work::ConsumePlan { };
+        planned: Bool = false;
+        // something changed since the last look; and when that was
+        // (monotonic ns)
+        dirty: Bool = true;
+        looked: Int = 0;
+        // the queues past the pool when last said, so it is said once
+        over: Int = 0;
+    }
+
+    /// The node `node` under `root`: every pull let go when either changed,
+    /// its queues under the old root being no longer its own.
+    fn place(c: nats::NatsClient, node: String, root: String) {
+        if node == self.node && root == self.root { return; }
+        self.close_all(c);
+        self.node = node;
+        self.root = root;
+        self.stream = work::stream_name(root);
+        self.slots = PullSlots { };
+        self.dirty = true;
+    }
+
+    /// A plan from the brain, taken when it is newer than the one held;
+    /// true when it was.
+    fn adopt_plan(p: work::ConsumePlan) -> Bool {
+        if self.planned && p.version <= self.plan.version { return false; }
+        self.plan = p;
+        self.planned = true;
+        return true;
+    }
+
+    /// What each of `seats` (as applied from `assignment`, within
+    /// `capabilities`) consumes, worked out again, and the pullers given to
+    /// its queues: a queue kept keeps its puller and its pull; one no seat
+    /// consumes any more has its puller let go.
+    @unbounded
+    fn configure(c: nats::NatsClient, seats: NodeSeats, assignment: String, capabilities: String) {
+        if len(self.root) == 0 { return; }
+        let mut next = SeatPulls { };
+        let mut it = std::json::array_first(std::json::find_field_raw(assignment, "seats"));
+        while !it.done {
+            let s = std::str::trim(it.element);
+            let id = std::json::find_string_field(s, "id");
+            let applied = seat_of(seats, id);
+            if len(applied.id) > 0 {
+                let mut p = seat_pull_of(
+                    self.root,
+                    self.node,
+                    s,
+                    engine_kind(capabilities, applied.engine),
+                    self.plan,
+                    self.planned,
+                );
+                // what the seat was doing, and a decline it remembers
+                for held in self.seats.items {
+                    if held.seat == id {
+                        p.state = held.state;
+                        p.reason = held.reason;
+                        p.ineligible = held.ineligible;
+                        p.ineligible_until = held.ineligible_until;
+                    }
+                }
+                push(next.items, p) or discard;
+            }
+            it = std::json::array_next(it);
+        }
+        self.seats = next;
+        self.allot(c);
+        self.dirty = true;
+    }
+
+    /// The pullers given to the seats' queues, in rounds: each seat's first
+    /// queue (its own), then each one's second, and so on, so a seat past
+    /// the pool loses its last queues, not its first.
+    @unbounded
+    fn allot(c: nats::NatsClient) {
+        // pullers whose queue no seat consumes any more are let go
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let p = at(self.slots.items, i) or PullSlot { };
+            if len(p.seat) > 0 && self.order_of(p.seat, p.subject) < 0 {
+                self.ps[i].close(c);
+                set(self.slots.items, i, PullSlot { }) or discard;
+            }
+            i = i + 1;
+        }
+        while count(self.slots.items) < PULLS_MAX {
+            push(self.slots.items, PullSlot { }) or discard;
+        }
+        let mut wanted = 0;
+        let mut placed = 0;
+        let mut k = 0;
+        while k < work::CONSUME_MAX {
+            for s in self.seats.items {
+                if len(s.hold) == 0 && k < count(s.queues) {
+                    let subject = at(s.queues, k) or "";
+                    wanted = wanted + 1;
+                    if self.place_queue(c, s.seat, subject, k) { placed = placed + 1; }
+                }
+            }
+            k = k + 1;
+        }
+        if wanted > placed && wanted != self.over {
+            log_warn(
+                "the node's seats consume more queues than it pulls at once: the last are not pulled",
+                fields2(
+                    std::log::kv("queues", to_string(wanted)),
+                    std::log::kv("pulled", to_string(placed)),
+                ),
+            );
+        }
+        self.over = if wanted > placed { wanted } else { 0 };
+    }
+
+    /// The place of `subject` among seat `seat`'s queues, -1 when the seat
+    /// does not consume it (or its plan holds it).
+    fn order_of(seat: String, subject: String) -> Int {
+        for s in self.seats.items {
+            if s.seat == seat {
+                if len(s.hold) > 0 { return -1; }
+                let mut k = 0;
+                for q in s.queues {
+                    if q == subject { return k; }
+                    k = k + 1;
+                }
+            }
+        }
+        return -1;
+    }
+
+    /// Seat `seat`'s queue `subject`, `order`th of its queues, on a puller:
+    /// the one it has, or a free one; false when none is free.
+    @unbounded
+    fn place_queue(c: nats::NatsClient, seat: String, subject: String, order: Int) -> Bool {
+        let mut free = -1;
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let p = at(self.slots.items, i) or PullSlot { };
+            if p.seat == seat && p.subject == subject {
+                let mut kept = p;
+                kept.order = order;
+                set(self.slots.items, i, kept) or discard;
+                return true;
+            }
+            if free < 0 && len(p.seat) == 0 { free = i; }
+            i = i + 1;
+        }
+        if free < 0 { return false; }
+        self.ps[free].stream = self.stream;
+        self.ps[free].consumer = work::consumer_name(subject);
+        set(
+            self.slots.items,
+            free,
+            PullSlot { seat: seat, subject: subject, order: order },
+        ) or discard;
+        return true;
+    }
+
+    /// The connection is new: every pull of the old one is gone, its
+    /// inbox with it, so each queue is swept again.
+    fn reset() {
+        let mut i = 0;
+        while i < PULLS_MAX {
+            self.ps[i].sid = 0;
+            self.ps[i].pulling = false;
+            i = i + 1;
+        }
+        i = 0;
+        while i < count(self.slots.items) {
+            let mut p = at(self.slots.items, i) or PullSlot { };
+            p.open = "";
+            p.empty = false;
+            p.retry_at = 0;
+            p.refusals = 0;
+            set(self.slots.items, i, p) or discard;
+            i = i + 1;
+        }
+        self.dirty = true;
+    }
+
+    /// Every pull let go: the pullers' inboxes unsubscribed, so the server
+    /// drops their open pulls and delivers them nothing more.
+    fn close_all(c: nats::NatsClient) {
+        let mut i = 0;
+        while i < PULLS_MAX {
+            if self.ps[i].sid > 0 { self.ps[i].close(c); }
+            i = i + 1;
+        }
+    }
+
+    /// Seat `seat` has a slot free again: its queues are swept again, a
+    /// backlog having maybe built up while it was full.
+    fn freed(seat: String) {
+        self.sweep_again(seat);
+        self.dirty = true;
+    }
+
+    fn sweep_again(seat: String) {
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let mut p = at(self.slots.items, i) or PullSlot { };
+            if p.seat == seat && p.empty {
+                p.empty = false;
+                set(self.slots.items, i, p) or discard;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The api declined seat `seat` as ineligible for the ticket
+    /// `message_id`: pulled again soon, it goes back with a delay, so the
+    /// seat does not claim it over and over while another could take it.
+    fn declined(seat: String, message_id: String, now: Int) {
+        let mut i = 0;
+        while i < count(self.seats.items) {
+            let mut s = at(self.seats.items, i) or SeatPull { };
+            if s.seat == seat {
+                s.ineligible = message_id;
+                s.ineligible_until = now + 10 * AVOID_DELAY_MS * 1000000;
+                set(self.seats.items, i, s) or discard;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// The ticket seat `seat` was declined `ineligible` for, still
+    /// remembered at `now`, "" for none.
+    fn ineligible_for(seat: String, now: Int) -> String {
+        for s in self.seats.items {
+            if s.seat == seat && s.ineligible_until > now { return s.ineligible; }
+        }
+        return "";
+    }
+
+    /// The puller `m` arrived on, -1 when it is none of them.
+    fn owner(m: nats::NatsMsg) -> Int {
+        if m.sid <= 0 { return -1; }
+        let mut i = 0;
+        while i < PULLS_MAX {
+            if self.ps[i].owns(m) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    /// The seat puller `i` pulls for, "" for none.
+    fn seat_at(i: Int) -> String {
+        let p = at(self.slots.items, i) or PullSlot { };
+        return p.seat;
+    }
+
+    /// Whether puller `i`'s queue is still one its seat consumes: a ticket
+    /// a pull opened before a plan changed it is put back.
+    fn consumed(i: Int) -> Bool {
+        let p = at(self.slots.items, i) or PullSlot { };
+        return len(p.seat) > 0 && self.order_of(p.seat, p.subject) >= 0;
+    }
+
+    /// What `m`, arrived on puller `i`, is, with that queue's pulls brought
+    /// up to date: a pull that ended leaves its queue free to pull again,
+    /// found empty, or waiting out a refusal.
+    fn take(i: Int, m: nats::NatsMsg, now: Int) -> nats::JsPulled {
+        let got = self.ps[i].take(m);
+        let mut p = at(self.slots.items, i) or PullSlot { };
+        if got.kind == "msg" {
+            p.refusals = 0;
+            // a ticket on a standing pull: the queues are swept again, in order
+            if p.open == "stand" { self.sweep_again(p.seat); }
+            if !self.ps[i].pulling { p.open = ""; }
+            p.empty = false;
+        } else if got.kind == "no_messages" {
+            p.open = "";
+            p.empty = true;
+            p.refusals = 0;
+        } else if got.kind == "expired" {
+            p.open = "";
+            p.refusals = 0;
+        } else if got.kind == "gone" || got.kind == "conflict" || got.kind == "status" {
+            p.open = "";
+            p.refusals = p.refusals + 1;
+            p.retry_at = now + retry_ms(p.refusals, REFUSED_MAX_MS) * 1000000;
+        }
+        set(self.slots.items, i, p) or discard;
+        self.dirty = true;
+        return got;
+    }
+
+    /// Open the pulls due, for each seat as `seats` and `busy` say, at
+    /// monotonic `now`, when anything changed or a look is due anyway;
+    /// true when a seat's state changed, for the status and the heartbeat.
+    @unbounded
+    fn look(c: nats::NatsClient, seats: NodeSeats, busy: String, now: Int) -> Bool {
+        if !self.dirty && now - self.looked < LOOK_MS * 1000000 { return false; }
+        self.dirty = false;
+        self.looked = now;
+        // a pull past its expiry with no word from the server: refused in
+        // silence (a permission it lacks, a server gone), tried again later
+        let mut i = 0;
+        while i < count(self.slots.items) {
+            let mut p = at(self.slots.items, i) or PullSlot { };
+            if len(p.open) > 0 && self.ps[i].wants_pull() {
+                p.open = "";
+                p.refusals = p.refusals + 1;
+                p.retry_at = now + retry_ms(p.refusals, SILENT_MAX_MS) * 1000000;
+                set(self.slots.items, i, p) or discard;
+            }
+            i = i + 1;
+        }
+        let mut changed = false;
+        let mut j = 0;
+        while j < count(self.seats.items) {
+            let mut sp = at(self.seats.items, j) or SeatPull { };
+            let s = seat_of(seats, sp.seat);
+            let off = pull_off_reason(s);
+            let free = free_for(busy, s, SLOTS);
+            let mut state = "pulling";
+            let mut reason = "";
+            if len(sp.hold) > 0 {
+                state = "held";
+                reason = sp.hold;
+            } else if len(off) > 0 {
+                state = "off";
+                reason = off;
+            } else if free <= 0 {
+                state = "full";
+            } else if c.connected {
+                let due = pulls_due(self.slots, sp.seat, free, now);
+                for o in due.items {
+                    self.open_pull(c, o, now);
+                }
+                if waits_on_all(self.slots, sp.seat, now) { state = "waiting"; }
+            } else {
+                state = "off";
+                reason = "not on NATS";
+            }
+            if state != sp.state || reason != sp.reason {
+                sp.state = state;
+                sp.reason = reason;
+                set(self.seats.items, j, sp) or discard;
+                changed = true;
+            }
+            j = j + 1;
+        }
+        return changed;
+    }
+
+    /// Open the pull `o`: a sweep for its batch that takes what is there,
+    /// or a standing pull of one ticket that waits `STAND_MS`.
+    fn open_pull(c: nats::NatsClient, o: PullOrder, now: Int) {
+        let mut p = at(self.slots.items, o.slot) or PullSlot { };
+        let mut failed = false;
+        if o.stand {
+            self.ps[o.slot].fetch(c, 1, STAND_MS, false) or { failed = true; };
+        } else {
+            self.ps[o.slot].fetch(c, o.batch, 0, true) or { failed = true; };
+        }
+        if failed {
+            // the connection is failing: the session finds it so and dials
+            // again, and every pull is made anew then
+            p.refusals = p.refusals + 1;
+            p.retry_at = now + retry_ms(p.refusals, SILENT_MAX_MS) * 1000000;
+        } else {
+            p.open = if o.stand { "stand" } else { "sweep" };
+        }
+        set(self.slots.items, o.slot, p) or discard;
+    }
+}

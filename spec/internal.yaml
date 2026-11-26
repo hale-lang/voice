@@ -19,6 +19,21 @@ info:
     there too. A lost notice costs a second, and a node accepts or refuses
     every request regardless of what the table said. Today's api instances
     read the table from Postgres on each request and do not subscribe.
+
+    ## The work stream and the board: protocol 3
+
+    Queue routing (`docs/design/queue-routing.md`; `protocol.yaml`,
+    "Pulling: protocol 3") is not served yet; these are its parts on this
+    side of the seam. The api publishes tickets into one JetStream stream
+    over the work subjects, `WorkStream`, consumed by one durable pull
+    consumer per queue, `WorkConsumer`, shared by every seat that consumes
+    it. The brain alone creates them, idempotently each tick for every
+    queue some seat is eligible for, and deletes a consumer no seat has
+    been eligible for in an hour; nodes never create one. The brain also
+    writes the board to Postgres each tick (`Board`; `store.md`, "The
+    board"), from which the api chooses a partition and the brain plans
+    each node's seats (`protocol.yaml`, `ConsumePlan`). The route table
+    stays until the push path goes.
   contact:
     url: https://github.com/hale-lang/voice
 
@@ -129,3 +144,227 @@ components:
         data_classes:
           type: array
           items: { type: string }
+
+    # ---- protocol 3: the work stream and the board ------------------------
+
+    WorkStream:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        The work stream's configuration, as JetStream's `STREAM.CREATE`
+        takes it (durations in nanoseconds); what it does not set is the
+        server's default. A ticket carries no content, so it is under 1 KiB
+        and the stream never holds a body.
+      required: [name, subjects, retention, storage, max_age, max_msgs_per_subject, discard, duplicate_window, allow_msg_ttl]
+      properties:
+        name:
+          type: string
+          const: VOICE_WORK
+          description: Standalone; grafted, named from the heart's root, so two hearts on one broker do not collide.
+        subjects:
+          type: array
+          description: '`<root>.work.>`: every work subject, under the root.'
+          items: { type: string }
+          minItems: 1
+          maxItems: 1
+        retention:
+          type: string
+          const: workqueue
+          description: A ticket goes when a consumer acks it.
+        storage:
+          type: string
+          const: file
+          description: Tickets survive a NATS restart.
+        max_age:
+          type: integer
+          const: 600000000000
+          description: |
+            10 minutes, the longest a request waits for a seat whatever its
+            deadline: no ticket outlives any request's wait.
+        max_msgs_per_subject:
+          type: integer
+          const: 1024
+          description: |
+            A queue's backlog is bounded: past it the publish is refused and
+            the caller answered `429 no_capacity` at once.
+        discard:
+          type: string
+          const: new
+          description: A full queue refuses the newcomer, not the oldest waiter.
+        duplicate_window:
+          type: integer
+          const: 120000000000
+          description: |
+            2 minutes. A copy of a ticket published again (a lost ack, a
+            reconnect) is kept once, by its `Nats-Msg-Id`
+            (`<request_id>.<attempt>.<copy>`); the window is the stream's,
+            whatever the subject.
+        allow_msg_ttl:
+          type: boolean
+          const: true
+          description: |
+            Each ticket's `Nats-TTL` is its own wait, so an expired one
+            leaves the depth the brain reads (NATS 2.11).
+
+    WorkConsumer:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        One queue's consumer, as JetStream's `CONSUMER.CREATE` takes it
+        (durations in nanoseconds): durable, pulled, filtered on the
+        queue's exact subject, since a work-queue stream refuses consumers
+        whose filters overlap. Moving a seat between queues starts or stops
+        its pulls and never changes a consumer.
+      required: [durable_name, filter_subject, ack_policy, ack_wait, max_deliver, max_ack_pending, deliver_policy]
+      properties:
+        durable_name:
+          type: string
+          pattern: '^w_[0-9a-f]{16}$'
+          description: '`w_` and the first 16 hex digits of the sha256 of `filter_subject`.'
+        filter_subject:
+          type: string
+          description: The queue's subject, whole, under the root.
+        ack_policy:
+          type: string
+          const: explicit
+        ack_wait:
+          type: integer
+          const: 10000000000
+          description: |
+            10 s: pull, claim and ack, milliseconds on the private network,
+            with room for a claim's 2 s and one retry. A ticket pulled and
+            not acked within it goes to another puller.
+        max_deliver:
+          type: integer
+          const: -1
+          description: Unlimited (the server's default); the ticket's TTL bounds its life, and claims make repeats harmless.
+        max_ack_pending:
+          type: integer
+          const: 1024
+        deliver_policy:
+          type: string
+          const: all
+
+    Board:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        The brain's board as `board` holds it (`store.md`, "The board"),
+        written each tick in the same transaction as node liveness: each
+        model's shape, each queue's reading and each seat's plan. The api
+        reads it to choose a partition; the brain's `ConsumePlan` for each
+        node is its seats' plans.
+      required: [version, at, models, queues, seats]
+      properties:
+        version:
+          type: integer
+          description: |
+            Milliseconds of Postgres's clock when the board was written, and
+            always above the version before it (the stored version plus one
+            when the clock has not passed it), as the route table's.
+        at: { type: string, format: date-time }
+        models:
+          type: array
+          items: { $ref: '#/components/schemas/BoardModel' }
+        queues:
+          type: array
+          items: { $ref: '#/components/schemas/QueueReading' }
+        seats:
+          type: array
+          items: { $ref: '#/components/schemas/BoardSeat' }
+
+    BoardModel:
+      type: object
+      x-voice-protocol: 3
+      required: [model, shape]
+      properties:
+        model:
+          type: string
+          description: A catalog model id.
+        shape:
+          type: string
+          enum: [m, p]
+          description: |
+            `m` when the enabled seats that serve it in configuration run
+            under one provider account, `p` when under more than one. The
+            api publishes in the shape the board says.
+
+    QueueReading:
+      type: object
+      x-voice-protocol: 3
+      description: One queue, as its consumer read at the brain's tick.
+      required: [subject, shape, model, provider_account, data_class, need, depth, oldest_age_ms, waiting_pulls, ack_pending, service_ms, seats]
+      properties:
+        subject:
+          type: string
+          description: The queue's subject, whole, under the root.
+        shape:
+          type: string
+          enum: [m, p, s]
+          description: A partition's shape, or `s` for a seat's own queue.
+        model:
+          type: [string, 'null']
+          description: The partition's model; null for a seat's own queue.
+        provider_account:
+          type: [string, 'null']
+          description: The partition's provider account (today's `account`), in the `p` shape; null otherwise.
+        data_class:
+          type: [string, 'null']
+          description: The partition's data class; null for a seat's own queue.
+        need:
+          type: [string, 'null']
+          enum: [tools, any, null]
+          description: The partition's need; null for a seat's own queue.
+        depth:
+          type: integer
+          minimum: 0
+          description: Tickets waiting in it, its consumer's pending.
+        oldest_age_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: How long its oldest ticket has waited; null when it is empty.
+        waiting_pulls:
+          type: integer
+          minimum: 0
+          description: Pulls standing on it, from seats with a free slot and nothing to take.
+        ack_pending:
+          type: integer
+          minimum: 0
+          description: Tickets pulled and not yet acked.
+        service_ms:
+          type: [integer, 'null']
+          minimum: 0
+          description: |
+            Recent service time of its model, from the ledger's last minute;
+            null with none. With `depth` over its consuming seats' free
+            slots, the expected wait.
+        seats:
+          type: array
+          description: The seats consuming it, `<node>/<seat>`.
+          items: { type: string }
+
+    BoardSeat:
+      type: object
+      x-voice-protocol: 3
+      required: [seat, hold, consume, concurrency, in_flight, conversations_held]
+      properties:
+        seat:
+          type: string
+          description: '`<node>/<seat>`.'
+        hold:
+          type: [string, 'null']
+          description: Why it is held, pulling nothing; null when it consumes.
+        consume:
+          type: array
+          description: The queues' subjects it consumes, in order; empty when held.
+          items: { type: string }
+        concurrency:
+          type: integer
+          minimum: 1
+        in_flight:
+          type: integer
+          minimum: 0
+        conversations_held:
+          type: integer
+          minimum: 0
+          description: How many conversations its runtime keeps the prompts of; 0 for a hosted upstream.

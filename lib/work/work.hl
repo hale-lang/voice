@@ -1,0 +1,512 @@
+// Queue routing's wire (docs/design/queue-routing.md): the work subjects,
+// the work stream's and its consumers' settings, and the messages of
+// protocol 3 (spec/protocol.yaml, "Pulling: protocol 3"; spec/internal.yaml,
+// `WorkStream`, `WorkConsumer`), each with its codec. The api publishes a
+// `Ticket` for each attempt of a request, a node's slot pulls it and sends a
+// `Claim`, the api answers a `Grant` (the `serve` message, body and all) or
+// a `Decline`, and the brain plans each node's seats in a `ConsumePlan`.
+//
+// Nothing serves through it yet: today's requests are offered with `serve`
+// (protocol 2), and the coordinator registers no node of protocol 3.
+
+/// The protocol a node that pulls speaks (spec/protocol.yaml, "Pulling:
+/// protocol 3"); the coordinator speaks 2 until it serves it.
+const PROTOCOL_PULL: Int = 3;
+
+// ---- the work stream (internal.yaml `WorkStream`) -------------------------
+//
+// Named as pond's `StreamSpec` and `ConsumerSpec` name them, in their units
+// (milliseconds), so each is the value to set there.
+
+/// The stream's name, standalone.
+const STREAM: String = "VOICE_WORK";
+/// A ticket goes when a consumer acks it.
+const STREAM_RETENTION: String = "workqueue";
+/// Tickets survive a NATS restart.
+const STREAM_STORAGE: String = "file";
+/// The longest a request waits for a seat, whatever its deadline, and the
+/// stream's max age: no ticket outlives any request's wait.
+const STREAM_MAX_AGE_MS: Int = 600000;
+/// A queue's most tickets: past it the publish is refused, and the caller
+/// answered `429 no_capacity` at once.
+const STREAM_MAX_MSGS_PER_SUBJECT: Int = 1024;
+/// A full queue refuses the newcomer, not the oldest waiter.
+const STREAM_DISCARD: String = "new";
+/// A copy published again within it is kept once, by its message id.
+const STREAM_DUPLICATE_WINDOW_MS: Int = 120000;
+/// Each ticket expires at its own wait (`HEADER_TTL`).
+const STREAM_ALLOW_MSG_TTL: Bool = true;
+
+/// A ticket's headers: its copy's message id (`message_id`), and its own
+/// wait, to `wait_until`.
+const HEADER_MSG_ID: String = "Nats-Msg-Id";
+const HEADER_TTL: String = "Nats-TTL";
+
+// ---- a queue's consumer (internal.yaml `WorkConsumer`) ---------------------
+
+/// A consumer's name: this, then 16 hex digits of its subject's sha256.
+const CONSUMER_PREFIX: String = "w_";
+const CONSUMER_ACK_POLICY: String = "explicit";
+/// Pull, claim and ack, with room for a claim's wait and one retry: a
+/// ticket not acked within it goes to another puller.
+const CONSUMER_ACK_WAIT_MS: Int = 10000;
+/// Unlimited, as pond's 0 says: the server's default, `-1` on the wire. A
+/// ticket's TTL bounds its life, and claims make repeats harmless.
+const CONSUMER_MAX_DELIVER: Int = 0;
+const CONSUMER_MAX_ACK_PENDING: Int = 1024;
+const CONSUMER_DELIVER_POLICY: String = "all";
+/// The brain deletes a consumer no seat has been eligible for this long.
+const CONSUMER_UNUSED_MS: Int = 3600000;
+
+/// How long a slot waits for the api's answer to its claim.
+const CLAIM_WAIT_MS: Int = 2000;
+/// How often the brain publishes a node's plan though it did not change:
+/// core NATS delivers it at most once.
+const PLAN_REPEAT_MS: Int = 30000;
+
+// ---- bounds ---------------------------------------------------------------
+
+/// The most seats a ticket avoids: a request's attempts are at most 8.
+const AVOID_MAX: Int = 8;
+/// The most seats one plan holds: a node's seats are at most 16.
+const PLAN_SEATS_MAX: Int = 16;
+/// The most queues one seat consumes.
+const CONSUME_MAX: Int = 64;
+
+// ---- subjects -------------------------------------------------------------
+
+/// An id as a subject's token: `.`, `*`, `>`, `%`, whitespace and every
+/// byte outside printable ASCII percent-encoded, `%` and two upper-case hex
+/// digits each, so `glm-4.7-flash` is `glm-4%2E7-flash`; any other byte as
+/// it is.
+fn token(id: String) -> String {
+    let v = std::str::bytes_view(id);
+    let out = std::bytes::BytesBuilder { initial_cap: len(id) + 8 };
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        if b <= 32 || b >= 127 || b == 37 || b == 42 || b == 46 || b == 62 {
+            out.append_u8(37);
+            out.append_u8(hex_digit(b / 16));
+            out.append_u8(hex_digit(b % 16));
+        } else {
+            out.append_u8(b);
+        }
+        i = i + 1;
+    }
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// An upper-case hex digit's byte.
+fn hex_digit(n: Int) -> Int {
+    return if n < 10 { 48 + n } else { 55 + n };
+}
+
+/// Every work subject, under `root` (`voice`, or the broker's prefix
+/// grafted, lib/broker): the stream's.
+fn work_subjects(root: String) -> String {
+    return root + ".work.>";
+}
+
+/// A partition of a model served under one provider account (the `m`
+/// shape). `need` is `tools` or `any`.
+fn model_subject(root: String, model: String, class: String, need: String) -> String {
+    return root + ".work.m." + token(model) + "." + token(class) + "." + need;
+}
+
+/// A partition of a model served under more than one provider account
+/// (the `p` shape), under `provider`, one of them.
+fn provider_subject(
+    root: String,
+    model: String,
+    provider: String,
+    class: String,
+    need: String
+) -> String {
+    return root + ".work.p." + token(model) + "." + token(provider) + "." + token(class) + "."
+        + need;
+}
+
+/// A seat's own queue, for a conversation's turns.
+fn seat_subject(root: String, node: String, seat: String) -> String {
+    return root + ".work.s." + token(node) + "." + token(seat);
+}
+
+/// Where the brain publishes a node's plan.
+fn consume_subject(root: String, node: String) -> String {
+    return root + ".node." + node + ".consume";
+}
+
+/// Where a ticket's request is claimed.
+fn claim_subject(reply_to: String) -> String {
+    return reply_to + ".claim";
+}
+
+/// A copy's `Nats-Msg-Id`, the same for every publish of that copy:
+/// `<request_id>.<attempt>.<copy>`.
+fn message_id(request_id: String, attempt: Int, copy: String) -> String {
+    return request_id + "." + to_string(attempt) + "." + copy;
+}
+
+/// The durable consumer of the queue on `subject`: `w_` and the first 16
+/// hex digits of the subject's sha256.
+fn consumer_name(subject: String) -> String {
+    let digest = std::hex::encode(std::crypto::sha256(std::bytes::from_string(subject)));
+    return CONSUMER_PREFIX + digest[0..16];
+}
+
+// ---- messages -------------------------------------------------------------
+
+/// What is wrong with a message that is refused.
+type WorkError { message: String = ""; }
+
+/// A request waiting for a seat (protocol.yaml `Ticket`). `provider_account`
+/// and `conversation` "" are `null`.
+type Ticket {
+    request_id: String = "";
+    attempt: Int = 1;
+    reply_to: String = "";
+    instance: String = "";
+    model: String = "";
+    provider_account: String = "";
+    data_class: String = "";
+    // tools | any
+    need: String = "any";
+    // responses | decision
+    endpoint: String = "responses";
+    conversation: String = "";
+    enqueued_at: Time = `1970-01-01T00:00:00Z`;
+    wait_until: Time = `1970-01-01T00:00:00Z`;
+    // shared | seat
+    copy: String = "shared";
+    // the seats that failed this request, `<node>/<seat>`
+    avoid: bounded[String; 8];
+    size: Int = 0;
+}
+
+/// A seat's claim on a ticket's request (protocol.yaml `Claim`).
+type Claim {
+    request_id: String = "";
+    attempt: Int = 1;
+    copy: String = "shared";
+    // `<node>/<seat>`
+    seat: String = "";
+}
+
+/// The api's answer to a claim: granted, `serve` the `serve` message as it
+/// came; or declined, for `reason` (taken, gone, avoided, ineligible).
+type ClaimAnswer {
+    granted: Bool = false;
+    serve: String = "";
+    reason: String = "";
+}
+
+/// One seat's plan (protocol.yaml `SeatPlan`): held, `hold` its reason; or
+/// the work subjects it consumes, in order.
+type SeatPlan {
+    seat: String = "";
+    hold: String = "";
+    consume: bounded[String; 64];
+}
+
+/// Which queues each of a node's seats consumes (protocol.yaml
+/// `ConsumePlan`).
+type ConsumePlan {
+    version: Int = 0;
+    seats: bounded[SeatPlan; 16];
+}
+
+// ---- writing --------------------------------------------------------------
+
+fn jq(s: String) -> String {
+    return "\"" + std::json::escape_string(s) + "\"";
+}
+
+/// A string, or `null` for "".
+fn jq_or_null(s: String) -> String {
+    return if len(s) > 0 { jq(s) } else { "null" };
+}
+
+/// A JSON list of strings.
+fn jstrings(items: bounded[String; 64]) -> String {
+    let mut out = "[";
+    let mut first = true;
+    for s in items {
+        out = out + (if first { "" } else { ", " }) + jq(s);
+        first = false;
+    }
+    return out + "]";
+}
+
+fn ticket_json(t: Ticket) -> String {
+    let mut avoid = "[";
+    let mut first = true;
+    for s in t.avoid {
+        avoid = avoid + (if first { "" } else { ", " }) + jq(s);
+        first = false;
+    }
+    avoid = avoid + "]";
+    return "{\"request_id\": " + jq(t.request_id) + ", \"attempt\": " + to_string(t.attempt)
+        + ", \"reply_to\": " + jq(t.reply_to) + ", \"instance\": " + jq(t.instance)
+        + ", \"model\": " + jq(t.model) + ", \"provider_account\": "
+        + jq_or_null(t.provider_account) + ", \"data_class\": " + jq(t.data_class)
+        + ", \"need\": " + jq(t.need) + ", \"endpoint\": " + jq(t.endpoint)
+        + ", \"conversation\": " + jq_or_null(t.conversation) + ", \"enqueued_at\": "
+        + jq(std::time::iso8601(t.enqueued_at)) + ", \"wait_until\": "
+        + jq(std::time::iso8601(t.wait_until)) + ", \"copy\": " + jq(t.copy) + ", \"avoid\": "
+        + avoid + ", \"size\": " + to_string(t.size) + "}";
+}
+
+fn claim_json(c: Claim) -> String {
+    return "{\"request_id\": " + jq(c.request_id) + ", \"attempt\": " + to_string(c.attempt)
+        + ", \"copy\": " + jq(c.copy) + ", \"seat\": " + jq(c.seat) + "}";
+}
+
+/// A `Decline` for `reason`.
+fn decline_json(reason: String) -> String {
+    return "{\"type\": \"decline\", \"reason\": " + jq(reason) + "}";
+}
+
+fn seat_plan_json(p: SeatPlan) -> String {
+    return "{\"seat\": " + jq(p.seat) + ", \"hold\": " + jq_or_null(p.hold) + ", \"consume\": "
+        + jstrings(p.consume) + "}";
+}
+
+fn consume_plan_json(p: ConsumePlan) -> String {
+    let mut seats = "[";
+    let mut first = true;
+    for s in p.seats {
+        seats = seats + (if first { "" } else { ", " }) + seat_plan_json(s);
+        first = false;
+    }
+    return "{\"version\": " + to_string(p.version) + ", \"seats\": " + seats + "]}";
+}
+
+// ---- reading --------------------------------------------------------------
+
+/// A message that is one JSON object, or refused.
+fn object_of(json: String, what: String) -> Bool fallible(WorkError) {
+    if !std::json::valid_object(json) {
+        fail WorkError { message: what + " is not one JSON object" };
+    }
+    return true;
+}
+
+/// A string the message must set, not empty.
+fn text_field(json: String, name: String) -> String fallible(WorkError) {
+    let f = std::json::string_field(json, name);
+    if f.kind != "string" || len(f.text) == 0 {
+        fail WorkError { message: "`" + name + "` is a required string" };
+    }
+    return f.text;
+}
+
+/// A string the message must set, or `null` (""). An empty string is
+/// refused: it is no id.
+fn nullable_field(json: String, name: String) -> String fallible(WorkError) {
+    let f = std::json::string_field(json, name);
+    if f.kind == "null" { return ""; }
+    if f.kind != "string" || len(f.text) == 0 {
+        fail WorkError { message: "`" + name + "` is a required string or null" };
+    }
+    return f.text;
+}
+
+/// A string the message must set, one of `allowed` (one per line).
+fn enum_field(json: String, name: String, allowed: String) -> String fallible(WorkError) {
+    let f = std::json::string_field(json, name);
+    if f.kind != "string" || len(f.text) == 0 || std::str::contains(f.text, "\n")
+        || !std::str::contains("\n" + allowed + "\n", "\n" + f.text + "\n")
+    {
+        fail WorkError {
+            message: "`" + name + "` is one of " + std::str::replace(allowed, "\n", ", "),
+        };
+    }
+    return f.text;
+}
+
+/// An integer the message must set, at least `least`.
+fn int_field(json: String, name: String, least: Int) -> Int fallible(WorkError) {
+    let raw = std::str::trim(std::json::find_field_raw(json, name));
+    if std::json::string_field(json, name).kind != "number" || !is_integer(raw) {
+        fail WorkError { message: "`" + name + "` is a required integer" };
+    }
+    let n = std::str::parse_int(raw) or fail WorkError {
+        message: "`" + name + "` is out of range",
+    };
+    if n < least {
+        fail WorkError { message: "`" + name + "` is at least " + to_string(least) };
+    }
+    return n;
+}
+
+/// Digits, with an optional leading minus: a JSON integer.
+fn is_integer(raw: String) -> Bool {
+    let v = std::str::bytes_view(raw);
+    if v.n == 0 { return false; }
+    let mut i = if std::str::byte_at(v, 0) == 45 { 1 } else { 0 };
+    if i >= v.n { return false; }
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        if b < 48 || b > 57 { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// A time the message must set, in UTC (`Z`).
+fn time_field(json: String, name: String) -> Time fallible(WorkError) {
+    let text = text_field(json, name) or raise;
+    return std::time::parse_time(text) or fail WorkError {
+        message: "`" + name + "` is a time in UTC (`2026-11-26T10:00:00Z`)",
+    };
+}
+
+/// True when `s` is 32 lower-case hex digits.
+fn hex32(s: String) -> Bool {
+    let v = std::str::bytes_view(s);
+    if v.n != 32 { return false; }
+    let mut i = 0;
+    while i < v.n {
+        let b = std::str::byte_at(v, i);
+        if !((b >= 48 && b <= 57) || (b >= 97 && b <= 102)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// True when `s` is `<node>/<seat>`: one `/`, something either side.
+fn seat_ref(s: String) -> Bool {
+    let slash = std::str::index_of(s, "/");
+    return slash > 0 && slash < len(s) - 1 && std::str::index_of(s[(slash + 1)..len(s)], "/") < 0;
+}
+
+/// A ticket, or refused when it is not one (protocol.yaml `Ticket`).
+fn ticket_of(json: String) -> Ticket fallible(WorkError) {
+    object_of(json, "a ticket") or raise;
+    let mut t = Ticket {
+        request_id: text_field(json, "request_id") or raise,
+        attempt: int_field(json, "attempt", 1) or raise,
+        reply_to: text_field(json, "reply_to") or raise,
+        instance: text_field(json, "instance") or raise,
+        model: text_field(json, "model") or raise,
+        provider_account: nullable_field(json, "provider_account") or raise,
+        data_class: text_field(json, "data_class") or raise,
+        need: enum_field(json, "need", "tools\nany") or raise,
+        endpoint: enum_field(json, "endpoint", "responses\ndecision") or raise,
+        conversation: nullable_field(json, "conversation") or raise,
+        enqueued_at: time_field(json, "enqueued_at") or raise,
+        wait_until: time_field(json, "wait_until") or raise,
+        copy: enum_field(json, "copy", "shared\nseat") or raise,
+        size: int_field(json, "size", 0) or raise,
+    };
+    if len(t.conversation) > 0 && !hex32(t.conversation) {
+        fail WorkError { message: "`conversation` is 32 lower-case hex digits or null" };
+    }
+    if std::json::string_field(json, "avoid").kind != "array" {
+        fail WorkError { message: "`avoid` is a required list of seats" };
+    }
+    let mut it = std::json::array_first(std::json::find_field_raw(json, "avoid"));
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if len(e) < 2 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+            fail WorkError { message: "`avoid` is a list of seats, `<node>/<seat>`" };
+        }
+        let s = std::json::unescape_string(e[1..(len(e) - 1)]);
+        if !seat_ref(s) {
+            fail WorkError { message: "`avoid` is a list of seats, `<node>/<seat>`" };
+        }
+        push(t.avoid, s) or fail WorkError {
+            message: "`avoid` holds at most " + to_string(AVOID_MAX) + " seats",
+        };
+        it = std::json::array_next(it);
+    }
+    return t;
+}
+
+/// A claim, or refused when it is not one (protocol.yaml `Claim`).
+fn claim_of(json: String) -> Claim fallible(WorkError) {
+    object_of(json, "a claim") or raise;
+    let c = Claim {
+        request_id: text_field(json, "request_id") or raise,
+        attempt: int_field(json, "attempt", 1) or raise,
+        copy: enum_field(json, "copy", "shared\nseat") or raise,
+        seat: text_field(json, "seat") or raise,
+    };
+    if !seat_ref(c.seat) { fail WorkError { message: "`seat` is `<node>/<seat>`" }; }
+    return c;
+}
+
+/// The api's answer to a claim: a `serve` message is the grant, a
+/// `decline` its reason; anything else is refused.
+fn answer_of(json: String) -> ClaimAnswer fallible(WorkError) {
+    object_of(json, "a claim's answer") or raise;
+    let kind = std::json::string_field(json, "type");
+    if kind.kind == "string" && kind.text == "serve" {
+        return ClaimAnswer { granted: true, serve: json };
+    }
+    if kind.kind != "string" || kind.text != "decline" {
+        fail WorkError { message: "a claim's answer is a `serve` or a `decline`" };
+    }
+    return ClaimAnswer {
+        reason: enum_field(json, "reason", "taken\ngone\navoided\nineligible") or raise,
+    };
+}
+
+/// A seat's queues, in order.
+type Subjects { items: bounded[String; 64]; }
+
+/// A list of subjects, at most 64, or refused for `name`.
+fn subjects_of(raw: String, name: String) -> Subjects fallible(WorkError) {
+    let mut out = Subjects { };
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        if len(e) < 3 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+            fail WorkError { message: "`" + name + "` is a list of subjects" };
+        }
+        push(out.items, std::json::unescape_string(e[1..(len(e) - 1)])) or fail WorkError {
+            message: "`" + name + "` holds at most " + to_string(CONSUME_MAX) + " subjects",
+        };
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// One seat's plan, or refused.
+fn seat_plan_of(json: String) -> SeatPlan fallible(WorkError) {
+    object_of(json, "a seat's plan") or raise;
+    let mut p = SeatPlan {
+        seat: text_field(json, "seat") or raise,
+        hold: nullable_field(json, "hold") or raise,
+    };
+    if std::json::string_field(json, "consume").kind != "array" {
+        fail WorkError { message: "`consume` is a required list of subjects" };
+    }
+    let subjects = subjects_of(std::json::find_field_raw(json, "consume"), "consume") or raise;
+    p.consume = subjects.items;
+    if len(p.hold) > 0 && count(p.consume) > 0 {
+        fail WorkError { message: "a held seat consumes nothing" };
+    }
+    return p;
+}
+
+/// A node's plan, or refused when it is not one (protocol.yaml
+/// `ConsumePlan`).
+fn consume_plan_of(json: String) -> ConsumePlan fallible(WorkError) {
+    object_of(json, "a plan") or raise;
+    let mut p = ConsumePlan { version: int_field(json, "version", 0) or raise };
+    if std::json::string_field(json, "seats").kind != "array" {
+        fail WorkError { message: "`seats` is a required list" };
+    }
+    let mut it = std::json::array_first(std::json::find_field_raw(json, "seats"));
+    while !it.done {
+        let s = seat_plan_of(std::str::trim(it.element)) or raise;
+        push(p.seats, s) or fail WorkError {
+            message: "`seats` holds at most " + to_string(PLAN_SEATS_MAX) + " seats",
+        };
+        it = std::json::array_next(it);
+    }
+    return p;
+}

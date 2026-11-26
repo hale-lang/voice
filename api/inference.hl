@@ -15,6 +15,15 @@
 // configuration only: they are reserved against in the store's
 // reservation transaction, which comes with the Postgres store.
 //
+// A request whose seats are all on nodes that pull (protocol 3) is queued
+// instead (queue.hl): published as a ticket to the work stream, granted to
+// the first seat that claims it, and served by that seat as an accepted
+// offer is. A seat that fails it before output is an attempt, as an offered
+// one is, and the next attempt's ticket avoids it; one that fails after
+// output fails the request. It waits for a claim until its
+// `voice.deadline`, or for `SLOT_WAIT`, as an offered request waits for a
+// slot.
+//
 // The api serves its callers at once: each request waits on its own seat's
 // answer while others are admitted, served and streamed (data_plane.hl,
 // `infer`).
@@ -140,6 +149,9 @@ type Served {
     // the caller (protocol.yaml `Result.tool_arguments_repaired`), as a
     // JSON list; "" for none
     repairs: String = "";
+    // a queued request this instance could not queue, nothing published:
+    // offered with `serve` instead (`Inference.serve_one`)
+    unqueued: Bool = false;
 }
 
 /// What a request is served as (`Inference.served_as`): its model, the
@@ -159,6 +171,8 @@ type Streamed {
     st: StreamState = StreamState { };
     served: Served = Served { };
     ending: String = "";
+    // as `Served.unqueued`, nothing sent (`Inference.stream_one`)
+    unqueued: Bool = false;
 }
 
 /// One seat a request could be offered, and its own name for the model.
@@ -169,6 +183,8 @@ type Candidates {
     serving: Int = 0;
     // its project or its key peeks: the request is recorded whole (peek.hl)
     peek: Bool = false;
+    // how it is queued, or `on` false for an offered request (queue.hl)
+    queue: QueuePlan = QueuePlan { };
 }
 
 locus Inference {
@@ -242,7 +258,7 @@ locus Inference {
             return answered;
         }
         // out of the queue for a slot however it ends (`await_turn`)
-        let mut s = self.serve_held(r, ctx, candidates, request_id) or {
+        let mut s = self.serve_one(r, ctx, candidates, request_id) or {
             self.leave(request_id);
             fail err;
         };
@@ -251,9 +267,171 @@ locus Inference {
         return s;
     }
 
+    /// Serve `r`, queued or offered as admission decided (`serve_held`); a
+    /// queued request this instance could not queue, nothing published (the
+    /// work stream gone since its keeper last looked), is offered.
+    fn serve_one(
+        r: InferenceRequest,
+        ctx: std::api::Context,
+        candidates: Candidates,
+        request_id: String
+    ) -> Served fallible(ApiError) {
+        let s = self.serve_held(r, ctx, candidates, request_id) or raise;
+        if !s.unqueued { return s; }
+        let mut offered = candidates;
+        offered.queue.on = false;
+        return self.serve_held(r, ctx, offered, request_id) or raise;
+    }
+
+    /// `serve_one`, streamed (`stream_held`).
+    fn stream_one(
+        r: InferenceRequest,
+        ctx: std::api::Context,
+        out: EventStream,
+        candidates: Candidates,
+        begun: StreamState,
+        hosted: Bool,
+        request_id: String
+    ) -> Streamed fallible(ApiError) {
+        let got = self.stream_held(r, ctx, out, candidates, begun, hosted, request_id) or raise;
+        if !got.unqueued { return got; }
+        let mut offered = candidates;
+        offered.queue.on = false;
+        return self.stream_held(r, ctx, out, offered, begun, hosted, request_id) or raise;
+    }
+
+    /// How queued request `id`, first published at `started`, waits for a
+    /// claim: until its `voice.deadline`, or for this instance's `wait` (at
+    /// least `QUEUE_WAIT_LEAST_MS`), and never past the work stream's max
+    /// age, which no ticket outlives.
+    fn ticket_wait(r: InferenceRequest, id: String, started: Int) -> Waiting {
+        let least = QUEUE_WAIT_LEAST_MS * 1000000;
+        let wait = if self.wait / 1ns > least { self.wait / 1ns } else { least };
+        let mut w = Waiting { request_id: id, since_ns: started, until_ns: started + wait };
+        if len(r.deadline) > 0 {
+            let at = rfc3339(r.deadline) or std::time::from_nanos(0);
+            if std::time::nanos(at) > 0 {
+                w.until_ns = started + std::time::nanos(at)
+                    - std::time::nanos(std::time::current());
+                w.by_deadline = true;
+            }
+        }
+        let most = started + work::STREAM_MAX_AGE_MS * 1000000;
+        if w.until_ns > most {
+            w.until_ns = most;
+            w.by_deadline = false;
+        }
+        return w;
+    }
+
+    /// Attempt `attempt` of queued request `request_id` (`offer`, listening
+    /// on `reply_to`): its ticket published to a partition of `q`'s
+    /// (`chosen`) avoiding the seats that failed it (`attempts`), then the
+    /// claims on it answered (`claim_verdict`) until one is granted, its
+    /// caller goes, its wait (`w`) ends, or the link is lost. Its copies are
+    /// published again whenever the work stream is made again. `state` says
+    /// how it ended: `granted` (to `c`, for `copy`, at `at_ns`); `expired`;
+    /// `gone`; `spent`, no partition left with a seat that has not failed
+    /// it; `full`, its partition at its most; `unqueued`, no stream takes
+    /// it (nothing published); or `lost`, with `why`.
+    @unbounded
+    fn claimed(
+        offer: Offer,
+        r: InferenceRequest,
+        q: QueuePlan,
+        request_id: String,
+        reply_to: String,
+        attempt: Int,
+        attempts: bounded[Attempt; 8],
+        w: Waiting
+    ) -> Claimed {
+        let avoid = avoid_of(attempts);
+        let draws = std::os::getrandom(4) or std::bytes::from_string("0000");
+        let subject = chosen(
+            q,
+            avoid,
+            (std::bytes::at(draws, 0) or 0) * 256 + (std::bytes::at(draws, 1) or 0),
+            (std::bytes::at(draws, 2) or 0) * 256 + (std::bytes::at(draws, 3) or 0),
+        );
+        if len(subject) == 0 { return Claimed { state: "spent" }; }
+        let mut account = "";
+        for p in q.partitions {
+            if p.subject == subject { account = p.account; }
+        }
+        let left = w.until_ns - std::time::monotonic_ns();
+        if left <= 0 { return Claimed { state: "expired" }; }
+        let ticket = ticket_of_request(
+            r,
+            request_id,
+            attempt,
+            reply_to,
+            self.instance,
+            account,
+            q.need,
+            std::time::from_nanos(std::time::nanos(std::time::current()) + left),
+            avoid,
+        );
+        let mut seen = self.link.queues();
+        let put = offer.put(
+            subject,
+            work::message_id(request_id, attempt, "shared"),
+            left / 1000000,
+            work::ticket_json(ticket),
+        );
+        if put == "no_stream" {
+            return Claimed { state: "unqueued", why: "no stream takes " + subject };
+        }
+        if put == "full" { return Claimed { state: "full", why: subject }; }
+        if len(put) > 0 { return Claimed { state: "lost", why: put }; }
+        let eligible = seat_refs(q);
+        let poll = SLOT_POLL / 1ns;
+        let mut watched = std::time::monotonic_ns();
+        while true {
+            let now = std::time::monotonic_ns();
+            if now >= w.until_ns { return Claimed { state: "expired" }; }
+            if now - watched >= poll {
+                watched = now;
+                if caller_gone(r.conn_fd) { return Claimed { state: "gone" }; }
+                let incarnation = self.link.queues();
+                if incarnation > 0 && incarnation != seen {
+                    // the work stream made again: its copies with it
+                    seen = incarnation;
+                    offer.republish((w.until_ns - now) / 1000000);
+                }
+            }
+            let left_now = w.until_ns - now;
+            let m = offer.claim(if left_now < poll { left_now } else { poll } * 1ns);
+            if m.kind == "lost" {
+                return Claimed { state: "lost", why: "the link to NATS was lost" };
+            }
+            if m.kind == "claim" {
+                let v = claim_verdict(m.claim, request_id, attempt, eligible, avoid, "", "");
+                if v == "grant" {
+                    let c = claimed_seat(q, m.claim.seat);
+                    offer.grant(
+                        serve_message(request_id, reply_to, c, r),
+                        m.claim.seat,
+                        m.claim.copy,
+                    );
+                    return Claimed {
+                        state: "granted",
+                        c: c,
+                        copy: m.claim.copy,
+                        at_ns: std::time::monotonic_ns(),
+                    };
+                }
+                offer.decline(v);
+            }
+        }
+        return Claimed { state: "expired" };
+    }
+
     /// Offer `r` to its seats in turn until one serves it. A seat at
     /// capacity has not failed: when every seat left refuses so, the
-    /// request waits for a slot (`await_turn`) and is offered again.
+    /// request waits for a slot (`await_turn`) and is offered again. A
+    /// queued request (`candidates.queue`) is instead published as a ticket
+    /// for each attempt (`claimed`), at most one attempt per seat admission
+    /// found up, each avoiding the seats that failed it before.
     fn serve_held(
         r: InferenceRequest,
         ctx: std::api::Context,
@@ -273,7 +451,13 @@ locus Inference {
         // the seat it was offered last that failed it, which its row names
         // when no seat serves it
         let mut last = Candidate { };
-        let mut w = self.waiting(r, candidates, request_id, started);
+        // queued: published as a ticket for each attempt (`claimed`)
+        let queued = candidates.queue.on;
+        let mut w = if queued {
+            self.ticket_wait(r, request_id, started)
+        } else {
+            self.waiting(r, candidates, request_id, started)
+        };
         let mut offering = true;
         while offering {
             if w.queued {
@@ -300,20 +484,74 @@ locus Inference {
                 }
             }
             let mut busy = 0;
-            for c in candidates.items {
-                if std::str::contains(failed, "\n" + c.seat.ref + "\n") { continue; }
+            for offered in candidates.items {
+                let mut c = offered;
+                if queued {
+                    // another attempt while a seat found up has not failed it
+                    if !untried(candidates.items, attempts.items) { break; }
+                } else if std::str::contains(failed, "\n" + c.seat.ref + "\n") {
+                    continue;
+                }
                 // each attempt answers on a subject of its own, so a seat left
                 // behind cannot answer for the next one
                 n = n + 1;
                 let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
-                let t0 = std::time::monotonic_ns();
-                let offer = self.link.offer(
-                    c.seat.node,
-                    request_id,
-                    reply_to,
-                    serve_message(request_id, reply_to, c, r),
-                );
+                let mut t0 = std::time::monotonic_ns();
+                let offer = if queued {
+                    self.link.queue(request_id, n, reply_to)
+                } else {
+                    self.link.offer(
+                        c.seat.node,
+                        request_id,
+                        reply_to,
+                        serve_message(request_id, reply_to, c, r),
+                    )
+                };
                 let mut o = offer.ack();
+                if queued {
+                    let g = self.claimed(
+                        offer,
+                        r,
+                        candidates.queue,
+                        request_id,
+                        reply_to,
+                        n,
+                        attempts.items,
+                        w,
+                    );
+                    if g.state != "granted" {
+                        offer.finish();
+                        if g.state == "spent" { break; }
+                        if g.state == "unqueued" && n == 1 { return Served { unqueued: true }; }
+                        w.state = g.state;
+                        w.queue_ms = (std::time::monotonic_ns() - w.since_ns) / 1000000;
+                        let e = queue_refusal(r, w, g, why, request_id, attempts.items);
+                        if count(attempts.items) > 0
+                            || ((g.state == "expired" || g.state == "gone") && self.wait / 1ns > 0)
+                        {
+                            self.unfinished(
+                                r,
+                                request_id,
+                                k,
+                                m,
+                                last,
+                                queue_status(w, g),
+                                started,
+                                attempts.items,
+                                candidates.peek,
+                                e.message,
+                                "",
+                                SeatOutput { },
+                            );
+                        }
+                        fail e;
+                    }
+                    // granted: the seat accepted it, as an offered seat does
+                    c = g.c;
+                    t0 = g.at_ns;
+                    w.queue_ms = (g.at_ns - w.since_ns) / 1000000;
+                    o = ServeOutcome { ack: "accepted" };
+                }
                 if at_capacity(o) {
                     busy = busy + 1;
                     why = c.seat.ref + ": " + failure_of(o);
@@ -493,7 +731,7 @@ locus Inference {
             return self.stream_hosted(r, ctx, out, candidates, request_id, tools, st) or raise;
         }
         // out of the queue for a slot however it ends (`await_turn`)
-        self.stream_held(r, ctx, out, candidates, st, false, request_id) or {
+        self.stream_one(r, ctx, out, candidates, st, false, request_id) or {
             self.leave(request_id);
             fail err;
         };
@@ -531,7 +769,13 @@ locus Inference {
         // the seat it was offered last that failed it, which its row names
         // when no seat serves it
         let mut last = Candidate { };
-        let mut w = self.waiting(r, candidates, request_id, started);
+        // queued: published as a ticket for each attempt (`claimed`)
+        let queued = candidates.queue.on;
+        let mut w = if queued {
+            self.ticket_wait(r, request_id, started)
+        } else {
+            self.waiting(r, candidates, request_id, started)
+        };
         let mut offering = true;
         while offering {
             if w.queued {
@@ -582,18 +826,93 @@ locus Inference {
                 }
             }
             let mut busy = 0;
-            for c in candidates.items {
-                if std::str::contains(failed, "\n" + c.seat.ref + "\n") { continue; }
+            for offered in candidates.items {
+                let mut c = offered;
+                if queued {
+                    // another attempt while a seat found up has not failed it
+                    if !untried(candidates.items, attempts.items) { break; }
+                } else if std::str::contains(failed, "\n" + c.seat.ref + "\n") {
+                    continue;
+                }
                 n = n + 1;
                 let reply_to = self.link.root() + ".reply." + request_id + "." + to_string(n);
-                let t0 = std::time::monotonic_ns();
-                let offer = self.link.offer(
-                    c.seat.node,
-                    request_id,
-                    reply_to,
-                    serve_message(request_id, reply_to, c, r),
-                );
+                let mut t0 = std::time::monotonic_ns();
+                let offer = if queued {
+                    self.link.queue(request_id, n, reply_to)
+                } else {
+                    self.link.offer(
+                        c.seat.node,
+                        request_id,
+                        reply_to,
+                        serve_message(request_id, reply_to, c, r),
+                    )
+                };
                 let mut o = offer.ack();
+                if queued {
+                    // nothing is sent while it waits for a claim, as while it
+                    // waits for a slot
+                    let g = self.claimed(
+                        offer,
+                        r,
+                        candidates.queue,
+                        request_id,
+                        reply_to,
+                        n,
+                        attempts.items,
+                        w,
+                    );
+                    if g.state != "granted" {
+                        offer.finish();
+                        if g.state == "spent" { break; }
+                        if g.state == "unqueued" && n == 1 {
+                            return Streamed { st: st, unqueued: true };
+                        }
+                        w.state = g.state;
+                        w.queue_ms = (std::time::monotonic_ns() - w.since_ns) / 1000000;
+                        let e = queue_refusal(r, w, g, why, request_id, attempts.items);
+                        if count(attempts.items) > 0
+                            || ((g.state == "expired" || g.state == "gone") && self.wait / 1ns > 0)
+                        {
+                            self.unfinished(
+                                r,
+                                request_id,
+                                k,
+                                m,
+                                last,
+                                queue_status(w, g),
+                                started,
+                                attempts.items,
+                                candidates.peek,
+                                e.message,
+                                out.text_so_far(),
+                                SeatOutput { },
+                            );
+                        }
+                        if !out.opened { fail e; }
+                        if g.state != "gone" {
+                            fail_stream(
+                                out,
+                                st,
+                                error_code_name(e.code),
+                                e.message,
+                                failed_voice(
+                                    request_id,
+                                    k,
+                                    m,
+                                    last,
+                                    attempts.items,
+                                    (std::time::monotonic_ns() - started) / 1000000,
+                                ),
+                            );
+                        }
+                        return Streamed { st: st };
+                    }
+                    // granted: the seat accepted it, as an offered seat does
+                    c = g.c;
+                    t0 = g.at_ns;
+                    w.queue_ms = (g.at_ns - w.since_ns) / 1000000;
+                    o = ServeOutcome { ack: "accepted" };
+                }
                 if at_capacity(o) {
                     busy = busy + 1;
                     why = c.seat.ref + ": " + failure_of(o);
@@ -924,7 +1243,7 @@ locus Inference {
         while true {
             h.calls = h.calls + 1;
             let id = call_id(request_id, h.calls);
-            let s = self.serve_held(r, ctx, c, id) or {
+            let s = self.serve_one(r, ctx, c, id) or {
                 self.leave(id);
                 fail err;
             };
@@ -990,7 +1309,7 @@ locus Inference {
         while true {
             h.calls = h.calls + 1;
             let id = call_id(request_id, h.calls);
-            let got = self.stream_held(r, ctx, out, c, st, true, id) or {
+            let got = self.stream_one(r, ctx, out, c, st, true, id) or {
                 self.leave(id);
                 fail err;
             };
@@ -1557,6 +1876,81 @@ locus Inference {
                 code: ErrorCode::no_eligible_seat,
                 message: why,
             };
+        }
+        // queued when every seat that could serve it pulls (queue.hl); read
+        // only while this instance sees the work stream
+        let incarnation = self.link.queues();
+        if incarnation > 0 {
+            let facts = self.seat_facts(seats, p, k, r) or fail metering_failed(err);
+            out.queue = queue_plan_of(
+                self.link.root(),
+                r.model,
+                r.data_class,
+                work::need_of(r.body),
+                incarnation,
+                facts,
+            );
+            if out.queue.on && count(out.queue.seats) == 0 {
+                fail ApiError {
+                    status: 503,
+                    kind: "server_error",
+                    code: ErrorCode::no_eligible_seat,
+                    message: "no seat serving model " + r.model
+                        + " that this request may go to carries tools, which it lists",
+                };
+            }
+        }
+        return out;
+    }
+
+    /// What queueing `r` needs to know of each seat serving its model
+    /// (queue.hl `SeatFact`): of `seats`, as admission read them, with its
+    /// node's registration and revocation, and its provider account's
+    /// windows (`quota_window`, as the nodes last reported them).
+    @bounded_by(seats)
+    fn seat_facts(
+        seats: st::SeatRows,
+        p: st::ProjectRow,
+        k: st::KeyRow,
+        r: InferenceRequest
+    ) -> SeatFacts fallible(st::StoreError) {
+        let nodes = self.store.nodes() or raise;
+        let mut out = SeatFacts { };
+        for s in seats.rows {
+            let mut serves = false;
+            let mut name = "";
+            for sm in s.serves.items {
+                if sm.model == r.model {
+                    serves = true;
+                    name = if sm.has_engine_name { sm.engine_name } else { "" };
+                }
+            }
+            if serves {
+                let f = self.store.fleet(s.node) or raise;
+                let mut revoked = true;
+                for n in nodes.rows {
+                    if n.id == s.node { revoked = n.revoked; }
+                }
+                let windows = self.store.windows(s.account) or raise;
+                push(
+                    out.items,
+                    SeatFact {
+                        seat: s,
+                        engine_name: name,
+                        serves: true,
+                        revoked: revoked,
+                        rank: work::rank_of(s.config),
+                        protocol: f.protocol,
+                        tools: work::carries_tools(
+                            engine_kind_of(f.capabilities, s.engine),
+                            s.config,
+                        ),
+                        allowed: allowed(s, p, k, r),
+                        used: fullest_window(windows),
+                        exhausted: window_full(windows),
+                    },
+                ) or discard;
+            }
         }
         return out;
     }

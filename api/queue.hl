@@ -1,0 +1,689 @@
+// Queue routing, the api's side (docs/design/queue-routing.md, "A request,
+// end to end"; step (d) of "Building phase 1"). A request whose seats are
+// all on nodes that pull (protocol 3) is queued: admitted as any request,
+// it is published as a ticket (lib/work `Ticket`) to one partition of the
+// work stream, and the api instance that holds its caller answers the
+// claims seats make on it (`<reply_to>.claim`), granting each attempt once
+// (`claim_verdict`); the granted seat then answers on the reply subject as
+// an accepted `serve` does. Any other request is offered with `serve`
+// (inference.hl), until the push path goes (step (f)).
+//
+// Which requests are queued (`queue_plan_of`): those whose seats that could
+// serve them (enabled, on a node not revoked, not a pair's follower,
+// spending an account the request may spend, carrying its data class) are
+// all on nodes registered with protocol 3, while this instance sees the
+// work stream (`QueueKeeper`). Each is published in its model's shape (lib/work
+// `partition`), the brain's rule, to one partition (`chosen`): the provider
+// accounts not exhausted, those with the most headroom, then one of two
+// drawn at random.
+//
+// The instance's `QueueBook`, shared by its requests and its keeper:
+// - the work stream's incarnation as last seen (its creation time, ms; 0
+//   while it is not there), from the stream's info every
+//   `LOOK_EVERY_MS` and from the brain's `<root>.queues.reset`, so a
+//   request waiting for a claim publishes its copies again when the stream
+//   was made again;
+// - the claims left over: an attempt that ends with a copy still in the
+//   stream (its caller gone before a seat claimed it) leaves its reply
+//   subject here, and the keeper answers each claim on it `gone` until the
+//   copy's wait ends. A claim on an attempt nobody holds any more is
+//   otherwise met by no responder, which a node takes the same way.
+
+import "../lib/work" as work;
+import "../lib/pond/realtime/nats" as nats;
+
+/// How often the keeper reads the work stream's info: whether it is there,
+/// and its incarnation.
+const LOOK_EVERY_MS: Int = 2000;
+/// How often the keeper forgets the leftover claims whose copies' waits
+/// ended.
+const PRUNE_EVERY_MS: Int = 5000;
+/// The book's note of the stream: a key no reply subject can be.
+const STREAM_NOTE: String = "\nstream";
+/// The least a queued request waits for a claim, whatever the instance's
+/// `wait`: a pull and a claim take a round trip each.
+const QUEUE_WAIT_LEAST_MS: Int = 1000;
+
+// ---- the book -------------------------------------------------------------
+
+/// One note of the book: the stream's incarnation (`STREAM_NOTE`), or an
+/// attempt's reply subject whose leftover claims are answered `answer`
+/// until `until_ms` (Unix ms).
+type QueueNote {
+    key: String = "";
+    incarnation: Int = 0;
+    answer: String = "";
+    until_ms: Int = 0;
+}
+
+/// The instance's book (above): shared by its requests, on the listener's
+/// pool, and its keeper, on a thread of its own.
+@form(hashmap, sync = serialized)
+locus QueueBook { capacity { pool notes of QueueNote indexed_by key; } }
+
+/// The work stream's incarnation as `book` last saw it; 0 while it is not
+/// there.
+fn incarnation_in(book: QueueBook) -> Int {
+    let n = book.get(STREAM_NOTE) or QueueNote { };
+    return n.incarnation;
+}
+
+// @unbounded: one note, replaced in place, whatever the calls.
+@unbounded
+fn note_incarnation(book: QueueBook, incarnation: Int) {
+    book.set(QueueNote { key: STREAM_NOTE, incarnation: incarnation });
+}
+
+/// Leave the claims on `reply_to` to the keeper: answered `answer` until
+/// `until_ms`, when it forgets them (`QueueKeeper.prune`), so the book holds
+/// no more than the requests left within a ticket's longest wait.
+@unbounded
+fn leave_claims(book: QueueBook, reply_to: String, answer: String, until_ms: Int) {
+    book.set(QueueNote { key: reply_to, answer: answer, until_ms: until_ms });
+}
+
+/// How a leftover claim on `reply_to` is answered at `now_ms`: its note's
+/// answer, "" for none (the claim is not this instance's to answer).
+fn left_answer(book: QueueBook, reply_to: String, now_ms: Int) -> String {
+    let n = book.get(reply_to) or QueueNote { };
+    if len(n.answer) == 0 || n.until_ms <= now_ms { return ""; }
+    return n.answer;
+}
+
+/// The Unix time now, in ms.
+fn unix_ms() -> Int {
+    return std::time::nanos(std::time::current()) / 1000000;
+}
+
+// ---- the keeper -----------------------------------------------------------
+
+/// Keeps the instance's book, on a thread of its own with a NATS connection
+/// of its own: it reads the work stream's info every `LOOK_EVERY_MS`,
+/// listens for the brain's `<root>.queues.reset`, and answers the leftover
+/// claims. With no NATS (`url` ""), it does nothing, and no request is
+/// queued.
+locus QueueKeeper {
+    params {
+        // voice's own NATS (grafted, the habitat's broker: its account, the
+        // vault entry of its password, its subjects' root and its inbox)
+        url: String = "";
+        user: String = "";
+        vault: String = "";
+        root: String = "voice";
+        inbox: String = "_INBOX";
+        timeout: Duration = 2s;
+        book: QueueBook = QueueBook { };
+        client: nats::NatsClient = nats::NatsClient { };
+        credential: std::secret::Credential = std::secret::Credential { };
+        connected: Bool = false;
+        // monotonic ms of the last look at the stream, and of the last prune
+        looked: Int = 0;
+        pruned: Int = 0;
+        // the trouble last said ("" none)
+        trouble: String = "";
+    }
+
+    birth() {
+        self.client.url = self.url;
+        self.client.user = self.user;
+        self.client.name = "voice-api-queues";
+        self.client.timeout = self.timeout;
+        self.client.inbox_prefix = self.inbox;
+        self.credential = std::secret::Credential { vault: self.vault };
+    }
+
+    // @unbounded: the keeper's loop, for the process's life.
+    @unbounded
+    run() {
+        while !self.draining {
+            self.step();
+        }
+    }
+
+    /// One turn: a message read and answered, the stream looked at when it
+    /// is time, the book pruned when it is time. A method, so each turn's
+    /// memory is reclaimed.
+    fn step() {
+        if len(self.url) == 0 {
+            std::time::sleep(200ms);
+            return;
+        }
+        if !self.connected {
+            self.dial();
+            if !self.connected {
+                std::time::sleep(1s);
+                return;
+            }
+        }
+        if self.client.read_msg(50ms) {
+            self.on_message();
+        } else if !self.client.connected {
+            self.lost("NATS closed the connection: " + self.client.last_error);
+            return;
+        }
+        let now = std::time::monotonic_ns() / 1000000;
+        if now - self.looked >= LOOK_EVERY_MS {
+            self.looked = now;
+            self.look();
+        }
+        if now - self.pruned >= PRUNE_EVERY_MS {
+            self.pruned = now;
+            self.prune();
+        }
+    }
+
+    fn dial() {
+        if !self.client.open_as(self.credential) {
+            self.lost("NATS does not answer: " + self.client.last_error);
+            return;
+        }
+        let mut ok = true;
+        self.client.sub_to(self.root + ".reply.*.*.claim", "") or { ok = false; };
+        self.client.sub_to(work::reset_subject(self.root), "") or { ok = false; };
+        self.client.flush() or { ok = false; };
+        if !ok {
+            self.client.close();
+            self.lost("subscribing failed: " + self.client.last_error);
+            return;
+        }
+        self.connected = true;
+        self.looked = 0;
+    }
+
+    /// The connection is gone: no request is queued until it is back.
+    fn lost(why: String) {
+        if self.connected { self.client.close(); }
+        self.connected = false;
+        note_incarnation(self.book, 0);
+        self.trouble_is(why);
+    }
+
+    /// The work stream's info: there, at its incarnation; or not.
+    fn look() {
+        let mut e = nats::NatsError { };
+        let info = nats::js_stream_info(self.client, work::stream_name(self.root)) or {
+            e = err;
+            nats::StreamInfo { }
+        };
+        if len(e.kind) == 0 {
+            let incarnation = info.created_ns / 1000000;
+            note_incarnation(self.book, if incarnation > 0 { incarnation } else { 1 });
+            self.trouble_is("");
+        } else if e.kind == "jetstream" {
+            // no such stream (10059), or JetStream not enabled: offered with
+            // `serve` until the brain makes it
+            note_incarnation(self.book, 0);
+            self.trouble_is("no work stream (" + e.detail + "): requests are offered with serve");
+        } else {
+            self.lost("reading the work stream: " + e.kind + ": " + e.detail);
+        }
+    }
+
+    @unbounded
+    fn on_message() {
+        let subject = self.client.last.subject;
+        if subject == work::reset_subject(self.root) {
+            let incarnation = std::json::find_int_field(
+                std::str::from_bytes(self.client.last.data),
+                "incarnation",
+            );
+            if incarnation > 0 && incarnation != incarnation_in(self.book) {
+                note_incarnation(self.book, incarnation);
+                log_info(
+                    "the work stream was made again: waiting requests publish their tickets again",
+                    std::log::kv("incarnation", to_string(incarnation)),
+                );
+            }
+            return;
+        }
+        if !std::str::ends_with(subject, ".claim") || len(self.client.last.reply) == 0 { return; }
+        let answer = left_answer(self.book, subject[0..(len(subject) - 6)], unix_ms());
+        if len(answer) == 0 { return; }
+        self.client.pub_msg(
+            self.client.last.reply,
+            "",
+            std::bytes::from_string(work::decline_json(answer)),
+        ) or discard;
+        self.client.flush() or discard;
+    }
+
+    /// Forget the leftover claims whose copies' waits ended.
+    @unbounded
+    fn prune() {
+        let now = unix_ms();
+        let mut gone = "";
+        for n in self.book.entries {
+            if n.key != STREAM_NOTE && n.until_ms <= now { gone = gone + n.key + "\n"; }
+        }
+        let v = std::str::bytes_view(gone);
+        let mut at = 0;
+        while at < v.n {
+            let nl = std::str::index_of(std::str::slice(v, at, v.n), "\n");
+            let end = if nl < 0 { v.n } else { at + nl };
+            self.book.remove(std::str::slice(v, at, end)) or discard;
+            at = end + 1;
+        }
+    }
+
+    /// Say trouble once while it is the same, and its end once.
+    fn trouble_is(what: String) {
+        if what == self.trouble { return; }
+        if len(what) > 0 {
+            log_warn("requests are not queued: " + what, std::log::kv("nats", self.url));
+        } else if len(self.trouble) > 0 {
+            log_info(
+                "requests are queued again: the work stream is there",
+                std::log::kv("nats", self.url),
+            );
+        }
+        self.trouble = what;
+    }
+}
+
+// ---- which requests are queued, and where ----------------------------------
+
+/// What admission knows of one seat for queueing a request (`queue_plan_of`):
+/// the seat, the model's name there, whether it serves the request's model
+/// and is enabled, whether its node is revoked, its rank in a pair
+/// (lib/work `rank_of`), the protocol its node registered with, whether it
+/// carries tools (lib/work `carries_tools`), whether the request may go to it
+/// (`allowed`), and its provider account's fullest window and whether one is
+/// at 100%.
+type SeatFact {
+    seat: st::SeatRow = st::SeatRow { };
+    engine_name: String = "";
+    serves: Bool = false;
+    revoked: Bool = false;
+    rank: Int = -1;
+    protocol: Int = 0;
+    tools: Bool = false;
+    allowed: Bool = false;
+    used: Float = 0.0;
+    exhausted: Bool = false;
+}
+
+type SeatFacts { items: bounded[SeatFact; 64]; }
+
+/// One partition a queued request may be published to: its subject, the
+/// provider account it is under (\"\" in the `m` shape, which names none),
+/// that account's fullest window and whether one is at 100%.
+type Partition {
+    subject: String = "";
+    account: String = "";
+    used: Float = 0.0;
+    exhausted: Bool = false;
+}
+
+/// How a request is queued (`queue_plan_of`). `on` false: offered with
+/// `serve`, `why` saying why.
+type QueuePlan {
+    on: Bool = false;
+    why: String = "";
+    need: String = "any";
+    several: Bool = false;
+    partitions: bounded[Partition; 16];
+    // the seats a claim may be granted to (its seat, its account, the
+    // model's name there), with no config
+    seats: bounded[Candidate; 32];
+}
+
+/// A seat as a claim's grant needs it: everything but its config, which may
+/// be large and which neither the grant nor the request's row reads.
+fn claim_candidate(f: SeatFact) -> Candidate {
+    return Candidate {
+        seat: st::SeatRow {
+            ref: f.seat.ref,
+            node: f.seat.node,
+            id: f.seat.id,
+            engine: f.seat.engine,
+            account: f.seat.account,
+            enabled: f.seat.enabled,
+            present: true,
+        },
+        engine_name: f.engine_name,
+    };
+}
+
+/// How a request for `model` of data class `class`, needing `need` (lib/work
+/// `need_of`), is queued under `root`, from what admission knows of each seat
+/// (`facts`) and the work stream's incarnation as this instance last saw it:
+/// queued while the stream is there, every seat that could serve it (one the
+/// request may go to, on a node not revoked, not a pair's follower) is on a
+/// node of protocol 3, and there is one; else offered with `serve`. The
+/// model's shape is its configuration's (lib/work, `several_with`): every
+/// enabled seat that serves it on a node not revoked, not a follower,
+/// whatever the request may spend. Its partitions are those of the provider
+/// accounts of the seats the request may go to that carry what it needs; a
+/// queued request with none (it lists tools, and no seat carries them)
+/// leaves `seats` empty, for admission to refuse.
+@bounded_by(facts)
+fn queue_plan_of(
+    root: String,
+    model: String,
+    class: String,
+    need: String,
+    incarnation: Int,
+    facts: SeatFacts
+) -> QueuePlan {
+    let mut out = QueuePlan { need: need };
+    if incarnation <= 0 {
+        out.why = "this instance sees no work stream";
+        return out;
+    }
+    let mut first = "";
+    let mut several = false;
+    let mut could = 0;
+    for f in facts.items {
+        if f.serves && f.seat.enabled && !f.revoked && work::makes_queues(f.rank) {
+            several = work::several_with(first, several, f.seat.account);
+            if len(first) == 0 { first = f.seat.account; }
+            if f.allowed {
+                could = could + 1;
+                if f.protocol != work::PROTOCOL_PULL {
+                    out.why = "seat " + f.seat.ref + " is on a node of protocol "
+                        + to_string(f.protocol);
+                    return out;
+                }
+            }
+        }
+    }
+    if could == 0 {
+        out.why = "no seat could serve it";
+        return out;
+    }
+    out.on = true;
+    out.several = several;
+    for f in facts.items {
+        if f.serves && f.allowed && !f.revoked && work::makes_queues(f.rank)
+            && (need != "tools" || f.tools)
+        {
+            push(out.seats, claim_candidate(f)) or discard;
+            let subject = work::partition(root, model, several, f.seat.account, class, need);
+            let mut known = false;
+            for p in out.partitions {
+                if p.subject == subject { known = true; }
+            }
+            if !known {
+                push(
+                    out.partitions,
+                    Partition {
+                        subject: subject,
+                        account: if several { f.seat.account } else { "" },
+                        used: f.used,
+                        exhausted: f.exhausted,
+                    },
+                ) or discard;
+            }
+        }
+    }
+    return out;
+}
+
+/// The partition a queued request is published to (the design's "Choosing a
+/// partition"), of `q`'s, leaving out those whose every seat failed it
+/// (`avoid`, `\n<node>/<seat>\n` each): the provider accounts that are not
+/// exhausted (unless every one is), then those with the most headroom (their
+/// fullest window within 10 points of the emptiest), then of two drawn at
+/// random (`a`, `b`, any integers), the one with the shorter expected wait.
+/// The expected wait is the board's (depth over free slots, times recent
+/// service time), which comes with the controller (step (e)); until then
+/// every partition's is the same and the first draw is taken. \"\" when
+/// none is left.
+fn chosen(q: QueuePlan, avoid: String, a: Int, b: Int) -> String {
+    let mut open = 0;
+    let mut fresh = 0;
+    for p in q.partitions {
+        if partition_untried(q, p, avoid) {
+            open = open + 1;
+            if !p.exhausted { fresh = fresh + 1; }
+        }
+    }
+    if open == 0 { return ""; }
+    let mut least = 1000.0;
+    for p in q.partitions {
+        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted) && p.used < least {
+            least = p.used;
+        }
+    }
+    let mut kept = 0;
+    for p in q.partitions {
+        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted)
+            && p.used <= least + 10.0
+        {
+            kept = kept + 1;
+        }
+    }
+    let i = (if a < 0 { -a } else { a }) % kept;
+    let mut j = (if b < 0 { -b } else { b }) % kept;
+    if j == i && kept > 1 { j = (j + 1) % kept; }
+    let mut first = "";
+    let mut second = "";
+    let mut k = 0;
+    for p in q.partitions {
+        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted)
+            && p.used <= least + 10.0
+        {
+            if k == i { first = p.subject; }
+            if k == j { second = p.subject; }
+            k = k + 1;
+        }
+    }
+    return if expected_wait_ms(second) < expected_wait_ms(first) { second } else { first };
+}
+
+/// A partition's expected wait, from the board: none to read until the
+/// controller writes one (step (e)), so every partition's is the same.
+fn expected_wait_ms(subject: String) -> Int {
+    return 0;
+}
+
+/// Whether partition `p` of `q` has a seat that has not failed the
+/// request (`avoid`).
+fn partition_untried(q: QueuePlan, p: Partition, avoid: String) -> Bool {
+    for c in q.seats {
+        if (len(p.account) == 0 || c.seat.account == p.account)
+            && !std::str::contains(avoid, "\n" + c.seat.ref + "\n")
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// The seat `ref` of `q`'s, as a claim's grant needs it; `present` false
+/// for none.
+fn claimed_seat(q: QueuePlan, ref: String) -> Candidate {
+    for c in q.seats {
+        if c.seat.ref == ref { return c; }
+    }
+    return Candidate { };
+}
+
+/// `q`'s seats as `\n<node>/<seat>\n...`, the form `claim_verdict` reads.
+fn seat_refs(q: QueuePlan) -> String {
+    let mut out = "\n";
+    for c in q.seats {
+        out = out + c.seat.ref + "\n";
+    }
+    return out;
+}
+
+// ---- claims ---------------------------------------------------------------
+
+/// How the claim `c` on attempt `attempt` of request `request_id` is
+/// answered (the design's "Delivery semantics"): `grant`; `again`, the
+/// granted claim itself repeated (the same seat and copy, its answer lost),
+/// granted again; or a decline: `gone` for a claim on no attempt this is;
+/// once the attempt is granted (`granted_seat`, `granted_copy`), `taken` for
+/// any other claim, whichever copy; before, `avoided` for a seat that
+/// failed the request (`avoid`, `\n<node>/<seat>\n` each), `ineligible`
+/// for one the request may not go to (`eligible`, the same form: the seats
+/// admission read, by provider account, data class, the key's and the
+/// project's accounts, and tools), so no stale plan bills a provider
+/// account the request may not spend.
+fn claim_verdict(
+    c: work::Claim,
+    request_id: String,
+    attempt: Int,
+    eligible: String,
+    avoid: String,
+    granted_seat: String,
+    granted_copy: String
+) -> String {
+    if c.request_id != request_id || c.attempt != attempt { return "gone"; }
+    if len(granted_seat) > 0 {
+        return if c.seat == granted_seat && c.copy == granted_copy { "again" } else { "taken" };
+    }
+    if std::str::contains(avoid, "\n" + c.seat + "\n") { return "avoided"; }
+    if !std::str::contains(eligible, "\n" + c.seat + "\n") { return "ineligible"; }
+    return "grant";
+}
+
+/// The ticket of attempt `attempt` of request `request_id`, its claims on
+/// `reply_to`, published to `partition` (its provider account, \"\" in the
+/// `m` shape) by `instance`, waiting until `wait_until`, the seats that
+/// failed it in `avoid` (`\n<node>/<seat>\n` each, at most 8).
+fn ticket_of_request(
+    r: InferenceRequest,
+    request_id: String,
+    attempt: Int,
+    reply_to: String,
+    instance: String,
+    account: String,
+    need: String,
+    wait_until: Time,
+    avoid: String
+) -> work::Ticket {
+    let mut t = work::Ticket {
+        request_id: request_id,
+        attempt: attempt,
+        reply_to: reply_to,
+        instance: instance,
+        model: r.model,
+        provider_account: account,
+        data_class: r.data_class,
+        need: need,
+        endpoint: r.seat_endpoint,
+        enqueued_at: std::time::current(),
+        wait_until: wait_until,
+        copy: "shared",
+        size: estimated_input_tokens(r.body),
+    };
+    let v = std::str::bytes_view(avoid);
+    let mut at = 0;
+    while at < v.n {
+        let rest = std::str::slice(v, at, v.n);
+        let nl = std::str::index_of(rest, "\n");
+        let end = if nl < 0 { v.n } else { at + nl };
+        let seat = std::str::slice(v, at, end);
+        if len(seat) > 0 { push(t.avoid, seat) or discard; }
+        at = end + 1;
+    }
+    return t;
+}
+
+/// A copy's headers: its message id, the same for every publish of it, and
+/// its wait left as its `Nats-TTL`.
+fn ticket_headers(msg_id: String, ttl_ms: Int) -> String fallible(nats::NatsError) {
+    let h = nats::with_header("", work::HEADER_MSG_ID, msg_id) or raise;
+    return nats::with_header(h, work::HEADER_TTL, work::ttl_header(ttl_ms)) or raise;
+}
+
+/// An account's fullest provider window, in percent, of its windows as the
+/// store holds them (`Store.windows`, a JSON array); 0 for none.
+@bounded_by(windows)
+fn fullest_window(windows: String) -> Float {
+    let mut most = 0.0;
+    let mut it = std::json::array_first(windows);
+    while !it.done {
+        let used = std::str::parse_float(
+            std::str::trim(std::json::find_field_raw(it.element, "used_percent")),
+        ) or 0.0;
+        if used > most { most = used; }
+        it = std::json::array_next(it);
+    }
+    return most;
+}
+
+/// Whether one of an account's provider windows is at 100%: it is
+/// exhausted, as the brain judges it.
+fn window_full(windows: String) -> Bool {
+    return fullest_window(windows) >= 100.0;
+}
+
+/// How a queued attempt's wait for a claim ended (`Inference.claimed`).
+type Claimed {
+    state: String = "";
+    c: Candidate = Candidate { };
+    copy: String = "";
+    at_ns: Int = 0;
+    why: String = "";
+}
+
+/// Whether a seat admission found up (`items`) has not failed the request
+/// (`attempts`): a queued request makes another attempt only while one has
+/// not.
+fn untried(items: bounded[Candidate; 8], attempts: bounded[Attempt; 8]) -> Bool {
+    let avoid = avoid_of(attempts);
+    for c in items {
+        if !std::str::contains(avoid, "\n" + c.seat.ref + "\n") { return true; }
+    }
+    return false;
+}
+
+/// The seats that failed a request (`attempts`), as a ticket's `avoid` is
+/// read here: `\n<node>/<seat>\n` each.
+fn avoid_of(attempts: bounded[Attempt; 8]) -> String {
+    let mut out = "\n";
+    for a in attempts {
+        if a.outcome == AttemptOutcome::failed { out = out + a.seat + "\n"; }
+    }
+    return out;
+}
+
+/// The answer to a queued request whose attempt was granted to no seat
+/// (`Claimed.state`): waited out, `w` saying how (`waited_out`: `429
+/// no_capacity`, past its own `voice.deadline` `504 deadline_exceeded`, a
+/// caller gone answered nothing it reads); its partition full, `429
+/// no_capacity` at once; the work stream not taking it, `503 no_capacity`,
+/// to ask again in a second. `why` is the last seat's failure.
+fn queue_refusal(
+    r: InferenceRequest,
+    w: Waiting,
+    g: Claimed,
+    why: String,
+    request_id: String,
+    attempts: bounded[Attempt; 8]
+) -> ApiError {
+    if g.state == "expired" || g.state == "gone" {
+        return waited_out(r, w, why, request_id, attempts);
+    }
+    if g.state == "full" {
+        return ApiError {
+            status: 429,
+            kind: "too_many_requests",
+            code: ErrorCode::no_capacity,
+            message: "the queue for model " + r.model + " is full: "
+                + to_string(work::STREAM_MAX_MSGS_PER_SUBJECT) + " requests wait for its seats",
+            has_voice: true,
+            voice: attempts_voice(request_id, attempts),
+            retry_after: SLOT_RETRY_AFTER,
+        };
+    }
+    return ApiError {
+        status: 503,
+        kind: "server_error",
+        code: ErrorCode::no_capacity,
+        message: "the work queue could not take the request: " + g.why,
+        has_voice: true,
+        voice: attempts_voice(request_id, attempts),
+        retry_after: 1,
+    };
+}
+
+/// How a queued request granted to no seat ends, as its row says.
+fn queue_status(w: Waiting, g: Claimed) -> String {
+    if g.state == "expired" || g.state == "gone" { return waited_status(w); }
+    if g.state == "full" { return "no_capacity"; }
+    return "failed";
+}

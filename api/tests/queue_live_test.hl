@@ -1,0 +1,903 @@
+// Queue routing on a JetStream-enabled NATS, when VOICE_TEST_NATS_URL
+// names one (CI's end-to-end job runs one): two api instances, each with its
+// own store, link and keeper, queue requests on the work stream, and a real
+// node (its session and slots) pulls them, claims them and serves them, a
+// fake seat beside it. A request is served end to end through a ticket; one
+// for a model a seat of protocol 2 could serve is offered with `serve`; a
+// seat that fails before output is avoided by the next attempt, which
+// another seat serves; a full partition is answered 429 at once; a claim on
+// a request whose caller left is declined `gone`; a waiting request
+// publishes its ticket again when the stream is made again, and is served;
+// and many requests from both instances, claimed by the node and by a fake
+// seat that claims each twice, repeats its granted claim and puts the
+// ticket back for the node to claim again, are each granted exactly once.
+// Each run works under a root of its own, so its stream is its own, and
+// deletes it at the end.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+import "../../lib/work" as work;
+import "../../lib/pond/realtime/nats" as nats;
+
+/// The node's engines, as the api is told them and as the node declares.
+const CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"reason\": null}";
+const NODE_CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
+
+/// The models, each its own partition.
+const MODELS: String = "echo-1 flaky hold quiet still late mixed";
+
+fn ms() -> Int { return std::time::monotonic_ns() / 1000000; }
+
+fn note(file: String, line: String) {
+    std::io::fs::write_file_append(file, line + "\n") or discard;
+}
+
+fn read(file: String) -> String { return std::io::fs::read_file(file) or ""; }
+
+/// True once `file` holds `needle`, within `wait_ms`.
+fn within(file: String, needle: String, wait_ms: Int) -> Bool {
+    let until = ms() + wait_ms;
+    while ms() < until {
+        if std::str::contains(read(file), needle) { return true; }
+        std::time::sleep(20ms);
+    }
+    return std::str::contains(read(file), needle);
+}
+
+/// The `n`th line of `text` (from 0), "" past its end.
+@bounded_by(text)
+fn line_of(text: String, n: Int) -> String {
+    let mut rest = text;
+    let mut i = 0;
+    while len(rest) > 0 {
+        let nl = std::str::index_of(rest, "\n");
+        let line = if nl < 0 { rest } else { rest[0..nl] };
+        if i == n { return line; }
+        rest = if nl < 0 { "" } else { rest[(nl + 1)..len(rest)] };
+        i = i + 1;
+    }
+    return "";
+}
+
+/// The `k`th tab-separated field of `line` (from 0).
+fn field(line: String, k: Int) -> String {
+    let mut rest = line;
+    let mut i = 0;
+    while i < k {
+        let t = std::str::index_of(rest, "\t");
+        if t < 0 { return ""; }
+        rest = rest[(t + 1)..len(rest)];
+        i = i + 1;
+    }
+    let t = std::str::index_of(rest, "\t");
+    return if t < 0 { rest } else { rest[0..t] };
+}
+
+/// How many times `needle` is in `text`.
+fn occurrences(text: String, needle: String) -> Int {
+    let mut n = 0;
+    let mut rest = text;
+    let mut at = std::str::index_of(rest, needle);
+    while at >= 0 {
+        n = n + 1;
+        rest = rest[(at + len(needle))..len(rest)];
+        at = std::str::index_of(rest, needle);
+    }
+    return n;
+}
+
+fn expect(r: std::http::Response, status: Int, what: String) {
+    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+}
+
+/// One api instance: its own store and link (its book kept by its own
+/// keeper), configured as the other is, serving the requests the test hands
+/// it (`<dir>/<name>.todo`, `<id>\t<flags>\t<body>` a line; `gone` in its
+/// flags for a caller that left before it was asked), writing each answer
+/// (`<dir>/<name>.done`, `<id>\t<status>\t<body>` a line). It beats for the
+/// nodes it registered, so they stay up.
+locus Instance {
+    params {
+        name: String = "";
+        dir: String = "";
+        e: api::DataPlane = api::DataPlane { };
+        key: String = "";
+        q1: String = "";
+        fake: String = "";
+        done: Int = 0;
+        beat_at: Int = 0;
+    }
+
+    run() {
+        self.configure();
+        while !self.draining {
+            self.step();
+        }
+    }
+
+    fn step() {
+        if ms() - self.beat_at >= 3000 {
+            self.beat_at = ms();
+            self.beat();
+        }
+        let line = line_of(read(self.dir + "/" + self.name + ".todo"), self.done);
+        if len(line) == 0 {
+            std::time::sleep(20ms);
+            return;
+        }
+        self.done = self.done + 1;
+        self.ask(line);
+    }
+
+    @unbounded
+    fn ask(line: String) {
+        let id = field(line, 0);
+        let flags = field(line, 1);
+        let body = field(line, 2);
+        let mut fd = -1;
+        let mut listener = -1;
+        if flags == "gone" {
+            // a caller that has left: its end closed before it is asked
+            listener = std::io::tcp::listen_socket("127.0.0.1", 0) or - 1;
+            let caller = std::io::tcp::connect(
+                "127.0.0.1",
+                std::io::tcp::__local_port(listener),
+            ) or - 1;
+            fd = std::io::tcp::__accept_one(listener);
+            std::io::tcp::close_fd(caller);
+        }
+        let r = self.e.handle(
+            std::http::Request {
+                method: "POST",
+                path: "/v1/responses",
+                headers: "Authorization: Bearer " + self.key,
+                body: body,
+                conn_fd: fd,
+            },
+        );
+        if fd >= 0 {
+            std::io::tcp::close_fd(fd);
+            std::io::tcp::close_fd(listener);
+        }
+        note(
+            self.dir + "/" + self.name + ".done",
+            id + "\t" + to_string(r.status) + "\t" + std::str::replace(r.body, "\n", " "),
+        );
+    }
+
+    fn plane(path: String, token: String, body: String) -> std::http::Response {
+        return self.e.handle(
+            std::http::Request {
+                method: "POST",
+                path: path,
+                headers: "Authorization: Bearer " + token,
+                body: body,
+            },
+        );
+    }
+
+    fn beat() {
+        if len(self.q1) == 0 { return; }
+        self.plane(
+            "/node/v1/heartbeat",
+            self.q1,
+            "{\"in_flight\": 0, \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
+                + up("good") + ", " + up("m3") + "]}",
+        );
+        self.plane(
+            "/node/v1/heartbeat",
+            self.fake,
+            "{\"in_flight\": 0, \"seats\": [" + up("a") + ", " + up("b") + ", " + up("c") + "]}",
+        );
+    }
+
+    @unbounded
+    fn configure() {
+        let store = self.e.store;
+        let catalog = api::Catalog { store: store };
+        let accounts = api::Accounts { store: store };
+        let projects = api::Projects { store: store };
+        let keys = api::Keys { store: store };
+        let nodes = api::Nodes { store: store, link: self.e.link };
+        let seats = api::Seats { store: store, link: self.e.link };
+        for model in ["echo-1", "flaky", "hold", "quiet", "still", "late", "mixed"] {
+            catalog.create(api::CatalogModelCreate { id: model }) or discard;
+        }
+        accounts.create(api::AccountCreate { id: "local", name: "Local" }) or discard;
+        projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
+        let made = keys.create(
+            api::KeyCreate { project: "work", name: "live" },
+        ) or api::Key { status: api::KeyStatus::revoked };
+        self.key = made.secret;
+        for id in ["q1", "fake", "old"] {
+            let n = nodes.create(api::NodeCreate { id: id }) or api::Node {
+                status: api::NodeStatus::pending,
+            };
+            if id == "q1" { self.q1 = n.enrollment_token; }
+            if id == "fake" { self.fake = n.enrollment_token; }
+            if id == "old" {
+                // registered with protocol 2, its seat never up: a seat that
+                // could serve `mixed` by configuration, which keeps it offered
+                self.plane(
+                    "/node/v1/register",
+                    n.enrollment_token,
+                    "{\"protocol\": 2, \"version\": \"0.1.0\", \"capabilities\": " + CAPS
+                        + ", \"local\": " + LOCAL + "}",
+                );
+            }
+        }
+        seat(seats, "q1", "s1", "echo-1", "", "{\"text\": \"hello from q1\"}");
+        seat(seats, "q1", "s2", "echo-1", "", "{\"text\": \"hello from q1\"}");
+        seat(seats, "q1", "bad", "flaky", "", "{\"text\": \"never\", \"fail_after_ms\": 200}");
+        seat(
+            seats,
+            "q1",
+            "good",
+            "flaky",
+            "hold",
+            "{\"text\": \"good\", \"first_output_ms\": 1500}",
+        );
+        seat(seats, "q1", "m3", "mixed", "", "{\"text\": \"pushed\"}");
+        seat(seats, "fake", "a", "echo-1", "late", "{\"text\": \"fake\"}");
+        seat(seats, "fake", "b", "echo-1", "late", "{\"text\": \"fake\"}");
+        seat(seats, "fake", "c", "quiet", "still", "{\"text\": \"fake\"}");
+        seat(seats, "old", "m2", "mixed", "", "{\"text\": \"old\"}");
+        let reg = self.plane(
+            "/node/v1/register",
+            self.q1,
+            "{\"protocol\": 3, \"version\": \"0.1.0\", \"capabilities\": " + CAPS + ", \"local\": "
+                + LOCAL + "}",
+        );
+        let assignment = std::str::trim(std::json::find_field_raw(reg.body, "assignment"));
+        std::io::fs::write_file(self.dir + "/" + self.name + ".assignment", assignment) or discard;
+        self.plane(
+            "/node/v1/seats",
+            self.q1,
+            "{\"assignment_version\": "
+                + to_string(std::json::find_int_field(assignment, "version"))
+                + ", \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
+                + up("good")
+                + ", " + up("m3") + "]}",
+        );
+        let freg = self.plane(
+            "/node/v1/register",
+            self.fake,
+            "{\"protocol\": 3, \"version\": \"0.1.0\", \"capabilities\": " + CAPS + ", \"local\": "
+                + LOCAL + "}",
+        );
+        self.plane(
+            "/node/v1/seats",
+            self.fake,
+            "{\"assignment_version\": "
+                + to_string(
+                    std::json::find_int_field(
+                        std::json::find_field_raw(freg.body, "assignment"),
+                        "version",
+                    ),
+                )
+                + ", \"seats\": [" + up("a") + ", " + up("b") + ", " + up("c") + "]}",
+        );
+        self.beat_at = ms();
+        note(self.dir + "/" + self.name + ".ready", "ready");
+    }
+}
+
+fn up(id: String) -> String {
+    return "{\"id\": \"" + id + "\", \"status\": \"up\", \"in_flight\": 0}";
+}
+
+/// A static seat of one at a time on `node`, serving `model` (and `also`).
+fn seat(
+    seats: api::Seats,
+    node_id: String,
+    id: String,
+    model: String,
+    also: String,
+    config: String
+) {
+    let mut sc = api::SeatCreate {
+        node: node_id,
+        id: id,
+        engine: "static",
+        account: "local",
+        config: std::json::Value::parse(config) or std::json::Value::null(),
+    };
+    push(sc.serves, st::SeatModel { model: model }) or discard;
+    if len(also) > 0 { push(sc.serves, st::SeatModel { model: also }) or discard; }
+    seats.create(sc) or {
+        std::test::assert(
+            false,
+            "seat " + node_id + "/" + id + ": " + api::ctl_problem(err).message,
+        );
+    };
+}
+
+/// A seat of its own, `fake/a` (and `fake/b`), pulling `echo-1` once
+/// `<dir>/fake.echo` exists and `late` once `<dir>/fake.late` does. For each
+/// echo-1 ticket it claims as `fake/a`; granted, it claims again as `fake/b`
+/// (to be declined `taken`) and as `fake/a` once more (to be granted again,
+/// the same claim repeated), puts the ticket back for another seat to
+/// claim, and serves it; a ticket it was granted before, pulled again, it
+/// claims as `fake/b` (to be declined `taken`). Each answer is a line of
+/// `<dir>/fake.log`.
+locus FakeSeat {
+    params {
+        url: String = "";
+        root: String = "";
+        dir: String = "";
+        c: nats::NatsClient = nats::NatsClient { name: "queue-live-fake-seat", timeout: 3s };
+        opened: Bool = false;
+        // the message ids it was granted, a line each
+        granted: String = "\n";
+    }
+
+    run() {
+        while !self.draining {
+            self.step();
+        }
+    }
+
+    fn step() {
+        if !self.opened {
+            self.c.url = self.url;
+            self.opened = self.c.open();
+            if !self.opened {
+                std::time::sleep(200ms);
+                return;
+            }
+        }
+        let mut pulled = false;
+        if std::io::fs::file_exists(self.dir + "/fake.echo") {
+            pulled = self.pull_one("echo-1") || pulled;
+        }
+        if std::io::fs::file_exists(self.dir + "/fake.late") {
+            pulled = self.pull_one("late") || pulled;
+        }
+        if !pulled { std::time::sleep(30ms); }
+    }
+
+    @unbounded
+    fn pull_one(model: String) -> Bool {
+        let subject = work::model_subject(self.root, model, "internal", "any");
+        let m = nats::js_next(
+            self.c,
+            work::stream_name(self.root),
+            work::consumer_name(subject),
+            1000,
+        ) or nats::NatsMsg { };
+        if len(m.reply) == 0 { return false; }
+        let t = work::ticket_of(std::str::from_bytes(m.data)) or {
+            nats::js_ack(self.c, m) or discard;
+            return true;
+        };
+        let log = self.dir + "/fake.log";
+        let id = work::message_id(t.request_id, t.attempt, t.copy);
+        if std::str::contains(self.granted, "\n" + id + "\n") {
+            let again = self.claim(t, "fake/b");
+            note(log, "retaken\t" + t.request_id + "\t" + reason_of(again));
+            nats::js_ack(self.c, m) or discard;
+            return true;
+        }
+        let first = self.claim(t, "fake/a");
+        let a = work::answer_of(first) or work::ClaimAnswer { reason: "unread" };
+        if !a.granted {
+            note(log, "declined\t" + t.request_id + "\t" + a.reason);
+            if a.reason == "ineligible" || a.reason == "avoided" {
+                nats::js_nak(self.c, m, 0) or discard;
+            } else {
+                nats::js_ack(self.c, m) or discard;
+            }
+            return true;
+        }
+        self.granted = self.granted + id + "\n";
+        note(log, "grant\t" + t.request_id + "\tfake/a");
+        if model == "echo-1" {
+            note(log, "second\t" + t.request_id + "\t" + reason_of(self.claim(t, "fake/b")));
+            note(log, "repeat\t" + t.request_id + "\t" + reason_of(self.claim(t, "fake/a")));
+            // put back: another seat pulls it and claims it, in vain
+            nats::js_nak(self.c, m, 0) or discard;
+            std::time::sleep(100ms);
+        } else {
+            nats::js_ack(self.c, m) or discard;
+        }
+        self.serve(t.request_id, a.serve);
+        return true;
+    }
+
+    fn claim(t: work::Ticket, seat_ref: String) -> String {
+        let r = self.c.request(
+            work::claim_subject(t.reply_to),
+            std::bytes::from_string(
+                work::claim_json(
+                    work::Claim {
+                        request_id: t.request_id,
+                        attempt: t.attempt,
+                        copy: t.copy,
+                        seat: seat_ref,
+                    },
+                ),
+            ),
+            2s,
+        ) or nats::NatsMsg { };
+        return std::str::from_bytes(r.data);
+    }
+
+    /// Serve a granted request as a node does: its terminal event, then
+    /// its result.
+    @unbounded
+    fn serve(rid: String, grant: String) {
+        let reply_to = std::json::find_string_field(grant, "reply_to");
+        let response = "{\"id\": \"" + rid
+            + "\", \"object\": \"response\", \"status\": \"completed\", \"model\": \"echo-1\", \"output\": [{\"type\": \"message\", \"role\": \"assistant\", \"content\": [{\"type\": \"output_text\", \"text\": \"fake\"}]}], \"usage\": {\"input_tokens\": 1, \"output_tokens\": 1, \"total_tokens\": 2}}";
+        self.c.pub_msg(
+            reply_to + ".event",
+            "",
+            std::bytes::from_string(
+                "{\"type\": \"event\", \"request_id\": \"" + rid
+                    + "\", \"event\": {\"type\": \"response.completed\", \"response\": " + response
+                    + "}}",
+            ),
+        ) or discard;
+        self.c.pub_msg(
+            reply_to + ".result",
+            "",
+            std::bytes::from_string(
+                "{\"type\": \"result\", \"request_id\": \"" + rid
+                    + "\", \"outcome\": \"served\", \"served\": {\"model\": \"echo-1\"}, \"timing\": {\"first_output_ms\": 1, \"engine_ms\": 2}}",
+            ),
+        ) or discard;
+        self.c.flush() or discard;
+    }
+}
+
+/// A claim's answer as a word: `granted` for a grant, else its decline's
+/// reason (`unanswered` for none).
+fn reason_of(answer: String) -> String {
+    let a = work::answer_of(answer) or work::ClaimAnswer { reason: "unanswered" };
+    return if a.granted { "granted" } else { a.reason };
+}
+
+/// Each claim the node's slots made, and how it went: `<request id>
+/// <claim> <seat>` a line of `file`.
+locus Tally {
+    params { file: String = ""; }
+    bus { subscribe node::ServeDone as on_done; }
+    fn on_done(d: node::ServeReport) {
+        if len(d.claim) > 0 { note(self.file, d.request_id + "\t" + d.claim + "\t" + d.seat); }
+    }
+}
+
+main locus App {
+    params {
+        url: String = "";
+        root: String = "";
+        dir: String = "";
+        c: nats::NatsClient = nats::NatsClient { name: "queue-live-test", timeout: 3s };
+        book1: api::QueueBook = api::QueueBook { };
+        book2: api::QueueBook = api::QueueBook { };
+        inst1: Instance = Instance { };
+        inst2: Instance = Instance { };
+        keeper1: api::QueueKeeper = api::QueueKeeper { };
+        keeper2: api::QueueKeeper = api::QueueKeeper { };
+        fake: FakeSeat = FakeSeat { };
+        tally: Tally = Tally { };
+        session: node::Session = node::Session { };
+        servers: node::Server = node::Server { };
+        // requests handed out so far, to number them
+        asked: Int = 0;
+    }
+    bus { publish node::PlaneJoined; }
+    placement {
+        inst1: pinned;
+        inst2: pinned;
+        keeper1: pinned;
+        keeper2: pinned;
+        fake: pinned;
+        session: pinned;
+        servers: pinned(replicas = 8);
+    }
+
+    run() {
+        self.scenarios();
+        nats::js_stream_delete(self.c, work::stream_name(self.root)) or discard;
+    }
+
+    /// The work stream as the brain makes it, and a consumer for each
+    /// model's partition and each seat's own queue; its incarnation.
+    @unbounded
+    fn make_stream() -> Int {
+        let stream = work::stream_name(self.root);
+        nats::js_stream_create_with(
+            self.c,
+            nats::StreamSpec {
+                name: stream,
+                subjects: work::work_subjects(self.root),
+                retention: work::STREAM_RETENTION,
+                storage: work::STREAM_STORAGE,
+                max_age_ms: work::STREAM_MAX_AGE_MS,
+                max_msgs_per_subject: work::STREAM_MAX_MSGS_PER_SUBJECT,
+                discard: work::STREAM_DISCARD,
+                discard_new_per_subject: work::STREAM_DISCARD_NEW_PER_SUBJECT,
+                duplicate_window_ms: work::STREAM_DUPLICATE_WINDOW_MS,
+                allow_msg_ttl: work::STREAM_ALLOW_MSG_TTL,
+            },
+        ) or {
+            std::test::assert(false, "the work stream: " + err.detail);
+            return 0;
+        };
+        for model in ["echo-1", "flaky", "hold", "quiet", "still", "late", "mixed"] {
+            self.consumer(work::model_subject(self.root, model, "internal", "any"));
+        }
+        for s in ["s1", "s2", "bad", "good", "m3"] {
+            self.consumer(work::seat_subject(self.root, "q1", s));
+        }
+        let info = nats::js_stream_info(self.c, stream) or nats::StreamInfo { };
+        return info.created_ns / 1000000;
+    }
+
+    fn consumer(subject: String) {
+        nats::js_consumer_create(
+            self.c,
+            work::stream_name(self.root),
+            nats::ConsumerSpec {
+                durable: work::consumer_name(subject),
+                filter: subject,
+                deliver: work::CONSUMER_DELIVER_POLICY,
+                ack_wait_ms: work::CONSUMER_ACK_WAIT_MS,
+                max_ack_pending: work::CONSUMER_MAX_ACK_PENDING,
+                max_deliver: work::CONSUMER_MAX_DELIVER,
+            },
+        ) or { std::test::assert(false, "the consumer of " + subject + ": " + err.detail); };
+    }
+
+    /// The partition of `model`'s consumer, as JetStream says it.
+    fn queue(model: String) -> nats::ConsumerInfo {
+        return nats::js_consumer_info(
+            self.c,
+            work::stream_name(self.root),
+            work::consumer_name(work::model_subject(self.root, model, "internal", "any")),
+        ) or nats::ConsumerInfo { name: "unread" };
+    }
+
+    /// Hand instance `inst` a request, `flags` and its body; its id.
+    fn hand(inst: String, flags: String, body: String) -> String {
+        self.asked = self.asked + 1;
+        let id = "q" + to_string(self.asked);
+        note(self.dir + "/" + inst + ".todo", id + "\t" + flags + "\t" + body);
+        return id;
+    }
+
+    /// The answer instance `inst` wrote for request `id`, waiting up to
+    /// `wait_ms`: `<status>\t<body>`, "" for none yet.
+    fn answer(inst: String, id: String, wait_ms: Int) -> String {
+        let file = self.dir + "/" + inst + ".done";
+        let seen = within(file, id + "\t", wait_ms);
+        let all = "\n" + read(file);
+        let at = std::str::index_of(all, "\n" + id + "\t");
+        if at < 0 { return ""; }
+        let rest = all[(at + len(id) + 2)..len(all)];
+        let nl = std::str::index_of(rest, "\n");
+        return if nl < 0 { rest } else { rest[0..nl] };
+    }
+
+    @unbounded
+    fn scenarios() {
+        let dir = self.dir;
+        self.c.url = self.url;
+        std::test::assert(self.c.open(), "the test NATS answers: " + self.c.last_error);
+        let first = self.make_stream();
+        std::test::assert(first > 0, "the work stream is made");
+        std::test::assert(
+            within(dir + "/api-1.ready", "ready", 20000)
+                && within(dir + "/api-2.ready", "ready", 20000),
+            "both instances are configured",
+        );
+        let until = ms() + 10000;
+        while ms() < until
+            && (api::incarnation_in(self.book1) <= 0 || api::incarnation_in(self.book2) <= 0)
+        {
+            std::time::sleep(50ms);
+        }
+        std::test::assert(
+            api::incarnation_in(self.book1) == first && api::incarnation_in(self.book2) == first,
+            "each instance's keeper sees the work stream, at its incarnation",
+        );
+        node::PlaneJoined <- node::Joined {
+            nats_url: self.url,
+            subject: self.root + ".node.q1",
+            assignment: read(dir + "/api-1.assignment"),
+            local: "{}",
+        };
+
+        // served end to end through a ticket
+        let a1 = self.hand("api-1", "", "{\"model\": \"echo-1\", \"input\": \"hi\"}");
+        let got = self.answer("api-1", a1, 20000);
+        std::test::assert_eq_str(field(got, 0), "200", "a queued request is served: " + got);
+        let served = std::json::find_string_field(
+            std::json::find_field_raw(std::json::find_field_raw(field(got, 1), "voice"), "served"),
+            "seat",
+        );
+        std::test::assert(
+            std::str::starts_with(served, "q1/s"),
+            "by a seat of the node: " + served,
+        );
+        std::test::assert(
+            std::str::contains(field(got, 1), "hello from q1"),
+            "its seat's answer: " + field(got, 1),
+        );
+        let echo = self.queue("echo-1");
+        std::test::assert(
+            echo.delivered_stream_seq >= 1 && echo.num_pending == 0 && echo.num_ack_pending == 0,
+            "through its partition, acknowledged at the grant: delivered "
+                + to_string(echo.delivered_stream_seq),
+        );
+
+        // a seat of protocol 2 that could serve it: offered with `serve`
+        let b1 = self.hand("api-1", "", "{\"model\": \"mixed\", \"input\": \"hi\"}");
+        let mixed = self.answer("api-1", b1, 20000);
+        std::test::assert_eq_str(
+            field(mixed, 0),
+            "200",
+            "a mixed fleet's request is served: " + mixed,
+        );
+        std::test::assert(std::str::contains(field(mixed, 1), "pushed"), "by q1/m3: " + mixed);
+        let mq = self.queue("mixed");
+        std::test::assert(
+            mq.delivered_stream_seq == 0 && mq.num_pending == 0,
+            "offered, never queued: delivered " + to_string(mq.delivered_stream_seq),
+        );
+
+        // a seat that fails before output: the next attempt avoids it, and
+        // another serves it (good, busy with `hold` meanwhile, frees)
+        let c0 = self.hand("api-2", "", "{\"model\": \"hold\", \"input\": \"hi\"}");
+        std::time::sleep(400ms);
+        let c1 = self.hand("api-1", "", "{\"model\": \"flaky\", \"input\": \"hi\"}");
+        let flaky = self.answer("api-1", c1, 30000);
+        std::test::assert_eq_str(field(flaky, 0), "200", "served after a seat failed it: " + flaky);
+        let fv = std::json::find_field_raw(field(flaky, 1), "voice");
+        std::test::assert_eq_str(
+            std::json::find_string_field(std::json::find_field_raw(fv, "served"), "seat"),
+            "q1/good",
+            "by the other seat",
+        );
+        let tried = std::json::find_field_raw(fv, "attempts");
+        let t0 = std::json::array_first(tried);
+        std::test::assert(
+            std::json::find_string_field(t0.element, "seat") == "q1/bad"
+                && std::json::find_string_field(t0.element, "outcome") == "failed",
+            "the failed seat first in its attempts: " + tried,
+        );
+        std::test::assert_eq_str(field(self.answer("api-2", c0, 20000), 0), "200", "hold served");
+
+        // a full partition: 429 at once
+        let quiet = work::model_subject(self.root, "quiet", "internal", "any");
+        let mut i = 0;
+        while i < work::STREAM_MAX_MSGS_PER_SUBJECT {
+            nats::js_publish_id(
+                self.c,
+                quiet,
+                "fill." + to_string(i),
+                std::bytes::from_string("{}"),
+            ) or { std::test::assert(false, "filling quiet: " + err.detail); };
+            i = i + 1;
+        }
+        let t_full = ms();
+        let d1 = self.hand("api-1", "", "{\"model\": \"quiet\", \"input\": \"hi\"}");
+        let full = self.answer("api-1", d1, 10000);
+        std::test::assert_eq_str(
+            field(full, 0),
+            "429",
+            "a full partition is answered 429: " + full,
+        );
+        std::test::assert(
+            std::str::contains(field(full, 1), "\"no_capacity\""),
+            "no_capacity: " + full,
+        );
+        std::test::assert(ms() - t_full < 5000, "at once: " + to_string(ms() - t_full) + " ms");
+
+        // a caller gone before a seat claims it: later claims are `gone`
+        let e1 = self.hand("api-1", "gone", "{\"model\": \"still\", \"input\": \"hi\"}");
+        let left = self.answer("api-1", e1, 10000);
+        std::test::assert_eq_str(
+            field(left, 0),
+            "499",
+            "a caller gone is answered nothing: " + left,
+        );
+        let still = nats::js_stream_msg_next(
+            self.c,
+            work::stream_name(self.root),
+            work::model_subject(self.root, "still", "internal", "any"),
+            0,
+        ) or nats::StoredMsg { };
+        let t = work::ticket_of(std::str::from_bytes(still.data)) or work::Ticket { };
+        std::test::assert(len(t.reply_to) > 0, "its ticket is still in the stream");
+        let gone = self.c.request(
+            work::claim_subject(t.reply_to),
+            std::bytes::from_string(
+                work::claim_json(
+                    work::Claim {
+                        request_id: t.request_id,
+                        attempt: t.attempt,
+                        copy: t.copy,
+                        seat: "fake/c",
+                    },
+                ),
+            ),
+            3s,
+        ) or nats::NatsMsg { };
+        std::test::assert_eq_str(
+            reason_of(std::str::from_bytes(gone.data)),
+            "gone",
+            "a claim on it is declined gone",
+        );
+
+        // the stream made again while a request waits: it publishes its
+        // ticket again, and a seat serves it
+        let deadline = std::time::iso8601(
+            std::time::from_nanos(std::time::nanos(std::time::current()) + 40000000000),
+        );
+        let f1 = self.hand(
+            "api-1",
+            "",
+            "{\"model\": \"late\", \"input\": \"hi\", \"voice\": {\"deadline\": \"" + deadline
+                + "\"}}",
+        );
+        let mut waiting = 0;
+        let w_until = ms() + 5000;
+        while ms() < w_until && waiting == 0 {
+            waiting = self.queue("late").num_pending;
+            std::time::sleep(50ms);
+        }
+        std::test::assert_eq_int(waiting, 1, "its ticket waits");
+        nats::js_stream_delete(self.c, work::stream_name(self.root)) or discard;
+        let second = self.make_stream();
+        std::test::assert(second > first, "a new incarnation");
+        self.c.pub_msg(
+            work::reset_subject(self.root),
+            "",
+            std::bytes::from_string(work::reset_json(second)),
+        ) or discard;
+        self.c.flush() or discard;
+        let mut again = 0;
+        let a_until = ms() + 5000;
+        while ms() < a_until && again == 0 {
+            again = self.queue("late").num_pending;
+            std::time::sleep(50ms);
+        }
+        std::test::assert_eq_int(again, 1, "published again into the new stream");
+        std::test::assert_eq_int(api::incarnation_in(self.book1), second, "at its incarnation");
+        std::io::fs::write_file(dir + "/fake.late", "") or discard;
+        let late = self.answer("api-1", f1, 20000);
+        std::test::assert_eq_str(field(late, 0), "200", "and served: " + late);
+        std::test::assert(
+            std::str::contains(field(late, 1), "\"fake/a\""),
+            "by the seat that claimed it: " + late,
+        );
+
+        // many requests from both instances, claimed by the node and the
+        // fake seat, which holds a standing pull beside the node's: each
+        // granted once
+        std::io::fs::unlink(dir + "/fake.late") or discard;
+        std::io::fs::write_file(dir + "/fake.echo", "") or discard;
+        let mut ids = "";
+        let mut n = 0;
+        while n < 24 {
+            ids = ids + "api-1\t"
+                + self.hand("api-1", "", "{\"model\": \"echo-1\", \"input\": \"hi\"}")
+                + "\n";
+            ids = ids + "api-2\t"
+                + self.hand("api-2", "", "{\"model\": \"echo-1\", \"input\": \"hi\"}")
+                + "\n";
+            n = n + 1;
+        }
+        // every answer in, and each slot's report of its claim told
+        let mut answers = "";
+        let mut k = 0;
+        while k < 48 {
+            let line = line_of(ids, k);
+            let got = self.answer(field(line, 0), field(line, 1), 60000);
+            std::test::assert_eq_str(field(got, 0), "200", "request " + line + " served: " + got);
+            answers = answers + field(got, 1) + "\n";
+            k = k + 1;
+        }
+        std::time::sleep(1s);
+        let now_fake = read(dir + "/fake.log");
+        let now_node = read(dir + "/tally");
+        let mut by_fake = 0;
+        let mut by_node = 0;
+        k = 0;
+        while k < 48 {
+            let body = line_of(answers, k);
+            let rid = std::json::find_string_field(body, "id");
+            let seat_ref = std::json::find_string_field(
+                std::json::find_field_raw(std::json::find_field_raw(body, "voice"), "served"),
+                "seat",
+            );
+            let fake_grants = occurrences(now_fake, "grant\t" + rid + "\t");
+            let node_grants = occurrences(now_node, rid + "\tgranted\t");
+            std::test::assert_eq_int(
+                fake_grants + node_grants,
+                1,
+                rid + " granted once (fake " + to_string(fake_grants) + ", node "
+                    + to_string(node_grants) + "), served by " + seat_ref,
+            );
+            if fake_grants == 1 {
+                by_fake = by_fake + 1;
+                std::test::assert_eq_str(
+                    seat_ref,
+                    "fake/a",
+                    rid + ": served by the seat granted it",
+                );
+                std::test::assert(
+                    std::str::contains(now_fake, "second\t" + rid + "\ttaken"),
+                    rid + ": another seat's claim declined taken",
+                );
+                std::test::assert(
+                    std::str::contains(now_fake, "repeat\t" + rid + "\tgranted"),
+                    rid + ": the granted claim repeated granted again",
+                );
+            } else {
+                by_node = by_node + 1;
+                std::test::assert(
+                    std::str::starts_with(seat_ref, "q1/s"),
+                    rid + ": by " + seat_ref,
+                );
+            }
+            k = k + 1;
+        }
+        std::test::assert(
+            by_fake > 0 && by_node > 0,
+            "both claimed some: fake " + to_string(by_fake) + ", node " + to_string(by_node),
+        );
+        let contested = occurrences(now_node, "\ttaken\t")
+            + occurrences(now_node, "\tno_responders\t")
+            + occurrences(now_fake, "retaken\t");
+        std::test::assert(
+            contested >= by_fake,
+            "each ticket the fake seat put back once granted was claimed again, in vain: "
+                + to_string(contested) + " for " + to_string(by_fake),
+        );
+
+    }
+}
+
+@unbounded
+fn main() {
+    if !std::env::var_exists("VOICE_TEST_NATS_URL") { return; }
+    let url = std::env::var("VOICE_TEST_NATS_URL");
+    let rand = std::os::getrandom(6) or std::bytes::from_string("fixed");
+    let root = "test.qd" + std::hex::encode(rand);
+    let dir = std::str::trim(node::run_out("mktemp\n-d"));
+    let b1 = api::QueueBook { };
+    let b2 = api::QueueBook { };
+    App {
+        url: url,
+        root: root,
+        dir: dir,
+        book1: b1,
+        book2: b2,
+        inst1: Instance {
+            name: "api-1",
+            dir: dir,
+            e: api::DataPlane {
+                instance: "api-1",
+                link: api::NatsLink { url: url, subjects: root, book: b1 },
+            },
+        },
+        inst2: Instance {
+            name: "api-2",
+            dir: dir,
+            e: api::DataPlane {
+                instance: "api-2",
+                link: api::NatsLink { url: url, subjects: root, book: b2 },
+            },
+        },
+        keeper1: api::QueueKeeper { url: url, root: root, book: b1 },
+        keeper2: api::QueueKeeper { url: url, root: root, book: b2 },
+        fake: FakeSeat { url: url, root: root, dir: dir },
+        tally: Tally { file: dir + "/tally" },
+        session: node::Session { id: "q1", data: dir, capabilities: NODE_CAPS },
+    };
+    node::run_out("rm\n-rf\n" + dir);
+}

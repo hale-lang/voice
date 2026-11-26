@@ -981,6 +981,8 @@ the notice of its new version.
 The brain being down does not stop serving: the last table in memory still
 routes, bounded by each node's own refusals; it only goes stale.
 
+A proposed replacement, seats pulling from work queues on JetStream, is in [`design/queue-routing.md`](./design/queue-routing.md).
+
 ## Events
 
 Voice is evented through Hale's bus, with NATS carrying the topics that

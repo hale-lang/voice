@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork merged (#255); stream, node pull, api tickets, controller pending.
+Implementation status: phase 1: groundwork merged (#255), decisions recorded (#this); stream, node pull, api tickets, controller pending.
 
 Proposed, 2026-11-26.
 
@@ -177,8 +177,11 @@ seat by the api.
 
 ### The stream
 
-One stream, `VOICE_WORK` (grafted, named from the heart's root, so two
-hearts on one broker do not collide), over `<root>.work.>`:
+One stream over `<root>.work.>`. Under voice's own NATS (the default
+root, `voice`) it is `VOICE_WORK`. Under a habitat's broker (any other
+root, `heart.<id>`) it is `VOICE_WORK_` and the first 12 hex digits of
+the sha256 of the root, so two hearts on one broker do not collide; a
+stream's name cannot carry the root's dots. Its settings:
 
 | Setting | Value | Why |
 |---|---|---|
@@ -195,13 +198,25 @@ A ticket is under 1 KiB; the 16 MiB `max_payload`
 Expiry is hygiene, not correctness: a claim on a ticket whose request is
 over is declined, so a stale ticket costs a seat one round trip.
 
+**A stream recreated.** When the brain finds the stream gone and creates
+it again, it publishes `<root>.queues.reset` (`internal.yaml`,
+`QueuesReset`), outside the stream's subjects, with the new stream's
+**incarnation**, its creation time in milliseconds:
+`{"incarnation": 1764151200000}`. Each api instance remembers the last
+incarnation it saw, and on a new one (any, when it has seen none)
+publishes again every copy it holds that is not granted, each under that
+copy's own message id. The same incarnation told twice is acted on once,
+and a copy that reached the new stream already is kept once by its
+message id.
+
 ### Consumers
 
 A work-queue stream refuses two consumers whose filters overlap, so there
 is one durable pull consumer per partition, filtered on its exact subject
 and shared by every seat that consumes it. Moving a seat between queues
 starts or stops its pulls and never changes a consumer. Its name is `w_`
-and 16 hex digits of the sha256 of the subject. Ack explicit; ack wait
+and the first 16 hex digits of the sha256 of the whole subject, root
+included. Ack explicit; ack wait
 10 s (Delivery); max deliver unlimited (TTL bounds a ticket's life, claims
 make repeats harmless); max ack pending 1024; deliver all. The brain
 creates the stream and the consumers, idempotently each tick for every
@@ -215,11 +230,12 @@ All on the node seam, so in [`protocol.yaml`](../../spec/protocol.yaml):
 - **`Ticket`**, published by the api into the stream: `request_id`,
   `attempt`, `reply_to`, `instance`, `model`, `provider_account` (the
   subject's, in the `p` shape; null in the `m` shape), `data_class`,
-  `need`, `endpoint` (`responses` or `decision`), `conversation` (32 hex
-  of a hash of the affinity key, or null), `enqueued_at`, `wait_until`,
-  `copy` (`shared` or `seat`), `avoid` (seats that failed this request),
-  `size` (voice's estimate of the input, a token per four characters, as
-  `input_tokens_estimated`).
+  `need`, `endpoint` (`responses` or `decision`), `conversation` (the
+  first 32 lower-case hex digits of the sha256 of the affinity key, or
+  null; Conversations), `enqueued_at`, `wait_until`, `copy` (`shared` or
+  `seat`), `avoid` (seats that failed this request, at most 8, as a
+  request's attempts are), `size` (voice's estimate of the input, a token
+  per four characters, as `input_tokens_estimated`).
   It goes into the stream as one or two **copies**: `shared`, on a
   partition, and, for a conversation's turn, `seat`, on the home seat's
   own queue (The window). Each copy has a `Nats-Msg-Id` of its own,
@@ -231,18 +247,28 @@ All on the node seam, so in [`protocol.yaml`](../../spec/protocol.yaml):
   `request_id`, `attempt`, `copy`, `seat` (`<node>/<seat>`). The api
   grants each attempt once, whichever copy was claimed; `copy` serves only
   to recognize a repeat (Delivery).
-- **`Grant`**, the api's answer: today's `Serve` message, body and all; or
-  **`Decline`**, with `reason` `taken` (another seat has it), `gone`
-  (answered, its caller left, or its wait ended), `avoided`, or
-  `ineligible` (the seat's provider account or data class is not one the
-  request may use, from the configuration the api read at admission).
+- **`Grant`**, the api's answer: today's `Serve` message, body and all,
+  `type: serve`; or **`Decline`**, `type: decline`, with `reason` `taken`
+  (another seat has it), `gone` (answered, its caller left, or its wait
+  ended), `avoided`, or `ineligible` (the seat's provider account or data
+  class is not one the request may use, from the configuration the api
+  read at admission). `type` tells the two apart; a grant needs no
+  wrapper, since it is the `Serve` message.
 - **`ConsumePlan`**, from the brain on `<root>.node.<node>.consume`: per
-  seat, `hold` with its reason, or the partitions to consume in order; a
-  version from Postgres's clock that only grows, as the route table's.
+  seat (at most 16, a node's most), `hold` with its reason, or the
+  subjects to consume in order (at most 64). Its `version` is the board's:
+  a node's plan is its seats' part of the board the brain wrote, and the
+  plan carries that board's version, so a node can say which board its
+  plan came from, and ignores a plan older than the one it holds.
 
 `event`, `alive`, `result` and `cancel` are unchanged. `serve` and
-`ServeAck` (with `refusal: capacity`) go with the push path (Migration),
-and the protocol becomes version 3.
+`ServeAck` (with `refusal: capacity`) go with the push path (Migration).
+
+**The protocol's version.** A node registers `protocol: 3` once it pulls
+(step (c), Building phase 1); from then on the api accepts 2 and 3 for
+exactly one release, then refuses 2 (Migration). Until step (c),
+`protocol.yaml` marks each channel and message of pulling
+`x-voice-protocol: 3`, and registration takes 2 alone.
 
 ## A request, end to end
 
@@ -346,6 +372,12 @@ one:
    consuming free slots, and the one with the shorter expected wait on the
    board (depth over free slots, times recent service time) is taken.
 
+**Headroom is read at admission.** The api reads each provider
+account's windows from `quota_window` (`store.md`) when it admits the
+request, the windows the nodes last reported, and never from the board.
+The board carries queue readings (each with its recent service time),
+models' shapes and seats' plans, and no provider account's headroom.
+
 Every instance reads the same board, up to a second old, so step 3 draws
 with randomness of its own rather than taking the best: a shared stale
 view must not send every instance's next request to one partition, the
@@ -362,6 +394,11 @@ conversation's key hashes highest with (`first_for`, rendezvous hashing,
 from its opening (`affinity_of`, `derived_conversation` in `api/usage.hl`,
 #221).
 
+A conversation is named, on a ticket and in `seat_conversation`, by the
+first 32 lower-case hex digits of the sha256 of that key, the one
+`affinity_of` returns: never the key itself, and the form
+`seat_conversation`'s check takes.
+
 ### Where a conversation is
 
 - **The api writes it at the grant**: `seat_conversation` (`conversation`
@@ -372,7 +409,10 @@ from its opening (`affinity_of`, `derived_conversation` in `api/usage.hl`,
   of the conversation hashes its tickets carried, as many as the engine
   holds, and sends it with every heartbeat; the list replaces that seat's
   rows older than the heartbeat, so a conversation the engine evicted
-  stops pointing at it.
+  stops pointing at it. This, and pruning old rows by age, come with steps
+  (c) and (d) (Building phase 1): the node's list with its pulls, the
+  api's use of it with its tickets. Until then no request's path writes
+  or reads the table.
 - **The api reads it at admission**, one indexed row. With none, or one
   whose seat no longer consumes the partition, the home seat is the one
   the key hashes highest with among the partition's consuming seats
@@ -519,8 +559,8 @@ changes when billing accounts arrive.
 
 **api.** Admission (`served_as`, `hold`, `admit`'s checks) stays. `admit`
 returns the eligible partitions in the model's shape and a
-conversation's home seat, reading the board and `seat_conversation`, not
-the route table. `serve_held`
+conversation's home seat, reading the board, `seat_conversation` and the
+provider accounts' `quota_window`, not the route table. `serve_held`
 becomes publish, wait for a claim, grant, read; the offer loop,
 `at_capacity` and its `busy` count go. The capacity wait goes:
 `await_turn`, `waiting`, `queued`, `taken`, `leave`, the queue's text
@@ -553,8 +593,9 @@ shape under its own provider account; a ticket it must not serve is
 declined `ineligible` at the claim), so a node never
 waits on the brain to serve. Draining stops every pull at once; what it
 holds runs to its result. Heartbeats carry each seat's conversations,
-prefill rate and plan version. `assign` and the node plane are unchanged;
-`serve` stays until the push path goes.
+prefill rate and plan version, from step (c) (Building phase 1); the
+heartbeat has none of them before. `assign` and the node plane are
+unchanged; `serve` stays until the push path goes.
 
 **brain.** `routes.hl` becomes `plan.hl`: `judge`, `seat_concurrency` and
 `part_routes` stay; `route_table` and `model_routes` go; the plan, the
@@ -577,16 +618,18 @@ memory and as a ticket, as it exists only in memory in `await_turn` today.
 Once the reservation lands, its `request` row covers it from admission.
 
 **spec.** `protocol.yaml` (version 3): the work subjects, `Ticket`,
-`Claim`, `Grant`, `Decline`, `ConsumePlan` and its subject, the
-heartbeat's new fields; "Serving" rewritten for pull; node permissions to
-pull from the work consumers, ack, and receive claims' answers on an
-inbox; `serve` and `ServeAck` removed with the push path. `internal.yaml`:
-`route` and `RouteNotice` go; the stream's and consumers' configuration,
-`Board` (successor of `RouteTable`, `ModelRoutes`, `SeatRoute`) and the
-reset notice come. `node.yaml`: `/node/v1/status` shows each seat's plan
-and standing pulls. `openapi.yaml`: `getQueues` replaces `getRoutes`; the
-heartbeat's body; `voice.attempts` described as grants. `store.md`: the
-board, `seat_conversation`, and the migration dropping `route_table`.
+`Claim`, `Grant`, `Decline`, `ConsumePlan` and its subject (#255), the
+heartbeat's new fields (step (c)); "Serving" rewritten for pull; node
+permissions to pull from the work consumers, ack, and receive claims'
+answers on an inbox; `serve` and `ServeAck` removed with the push path.
+`internal.yaml`: `route` and `RouteNotice` go; the stream's and
+consumers' configuration, `Board` (successor of `RouteTable`,
+`ModelRoutes`, `SeatRoute`) (#255) and the reset notice
+(`QueuesReset`) come. `node.yaml`: `/node/v1/status` shows each seat's
+plan and standing pulls (step (c)). `openapi.yaml`: `getQueues` replaces
+`getRoutes`; the heartbeat's body; `voice.attempts` described as grants.
+`store.md`: the board, `seat_conversation`, and the migration dropping
+`route_table`.
 
 ## Failure modes
 
@@ -597,7 +640,7 @@ board, `seat_conversation`, and the migration dropping `route_table`.
 | JetStream alone (core NATS up) | The publish meets no responder: `503` at once. No fallback to offering a seat directly: a second path kept for outages is a second path to keep working. |
 | A node, from NATS | Its pulls stop, so it takes no new work (today: an offer, 5 s without an ack, the next seat). Tickets it pulled and had not acked come back after the ack wait. What it was serving fails by the api's timers: retried elsewhere before output, failed after. |
 | A node, from the api only | Missed heartbeats mark it down after 15 s; the brain holds its seats, and it stops pulling once the plan reaches it over NATS. |
-| The stream lost | The brain recreates the stream and consumers on its next tick and publishes a reset on `<root>.queues.reset` (outside the stream's subjects); each api instance publishes again every copy of its requests not yet granted, each under that copy's own message id. Granted requests are out of the stream and run on. Postgres holds what is in flight (`in_flight`; `request` once reservations land), not what waits: only the waiting request's instance knows it, and it republishes. |
+| The stream lost | The brain recreates the stream and consumers on its next tick and publishes a reset on `<root>.queues.reset` (outside the stream's subjects) naming the new stream's incarnation (A stream recreated); each api instance, on an incarnation new to it, publishes again every copy of its requests not yet granted, each under that copy's own message id. Granted requests are out of the stream and run on. Postgres holds what is in flight (`in_flight`; `request` once reservations land), not what waits: only the waiting request's instance knows it, and it republishes. |
 | An api instance | Its callers' connections end with it, and nobody else can answer them: a caller's HTTP connection is to one instance. Its unclaimed tickets are orphans: a claim meets no responder at once, and the seat acks and pulls the next; the TTL clears the rest. What it granted runs to a result nobody reads, as today. The brain reclaims its rows, as today. A stop it is told of (SIGTERM) answers its unclaimed callers `503` with `Retry-After: 1` and serves what it has granted. |
 | A provider account's quota | The brain holds its seats until the window resets; the api leaves its partitions out; a request that named it is `503 no_capacity` with `Retry-After`, as today. |
 | Postgres | Nothing is served and nothing is configured, as today. |
@@ -644,38 +687,50 @@ pond `v0.9.0` with hale's changes and `max_ack_pending`,
 - `js_ack`: `+ACK` on the message's reply subject.
 
 Only the teller uses it, on the organization's nerves (`api/teller.hl`).
-Voice's own NATS runs without JetStream: `deploy/nats/nats.conf` has no
-`jetstream` block ("NATS is core NATS, not JetStream", internals.md).
+Voice's own NATS runs JetStream since #255 (`deploy/nats/nats.conf`: its
+store in Compose's `nats` volume), which nothing uses yet.
 
-The gaps this design needs closed:
+The gaps this design needs closed, each by a pull request to pond:
 
 1. **Stream settings**: work-queue retention, max age, max messages per
    subject, discard policy, duplicate window, per-message TTL
    (`allow_msg_ttl`); and `STREAM.UPDATE`, since a changed stream is
-   refused by `js_stream_create`.
+   refused by `js_stream_create`. hale-lang/pond#37 (`StreamSpec`,
+   `js_stream_create_with`, `js_stream_update`).
 2. **Consumers**: `max_deliver` (none is sent, so the server's default
-   applies) and `CONSUMER.DELETE`.
+   applies) and `CONSUMER.DELETE`. hale-lang/pond#37
+   (`ConsumerSpec.max_deliver`, `js_consumer_delete`).
 3. **Reading state**: `CONSUMER.INFO` (pending, waiting pulls, ack
    pending), `STREAM.MSG.GET` (the oldest ticket's time), stream info.
+   hale-lang/pond#39 (`js_consumer_info`, `js_stream_msg_next`,
+   `js_stream_info`).
 4. **Acks**: `-NAK` with an optional delay, for a surplus ticket and one
    that avoids the seat. `+TERM` is useful, not required.
+   hale-lang/pond#38 (`js_nak`, `js_term`).
 5. **A pull that does not block**: `MSG.NEXT` published with a batch, an
    expiry and `no_wait` to an inbox the caller already reads, and the 404,
    408 and 409 statuses that arrive there. `js_next` holds its connection
    for the whole wait, so a node pulling several partitions would need a
-   connection and a thread for each.
+   connection and a thread for each. hale-lang/pond#38 (`JsPuller`).
 6. **Headers on an acknowledged publish** beyond the message id, for
    `Nats-TTL`. The client has `pub_headers` and `request_with`; the
-   wrapper builds only `msg_id_headers`.
+   wrapper builds only `msg_id_headers`. hale-lang/pond#39
+   (`js_publish_headers`, `with_header`; and `NatsError.code`, which
+   tells a full partition from other refusals).
 7. **Delivery metadata**: stream sequence, delivery count and time, which
    the `$JS.ACK.…` reply subject carries; a small parser.
+   hale-lang/pond#38 (`js_meta`).
 8. *Optional*: `STREAM.MSG.DELETE`, to remove a cancelled ticket at once.
+   hale-lang/pond#39 (`js_stream_msg_delete`).
 
-They belong upstream in pond and reach voice by re-vendoring, after the
-pending re-vendor to pond `v0.9.1`. Outside pond: voice's NATS needs a
-`jetstream` block and a volume (Compose), and, grafted, the heart's
-broker account needs JetStream with limits and the nodes' account
-permission to pull from the work consumers and ack.
+Voice's three local patches, marked `voice:` in its copy (`NatsPublisher`
+logging through `std::log`, `NatsClient.inbox_prefix`, and the
+latest-value write's liveness), are on pond's main already, with the older
+pieces voice relies on. So voice re-vendors once, to pond's main after
+those three pull requests merge, and its copy then carries no patch of
+its own. Outside pond: grafted, the heart's broker account needs
+JetStream with limits and the nodes' account permission to pull from the
+work consumers and ack (`compose.yaml`'s header).
 
 ## Migration
 
@@ -683,11 +738,15 @@ Both paths run for one release, chosen per request by the fleet, with no
 flag:
 
 1. **Pond** gains the above; voice re-vendors it.
-2. **JetStream is on** in Compose and, grafted, in the heart's NATS account.
+2. **JetStream is on** in Compose (#255) and, grafted, in the heart's NATS
+   account.
 3. **The brain** ensures the stream and consumers and writes the board
    and plans, and still writes the route table.
-4. **The node** speaks protocol 3: it pulls and still answers `serve`, one
-   `busy` count covering both, so a slot taken by a push is not pulled for.
+4. **The node** speaks protocol 3 and registers `protocol: 3`: it pulls
+   and still answers `serve`, one `busy` count covering both, so a slot
+   taken by a push is not pulled for. From the release that ships it, the
+   api registers nodes of protocol 2 and 3 alike, for exactly that one
+   release.
 5. **The api** queues a request when every seat that could serve it is on
    a node of protocol 3, and offers it as today otherwise. A fleet moves
    model by model as its nodes upgrade, with nothing for the operator to
@@ -721,6 +780,28 @@ Proposed wording:
 > consumes and claims the request from the api instance that holds the
 > caller, which grants it once. The brain plans which queues each seat
 > consumes and is never on a request's path.
+
+### Building phase 1
+
+Phase 1 is built in five steps, each merged on its own, and none changes
+how a request is served before (d):
+
+- **(a) Groundwork** (#255): the contract of protocol 3, each channel and
+  message marked `x-voice-protocol: 3`; `lib/work` (subjects, message
+  ids, consumer names, the stream's settings, the messages' codecs); the
+  `board` and `seat_conversation` tables (store.md, Migration 47);
+  JetStream in Compose's NATS.
+- **(b) The stream**: pond's gaps closed and re-vendored (Pond), and the
+  brain ensuring the stream and the consumers (Migration, steps 1 and 2,
+  and step 3's stream and consumers).
+- **(c) Node pull**: Migration's step 4. The node registers
+  `protocol: 3`, pulls, keeps each seat's conversations, and reports on
+  its heartbeat each seat's plan version, conversations and prefill rate,
+  and on `/node/v1/status` its plans and standing pulls.
+- **(d) Api tickets**: Migration's step 5. The api publishes tickets and
+  answers claims; it writes `seat_conversation` at the grant, corrects it
+  from the heartbeats' conversations, and prunes its old rows.
+- **(e) The controller**: the brain's board and plans (The brain).
 
 ## Phase 2: loading and unloading by demand
 
@@ -815,8 +896,9 @@ Each with a recommendation.
    could pull any partition, as any can read every node's requests today.
    *Recommend accepting it for now*; per-node users, when they come, pull
    only from their seats' partitions.
-9. **One release of both paths.** *Recommend exactly one*, then refusing
-   protocol 2 at registration.
+9. **One release of both paths.** *Decided*: a node registers protocol 3
+   once it pulls (step (c)); the api accepts 2 and 3 for exactly one
+   release, then refuses 2 at registration.
 10. **Failing a silent granted seat sooner.** A node sending `alive` each
     second from the grant until first output would let the api fail it in
     the idle span (30 s) rather than the first span (120 s). *Recommend

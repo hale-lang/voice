@@ -472,12 +472,14 @@ returning version;
 ### Where a conversation is
 
 The seat a conversation's last turn was granted to, so its next turn goes
-first to the seat whose engine holds its prompt cache. A conversation is 32
-hex digits of a hash of the request's affinity key (`protocol.yaml`,
-`Ticket.conversation`), never the key itself. The api writes the row when
-it grants an attempt, and reads it at admission, one row by its key; a
-seat's node will correct its rows by the conversations it reports its
-engine holds, and old rows will be pruned by age. Neither is read on a
+first to the seat whose engine holds its prompt cache. A conversation is
+the first 32 lower-case hex digits of the sha256 of the request's affinity
+key (`protocol.yaml`, `Ticket.conversation`), never the key itself. The
+api writes the row when it grants an attempt, and reads it at admission,
+one row by its key; a seat's node will correct its rows by the
+conversations it reports its engine holds, and old rows will be pruned by
+age, with steps (c) and (d) of queue routing's phase 1
+(`docs/design/queue-routing.md`, "Building phase 1"). Neither is read on a
 request's path yet.
 
 ```sql

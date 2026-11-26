@@ -7,7 +7,7 @@ info:
     instances. Not part of the seam a node plugs into; that is
     `protocol.yaml`. Written from an api instance's side.
 
-    The one subject today tells the api instances that the route table
+    The one subject in use today tells the api instances that the route table
     changed. The brain computes the table from the fleet's reported state
     (`store.md`, "The brain's read") every second and writes it to Postgres
     (`route_table`, `store.md`, "The route table"), then publishes the new
@@ -34,6 +34,18 @@ info:
     board"), from which the api chooses a partition and the brain plans
     each node's seats (`protocol.yaml`, `ConsumePlan`). The route table
     stays until the push path goes.
+
+    The board carries each model's shape, each queue's reading (with its
+    model's recent service time) and each seat's plan, and no provider
+    account's headroom: the api reads that from `quota_window` (`store.md`)
+    when it admits a request.
+
+    When the brain finds the stream gone and creates it again, it
+    publishes the new stream's incarnation on `voice.queues.reset`,
+    outside the stream's subjects (`QueuesReset`). Each api instance, on
+    an incarnation new to it, publishes again every copy of a ticket it
+    holds that is not granted, under that copy's own `Nats-Msg-Id`, so
+    the requests waiting when the stream was lost wait on in the new one.
   contact:
     url: https://github.com/hale-lang/voice
 
@@ -50,12 +62,22 @@ channels:
     address: voice.route
     messages:
       routeNotice: { $ref: '#/components/messages/routeNotice' }
+  queuesReset:
+    address: voice.queues.reset
+    description: The work stream was created again, from the brain.
+    x-voice-protocol: 3
+    messages:
+      queuesReset: { $ref: '#/components/messages/queuesReset' }
 
 operations:
   receiveRouteNotice:
     action: receive
     channel: { $ref: '#/channels/route' }
     summary: The route table's new version, from the brain.
+  receiveQueuesReset:
+    action: receive
+    channel: { $ref: '#/channels/queuesReset' }
+    summary: The work stream's new incarnation, from the brain; publish again every copy not granted.
 
 components:
   messages:
@@ -63,6 +85,10 @@ components:
       name: route_notice
       contentType: application/octet-stream
       payload: { $ref: '#/components/schemas/RouteNotice' }
+    queuesReset:
+      name: queues_reset
+      x-voice-protocol: 3
+      payload: { $ref: '#/components/schemas/QueuesReset' }
 
   schemas:
     RouteNotice:
@@ -147,6 +173,26 @@ components:
 
     # ---- protocol 3: the work stream and the board ------------------------
 
+    QueuesReset:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        The work stream was lost and the brain created it again, with its
+        consumers. Published once, on `<root>.queues.reset`. Core NATS
+        delivers it at most once: an instance that misses it publishes
+        nothing again, and its waiting requests wait their wait out.
+      required: [incarnation]
+      properties:
+        incarnation:
+          type: integer
+          minimum: 0
+          description: |
+            The new stream's creation time, in milliseconds since the Unix
+            epoch, as JetStream's stream info gives it. An api instance
+            remembers the last it saw, and on another (or the first, when
+            it has seen none) publishes again every copy of a ticket it
+            holds that is not granted, each under its own `Nats-Msg-Id`.
+
     WorkStream:
       type: object
       x-voice-protocol: 3
@@ -159,8 +205,13 @@ components:
       properties:
         name:
           type: string
-          const: VOICE_WORK
-          description: Standalone; grafted, named from the heart's root, so two hearts on one broker do not collide.
+          pattern: '^VOICE_WORK(_[0-9a-f]{12})?$'
+          description: |
+            `VOICE_WORK` under voice's own NATS, the default root `voice`.
+            Under a habitat's broker, any other root (`heart.<id>`),
+            `VOICE_WORK_` and the first 12 lower-case hex digits of the
+            sha256 of the root, so two hearts on one broker do not collide;
+            a stream's name cannot carry the root's dots.
         subjects:
           type: array
           description: '`<root>.work.>`: every work subject, under the root.'
@@ -220,7 +271,7 @@ components:
         durable_name:
           type: string
           pattern: '^w_[0-9a-f]{16}$'
-          description: '`w_` and the first 16 hex digits of the sha256 of `filter_subject`.'
+          description: '`w_` and the first 16 lower-case hex digits of the sha256 of `filter_subject`, the whole subject, root included.'
         filter_subject:
           type: string
           description: The queue's subject, whole, under the root.

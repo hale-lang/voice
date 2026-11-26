@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257; node pull, api tickets, controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #NNN; api tickets, controller pending.
 
 Proposed, 2026-11-26.
 
@@ -104,7 +104,7 @@ Four rules carry the design:
 
 A partition is the set of requests the same seats may serve. A seat runs
 under one provider account, carries some data classes, serves some models,
-and carries tools or not (`node/capabilities.hl`, `seat_carries_tools`).
+and carries tools or not (`lib/work`, `carries_tools`).
 The provider account matters to a subject only when it splits a model's
 seats, so a model has one of two shapes:
 
@@ -304,7 +304,8 @@ exactly one release, then refuses 2 (Migration). Until step (c),
 
 A node's slot with a free place pulls a ticket, checks it (a ticket that
 avoids this seat is put back with a delay; one past `wait_until` is acked
-and dropped), claims it, acks it on `Grant` or `Decline`, and on `Grant`
+and dropped), claims it, acks it on `Grant` or `Decline` (but puts it back
+on `ineligible` and `avoided`, Delivery semantics), and on `Grant`
 runs the engine as a slot runs an accepted `serve` today
 ([`node/serve.hl`](../../node/serve.hl)).
 
@@ -312,8 +313,10 @@ runs the engine as a slot runs an accepted `serve` today
 
 - **Ack on grant**: before the engine starts, before any output. A grant
   is the seat accepting the request, as `accepted` is today. A `Decline`
-  is acked too, the ticket having no further use, except `ineligible`,
-  which is put back at once for a seat that may serve it.
+  of `taken` or `gone` is acked too, the ticket having no further use;
+  `ineligible` is put back at once for a seat that may serve it, and
+  `avoided` after a delay, as a ticket whose `avoid` names the seat is
+  (another seat may still serve it).
 - **Redelivery.** A ticket pulled and not acked within the ack wait (the
   node died or lost NATS between pull and grant) goes to another puller.
   The api dedupes by `request_id` and `attempt`, across copies: if the

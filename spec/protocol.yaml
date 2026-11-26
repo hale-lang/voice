@@ -173,15 +173,16 @@ info:
     pulls its work from queues on JetStream instead of being offered it by
     `serve`. Its channels and messages are below, each marked
     `x-voice-protocol: 3`; everything else here is protocol 2, which
-    protocol 3 keeps. The coordinator does not serve protocol 3 yet: it
-    registers a node of protocol 2 alone (`Registration.protocol`) and
-    offers every request with `serve`. A node registers `protocol: 3` once
-    it pulls; from the release that ships pulling, the coordinator
-    registers nodes of protocol 2 and 3 alike for exactly that one
-    release, and then refuses protocol 2. The heartbeat's fields for plans
-    and pulls (each seat's plan version, conversations and prefill rate),
-    and `node.yaml`'s status of them, come with the node's pulling (the
-    design's "Building phase 1", step (c)) and are not here yet.
+    protocol 3 keeps. A node of protocol 3 pulls, and registers
+    `protocol: 3`; it still answers `serve`, one count of its slots
+    covering both, so a slot serving a `serve` is not pulled for. From the
+    release that ships it, the coordinator registers nodes of protocol 2
+    and 3 alike (`Registration.protocol`) for exactly that one release,
+    and then refuses protocol 2. It publishes no ticket yet: it offers
+    every request with `serve` until it queues (the design's "Building
+    phase 1", step (d)). A node of protocol 3 reports how each seat pulls
+    on its heartbeat and in its status (`SeatState.pull`); each seat's
+    conversations and prefill rate are not reported yet.
 
     - **Tickets.** The api admits a request as it does today and publishes
       a `Ticket` for each attempt into the work stream (`VOICE_WORK`
@@ -226,10 +227,22 @@ info:
     - **Plans.** The brain publishes each node's `ConsumePlan` on
       `voice.node.<node>.consume` when it changes and every 30 s: per seat,
       held with a reason, or the queues to consume, in order. A node with no
-      plan consumes, for each seat, its own queue and the partitions its
-      assignment makes it eligible for, in both shapes (the `p` ones under
-      its own provider account); a ticket it may not serve is declined
-      `ineligible` at the claim.
+      plan, and a seat its plan does not name, consumes its own queue and
+      the partitions its assignment makes it eligible for, in both shapes
+      (the `p` ones under its own provider account); a ticket it may not
+      serve is declined `ineligible` at the claim.
+    - **How a seat pulls.** Only while it has a free slot, by the node's
+      own count, and never while it is not `up`, held by its plan, or a
+      pair's follower (rank 1), whose leader pulls for the pair. With free
+      slots it sweeps its queues in order, one pull at a time that takes
+      what is there for at most as many tickets as it has free slots
+      (`no_wait`); once every queue was found empty it holds a standing
+      pull of one ticket on each, waiting 30 s, and serves the first to
+      arrive. A ticket that comes when the seat has no free slot left (a
+      standing pull of another queue answered too) is put back at once
+      (`-NAK`). A ticket past its `wait_until` is acked and dropped; one
+      that avoids the seat, or needs tools the seat does not carry, is put
+      back after 1 s, for another seat.
 
     The subject routes a ticket; the claim decides who serves it. Grafted,
     the work subjects are under the broker's prefix as every other.
@@ -1128,6 +1141,43 @@ components:
             it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out
             until it says.
         in_flight: { type: integer, minimum: 0 }
+        pull:
+          $ref: '#/components/schemas/SeatPull'
+
+    SeatPull:
+      type: object
+      x-voice-protocol: 3
+      description: |
+        How a seat pulls, from a node of protocol 3: on its heartbeat, its
+        seats' report and its status; left out by a node of protocol 2.
+      required: [state, reason, plan_version, queues]
+      properties:
+        state:
+          type: string
+          enum: [pulling, waiting, full, held, off]
+          description: |
+            `pulling`: it has a free slot and sweeps its queues. `waiting`:
+            it has a free slot and found every queue empty, and holds a
+            standing pull on each. `full`: every slot it may take is
+            serving or claiming. `held`: its plan holds it (`reason`).
+            `off`: it pulls nothing: it is not `up`, a pair's follower, or
+            its node is not on NATS (`reason`).
+        reason:
+          type: [string, 'null']
+          description: Why it is held or off; null otherwise.
+        plan_version:
+          type: [integer, 'null']
+          description: |
+            The version of the plan it follows (`ConsumePlan.version`),
+            null while it pulls on its own eligibility (no plan, or one
+            that does not name it).
+        queues:
+          type: array
+          maxItems: 64
+          description: |
+            The work subjects it consumes, in the order it sweeps them;
+            empty when it is held.
+          items: { type: string }
 
     FetchProgress:
       type: object
@@ -1491,9 +1541,12 @@ components:
             ended). `avoided`: the seat failed this request before.
             `ineligible`: the seat's provider account or data class is not
             one the request may use, from the configuration the api read at
-            admission. The node acks the ticket on every decline but
-            `ineligible`, which it puts back at once for a seat that may
-            serve it.
+            admission. The node acks the ticket on `taken` and `gone`; it
+            puts it back for a seat that may serve it on `ineligible`, at
+            once, and on `avoided`, after 1 s, as it does a ticket whose
+            `avoid` names it. A claim nothing answers (no responders: the
+            api instance is gone) is acked and dropped; one unanswered
+            within its 2 s twice is put back at once.
 
     ConsumePlan:
       type: object
@@ -1553,8 +1606,11 @@ components:
       properties:
         protocol:
           type: integer
-          const: 2
-          description: This document's version.
+          enum: [2, 3]
+          description: |
+            This document's version the node speaks: 3, a node that pulls
+            and still answers `serve`; 2, one from before. The coordinator
+            registers both for one release, then refuses 2.
         version:
           type: string
           description: The node software's version.
@@ -1566,7 +1622,10 @@ components:
       description: The coordinator's answer to a registration.
       required: [protocol, heartbeat_interval_ms, nats, assignment]
       properties:
-        protocol: { type: integer, const: 2 }
+        protocol:
+          type: integer
+          enum: [2, 3]
+          description: The protocol the node registered under, its own.
         heartbeat_interval_ms: { type: integer, minimum: 1000 }
         nats:
           type: object

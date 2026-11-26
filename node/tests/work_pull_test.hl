@@ -1,0 +1,369 @@
+// The node's pulls (pull.hl), without NATS: the queues a seat consumes with
+// no plan and with one; whether a seat pulls (a pair's follower never); its
+// free slots; which pulls it opens, never beyond its free slots, a sweep in
+// order then standing pulls; what it does with a ticket, extras put back;
+// and how the heartbeat says it.
+import ".." as node;
+import "../../lib/work" as work;
+
+const ROOT: String = "voice";
+
+const STATIC_SEAT: String = "{\"id\": \"s1\", \"engine\": \"static\", \"account\": \"acct\", \"serves\": [{\"model\": \"glm-4.7\"}, {\"model\": \"echo\", \"as\": \"e\"}], \"data_classes\": [\"internal\", \"secret\"], \"config\": {\"text\": \"hi\"}}";
+
+const UPSTREAM_SEAT: String = "{\"id\": \"up\", \"engine\": \"cloud\", \"account\": \"work\", \"serves\": [{\"model\": \"m\"}], \"config\": {\"base_url\": \"https://x\", \"model\": \"m\"}}";
+
+fn queues(s: work::Subjects) -> String {
+    let mut out = "";
+    for q in s.items {
+        out = out + q + "\n";
+    }
+    return out;
+}
+
+fn plan_queues(p: node::SeatPull) -> String {
+    let mut out = "";
+    for q in p.queues {
+        out = out + q + "\n";
+    }
+    return out;
+}
+
+fn selection() {
+    std::test::assert_eq_str(node::root_of("voice.node.laptop", "laptop"), "voice", "the root");
+    std::test::assert_eq_str(
+        node::root_of("heart.zz.node.laptop", "laptop"),
+        "heart.zz",
+        "a habitat's root",
+    );
+    std::test::assert_eq_str(node::root_of("voice.node.other", "laptop"), "", "not its subject");
+    std::test::assert_eq_str(node::inbox_of("voice"), "_INBOX", "NATS's own inbox, standalone");
+    std::test::assert_eq_str(
+        node::inbox_of("heart.zz"),
+        "heart.zz._INBOX",
+        "under the root, grafted",
+    );
+
+    // no plan: its own queue, then each model's and class's partitions in
+    // both shapes, `any` alone for a seat that carries no tools
+    std::test::assert_eq_str(
+        queues(node::eligible_queues(ROOT, "laptop", STATIC_SEAT, "static")),
+        "voice.work.s.laptop.s1\n" + "voice.work.m.glm-4%2E7.internal.any\n"
+            + "voice.work.p.glm-4%2E7.acct.internal.any\n" + "voice.work.m.glm-4%2E7.secret.any\n"
+            + "voice.work.p.glm-4%2E7.acct.secret.any\n" + "voice.work.m.echo.internal.any\n"
+            + "voice.work.p.echo.acct.internal.any\n" + "voice.work.m.echo.secret.any\n"
+            + "voice.work.p.echo.acct.secret.any\n",
+        "a static seat's queues, both shapes, every class, `any` alone",
+    );
+    // one that carries tools consumes `tools` too; no data classes named:
+    // `internal`
+    std::test::assert_eq_str(
+        queues(node::eligible_queues(ROOT, "laptop", UPSTREAM_SEAT, "openai-compatible")),
+        "voice.work.s.laptop.up\n" + "voice.work.m.m.internal.any\n"
+            + "voice.work.m.m.internal.tools\n" + "voice.work.p.m.work.internal.any\n"
+            + "voice.work.p.m.work.internal.tools\n",
+        "an upstream's queues, `tools` too, under `internal`",
+    );
+
+    // a plan naming the seat: its queues, in its order, and its version
+    let mut plan = work::ConsumePlan { version: 42 };
+    let mut sp = work::SeatPlan { seat: "s1" };
+    push(sp.consume, "voice.work.m.echo.internal.any") or discard;
+    push(sp.consume, "voice.work.s.laptop.s1") or discard;
+    push(plan.seats, sp) or discard;
+    push(plan.seats, work::SeatPlan { seat: "held", hold: "its provider account is exhausted" })
+    or discard;
+    let followed = node::seat_pull_of(ROOT, "laptop", STATIC_SEAT, "static", plan, true);
+    std::test::assert_eq_str(
+        plan_queues(followed),
+        "voice.work.m.echo.internal.any\nvoice.work.s.laptop.s1\n",
+        "a plan's queues, in its order",
+    );
+    std::test::assert_eq_int(followed.plan_version, 42, "and its version");
+    let held = node::seat_pull_of(
+        ROOT,
+        "laptop",
+        "{\"id\": \"held\", \"account\": \"a\", \"serves\": [{\"model\": \"m\"}]}",
+        "static",
+        plan,
+        true,
+    );
+    std::test::assert(
+        held.hold == "its provider account is exhausted" && count(held.queues) == 0,
+        "a seat its plan holds consumes nothing, and says why",
+    );
+    let unnamed = node::seat_pull_of(
+        ROOT,
+        "laptop",
+        UPSTREAM_SEAT,
+        "openai-compatible",
+        plan,
+        true,
+    );
+    std::test::assert(
+        unnamed.plan_version == -1 && count(unnamed.queues) == 5,
+        "a seat the plan does not name pulls on its own eligibility",
+    );
+    let none = node::seat_pull_of(ROOT, "laptop", STATIC_SEAT, "static", plan, false);
+    std::test::assert(
+        none.plan_version == -1 && count(none.queues) == 9,
+        "with no plan, on its own eligibility",
+    );
+}
+
+fn eligibility() {
+    let up = node::NodeSeat { id: "s1", status: "up", concurrency: 2 };
+    std::test::assert_eq_str(node::pull_off_reason(up), "", "a seat up pulls");
+    std::test::assert_eq_str(
+        node::pull_off_reason(node::NodeSeat { id: "s1", status: "paused" }),
+        "the seat is paused",
+        "a paused seat does not",
+    );
+    let follower = node::NodeSeat {
+        id: "pair",
+        status: "up",
+        config: "{\"cluster\": {\"rank\": 1, \"peer\": \"spark\"}}",
+    };
+    std::test::assert_eq_str(
+        node::pull_off_reason(follower),
+        "the follower of a pair: its leader pulls",
+        "a pair's follower never pulls",
+    );
+    let leader = node::NodeSeat {
+        id: "pair",
+        status: "up",
+        config: "{\"cluster\": {\"rank\": 0, \"peer\": \"flare\"}}",
+    };
+    std::test::assert_eq_str(node::pull_off_reason(leader), "", "its leader does");
+
+    // free slots: the seat's concurrency less what it serves and claims,
+    // within the node's
+    std::test::assert_eq_int(node::free_for("", up, 40), 2, "an idle seat of 2");
+    std::test::assert_eq_int(node::free_for("0\ts1\tr1\n", up, 40), 1, "one serving");
+    std::test::assert_eq_int(
+        node::free_for("0\ts1\tr1\n1\ts1\tr2\n", up, 40),
+        0,
+        "at its concurrency",
+    );
+    std::test::assert_eq_int(
+        node::free_for("0\tother\tr1\n", up, 1),
+        0,
+        "the node's slots all taken",
+    );
+}
+
+fn slots_of(a: node::PullSlot, b: node::PullSlot, c: node::PullSlot) -> node::PullSlots {
+    let mut out = node::PullSlots { };
+    push(out.items, a) or discard;
+    push(out.items, b) or discard;
+    push(out.items, c) or discard;
+    return out;
+}
+
+fn orders(o: node::PullOrders) -> String {
+    let mut out = "";
+    for p in o.items {
+        out = out + to_string(p.slot) + (if p.stand { " stand " } else { " sweep " })
+            + to_string(p.batch) + "\n";
+    }
+    return out;
+}
+
+fn gating() {
+    let now = 1000;
+    let a = node::PullSlot { seat: "s1", subject: "q.a", order: 1 };
+    let b = node::PullSlot { seat: "s1", subject: "q.b", order: 0 };
+    let other = node::PullSlot { seat: "s2", subject: "q.a", order: 0 };
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, b, other), "s1", 0, now)),
+        "",
+        "no free slot: no pull",
+    );
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, b, other), "s1", 3, now)),
+        "1 sweep 3\n",
+        "a sweep of its first queue in order, for its free slots and no more",
+    );
+    let mut sweeping = b;
+    sweeping.open = "sweep";
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, sweeping, other), "s1", 3, now)),
+        "",
+        "one sweep at a time",
+    );
+    let mut swept = b;
+    swept.empty = true;
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, swept, other), "s1", 1, now)),
+        "0 sweep 1\n",
+        "then the next queue",
+    );
+    let mut a_empty = a;
+    a_empty.empty = true;
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a_empty, swept, other), "s1", 2, now)),
+        "0 stand 1\n1 stand 1\n",
+        "every queue empty: a standing pull of one ticket on each",
+    );
+    let mut standing = swept;
+    standing.open = "stand";
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a_empty, standing, other), "s1", 2, now)),
+        "0 stand 1\n",
+        "one already standing is not pulled again",
+    );
+    std::test::assert(
+        !node::waits_on_all(slots_of(a_empty, standing, other), "s1", now),
+        "not waiting on every queue yet",
+    );
+    let mut a_standing = a_empty;
+    a_standing.open = "stand";
+    std::test::assert(
+        node::waits_on_all(slots_of(a_standing, standing, other), "s1", now),
+        "waiting on every queue",
+    );
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a_standing, standing, other), "s1", 2, now)),
+        "",
+        "and nothing more to open",
+    );
+    let mut gone = b;
+    gone.refusals = 2;
+    gone.open = "sweep";
+    std::test::assert(
+        node::waits_on_all(slots_of(a_standing, gone, other), "s1", now),
+        "a queue with no consumer, tried again, is passed over",
+    );
+    let mut refused = b;
+    refused.retry_at = now + 1;
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, refused, other), "s1", 1, now)),
+        "0 sweep 1\n",
+        "a queue waiting out a refusal is passed over",
+    );
+    std::test::assert_eq_str(
+        orders(node::pulls_due(slots_of(a, b, other), "s2", 1, now)),
+        "2 sweep 1\n",
+        "each seat pulls its own queues",
+    );
+    std::test::assert(
+        node::retry_ms(1, 5000) == 1000 && node::retry_ms(2, 5000) == 2000
+            && node::retry_ms(3, 5000) == 4000 && node::retry_ms(4, 5000) == 5000
+            && node::retry_ms(9, 30000) == 30000,
+        "refusals wait 1 s, doubled, to their most",
+    );
+}
+
+fn ticket(avoid: String, need: String, wait_s: Int) -> String {
+    let now = std::time::unix(std::time::current());
+    let mut t = work::Ticket {
+        request_id: "resp_1",
+        attempt: 2,
+        reply_to: "voice.reply.a.resp_1.2",
+        instance: "api-1",
+        model: "echo",
+        data_class: "internal",
+        need: need,
+        enqueued_at: std::time::time_from_unix(now),
+        wait_until: std::time::time_from_unix(now + wait_s),
+    };
+    if len(avoid) > 0 { push(t.avoid, avoid) or discard; }
+    return work::ticket_json(t);
+}
+
+fn verdicts() {
+    let now = std::time::current();
+    let ok = ticket("", "any", 60);
+    std::test::assert_eq_str(
+        node::verdict(ok, "laptop/s1", true, 1, false, "", now),
+        "claim",
+        "a ticket with a free slot is claimed",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ok, "laptop/s1", true, 0, false, "", now),
+        "extra",
+        "with none free it is put back at once",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ok, "laptop/s1", false, 1, false, "", now),
+        "extra",
+        "and by a seat that pulls no more",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ticket("", "any", -1), "laptop/s1", true, 1, false, "", now),
+        "late",
+        "past its wait: dropped",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ticket("laptop/s1", "any", 60), "laptop/s1", true, 1, false, "", now),
+        "avoid",
+        "one that avoids the seat goes back with a delay",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ticket("laptop/s2", "any", 60), "laptop/s1", true, 1, false, "", now),
+        "claim",
+        "another seat's avoidance is not its",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ticket("", "tools", 60), "laptop/s1", true, 1, false, "", now),
+        "avoid",
+        "tools a seat does not carry",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ticket("", "tools", 60), "laptop/s1", true, 1, true, "", now),
+        "claim",
+        "and claimed by one that does",
+    );
+    std::test::assert_eq_str(
+        node::verdict(ok, "laptop/s1", true, 1, false, "resp_1.2.shared", now),
+        "avoid",
+        "one the api just declined it as ineligible for",
+    );
+    std::test::assert_eq_str(
+        node::verdict("{\"request_id\": 1}", "laptop/s1", true, 1, false, "", now),
+        "malformed",
+        "not a ticket",
+    );
+}
+
+fn said() {
+    let mut p = node::SeatPull { seat: "s1", state: "waiting", plan_version: 7 };
+    push(p.queues, "voice.work.s.laptop.s1") or discard;
+    std::test::assert_eq_str(
+        node::seat_pull_json(p),
+        "{\"state\": \"waiting\", \"reason\": null, \"plan_version\": 7, \"queues\": [\"voice.work.s.laptop.s1\"]}",
+        "a seat's pulls as the heartbeat says them",
+    );
+    let mut pulls = node::SeatPulls { };
+    push(
+        pulls.items,
+        node::SeatPull {
+            seat: "f",
+            state: "off",
+            reason: "the follower of a pair: its leader pulls",
+        },
+    )
+    or discard;
+    std::test::assert_eq_str(
+        node::pull_field(pulls, "f"),
+        ", \"pull\": {\"state\": \"off\", \"reason\": \"the follower of a pair: its leader pulls\", \"plan_version\": null, \"queues\": []}",
+        "a follower's, off",
+    );
+    std::test::assert_eq_str(node::pull_field(pulls, "x"), "", "none for a seat it does not hold");
+    let seats = node::apply_assignment(
+        "{\"version\": 1, \"seats\": [{\"id\": \"f\", \"engine\": \"static\", \"account\": \"a\", \"serves\": [{\"model\": \"m\"}], \"config\": {\"text\": \"hi\"}}]}",
+        "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}",
+        "{}",
+    );
+    std::test::assert(
+        std::str::contains(node::states_json(seats, "", pulls), "\"pull\": {\"state\": \"off\""),
+        "on the seat's state: " + node::states_json(seats, "", pulls),
+    );
+}
+
+fn main() {
+    selection();
+    eligibility();
+    gating();
+    verdicts();
+    said();
+}

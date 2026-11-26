@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #NNN; api tickets, controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258; api tickets, controller pending.
 
 Proposed, 2026-11-26.
 

@@ -658,9 +658,10 @@ The node also pulls its work, queue routing's phase 1
 ([`design/queue-routing.md`](./design/queue-routing.md)): it registers
 `protocol: 3`, and each seat that may serve pulls tickets from its queues
 on the work stream the brain keeps ([`node/pull.hl`](../node/pull.hl)).
-Nothing publishes a ticket yet, so a node pulls and finds nothing: the api
-offers every request with `serve` until it queues, and the node answers
-`serve` exactly as before, one count of its slots (`busy`) covering both.
+The api queues a request only when every seat that could serve it is on a
+node of protocol 3 (see "A request, end to end") and offers any other with
+`serve`, which the node answers exactly as before, one count of its slots
+(`busy`) covering both.
 A seat pulls only while it has a free slot by that count, and never while
 it is not `up`, while its plan holds it, or as a pair's follower (rank 1),
 whose leader pulls for the pair. What it consumes is its part of the
@@ -774,7 +775,8 @@ Each second the one that works:
 - keeps queue routing's work stream and its consumers
   ([`brain/work.hl`](../brain/work.hl);
   [`docs/design/queue-routing.md`](design/queue-routing.md), "The stream"
-  and "Consumers"), which nothing publishes to or pulls from yet. It reads
+  and "Consumers"), which the api queues requests on and the nodes pull
+  from. It reads
   the seats configured to serve (enabled, on a node not revoked, a pair's
   leader and not its follower; whether they are up never counts) and the
   queues they make: per catalog model they serve, data class and need
@@ -951,7 +953,49 @@ when it cannot reach the coordinator.
    the model's current price, and records the request as in flight on this
    instance. If a limit does not fit, nothing is held and the answer is
    `429`. The transactions are in [`spec/store.md`](../spec/store.md).
-3. **Pick a seat** from the route table in memory (today, from the fleet's
+3. **Queue or offer,** chosen per request, with no setting (queue
+   routing's phase 1, [`design/queue-routing.md`](./design/queue-routing.md),
+   Migration). The request is **queued** when this api instance sees the
+   work stream and every seat that could serve it (enabled, on a node not
+   revoked, not a pair's follower, spending an account the request may
+   spend, carrying its data class) is on a node that registered with
+   protocol 3; any other is **offered**, as below, until the push path goes
+   (the design's step (f)). The instance's keeper
+   ([`api/queue.hl`](../api/queue.hl), `QueueKeeper`, a thread with a NATS
+   connection of its own) reads the stream's info every 2 s and hears the
+   brain's `<root>.queues.reset`; without NATS, without JetStream, or
+   before a brain has made the stream, every request is offered. A queued
+   request whose first ticket finds no stream (gone since the keeper last
+   looked) is offered instead, nothing having been published.
+4. **Queued.** The api publishes a ticket for each attempt (`lib/work`
+   `Ticket`: what eligibility needs and where to claim it, never the
+   request's content) to one partition of the work stream: the model's
+   `m` subject when the seats configured to serve it run under one
+   provider account, else the `p` subject of one account the request may
+   spend (by lib/work's rule, which the brain makes the queues by), of
+   those not exhausted the ones with the most headroom (their windows in
+   `quota_window` as admission reads them), then one of two drawn at
+   random. Its message id is `<request id>.<attempt>.shared` and its
+   `Nats-TTL` the wait it has left. A seat with a free slot pulls it and
+   claims it on `<reply_to>.claim`; the attempt, on the instance that
+   holds the caller, grants the first claim of a seat the request may go
+   to (judged again at the claim: its provider account, data class, the
+   key's and the project's accounts, tools) with the `serve` message, body
+   and all, and declines every other: `taken` once granted (the granted
+   claim itself repeated, its answer lost, is granted again), `avoided` for
+   a seat that failed the request, `ineligible` for one it may not go to,
+   `gone` for a claim on no attempt it holds. The granted seat answers as
+   an accepted offer does, from here on the same: the same events,
+   timings, keep-alives, usage and `cancel`. It waits for a claim until
+   its `voice.deadline` or for 60 s (never past the stream's 10 minutes),
+   then answers `504 deadline_exceeded` or `429 no_capacity`, as an offered
+   request waiting for a slot does; a partition at its 1024 tickets is
+   `429 no_capacity` at once, and a stream that will not take the ticket
+   `503`. A caller gone while it waits is looked for every 250 ms; the
+   claims on the ticket it leaves behind are declined `gone` by the keeper
+   until its TTL removes it. When the brain makes the stream again, each
+   waiting attempt publishes its ticket again under the same message id.
+5. **Offered: pick a seat** from the route table in memory (today, from the fleet's
    state in the store; see "The brain"): the best-ranked seat
    for the model among the permitted accounts, with room by the api's own
    count. If the model's accounts are all exhausted, the answer is
@@ -974,7 +1018,7 @@ when it cannot reach the coordinator.
    slot within the seat is named: llama-server's `id_slot` would skip its
    own restore of a returning conversation's prefix from its prompt cache,
    and every engine finds that prefix itself.
-4. **Serve.** The api publishes `serve` on the node's subject as a request,
+   **Serve.** The api publishes `serve` on the node's subject as a request,
    naming a reply subject for this one, and the node answers `accepted` or
    `refused` at once. `refused`, or no answer, means the next candidate;
    the node, not the table, is the truth about its own capacity. The body
@@ -983,11 +1027,13 @@ when it cannot reach the coordinator.
    events come back on the reply subject, to the instance that asked, and
    are relayed as they arrive, as server-sent events or collected into one
    response. See [Events](#events).
-5. **Retry.** If the seat fails before anything reached the caller, the api
+6. **Retry.** If the seat fails before anything reached the caller, the api
    takes the next candidate, on a different seat and within the named
-   account if there is one. The move is recorded as an attempt. After
-   output has begun, a failure fails the response.
-6. **Settle,** in one transaction. The node's `result` carries the model
+   account if there is one; queued, it publishes the next attempt's ticket,
+   every seat that failed the request in its `avoid` (at most 8). The move
+   is recorded as an attempt. After output has begun, a failure fails the
+   response.
+7. **Settle,** in one transaction. The node's `result` carries the model
    that actually ran, cache writes, timing and, from the CLI engines, the
    account's quota windows. The api settles the reservation on actual
    usage and writes the usage record: of the input, what the seat's prompt

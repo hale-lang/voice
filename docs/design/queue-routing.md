@@ -671,9 +671,9 @@ plan and standing pulls (step (c)). `openapi.yaml`: `getQueues` replaces
 
 ## Pond: what JetStream support there is
 
-Voice's copy is pond's main at `843c5d3` since step (b) (#257;
-[`lib/pond/README.md`](../../lib/pond/README.md)), which closes every gap
-below (pond #37, #38, #39). Before it, the vendored copy (pond `v0.9.0`
+Voice's copy is pond's main at `0e1501f` since step (d)
+([`lib/pond/README.md`](../../lib/pond/README.md)), which closes every gap
+below (pond #37, #38, #39, #40); step (b) (#257) took it at `843c5d3`. Before it, the vendored copy (pond `v0.9.0`
 with hale's changes and `max_ack_pending`) had:
 
 - `js_stream_create(name, subjects)`: file storage over the subjects and
@@ -732,9 +732,10 @@ Voice's three local patches, marked `voice:` in its copy (`NatsPublisher`
 logging through `std::log`, `NatsClient.inbox_prefix`, and the
 latest-value write's liveness), are on pond's main already, with the older
 pieces voice relies on. So voice re-vendored once, to pond's main after
-those three pull requests merged, and dropped them; its copy carries one
-patch of its own, `StreamInfo.created_ns` (the stream's creation time,
-which the incarnation is), for pond. Outside pond: grafted, the heart's broker account needs
+those three pull requests merged, and dropped them; the one patch it
+carried then, `StreamInfo.created_ns` (the stream's creation time, which
+the incarnation is), is pond's since pond #40, and its copy carries none.
+Outside pond: grafted, the heart's broker account needs
 JetStream with limits and the nodes' account permission to pull from the
 work consumers and ack (`compose.yaml`'s header).
 

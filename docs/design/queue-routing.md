@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #PR; node pull, api tickets, controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257; node pull, api tickets, controller pending.
 
 Proposed, 2026-11-26.
 
@@ -668,7 +668,7 @@ plan and standing pulls (step (c)). `openapi.yaml`: `getQueues` replaces
 
 ## Pond: what JetStream support there is
 
-Voice's copy is pond's main at `843c5d3` since step (b) (#PR;
+Voice's copy is pond's main at `843c5d3` since step (b) (#257;
 [`lib/pond/README.md`](../../lib/pond/README.md)), which closes every gap
 below (pond #37, #38, #39). Before it, the vendored copy (pond `v0.9.0`
 with hale's changes and `max_ack_pending`) had:

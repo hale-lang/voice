@@ -32,7 +32,14 @@
 // A binding whose adapter says `delivery: Delivery::Latest` is a
 // latest-value signal instead: the conn keeps only the newest message
 // of each of its subjects that the server has not confirmed, writes it
-// when it can, and never audits it (`Delivery`).
+// when it can, and never audits it (`Delivery`); a connection that
+// stops confirming it is closed and dialled again with a growing wait
+// (`latest_confirm_ms`).
+//
+// Inbound subjects under `untyped` skip the topics: they go out on
+// `NatsInbound` as they arrived, for a subscriber that reads the bytes
+// itself and acknowledges what it pulled (`nats_ack`). `NatsPublisher`
+// is the other adapter: publish only, a connection per send, no conn.
 
 /// The outbound queue that NatsConn drains. One per program: every
 /// bound topic's adapter publishes here, and one NatsConn writes it.
@@ -50,42 +57,60 @@ locus NatsAdapter {
     }
 }
 
-/// A publish-only adapter: each `send` dials the server, publishes onto
-/// the JetStream stream that takes its subject, waits for the stream to
-/// acknowledge it (a PubAck), and hangs up — on the publisher's own
-/// thread, holding nothing between sends, so two publishers share
-/// nothing. It receives nothing and dispatches nothing into the program:
-/// a program bound to it keeps an exact artifact, its routes, publishes
-/// and reachability what its source declares, so a fleet claim over it
-/// can still be certified (a `NatsConn` hands whatever arrives to
-/// `std::bus::__local_dispatch`, any subject, which no checker can
-/// bound). For a program that says a little, rarely, and must stay
-/// provable; one that says much holds a `NatsConn`. `url` "" publishes
-/// nothing. A publish the stream did not take is said on stderr: `send`
-/// cannot fail, by contract, and this adapter keeps no queue to retry.
+/// A publish-only adapter, for a program that says a little, rarely,
+/// and keeps no connection for it. Each `send` dials the server,
+/// publishes onto the JetStream stream that takes its subject, waits for
+/// the stream's PubAck, and hangs up, all on the publisher's own thread
+/// and holding nothing between sends. It needs no `NatsConn` and no
+/// placement, and it receives nothing: no inbound subject is dispatched
+/// into the program, so the program's topology is exactly what its
+/// source declares (a `NatsConn` hands what arrives to
+/// `std::bus::__local_dispatch`, any subject). A program that says much
+/// holds a `NatsConn` instead.
+///
+/// `send` cannot fail, by contract, and this adapter keeps no queue to
+/// retry: a message it could not deliver (no connection, or no stream
+/// took it) is said as a `warn` on `std::log` (logger `nats`) and
+/// dropped. `url` "" publishes nothing.
 locus NatsPublisher {
     params {
         url: String = "";
         subject_prefix: String = "";
         name: String = "hale-bus-publisher";
         user: String = "";
-        // `user`'s password, sealed: revealed only on the CONNECT line
+        pass: String = "";
+        token: String = "";
+        // sealed: `user`'s password, or with no `user` the token,
+        // revealed only on the CONNECT line (see NatsClient)
         credential: std::secret::Credential = std::secret::Credential { };
+        // how long the dial, the handshake and the PubAck may each wait
+        timeout: Duration = 2s;
     }
     fn send(subject: String, bytes: Bytes) {
         if len(self.url) == 0 { return; }
-        let c = NatsClient { url: self.url, name: self.name, user: self.user, timeout: 2s };
-        // voice: through std::log, not a bare eprintln
+        let c = NatsClient {
+            url: self.url,
+            name: self.name,
+            user: self.user,
+            pass: self.pass,
+            token: self.token,
+            timeout: self.timeout,
+        };
         let log = std::log::Logger { name: "nats" };
         if !c.open_as(self.credential) {
-            log.warn_kv("publisher: could not connect", "error=" + c.last_error);
+            log.warn_kv(
+                "publisher: could not connect, message dropped",
+                std::log::kv("subject", self.subject_prefix + subject) + " "
+                    + std::log::kv("error", c.last_error),
+            );
             return;
         }
         let ack = js_publish(c, self.subject_prefix + subject, bytes) or PubAck { seq: -1 };
         if ack.seq < 0 {
             log.warn_kv(
                 "publisher: the stream did not take a message",
-                "subject=" + self.subject_prefix + subject + " error=" + c.last_error,
+                std::log::kv("subject", self.subject_prefix + subject) + " "
+                    + std::log::kv("error", c.last_error),
             );
         }
         c.close();
@@ -124,14 +149,18 @@ locus NatsConn {
         // `orders.new` travel as `acme.orders.new`). `subjects` are
         // given without it; a `consumer.filter` is a NATS subject, with it.
         subject_prefix: String = "";
-        // Wire subjects under this prefix are not dispatched to a topic:
-        // each goes out on `NatsInbound` as it arrived, its whole wire
-        // subject and its bytes, for a subscriber that reads them itself
-        // ("" is none). A NATS subject, with `subject_prefix` if any.
+        // Wire subjects under this prefix ("" none) are not dispatched to
+        // a topic: each goes out on `NatsInbound` as it arrived, its whole
+        // wire subject and its bytes, for a subscriber that reads them
+        // itself. A NATS subject, with `subject_prefix` if any; it still
+        // has to be received, through `subjects` or the durable consumer.
         // One pulled from the durable consumer is not acknowledged here:
         // the subscriber acknowledges it when it is done with it
         // (`nats_ack`), so what it never finishes comes again.
         untyped: String = "";
+        // where this conn's own reply subjects live (JetStream PubAcks and
+        // pulls, and its client's requests): `<inbox_prefix>.<random>`
+        inbox_prefix: String = "_INBOX";
         // JetStream. `jetstream`: outbound messages are acknowledged by
         // the stream that takes their subject (a PubAck) instead of a
         // PING barrier. `stream` + `consumer.durable`: receive from that
@@ -149,17 +178,16 @@ locus NatsConn {
         // pond COMPILER-BUGS.md #3).
         run_for_ms: Int = 0;
         reconnect_max_ms: Int = 2000;
-        // voice: a latest-value write the server has not confirmed (its
-        // PING unanswered) in `latest_confirm_ms` drops the connection,
-        // which is dialled again after a wait that doubles from 1 s to
-        // `latest_backoff_max_ms`; only a confirmed write resets the wait.
-        // A server that takes the connection and then goes silent is
-        // otherwise written to forever, the newest never told.
+        // Latest-value liveness. A latest-value write the server has not
+        // confirmed `latest_confirm_ms` after its PING (no PONG at all
+        // meanwhile) closes the connection: a server that takes the
+        // connection and then goes silent would otherwise be written to
+        // forever, the newest value never confirmed. It is dialled again
+        // after a wait that starts at 1 s and doubles up to
+        // `latest_backoff_max_ms`; only a confirmed latest-value write
+        // resets the wait, a dial alone does not.
         latest_confirm_ms: Int = 2000;
         latest_backoff_max_ms: Int = 30000;
-        latest_backoff_ms: Int = 0;
-        // monotonic ns the oldest unconfirmed latest-value PING went out, 0 none
-        latest_ping_ns: Int = 0;
 
         client: NatsClient = NatsClient { };
         // pending message i is message number base_id + i; acks[i] is 1
@@ -178,21 +206,23 @@ locus NatsConn {
         received: Int = 0;
         reconnects: Int = 0;
         last_error: String = "";
-        // the trouble behind `last_error` when the audit last spoke: what
-        // a refusal, the server or the client said, never the audit's own
-        // verdict, so an audit names the cause, not an earlier audit
+        // the trouble behind `last_error`: what a refusal, the server or
+        // the client said, never the audit's own verdict, so the audit
+        // names the cause and not an earlier verdict
         cause: String = "";
         inbox: String = "";
         ack_sid: Int = 0;
         pull_sid: Int = 0;
         pull_open: Bool = false;
-        // pulls in a row the server refused (a 503: the durable, or its
-        // stream, gone while the connection holds). The owner reads it:
-        // positive is a pulse stopped, back to 0 the pulse again. The
-        // durable is made again on the next step, and the next pull, a
-        // pull's life later, says whether it took.
+        // pulls in a row the server refused with a 503 (nothing answers:
+        // the durable, or its stream, is gone while the connection holds);
+        // back to 0 once one is answered. The durable is created again on
+        // the next step, without waiting for the reply (it arrives on
+        // `create_sid`), and pulled again at the pull's deadline, not at
+        // once.
         pull_refused: Int = 0;
         recreate_consumer: Bool = false;
+        create_sid: Int = 0;
         pull_left: Int = 0;
         pull_deadline_ns: Int = 0;
         // core mode: pending entries below this are covered by the PING
@@ -215,32 +245,36 @@ locus NatsConn {
         latest_dropped: Int = 0;
         // latest-value writes to the socket (again after a reconnect)
         latest_sent: Int = 0;
+        // monotonic ns since which a latest-value write has waited for a
+        // PONG (0: none waits), the wait before the next dial after a
+        // liveness drop (0: none dropped since the last confirmation), and
+        // how many connections were closed for want of a confirmation
+        latest_wait_ns: Int = 0;
+        latest_backoff_ms: Int = 0;
+        latest_drops: Int = 0;
         backoff_ms: Int = 0;
         retry_at_ns: Int = 0;
     }
 
-    // `NatsInbound` is heard here too, and dropped: a program that takes
-    // nothing untyped (most) still has a subscriber for what this conn
-    // publishes, and the one that sets `untyped` subscribes beside it.
-    // A pulled message only this no-op hears is never acknowledged, so
-    // it is not lost: it comes again.
+    // `NatsInbound`: what arrives under `untyped`. A pulled message that
+    // no subscriber acknowledges is not lost: it comes again.
     bus {
         subscribe NatsOutbound as on_out;
         publish NatsInbound;
-        subscribe NatsInbound as on_untyped;
     }
 
     closure delivery { captures: sent, acked, last_error; epoch inline; }
 
-    // Record why delivery is in trouble: a refused publish or a server
-    // error. The audit's verdict is written by the audit itself.
-    // `self.last_error` holds only the last trouble, replaced whole (the old text is
-    // retired); the survey cannot prove the new text independent of it.
-    @bounded_by(self.last_error)
+    // Record why delivery is in trouble.
+    // @unbounded: once per refused publish, server error, liveness drop
+    // (at most one per `latest_confirm_ms` plus its backoff), or the
+    // violation that ends this conn.
+    @unbounded
     fn note(what: String, detail: String) {
         self.last_error = what + detail;
-        self.cause = what + detail;
+        self.cause = self.last_error;
     }
+
     // What the client said, as this conn's trouble.
     fn client_trouble() {
         self.last_error = self.client.last_error;
@@ -254,19 +288,22 @@ locus NatsConn {
         self.client.token = self.token;
         self.client.name = self.name;
         self.client.timeout = self.timeout;
+        self.client.inbox_prefix = self.inbox_prefix;
         // what this program publishes reaches its own subscribers on
         // the bus already; the server must not send it back
         self.client.echo = false;
-        self.inbox = new_inbox();
+        self.inbox = new_inbox_under(self.inbox_prefix);
     }
 
     // Runs on this locus's thread, between reads (run() yields for it).
-    // One entry per message the server has not acknowledged; advance()
-    // cuts them as acknowledgements arrive and the audit ends the conn if
-    // they stop.
-    @bounded_by(unacknowledged)
+    // @unbounded: one entry per message the server has not acknowledged;
+    // advance() cuts them as acknowledgements arrive and the audit ends
+    // the conn if they stop.
+    @unbounded
     fn on_out(o: Outbound) {
         if o.ack {
+            // an untyped message's acknowledgement: once, or not at all
+            // (the message then comes again)
             if self.client.connected { self.client.pub_msg(o.subject, "", o.data) or discard; }
             return;
         }
@@ -371,61 +408,54 @@ locus NatsConn {
         }
         if wrote {
             let p = self.ping();
-            // voice: when the oldest unconfirmed write went out
-            if self.latest_ping_ns == 0 { self.latest_ping_ns = std::time::monotonic_ns(); }
+            if self.latest_wait_ns == 0 { self.latest_wait_ns = std::time::monotonic_ns(); }
         }
     }
 
-    // What PONG number `pongs` confirms of the latest-value messages.
+    // What PONG number `pongs` confirms of the latest-value messages. A
+    // confirmation resets the liveness backoff; any PONG restarts the
+    // confirm window of what still waits, since the server answers.
     fn confirm_newest() {
         let n = self.newest_wait.len();
         let mut waiting = false;
-        let mut confirmed = false;
         let mut i = 0;
         while i < n {
             let w = self.newest_wait.get(i) or 0;
             if w > 0 && w <= self.pongs {
                 self.newest_wait.set(i, 0) or discard;
-                confirmed = true;
+                self.latest_backoff_ms = 0;
             } else if w > 0 {
                 waiting = true;
             }
             i = i + 1;
         }
-        // voice: the server answers; a later drop waits from 1 s again
-        if confirmed { self.latest_backoff_ms = 0; }
-        if !waiting { self.latest_ping_ns = 0; }
+        self.latest_wait_ns = if waiting { std::time::monotonic_ns() } else { 0 };
     }
 
-    // voice: a latest-value write unconfirmed past `latest_confirm_ms`: the
-    // connection is dropped and dialled again after a wait that grows. True
-    // when it was dropped.
+    // A latest-value write unconfirmed for `latest_confirm_ms`: close the
+    // connection, and dial again after the liveness backoff. True when it
+    // was closed. What it held is written again after the redial, as after
+    // any reconnect.
     fn latest_unconfirmed(now: Int) -> Bool {
-        if self.latest_ping_ns == 0
-            || now - self.latest_ping_ns < self.latest_confirm_ms * 1000000
-        {
-            return false;
-        }
+        if self.latest_wait_ns == 0 { return false; }
+        if now - self.latest_wait_ns < self.latest_confirm_ms * 1000000 { return false; }
         self.client.close();
-        self.note(
-            "latest-value write unconfirmed after ",
-            to_string(self.latest_confirm_ms) + " ms",
-        );
-        let n = self.newest_wait.len();
-        let mut i = 0;
-        while i < n {
-            if (self.newest_wait.get(i) or 0) > 0 { self.newest_wait.set(i, -1) or discard; }
-            i = i + 1;
-        }
-        self.latest_ping_ns = 0;
+        self.latest_wait_ns = 0;
+        self.latest_drops = self.latest_drops + 1;
         self.latest_backoff_ms = if self.latest_backoff_ms == 0 {
             1000
-        } else if self.latest_backoff_ms * 2 > self.latest_backoff_max_ms {
-            self.latest_backoff_max_ms
         } else {
             self.latest_backoff_ms * 2
         };
+        if self.latest_backoff_ms > self.latest_backoff_max_ms {
+            self.latest_backoff_ms = self.latest_backoff_max_ms;
+        }
         self.retry_at_ns = now + self.latest_backoff_ms * 1000000;
+        self.note(
+            "latest-value write unconfirmed after " + to_string(self.latest_confirm_ms)
+                + " ms: connection closed, dialling again in ",
+            to_string(self.latest_backoff_ms) + " ms",
+        );
         return true;
     }
 
@@ -520,9 +550,9 @@ locus NatsConn {
             let status = header_status(f.headers);
             if len(status) > 0 {
                 // 503: nothing answers the pull while the connection holds
-                // (the durable or its stream is gone). Counted for the
-                // owner, made again on the next step, and pulled again at
-                // the pull's deadline rather than at once
+                // (the durable or its stream is gone). Counted, the durable
+                // created again on the next step, and pulled again at the
+                // pull's deadline rather than at once
                 if std::str::starts_with(status, "503") {
                     self.pull_refused = self.pull_refused + 1;
                     self.recreate_consumer = true;
@@ -540,6 +570,7 @@ locus NatsConn {
         self.pull_refused = 0;
         self.received = self.received + 1;
         if self.is_untyped(f.subject) {
+            // its subscriber acknowledges it (`nats_ack`)
             NatsInbound <- Inbound { subject: f.subject, data: f.data, reply: f.reply };
         } else {
             std::bus::__local_dispatch(self.local_subject(f.subject), f.data);
@@ -551,7 +582,25 @@ locus NatsConn {
         if self.pull_left <= 0 { self.pull_open = false; }
     }
 
-    fn on_untyped(m: Inbound) { }
+    // The reply to creating the durable again: said if refused (its stream
+    // gone too: tried again after the next refused pull), and pulled at
+    // once if not.
+    fn on_created(f: NatsFrame) {
+        let status = if f.op == "HMSG" { header_status(f.headers) } else { "" };
+        let refused = if len(status) > 0 {
+            "no reply (" + status + ")"
+        } else {
+            js_error_of(std::str::from_bytes(f.data))
+        };
+        if len(refused) > 0 {
+            self.note(
+                "jetstream: durable " + self.consumer.durable + " not created again: ",
+                refused,
+            );
+            return;
+        }
+        self.pull_open = false;
+    }
 
     fn is_untyped(subject: String) -> Bool {
         return len(self.untyped) > 0 && std::str::starts_with(subject, self.untyped);
@@ -569,6 +618,7 @@ locus NatsConn {
         if f.op == "MSG" || f.op == "HMSG" {
             if f.sid == self.ack_sid && self.ack_sid > 0 { self.on_pub_ack(f); return; }
             if f.sid == self.pull_sid && self.pull_sid > 0 { self.on_pulled(f); return; }
+            if f.sid == self.create_sid && self.create_sid > 0 { self.on_created(f); return; }
             // a core subscription's message: nothing to acknowledge
             if self.is_untyped(f.subject) {
                 NatsInbound <- Inbound { subject: f.subject, data: f.data };
@@ -589,6 +639,7 @@ locus NatsConn {
         self.pings = 0;
         self.pongs = 0;
         self.barrier = -1;
+        self.latest_wait_ns = 0;
         if !self.client.open_as(self.credential) { self.client_trouble(); return false; }
         if self.jetstream {
             self.ack_sid = self.client.sub_to(self.inbox + ".ack.*", "") or 0;
@@ -598,7 +649,9 @@ locus NatsConn {
             if !self.client.connected { self.client_trouble(); return false; }
             if std::str::starts_with(self.client.last_error, "jetstream") { self.client_trouble(); }
             self.pull_sid = self.client.sub_to(self.inbox + ".pull", "") or 0;
+            self.create_sid = self.client.sub_to(self.inbox + ".create", "") or 0;
             self.pull_open = false;
+            self.recreate_consumer = false;
         }
         let mut rest = self.subjects;
         while len(rest) > 0 {
@@ -626,12 +679,12 @@ locus NatsConn {
     }
 
     // The oldest unacknowledged message, if it is older than the window.
-    fn audit(now: Int) {
+    fn audit(now: Int) fallible(ClosureViolation) {
         if self.head >= self.pending.len() { return; }
         let queued = self.queued.get(self.head) or now;
         if now - queued < self.ack_window_ms * 1000000 { return; }
-        // the cause, not `last_error`: an earlier audit's verdict fed back
-        // in would grow the field by a verdict per audit
+        // the cause, not `last_error`: an earlier verdict fed back in
+        // would grow the field by a verdict per audit
         let why = if len(self.cause) > 0 { self.cause } else { "no acknowledgement" };
         self.last_error = "message " + to_string(self.base_id + self.head) + " on "
             + self.pending.subject_at(self.head) + " unacknowledged after "
@@ -654,9 +707,15 @@ locus NatsConn {
                 return;
             }
         }
-        if self.recreate_consumer && len(self.stream) > 0 && len(self.consumer.durable) > 0 {
+        if self.recreate_consumer && self.create_sid > 0 {
+            // not `js_consumer_create`: its request would wait here, and
+            // set aside the frames (PONGs, PubAcks, messages) this loop reads
             self.recreate_consumer = false;
-            js_consumer_create(self.client, self.stream, self.consumer) or discard;
+            self.client.pub_msg(
+                "$JS.API.CONSUMER.CREATE." + self.stream + "." + self.consumer.durable,
+                self.inbox + ".create",
+                std::bytes::from_string(consumer_create_body(self.stream, self.consumer)),
+            ) or discard;
         }
         if self.pull_sid > 0 && (!self.pull_open || now > self.pull_deadline_ns) { self.pull(); }
         let mut n = 0;
@@ -677,15 +736,17 @@ locus NatsConn {
         }
     }
 
-    // The connection's receive loop, for the conn's life;
+    // @unbounded: the connection's receive loop, for the conn's life;
     // each pass reads at most 256 frames or waits 10 ms.
+    @unbounded
     run() {
         let started = std::time::monotonic_ns();
         while !self.draining {
             let now = std::time::monotonic_ns();
             if self.run_for_ms > 0 && now - started >= self.run_for_ms * 1000000 { break; }
             self.step(now);
-            self.audit(now);
+            // a violation has begun the drain; the loop reads `draining` next
+            self.audit(now) or discard;
             // yield: NatsOutbound handlers run here, on this thread
             if self.client.connected { std::time::sleep(0ms); } else { std::time::sleep(10ms); }
         }

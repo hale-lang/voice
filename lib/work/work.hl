@@ -18,8 +18,10 @@ const PROTOCOL_PULL: Int = 3;
 // Named as pond's `StreamSpec` and `ConsumerSpec` name them, in their units
 // (milliseconds), so each is the value to set there.
 
-/// The stream's name, standalone.
+/// The stream's name under voice's own NATS (`stream_name`).
 const STREAM: String = "VOICE_WORK";
+/// The root of every subject under voice's own NATS (lib/broker).
+const DEFAULT_ROOT: String = "voice";
 /// A ticket goes when a consumer acks it.
 const STREAM_RETENTION: String = "workqueue";
 /// Tickets survive a NATS restart.
@@ -32,6 +34,10 @@ const STREAM_MAX_AGE_MS: Int = 600000;
 const STREAM_MAX_MSGS_PER_SUBJECT: Int = 1024;
 /// A full queue refuses the newcomer, not the oldest waiter.
 const STREAM_DISCARD: String = "new";
+/// The discard is per queue: a queue at its most refuses its newcomer
+/// (err_code 10077) while the others take theirs. Without it a queue at
+/// `STREAM_MAX_MSGS_PER_SUBJECT` would drop its own oldest ticket.
+const STREAM_DISCARD_NEW_PER_SUBJECT: Bool = true;
 /// A copy published again within it is kept once, by its message id.
 const STREAM_DUPLICATE_WINDOW_MS: Int = 120000;
 /// Each ticket expires at its own wait (`HEADER_TTL`).
@@ -41,6 +47,29 @@ const STREAM_ALLOW_MSG_TTL: Bool = true;
 /// wait, to `wait_until`.
 const HEADER_MSG_ID: String = "Nats-Msg-Id";
 const HEADER_TTL: String = "Nats-TTL";
+
+/// The stream's name under `root`: `VOICE_WORK` under voice's own NATS
+/// (`voice`); under any other root (a habitat's broker, `heart.<id>`),
+/// `VOICE_WORK_` and the first 12 hex digits of the root's sha256, so two
+/// hearts on one broker do not collide. A stream's name cannot carry the
+/// root's dots.
+fn stream_name(root: String) -> String {
+    if root == DEFAULT_ROOT { return STREAM; }
+    let digest = std::hex::encode(std::crypto::sha256(std::bytes::from_string(root)));
+    return STREAM + "_" + digest[0..12];
+}
+
+/// Where the brain tells the stream's new incarnation once it created the
+/// stream (internal.yaml `QueuesReset`): outside the stream's subjects.
+fn reset_subject(root: String) -> String {
+    return root + ".queues.reset";
+}
+
+/// A `QueuesReset`: the new stream's creation time, in milliseconds since
+/// the Unix epoch.
+fn reset_json(incarnation: Int) -> String {
+    return "{\"incarnation\": " + to_string(incarnation) + "}";
+}
 
 // ---- a queue's consumer (internal.yaml `WorkConsumer`) ---------------------
 
@@ -131,6 +160,41 @@ fn provider_subject(
 /// A seat's own queue, for a conversation's turns.
 fn seat_subject(root: String, node: String, seat: String) -> String {
     return root + ".work.s." + token(node) + "." + token(seat);
+}
+
+/// Whether a seat carries a request's `tools`, so it consumes its models'
+/// `tools` queues as well as their `any` ones, from its engine's `kind`
+/// (the node's declared capabilities) and its `config`: an
+/// openai-compatible seat does (its upstream speaks tool calls); a managed
+/// seat under llama-server or TensorFold, or under vLLM when its variant
+/// names a tool-call parser (the api refuses a variant naming one vLLM
+/// does not know, api/recipes.hl); a static seat as its `tool_call` drill;
+/// any other never. The rule the api offers by (api/catalog.hl
+/// `seat_tools`) and a node serves by (node/capabilities.hl
+/// `seat_carries_tools`).
+fn carries_tools(kind: String, config: String) -> Bool {
+    if kind == "openai-compatible" { return true; }
+    if kind == "managed" {
+        let server = std::json::find_string_field(
+            std::json::find_field_raw(config, "runtime"),
+            "server",
+        );
+        if server == "llama-server" || server == "tensorfold" { return true; }
+        return server == "vllm"
+            && len(
+                std::json::find_string_field(
+                    std::json::find_field_raw(config, "variant"),
+                    "tool_call_parser",
+                ),
+            ) > 0;
+    }
+    if kind == "static" {
+        return std::str::starts_with(
+            std::str::trim(std::json::find_field_raw(config, "tool_call")),
+            "{",
+        );
+    }
+    return false;
 }
 
 /// Where the brain publishes a node's plan.

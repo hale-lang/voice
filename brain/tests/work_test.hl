@@ -1,0 +1,196 @@
+// The work stream and its queues as the brain keeps them (work.hl): the
+// stream's and each consumer's settings, the stream's name under a root,
+// and the queues the seats configured to serve make, in either shape.
+import ".." as brain;
+import "../../lib/work" as work;
+
+/// One seat as `WORK_READ` gives it.
+fn seat(
+    node: String,
+    id: String,
+    account: String,
+    models: String,
+    classes: String,
+    kind: String,
+    tools: String,
+    rank: String
+) -> String {
+    return "{\"node\": \"" + node + "\", \"id\": \"" + id + "\", \"account\": \"" + account
+        + "\", \"models\": " + models + ", \"data_classes\": " + classes + ", \"kind\": " + kind
+        + ", \"tools\": " + tools + ", \"cluster_rank\": " + rank + "}";
+}
+
+const LLAMA: String = "{\"runtime\": {\"server\": \"llama-server\"}}";
+const VLLM: String = "{\"runtime\": {\"server\": \"vllm\"}}";
+
+fn settings() {
+    let s = brain::stream_spec("voice");
+    std::test::assert(
+        s.name == "VOICE_WORK" && s.subjects == "voice.work.>" && s.retention == "workqueue"
+            && s.storage == "file" && s.max_age_ms == 600000 && s.max_msgs_per_subject == 1024
+            && s.discard == "new" && s.discard_new_per_subject && s.duplicate_window_ms == 120000
+            && s.allow_msg_ttl && s.max_msgs == 0 && s.max_bytes == 0,
+        "the stream is internal.yaml's WorkStream, a full queue refusing its own newcomer",
+    );
+    let g = brain::stream_spec("heart.zz");
+    std::test::assert_eq_str(g.name, "VOICE_WORK_01d826f4b33e", "under a habitat's root");
+    std::test::assert_eq_str(g.subjects, "heart.zz.work.>", "over that root's work subjects");
+    std::test::assert(
+        brain::stream_spec("heart.zy").name != g.name,
+        "two hearts on one broker, two streams",
+    );
+    let subject = "voice.work.m.echo-1.internal.any";
+    let c = brain::consumer_spec(subject);
+    std::test::assert(
+        c.durable == "w_2feee3bc3a3dc18d" && c.durable == work::consumer_name(subject)
+            && c.filter == subject && c.deliver == "all" && c.ack_wait_ms == 10000
+            && c.max_ack_pending == 1024 && c.max_deliver == 0,
+        "a queue's consumer is internal.yaml's WorkConsumer, named from its subject",
+    );
+}
+
+fn shapes() {
+    let rows = seat(
+        "laptop",
+        "a",
+        "local",
+        "[\"echo-1\", \"glm-4.7-flash\"]",
+        "[\"internal\", \"public\"]",
+        "\"managed\"",
+        LLAMA,
+        "null",
+    ) + "\n"
+        + seat(
+            "spark",
+            "b",
+            "local",
+            "[\"glm-4.7-flash\"]",
+            "[\"internal\"]",
+            "\"managed\"",
+            VLLM,
+            "null",
+        )
+        + "\n"
+        + seat(
+            "cloud",
+            "up",
+            "hosted",
+            "[\"glm-4.7-flash\"]",
+            "[\"internal\"]",
+            "\"openai-compatible\"",
+            "{}",
+            "null",
+        )
+        + "\n";
+    let got = brain::partitions("voice", rows);
+    let want = "voice.work.m.echo-1.internal.any\n" + "voice.work.m.echo-1.internal.tools\n"
+        + "voice.work.m.echo-1.public.any\n" + "voice.work.m.echo-1.public.tools\n"
+        + "voice.work.p.glm-4%2E7-flash.local.internal.any\n"
+        + "voice.work.p.glm-4%2E7-flash.local.internal.tools\n"
+        + "voice.work.p.glm-4%2E7-flash.local.public.any\n"
+        + "voice.work.p.glm-4%2E7-flash.local.public.tools\n" + "voice.work.s.laptop.a\n"
+        + "voice.work.s.spark.b\n" + "voice.work.p.glm-4%2E7-flash.hosted.internal.any\n"
+        + "voice.work.p.glm-4%2E7-flash.hosted.internal.tools\n" + "voice.work.s.cloud.up\n";
+    std::test::assert_eq_str(
+        got,
+        want,
+        "a model under one provider account in the m shape, under two in the p shape, one per account; tools only where a seat carries them; each queue once; each seat's own",
+    );
+
+    // the second account's seat removed from configuration: glm is one
+    // account's again, in the m shape
+    let one = seat(
+        "laptop",
+        "a",
+        "local",
+        "[\"glm-4.7-flash\"]",
+        "[\"internal\"]",
+        "\"managed\"",
+        VLLM,
+        "null",
+    ) + "\n"
+        + seat(
+            "spark",
+            "b",
+            "local",
+            "[\"glm-4.7-flash\"]",
+            "[\"internal\"]",
+            "\"managed\"",
+            VLLM,
+            "null",
+        );
+    std::test::assert_eq_str(
+        brain::partitions("heart.zz", one),
+        "heart.zz.work.m.glm-4%2E7-flash.internal.any\nheart.zz.work.s.laptop.a\nheart.zz.work.s.spark.b\n",
+        "two seats of one account share the model's queue; under the broker's root",
+    );
+
+    // a pair: the leader makes the queues, the follower none, and the
+    // follower's account (were it another) changes no model's shape
+    let pair = seat(
+        "spark",
+        "big",
+        "local",
+        "[\"deepseek-v4\"]",
+        "[\"internal\"]",
+        "\"managed\"",
+        "{\"runtime\": {\"server\": \"tensorfold\"}}",
+        "0",
+    ) + "\n"
+        + seat(
+            "flare",
+            "big",
+            "other",
+            "[\"deepseek-v4\"]",
+            "[\"internal\"]",
+            "\"managed\"",
+            "{\"runtime\": {\"server\": \"tensorfold\"}}",
+            "1",
+        );
+    std::test::assert_eq_str(
+        brain::partitions("voice", pair),
+        "voice.work.m.deepseek-v4.internal.any\nvoice.work.m.deepseek-v4.internal.tools\nvoice.work.s.spark.big\n",
+        "a pair's leader makes its queues; its follower serves nothing itself",
+    );
+
+    // a node that never registered: its engine's kind unknown, so its seat
+    // is taken to carry no tools
+    std::test::assert_eq_str(
+        brain::partitions(
+            "voice",
+            seat("new", "s", "local", "[\"echo-1\"]", "[\"internal\"]", "null", LLAMA, "null"),
+        ),
+        "voice.work.m.echo-1.internal.any\nvoice.work.s.new.s\n",
+        "an engine of no known kind carries no tools",
+    );
+    std::test::assert_eq_str(brain::partitions("voice", ""), "", "no seats, no queues");
+}
+
+fn tools() {
+    std::test::assert(work::carries_tools("openai-compatible", "{}"), "an upstream carries tools");
+    std::test::assert(
+        work::carries_tools("managed", LLAMA)
+            && work::carries_tools("managed", "{\"runtime\": {\"server\": \"tensorfold\"}}")
+            && work::carries_tools(
+                "managed",
+                "{\"runtime\": {\"server\": \"vllm\"}, \"variant\": {\"tool_call_parser\": \"hermes\"}}",
+            ),
+        "llama-server, TensorFold, and vLLM with a tool-call parser do",
+    );
+    std::test::assert(
+        !work::carries_tools("managed", VLLM)
+            && !work::carries_tools("managed", "{\"runtime\": {\"server\": \"decision\"}}"),
+        "vLLM without a parser does not, nor the decision server",
+    );
+    std::test::assert(
+        work::carries_tools("static", "{\"tool_call\": {\"name\": \"t\"}}")
+            && !work::carries_tools("static", "{}") && !work::carries_tools("", LLAMA),
+        "a static seat as its drill says; an unknown kind never",
+    );
+}
+
+fn main() {
+    settings();
+    shapes();
+    tools();
+}

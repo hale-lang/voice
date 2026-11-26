@@ -1,8 +1,9 @@
 // The work stream and its queues' consumers (docs/design/queue-routing.md,
 // "The stream" and "Consumers"; internal.yaml `WorkStream`, `WorkConsumer`
-// and `QueuesReset`), which the working brain keeps. Nodes pull from its
-// queues (node/pull.hl), but nothing publishes a ticket yet: requests are
-// served through the route table.
+// and `QueuesReset`), which the working brain keeps. The api queues a
+// request on it when every seat that could serve the request pulls
+// (api/queue.hl), and nodes pull from its queues (node/pull.hl); any other
+// request is still offered through the route table.
 //
 // Each tick the working brain reads the seats configured to serve
 // (`WORK_READ`), works out the queues they make (`partitions`) and hands
@@ -88,11 +89,17 @@ type Taken { subject: String = ""; present: Bool = false; }
 @form(hashmap)
 locus TakenSubjects { capacity { pool rows of Taken indexed_by subject; } }
 
-/// Whether a row of `WORK_READ` makes queues: a pair's follower (rank
-/// other than 0) serves nothing itself, so it makes none.
+/// Whether a row of `WORK_READ` makes queues (lib/work `makes_queues`): a
+/// pair's follower (rank other than 0) serves nothing itself, so it makes
+/// none.
 fn makes_queues(row: String) -> Bool {
-    return std::json::string_field(row, "cluster_rank").kind != "number"
-        || std::json::find_int_field(row, "cluster_rank") == 0;
+    return work::makes_queues(
+        if std::json::string_field(row, "cluster_rank").kind == "number" {
+            std::json::find_int_field(row, "cluster_rank")
+        } else {
+                -1
+        },
+    );
 }
 
 /// The queues the seats of `rows` (`WORK_READ`, one a line) make under
@@ -101,7 +108,9 @@ fn makes_queues(row: String) -> Bool {
 /// one per account, when they run under more; for each data class a seat
 /// carries, `any`, and `tools` too when the seat carries tools. Each seat
 /// also has its own queue. Read from configuration alone, never from which
-/// seats are up, so a model's shape changes only when its seats do.
+/// seats are up, so a model's shape changes only when its seats do; by
+/// lib/work's rule (`makes_queues`, `several_with`, `partition`), which the
+/// api publishes by.
 @bounded_by(rows)
 fn partitions(root: String, rows: String) -> String {
     let shapes = Shapes { };
@@ -119,7 +128,7 @@ fn partitions(root: String, rows: String) -> String {
                 let s = shapes.get(model) or Shape { };
                 if !s.present {
                     shapes.set(Shape { model: model, account: account, present: true });
-                } else if !s.several && s.account != account {
+                } else if !s.several && work::several_with(s.account, s.several, account) {
                     shapes.set(
                         Shape { model: model, account: s.account, several: true, present: true },
                     );
@@ -150,12 +159,15 @@ fn partitions(root: String, rows: String) -> String {
                 while !c.done {
                     let class = json_string(c.element);
                     text = text
-                        + taken_once(taken, queue(root, model, s.several, account, class, "any"));
+                        + taken_once(
+                            taken,
+                            work::partition(root, model, s.several, account, class, "any"),
+                        );
                     if tools {
                         text = text
                             + taken_once(
                                 taken,
-                                queue(root, model, s.several, account, class, "tools"),
+                                work::partition(root, model, s.several, account, class, "tools"),
                             );
                     }
                     c = std::json::array_next(c);
@@ -170,22 +182,6 @@ fn partitions(root: String, rows: String) -> String {
         }
     }
     return text;
-}
-
-/// One queue of a model: in the `p` shape under `account`, else the `m`.
-fn queue(
-    root: String,
-    model: String,
-    several: Bool,
-    account: String,
-    class: String,
-    need: String
-) -> String {
-    return if several {
-        work::provider_subject(root, model, account, class, need)
-    } else {
-        work::model_subject(root, model, class, need)
-    };
 }
 
 /// `subject` and a line break the first time, "" after. `taken` holds a

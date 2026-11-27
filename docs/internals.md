@@ -1412,6 +1412,10 @@ on, plus shared seeds for the protocol's message types and for the store
 (schema and queries, used by both the api and the brain). The shapes come
 from Hale's
 [styleguide](https://github.com/hale-lang/hale/blob/main/spec/styleguide.md).
+What each program may reach (Postgres, each side of queue routing's
+protocol, the work stream) is law: claims in [`lib/law`](../lib/law/law.hl)
+that `hale check` proves of each program, listed with the invariants they
+hold and the ones they cannot yet in [constitution.md](./constitution.md).
 
 **Api**
 

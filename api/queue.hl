@@ -300,12 +300,15 @@ type SeatFact {
     allowed: Bool = false;
     used: Float = 0.0;
     exhausted: Bool = false;
+    // the conversations its engine holds (lib/concurrency
+    // `conversations_held`): none for a hosted seat
+    holds: Int = 0;
 }
 
 type SeatFacts { items: bounded[SeatFact; 64]; }
 
 /// One partition a queued request may be published to: its subject, the
-/// provider account it is under (\"\" in the `m` shape, which names none),
+/// provider account it is under ("" in the `m` shape, which names none),
 /// that account's fullest window and whether one is at 100%.
 type Partition {
     subject: String = "";
@@ -325,6 +328,15 @@ type QueuePlan {
     // the seats a claim may be granted to (its seat, its account, the
     // model's name there), with no config
     seats: bounded[Candidate; 32];
+    // those of them whose engines hold conversations, `\n<node>/<seat>\n`
+    // each
+    holding: String = "\n";
+    // the conversation it is a turn of (lib/work `conversation_of`, "" for
+    // none) and its home seat, whose own queue it is published to first
+    // (`home_of`; none, `seat.ref` "", for a turn that goes straight to
+    // its partition)
+    conversation: String = "";
+    home: Candidate = Candidate { };
 }
 
 /// A seat as a claim's grant needs it: everything but its config, which may
@@ -398,6 +410,7 @@ fn queue_plan_of(
             && (need != "tools" || f.tools)
         {
             push(out.seats, claim_candidate(f)) or discard;
+            if f.holds > 0 { out.holding = out.holding + f.seat.ref + "\n"; }
             let subject = work::partition(root, model, several, f.seat.account, class, need);
             let mut known = false;
             for p in out.partitions {
@@ -427,7 +440,7 @@ fn queue_plan_of(
 /// random (`a`, `b`, any integers), the one with the shorter expected wait.
 /// The expected wait is the board's (depth over free slots, times recent
 /// service time), which comes with the controller (step (e)); until then
-/// every partition's is the same and the first draw is taken. \"\" when
+/// every partition's is the same and the first draw is taken. "" when
 /// none is left.
 fn chosen(q: QueuePlan, avoid: String, a: Int, b: Int) -> String {
     let mut open = 0;
@@ -508,6 +521,60 @@ fn seat_refs(q: QueuePlan) -> String {
     return out;
 }
 
+// ---- a conversation's turn (the design's "Conversations") -----------------
+
+/// The longest a turn waits on its home seat before its partition takes it
+/// too, whatever its miss.
+const WINDOW_MOST_MS: Int = 10000;
+/// The window of a seat with no measured prefill rate (the design: "until a
+/// seat has one, W is 1 s"). Nodes do not report one yet: every window is
+/// this, until they do.
+const WINDOW_UNMEASURED_MS: Int = 1000;
+
+/// A turn's home seat (the design's "Where a conversation is"), of `q`'s
+/// seats: the seat `recorded` (`seat_conversation`, "" for none) when it is
+/// among the seats admission found up (`items`, already in the order their
+/// refs hash with the conversation's key, `first_for`); else the first of
+/// them it may be granted to, as rendezvous hashing puts a new conversation
+/// where every instance would. None (`seat.ref` "") when that seat's engine
+/// holds no conversations (a hosted seat, whose provider's cache is the
+/// provider account's): such a turn goes straight to its partition.
+fn home_of(q: QueuePlan, recorded: String, items: bounded[Candidate; 8]) -> Candidate {
+    let mut home = "";
+    if len(recorded) > 0 {
+        for c in items {
+            if c.seat.ref == recorded { home = recorded; }
+        }
+    }
+    if len(home) == 0 {
+        for c in items {
+            if len(home) == 0 && len(claimed_seat(q, c.seat.ref).seat.ref) > 0 {
+                home = c.seat.ref;
+            }
+        }
+    }
+    let seat = claimed_seat(q, home);
+    if len(seat.seat.ref) == 0 || !std::str::contains(q.holding, "\n" + home + "\n") {
+        return Candidate { };
+    }
+    return seat;
+}
+
+/// How long a turn waits on its home seat (the design's "The window"):
+/// half its estimated miss (`size` tokens read at `prefill_rate` tokens a
+/// second; `WINDOW_UNMEASURED_MS` for a seat with no rate, 0), at most
+/// `WINDOW_MOST_MS` and half the time it has left (`left_ms`).
+fn window_ms(size: Int, prefill_rate: Int, left_ms: Int) -> Int {
+    let mut w = if prefill_rate > 0 {
+        size * 1000 / prefill_rate / 2
+    } else {
+        WINDOW_UNMEASURED_MS
+    };
+    if w > WINDOW_MOST_MS { w = WINDOW_MOST_MS; }
+    if w > left_ms / 2 { w = left_ms / 2; }
+    return if w > 0 { w } else { 0 };
+}
+
 // ---- claims ---------------------------------------------------------------
 
 /// How the claim `c` on attempt `attempt` of request `request_id` is
@@ -540,9 +607,10 @@ fn claim_verdict(
 }
 
 /// The ticket of attempt `attempt` of request `request_id`, its claims on
-/// `reply_to`, published to `partition` (its provider account, \"\" in the
+/// `reply_to`, published to `partition` (its provider account, "" in the
 /// `m` shape) by `instance`, waiting until `wait_until`, the seats that
-/// failed it in `avoid` (`\n<node>/<seat>\n` each, at most 8).
+/// failed it in `avoid` (`\n<node>/<seat>\n` each, at most 8), a turn of
+/// `conversation` ("" for none), as its `copy` (`shared` or `seat`).
 fn ticket_of_request(
     r: InferenceRequest,
     request_id: String,
@@ -552,7 +620,9 @@ fn ticket_of_request(
     account: String,
     need: String,
     wait_until: Time,
-    avoid: String
+    avoid: String,
+    conversation: String,
+    copy: String
 ) -> work::Ticket {
     let mut t = work::Ticket {
         request_id: request_id,
@@ -566,7 +636,8 @@ fn ticket_of_request(
         endpoint: r.seat_endpoint,
         enqueued_at: std::time::current(),
         wait_until: wait_until,
-        copy: "shared",
+        conversation: conversation,
+        copy: copy,
         size: estimated_input_tokens(r.body),
     };
     let v = std::str::bytes_view(avoid);

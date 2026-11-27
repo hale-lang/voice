@@ -1,0 +1,121 @@
+// Voice's constitution (docs/constitution.md): the architectural invariants
+// `hale check --matrix` proves of each program, as claims over its closed
+// world. A policy seed: it declares no `main locus`. Every program imports
+// it, and the repository's hale.toml binds the law: `Voice`, the base,
+// to every program, and each program's own constitution through its
+// environment (`[environments.api]`: `VoiceApi`). `program` in a claim is
+// then the checked program's own declarations. Importing this seed binds
+// nothing: a plain `hale check api` holds the api to none of it.
+//
+// The vocabulary is the libraries the programs share: pond's Postgres
+// driver and NATS client, and queue routing's protocol (lib/work). A claim
+// names who may reach which part of it; a change that breaks one fails the
+// check with the path that breaks it. Claims compile away.
+
+import "../pond/pq" as pq;
+import "../pond/db" as db;
+import "../pond/migrations" as migs;
+import "../pond/realtime/nats" as nats;
+import "../work" as work;
+
+// ---- the vocabulary ---------------------------------------------------------
+
+// Postgres: the driver, its query layer and the migrator.
+group postgres = { pq::*, db::*, migs::* };
+
+// A message published into a JetStream stream: voice's work stream, or the
+// organization's nerves.
+group stream_publish = { nats::js_publish, nats::js_publish_id, nats::js_publish_headers };
+
+// Taking work off a stream: pulling a ticket and settling it.
+group stream_consume = { nats::JsPuller, nats::js_next, nats::js_ack, nats::js_nak, nats::js_term };
+
+// Keeping the work stream and its consumers, which only the brain does.
+group stream_keeping = {
+    nats::js_stream_create,
+    nats::js_stream_create_with,
+    nats::js_stream_update,
+    nats::js_stream_delete,
+    nats::js_consumer_create,
+    nats::js_consumer_delete,
+};
+
+// Writing a ticket, which only the api enqueues.
+group ticket_writing = { work::ticket_json };
+
+// Reading a ticket, which a seat does when it pulls one.
+group ticket_reading = { work::ticket_of };
+
+// A seat's claim on a ticket's request, and reading the api's answer.
+group claiming = { work::claim_json, work::claim_subject, work::answer_of };
+
+// Answering a claim: reading it, and declining it (a grant is the `serve`
+// message, which only the api holds).
+group granting = { work::claim_of, work::decline_json };
+
+// Queue routing's codec, all of it.
+group work_protocol = { work::* };
+
+// The drivers that dial with a credential: Postgres and NATS.
+group drivers = { pq::*, db::*, migs::*, nats::* };
+
+// ---- every program ---------------------------------------------------------
+
+// The base, every program's (hale.toml `[claims] base`): queue routing's
+// codec is data alone. It does no I/O and touches no secret, so a ticket,
+// a claim or a plan carries only what its caller put in it.
+constitution Voice {
+    protocol_codec_does_no_io: forbid reaches(work_protocol, effects(syscall));
+    protocol_codec_holds_no_secret: forbid reaches(work_protocol, effects(secret_use));
+}
+
+// ---- the programs -----------------------------------------------------------
+
+// The api: it enqueues tickets and answers claims; it never claims a
+// ticket or takes one off the stream, which is a seat's.
+constitution VoiceApi extends Voice {
+    api_never_claims: forbid reaches(program, claiming);
+    api_never_reads_a_ticket: forbid reaches(program, ticket_reading);
+    api_never_consumes_work: forbid reaches(program, stream_consume);
+    api_never_keeps_the_stream: forbid reaches(program, stream_keeping);
+    // the hosted tool (web_fetch.hl) reads what a page says, which is
+    // untrusted: its code reaches neither the store nor NATS
+    fetch_reaches_no_driver: forbid reaches(hosted_fetch, drivers);
+}
+
+// The node: it pulls tickets and claims them; it never enqueues one,
+// answers a claim, publishes into a stream or reaches Postgres.
+constitution VoiceNode extends Voice {
+    node_never_reaches_postgres: forbid reaches(program, postgres);
+    node_never_writes_a_ticket: forbid reaches(program, ticket_writing);
+    node_never_grants: forbid reaches(program, granting);
+    node_never_publishes_into_a_stream: forbid reaches(program, stream_publish);
+    node_never_keeps_the_stream: forbid reaches(program, stream_keeping);
+}
+
+// The brain: it steers and never serves. It reads the fleet from Postgres
+// and keeps the stream and its consumers; it never writes, reads, claims,
+// grants or consumes a request's work, and never publishes into a stream.
+// Its own code never holds a secret: the credentials it is given go to the
+// drivers that dial with them.
+constitution VoiceBrain extends Voice {
+    brain_never_writes_a_ticket: forbid reaches(program, ticket_writing);
+    brain_never_reads_a_ticket: forbid reaches(program, ticket_reading);
+    brain_never_claims: forbid reaches(program, claiming);
+    brain_never_grants: forbid reaches(program, granting);
+    brain_never_consumes_work: forbid reaches(program, stream_consume);
+    brain_never_publishes_into_a_stream: forbid reaches(program, stream_publish);
+    brain_holds_no_secret: forbid reaches(program, effects(secret_use)) avoiding drivers;
+    // every line it writes goes through std::log (std::law::Standard's
+    // clause, which a constitution cannot extend by its path yet)
+    brain_logs_structured: forbid reaches(program, effects(stdio)) avoiding std::log::*;
+}
+
+// voice-decide: the decision runtime a node starts, an engine like any
+// other. It knows nothing of the coordinator: no Postgres, no NATS, no
+// queue routing.
+constitution VoiceDecide extends Voice {
+    decide_never_reaches_postgres: forbid reaches(program, postgres);
+    decide_never_reaches_nats: forbid reaches(program, drivers);
+    decide_speaks_no_voice_protocol: forbid reaches(program, work_protocol);
+}

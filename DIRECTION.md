@@ -153,14 +153,20 @@ Requests move between the pieces as Hale bus topics, keyed by node and by
 request, bound to NATS from the MVP on: an api instance publishes `serve` on
 the node's subject, and the node streams the answer to the reply subject
 that request named. No instance holds a node's connection, so nothing is
-forwarded. [`docs/internals.md`](./docs/internals.md) documents the architecture.
+forwarded. [`docs/internals.md`](./docs/internals.md) documents the architecture,
+and [`docs/constitution.md`](./docs/constitution.md) what `hale check --matrix`
+proves of it: which program may reach Postgres, enqueue, claim, grant and
+keep the work stream, as claims `hale.toml` binds to every program.
 
 - `axiom` **The MVP runs the real process model.** The api and the brain are
   separate processes from the start (one api, one [brain](./brain/)), so the
   process model is the real one from the first slice
   ([`compose.yaml`](./compose.yaml)). The brain reads the fleet only from
   Postgres and hands the api nothing but the route table, and the process
-  boundary makes that a fact rather than a convention.
+  boundary makes that a fact rather than a convention. Partly enforced by
+  claim: the brain never writes, reads, claims, grants or consumes a
+  request's work (`brain_never_*`,
+  [`docs/constitution.md`](./docs/constitution.md)).
 - `axiom` **State never travels as events; it stays in Postgres.** What
   crosses NATS is a snapshot or a request
   ([`internal.yaml`](./spec/internal.yaml)); reservations and settlement are

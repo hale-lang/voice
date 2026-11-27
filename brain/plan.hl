@@ -12,16 +12,16 @@
 // - orders each seat's queues (`ordered`): its own queue first, then its
 //   partitions; for a seat that serves several models, by pressure (the
 //   oldest ticket's age over its model's service time), with hysteresis;
-//   and last, the same partitions in the other shape, as a node with no
-//   plan consumes both, so tickets the api published before a model
-//   changed shape are served (their consumers, made before, stay; one
-//   that does not exist is a pull refused, which the node passes over);
+//   and last, a model changing shape's queues in the other shape: the new
+//   one's while the change is prepared, the old one's until it drains
+//   (`wanted_state`, `settled_state`, the board's `models`);
 // - writes the board, one row, versioned as the route table is, and hands
 //   each node's plan to its keeper, which publishes it on
 //   `<root>.node.<node>.consume` with the board's version.
 //
 // Phase 1 orders and holds; it never takes a partition from a seat it
-// configures, so none loses its last consumer.
+// configures, so none loses its last consumer, but in a change of shape's
+// old queues, once they drained.
 
 import "../lib/work" as work;
 
@@ -137,8 +137,8 @@ fn fill_services(out: Services, csv: String) {
 }
 
 /// The orders the last tick left (`Planned.orders`: `<seat>\t<streak>\t<its
-/// partitions, space-separated>` a line) into `out`. A subject holds no
-/// whitespace (lib/work `token`).
+/// partitions, space-separated, by `order_key`>` a line) into `out`. A key
+/// holds no whitespace (lib/work `token`).
 @bounded_by(text)
 fn fill_orders(out: SeatOrders, text: String) {
     let v = std::str::bytes_view(text);
@@ -250,6 +250,14 @@ fn ordered(base: work::Subjects, current: work::Subjects, streak: Int, p: Pressu
     return Ordered { order: want, streak: 0, changed: true };
 }
 
+/// A partition's place in a seat's order, whatever its shape (a line of
+/// `state_queues`): its model, data class and need, as tokens, which hold
+/// no whitespace.
+fn order_key(line: String) -> String {
+    return work::token(tab_field(line, 3)) + "." + work::token(tab_field(line, 5)) + "."
+        + tab_field(line, 6);
+}
+
 /// A list of subjects, space-separated (`fill_orders`).
 fn spaced(items: bounded[String; 64]) -> String {
     let mut out = "";
@@ -288,6 +296,35 @@ type Planned {
     plans: String = "";
     orders: String = "";
     said: String = "";
+    // every queue the seats make, each once, a line each: the consumers to
+    // keep
+    subjects: String = "";
+    // each model whose shape flipped or whose old shape was let go, why
+    // (`<model>\t<why>` a line)
+    changed: String = "";
+}
+
+/// A model's state as the board holds it (internal.yaml `BoardModel`).
+fn model_json(s: ModelState) -> String {
+    return "{\"model\": " + st::jq(s.model) + ", \"shape\": " + st::jq(s.shape)
+        + ", \"provider_account\": " + jq_or_null(if s.shape == "m" { s.account } else { "" })
+        + ", \"next\": "
+        + (if len(s.next) > 0 {
+            "{\"shape\": " + st::jq(s.next) + ", \"provider_account\": "
+                + jq_or_null(if s.next == "m" { s.next_account } else { "" }) + ", \"after\": "
+                + to_string(s.next_after) + "}"
+        } else {
+            "null"
+        })
+        + ", \"previous\": "
+        + (if len(s.prev) > 0 {
+            "{\"shape\": " + st::jq(s.prev) + ", \"provider_account\": "
+                + jq_or_null(if s.prev == "m" { s.prev_account } else { "" }) + ", \"since\": "
+                + to_string(s.prev_since) + "}"
+        } else {
+            "null"
+        })
+        + "}";
 }
 
 /// A JSON list of strings.
@@ -303,11 +340,244 @@ fn jq_or_null(s: String) -> String {
     return if len(s) > 0 { st::jq(s) } else { "null" };
 }
 
+// ---- a model's shape, and its changes (the design's "A model changing
+// shape") ------------------------------------------------------------------
+
+/// A model's shape as the board says it (internal.yaml `BoardModel`): the
+/// shape the api publishes in (`m` under its one provider account, or `p`),
+/// a change prepared (`next`, its account in the `m` shape, and the board's
+/// version before the one that prepared it, `next_after`), and the shape it
+/// left (`prev`, its account, since when in ms of the store's clock), whose
+/// queues are consumed until they drain.
+type ModelState {
+    model: String = "";
+    shape: String = "m";
+    account: String = "";
+    next: String = "";
+    next_account: String = "";
+    next_after: Int = 0;
+    prev: String = "";
+    prev_account: String = "";
+    prev_since: Int = 0;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus ModelStates { capacity { pool rows of ModelState indexed_by model; } }
+
+/// The last board's `models` (a JSON list of `BoardModel`s) into `out`.
+@bounded_by(models)
+fn fill_states(out: ModelStates, models: String) {
+    let mut it = std::json::array_first(models);
+    while !it.done {
+        let m = std::str::trim(it.element);
+        let model = st::pg_text(m, "model");
+        let shape = st::pg_text(m, "shape");
+        if len(model) > 0 && (shape == "m" || shape == "p") {
+            let next = std::str::trim(std::json::find_field_raw(m, "next"));
+            let prev = std::str::trim(std::json::find_field_raw(m, "previous"));
+            out.set(
+                ModelState {
+                    model: model,
+                    shape: shape,
+                    account: st::pg_text(m, "provider_account"),
+                    next: if std::str::starts_with(next, "{") {
+                        st::pg_text(next, "shape")
+                    } else {
+                        ""
+                    },
+                    next_account: st::pg_text(next, "provider_account"),
+                    next_after: int_or(next, "after", 0),
+                    prev: if std::str::starts_with(prev, "{") {
+                        st::pg_text(prev, "shape")
+                    } else {
+                        ""
+                    },
+                    prev_account: st::pg_text(prev, "provider_account"),
+                    prev_since: int_or(prev, "since", 0),
+                    present: true,
+                },
+            );
+        }
+        it = std::json::array_next(it);
+    }
+}
+
+/// A model's state this tick before its queues are looked at: `was` (the
+/// last board's; `present` false for a model it did not hold), configuration
+/// wanting `want` (its shape, from its seats: several provider accounts or
+/// one, `want.account` the first), `last_version` the last board's version.
+/// A model the board did not hold takes configuration's shape at once:
+/// nothing was published in another. One whose shape configuration keeps
+/// stays, its `m` account configuration's, a change it had prepared
+/// dropped. One whose shape configuration changes prepares the change
+/// (`next`), and keeps it while it is the same; the board still says the
+/// old shape, which the api publishes in, until `settled` flips it.
+fn wanted_state(was: ModelState, want: Shape, last_version: Int) -> ModelState {
+    let shape = if want.several { "p" } else { "m" };
+    let account = if want.several { "" } else { want.account };
+    if !was.present {
+        return ModelState { model: want.model, shape: shape, account: account, present: true };
+    }
+    let mut out = was;
+    if was.shape == shape {
+        out.account = account;
+        out.next = "";
+        out.next_account = "";
+        out.next_after = 0;
+        return out;
+    }
+    if was.next != shape || was.next_account != account {
+        out.next = shape;
+        out.next_account = account;
+        out.next_after = last_version;
+    }
+    return out;
+}
+
+/// `s` once its queues are looked at: a change prepared flips the board
+/// (`ready`: the keeper read every queue of the new shape, so their
+/// consumers are made, in a pass after the board that prepared it, so the
+/// plans naming them are out), the old shape kept as `prev` since `now_ms`;
+/// an old shape left long enough and empty (`drained`) is let go.
+fn settled_state(s: ModelState, ready: Bool, drained: Bool, now_ms: Int) -> ModelState {
+    let mut out = s;
+    if len(out.prev) > 0 && drained {
+        out.prev = "";
+        out.prev_account = "";
+        out.prev_since = 0;
+    }
+    if len(out.next) > 0 && ready {
+        out.prev = s.shape;
+        out.prev_account = s.account;
+        out.prev_since = now_ms;
+        out.shape = s.next;
+        out.account = s.next_account;
+        out.next = "";
+        out.next_account = "";
+        out.next_after = 0;
+    }
+    return out;
+}
+
+/// Whether a seat under `account` consumes a model's queues in `shape`
+/// (under `under`, its one account, in the `m` shape): a `p` queue is the
+/// seat's own account's; an `m` queue only its account's seats consume,
+/// since its tickets were judged against that account alone.
+fn consumes_in(shape: String, under: String, account: String) -> Bool {
+    return shape == "p" || under == account;
+}
+
+/// A model's queue for data class `class` and `need` in `shape`, under
+/// `account` in the `p` shape.
+fn subject_in(
+    root: String,
+    model: String,
+    shape: String,
+    account: String,
+    class: String,
+    need: String
+) -> String {
+    return work::partition(root, model, shape == "p", account, class, need);
+}
+
+/// The queues the seats of `rows` (`WORK_READ`) make under `root`, the
+/// models in the states of `states`, one a line: `<node>/<seat>`, the
+/// subject, its shape (`m`, `p`, `s` for the seat's own), model, provider
+/// account (`p`), data class, need, and its role: `own`; `cur`, the shape
+/// the board says; `next`, a change prepared; `prev`, the shape left. A
+/// seat's own queue first, then each model it serves, each data class, `any`
+/// and `tools` when it carries tools, in configuration's order; for each,
+/// the queue in each shape the seat consumes (`consumes_in`). A pair's
+/// follower makes none.
+@bounded_by(rows)
+fn state_queues(root: String, rows: String, states: ModelStates) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let lines = std::str::bytes_view(rows);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let row = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(row) > 0 && makes_queues(row) {
+            let node = st::pg_text(row, "node");
+            let id = st::pg_text(row, "id");
+            let ref = node + "/" + id;
+            let account = st::pg_text(row, "account");
+            let tools = work::carries_tools(
+                st::pg_text(row, "kind"),
+                std::json::find_field_raw(row, "tools"),
+            );
+            out.append_str(ref + "\t" + work::seat_subject(root, node, id) + "\ts\t\t\t\t\town\n");
+            let classes = std::json::find_field_raw(row, "data_classes");
+            let mut m = std::json::array_first(std::json::find_field_raw(row, "models"));
+            while !m.done {
+                let model = json_string(m.element);
+                let s = states.get(model) or ModelState { };
+                let mut c = std::json::array_first(classes);
+                while s.present && !c.done {
+                    let class = json_string(c.element);
+                    for need in ["any", "tools"] {
+                        if need == "any" || tools {
+                            for role in ["cur", "next", "prev"] {
+                                let shape = if role == "cur" {
+                                    s.shape
+                                } else if role == "next" {
+                                    s.next
+                                } else {
+                                    s.prev
+                                };
+                                let under = if role == "cur" {
+                                    s.account
+                                } else if role == "next" {
+                                    s.next_account
+                                } else {
+                                    s.prev_account
+                                };
+                                if len(shape) > 0 && consumes_in(shape, under, account) {
+                                    out.append_str(
+                                        ref + "\t"
+                                            + subject_in(root, model, shape, account, class, need)
+                                            + "\t" + shape + "\t" + model + "\t"
+                                            + (if shape == "p" { account } else { "" }) + "\t"
+                                            + class
+                                            + "\t" + need + "\t" + role + "\n",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    c = std::json::array_next(c);
+                }
+                m = std::json::array_next(m);
+            }
+        }
+    }
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// Whether a model's change can flip and its old shape be let go, from its
+/// queues (`state_queues`'s lines) and the keeper's readings.
+type Settle {
+    model: String = "";
+    unready: Bool = false;
+    undrained: Bool = false;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus Settles { capacity { pool rows of Settle indexed_by model; } }
+
 /// The plan of a tick under `root`: from the seats judged (`seats`,
 /// `SEAT_READ`'s rows), the seats configured to serve and what they serve
 /// (`work`, `WORK_READ`'s), the ledger's service times (`services`,
-/// `SERVICE_READ`'s), the keeper's last readings (`readings`) and the
-/// orders the last tick left (`orders`).
+/// `SERVICE_READ`'s), the keeper's last readings (`readings`) from its pass
+/// over the board at `read_version` (0 for none yet), the orders the last
+/// tick left (`orders`), and the last board (its `models`, `last_models`,
+/// and version, `last_version`); `now_ms` the store's clock, and `drain_ms`
+/// the longest a ticket waits, after which a shape left and empty is let
+/// go.
 @bounded_by(seats)
 fn plan(
     root: String,
@@ -315,23 +585,76 @@ fn plan(
     work: String,
     services: String,
     readings: String,
-    orders: String
+    read_version: Int,
+    orders: String,
+    last_models: String,
+    last_version: Int,
+    now_ms: Int,
+    drain_ms: Int
 ) -> Planned {
     let shapes = Shapes { };
     fill_shapes(shapes, work);
-    let queues = seat_queues(root, work, shapes);
     let read = Readings { };
     fill_readings(read, readings);
     let service = Services { };
     fill_services(service, services);
     let before = SeatOrders { };
     fill_orders(before, orders);
+    let was = ModelStates { };
+    fill_states(was, last_models);
+
+    // each model's shape: configuration's, a change prepared, or flipped
+    let states = ModelStates { };
+    for sh in shapes.entries {
+        let w = was.get(sh.model) or ModelState { };
+        states.set(wanted_state(w, sh, last_version));
+    }
+    let draft = state_queues(root, work, states);
+    let settles = Settles { };
+    let dv = std::str::bytes_view(draft);
+    let mut start = 0;
+    while start < dv.n {
+        let nl = st::line_end(dv, start);
+        let line = std::str::slice(dv, start, nl);
+        start = nl + 1;
+        let role = tab_field(line, 7);
+        if role == "next" || role == "prev" {
+            let model = tab_field(line, 3);
+            let r = read.get(tab_field(line, 1)) or Reading { };
+            let had = settles.get(model) or Settle { model: model, present: true };
+            let mut x = had;
+            if role == "next" && !r.present { x.unready = true; }
+            if role == "prev" && r.present && (r.depth > 0 || r.ack_pending > 0) {
+                x.undrained = true;
+            }
+            settles.set(x);
+        }
+    }
+    let mut changed = "";
+    for sh in shapes.entries {
+        let s = states.get(sh.model) or ModelState { };
+        let k = settles.get(sh.model) or Settle { };
+        let ready = len(s.next) > 0 && read_version > s.next_after && !k.unready;
+        let drained = len(s.prev) > 0 && read_version > 0 && now_ms - s.prev_since >= drain_ms
+            && !k.undrained;
+        let done = settled_state(s, ready, drained, now_ms);
+        states.set(done);
+        if ready {
+            changed = changed + sh.model + "\tshape " + done.shape + " from " + done.prev
+                + ": its queues are made and the plans name them\n";
+        }
+        if drained {
+            changed = changed + sh.model + "\tits " + s.prev
+                + " queues let go: drained, and the longest wait passed\n";
+        }
+    }
+    let queues = state_queues(root, work, states);
 
     // each seat's queues, and each queue's pressure and model
     let by_seat = LinesBy { };
     let pressures = Pressures { };
     let qv = std::str::bytes_view(queues);
-    let mut start = 0;
+    start = 0;
     while start < qv.n {
         let nl = st::line_end(qv, start);
         let line = std::str::slice(qv, start, nl);
@@ -382,29 +705,20 @@ fn plan(
                 let mut other = work::Subjects { };
                 let mut models = "\n";
                 let mut several = 0;
-                let account = st::pg_text(row, "account");
                 let mv = std::str::bytes_view(mine.text);
                 let mut pos = 0;
                 while pos < mv.n {
                     let e = st::line_end(mv, pos);
                     let line = std::str::slice(mv, pos, e);
                     pos = e + 1;
-                    if tab_field(line, 2) == "s" {
+                    let role = tab_field(line, 7);
+                    if role == "own" {
                         own = tab_field(line, 1);
+                    } else if role == "next" || role == "prev" {
+                        // a change's other shape, after the board's
+                        push(other.items, tab_field(line, 1)) or discard;
                     } else if len(line) > 0 {
                         push(base.items, tab_field(line, 1)) or discard;
-                        // the same partition in the other shape, last
-                        push(
-                            other.items,
-                            work::partition(
-                                root,
-                                tab_field(line, 3),
-                                tab_field(line, 2) == "m",
-                                account,
-                                tab_field(line, 5),
-                                tab_field(line, 6),
-                            ),
-                        ) or discard;
                         let model = tab_field(line, 3);
                         if !std::str::contains(models, "\n" + model + "\n") {
                             models = models + model + "\n";
@@ -414,16 +728,46 @@ fn plan(
                 }
                 if len(own) == 0 { own = work::seat_subject(root, here, id); }
                 let mut order = base;
-                // a seat serving several models orders them by pressure
+                // a seat serving several models orders them by pressure, its
+                // order kept by partition, whatever its shape, so a change of
+                // shape keeps its place
                 if several > 1 {
+                    let keyed = Pressures { };
+                    let subject_of = LinesBy { };
+                    let mut keys = work::Subjects { };
+                    let kv = std::str::bytes_view(mine.text);
+                    let mut kp = 0;
+                    while kp < kv.n {
+                        let e = st::line_end(kv, kp);
+                        let line = std::str::slice(kv, kp, e);
+                        kp = e + 1;
+                        if tab_field(line, 7) == "cur" {
+                            let key = order_key(line);
+                            let subject = tab_field(line, 1);
+                            push(keys.items, key) or discard;
+                            subject_of.set(Lines { key: key, text: subject, present: true });
+                            keyed.set(
+                                Pressure {
+                                    subject: key,
+                                    value: pressure_in(pressures, subject),
+                                    present: true,
+                                },
+                            );
+                        }
+                    }
                     let was = before.get(ref) or SeatOrder { };
-                    let o = ordered(base, unspaced(was.order), was.streak, pressures);
-                    order = o.order;
+                    let o = ordered(keys, unspaced(was.order), was.streak, keyed);
+                    let mut by_key = work::Subjects { };
+                    for k in o.order.items {
+                        let x = subject_of.get(k) or Lines { };
+                        push(by_key.items, x.text) or discard;
+                    }
+                    order = by_key;
                     next_orders.append_str(
                         ref + "\t" + to_string(o.streak) + "\t" + spaced(o.order.items) + "\n",
                     );
                     if o.changed {
-                        let head = at(o.order.items, 0) or "";
+                        let head = at(by_key.items, 0) or "";
                         let r = read.get(head) or Reading { };
                         said = said + ref + "\t" + head + "\t"
                             + (if r.depth > 0 && r.oldest_ms >= 0 {
@@ -452,10 +796,8 @@ fn plan(
                         },
                     );
                 }
-                // after them, its partitions in the other shape, as a node
-                // with no plan consumes both: a ticket the api published
-                // there before a change of shape is served, until changes
-                // of shape are sequenced
+                // after them, a change's queues in the other shape: the new
+                // one's before the board flips, the old one's until drained
                 for s in other.items {
                     if !holds_subject(p.consume, s) { push(p.consume, s) or discard; }
                 }
@@ -521,24 +863,28 @@ fn plan(
         }
     }
 
-    // each model a seat makes queues for, in its shape, in the order its
-    // queues first come
+    // each model a seat makes queues for, its shape and any change, in the
+    // order its queues first come; and every queue, for the keeper
     let board_models = st::JsonList { };
+    let wanted = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let listed = TakenSubjects { };
     start = 0;
     while start < qv.n {
         let nl = st::line_end(qv, start);
         let line = std::str::slice(qv, start, nl);
         start = nl + 1;
+        wanted.append_str(taken_once(listed, tab_field(line, 1)));
         let model = tab_field(line, 3);
         if len(model) > 0 && len(taken_once(taken, "\n" + model)) > 0 {
-            board_models.add(
-                "{\"model\": " + st::jq(model) + ", \"shape\": " + st::jq(tab_field(line, 2)) + "}",
-            );
+            board_models.add(model_json(states.get(model) or ModelState { model: model }));
         }
     }
     let p = plans.finish() or b"";
     let o = next_orders.finish() or b"";
+    let wb = wanted.finish() or b"";
     return Planned {
+        subjects: std::str::from_bytes(wb),
+        changed: changed,
         board: "{\"models\": [" + board_models.text() + "], \"queues\": [" + board_queues.text()
             + "], \"seats\": [" + board_seats.text() + "]}",
         plans: std::str::from_bytes(p),

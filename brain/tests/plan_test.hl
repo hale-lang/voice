@@ -218,13 +218,33 @@ fn planned() {
     let readings = echo_local + "\t0\t0\t1\t-1\n" + late + "\t5\t1\t0\t9000\n";
     let services = "{\"model\": \"late\", \"n\": 3, \"service_ms\": 1000}\n{\"model\": \"echo-1\", \"n\": 9, \"service_ms\": 400}\n";
     // two ticks already pressed it
-    let orders = "n/multi\t2\t" + echo_local + " " + late + "\n";
-    let p = brain::plan("voice", seats, work, services, readings, orders);
+    // two ticks already pressed it; an order is kept by partition, whatever
+    // its shape
+    let orders = "n/multi\t2\techo-1.internal.any late.internal.any\n";
+    let p = brain::plan(
+        "voice",
+        seats,
+        work,
+        services,
+        readings,
+        1,
+        orders,
+        "",
+        0,
+        1000000,
+        600000,
+    );
     std::test::assert(std::json::valid_object(p.board), "the board is one JSON object: " + p.board);
     let models = std::json::find_field_raw(p.board, "models");
     std::test::assert(
-        std::str::contains(models, "{\"model\": \"echo-1\", \"shape\": \"p\"}")
-            && std::str::contains(models, "{\"model\": \"late\", \"shape\": \"m\"}"),
+        std::str::contains(
+            models,
+            "{\"model\": \"echo-1\", \"shape\": \"p\", \"provider_account\": null, \"next\": null, \"previous\": null}",
+        )
+            && std::str::contains(
+                models,
+                "{\"model\": \"late\", \"shape\": \"m\", \"provider_account\": \"local\", \"next\": null, \"previous\": null}",
+            ),
         "each model in its shape: echo-1 under two accounts, late under one: " + models,
     );
     // the multi-model seat: its own queue, then late's first, said once
@@ -244,17 +264,14 @@ fn planned() {
     let multi = at(parsed.seats, 0) or work::SeatPlan { };
     std::test::assert(
         multi.seat == "multi" && len(multi.hold) == 0
-            && brain::spaced(multi.consume)
-            == "voice.work.s.n.multi " + late + " " + echo_local
-            + " voice.work.m.echo-1.internal.any voice.work.p.late.local.internal.any",
-        "the seat that serves two models takes late's backed-up queue first, after its own; its partitions in the other shape last: "
+            && brain::spaced(multi.consume) == "voice.work.s.n.multi " + late + " " + echo_local,
+        "the seat that serves two models takes late's backed-up queue first, after its own: "
             + brain::spaced(multi.consume),
     );
     let one = at(parsed.seats, 1) or work::SeatPlan { };
     std::test::assert(
         one.seat == "one"
-            && brain::spaced(one.consume)
-            == "voice.work.s.n.one " + echo_local + " voice.work.m.echo-1.internal.any",
+            && brain::spaced(one.consume) == "voice.work.s.n.one " + echo_local,
         "a seat of one model keeps configuration's order: " + brain::spaced(one.consume),
     );
     std::test::assert(
@@ -266,7 +283,7 @@ fn planned() {
     );
     std::test::assert_eq_str(
         p.orders,
-        "n/multi\t0\t" + late + " " + echo_local + "\n",
+        "n/multi\t0\tlate.internal.any echo-1.internal.any\n",
         "the order kept for the next tick: only a seat of several models has one",
     );
     // the held seat: why, and nothing to consume
@@ -333,7 +350,7 @@ fn planned() {
 
     // nothing read yet (a brain just started): the same seats, configuration's
     // order, the board's readings empty
-    let bare = brain::plan("voice", seats, work, "", "", "");
+    let bare = brain::plan("voice", seats, work, "", "", 0, "", "", 0, 1000000, 600000);
     std::test::assert(
         std::str::contains(bare.plans, "\"consume\": [\"voice.work.s.n.multi\", \"" + echo_local)
             && len(bare.said) == 0,
@@ -341,7 +358,289 @@ fn planned() {
     );
 }
 
+/// Seat `id`'s queues in the node plan `plans` (`Planned.plans`) of node
+/// `node`, space-separated.
+fn consume_of(plans: String, node: String, id: String) -> String {
+    let mut k = 0;
+    while k < 8 {
+        let line = line_of(plans, k);
+        if brain::tab_field(line, 0) == node {
+            let p = work::consume_plan_of(
+                "{\"version\": 1, \"seats\": " + brain::tab_field(line, 1) + "}",
+            ) or { return "?"; };
+            for x in p.seats {
+                if x.seat == id { return brain::spaced(x.consume); }
+            }
+        }
+        k = k + 1;
+    }
+    return "?";
+}
+
+/// One model's entry in a board's `models`.
+fn model_of(board: String, model: String) -> String {
+    let mut it = std::json::array_first(std::json::find_field_raw(board, "models"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "model") == model {
+            return std::str::trim(it.element);
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
+}
+
+/// A model changing shape, as the design sequences it: one account to
+/// two (m to p) and back.
+fn switches() {
+    let m = "voice.work.m.g.internal.any";
+    let pa = "voice.work.p.g.local.internal.any";
+    let pb = "voice.work.p.g.other.internal.any";
+    let own_a = "voice.work.s.n.a";
+    let own_b = "voice.work.s.z.b";
+    let g = "[{\"model\": \"g\", \"as\": null}]";
+    let one_seats = row("", "n", "a", g) + "\n";
+    let one_work = work_row("n", "a", "local", "[\"g\"]") + "\n";
+    let two_seats = one_seats + row("\"account\": \"other\", ", "z", "b", g) + "\n";
+    let two_work = one_work + work_row("z", "b", "other", "[\"g\"]") + "\n";
+    let was_m = "[{\"model\": \"g\", \"shape\": \"m\", \"provider_account\": \"local\", \"next\": null, \"previous\": null}]";
+
+    // steady under one account
+    let steady = brain::plan("voice", one_seats, one_work, "", "", 9, "", was_m, 9, 1000, 1000);
+    std::test::assert_eq_str(consume_of(steady.plans, "n", "a"), own_a + " " + m, "one account: m");
+
+    // a second account's seat configured: the board stays m, the change
+    // prepared; a consumes m and its p, b only its p; every queue kept
+    let t1 = brain::plan("voice", two_seats, two_work, "", "", 10, "", was_m, 10, 2000, 1000);
+    let g1 = model_of(t1.board, "g");
+    std::test::assert(
+        std::json::find_string_field(g1, "shape") == "m"
+            && std::str::contains(
+                g1,
+                "\"next\": {\"shape\": \"p\", \"provider_account\": null, \"after\": 10}",
+            ),
+        "the board still says m, with the change prepared: " + g1,
+    );
+    std::test::assert(
+        consume_of(t1.plans, "n", "a") == own_a + " " + m + " " + pa
+            && consume_of(t1.plans, "z", "b") == own_b + " " + pb,
+        "the first account's seat consumes the old m and its new p; the second, only its p: "
+            + t1.plans,
+    );
+    std::test::assert(
+        std::str::contains(t1.subjects, m + "\n") && std::str::contains(t1.subjects, pa + "\n")
+            && std::str::contains(t1.subjects, pb + "\n"),
+        "the new queues' consumers made: " + t1.subjects,
+    );
+    let models1 = std::str::trim(std::json::find_field_raw(t1.board, "models"));
+    // readings from a pass over the board before it: no flip
+    let all_read = m + "\t0\t0\t1\t-1\n" + pa + "\t0\t0\t1\t-1\n" + pb + "\t0\t0\t1\t-1\n";
+    let early = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        all_read,
+        10,
+        "",
+        models1,
+        11,
+        2100,
+        1000,
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(model_of(early.board, "g"), "shape"),
+        "m",
+        "readings from before the change was prepared flip nothing",
+    );
+    // a new queue not read yet (its consumer not made): no flip
+    let partial = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        m + "\t0\t0\t1\t-1\n" + pa + "\t0\t0\t1\t-1\n",
+        11,
+        "",
+        models1,
+        11,
+        2100,
+        1000,
+    );
+    std::test::assert_eq_str(
+        std::json::find_string_field(model_of(partial.board, "g"), "shape"),
+        "m",
+        "nor before every new queue's consumer is read",
+    );
+    // the keeper read them all after the board that prepared it: flipped
+    let t2 = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        all_read,
+        11,
+        "",
+        models1,
+        11,
+        2200,
+        1000,
+    );
+    let g2 = model_of(t2.board, "g");
+    std::test::assert(
+        std::json::find_string_field(g2, "shape") == "p"
+            && std::str::contains(g2, "\"next\": null")
+            && std::str::contains(
+                g2,
+                "\"previous\": {\"shape\": \"m\", \"provider_account\": \"local\", \"since\": 2200}",
+            ),
+        "the board flips to p, the old m kept as it drains: " + g2,
+    );
+    std::test::assert(
+        consume_of(t2.plans, "n", "a") == own_a + " " + pa + " " + m
+            && consume_of(t2.plans, "z", "b") == own_b + " " + pb
+            && std::str::contains(t2.changed, "g\tshape p from m"),
+        "a consumes its p first and the old m after; said: " + t2.plans,
+    );
+    let models2 = std::str::trim(std::json::find_field_raw(t2.board, "models"));
+    // the old m: kept before the longest wait has passed, and while it holds
+    // a ticket
+    let early_drain = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        all_read,
+        12,
+        "",
+        models2,
+        12,
+        3100,
+        1000,
+    );
+    std::test::assert(
+        std::str::contains(consume_of(early_drain.plans, "n", "a"), m),
+        "the old m consumed until the longest wait has passed",
+    );
+    let busy = pa + "\t0\t0\t1\t-1\n" + pb + "\t0\t0\t1\t-1\n" + m + "\t2\t0\t0\t500\n";
+    let not_empty = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        busy,
+        12,
+        "",
+        models2,
+        12,
+        3300,
+        1000,
+    );
+    std::test::assert(
+        std::str::contains(consume_of(not_empty.plans, "n", "a"), m),
+        "and while it is not empty",
+    );
+    let t3 = brain::plan(
+        "voice",
+        two_seats,
+        two_work,
+        "",
+        all_read,
+        12,
+        "",
+        models2,
+        12,
+        3300,
+        1000,
+    );
+    std::test::assert(
+        consume_of(t3.plans, "n", "a") == own_a + " " + pa
+            && std::str::contains(model_of(t3.board, "g"), "\"previous\": null")
+            && !std::str::contains(t3.subjects, m + "\n")
+            && std::str::contains(t3.changed, "its m queues let go"),
+        "empty past the longest wait: let go, its consumer no longer kept: " + t3.plans,
+    );
+
+    // back to one account: the board stays p, a consumes its p and the new
+    // m; flipped once read; the p drained after
+    let models3 = std::str::trim(std::json::find_field_raw(t3.board, "models"));
+    let b1 = brain::plan(
+        "voice",
+        one_seats,
+        one_work,
+        "",
+        all_read,
+        13,
+        "",
+        models3,
+        13,
+        4000,
+        1000,
+    );
+    let gb = model_of(b1.board, "g");
+    std::test::assert(
+        std::json::find_string_field(gb, "shape") == "p"
+            && std::str::contains(
+                gb,
+                "\"next\": {\"shape\": \"m\", \"provider_account\": \"local\"",
+            )
+            && consume_of(b1.plans, "n", "a") == own_a + " " + pa + " " + m,
+        "several to one: the board stays p, the remaining seat consumes its p and the new m: "
+            + gb,
+    );
+    let models4 = std::str::trim(std::json::find_field_raw(b1.board, "models"));
+    let b2 = brain::plan(
+        "voice",
+        one_seats,
+        one_work,
+        "",
+        all_read,
+        14,
+        "",
+        models4,
+        14,
+        4100,
+        1000,
+    );
+    std::test::assert(
+        std::json::find_string_field(model_of(b2.board, "g"), "shape") == "m"
+            && consume_of(b2.plans, "n", "a") == own_a + " " + m + " " + pa
+            && !std::str::contains(b2.subjects, pb + "\n"),
+        "flipped to m, its p drained after; the gone account's queue no longer kept: "
+            + b2.plans,
+    );
+    let models5 = std::str::trim(std::json::find_field_raw(b2.board, "models"));
+    let b3 = brain::plan(
+        "voice",
+        one_seats,
+        one_work,
+        "",
+        all_read,
+        15,
+        "",
+        models5,
+        15,
+        5200,
+        1000,
+    );
+    std::test::assert_eq_str(consume_of(b3.plans, "n", "a"), own_a + " " + m, "and let go");
+
+    // a brain just started, with no readings yet: nothing drains on none
+    let fresh = brain::plan("voice", one_seats, one_work, "", "", 0, "", models5, 15, 9000, 1000);
+    std::test::assert(
+        std::str::contains(consume_of(fresh.plans, "n", "a"), pa),
+        "no readings yet: the old shape stays consumed",
+    );
+    // a model the board did not hold takes configuration's shape at once
+    let new_model = brain::plan("voice", two_seats, two_work, "", "", 0, "", "[]", 0, 1000, 1000);
+    std::test::assert_eq_str(
+        std::json::find_string_field(model_of(new_model.board, "g"), "shape"),
+        "p",
+        "a model new to the board: configuration's shape, nothing published in another",
+    );
+}
+
 fn main() {
+    switches();
     holds();
     hysteresis();
     planned();

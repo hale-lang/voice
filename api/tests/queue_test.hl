@@ -1,0 +1,444 @@
+// Queue routing, the api's side (queue.hl): which requests are queued and
+// which offered, the partition a queued one goes to, its ticket and the
+// ticket's headers, and how each claim on it is answered, a repeat and a
+// second copy among them.
+import ".." as api;
+import "../../store" as st;
+import "../../lib/work" as work;
+import "../../lib/pond/realtime/nats" as nats;
+
+/// A seat `ref` (`<node>/<seat>`) under `account`, serving the request's
+/// model, on a node of `protocol`, carrying tools or not, which the request
+/// may go to or not.
+fn fact(ref: String, account: String, protocol: Int, tools: Bool, allowed: Bool) -> api::SeatFact {
+    let slash = std::str::index_of(ref, "/");
+    return api::SeatFact {
+        seat: st::SeatRow {
+            ref: ref,
+            node: ref[0..slash],
+            id: ref[(slash + 1)..len(ref)],
+            engine: "static",
+            account: account,
+            enabled: true,
+            present: true,
+        },
+        serves: true,
+        protocol: protocol,
+        tools: tools,
+        allowed: allowed,
+    };
+}
+
+fn facts(items: bounded[api::SeatFact; 8]) -> api::SeatFacts {
+    let mut out = api::SeatFacts { };
+    for f in items {
+        push(out.items, f) or discard;
+    }
+    return out;
+}
+
+fn plan(fs: api::SeatFacts, need: String) -> api::QueuePlan {
+    return api::queue_plan_of("voice", "glm-4.7-flash", "internal", need, 1764151200000, fs);
+}
+
+fn path_choice() {
+    let one = facts([fact("spark/coder", "local", 3, true, true)]);
+    let p = plan(one, "any");
+    std::test::assert(p.on, "every seat that could serve it pulls: queued");
+    std::test::assert(!p.several, "one provider account: the m shape");
+    std::test::assert_eq_int(count(p.partitions), 1, "one partition");
+    std::test::assert_eq_str(
+        (at(p.partitions, 0) or api::Partition { }).subject,
+        "voice.work.m.glm-4%2E7-flash.internal.any",
+        "the model's own, by its class and need",
+    );
+    std::test::assert_eq_str(
+        (at(p.partitions, 0) or api::Partition { }).account,
+        "",
+        "naming no provider account",
+    );
+    let none = api::queue_plan_of("voice", "glm-4.7-flash", "internal", "any", 0, one);
+    std::test::assert(!none.on, "no work stream seen: offered");
+    std::test::assert(std::str::contains(none.why, "work stream"), "saying so: " + none.why);
+
+    // a seat the request may go to on a node of protocol 2: offered
+    let mixed = facts(
+        [fact("spark/coder", "local", 3, true, true), fact("mini/coder", "local", 2, true, true)],
+    );
+    let m = plan(mixed, "any");
+    std::test::assert(!m.on, "a seat of protocol 2 that could serve it: offered");
+    std::test::assert(std::str::contains(m.why, "mini/coder"), "naming it: " + m.why);
+    // one it may not go to, or a node never registered, does not count
+    let other = facts(
+        [fact("spark/coder", "local", 3, true, true), fact("mini/coder", "work", 2, true, false)],
+    );
+    std::test::assert(plan(other, "any").on, "a seat it may not go to does not hold it back");
+    let mut follower = fact("flare/coder", "local", 0, true, true);
+    follower.rank = 1;
+    let mut revoked = fact("old/coder", "other", 2, true, true);
+    revoked.revoked = true;
+    let pair = facts([fact("spark/coder", "local", 3, true, true), follower, revoked]);
+    let pp = plan(pair, "any");
+    std::test::assert(pp.on, "a pair's follower and a revoked node's seat do not count");
+    std::test::assert(!pp.several, "nor for the shape");
+    std::test::assert_eq_int(count(pp.seats), 1, "and are not seats a claim may be granted to");
+    let gone = facts([fact("spark/coder", "local", 3, true, false)]);
+    std::test::assert(!plan(gone, "any").on, "no seat it may go to: not queued");
+
+    // a model served under two provider accounts: the p shape, whatever
+    // the request may spend
+    let two = facts(
+        [
+            fact("spark/coder", "local", 3, true, true),
+            fact("cloud/coder", "hosted", 3, true, false),
+        ],
+    );
+    let p2 = plan(two, "any");
+    std::test::assert(p2.on && p2.several, "served under two accounts: the p shape");
+    std::test::assert_eq_int(count(p2.partitions), 1, "one partition: the account it may spend");
+    std::test::assert_eq_str(
+        (at(p2.partitions, 0) or api::Partition { }).subject,
+        "voice.work.p.glm-4%2E7-flash.local.internal.any",
+        "under that account",
+    );
+    std::test::assert_eq_str(
+        (at(p2.partitions, 0) or api::Partition { }).account,
+        "local",
+        "which the ticket names",
+    );
+    let both = facts(
+        [
+            fact("spark/coder", "local", 3, true, true),
+            fact("cloud/coder", "hosted", 3, true, true),
+            fact("cloud/coder2", "hosted", 3, true, true),
+        ],
+    );
+    std::test::assert_eq_int(
+        count(plan(both, "any").partitions),
+        2,
+        "one per account it may spend",
+    );
+
+    // tools: only the seats that carry them
+    let tools = facts(
+        [fact("spark/coder", "local", 3, false, true), fact("mini/coder", "local", 3, true, true)],
+    );
+    let t = plan(tools, "tools");
+    std::test::assert_eq_int(count(t.seats), 1, "a request with tools goes to a seat with tools");
+    std::test::assert_eq_str(
+        (at(t.seats, 0) or api::Candidate { }).seat.ref,
+        "mini/coder",
+        "the one that carries them",
+    );
+    std::test::assert_eq_str(
+        (at(t.partitions, 0) or api::Partition { }).subject,
+        "voice.work.m.glm-4%2E7-flash.internal.tools",
+        "on the model's tools partition",
+    );
+    let notools = facts([fact("spark/coder", "local", 3, false, true)]);
+    let nt = plan(notools, "tools");
+    std::test::assert(
+        nt.on && count(nt.seats) == 0,
+        "none carries them: left for admission to refuse",
+    );
+    std::test::assert_eq_str(
+        work::need_of("{\"tools\": [{\"type\": \"function\"}]}"),
+        "tools",
+        "need: tools",
+    );
+    std::test::assert_eq_str(work::need_of("{\"tools\": []}"), "any", "none listed: any");
+    std::test::assert_eq_str(work::need_of("{\"input\": \"hi\"}"), "any", "no tools: any");
+}
+
+fn partition(subject: String, account: String, used: Float, exhausted: Bool) -> api::Partition {
+    return api::Partition { subject: subject, account: account, used: used, exhausted: exhausted };
+}
+
+fn seat(ref: String, account: String) -> api::Candidate {
+    let slash = std::str::index_of(ref, "/");
+    return api::Candidate {
+        seat: st::SeatRow {
+            ref: ref,
+            node: ref[0..slash],
+            id: ref[(slash + 1)..len(ref)],
+            account: account,
+        },
+    };
+}
+
+fn partition_choice() {
+    let mut q = api::QueuePlan { on: true, several: true };
+    push(q.partitions, partition("p.a", "a", 20.0, false)) or discard;
+    push(q.partitions, partition("p.b", "b", 25.0, false)) or discard;
+    push(q.partitions, partition("p.c", "c", 60.0, false)) or discard;
+    push(q.partitions, partition("p.d", "d", 0.0, true)) or discard;
+    push(q.seats, seat("n1/a", "a")) or discard;
+    push(q.seats, seat("n2/b", "b")) or discard;
+    push(q.seats, seat("n3/c", "c")) or discard;
+    push(q.seats, seat("n4/d", "d")) or discard;
+    // exhausted d is left out; c is more than 10 points fuller than a
+    let mut seen = "";
+    let mut i = 0;
+    while i < 40 {
+        let s = api::chosen(q, "\n", i * 7 + 3, i * 13 + 1);
+        if !std::str::contains(seen, s + ";") { seen = seen + s + ";"; }
+        i = i + 1;
+    }
+    std::test::assert(
+        std::str::contains(seen, "p.a;") && std::str::contains(seen, "p.b;"),
+        "both with the most headroom are drawn: " + seen,
+    );
+    std::test::assert(
+        !std::str::contains(seen, "p.c") && !std::str::contains(seen, "p.d"),
+        "never the fuller one, nor the exhausted one: " + seen,
+    );
+    // a partition whose every seat failed the request is left out
+    std::test::assert_eq_str(api::chosen(q, "\nn1/a\n", 0, 0), "p.b", "a's one seat failed it: b");
+    std::test::assert_eq_str(api::chosen(q, "\nn1/a\nn2/b\n", 5, 9), "p.c", "then c");
+    std::test::assert_eq_str(
+        api::chosen(q, "\nn1/a\nn2/b\nn3/c\n", 0, 1),
+        "p.d",
+        "an exhausted one only when nothing else is left",
+    );
+    std::test::assert_eq_str(
+        api::chosen(q, "\nn1/a\nn2/b\nn3/c\nn4/d\n", 0, 1),
+        "",
+        "and none once every seat failed it",
+    );
+    let mut m = api::QueuePlan { on: true };
+    push(m.partitions, partition("voice.work.m.x.internal.any", "", 0.0, false)) or discard;
+    push(m.seats, seat("n1/a", "a")) or discard;
+    push(m.seats, seat("n2/b", "b")) or discard;
+    std::test::assert_eq_str(
+        api::chosen(m, "\nn1/a\n", 7, 3),
+        "voice.work.m.x.internal.any",
+        "the m shape's one partition while a seat has not failed it",
+    );
+}
+
+fn ticket_and_headers() {
+    let r = api::InferenceRequest {
+        model: "glm-4.7-flash",
+        data_class: "internal",
+        seat_endpoint: "responses",
+        body: "{\"input\": \"" + "abcd" + "abcd" + "\"}",
+    };
+    let until = std::time::parse_time("2026-11-26T10:01:00Z") or std::time::current();
+    let t = api::ticket_of_request(
+        r,
+        "resp_0a",
+        2,
+        "voice.reply.resp_0a.2",
+        "api-1",
+        "local",
+        "tools",
+        until,
+        "\nspark/coder\nmini/coder\n",
+    );
+    let json = work::ticket_json(t);
+    let back = work::ticket_of(json) or work::Ticket { };
+    std::test::assert_eq_str(back.request_id, "resp_0a", "its request");
+    std::test::assert_eq_int(back.attempt, 2, "its attempt");
+    std::test::assert_eq_str(back.reply_to, "voice.reply.resp_0a.2", "where its claims go");
+    std::test::assert_eq_str(back.instance, "api-1", "the instance that holds it");
+    std::test::assert_eq_str(back.provider_account, "local", "its partition's account");
+    std::test::assert_eq_str(back.need, "tools", "its need");
+    std::test::assert_eq_str(back.copy, "shared", "the shared copy");
+    std::test::assert_eq_str(
+        std::time::iso8601(back.wait_until),
+        "2026-11-26T10:01:00Z",
+        "its wait",
+    );
+    std::test::assert_eq_int(count(back.avoid), 2, "the seats that failed it");
+    std::test::assert_eq_str(at(back.avoid, 1) or "", "mini/coder", "in order");
+    std::test::assert(back.size > 0, "an estimate of its input");
+    std::test::assert(!std::str::contains(json, "abcd"), "never its content: " + json);
+    std::test::assert_eq_str(
+        work::message_id("resp_0a", 2, "shared"),
+        "resp_0a.2.shared",
+        "the shared copy's message id",
+    );
+    let h = api::ticket_headers("resp_0a.2.shared", 59001) or "";
+    std::test::assert(
+        std::str::contains(h, "Nats-Msg-Id: resp_0a.2.shared\r\n"),
+        "the copy's message id: " + h,
+    );
+    std::test::assert(
+        std::str::contains(h, "Nats-TTL: 60s\r\n"),
+        "its wait left, rounded up: " + h,
+    );
+    std::test::assert_eq_str(nats::header_value(h, "Nats-TTL"), "60s", "read back");
+    std::test::assert_eq_str(work::ttl_header(0), "1s", "never under a second");
+    std::test::assert_eq_str(work::ttl_header(1000), "1s", "a second");
+    let mut refused = "";
+    api::ticket_headers("resp_0a.2.shared\r\nNats-Expected-Stream: X", 1000) or {
+        refused = err.kind;
+        ""
+    };
+    std::test::assert_eq_str(refused, "header", "a message id cannot carry a header in");
+    std::test::assert_eq_str(
+        work::conversation_of("derived:0123"),
+        std::hex::encode(std::crypto::sha256(std::bytes::from_string("derived:0123")))[0..32],
+        "a conversation is named by 32 hex digits of its key's sha256",
+    );
+    std::test::assert_eq_str(work::conversation_of(""), "", "none for no key");
+}
+
+fn claim(rid: String, attempt: Int, copy: String, seat: String) -> work::Claim {
+    return work::Claim { request_id: rid, attempt: attempt, copy: copy, seat: seat };
+}
+
+fn claims() {
+    let eligible = "\nspark/coder\nmini/coder\nflare/coder\n";
+    let avoid = "\nflare/coder\n";
+    let v = api::claim_verdict(
+        claim("r1", 1, "shared", "spark/coder"),
+        "r1",
+        1,
+        eligible,
+        avoid,
+        "",
+        "",
+    );
+    std::test::assert_eq_str(v, "grant", "the first claim of a seat it may go to is granted");
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "shared", "flare/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            "",
+            "",
+        ),
+        "avoided",
+        "a seat that failed it is avoided",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "shared", "cloud/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            "",
+            "",
+        ),
+        "ineligible",
+        "one it may not go to is ineligible",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 2, "shared", "spark/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            "",
+            "",
+        ),
+        "gone",
+        "a claim on another attempt is gone",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r2", 1, "shared", "spark/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            "",
+            "",
+        ),
+        "gone",
+        "and on another request",
+    );
+    // granted once, across copies
+    let g = "spark/coder";
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "shared", "mini/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            g,
+            "shared",
+        ),
+        "taken",
+        "once granted, another seat's claim is taken",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "seat", "mini/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            g,
+            "shared",
+        ),
+        "taken",
+        "whichever copy it claims",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "seat", "spark/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            g,
+            "shared",
+        ),
+        "taken",
+        "the granted seat's claim on the other copy too: no seat is granted an attempt twice",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "shared", "spark/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            g,
+            "shared",
+        ),
+        "again",
+        "the granted claim repeated, its answer lost, is granted again",
+    );
+    std::test::assert_eq_str(
+        api::claim_verdict(
+            claim("r1", 1, "shared", "flare/coder"),
+            "r1",
+            1,
+            eligible,
+            avoid,
+            g,
+            "shared",
+        ),
+        "taken",
+        "and an avoided seat's, once granted, is taken",
+    );
+    let mut failed = api::Attempts { };
+    push(
+        failed.items,
+        api::Attempt { seat: "flare/coder", outcome: api::AttemptOutcome::failed },
+    ) or discard;
+    push(
+        failed.items,
+        api::Attempt { seat: "spark/coder", outcome: api::AttemptOutcome::served },
+    ) or discard;
+    std::test::assert_eq_str(
+        api::avoid_of(failed.items),
+        "\nflare/coder\n",
+        "a ticket avoids the seats that failed it",
+    );
+}
+
+fn main() {
+    path_choice();
+    partition_choice();
+    ticket_and_headers();
+    claims();
+}

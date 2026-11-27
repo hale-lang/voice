@@ -1,7 +1,11 @@
 // The api's link to the nodes: NATS, as ../spec/protocol.yaml says. The
 // api publishes `assign` on a node's subject, and `serve` as a request
 // whose answer is the node's ack; the node then streams the request's
-// events and its result to the reply subject the api named.
+// events and its result to the reply subject the api named. A queued
+// request (queue.hl) is published instead as a ticket to the work stream,
+// and its attempt answers the claims seats make on it: the one it grants
+// (the `serve` message, body and all) then streams as an accepted `serve`
+// does.
 //
 // Everything above reaches it through `Link`, so the tests serve through
 // a node of their own, in process.
@@ -53,6 +57,14 @@ interface Link {
     /// `reply_to`, as it goes on the wire) to the node: the offer, its own,
     /// so requests served at once each wait on theirs.
     fn offer(node: String, request_id: String, reply_to: String, body: Bytes) -> Offer;
+    /// The work stream's incarnation as this instance last saw it
+    /// (queue.hl `QueueKeeper`), 0 while it is not there: a request is
+    /// queued only while it is.
+    fn queues() -> Int;
+    /// Attempt `attempt` of the queued request `request_id`: listening on
+    /// `reply_to` for its claims and its seat's answer, its own, with no
+    /// copy of its ticket published yet (`Offer.put`).
+    fn queue(request_id: String, attempt: Int, reply_to: String) -> Offer;
 }
 
 /// One request's offer to one seat, from its ack to its finish.
@@ -64,9 +76,36 @@ interface Offer {
     /// standard event object), `alive` (the seat at work, though it sends
     /// no event yet), the `result`, `none` when the wait ran out, or `lost`.
     fn next(wait: Duration) -> LinkMsg;
-    /// End the offer; one whose result has not come is sent `cancel`.
+    /// End the offer; one whose result has not come is sent `cancel`. A
+    /// queued attempt whose copy is still in the work stream, no seat
+    /// granted, leaves the claims on it to the instance's keeper, which
+    /// declines them `gone` (queue.hl).
     fn finish();
+    /// A queued attempt's copy of its ticket (`ticket`, its JSON) published
+    /// to `subject` under its message id `msg_id`, waiting `ttl_ms` at
+    /// most: "" once the work stream holds it; `full` when its partition
+    /// holds its most; `no_stream` when no stream takes it; else `lost:`
+    /// and why.
+    fn put(subject: String, msg_id: String, ttl_ms: Int, ticket: String) -> String;
+    /// Each copy published again under its own message id, each to wait
+    /// `ttl_ms` at most: the work stream was made again. How many it took.
+    fn republish(ttl_ms: Int) -> Int;
+    /// A queued attempt's next claim before it is granted, waiting at most
+    /// `wait`: `claim` (a claim it may grant), `none`, or `lost`.
+    fn claim(wait: Duration) -> ClaimIn;
+    /// Decline the claim `claim` gave last, for `reason`.
+    fn decline(reason: String);
+    /// Grant the claim `claim` gave last, by seat `seat` (`<node>/<seat>`)
+    /// for its copy `copy`: `grant` is the `serve` message for that seat.
+    /// The attempt is an accepted offer from then on; a claim it reads
+    /// after is declined `taken`, or, the same seat and copy again, granted
+    /// again.
+    fn grant(grant: Bytes, seat: String, copy: String);
 }
+
+/// A claim on a queued attempt (`Offer.claim`): `kind` is `claim`, `none`
+/// when the wait ran out, or `lost`.
+type ClaimIn { kind: String = "none"; claim: work::Claim = work::Claim { }; }
 
 /// One message of an open offer. `json` is the event object, or the result.
 type LinkMsg { kind: String = "none"; json: String = ""; }
@@ -129,6 +168,9 @@ locus NatsLink {
         vault: String = "";
         subjects: String = "voice";
         inbox: String = "_INBOX";
+        // the instance's book (queue.hl): the work stream as its keeper last
+        // saw it, and the claims left over
+        book: QueueBook = QueueBook { };
     }
 
     fn place() -> String { return if len(self.node_url) > 0 { self.node_url } else { self.url }; }
@@ -191,6 +233,37 @@ locus NatsLink {
         a.send(self.url, body);
         return a;
     }
+
+    fn queues() -> Int { return incarnation_in(self.book); }
+
+    /// Listen on the attempt's replies first, then publish its copies
+    /// (`put`), so no claim can come before the api listens. Each attempt
+    /// has a connection of its own, as an offer does.
+    @unbounded
+    fn queue(request_id: String, attempt: Int, reply_to: String) -> Offer {
+        if len(self.url) == 0 {
+            return NatsAttempt {
+                queued: true,
+                outcome: ServeOutcome { ack: "lost", reason: "no NATS is configured" },
+            };
+        }
+        let a = NatsAttempt {
+            reply_to: reply_to,
+            request_id: request_id,
+            attempt: attempt,
+            subjects: self.subjects,
+            queued: true,
+            book: self.book,
+            c: nats::NatsClient {
+                name: "voice-api",
+                user: self.user,
+                credential: std::secret::Credential { vault: self.vault },
+                inbox_prefix: self.inbox,
+            },
+        };
+        a.listen(self.url);
+        return a;
+    }
 }
 
 /// One offer over NATS, from its subscription to its finish. Only messages
@@ -208,9 +281,193 @@ locus NatsAttempt {
         finished: Bool = false;
         // the node's ack, once `send` has offered it
         outcome: ServeOutcome = ServeOutcome { ack: "lost" };
+        // a queued attempt (queue.hl): its number, whether it listens on
+        // its replies, the instance's book, its copies as published
+        // (`<subject>\t<message id>\t<ticket>` a line) and the latest
+        // their waits end at (Unix ms), the reply subject of the claim read
+        // last, and the claim it granted with its grant, kept until its
+        // seat first answers, should that claim come again
+        queued: Bool = false;
+        attempt: Int = 1;
+        listening: Bool = false;
+        book: QueueBook = QueueBook { };
+        copies: String = "";
+        until_ms: Int = 0;
+        claim_reply: String = "";
+        granted_seat: String = "";
+        granted_copy: String = "";
+        grant_body: Bytes = b"";
     }
 
     fn ack() -> ServeOutcome { return self.outcome; }
+
+    /// Listen on the attempt's replies at `url`; its outcome `lost` when it
+    /// cannot.
+    fn listen(url: String) { self.outcome = self.listened(url); }
+
+    fn listened(url: String) -> ServeOutcome {
+        self.c.url = url;
+        if !self.c.open() {
+            return ServeOutcome {
+                ack: "lost",
+                reason: "NATS unreachable at " + url + ": " + self.c.last_error,
+            };
+        }
+        let sid = self.c.sub_to(self.reply_to + ".>", "") or - 1;
+        if sid < 0 {
+            let why = self.c.last_error;
+            self.c.close();
+            return ServeOutcome { ack: "lost", reason: why };
+        }
+        self.listening = true;
+        return ServeOutcome { };
+    }
+
+    @unbounded
+    fn put(subject: String, msg_id: String, ttl_ms: Int, ticket: String) -> String {
+        if !self.listening { return "lost: " + self.outcome.reason; }
+        let headers = ticket_headers(msg_id, ttl_ms) or {
+            return "lost: " + err.detail;
+        };
+        let mut e = nats::NatsError { };
+        let stored = nats::js_publish_headers(
+            self.c,
+            subject,
+            headers,
+            std::bytes::from_string(ticket),
+        ) or {
+            e = err;
+            nats::PubAck { }
+        };
+        if len(e.kind) > 0 {
+            // a refusal by its own result, never the client's sticky
+            // `last_error`: 10077, the partition at its most; no stream
+            // takes the subject (no responder, or 10059)
+            if e.kind == "jetstream" && e.code == 10077 { return "full"; }
+            if e.kind == "jetstream" && (e.code == 0 || e.code == 10059) {
+                // this instance queues nothing more until its keeper sees
+                // the stream again
+                note_incarnation(self.book, 0);
+                return "no_stream";
+            }
+            return "lost: " + e.kind + ": " + e.detail;
+        }
+        self.copies = self.copies + subject + "\t" + msg_id + "\t" + ticket + "\n";
+        let until = unix_ms() + ttl_ms;
+        if until > self.until_ms { self.until_ms = until; }
+        return "";
+    }
+
+    @unbounded
+    fn republish(ttl_ms: Int) -> Int {
+        if !self.listening { return 0; }
+        let mut took = 0;
+        let v = std::str::bytes_view(self.copies);
+        let mut at = 0;
+        while at < v.n {
+            let rest = std::str::slice(v, at, v.n);
+            let nl = std::str::index_of(rest, "\n");
+            let end = if nl < 0 { v.n } else { at + nl };
+            let line = std::str::slice(v, at, end);
+            at = end + 1;
+            let t1 = std::str::index_of(line, "\t");
+            let tail = if t1 >= 0 { line[(t1 + 1)..len(line)] } else { "" };
+            let t2 = std::str::index_of(tail, "\t");
+            if t1 > 0 && t2 > 0 {
+                let headers = ticket_headers(tail[0..t2], ttl_ms) or "";
+                let mut ok = len(headers) > 0;
+                if ok {
+                    let stored = nats::js_publish_headers(
+                        self.c,
+                        line[0..t1],
+                        headers,
+                        std::bytes::from_string(tail[(t2 + 1)..len(tail)]),
+                    ) or {
+                        ok = false;
+                        nats::PubAck { }
+                    };
+                }
+                if ok { took = took + 1; }
+            }
+        }
+        let until = unix_ms() + ttl_ms;
+        if until > self.until_ms { self.until_ms = until; }
+        return took;
+    }
+
+    @unbounded
+    fn claim(wait: Duration) -> ClaimIn {
+        if !self.listening { return ClaimIn { kind: "lost" }; }
+        let deadline = std::time::monotonic() + wait;
+        while std::time::monotonic() < deadline {
+            if self.c.read_msg(deadline - std::time::monotonic()) {
+                if self.c.last.subject == self.reply_to + ".claim"
+                    && len(self.c.last.reply) > 0
+                {
+                    self.claim_reply = self.c.last.reply;
+                    let c = work::claim_of(std::str::from_bytes(self.c.last.data)) or {
+                        // not a claim: it cannot be judged, so the seat
+                        // that sent it puts the ticket back for another
+                        self.decline("ineligible");
+                        work::Claim { request_id: "" }
+                    };
+                    if len(c.request_id) > 0 { return ClaimIn { kind: "claim", claim: c }; }
+                }
+            } else if !self.c.connected {
+                return ClaimIn { kind: "lost" };
+            }
+        }
+        return ClaimIn { kind: "none" };
+    }
+
+    fn decline(reason: String) { self.answer(std::bytes::from_string(work::decline_json(reason))); }
+
+    fn grant(grant: Bytes, seat: String, copy: String) {
+        self.answer(grant);
+        self.granted_seat = seat;
+        self.granted_copy = copy;
+        self.grant_body = grant;
+        let slash = std::str::index_of(seat, "/");
+        self.node = if slash > 0 { seat[0..slash] } else { seat };
+        self.outcome = ServeOutcome { ack: "accepted" };
+        self.open = true;
+    }
+
+    /// The grant no longer kept: its seat has answered, so has it.
+    // @unbounded: once an attempt, the first time its seat answers.
+    @unbounded
+    fn forget_grant() { self.grant_body = b""; }
+
+    /// The claim read last answered with `body`.
+    fn answer(body: Bytes) {
+        if len(self.claim_reply) == 0 { return; }
+        self.c.pub_msg(self.claim_reply, "", body) or discard;
+        self.c.flush() or discard;
+        self.claim_reply = "";
+    }
+
+    /// A claim read once the attempt is granted: its grant again for the
+    /// granted claim itself, its answer lost (until the seat first answers,
+    /// when the grant is no longer kept), `taken` for any other.
+    @unbounded
+    fn answer_late() {
+        let c = work::claim_of(std::str::from_bytes(self.c.last.data)) or work::Claim { };
+        self.claim_reply = self.c.last.reply;
+        let v = claim_verdict(
+            c,
+            self.request_id,
+            self.attempt,
+            "",
+            "",
+            self.granted_seat,
+            self.granted_copy,
+        );
+        if v == "again" && len(self.grant_body) > 0 {
+            self.answer(self.grant_body);
+        } else {
+            self.decline(if v == "again" { "taken" } else { v });
+        }
+    }
 
     /// Offer `body` at `url`, its ack kept for `ack`.
     fn send(url: String, body: Bytes) { self.outcome = self.offered(url, body); }
@@ -264,9 +521,15 @@ locus NatsAttempt {
         let deadline = std::time::monotonic() + wait;
         while std::time::monotonic() < deadline {
             if self.c.read_msg(deadline - std::time::monotonic()) {
+                if self.queued && self.c.last.subject == self.reply_to + ".claim" {
+                    if len(self.c.last.reply) > 0 { self.answer_late(); }
+                    continue;
+                }
                 let msg = std::str::from_bytes(self.c.last.data);
                 // a message that names another request is not this one's
                 if std::json::find_string_field(msg, "request_id") == self.request_id {
+                    // the seat answers: it has its grant, kept no longer
+                    if len(self.grant_body) > 0 { self.forget_grant(); }
                     if self.c.last.subject == self.reply_to + ".event" {
                         return LinkMsg {
                             kind: "event",
@@ -289,12 +552,23 @@ locus NatsAttempt {
     }
 
     fn finish() {
+        if self.queued && self.listening && !self.open {
+            // never granted: a copy still in the stream is claimed in vain,
+            // which the keeper declines `gone` until its wait ends
+            if len(self.copies) > 0 && self.until_ms > unix_ms() {
+                leave_claims(self.book, self.reply_to, "gone", self.until_ms);
+            }
+            self.c.close();
+            self.listening = false;
+            return;
+        }
         if !self.open { return; }
         if !self.finished && self.c.connected {
             cancel(self.c, self.subjects, self.node, self.request_id);
         }
         self.c.close();
         self.open = false;
+        self.listening = false;
     }
 }
 

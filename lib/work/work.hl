@@ -6,14 +6,15 @@
 // `Claim`, the api answers a `Grant` (the `serve` message, body and all) or
 // a `Decline`, and the brain plans each node's seats in a `ConsumePlan`.
 //
-// Nodes pull (node/pull.hl) and the brain keeps the stream and its
-// consumers (brain/work.hl), but no request is served through it yet: the
-// api publishes no ticket until it queues (step (d) of the design's
-// "Building phase 1"), and offers every request with `serve`.
+// Nodes pull (node/pull.hl), the brain keeps the stream and its consumers
+// (brain/work.hl), and the api publishes a ticket for each request whose
+// seats are all on nodes that pull, offering any other with `serve` (step
+// (d) of the design's "Building phase 1"; api/queue.hl).
 
 /// The protocol a node that pulls speaks (spec/protocol.yaml, "Pulling:
 /// protocol 3"). The coordinator registers nodes of protocol 2 and 3 alike
-/// for one release, and offers every request with `serve` until it queues.
+/// for one release, and queues a request only when every seat that could
+/// serve it is on a node of this protocol.
 const PROTOCOL_PULL: Int = 3;
 
 // ---- the work stream (internal.yaml `WorkStream`) -------------------------
@@ -160,6 +161,79 @@ fn provider_subject(
         + need;
 }
 
+// ---- a model's shape (the design's "Partitions") -------------------------
+//
+// A model's queues are in the `m` shape when the seats configured to serve
+// it (enabled, on a node not revoked, not a pair's follower) run under one
+// provider account, and in the `p` shape, one per account, when they run
+// under more. The brain makes the queues by it (brain/work.hl
+// `partitions`) and the api publishes by it (api/queue.hl), each from the
+// configuration it reads, through these, so the two never disagree.
+
+/// A seat's rank in a pair (its config's `cluster.rank`, 0 the leader's),
+/// or -1 for a seat that is no pair's part.
+fn rank_of(config: String) -> Int {
+    let cluster = std::str::trim(std::json::find_field_raw(config, "cluster"));
+    return if len(cluster) > 0 { std::json::find_int_field(cluster, "rank") } else { -1 };
+}
+
+/// Whether a seat of rank `rank` (`rank_of`) counts towards its models'
+/// shapes and makes queues: a pair's follower (rank other than 0) serves
+/// nothing itself, so it does neither.
+fn makes_queues(rank: Int) -> Bool {
+    return rank <= 0;
+}
+
+/// Whether a model whose seats so far run under `first` ("" for none
+/// yet), and under more than one account if `several`, is served under
+/// more than one once a seat under `account` counts too.
+fn several_with(first: String, several: Bool, account: String) -> Bool {
+    return several || (len(first) > 0 && first != account);
+}
+
+/// The queue of `model` for data class `class` and `need` (`tools` or
+/// `any`): in the `p` shape (`several`) under `account`, else the `m`.
+fn partition(
+    root: String,
+    model: String,
+    several: Bool,
+    account: String,
+    class: String,
+    need: String
+) -> String {
+    return if several {
+        provider_subject(root, model, account, class, need)
+    } else {
+        model_subject(root, model, class, need)
+    };
+}
+
+/// A ticket's `need`: `tools` when its request lists tools, else `any`.
+fn need_of(body: String) -> String {
+    let tools = std::str::trim(std::json::find_field_raw(body, "tools"));
+    return if std::str::starts_with(tools, "[") && !std::json::array_first(tools).done {
+        "tools"
+    } else {
+        "any"
+    };
+}
+
+/// A ticket's `Nats-TTL`: its wait left, `ms`, in whole seconds rounded
+/// up and at least one (NATS takes no less), as `<n>s`.
+fn ttl_header(ms: Int) -> String {
+    let s = (ms + 999) / 1000;
+    return to_string(if s < 1 { 1 } else { s }) + "s";
+}
+
+/// A conversation's name on a ticket and in `seat_conversation`: the first
+/// 32 lower-case hex digits of the sha256 of its affinity key, never the
+/// key itself; "" for none.
+fn conversation_of(key: String) -> String {
+    if len(key) == 0 { return ""; }
+    let digest = std::hex::encode(std::crypto::sha256(std::bytes::from_string(key)));
+    return digest[0..32];
+}
+
 /// A seat's own queue, for a conversation's turns.
 fn seat_subject(root: String, node: String, seat: String) -> String {
     return root + ".work.s." + token(node) + "." + token(seat);
@@ -172,9 +246,9 @@ fn seat_subject(root: String, node: String, seat: String) -> String {
 /// seat under llama-server or TensorFold, or under vLLM when its variant
 /// names a tool-call parser voice knows (`tool_call_parser_known`), which
 /// the node starts vLLM with; a static seat as its `tool_call` drill; any
-/// other never. The rule a node serves by (node/session.hl, node/run.hl)
-/// and the brain makes queues by (brain/work.hl); the api offers by its
-/// own copy (api/catalog.hl `seat_tools`) until it queues.
+/// other never. The rule a node serves by (node/session.hl, node/run.hl),
+/// the brain makes queues by (brain/work.hl), and the api says a model
+/// carries tools by and judges a claim by (api/catalog.hl `seat_tools`).
 fn carries_tools(kind: String, config: String) -> Bool {
     if kind == "openai-compatible" { return true; }
     if kind == "managed" {

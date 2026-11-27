@@ -795,6 +795,16 @@ for i in $(seq 1 50); do
   sleep 0.2
 done
 case "$out" in *'hello again'*) ;; *) echo "the node never applied the new assignment: $out"; cat "$work/node.log"; exit 1 ;; esac
+if [ -n "${DATABASE_URL:-}" ] && [ "${E2E_BROKER:-}" != grafted ]; then
+  # queued (queue routing, step (d)): the work stream the brain made is
+  # there and laptop's node pulls, so the request was published as a
+  # ticket to echo-1's partition, pulled, claimed and granted, and laptop
+  # served it as it serves an offer
+  echo_queue=$(python3 -c 'import hashlib; print("w_" + hashlib.sha256(b"voice.work.m.echo-1.internal.any").hexdigest()[:16])')
+  queued=$(python3 scripts/nats-request.py "${NATS_URL#nats://}" "\$JS.API.CONSUMER.INFO.VOICE_WORK.$echo_queue" | python3 -c 'import json,sys; c = json.load(sys.stdin); print(c["delivered"]["stream_seq"], c["num_pending"], c["num_ack_pending"])')
+  case "$queued" in "0 "*|"") echo "no request went through echo-1's queue: $queued"; cat "$work/api.log"; exit 1 ;; *" 0 0") ;; *) echo "echo-1's queue holds what was served: $queued"; exit 1 ;; esac
+  echo "the request was queued: a ticket on echo-1's partition, claimed, granted and served by laptop/static"
+fi
 
 responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true; }
 

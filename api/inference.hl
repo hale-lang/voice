@@ -359,11 +359,12 @@ locus Inference {
             if p.subject == subject { account = p.account; }
         }
         // a turn of a conversation with a home seat goes to its home's
-        // provider account's partition, while it has a seat that has not
-        // failed it
+        // provider account's partition, where its home may still claim it,
+        // while it has a seat that has not failed it and is not exhausted;
+        // a home the board says cannot take it soon gives it none
         for p in q.partitions {
             if len(p.account) > 0 && p.account == q.home.seat.account
-                && partition_untried(q, p, avoid)
+                && len(q.home_skip) == 0 && !p.exhausted && partition_untried(q, p, avoid)
             {
                 subject = p.subject;
                 account = p.account;
@@ -374,9 +375,13 @@ locus Inference {
         let until = std::time::from_nanos(std::time::nanos(std::time::current()) + left);
         let mut seen = self.link.queues();
         // a conversation's turn waits on its home seat's own queue first
-        // (the design's "The window"), unless that seat failed it
+        // (the design's "The window"), unless that seat failed it or the
+        // board says it cannot take it soon (held, consuming nothing, its
+        // own queue full)
         let home = q.home.seat;
-        let window = if len(home.ref) > 0 && !std::str::contains(avoid, "\n" + home.ref + "\n") {
+        let window = if len(home.ref) > 0 && !std::str::contains(avoid, "\n" + home.ref + "\n")
+            && len(q.home_skip) == 0
+        {
             window_ms(estimated_input_tokens(r.body), 0, left / 1000000)
         } else {
             0
@@ -1972,6 +1977,17 @@ locus Inference {
                         + " that this request may go to carries tools, which it lists",
                 };
             }
+            // every provider account it may spend exhausted: refused as the
+            // route table refuses it, whose seats it leaves out
+            if out.queue.on && every_exhausted(out.queue) {
+                fail ApiError {
+                    status: 503,
+                    kind: "server_error",
+                    code: ErrorCode::no_eligible_seat,
+                    message: "every account serving model " + r.model
+                        + " that this request may spend is exhausted: a provider window is at 100%",
+                };
+            }
             // a conversation's turn: its home seat, the seat its last turn
             // was granted to (`seat_conversation`), else the one its key
             // hashes to
@@ -1981,6 +1997,12 @@ locus Inference {
                     out.queue.conversation,
                 ) or fail metering_failed(err);
                 out.queue.home = home_of(out.queue, row.seat, out.items);
+            }
+            // the brain's board, when it is fresh: each partition's expected
+            // wait, and whether the home seat can take the turn soon; a board
+            // missing, stale or unread leaves the choice as it is without one
+            if out.queue.on {
+                out.queue = with_board(out.queue, self.store.board() or "", self.link.root());
             }
         }
         return out;

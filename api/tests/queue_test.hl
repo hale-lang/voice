@@ -197,13 +197,16 @@ fn partition_choice() {
     std::test::assert_eq_str(api::chosen(q, "\nn1/a\nn2/b\n", 5, 9), "p.c", "then c");
     std::test::assert_eq_str(
         api::chosen(q, "\nn1/a\nn2/b\nn3/c\n", 0, 1),
-        "p.d",
-        "an exhausted one only when nothing else is left",
-    );
-    std::test::assert_eq_str(
-        api::chosen(q, "\nn1/a\nn2/b\nn3/c\nn4/d\n", 0, 1),
         "",
-        "and none once every seat failed it",
+        "never an exhausted one, even when nothing else is left",
+    );
+    std::test::assert(!api::every_exhausted(q), "the request has accounts with headroom");
+    let mut spent = api::QueuePlan { on: true, several: true };
+    push(spent.partitions, partition("p.d", "d", 100.0, true)) or discard;
+    push(spent.partitions, partition("p.e", "e", 100.0, true)) or discard;
+    std::test::assert(
+        api::every_exhausted(spent) && !api::every_exhausted(api::QueuePlan { on: true }),
+        "every account exhausted: admission refuses it, as the route table leaves their seats out",
     );
     let mut m = api::QueuePlan { on: true };
     push(m.partitions, partition("voice.work.m.x.internal.any", "", 0.0, false)) or discard;
@@ -213,6 +216,199 @@ fn partition_choice() {
         api::chosen(m, "\nn1/a\n", 7, 3),
         "voice.work.m.x.internal.any",
         "the m shape's one partition while a seat has not failed it",
+    );
+}
+
+/// A board as the store reads it, `age_ms` old: `queues` and `seats` its
+/// lists' entries.
+fn board(age_ms: Int, queues: String, seats: String) -> String {
+    return "{\"version\": 7, \"at\": \"2026-11-26T10:00:00.000Z\", \"age_ms\": "
+        + to_string(age_ms) + ", \"models\": [], \"queues\": [" + queues + "], \"seats\": ["
+        + seats + "]}";
+}
+
+fn reading(subject: String, depth: Int, service: String, seats: String) -> String {
+    return "{\"subject\": \"" + subject + "\", \"shape\": \"p\", \"depth\": "
+        + to_string(depth) + ", \"service_ms\": " + service + ", \"seats\": [" + seats + "]}";
+}
+
+fn board_seat(
+    ref: String,
+    hold: String,
+    consume: String,
+    concurrency: Int,
+    in_flight: Int
+) -> String {
+    return "{\"seat\": \"" + ref + "\", \"hold\": " + hold + ", \"consume\": [" + consume
+        + "], \"concurrency\": " + to_string(concurrency) + ", \"in_flight\": "
+        + to_string(in_flight) + ", \"conversations_held\": 4}";
+}
+
+fn boards() {
+    // the expected wait: depth over free slots, times the service time
+    std::test::assert_eq_int(api::expected_wait_ms(6, 3, 4, 2000), 4000, "6 over 3 free, 2 s each");
+    std::test::assert_eq_int(api::expected_wait_ms(0, 1, 4, 2000), 0, "empty with a slot free");
+    std::test::assert_eq_int(
+        api::expected_wait_ms(3, 0, 4, 2000),
+        2000,
+        "no slot free: behind 3, a slot every 2 s over 4",
+    );
+    std::test::assert_eq_int(
+        api::expected_wait_ms(2, 1, 1, -1),
+        2000,
+        "no service time: a second each",
+    );
+    std::test::assert_eq_int(
+        api::expected_wait_ms(0, 0, 0, 100),
+        600000,
+        "nothing consuming it: longer than any ticket waits",
+    );
+
+    let mut q = api::QueuePlan { on: true, several: true };
+    push(q.partitions, partition("voice.work.p.m.a.internal.any", "a", 10.0, false)) or discard;
+    push(q.partitions, partition("voice.work.p.m.b.internal.any", "b", 12.0, false)) or discard;
+    push(q.seats, seat("n1/a", "a")) or discard;
+    push(q.seats, seat("n2/b", "b")) or discard;
+    let a_q = "voice.work.p.m.a.internal.any";
+    let b_q = "voice.work.p.m.b.internal.any";
+    // a's queue backed up and its one seat busy; b's empty with a slot free
+    let fresh = board(
+        900,
+        reading(a_q, 8, "3000", "\"n1/a\"") + ", " + reading(b_q, 0, "3000", "\"n2/b\""),
+        board_seat("n1/a", "null", "\"voice.work.s.n1.a\", \"" + a_q + "\"", 2, 2) + ", "
+            + board_seat("n2/b", "null", "\"voice.work.s.n2.b\", \"" + b_q + "\"", 2, 1),
+    );
+    let read = api::with_board(q, fresh, "voice");
+    let pa = at(read.partitions, 0) or api::Partition { };
+    let pb = at(read.partitions, 1) or api::Partition { };
+    std::test::assert(
+        read.board && pa.wait_ms == 13500 && pb.wait_ms == 0,
+        "each partition's expected wait from the board: " + to_string(pa.wait_ms) + ", "
+            + to_string(pb.wait_ms),
+    );
+    let mut k = 0;
+    while k < 20 {
+        std::test::assert_eq_str(
+            api::chosen(read, "\n", k, k + 1),
+            b_q,
+            "of the two drawn, the shorter expected wait, whichever is drawn first",
+        );
+        k = k + 1;
+    }
+    // the draws weighted by free slots: of three, the one with all of them
+    // is always drawn, and of the two the shorter wait taken
+    let mut w = api::QueuePlan { on: true, several: true };
+    let mut p1 = partition("p.1", "a", 0.0, false);
+    p1.free = 0;
+    p1.wait_ms = 100;
+    let mut p2 = partition("p.2", "b", 0.0, false);
+    p2.free = 0;
+    p2.wait_ms = 50;
+    let mut p3 = partition("p.3", "c", 0.0, false);
+    p3.free = 5;
+    p3.wait_ms = 0;
+    push(w.partitions, p1) or discard;
+    push(w.partitions, p2) or discard;
+    push(w.partitions, p3) or discard;
+    push(w.seats, seat("n1/a", "a")) or discard;
+    push(w.seats, seat("n2/b", "b")) or discard;
+    push(w.seats, seat("n3/c", "c")) or discard;
+    k = 0;
+    while k < 30 {
+        std::test::assert_eq_int(
+            api::drawn(w, "\n", 0.0, k * 7 + 1, -1),
+            2,
+            "the one partition with free slots is drawn first",
+        );
+        std::test::assert_eq_str(
+            api::chosen(w, "\n", k * 7 + 1, k * 3),
+            "p.3",
+            "and taken, its wait the shortest",
+        );
+        k = k + 1;
+    }
+    let mut seen_rest = "";
+    k = 0;
+    while k < 30 {
+        let d = api::drawn(w, "\n", 0.0, k, 2);
+        if !std::str::contains(seen_rest, to_string(d) + ";") {
+            seen_rest = seen_rest + to_string(d) + ";";
+        }
+        k = k + 1;
+    }
+    std::test::assert_eq_str(seen_rest, "0;1;", "with none free among the rest, evenly");
+
+    // stale, or none: as without a board, the first draw
+    let stale = api::with_board(q, board(6000, "", ""), "voice");
+    std::test::assert(
+        !stale.board && (at(stale.partitions, 0) or api::Partition { }).wait_ms == -1,
+        "a board older than 5 s is not read",
+    );
+    std::test::assert_eq_str(api::chosen(stale, "\n", 0, 1), a_q, "the first draw taken");
+    std::test::assert_eq_str(api::chosen(stale, "\n", 1, 0), b_q, "whichever it is");
+    std::test::assert(
+        !api::with_board(q, "", "voice").board,
+        "no board at all: none read",
+    );
+
+    // a conversation's home seat and the window: 0 when the board says it
+    // cannot take the turn soon
+    let mut t = api::QueuePlan { on: true };
+    push(t.partitions, partition("voice.work.m.m.internal.any", "", 0.0, false)) or discard;
+    push(t.seats, seat("n1/a", "local")) or discard;
+    t.home = seat("n1/a", "local");
+    let own = "\"voice.work.s.n1.a\", \"voice.work.m.m.internal.any\"";
+    let consuming = api::with_board(
+        t,
+        board(
+            100,
+            reading("voice.work.s.n1.a", 1, "null", "\"n1/a\""),
+            board_seat("n1/a", "null", own, 2, 1),
+        ),
+        "voice",
+    );
+    std::test::assert_eq_str(consuming.home_skip, "", "a home seat consuming, its queue short");
+    let held = api::with_board(
+        t,
+        board(100, "", board_seat("n1/a", "\"its node is draining\"", "", 2, 0)),
+        "voice",
+    );
+    std::test::assert_eq_str(
+        held.home_skip,
+        "its home seat is held: its node is draining",
+        "held: straight to the partition",
+    );
+    let absent = api::with_board(t, board(100, "", ""), "voice");
+    std::test::assert(
+        std::str::contains(absent.home_skip, "consumes nothing"),
+        "not on the board: consuming nothing",
+    );
+    let other = api::with_board(
+        t,
+        board(100, "", board_seat("n1/a", "null", "\"voice.work.m.m.internal.any\"", 2, 0)),
+        "voice",
+    );
+    std::test::assert(
+        std::str::contains(other.home_skip, "does not consume its own queue"),
+        "a plan without its own queue: consuming none of it",
+    );
+    let full = api::with_board(
+        t,
+        board(
+            100,
+            reading("voice.work.s.n1.a", 2, "null", "\"n1/a\""),
+            board_seat("n1/a", "null", own, 2, 2),
+        ),
+        "voice",
+    );
+    std::test::assert(
+        std::str::contains(full.home_skip, "holds 2 tickets"),
+        "its own queue as long as its concurrency: full",
+    );
+    std::test::assert_eq_str(
+        api::with_board(t, board(9000, "", ""), "voice").home_skip,
+        "",
+        "a stale board says nothing of it: the window is its own",
     );
 }
 
@@ -534,6 +730,7 @@ fn main() {
     turns();
     path_choice();
     partition_choice();
+    boards();
     ticket_and_headers();
     claims();
 }

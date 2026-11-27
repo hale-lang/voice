@@ -1,12 +1,20 @@
 // The brain against Postgres, when VOICE_TEST_DATABASE_URL names a database
 // at the current schema (`api migrate`), which this test empties first:
 // the one-brain lock, the reclaim of a dead api instance, node liveness and
-// the route table read from the fleet as reported.
+// the route table read from the fleet as reported, and the board. With
+// VOICE_TEST_NATS_URL naming a JetStream-enabled NATS too, the controller
+// ticks as the working brain does (`controller`): a backlog on one model's
+// queue moves a seat that serves two to it within a few ticks, and back
+// once it drains, and an exhausted account's seats are held, each change
+// published in the node's plan. (In this one file, since the brain's test
+// files run side by side and this database is theirs.)
 import ".." as brain;
 import "../../api" as api;
 import "../../store" as st;
 import "../../lib/pond/pq" as pq;
 import "../../lib/pond/db" as db;
+import "../../lib/work" as work;
+import "../../lib/pond/realtime/nats" as nats;
 
 fn connect(url: String) -> pq::PgConn {
     let d = st::parse_dsn(url);
@@ -38,7 +46,7 @@ fn main() {
     run(c, "SET TIME ZONE 'UTC'");
     run(
         c,
-        "TRUNCATE route_table, usage, request, budget_state, limit_state, api_instance, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
+        "TRUNCATE route_table, board, usage, request, budget_state, limit_state, api_instance, change, quota_window, seat_state, node_state, seat, node, \"limit\", budget, api_key, project, account, catalog_model, recipe, placement, runtime RESTART IDENTITY CASCADE",
     );
 
     // the one brain
@@ -204,7 +212,7 @@ fn main() {
         "in_flight",
         "and is rolled back",
     );
-    let after_failure = brain::write_table(c2);
+    let after_failure = brain::write_tick(c2, "voice", "", "");
     std::test::assert(
         after_failure.version > 0,
         "the route table is still written: " + after_failure.detail,
@@ -230,7 +238,7 @@ fn main() {
         "up",
         "a node heartbeating is up",
     );
-    let w = brain::write_table(c2);
+    let w = brain::write_tick(c2, "voice", "", "");
     let table = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         std::str::contains(table, "\"seat\": \"laptop/static\""),
@@ -249,6 +257,66 @@ fn main() {
             && std::str::contains(read, "laptop/static"),
         "its time and its routes",
     );
+    // the board, in the same transaction: its version from the store's
+    // clock, the seat not held and consuming its own queue and its model's,
+    // and the node's plan handed over with it
+    std::test::assert(
+        w.board.version > 0 && w.board.worked,
+        "the board is written: " + w.board.step + " " + w.board.detail,
+    );
+    std::test::assert_eq_str(
+        one(c2, "SELECT version::text FROM board"),
+        to_string(w.board.version),
+        "the board's row is at the version handed over",
+    );
+    let seat_row = one(
+        c2,
+        "SELECT s::text FROM board, jsonb_array_elements(body->'seats') s WHERE s->>'seat' = 'laptop/static'",
+    );
+    std::test::assert(
+        std::str::contains(seat_row, "\"hold\": null")
+            && std::str::contains(
+                seat_row,
+                "\"consume\": [\"voice.work.s.laptop.static\", \"voice.work.m.echo-1.internal.any\", \"voice.work.p.echo-1.static.internal.any\"]",
+            ),
+        "its seat consumes its own queue, then its model's: " + seat_row,
+    );
+    std::test::assert(
+        std::str::starts_with(w.board.plans, "laptop\t[{\"seat\": \"static\"")
+            && std::str::contains(w.board.subjects, "voice.work.s.laptop.static\n"),
+        "the node's plan and the queues, handed over: " + w.board.plans,
+    );
+    std::test::assert(
+        std::str::ends_with(std::json::find_string_field(store.board() or "", "at"), "Z"),
+        "the api reads the board with its time",
+    );
+    // the ledger's last minute: a model's service time, its seat's
+    // `engine_ms`, else the wall time less the queue's; a value that is no
+    // number counts as none, and an old request not at all
+    run(
+        c2,
+        "INSERT INTO usage (id, created_at, project, key, account, requested_model, status, served, record) VALUES ('resp_a', now(), 'work', 'k_1', 'static', 'echo-1', 'served', '{\"seat\": \"laptop/static\"}', '{\"resolved_model\": \"echo-1\", \"timing\": {\"wall_ms\": 900, \"queue_ms\": 100, \"engine_ms\": 700}}'), ('resp_b', now(), 'work', 'k_1', 'static', 'echo-1', 'served', '{\"seat\": \"laptop/static\"}', '{\"resolved_model\": \"echo-1\", \"timing\": {\"wall_ms\": 600, \"queue_ms\": 100, \"engine_ms\": \"x\"}}'), ('resp_c', now() - interval '5 minutes', 'work', 'k_1', 'static', 'echo-1', 'served', '{\"seat\": \"laptop/static\"}', '{\"resolved_model\": \"echo-1\", \"timing\": {\"wall_ms\": 90000, \"queue_ms\": 0, \"engine_ms\": 90000}}')",
+    );
+    let services = c2.query_params(brain::SERVICE_READ, db::Args { });
+    std::test::assert(services.ok, "the service times are read: " + services.err.detail);
+    std::test::assert(
+        std::json::find_string_field(std::str::trim(services.csv), "model") == "echo-1"
+            && std::json::find_int_field(std::str::trim(services.csv), "n") == 2
+            && std::json::find_int_field(std::str::trim(services.csv), "service_ms") == 600,
+        "echo-1's last minute: two requests, 700 and 500 ms: " + services.csv,
+    );
+    let boarded = brain::write_tick(c2, "voice", "", "");
+    std::test::assert(
+        std::str::contains(
+            one(
+                c2,
+                "SELECT q::text FROM board, jsonb_array_elements(body->'queues') q WHERE q->>'subject' = 'voice.work.m.echo-1.internal.any'",
+            ),
+            "\"service_ms\": 600",
+        ) && boarded.board.version > w.board.version,
+        "the board's queue carries its model's service time, at a later version",
+    );
+    run(c2, "DELETE FROM usage WHERE id IN ('resp_a', 'resp_b', 'resp_c')");
     // a placement's seat as a store from before holds it (its row's
     // concurrency 1): free up to what its runtime is started with
     run(
@@ -259,7 +327,7 @@ fn main() {
         c2,
         "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('laptop', 'tf', 'up', 1, now())",
     );
-    brain::write_table(c2);
+    brain::write_tick(c2, "voice", "", "");
     let placed = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         std::str::contains(placed, "\"seat\": \"laptop/tf\"")
@@ -269,7 +337,7 @@ fn main() {
     // the version goes on past the stored one, whatever the clock says
     run(c2, "UPDATE route_table SET version = 9000000000000");
     std::test::assert_eq_int(
-        brain::write_table(c2).version,
+        brain::write_tick(c2, "voice", "", "").version,
         9000000000001,
         "a version is never below the one before it",
     );
@@ -289,7 +357,7 @@ fn main() {
         "99.999995",
         "the use as reported",
     );
-    brain::write_table(c2);
+    brain::write_tick(c2, "voice", "", "");
     std::test::assert(
         std::str::contains(one(c2, "SELECT body::text FROM route_table"), "laptop/static"),
         "a seat whose account is at 99.999995% still routes",
@@ -299,7 +367,7 @@ fn main() {
         c2,
         "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'five_hour', 100, now() + interval '1 hour', now())",
     );
-    brain::write_table(c2);
+    brain::write_tick(c2, "voice", "", "");
     let full = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         !std::str::contains(full, "laptop/static"),
@@ -342,8 +410,239 @@ fn main() {
     std::test::assert(seats.ok, "the seats' queues are read: " + seats.err.detail);
     std::test::assert_eq_str(
         brain::partitions("voice", seats.csv),
-        "voice.work.m.echo-1.internal.any\nvoice.work.s.laptop.static\nvoice.work.s.laptop.tf\nvoice.work.m.echo-1.internal.tools\nvoice.work.m.echo-1.public.any\nvoice.work.m.echo-1.public.tools\nvoice.work.s.spark.coder\n",
+        "voice.work.s.laptop.static\nvoice.work.m.echo-1.internal.any\nvoice.work.s.laptop.tf\nvoice.work.s.spark.coder\nvoice.work.m.echo-1.internal.tools\nvoice.work.m.echo-1.public.any\nvoice.work.m.echo-1.public.tools\n",
         "the queues of the seats configured to serve, whether up or not",
     );
     c2.close();
+    if std::env::var_exists("VOICE_TEST_NATS_URL") {
+        controller(url, std::env::var("VOICE_TEST_NATS_URL"));
+    }
+}
+
+/// What a tick leaves for the next: the keeper's readings and the seats'
+/// orders; and the plan of node `n` it published, "" for none.
+type Ticked { readings: String = ""; orders: String = ""; plan: String = ""; version: Int = 0; }
+
+/// One tick of the working brain, as `Brain.tick` and its keeper's pass
+/// make it, under `root`: the board written, the stream and consumers
+/// kept, the plans published (`sent`), the queues read back; node `n`'s
+/// plan as `listener` heard it.
+@unbounded
+fn tick(
+    c: pq::PgConn,
+    nc: nats::NatsClient,
+    listener: nats::NatsClient,
+    root: String,
+    sent: brain::SentPlans,
+    was: Ticked
+) -> Ticked {
+    let w = brain::write_tick(c, root, was.readings, was.orders);
+    std::test::assert(
+        w.version > 0 && w.board.version > 0,
+        "a tick writes the board: " + w.step + w.board.step + " " + w.detail + w.board.detail,
+    );
+    let u = brain::upkeep(nc, root, w.board.subjects, false);
+    std::test::assert(len(u.step) == 0, "the stream is kept: " + u.detail);
+    let e = brain::publish_plans(
+        nc,
+        root,
+        w.board.plans,
+        w.board.version,
+        1,
+        sent,
+        std::time::monotonic_ns() / 1000000,
+    );
+    std::test::assert(len(e.kind) == 0, "the plans are published: " + e.detail);
+    let r = brain::read_queues(
+        nc,
+        root,
+        w.board.subjects,
+        std::time::nanos(std::time::current()) / 1000000,
+    );
+    std::test::assert(len(r.step) == 0, "the queues are read: " + r.detail);
+    let mut plan = "";
+    while listener.read_msg(200ms) {
+        plan = std::str::from_bytes(listener.last.data);
+    }
+    return Ticked {
+        readings: r.lines,
+        orders: w.board.orders,
+        plan: plan,
+        version: w.board.version,
+    };
+}
+
+/// Seat `id`'s queues in `plan` (a `ConsumePlan`), space-separated, or
+/// `held: <why>`; "?" when the plan does not name it.
+fn consumes(plan: String, id: String) -> String {
+    let p = work::consume_plan_of(plan) or { return "?"; };
+    for s in p.seats {
+        if s.seat == id {
+            if len(s.hold) > 0 { return "held: " + s.hold; }
+            let mut out = "";
+            for q in s.consume {
+                out = if len(out) == 0 { q } else { out + " " + q };
+            }
+            return out;
+        }
+    }
+    return "?";
+}
+
+/// The controller over Postgres and a JetStream-enabled NATS, a root of its
+/// own: node `n`'s seat `multi` serves two models, `solo` one.
+@unbounded
+fn controller(url: String, nats_url: String) {
+    let c = connect(url);
+    std::test::assert(c.open().ok, "the test database answers");
+    run(c, "SET TIME ZONE 'UTC'");
+    run(
+        c,
+        "TRUNCATE route_table, board, usage, request, api_instance, quota_window, seat_state, node_state, seat, node, api_key, project, account, catalog_model RESTART IDENTITY CASCADE",
+    );
+    run(c, "INSERT INTO catalog_model (id, kind) VALUES ('echo-1', 'local'), ('late', 'local')");
+    run(c, "INSERT INTO account (id, name, billing) VALUES ('local', 'Local', 'none')");
+    run(
+        c,
+        "INSERT INTO node (id, name, token_digest, assignment_version, status) VALUES ('n', 'N', '\\x00', 1, 'up')",
+    );
+    run(
+        c,
+        "INSERT INTO node_state (node, version, capabilities, local, registered_at, last_heartbeat_at, applied_version) VALUES ('n', '0.1.0', '{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}', '{\"paused\": false, \"paused_seats\": []}', now(), now(), 1)",
+    );
+    run(
+        c,
+        "INSERT INTO seat (node, id, engine, account, serves, concurrency, config) VALUES ('n', 'multi', 'static', 'local', '[{\"model\": \"echo-1\", \"as\": null}, {\"model\": \"late\", \"as\": null}]', 1, '{\"text\": \"hi\"}'), ('n', 'solo', 'static', 'local', '[{\"model\": \"echo-1\", \"as\": null}]', 1, '{\"text\": \"hi\"}')",
+    );
+    run(
+        c,
+        "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('n', 'multi', 'up', 0, now()), ('n', 'solo', 'up', 0, now())",
+    );
+    let nc = nats::NatsClient { url: nats_url, name: "controller-test", timeout: 2s };
+    std::test::assert(nc.open(), "the test NATS answers: " + nc.last_error);
+    let listener = nats::NatsClient { url: nats_url, name: "controller-listener", timeout: 2s };
+    std::test::assert(listener.open(), "and takes a second connection");
+    let rand = std::os::getrandom(6) or std::bytes::from_string("fixed");
+    let root = "test.e1" + std::hex::encode(rand);
+    listener.sub_to(work::consume_subject(root, "n"), "") or {
+        std::test::assert(false, "the listener subscribes: " + err.detail);
+        return;
+    };
+    listener.flush() or discard;
+    let sent = brain::SentPlans { };
+    let echo = root + ".work.m.echo-1.internal.any";
+    let late = root + ".work.m.late.internal.any";
+    let own = root + ".work.s.n.multi";
+    // last, each partition in the other shape, as a node with no plan
+    // consumes both
+    let leftovers = " " + root + ".work.p.echo-1.local.internal.any " + root
+        + ".work.p.late.local.internal.any";
+    let base = own + " " + echo + " " + late + leftovers;
+
+    // the first tick: each seat its own queue, then configuration's order
+    let mut t = tick(c, nc, listener, root, sent, Ticked { });
+    std::test::assert_eq_str(consumes(t.plan, "multi"), base, "multi in configuration's order");
+    std::test::assert_eq_str(
+        consumes(t.plan, "solo"),
+        root + ".work.s.n.solo " + echo + " " + root + ".work.p.echo-1.local.internal.any",
+        "solo its own, then echo-1's",
+    );
+    std::test::assert_eq_int(
+        std::json::find_int_field(t.plan, "version"),
+        t.version,
+        "the plan's version is the board's",
+    );
+    let first_version = t.version;
+    t = tick(c, nc, listener, root, sent, t);
+    std::test::assert_eq_str(t.plan, "", "an unchanged plan is not published again at once");
+
+    // late's queue backs up: three ticks of its pressure after the keeper
+    // read it, and multi takes it first
+    let mut i = 0;
+    while i < 5 {
+        nats::js_publish(nc, late, b"{}") or {
+            std::test::assert(false, "a ticket on late's queue: " + err.detail);
+        };
+        i = i + 1;
+    }
+    std::time::sleep(200ms);
+    let mut ticks = 0;
+    let mut moved = "";
+    while ticks < 6 && len(moved) == 0 {
+        t = tick(c, nc, listener, root, sent, t);
+        ticks = ticks + 1;
+        if len(t.plan) > 0 { moved = consumes(t.plan, "multi"); }
+    }
+    std::test::assert_eq_str(
+        moved,
+        own + " " + late + " " + echo + leftovers,
+        "a backlog on late's queue moves multi to it, after its own",
+    );
+    std::test::assert(
+        ticks >= 3 && ticks <= 4,
+        "within the hysteresis's three ticks of the backlog being read: " + to_string(ticks),
+    );
+    std::test::assert(
+        std::json::find_int_field(t.plan, "version") > first_version,
+        "in a plan at a newer board's version",
+    );
+    let board = one(
+        c,
+        "SELECT q::text FROM board, jsonb_array_elements(body->'queues') q WHERE q->>'subject' = '"
+            + late + "'",
+    );
+    std::test::assert(
+        std::json::find_int_field(board, "depth") == 5
+            && std::json::find_int_field(board, "oldest_age_ms") >= 200
+            && std::str::contains(board, "\"seats\": [\"n/multi\"]"),
+        "the board reads late's backlog and its oldest's age: " + board,
+    );
+    std::test::assert_eq_str(
+        consumes(t.plan, "solo"),
+        root + ".work.s.n.solo " + echo + " " + root + ".work.p.echo-1.local.internal.any",
+        "solo keeps its order",
+    );
+
+    // drained: back to configuration's order, three ticks after
+    nats::js_call(
+        nc,
+        "$JS.API.STREAM.PURGE." + work::stream_name(root),
+        "{\"filter\": \"" + late + "\"}",
+    )
+    or { std::test::assert(false, "late's queue drained: " + err.detail); };
+    ticks = 0;
+    moved = "";
+    while ticks < 6 && len(moved) == 0 {
+        t = tick(c, nc, listener, root, sent, t);
+        ticks = ticks + 1;
+        if len(t.plan) > 0 { moved = consumes(t.plan, "multi"); }
+    }
+    std::test::assert_eq_str(moved, base, "back to configuration's order once it drains");
+    std::test::assert(ticks >= 3 && ticks <= 4, "within as many ticks: " + to_string(ticks));
+
+    // an exhausted account: its seats held, why in the plan; and let go
+    run(
+        c,
+        "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('local', 'five_hour', 100, now() + interval '1 hour', now())",
+    );
+    t = tick(c, nc, listener, root, sent, t);
+    std::test::assert(
+        std::str::starts_with(
+            consumes(t.plan, "multi"),
+            "held: its account local is exhausted until ",
+        )
+            && std::str::starts_with(
+                consumes(t.plan, "solo"),
+                "held: its account local is exhausted",
+            ),
+        "an exhausted account's seats are held, pulling nothing: " + t.plan,
+    );
+    run(c, "DELETE FROM quota_window");
+    t = tick(c, nc, listener, root, sent, t);
+    std::test::assert_eq_str(consumes(t.plan, "multi"), base, "and let go once it has headroom");
+
+    nats::js_stream_delete(nc, work::stream_name(root)) or discard;
+    listener.close();
+    nc.close();
+    c.close();
 }

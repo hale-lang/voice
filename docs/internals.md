@@ -773,7 +773,10 @@ Each second the one that works:
   "Reclaim"); an instance whose reclaim fails is left for the next tick;
 - in one transaction, writes each node's `up` or `down` from its heartbeat
   and the route table (`route_table`, spec/store.md, "The route table"),
-  its version from Postgres's clock and never below the one before it;
+  its version from Postgres's clock and never below the one before it, and
+  the board (`board`, spec/store.md, "The board"; internal.yaml `Board`),
+  versioned the same way, after a savepoint, so a failure of the board's
+  own is rolled back to it, said once, and costs the route table nothing;
 - publishes that version on `voice.route`
   ([`internal.yaml`](../spec/internal.yaml)), saying once if it cannot;
 - keeps queue routing's work stream and its consumers
@@ -796,8 +799,38 @@ Each second the one that works:
   `voice.queues.reset`. Then one durable pull consumer per queue
   (`WorkConsumer`), each a JetStream request, every tick. A consumer for a
   queue no seat makes any longer stays; deleting it comes with the
-  controller. NATS or JetStream not answering is said once and tried again
-  next tick; the table is written meanwhile. A standby keeps nothing.
+  consumer lifecycle. NATS or JetStream not answering is said once and
+  tried again next tick; the table and the board are written meanwhile. A
+  standby keeps nothing;
+- plans which queues each seat consumes, in what order
+  ([`brain/plan.hl`](../brain/plan.hl); the design's "The brain: from table
+  writer to controller"), and writes it on the board. Each seat is judged
+  as the route table judges it (`hold_of`), and one that would not route is
+  **held**, with why (disabled, its node not up or draining or behind its
+  assignment, the seat not `up`, a local control, its account inactive or
+  exhausted until a reset, a pair's follower, or a leader whose follower is
+  down). Any other consumes its own queue first, then its partitions in
+  configuration's order; a seat serving several models orders them by
+  **pressure**, each queue's oldest ticket's age over its model's recent
+  service time (the ledger's last minute, read seat by seat through its
+  index by served seat, `SERVICE_READ`; 1 s for a model with none). The
+  order changes only when the queue it would move ahead has had at least
+  twice the pressure of the one in its place for three ticks in a row, so
+  small changes never flap it, and it goes back to configuration's order
+  the same way once its queues drain. Each new order is said once, with
+  why. The board holds each model's shape, each queue's reading (its
+  depth, `num_pending` from its consumer's info, its oldest ticket's age
+  from the stream's first message on its subject, standing pulls, ack
+  pending, its model's service time, the seats consuming it) and each
+  seat's plan, concurrency, in flight and conversations held. The keeper
+  publishes each node's part, a `ConsumePlan` (protocol.yaml), on
+  `voice.node.<node>.consume` with the board's version when it changed,
+  and as it was every 30 s, saying once each seat it holds or lets go; then
+  it reads every queue's consumer and hands the readings back for the next
+  tick's board. Readings are a tick behind, so a backlog moves a seat's
+  order on the third or fourth tick after it builds. With the brain down,
+  nodes pull on the last plan they were given, and a node with none on its
+  own eligibility.
 
 A tick at the bounds (256 seats each serving 16 of 256 models) computes the
 table in milliseconds. `GET /admin/v1/routes` reads the table from Postgres, and so does the
@@ -979,8 +1012,16 @@ when it cannot reach the coordinator.
    spend (by lib/work's rule, which the brain makes the queues by), of
    those not exhausted the ones with the most headroom (their windows in
    `quota_window` as admission reads them), then one of two drawn at
-   random. Its message id is `<request id>.<attempt>.shared` and its
-   `Nats-TTL` the wait it has left. A seat with a free slot pulls it and
+   random (weighted by their consuming seats' free slots, as the brain's
+   board says them), the one with the shorter expected wait on the board (its
+   depth over its consuming seats' free slots, times its model's recent
+   service time; with no slot free, a slot each service time over their
+   concurrency). Exhausted accounts' partitions are never published to: a
+   request whose every one is exhausted is refused `503 no_eligible_seat`,
+   as the route table, which leaves their seats out, refuses it. A board
+   older than 5 s by the store's clock (the brain down) is not read: of the
+   two drawn the first is taken. Its message id is
+   `<request id>.<attempt>.shared` and its `Nats-TTL` the wait it has left. A seat with a free slot pulls it and
    claims it on `<reply_to>.claim`; the attempt, on the instance that
    holds the caller, grants the first claim of a seat the request may go
    to (judged again at the claim: its provider account, data class, the
@@ -1007,7 +1048,12 @@ when it cannot reach the coordinator.
    `<request id>.<attempt>.seat`, which the seat pulls before any
    partition; with no claim within the window (half the estimated miss,
    at most 10 s and half the time left: 1 s while nodes report no prefill
-   rate) the `shared` copy goes to the partition too. Whichever copy is
+   rate) the `shared` copy goes to the partition too, under the home seat's
+   provider account in the `p` shape, where the home may still claim it.
+   The window is 0, the turn straight to a partition chosen as any other's,
+   when the board says the home seat is held, consumes nothing (not on the
+   board, or its plan names not its own queue), or its own queue already
+   holds as many tickets as it serves at once. Whichever copy is
    claimed first is granted, the other declined `taken`, by the attempt
    while it runs and by the keeper after, until its TTL. A hosted home
    seat (whose provider's cache is the provider account's), or one that

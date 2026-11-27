@@ -8,9 +8,12 @@
 // another seat serves; a full partition is answered 429 at once; a claim on
 // a request whose caller left is declined `gone`; a waiting request
 // publishes its ticket again when the stream is made again, and is served;
-// and many requests from both instances, claimed by the node and by a fake
+// many requests from both instances, claimed by the node and by a fake
 // seat that claims each twice, repeats its granted claim and puts the
-// ticket back for the node to claim again, are each granted exactly once.
+// ticket back for the node to claim again, are each granted exactly once;
+// and, by the brain's board, a turn goes straight to a partition when its
+// home seat is held or its own queue full, to the one with the shorter
+// expected wait, and as with no board once the board is stale.
 // Each run works under a root of its own, so its stream is its own, and
 // deletes it at the end.
 import ".." as api;
@@ -135,6 +138,15 @@ locus Instance {
         let id = field(line, 0);
         let flags = field(line, 1);
         let body = field(line, 2);
+        if flags == "board" {
+            // the brain's board, as if it had just written it
+            let written = self.e.store.put_board(body) or 0;
+            note(
+                self.dir + "/" + self.name + ".done",
+                id + "\t" + (if written > 0 { "200" } else { "500" }) + "\tboard",
+            );
+            return;
+        }
         if std::str::starts_with(flags, "pin:") {
             // where its conversation's last turn was granted, as if it had been
             let key = std::json::find_string_field(body, "prompt_cache_key");
@@ -189,7 +201,8 @@ locus Instance {
             "/node/v1/heartbeat",
             self.q1,
             "{\"in_flight\": 0, \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
-                + up("good") + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + "]}",
+                + up("good") + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + ", "
+                + up("pa") + ", " + up("pb") + "]}",
         );
         self.plane(
             "/node/v1/heartbeat",
@@ -216,11 +229,13 @@ locus Instance {
             "late",
             "mixed",
             "turns",
-            "slowt"
+            "slowt",
+            "pick"
         ] {
             catalog.create(api::CatalogModelCreate { id: model }) or discard;
         }
         accounts.create(api::AccountCreate { id: "local", name: "Local" }) or discard;
+        accounts.create(api::AccountCreate { id: "other", name: "Other" }) or discard;
         projects.create(api::ProjectCreate { id: "work", name: "Work" }) or discard;
         let made = keys.create(
             api::KeyCreate { project: "work", name: "live" },
@@ -264,6 +279,9 @@ locus Instance {
             "slowt",
             "{\"text\": \"from t2\", \"first_output_ms\": 1500}",
         );
+        // `pick`, under two accounts: its partitions in the p shape
+        seat_of(seats, "q1", "pa", "local", "pick", "", "{\"text\": \"from pa\"}");
+        seat_of(seats, "q1", "pb", "other", "pick", "", "{\"text\": \"from pb\"}");
         seat(seats, "fake", "a", "echo-1", "late", "{\"text\": \"fake\"}");
         seat(seats, "fake", "b", "echo-1", "late", "{\"text\": \"fake\"}");
         seat(seats, "fake", "c", "quiet", "still", "{\"text\": \"fake\"}");
@@ -283,7 +301,8 @@ locus Instance {
                 + to_string(std::json::find_int_field(assignment, "version"))
                 + ", \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
                 + up("good")
-                + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + "]}",
+                + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + ", " + up("pa") + ", "
+                + up("pb") + "]}",
         );
         let freg = self.plane(
             "/node/v1/register",
@@ -321,11 +340,24 @@ fn seat(
     also: String,
     config: String
 ) {
+    seat_of(seats, node_id, id, "local", model, also, config);
+}
+
+/// `seat`, under `account`.
+fn seat_of(
+    seats: api::Seats,
+    node_id: String,
+    id: String,
+    account: String,
+    model: String,
+    also: String,
+    config: String
+) {
     let mut sc = api::SeatCreate {
         node: node_id,
         id: id,
         engine: "static",
-        account: "local",
+        account: account,
         config: std::json::Value::parse(config) or std::json::Value::null(),
     };
     push(sc.serves, st::SeatModel { model: model }) or discard;
@@ -585,8 +617,11 @@ main locus App {
         ] {
             self.consumer(work::model_subject(self.root, model, "internal", "any"));
         }
-        for s in ["s1", "s2", "bad", "good", "m3", "t1", "t2"] {
+        for s in ["s1", "s2", "bad", "good", "m3", "t1", "t2", "pa", "pb"] {
             self.consumer(work::seat_subject(self.root, "q1", s));
+        }
+        for account in ["local", "other"] {
+            self.consumer(work::provider_subject(self.root, "pick", account, "internal", "any"));
         }
         self.consumer(work::seat_subject(self.root, "fake", "a"));
         self.consumer(work::seat_subject(self.root, "fake", "b"));
@@ -646,6 +681,108 @@ main locus App {
             work::stream_name(self.root),
             work::consumer_name(work::seat_subject(self.root, "q1", seat)),
         ) or nats::ConsumerInfo { name: "unread" };
+    }
+
+    /// `pick`'s partition under `account`'s consumer, as JetStream says it.
+    fn picked(account: String) -> nats::ConsumerInfo {
+        return nats::js_consumer_info(
+            self.c,
+            work::stream_name(self.root),
+            work::consumer_name(
+                work::provider_subject(self.root, "pick", account, "internal", "any"),
+            ),
+        ) or nats::ConsumerInfo { name: "unread" };
+    }
+
+    /// The brain's board: a turn of `pick` whose home seat is `pa` (where its
+    /// last turn was granted, set so before each), with no board, goes to its home's own queue and is served
+    /// there; with a fresh board that holds `pa`, or says its own queue is
+    /// full, it goes straight to a partition (its window 0), and of the two
+    /// drawn, `pb`'s, whose expected wait is shorter than `pa`'s backed-up
+    /// one's, serves it; with the board gone stale (the brain down), the
+    /// choice is as with none.
+    @unbounded
+    fn boards() {
+        let mut key = "";
+        let mut i = 0;
+        while i < 200 && len(key) == 0 {
+            let k = "pick-" + to_string(i);
+            if api::key_hash(k + "\nq1/pa") > api::key_hash(k + "\nq1/pb") { key = k; }
+            i = i + 1;
+        }
+        let ask = "{\"model\": \"pick\", \"input\": \"hi\", \"prompt_cache_key\": \"" + key + "\"}";
+        let own_a = self.own_queue("pa").delivered_stream_seq;
+        let none = self.answer("api-1", self.hand("api-1", "pin:q1/pa", ask), 20000);
+        std::test::assert_eq_str(field(none, 0), "200", "with no board, served: " + none);
+        std::test::assert(
+            std::str::contains(field(none, 1), "from pa")
+                && self.own_queue("pa").delivered_stream_seq > own_a,
+            "on its home seat, through its own queue: " + none,
+        );
+        let local_q = work::provider_subject(self.root, "pick", "local", "internal", "any");
+        let other_q = work::provider_subject(self.root, "pick", "other", "internal", "any");
+        let pa_own = work::seat_subject(self.root, "q1", "pa");
+        let pb_own = work::seat_subject(self.root, "q1", "pb");
+        // pa's partition backed up behind its busy seat; pb's empty, pb free
+        let queues = "{\"subject\": \"" + local_q
+            + "\", \"shape\": \"p\", \"depth\": 40, \"service_ms\": 3000, \"seats\": [\"q1/pa\"]}, {\"subject\": \""
+            + other_q
+            + "\", \"shape\": \"p\", \"depth\": 0, \"service_ms\": 3000, \"seats\": [\"q1/pb\"]}";
+        let pb_seat = "{\"seat\": \"q1/pb\", \"hold\": null, \"consume\": [\"" + pb_own + "\", \""
+            + other_q + "\"], \"concurrency\": 1, \"in_flight\": 0, \"conversations_held\": 1}";
+        let cases = [
+            "{\"seat\": \"q1/pa\", \"hold\": \"its node is draining\", \"consume\": [], \"concurrency\": 1, \"in_flight\": 1, \"conversations_held\": 1}",
+            "{\"seat\": \"q1/pa\", \"hold\": null, \"consume\": [\"" + pa_own + "\", \"" + local_q
+                + "\"], \"concurrency\": 1, \"in_flight\": 1, \"conversations_held\": 1}"
+        ];
+        let mut c = 0;
+        for pa_seat in cases {
+            // the second: pa consuming, but its own queue as long as it
+            // serves at once
+            let own_queue = if c == 1 {
+                ", {\"subject\": \"" + pa_own
+                    + "\", \"shape\": \"s\", \"depth\": 1, \"service_ms\": null, \"seats\": [\"q1/pa\"]}"
+            } else {
+                ""
+            };
+            let board = "{\"models\": [{\"model\": \"pick\", \"shape\": \"p\"}], \"queues\": ["
+                + queues + own_queue + "], \"seats\": [" + pa_seat + ", " + pb_seat + "]}";
+            let what = if c == 0 { "its home held" } else { "its home's own queue full" };
+            std::test::assert_eq_str(
+                field(self.answer("api-1", self.hand("api-1", "board", board), 5000), 0),
+                "200",
+                "the board is written",
+            );
+            let own_before = self.own_queue("pa").delivered_stream_seq;
+            let other_before = self.picked("other").delivered_stream_seq;
+            let got = self.answer("api-1", self.hand("api-1", "pin:q1/pa", ask), 20000);
+            std::test::assert_eq_str(field(got, 0), "200", what + ": served: " + got);
+            let waited = std::json::find_int_field(
+                std::json::find_field_raw(
+                    std::json::find_field_raw(field(got, 1), "voice"),
+                    "timing",
+                ),
+                "queue_ms",
+            );
+            std::test::assert(
+                std::str::contains(field(got, 1), "from pb") && waited < 900
+                    && self.picked("other").delivered_stream_seq > other_before
+                    && self.own_queue("pa").delivered_stream_seq == own_before,
+                what
+                    + ": its window 0, straight to the partition with the shorter expected wait, pb's, in "
+                    + to_string(waited) + " ms: " + got,
+            );
+            c = c + 1;
+        }
+        // the board gone stale: as with none, its home's own queue first
+        std::time::sleep(5200ms);
+        let own_before = self.own_queue("pa").delivered_stream_seq;
+        let stale = self.answer("api-1", self.hand("api-1", "pin:q1/pa", ask), 20000);
+        std::test::assert(
+            field(stale, 0) == "200" && std::str::contains(field(stale, 1), "from pa")
+                && self.own_queue("pa").delivered_stream_seq > own_before,
+            "a board 5 s old is not read: its home's own queue, as with none: " + stale,
+        );
     }
 
     /// A conversation's turns: served on its home seat through the seat's
@@ -959,6 +1096,9 @@ main locus App {
 
         // a conversation's turns: on its home seat's own queue first
         self.turns();
+
+        // the brain's board: a window 0, and the shorter expected wait
+        self.boards();
 
         // many requests from both instances, claimed by the node and the
         // fake seat, which holds a standing pull beside the node's: each

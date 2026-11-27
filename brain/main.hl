@@ -1,5 +1,6 @@
 // The brain: keeps the route table (../docs/internals.md, "The route table"),
-// and queue routing's work stream and its consumers (work.hl).
+// and queue routing's board, plans, work stream and consumers (plan.hl,
+// work.hl).
 //
 // It shares nothing with the api but Postgres. Only one brain works at a
 // time: it holds a Postgres advisory lock on its connection, and a second
@@ -12,18 +13,22 @@
 // Each tick, while it holds the lock, it reclaims what dead api instances
 // held (each instance in a transaction of its own, a failure logged and
 // left for the next tick), then, in one transaction, writes each node's
-// liveness and the route table (`route_table`, store.md), and publishes
-// the table's new version, `RouteWritten`, which a pinned NATS connection
-// tells on `<root>.route` (`voice.route` standalone; internal.yaml) on a
-// thread of its own, so the tick never waits on NATS. The binding keeps
-// only the newest version (pond's `Delivery::Latest`): one that NATS
-// cannot take now is replaced by the next, and the newest is told once
-// NATS is back. Then it reads the seats configured to serve and hands the
-// queues they make to its keeper (work.hl `WorkKeeper`), pinned on a thread
-// of its own with a NATS connection of its own, which keeps the work stream
-// and a consumer per queue; a standby hands it nothing. Per-tick work runs
-// in a method, so each tick's memory is reclaimed. It needs Postgres 14 or
-// newer (`idle_session_timeout`), and says so and stops on an older one.
+// liveness, the route table (`route_table`, store.md) and the board
+// (`board`, plan.hl), and publishes the table's new version,
+// `RouteWritten`, which a pinned NATS connection tells on `<root>.route`
+// (`voice.route` standalone; internal.yaml) on a thread of its own, so the
+// tick never waits on NATS. The binding keeps only the newest version
+// (pond's `Delivery::Latest`): one that NATS cannot take now is replaced by
+// the next, and the newest is told once NATS is back. The board is written
+// after a savepoint: a failure of its own is rolled back to it and said,
+// and the route table and liveness are written regardless. Then it hands
+// its keeper (work.hl `WorkKeeper`), pinned on a thread of its own with a
+// NATS connection of its own, the queues the seats configured to serve make
+// and each node's plan; the keeper keeps the work stream and a consumer per
+// queue, publishes the plans, and reads the queues back for the next
+// tick's board. A standby hands it nothing. Per-tick work runs in a method,
+// so each tick's memory is reclaimed. It needs Postgres 14 or newer
+// (`idle_session_timeout`), and says so and stops on an older one.
 
 import "../lib/logfmt" as logfmt;
 import "../store" as st;
@@ -57,8 +62,16 @@ main locus Brain {
         trouble: String = "";
         // the root of voice's subjects: `voice`, grafted the broker's
         root: String = "voice";
-        // the last trouble reading the seats' queues, said once
-        work_trouble: String = "";
+        // the last trouble writing the board, said once
+        board_trouble: String = "";
+        // the keeper's last readings of the queues (plan.hl `fill_readings`),
+        // and each seat's order of its queues as the last board gave it
+        // (`fill_orders`)
+        readings: String = "";
+        orders: String = "";
+        // grows each time this brain takes the lock: its keeper publishes
+        // every plan afresh under a new term
+        term: Int = 0;
         // tells NATS each version, on its own thread: grafted, as the
         // habitat broker's account, its subjects under the broker's root;
         // with no NATS (`url` ""), it dials nothing and tells no one
@@ -80,6 +93,7 @@ main locus Brain {
     bus {
         publish RouteWritten;
         publish WorkWanted;
+        subscribe QueuesRead as on_read;
     }
 
     birth() {
@@ -108,6 +122,10 @@ main locus Brain {
     }
 
     dissolve() { self.conn.close(); }
+
+    /// The keeper's readings of the queues, for the next tick's board.
+    @bounded_by(r)
+    fn on_read(r: Read) { self.readings = r.lines; }
 
     /// One pass.
     fn tick() {
@@ -148,6 +166,8 @@ main locus Brain {
                 return;
             }
             self.holding = true;
+            self.term = self.term + 1;
+            self.orders = "";
             self.say("working", "holding the lock; working");
         }
         let reclaimed = reclaim(self.conn);
@@ -158,57 +178,73 @@ main locus Brain {
         if reclaimed > 0 {
             log_info("reclaimed dead api instances", std::log::kv("count", to_string(reclaimed)));
         }
-        let version = self.written();
-        if version < 0 { return; }
-        // the pinned connection tells NATS; the tick never waits on it
-        RouteWritten <- Version { version: version };
-        self.trouble_is("");
-        self.want_work();
-    }
-
-    /// The queues the seats configured to serve make, handed to the keeper,
-    /// which keeps their stream and consumers on its own thread. A lost
-    /// connection drops the lock; any other failure is said once and tried
-    /// again next tick.
-    fn want_work() {
-        let none = db::Args { };
-        let rows = self.conn.query_params(WORK_READ, none);
-        if !rows.ok {
-            if rows.err.kind == "io" {
-                self.drop("the seats' queues: " + rows.err.detail);
-                return;
+        let w = write_tick(self.conn, self.root, self.readings, self.orders);
+        if w.version < 0 {
+            if w.kind == "io" {
+                self.drop(w.step + ": " + w.detail);
+            } else {
+                self.trouble_is(w.step + " failed: " + w.detail);
             }
-            self.work_trouble_is("the seats' queues could not be read: " + rows.err.detail);
             return;
         }
-        self.work_trouble_is("");
-        WorkWanted <- Wanted { subjects: partitions(self.root, rows.csv) };
+        // the pinned connection tells NATS; the tick never waits on it
+        RouteWritten <- Version { version: w.version };
+        self.trouble_is("");
+        self.boarded(w.board);
+        // the keeper keeps the queues and publishes the plans on its own
+        // thread; with no queues read, it is handed nothing
+        if w.board.worked {
+            WorkWanted <- Wanted {
+                subjects: w.board.subjects,
+                plans: w.board.plans,
+                version: w.board.version,
+                term: self.term,
+            };
+        }
     }
 
-    /// Say trouble reading the seats' queues, or its end, once each time it
+    /// The board as this tick wrote it, or why it did not: its orders kept
+    /// for the next tick, each seat's new order said once with why, and
+    /// trouble said once while it lasts.
+    @unbounded
+    fn boarded(b: Boarded) {
+        if b.version < 0 {
+            self.board_trouble_is(b.step + " failed: " + b.detail);
+            return;
+        }
+        self.board_trouble_is("");
+        self.orders = b.orders;
+        let v = std::str::bytes_view(b.said);
+        let mut start = 0;
+        while start < v.n {
+            let nl = st::line_end(v, start);
+            let line = std::str::slice(v, start, nl);
+            start = nl + 1;
+            if len(line) > 0 {
+                log_info(
+                    "a seat's queues ordered anew",
+                    fields2(
+                        fields2(
+                            std::log::kv("seat", tab_field(line, 0)),
+                            std::log::kv("first", tab_field(line, 1)),
+                        ),
+                        std::log::kv("why", tab_field(line, 2)),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Say trouble writing the board, or its end, once each time it
     /// changes.
-    fn work_trouble_is(what: String) {
-        if what == self.work_trouble { return; }
+    fn board_trouble_is(what: String) {
+        if what == self.board_trouble { return; }
         if len(what) > 0 {
-            log_warn(what, "");
-        } else {
-            log_info("the seats' queues are read again", "");
+            log_warn("the board is not written: " + what, "");
+        } else if len(self.board_trouble) > 0 {
+            log_info("the board is written again", "");
         }
-        self.work_trouble = what;
-    }
-
-    /// Node liveness and the route table; the table's new version, or -1
-    /// when it was not written: a lost connection drops the lock, any
-    /// other failure is said and tried again next tick.
-    fn written() -> Int {
-        let w = write_table(self.conn);
-        if w.version >= 0 { return w.version; }
-        if w.kind == "io" {
-            self.drop(w.step + ": " + w.detail);
-        } else {
-            self.trouble_is(w.step + " failed: " + w.detail);
-        }
-        return -1;
+        self.board_trouble = what;
     }
 
     /// Say trouble, or its end, once each time it changes.
@@ -245,13 +281,37 @@ main locus Brain {
 /// where it changed, and never over `revoked`.
 const LIVENESS: String = "UPDATE node n SET status = CASE WHEN ns.last_heartbeat_at > now() - interval '15 seconds' THEN 'up' ELSE 'down' END FROM node_state ns WHERE ns.node = n.id AND n.status <> 'revoked' AND n.status <> CASE WHEN ns.last_heartbeat_at > now() - interval '15 seconds' THEN 'up' ELSE 'down' END";
 
-/// How a table's write went: its version, or -1 with the step that
-/// failed, how (`io` for a lost connection) and why.
-type Written { version: Int = -1; step: String = ""; kind: String = ""; detail: String = ""; }
+/// How a tick's write went: the route table's version, or -1 with the step
+/// that failed, how (`io` for a lost connection) and why; and the board's.
+type Written {
+    version: Int = -1;
+    step: String = "";
+    kind: String = "";
+    detail: String = "";
+    board: Boarded = Boarded { };
+}
 
-/// Node liveness and the route table, in one transaction (store.md, "The
-/// route table"); rolled back when a step fails.
-fn write_table(conn: pq::PgConn) -> Written {
+/// How the board's write went: its version, or -1 with the step that
+/// failed and why; whether the seats' queues were read (`worked`), and
+/// what the plan made of them (plan.hl `Planned`): the queues to keep, each
+/// node's plan, the orders for the next tick, and what to say.
+type Boarded {
+    version: Int = -1;
+    step: String = "";
+    detail: String = "";
+    worked: Bool = false;
+    subjects: String = "";
+    plans: String = "";
+    orders: String = "";
+    said: String = "";
+}
+
+/// Node liveness, the route table and the board, in one transaction (store.md,
+/// "The route table", "The board"); rolled back when a step before the
+/// board fails. The board is written after a savepoint, and a failure of
+/// its own is rolled back to it: the route table and liveness are written
+/// whatever becomes of the board.
+fn write_tick(conn: pq::PgConn, root: String, readings: String, orders: String) -> Written {
     let begun = conn.begin();
     if !begun.ok {
         return Written { step: "begin", kind: begun.err.kind, detail: begun.err.detail };
@@ -271,9 +331,74 @@ fn write_table(conn: pq::PgConn) -> Written {
     if !saved.ok {
         return rolled_back(conn, "the route table's write", saved.err.kind, saved.err.detail);
     }
+    let mark = conn.exec("SAVEPOINT board");
+    if !mark.ok {
+        return rolled_back(conn, "the board's savepoint", mark.err.kind, mark.err.detail);
+    }
+    let b = write_board(conn, root, rows.csv, readings, orders);
+    if b.version < 0 {
+        let back = conn.exec("ROLLBACK TO SAVEPOINT board");
+        if !back.ok {
+            return rolled_back(conn, "the board's rollback", back.err.kind, back.err.detail);
+        }
+    }
     let done = conn.commit();
     if !done.ok { return rolled_back(conn, "the commit", done.err.kind, done.err.detail); }
-    return Written { version: std::str::parse_int(std::str::trim(saved.csv)) or - 1 };
+    return Written {
+        version: std::str::parse_int(std::str::trim(saved.csv)) or - 1,
+        board: if b.version >= 0 { b } else { Boarded {
+            step: b.step,
+            detail: b.detail,
+            worked: b.worked,
+            subjects: b.subjects,
+        } },
+    };
+}
+
+/// The board, within the tick's transaction: the seats configured to serve
+/// and the queues they make, the ledger's service times, the plan (plan.hl
+/// `plan`), and the row written (store.md, "The board"), its version from
+/// the store's clock, as the route table's.
+fn write_board(
+    conn: pq::PgConn,
+    root: String,
+    seats: String,
+    readings: String,
+    orders: String
+) -> Boarded {
+    let none = db::Args { };
+    let work = conn.query_params(WORK_READ, none);
+    if !work.ok { return Boarded { step: "the seats' queues", detail: work.err.detail }; }
+    let subjects = partitions(root, work.csv);
+    let service = conn.query_params(SERVICE_READ, none);
+    if !service.ok {
+        return Boarded {
+            step: "the service times' read",
+            detail: service.err.detail,
+            worked: true,
+            subjects: subjects,
+        };
+    }
+    let p = plan(root, seats, work.csv, service.csv, readings, orders);
+    let a = db::Args { };
+    a.add(p.board);
+    let saved = conn.query_params(st::BOARD_WRITE, a);
+    if !saved.ok {
+        return Boarded {
+            step: "the board's write",
+            detail: saved.err.detail,
+            worked: true,
+            subjects: subjects,
+        };
+    }
+    return Boarded {
+        version: std::str::parse_int(std::str::trim(saved.csv)) or - 1,
+        worked: true,
+        subjects: subjects,
+        plans: p.plans,
+        orders: p.orders,
+        said: p.said,
+    };
 }
 
 fn rolled_back(conn: pq::PgConn, step: String, kind: String, detail: String) -> Written {

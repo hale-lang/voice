@@ -691,7 +691,11 @@ seat (and the same seat pulling it again within 10 s puts it back after
 claim nothing answers is the caller's instance gone: acknowledged and
 dropped. A ticket past its `wait_until` is acknowledged and dropped
 unclaimed. Each seat's pulls (state, plan version, queues) are on the
-heartbeat and the seats' report (`SeatState.pull`) and in `/node/v1/status`.
+heartbeat and the seats' report (`SeatState.pull`) and in `/node/v1/status`,
+with the conversations its engine holds (`SeatState.conversations`): the
+`conversation` of each ticket the seat was granted, the newest first, as
+many as its runtime holds (`lib/concurrency` `conversations_held`:
+llama-server its slots, TensorFold 80, vLLM 32, a hosted seat none).
 
 The node's calls to the api's node plane run on a thread of their own
 (`Plane`), apart from the NATS session (`Session`): the api serves one
@@ -995,6 +999,23 @@ when it cannot reach the coordinator.
    claims on the ticket it leaves behind are declined `gone` by the keeper
    until its TTL removes it. When the brain makes the stream again, each
    waiting attempt publishes its ticket again under the same message id.
+   **A conversation's turn** (its key, as below, named on the ticket by 32
+   hex digits of its sha256) has a home seat: the seat its last turn was
+   granted to (`seat_conversation`, read at admission), or, with none or
+   that seat not up, the one its key hashes to (rendezvous hashing, as
+   below). Its ticket goes first to that seat's own queue,
+   `<request id>.<attempt>.seat`, which the seat pulls before any
+   partition; with no claim within the window (half the estimated miss,
+   at most 10 s and half the time left: 1 s while nodes report no prefill
+   rate) the `shared` copy goes to the partition too. Whichever copy is
+   claimed first is granted, the other declined `taken`, by the attempt
+   while it runs and by the keeper after, until its TTL. A hosted home
+   seat (whose provider's cache is the provider account's), or one that
+   failed the turn, is skipped: straight to the partition. The grant
+   records the seat; each heartbeat corrects it by the conversations the
+   node says each seat's engine holds (`SeatState.conversations`, the
+   newest first, as many as its runtime holds), and rows nothing told
+   again for a day are pruned.
 5. **Offered: pick a seat** from the route table in memory (today, from the fleet's
    state in the store; see "The brain"): the best-ranked seat
    for the model among the permitted accounts, with room by the api's own

@@ -47,6 +47,12 @@ topic RouteWritten { payload: Version; subject: "route"; }
 /// The lock every brain asks for: one key for voice's one brain.
 const BRAIN_LOCK: String = "SELECT pg_try_advisory_lock(hashtext('voice.brain'))";
 
+/// Who holds the lock, once this brain does: its session's backend pid and
+/// start (microseconds since the Unix epoch), which its keeper's fence
+/// checks still hold the lock before anything that loses tickets (work.hl
+/// `Fence`).
+const LEADER_READ: String = "SELECT row_to_json(t) FROM (SELECT pid, (extract(epoch FROM backend_start) * 1000000)::bigint AS start FROM pg_stat_activity WHERE pid = pg_backend_pid()) t";
+
 main locus Brain {
     params {
         database: String = "";
@@ -72,6 +78,15 @@ main locus Brain {
         // grows each time this brain takes the lock: its keeper publishes
         // every plan afresh under a new term
         term: Int = 0;
+        // the board version of the keeper pass its readings came from (0
+        // for none yet)
+        read_version: Int = 0;
+        // the longest a ticket waits: a model's old shape, and a queue no
+        // seat consumes, are let go once empty for this long
+        drain_ms: Int = work::STREAM_MAX_AGE_MS;
+        // this brain's session, which holds the lock (`LEADER_READ`)
+        leader_pid: Int = 0;
+        leader_start: Int = 0;
         // tells NATS each version, on its own thread: grafted, as the
         // habitat broker's account, its subjects under the broker's root;
         // with no NATS (`url` ""), it dials nothing and tells no one
@@ -125,7 +140,11 @@ main locus Brain {
 
     /// The keeper's readings of the queues, for the next tick's board.
     @bounded_by(r)
-    fn on_read(r: Read) { self.readings = r.lines; }
+    fn on_read(r: Read) {
+        if r.term != self.term { return; }
+        self.readings = r.lines;
+        self.read_version = r.version;
+    }
 
     /// One pass.
     fn tick() {
@@ -165,9 +184,18 @@ main locus Brain {
                 self.say("standby", "another brain holds the lock; standing by");
                 return;
             }
+            let me = self.conn.query_one(LEADER_READ);
+            if !me.ok {
+                self.drop("the lock's session: " + me.err.detail);
+                return;
+            }
             self.holding = true;
             self.term = self.term + 1;
             self.orders = "";
+            self.readings = "";
+            self.read_version = 0;
+            self.leader_pid = std::json::find_int_field(std::str::trim(me.data), "pid");
+            self.leader_start = std::json::find_int_field(std::str::trim(me.data), "start");
             self.say("working", "holding the lock; working");
         }
         let reclaimed = reclaim(self.conn);
@@ -178,7 +206,14 @@ main locus Brain {
         if reclaimed > 0 {
             log_info("reclaimed dead api instances", std::log::kv("count", to_string(reclaimed)));
         }
-        let w = write_tick(self.conn, self.root, self.readings, self.orders);
+        let w = write_tick(
+            self.conn,
+            self.root,
+            self.readings,
+            self.read_version,
+            self.orders,
+            self.drain_ms,
+        );
         if w.version < 0 {
             if w.kind == "io" {
                 self.drop(w.step + ": " + w.detail);
@@ -199,6 +234,8 @@ main locus Brain {
                 plans: w.board.plans,
                 version: w.board.version,
                 term: self.term,
+                leader_pid: self.leader_pid,
+                leader_start: self.leader_start,
             };
         }
     }
@@ -214,6 +251,22 @@ main locus Brain {
         }
         self.board_trouble_is("");
         self.orders = b.orders;
+        let cv = std::str::bytes_view(b.changed);
+        let mut at_line = 0;
+        while at_line < cv.n {
+            let nl = st::line_end(cv, at_line);
+            let line = std::str::slice(cv, at_line, nl);
+            at_line = nl + 1;
+            if len(line) > 0 {
+                log_info(
+                    "a model's queues change shape",
+                    fields2(
+                        std::log::kv("model", tab_field(line, 0)),
+                        std::log::kv("what", tab_field(line, 1)),
+                    ),
+                );
+            }
+        }
         let v = std::str::bytes_view(b.said);
         let mut start = 0;
         while start < v.n {
@@ -304,6 +357,7 @@ type Boarded {
     plans: String = "";
     orders: String = "";
     said: String = "";
+    changed: String = "";
 }
 
 /// Node liveness, the route table and the board, in one transaction (store.md,
@@ -311,7 +365,14 @@ type Boarded {
 /// board fails. The board is written after a savepoint, and a failure of
 /// its own is rolled back to it: the route table and liveness are written
 /// whatever becomes of the board.
-fn write_tick(conn: pq::PgConn, root: String, readings: String, orders: String) -> Written {
+fn write_tick(
+    conn: pq::PgConn,
+    root: String,
+    readings: String,
+    read_version: Int,
+    orders: String,
+    drain_ms: Int
+) -> Written {
     let begun = conn.begin();
     if !begun.ok {
         return Written { step: "begin", kind: begun.err.kind, detail: begun.err.detail };
@@ -335,7 +396,7 @@ fn write_tick(conn: pq::PgConn, root: String, readings: String, orders: String) 
     if !mark.ok {
         return rolled_back(conn, "the board's savepoint", mark.err.kind, mark.err.detail);
     }
-    let b = write_board(conn, root, rows.csv, readings, orders);
+    let b = write_board(conn, root, rows.csv, readings, read_version, orders, drain_ms);
     if b.version < 0 {
         let back = conn.exec("ROLLBACK TO SAVEPOINT board");
         if !back.ok {
@@ -355,16 +416,22 @@ fn write_tick(conn: pq::PgConn, root: String, readings: String, orders: String) 
     };
 }
 
+/// The last board's version and models, and the store's clock in ms.
+const LAST_BOARD_READ: String = "SELECT row_to_json(t) FROM (SELECT (extract(epoch FROM now()) * 1000)::bigint AS now_ms, (SELECT version FROM board) AS version, (SELECT body->'models' FROM board) AS models) t";
+
 /// The board, within the tick's transaction: the seats configured to serve
-/// and the queues they make, the ledger's service times, the plan (plan.hl
-/// `plan`), and the row written (store.md, "The board"), its version from
-/// the store's clock, as the route table's.
+/// and the queues they make, the ledger's service times, the last board's
+/// models (their shapes and changes), the plan (plan.hl `plan`), and the
+/// row written (store.md, "The board"), its version from the store's
+/// clock, as the route table's.
 fn write_board(
     conn: pq::PgConn,
     root: String,
     seats: String,
     readings: String,
-    orders: String
+    read_version: Int,
+    orders: String,
+    drain_ms: Int
 ) -> Boarded {
     let none = db::Args { };
     let work = conn.query_params(WORK_READ, none);
@@ -379,7 +446,29 @@ fn write_board(
             subjects: subjects,
         };
     }
-    let p = plan(root, seats, work.csv, service.csv, readings, orders);
+    let last = conn.query_one(LAST_BOARD_READ);
+    if !last.ok {
+        return Boarded {
+            step: "the last board's read",
+            detail: last.err.detail,
+            worked: true,
+            subjects: subjects,
+        };
+    }
+    let row = std::str::trim(last.data);
+    let p = plan(
+        root,
+        seats,
+        work.csv,
+        service.csv,
+        readings,
+        read_version,
+        orders,
+        std::str::trim(std::json::find_field_raw(row, "models")),
+        int_or(row, "version", 0),
+        std::json::find_int_field(row, "now_ms"),
+        drain_ms,
+    );
     let a = db::Args { };
     a.add(p.board);
     let saved = conn.query_params(st::BOARD_WRITE, a);
@@ -394,10 +483,11 @@ fn write_board(
     return Boarded {
         version: std::str::parse_int(std::str::trim(saved.csv)) or - 1,
         worked: true,
-        subjects: subjects,
+        subjects: p.subjects,
         plans: p.plans,
         orders: p.orders,
         said: p.said,
+        changed: p.changed,
     };
 }
 
@@ -613,6 +703,7 @@ fn main() {
             credential: std::secret::Credential { vault: b.vault },
         },
         keeper: WorkKeeper {
+            database: database,
             url: b.url,
             user: b.user,
             vault: b.vault,

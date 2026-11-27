@@ -6,7 +6,10 @@
 // ticks as the working brain does (`controller`): a backlog on one model's
 // queue moves a seat that serves two to it within a few ticks, and back
 // once it drains, and an exhausted account's seats are held, each change
-// published in the node's plan. (In this one file, since the brain's test
+// published in the node's plan; a model gaining and losing a second account
+// changes shape as the design sequences it, every ticket in flight served;
+// a queue no seat consumes is deleted once empty past the longest wait, not
+// before; and a brain that lost the lock deletes nothing. (In this one file, since the brain's test
 // files run side by side and this database is theirs.)
 import ".." as brain;
 import "../../api" as api;
@@ -212,7 +215,7 @@ fn main() {
         "in_flight",
         "and is rolled back",
     );
-    let after_failure = brain::write_tick(c2, "voice", "", "");
+    let after_failure = brain::write_tick(c2, "voice", "", 0, "", 600000);
     std::test::assert(
         after_failure.version > 0,
         "the route table is still written: " + after_failure.detail,
@@ -238,7 +241,7 @@ fn main() {
         "up",
         "a node heartbeating is up",
     );
-    let w = brain::write_tick(c2, "voice", "", "");
+    let w = brain::write_tick(c2, "voice", "", 0, "", 600000);
     let table = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         std::str::contains(table, "\"seat\": \"laptop/static\""),
@@ -277,7 +280,7 @@ fn main() {
         std::str::contains(seat_row, "\"hold\": null")
             && std::str::contains(
                 seat_row,
-                "\"consume\": [\"voice.work.s.laptop.static\", \"voice.work.m.echo-1.internal.any\", \"voice.work.p.echo-1.static.internal.any\"]",
+                "\"consume\": [\"voice.work.s.laptop.static\", \"voice.work.m.echo-1.internal.any\"]",
             ),
         "its seat consumes its own queue, then its model's: " + seat_row,
     );
@@ -305,7 +308,7 @@ fn main() {
             && std::json::find_int_field(std::str::trim(services.csv), "service_ms") == 600,
         "echo-1's last minute: two requests, 700 and 500 ms: " + services.csv,
     );
-    let boarded = brain::write_tick(c2, "voice", "", "");
+    let boarded = brain::write_tick(c2, "voice", "", 0, "", 600000);
     std::test::assert(
         std::str::contains(
             one(
@@ -327,7 +330,7 @@ fn main() {
         c2,
         "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('laptop', 'tf', 'up', 1, now())",
     );
-    brain::write_tick(c2, "voice", "", "");
+    brain::write_tick(c2, "voice", "", 0, "", 600000);
     let placed = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         std::str::contains(placed, "\"seat\": \"laptop/tf\"")
@@ -337,7 +340,7 @@ fn main() {
     // the version goes on past the stored one, whatever the clock says
     run(c2, "UPDATE route_table SET version = 9000000000000");
     std::test::assert_eq_int(
-        brain::write_tick(c2, "voice", "", "").version,
+        brain::write_tick(c2, "voice", "", 0, "", 600000).version,
         9000000000001,
         "a version is never below the one before it",
     );
@@ -357,7 +360,7 @@ fn main() {
         "99.999995",
         "the use as reported",
     );
-    brain::write_tick(c2, "voice", "", "");
+    brain::write_tick(c2, "voice", "", 0, "", 600000);
     std::test::assert(
         std::str::contains(one(c2, "SELECT body::text FROM route_table"), "laptop/static"),
         "a seat whose account is at 99.999995% still routes",
@@ -367,7 +370,7 @@ fn main() {
         c2,
         "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'five_hour', 100, now() + interval '1 hour', now())",
     );
-    brain::write_tick(c2, "voice", "", "");
+    brain::write_tick(c2, "voice", "", 0, "", 600000);
     let full = one(c2, "SELECT body::text FROM route_table");
     std::test::assert(
         !std::str::contains(full, "laptop/static"),
@@ -419,14 +422,31 @@ fn main() {
     }
 }
 
-/// What a tick leaves for the next: the keeper's readings and the seats'
-/// orders; and the plan of node `n` it published, "" for none.
-type Ticked { readings: String = ""; orders: String = ""; plan: String = ""; version: Int = 0; }
+/// What a tick leaves for the next: the keeper's readings and the board
+/// version of the pass they came from, the seats' orders; node `n`'s plan
+/// as published, "" for none; every node's plan as handed over; and what
+/// the keeper's prune did.
+type Ticked {
+    readings: String = "";
+    read_version: Int = 0;
+    orders: String = "";
+    plan: String = "";
+    plans: String = "";
+    version: Int = 0;
+    passes: Int = 0;
+    subjects: String = "";
+    pruned: brain::Pruned = brain::Pruned { };
+}
+
+/// The longest wait, as these ticks are given it: short, so a drain is
+/// seen in a test.
+const DRAIN_MS: Int = 1500;
 
 /// One tick of the working brain, as `Brain.tick` and its keeper's pass
-/// make it, under `root`: the board written, the stream and consumers
-/// kept, the plans published (`sent`), the queues read back; node `n`'s
-/// plan as `listener` heard it.
+/// make it, under `root`: the board written, the stream and consumers kept
+/// (behind `fence`), the plans published (`sent`), the queues read back,
+/// the queues no seat consumes pruned (`seen`); node `n`'s plan as
+/// `listener` heard it.
 @unbounded
 fn tick(
     c: pq::PgConn,
@@ -434,14 +454,16 @@ fn tick(
     listener: nats::NatsClient,
     root: String,
     sent: brain::SentPlans,
+    seen: brain::Unwanteds,
+    fence: brain::Fence,
     was: Ticked
 ) -> Ticked {
-    let w = brain::write_tick(c, root, was.readings, was.orders);
+    let w = brain::write_tick(c, root, was.readings, was.read_version, was.orders, DRAIN_MS);
     std::test::assert(
         w.version > 0 && w.board.version > 0,
         "a tick writes the board: " + w.step + w.board.step + " " + w.detail + w.board.detail,
     );
-    let u = brain::upkeep(nc, root, w.board.subjects, false);
+    let u = brain::keep_stream(nc, root, w.board.subjects, false, fence);
     std::test::assert(len(u.step) == 0, "the stream is kept: " + u.detail);
     let e = brain::publish_plans(
         nc,
@@ -460,16 +482,98 @@ fn tick(
         std::time::nanos(std::time::current()) / 1000000,
     );
     std::test::assert(len(r.step) == 0, "the queues are read: " + r.detail);
+    let pr = brain::prune(
+        nc,
+        root,
+        w.board.subjects,
+        seen,
+        was.passes + 1,
+        std::time::nanos(std::time::current()) / 1000000,
+        DRAIN_MS,
+        fence,
+    );
+    std::test::assert(len(pr.step) == 0, "the queues are pruned: " + pr.detail);
     let mut plan = "";
     while listener.read_msg(200ms) {
-        plan = std::str::from_bytes(listener.last.data);
+        if listener.last.subject == work::consume_subject(root, "n") {
+            plan = std::str::from_bytes(listener.last.data);
+        }
     }
     return Ticked {
         readings: r.lines,
+        read_version: w.board.version,
         orders: w.board.orders,
         plan: plan,
+        plans: w.board.plans,
         version: w.board.version,
+        passes: was.passes + 1,
+        subjects: w.board.subjects,
+        pruned: pr,
     };
+}
+
+/// Seat `id` of node `node`'s queues in a tick's plans as handed over,
+/// space-separated.
+fn handed(t: Ticked, node: String, id: String) -> String {
+    let v = std::str::bytes_view(t.plans);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        if brain::tab_field(line, 0) == node {
+            return consumes("{\"version\": 1, \"seats\": " + brain::tab_field(line, 1) + "}", id);
+        }
+    }
+    return "?";
+}
+
+/// Whether the work stream under `root` holds the consumer of `subject`.
+fn has_consumer(nc: nats::NatsClient, root: String, subject: String) -> Bool {
+    let mut ok = true;
+    nats::js_consumer_info(nc, work::stream_name(root), work::consumer_name(subject)) or {
+        ok = false;
+        nats::ConsumerInfo { }
+    };
+    return ok;
+}
+
+/// The tickets seat `id` of node `node` takes, pulling each queue of its
+/// plan in order as a slot would (a ticket each, acked), until all are
+/// empty: their bodies, one a line.
+@unbounded
+fn served_by(nc: nats::NatsClient, root: String, t: Ticked, node: String, id: String) -> String {
+    let queues = handed(t, node, id) + " ";
+    let mut out = "";
+    let v = std::str::bytes_view(queues);
+    let mut from = 0;
+    while from < v.n {
+        let rest = std::str::slice(v, from, v.n);
+        let sp = std::str::index_of(rest, " ");
+        let end = if sp < 0 { v.n } else { from + sp };
+        let subject = std::str::slice(v, from, end);
+        from = end + 1;
+        let mut more = len(subject) > 0;
+        while more {
+            let mut got = true;
+            let m = nats::js_next(
+                nc,
+                work::stream_name(root),
+                work::consumer_name(subject),
+                200,
+            ) or {
+                got = false;
+                nats::NatsMsg { }
+            };
+            if got {
+                nats::js_ack(nc, m) or discard;
+                out = out + std::str::from_bytes(m.data) + "\n";
+            }
+            more = got;
+        }
+    }
+    nc.flush() or discard;
+    return out;
 }
 
 /// Seat `id`'s queues in `plan` (a `ConsumePlan`), space-separated, or
@@ -530,21 +634,29 @@ fn controller(url: String, nats_url: String) {
     };
     listener.flush() or discard;
     let sent = brain::SentPlans { };
+    let seen = brain::Unwanteds { };
+    // this test's connection leads, as a working brain's session does
+    let lead = connect(url);
+    std::test::assert(lead.open().ok, "the leader's session opens");
+    std::test::assert_eq_str(one(lead, brain::BRAIN_LOCK), "t", "and takes the brain's lock");
+    let me = one(lead, brain::LEADER_READ);
+    let fence = brain::Fence {
+        database: url,
+        pid: std::json::find_int_field(me, "pid"),
+        start: std::json::find_int_field(me, "start"),
+    };
+    std::test::assert(fence.holds(), "the fence sees the lock held by its session");
     let echo = root + ".work.m.echo-1.internal.any";
     let late = root + ".work.m.late.internal.any";
     let own = root + ".work.s.n.multi";
-    // last, each partition in the other shape, as a node with no plan
-    // consumes both
-    let leftovers = " " + root + ".work.p.echo-1.local.internal.any " + root
-        + ".work.p.late.local.internal.any";
-    let base = own + " " + echo + " " + late + leftovers;
+    let base = own + " " + echo + " " + late;
 
     // the first tick: each seat its own queue, then configuration's order
-    let mut t = tick(c, nc, listener, root, sent, Ticked { });
+    let mut t = tick(c, nc, listener, root, sent, seen, fence, Ticked { });
     std::test::assert_eq_str(consumes(t.plan, "multi"), base, "multi in configuration's order");
     std::test::assert_eq_str(
         consumes(t.plan, "solo"),
-        root + ".work.s.n.solo " + echo + " " + root + ".work.p.echo-1.local.internal.any",
+        root + ".work.s.n.solo " + echo,
         "solo its own, then echo-1's",
     );
     std::test::assert_eq_int(
@@ -553,7 +665,7 @@ fn controller(url: String, nats_url: String) {
         "the plan's version is the board's",
     );
     let first_version = t.version;
-    t = tick(c, nc, listener, root, sent, t);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
     std::test::assert_eq_str(t.plan, "", "an unchanged plan is not published again at once");
 
     // late's queue backs up: three ticks of its pressure after the keeper
@@ -569,13 +681,13 @@ fn controller(url: String, nats_url: String) {
     let mut ticks = 0;
     let mut moved = "";
     while ticks < 6 && len(moved) == 0 {
-        t = tick(c, nc, listener, root, sent, t);
+        t = tick(c, nc, listener, root, sent, seen, fence, t);
         ticks = ticks + 1;
         if len(t.plan) > 0 { moved = consumes(t.plan, "multi"); }
     }
     std::test::assert_eq_str(
         moved,
-        own + " " + late + " " + echo + leftovers,
+        own + " " + late + " " + echo,
         "a backlog on late's queue moves multi to it, after its own",
     );
     std::test::assert(
@@ -599,7 +711,7 @@ fn controller(url: String, nats_url: String) {
     );
     std::test::assert_eq_str(
         consumes(t.plan, "solo"),
-        root + ".work.s.n.solo " + echo + " " + root + ".work.p.echo-1.local.internal.any",
+        root + ".work.s.n.solo " + echo,
         "solo keeps its order",
     );
 
@@ -613,7 +725,7 @@ fn controller(url: String, nats_url: String) {
     ticks = 0;
     moved = "";
     while ticks < 6 && len(moved) == 0 {
-        t = tick(c, nc, listener, root, sent, t);
+        t = tick(c, nc, listener, root, sent, seen, fence, t);
         ticks = ticks + 1;
         if len(t.plan) > 0 { moved = consumes(t.plan, "multi"); }
     }
@@ -625,7 +737,7 @@ fn controller(url: String, nats_url: String) {
         c,
         "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('local', 'five_hour', 100, now() + interval '1 hour', now())",
     );
-    t = tick(c, nc, listener, root, sent, t);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
     std::test::assert(
         std::str::starts_with(
             consumes(t.plan, "multi"),
@@ -638,11 +750,207 @@ fn controller(url: String, nats_url: String) {
         "an exhausted account's seats are held, pulling nothing: " + t.plan,
     );
     run(c, "DELETE FROM quota_window");
-    t = tick(c, nc, listener, root, sent, t);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
     std::test::assert_eq_str(consumes(t.plan, "multi"), base, "and let go once it has headroom");
+
+    // ---- a model changing shape (the design's "A model changing shape"):
+    // echo-1 gains a seat under a second account, then loses it, tickets
+    // waiting on every queue as it goes, each served
+    let pl = root + ".work.p.echo-1.local.internal.any";
+    let po = root + ".work.p.echo-1.other.internal.any";
+    let own_b = root + ".work.s.z.b";
+    run(c, "INSERT INTO account (id, name, billing) VALUES ('other', 'Other', 'none')");
+    run(
+        c,
+        "INSERT INTO node (id, name, token_digest, assignment_version, status) VALUES ('z', 'Z', '\\x00', 1, 'up')",
+    );
+    run(
+        c,
+        "INSERT INTO node_state (node, version, capabilities, local, registered_at, last_heartbeat_at, applied_version) VALUES ('z', '0.1.0', '{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}', '{\"paused\": false, \"paused_seats\": []}', now(), now(), 1)",
+    );
+    nats::js_publish(nc, echo, b"t1") or { std::test::assert(false, "t1: " + err.detail); };
+    run(
+        c,
+        "INSERT INTO seat (node, id, engine, account, serves, concurrency, config) VALUES ('z', 'b', 'static', 'other', '[{\"model\": \"echo-1\", \"as\": null}]', 1, '{\"text\": \"hi\"}')",
+    );
+    run(
+        c,
+        "INSERT INTO seat_state (node, seat, status, in_flight, reported_at) VALUES ('z', 'b', 'up', 0, now())",
+    );
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    let shape_of = "SELECT m::text FROM board, jsonb_array_elements(body->'models') m WHERE m->>'model' = 'echo-1'";
+    let prepared = one(c, shape_of);
+    std::test::assert(
+        std::json::find_string_field(prepared, "shape") == "m"
+            && std::json::find_string_field(std::json::find_field_raw(prepared, "next"), "shape")
+            == "p",
+        "one account to two: the board stays m, the change prepared: " + prepared,
+    );
+    std::test::assert(
+        handed(t, "n", "multi") == own + " " + echo + " " + late + " " + pl
+            && handed(t, "z", "b") == own_b + " " + po
+            && has_consumer(nc, root, pl) && has_consumer(nc, root, po),
+        "the new queues made; the first account's seat consumes m and its p, the second only its p: "
+            + t.plans,
+    );
+    // the api, by the board, still publishes m
+    nats::js_publish(nc, echo, b"t2") or { std::test::assert(false, "t2: " + err.detail); };
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    let flipped = one(c, shape_of);
+    std::test::assert(
+        std::json::find_string_field(flipped, "shape") == "p"
+            && std::json::find_string_field(std::json::find_field_raw(flipped, "previous"), "shape")
+            == "m"
+            && std::json::find_string_field(
+                std::json::find_field_raw(flipped, "previous"),
+                "provider_account",
+            ) == "local"
+            && handed(t, "n", "multi") == own + " " + pl + " " + late + " " + echo,
+        "the board flips once the keeper read the new queues; the old m consumed last: "
+            + flipped + " " + t.plans,
+    );
+    nats::js_publish(nc, pl, b"t3") or { std::test::assert(false, "t3: " + err.detail); };
+    nats::js_publish(nc, po, b"t4") or { std::test::assert(false, "t4: " + err.detail); };
+    let up = served_by(nc, root, t, "n", "multi") + served_by(nc, root, t, "z", "b");
+    std::test::assert(
+        occurrences(up, "t1\n") == 1 && occurrences(up, "t2\n") == 1
+            && occurrences(up, "t3\n") == 1 && occurrences(up, "t4\n") == 1,
+        "every ticket served across the change, each once, by the queues the plans name: " + up,
+    );
+    // the old m: consumed until the longest wait has passed and it is
+    // empty; its consumer deleted only after as long again, empty
+    std::time::sleep(1600ms);
+    // a tick to read it empty (readings are a tick behind), then let go
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        handed(t, "n", "multi") == own + " " + pl + " " + late
+            && std::str::contains(one(c, shape_of), "\"previous\": null")
+            && has_consumer(nc, root, echo),
+        "the old m let go from the plans, its consumer not deleted yet: " + t.plans,
+    );
+    std::time::sleep(1600ms);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        !has_consumer(nc, root, echo) && t.pruned.deleted >= 1,
+        "empty, no queue's for the longest wait: its consumer deleted",
+    );
+
+    // ---- two accounts back to one; the gone account's queue holds a
+    // ticket, so its consumer stays until it drains
+    run(c, "DELETE FROM seat_state WHERE node = 'z'");
+    run(c, "DELETE FROM seat WHERE node = 'z'");
+    nats::js_publish(nc, po, b"t8") or { std::test::assert(false, "t8: " + err.detail); };
+    nats::js_publish(nc, pl, b"t5") or { std::test::assert(false, "t5: " + err.detail); };
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        std::json::find_string_field(one(c, shape_of), "shape") == "p"
+            && handed(t, "n", "multi") == own + " " + pl + " " + late + " " + echo,
+        "two accounts to one: the board stays p, the remaining seat consumes its p and the new m: "
+            + t.plans,
+    );
+    nats::js_publish(nc, pl, b"t6") or { std::test::assert(false, "t6: " + err.detail); };
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        std::json::find_string_field(one(c, shape_of), "shape") == "m"
+            && handed(t, "n", "multi") == own + " " + echo + " " + late + " " + pl,
+        "flipped to m, its p consumed last: " + t.plans,
+    );
+    nats::js_publish(nc, echo, b"t7") or { std::test::assert(false, "t7: " + err.detail); };
+    let down = served_by(nc, root, t, "n", "multi");
+    std::test::assert(
+        occurrences(down, "t5\n") == 1 && occurrences(down, "t6\n") == 1
+            && occurrences(down, "t7\n") == 1,
+        "every ticket served across the change back: " + down,
+    );
+    std::time::sleep(1600ms);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert_eq_str(
+        handed(t, "n", "multi"),
+        own + " " + echo + " " + late,
+        "its p let go",
+    );
+    std::time::sleep(1600ms);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        !has_consumer(nc, root, pl) && has_consumer(nc, root, po) && t.pruned.waiting >= 1,
+        "the drained p deleted; the gone account's, holding a ticket, kept past the longest wait",
+    );
+    nats::js_call(
+        nc,
+        "$JS.API.STREAM.PURGE." + work::stream_name(root),
+        "{\"filter\": \"" + po + "\"}",
+    ) or { std::test::assert(false, "its ticket gone: " + err.detail); };
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(!has_consumer(nc, root, po), "and deleted once empty");
+    std::test::assert(!has_consumer(nc, root, own_b), "as the gone seat's own queue");
+
+    // ---- a brain that lost the lock: its keeper's fence refuses to delete
+    // a consumer or to make the stream again
+    lead.close();
+    let until = std::time::monotonic() + 10s;
+    while fence.holds() && std::time::monotonic() < until {
+        std::time::sleep(50ms);
+    }
+    std::test::assert(!fence.holds(), "the lock gone with its session: the fence says no");
+    run(c, "DELETE FROM seat_state WHERE seat = 'solo'");
+    run(c, "DELETE FROM seat WHERE id = 'solo'");
+    let solo = root + ".work.s.n.solo";
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::time::sleep(1600ms);
+    t = tick(c, nc, listener, root, sent, seen, fence, t);
+    std::test::assert(
+        t.pruned.fenced && t.pruned.deleted == 0 && has_consumer(nc, root, solo),
+        "an empty queue no seat consumes, past the wait, is kept: the fence refused",
+    );
+    let name = work::stream_name(root);
+    nats::js_stream_delete(nc, name) or discard;
+    nats::js_stream_create(nc, name, work::work_subjects(root)) or {
+        std::test::assert(false, "a stream the keeper must make again: " + err.detail);
+    };
+    let stale = brain::keep_stream(nc, root, t.subjects, false, fence);
+    let config = std::json::find_field_raw(
+        nats::js_call(nc, "$JS.API.STREAM.INFO." + name, "") or "",
+        "config",
+    );
+    std::test::assert(
+        stale.unreplaced && stale.kind == "fenced" && !stale.created
+            && std::json::find_string_field(config, "retention") == "limits",
+        "nor is a stream deleted to be made again: " + stale.detail,
+    );
+    // the working brain's keeper does both
+    let lead2 = connect(url);
+    std::test::assert(lead2.open().ok, "a new leader's session opens");
+    std::test::assert_eq_str(one(lead2, brain::BRAIN_LOCK), "t", "and takes the lock");
+    let me2 = one(lead2, brain::LEADER_READ);
+    let fence2 = brain::Fence {
+        database: url,
+        pid: std::json::find_int_field(me2, "pid"),
+        start: std::json::find_int_field(me2, "start"),
+    };
+    let remade = brain::keep_stream(nc, root, t.subjects, false, fence2);
+    std::test::assert(
+        remade.replaced && remade.created && len(remade.step) == 0,
+        "the working brain's keeper makes the stream again: " + remade.detail,
+    );
+    lead2.close();
 
     nats::js_stream_delete(nc, work::stream_name(root)) or discard;
     listener.close();
     nc.close();
     c.close();
+}
+
+/// How many times `needle` is in `text`.
+fn occurrences(text: String, needle: String) -> Int {
+    let mut n = 0;
+    let mut rest = text;
+    let mut at_pos = std::str::index_of(rest, needle);
+    while at_pos >= 0 {
+        n = n + 1;
+        rest = rest[(at_pos + len(needle))..len(rest)];
+        at_pos = std::str::index_of(rest, needle);
+    }
+    return n;
 }

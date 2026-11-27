@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260, the board and plans #261; the consumer lifecycle, shape switches and fencing, observability and the prefill rate pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260, the board and plans #261, the consumer lifecycle, shape switches and fencing #262; observability and the prefill rate pending.
 
 Proposed, 2026-11-26.
 
@@ -162,7 +162,21 @@ switch together, in this order:
    passed since the switch, so nothing is left behind on them.
 
 An api with a stale board publishes in the old shape, which is still
-consumed until step 3, and step 3 waits out the longest wait. A node with
+consumed until step 3, and step 3 waits out the longest wait.
+
+As built (step (e)): the board holds each model's shape with the change in
+progress (internal.yaml `BoardModel`: `next`, prepared; `previous`, left
+and draining). The brain flips the board once its keeper has read every
+queue of the new shape (their consumers made) in a pass after the board
+that prepared the change (the plans naming them published), and lets the
+old shape go once the longest wait has passed since the flip and the
+keeper read its queues empty; the keeper deletes their consumers after the
+longest wait again, still empty (Consumers). The api publishes in the
+board's shape whatever the board's age, and by configuration's rule only
+for a model the board does not hold; while the board says `m`, a request
+that may not spend its one account is offered with `serve`, until the push
+path goes. A seat keeps its place in its order across a change, the order
+being kept by model, class and need rather than subject. A node with
 no plan (started while the brain is down) consumes, for each seat, both
 the `m` subjects and its own provider account's `p` subjects; a ticket it
 must not serve is declined `ineligible` at the claim and put back. The
@@ -221,7 +235,16 @@ included. Ack explicit; ack wait
 make repeats harmless); max ack pending 1024; deliver all. The brain
 creates the stream and the consumers, idempotently each tick for every
 partition some seat is eligible for, and deletes a consumer no seat has
-been eligible for in an hour. Nodes never create consumers.
+been eligible for in an hour. Nodes never create consumers. As built
+(step (e)): the keeper lists the stream's consumers each pass and deletes
+one of voice's that no queue the seats make is, once it is empty (nothing
+waiting, nothing pulled and not acked) and has been so for the longest
+wait (10 minutes) rather than an hour, the wait after which no ticket
+published to it is left. **Fencing**: before it deletes a consumer, or
+deletes the stream to make it again (10052), the keeper asks Postgres
+whether the session of the brain that handed it the work (its pid and
+start) still holds the brain's lock; a brain that lost the lock while a
+pass was in hand deletes nothing. Creating stays idempotent and unfenced.
 
 ### Messages
 

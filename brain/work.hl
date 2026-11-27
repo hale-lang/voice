@@ -19,8 +19,11 @@
 // each node's plan on `<root>.node.<node>.consume` when it changed, with
 // the board's version, and every 30 s regardless (`PLAN_REPEAT_MS`), and
 // reads each queue's consumer (`read_queues`): its readings go back to the
-// brain for its next tick. A consumer for a queue no seat makes any longer
-// is left as it is: deleting one waits for the consumer lifecycle.
+// brain for its next tick. Last, it deletes the consumers no queue is any
+// longer, each once empty past the longest wait (`prune`). Before anything
+// that loses tickets (a consumer deleted, the stream deleted to be made
+// again) it asks its fence whether its brain still holds the lock
+// (`Fence`); creating stays idempotent.
 //
 // NATS or JetStream not answering is said once, and the keeper tries again
 // on the next tick; the route table and the board are written meanwhile,
@@ -276,15 +279,20 @@ type Wanted {
     plans: String = "";
     version: Int = 0;
     term: Int = 0;
+    // the brain's session that holds the lock (main.hl `LEADER_READ`),
+    // which the keeper's fence checks before anything that loses tickets
+    leader_pid: Int = 0;
+    leader_start: Int = 0;
 }
 
 /// From the brain's tick to its keeper, in the process only.
 topic WorkWanted { payload: Wanted; subject: "voice.brain.work_wanted"; }
 
 /// The queues' readings, from the keeper to the brain's next tick (plan.hl
-/// `fill_readings`): `<subject>\t<depth>\t<ack pending>\t<standing
+/// `fill_readings`), from its pass over the board at `version` under the
+/// brain's `term`: `<subject>\t<depth>\t<ack pending>\t<standing
 /// pulls>\t<oldest ticket's age in ms, -1 for none>` a line.
-type Read { lines: String = ""; }
+type Read { lines: String = ""; version: Int = 0; term: Int = 0; }
 
 /// From the keeper to the brain, in the process only.
 topic QueuesRead { payload: Read; subject: "voice.brain.queues_read"; }
@@ -300,6 +308,9 @@ type Upkeep {
     incarnation: Int = 0;
     // a new incarnation still to be told on `<root>.queues.reset`
     owed: Bool = false;
+    // the stream must be made again and this pass was not let to delete it
+    // (`may_replace` false): nothing was changed
+    unreplaced: Bool = false;
     // told on this pass
     told: Bool = false;
     // consumers in place, and refused
@@ -334,9 +345,19 @@ fn refused_with(e: nats::NatsError, code: Int) -> Bool {
 /// the stream's new incarnation told on `<root>.queues.reset` while one is
 /// `owed` (a pass that created the stream owes one; a pass that fails
 /// before telling it keeps owing it). A consumer JetStream refuses is
-/// counted and the rest are made; any other failure ends the pass.
+/// counted and the rest are made; any other failure ends the pass. A
+/// stream whose settings cannot change in place is deleted and made again
+/// only when `may_replace`, which loses the tickets it holds: else the
+/// pass ends there, `unreplaced`, having changed nothing (`keep_stream`
+/// asks the fence first).
 @bounded_by(subjects)
-fn upkeep(c: nats::NatsClient, root: String, subjects: String, owed: Bool) -> Upkeep {
+fn upkeep(
+    c: nats::NatsClient,
+    root: String,
+    subjects: String,
+    owed: Bool,
+    may_replace: Bool
+) -> Upkeep {
     let spec = stream_spec(root);
     let mut out = Upkeep { owed: owed };
     let none = nats::NatsError { };
@@ -364,6 +385,10 @@ fn upkeep(c: nats::NatsClient, root: String, subjects: String, owed: Bool) -> Up
             if len(e.kind) == 0 {
                 out.updated = true;
             } else if refused_with(e, UPDATE_REFUSED) {
+                if !may_replace {
+                    out.unreplaced = true;
+                    return out;
+                }
                 e = none;
                 nats::js_stream_delete(c, spec.name) or { e = err; };
                 if len(e.kind) > 0 {
@@ -417,6 +442,212 @@ fn upkeep(c: nats::NatsClient, root: String, subjects: String, owed: Bool) -> Up
         out.told = true;
     }
     if len(refusal.kind) > 0 { return failed_at(out, "making a queue's consumer", refusal); }
+    return out;
+}
+
+// ---- the fence ------------------------------------------------------------
+
+/// Whether the brain session `$1` (its pid), started at `$2` (microseconds
+/// since the Unix epoch), holds the brain's lock now (main.hl `BRAIN_LOCK`:
+/// one bigint key, its low 32 bits in `objid`).
+const FENCE_READ: String = "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1 AND l.objid::bigint = (hashtext('voice.brain')::bigint & 4294967295) AND l.pid = $1::int AND (extract(epoch FROM a.backend_start) * 1000000)::bigint = $2::bigint)";
+
+/// The keeper's fence: before it deletes the work stream to make it again,
+/// or deletes a consumer, it asks Postgres whether the brain that handed it
+/// the work still holds the lock (`FENCE_READ`, on a connection of its
+/// own, opened the first time it asks). A brain that lost the lock (its
+/// session ended while it was stopped, and a standby works) may still have
+/// a pass in hand; the fence keeps it from deleting what the working
+/// brain keeps, and the tickets in it. Creating stays idempotent and needs
+/// no fence. Anything but a yes is a no.
+locus Fence {
+    params {
+        database: String = "";
+        conn: pq::PgConn = pq::PgConn { sslmode: "prefer" };
+        opened: Bool = false;
+        // the lock's holder as the brain said it
+        pid: Int = 0;
+        start: Int = 0;
+    }
+
+    fn holds() -> Bool {
+        if self.pid <= 0 || len(self.database) == 0 { return false; }
+        if !self.opened {
+            let d = st::parse_dsn(self.database);
+            self.conn.host = d.host;
+            self.conn.port = d.port;
+            self.conn.user = d.user;
+            self.conn.password = d.password;
+            self.conn.vault = d.vault;
+            self.conn.database = d.database;
+            self.conn.sslmode = d.sslmode;
+            let opened = self.conn.open();
+            if !opened.ok { return false; }
+            self.opened = true;
+        }
+        let a = db::Args { };
+        a.add(to_string(self.pid));
+        a.add(to_string(self.start));
+        let r = self.conn.query_params(FENCE_READ, a);
+        if !r.ok {
+            self.conn.close();
+            self.opened = false;
+            return false;
+        }
+        return std::str::trim(r.csv) == "t";
+    }
+
+    dissolve() {
+        if self.opened { self.conn.close(); }
+    }
+}
+
+/// `upkeep`, the stream made again only once `fence` says this brain still
+/// holds the lock: a pass first changes nothing it cannot undo, and is
+/// made again, let to replace the stream, only after the fence answers yes.
+/// A fence that answers no leaves the stream as it is (`unreplaced`, with
+/// `step` saying so).
+@bounded_by(subjects)
+fn keep_stream(
+    c: nats::NatsClient,
+    root: String,
+    subjects: String,
+    owed: Bool,
+    fence: Fence
+) -> Upkeep {
+    let u = upkeep(c, root, subjects, owed, false);
+    if !u.unreplaced { return u; }
+    if !fence.holds() {
+        let mut out = u;
+        out.step = "making the work stream again";
+        out.kind = "fenced";
+        out.detail = "this brain no longer holds the lock: the stream is the working brain's";
+        return out;
+    }
+    return upkeep(c, root, subjects, owed, true);
+}
+
+// ---- letting a queue go -----------------------------------------------------
+
+/// A consumer of the work stream no seat consumes any longer, and since
+/// when the keeper has seen it so (Unix ms), as of its pass `pass`.
+type Unwanted { name: String = ""; since_ms: Int = 0; pass: Int = 0; present: Bool = false; }
+
+@form(hashmap)
+locus Unwanteds { capacity { pool rows of Unwanted indexed_by name; } }
+
+/// How a prune went: consumers deleted, those left for being not yet
+/// empty, whether the fence refused, and what failed.
+type Pruned {
+    deleted: Int = 0;
+    waiting: Int = 0;
+    fenced: Bool = false;
+    gone: String = "";
+    step: String = "";
+    kind: String = "";
+    detail: String = "";
+}
+
+/// The consumers of the work stream under `root` that no queue of
+/// `subjects` (one a line) is, deleted once each is empty (nothing
+/// waiting, nothing pulled and not acked) and has been no queue's for
+/// `drain_ms` (the longest a ticket waits) by `now_ms`, each only after
+/// `fence` says this brain holds the lock; `seen` keeps since when each
+/// has been no queue's, across passes (`pass` this one's number). Only
+/// voice's own consumers (`w_`) are looked at, a page of JetStream's list
+/// at a time. A refused fence ends the prune; deleting none, it is tried
+/// again next pass.
+@unbounded
+fn prune(
+    c: nats::NatsClient,
+    root: String,
+    subjects: String,
+    seen: Unwanteds,
+    pass: Int,
+    now_ms: Int,
+    drain_ms: Int,
+    fence: Fence
+) -> Pruned {
+    let stream = work::stream_name(root);
+    let wanted = "\n" + subjects;
+    let mut out = Pruned { };
+    let mut offset = 0;
+    let mut more = true;
+    while more {
+        let mut e = nats::NatsError { };
+        let page = nats::js_call(
+            c,
+            "$JS.API.CONSUMER.LIST." + stream,
+            "{\"offset\": " + to_string(offset) + "}",
+        ) or {
+            e = err;
+            ""
+        };
+        if len(e.kind) > 0 {
+            out.step = "listing the queues' consumers";
+            out.kind = e.kind;
+            out.detail = e.detail;
+            return out;
+        }
+        let total = std::json::find_int_field(page, "total");
+        let mut n = 0;
+        let mut it = std::json::array_first(std::json::find_field_raw(page, "consumers"));
+        while !it.done {
+            n = n + 1;
+            let info = std::str::trim(it.element);
+            let name = st::pg_text(info, "name");
+            let subject = st::pg_text(std::json::find_field_raw(info, "config"), "filter_subject");
+            if std::str::starts_with(name, work::CONSUMER_PREFIX) {
+                if std::str::contains(wanted, "\n" + subject + "\n") {
+                    seen.remove(name) or discard;
+                } else {
+                    let was = seen.get(name) or Unwanted { };
+                    let since = if was.present { was.since_ms } else { now_ms };
+                    seen.set(Unwanted { name: name, since_ms: since, pass: pass, present: true });
+                    let empty = std::json::find_int_field(info, "num_pending") == 0
+                        && std::json::find_int_field(info, "num_ack_pending") == 0;
+                    if now_ms - since >= drain_ms {
+                        if !empty {
+                            out.waiting = out.waiting + 1;
+                        } else if !out.fenced {
+                            if !fence.holds() {
+                                out.fenced = true;
+                            } else {
+                                nats::js_consumer_delete(c, stream, name) or { e = err; };
+                                if len(e.kind) > 0
+                                    && !(e.kind == "jetstream" && e.code == NO_CONSUMER)
+                                {
+                                    out.step = "deleting a queue's consumer";
+                                    out.kind = e.kind;
+                                    out.detail = e.detail;
+                                    return out;
+                                }
+                                e = nats::NatsError { };
+                                seen.remove(name) or discard;
+                                out.deleted = out.deleted + 1;
+                                out.gone = out.gone + subject + "\n";
+                            }
+                        }
+                    }
+                }
+            }
+            it = std::json::array_next(it);
+        }
+        offset = offset + n;
+        more = n > 0 && offset < total;
+    }
+    // forget the consumers no longer listed
+    let mut stale = "";
+    for u in seen.entries {
+        if u.pass != pass { stale = stale + u.name + "\n"; }
+    }
+    let v = std::str::bytes_view(stale);
+    let mut at_line = 0;
+    while at_line < v.n {
+        let nl = st::line_end(v, at_line);
+        seen.remove(std::str::slice(v, at_line, nl)) or discard;
+        at_line = nl + 1;
+    }
     return out;
 }
 
@@ -647,6 +878,18 @@ locus WorkKeeper {
         due: Bool = false;
         // each node's plan as last published
         sent: SentPlans = SentPlans { };
+        // voice's Postgres, for the fence, and the brain's session that
+        // holds the lock, as the last work handed over said
+        database: String = "";
+        fence: Fence = Fence { };
+        leader_pid: Int = 0;
+        leader_start: Int = 0;
+        // the consumers no queue is, since when; the passes so far; and the
+        // longest a ticket waits, after which an empty one is deleted
+        unwanted: Unwanteds = Unwanteds { };
+        passes: Int = 0;
+        fence_said: Bool = false;
+        drain_ms: Int = work::STREAM_MAX_AGE_MS;
         // a new incarnation not told yet
         owed: Bool = false;
         // the trouble last said ("" none), and the consumers last said
@@ -673,6 +916,8 @@ locus WorkKeeper {
         self.plans = w.plans;
         self.version = w.version;
         self.term = w.term;
+        self.leader_pid = w.leader_pid;
+        self.leader_start = w.leader_start;
         self.due = true;
     }
 
@@ -698,7 +943,11 @@ locus WorkKeeper {
             }
             self.connected = true;
         }
-        let u = upkeep(self.client, self.root, self.wanted, self.owed);
+        self.fence.database = self.database;
+        self.fence.pid = self.leader_pid;
+        self.fence.start = self.leader_start;
+        self.passes = self.passes + 1;
+        let u = keep_stream(self.client, self.root, self.wanted, self.owed, self.fence);
         self.owed = u.owed;
         let stream = std::log::kv("stream", work::stream_name(self.root));
         if u.created {
@@ -722,7 +971,7 @@ locus WorkKeeper {
             );
         }
         if len(u.step) > 0 {
-            if u.kind != "jetstream" {
+            if u.kind != "jetstream" && u.kind != "fenced" {
                 self.client.close();
                 self.connected = false;
             }
@@ -772,8 +1021,58 @@ locus WorkKeeper {
             );
             return;
         }
-        QueuesRead <- Read { lines: r.lines };
+        QueuesRead <- Read { lines: r.lines, version: self.version, term: self.term };
+        // with a board written this tick, the queues no seat consumes, once
+        // empty and past the longest wait
+        if self.version > 0 {
+            let pr = prune(
+                self.client,
+                self.root,
+                self.wanted,
+                self.unwanted,
+                self.passes,
+                std::time::nanos(std::time::current()) / 1000000,
+                self.drain_ms,
+                self.fence,
+            );
+            if len(pr.step) > 0 {
+                self.client.close();
+                self.connected = false;
+                self.trouble_is(
+                    pr.step + " " + pr.kind,
+                    pr.step + ": " + pr.kind + ": " + pr.detail,
+                );
+                return;
+            }
+            self.said_pruned(pr);
+        }
         self.trouble_is("", "");
+    }
+
+    /// Say each consumer deleted, and a fence that refused, once while it
+    /// does.
+    @unbounded
+    fn said_pruned(pr: Pruned) {
+        let v = std::str::bytes_view(pr.gone);
+        let mut at_line = 0;
+        while at_line < v.n {
+            let nl = st::line_end(v, at_line);
+            let subject = std::str::slice(v, at_line, nl);
+            at_line = nl + 1;
+            if len(subject) > 0 {
+                log_info(
+                    "a queue no seat consumes is let go: empty past the longest wait",
+                    std::log::kv("subject", subject),
+                );
+            }
+        }
+        if pr.fenced && !self.fence_said {
+            log_warn(
+                "a queue's consumer is kept: this brain no longer holds the lock",
+                std::log::kv("pid", to_string(self.leader_pid)),
+            );
+        }
+        self.fence_said = pr.fenced;
     }
 
     /// Say trouble once while it is the same (`key`), and its end once.

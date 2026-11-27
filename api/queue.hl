@@ -376,12 +376,15 @@ fn claim_candidate(f: SeatFact) -> Candidate {
 /// queued while the stream is there, every seat that could serve it (one the
 /// request may go to, on a node not revoked, not a pair's follower) is on a
 /// node of protocol 3, and there is one; else offered with `serve`. The
-/// model's shape is its configuration's (lib/work, `several_with`): every
-/// enabled seat that serves it on a node not revoked, not a follower,
+/// model's shape is the board's (`shape`, `board_shape`) while the board
+/// holds the model, else its configuration's (lib/work, `several_with`):
+/// every enabled seat that serves it on a node not revoked, not a follower,
 /// whatever the request may spend. Its partitions are those of the provider
-/// accounts of the seats the request may go to that carry what it needs; a
-/// queued request with none (it lists tools, and no seat carries them)
-/// leaves `seats` empty, for admission to refuse.
+/// accounts of the seats the request may go to that carry what it needs (in
+/// the board's `m` shape, only its one account's seats; a request that may
+/// go to none of them, while the brain prepares a change of shape, is
+/// offered); a queued request with none (it lists tools, and no seat
+/// carries them) leaves `seats` empty, for admission to refuse.
 @bounded_by(facts)
 fn queue_plan_of(
     root: String,
@@ -389,7 +392,8 @@ fn queue_plan_of(
     class: String,
     need: String,
     incarnation: Int,
-    facts: SeatFacts
+    facts: SeatFacts,
+    shape: BoardShape
 ) -> QueuePlan {
     let mut out = QueuePlan { need: need };
     if incarnation <= 0 {
@@ -417,11 +421,36 @@ fn queue_plan_of(
         out.why = "no seat could serve it";
         return out;
     }
+    // the shape the board says, whatever its age, while it holds the model
+    // (the brain flips it only once the new shape's queues are made and
+    // consumed): in the `m` shape only its one account's seats consume it
+    let mut under = "";
+    if shape.present {
+        several = shape.shape == "p";
+        under = if several { "" } else { shape.account };
+    }
+    if len(under) > 0 {
+        let mut theirs = 0;
+        for f in facts.items {
+            if f.serves && f.allowed && !f.revoked && work::makes_queues(f.rank)
+                && f.seat.account == under
+            {
+                theirs = theirs + 1;
+            }
+        }
+        if theirs == 0 {
+            // a model changing shape, the board not flipped yet: its one
+            // queue is the old account's, which this request may not spend
+            out.why = "the board has model " + model + " under account " + under
+                + ", which no seat this request may go to spends";
+            return out;
+        }
+    }
     out.on = true;
     out.several = several;
     for f in facts.items {
         if f.serves && f.allowed && !f.revoked && work::makes_queues(f.rank)
-            && (need != "tools" || f.tools)
+            && (need != "tools" || f.tools) && (len(under) == 0 || f.seat.account == under)
         {
             push(out.seats, claim_candidate(f)) or discard;
             if f.holds > 0 { out.holding = out.holding + f.seat.ref + "\n"; }
@@ -444,6 +473,33 @@ fn queue_plan_of(
         }
     }
     return out;
+}
+
+/// A model's shape as the brain's board says it (internal.yaml
+/// `BoardModel`): `m` under its one provider account, or `p`; `present`
+/// false when the board does not hold the model (or there is no board).
+type BoardShape { shape: String = ""; account: String = ""; present: Bool = false; }
+
+/// The shape the board (`Store.board`) gives `model`, whatever the board's
+/// age: an api with a stale board publishes in the shape the brain last
+/// wrote, which the seats consume until a change of it drains.
+@bounded_by(board)
+fn board_shape(board: String, model: String) -> BoardShape {
+    let mut it = std::json::array_first(std::json::find_field_raw(board, "models"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "model") == model {
+            let shape = string_of(std::json::find_field_raw(it.element, "shape"));
+            if shape == "m" || shape == "p" {
+                return BoardShape {
+                    shape: shape,
+                    account: string_of(std::json::find_field_raw(it.element, "provider_account")),
+                    present: true,
+                };
+            }
+        }
+        it = std::json::array_next(it);
+    }
+    return BoardShape { };
 }
 
 /// The partition a queued request is published to (the design's "Choosing a

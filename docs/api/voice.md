@@ -216,7 +216,7 @@ client can pace itself instead of discovering the wall by failing.
 - [nodes](#tag-nodes) (14)
 - [changes](#tag-changes) (2)
 - [events](#tag-events) (1)
-- [routes](#tag-routes) (2)
+- [routes](#tag-routes) (3)
 - [tools](#tag-tools) (2)
 - [node](#tag-node) (10)
 - [health](#tag-health) (2)
@@ -2900,6 +2900,36 @@ Responses:
 | 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
 | 503 | No table yet: no brain has written one. `code` is `route_table_unavailable`. | `application/json` [ErrorResponse](#schema-errorresponse) |
 
+### GET `/admin/v1/queues`
+
+**The brain's board, as it last wrote it** · `getQueues`
+
+Authentication: operatorToken
+
+Queue routing's board (`docs/design/queue-routing.md`,
+Observability), the latest the brain wrote to Postgres: each model's
+shape and any change of it in progress; each queue (a model's
+partition, or a seat's own) with its depth, its oldest ticket's age,
+the pulls standing on it, the tickets pulled and not acked, its
+model's recent service time and the seats consuming it; and each
+seat's plan (held and why, or its queues in order), concurrency, in
+flight and conversations held. The queues' readings are the brain's
+keeper's, a tick behind the board. `age_ms` is how old the board is
+by the store's clock; one older than a few seconds says the brain is
+down, and the api reads past it. How each seat pulls as its node
+last reported it, and the plan version it follows, are on the seat
+(`SeatSummary.pull`). Read from the store, so it answers at once.
+
+Responses:
+
+| Status | Description | Body |
+|---|---|---|
+| 200 | The board. | `application/json` [QueueBoard](#schema-queueboard) |
+| 401 | Missing, unknown or revoked credential. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 403 | The credential may not do this: the model is not visible to the key, the data class is not one the project may send, or the principal does not own the project. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 500 | `internal_error`: the server could not complete the request, as when its store refuses a read or a write. Nothing the request asked for was applied unless the response says so; retrying is safe. | `application/json` [ErrorResponse](#schema-errorresponse) |
+| 503 | No board yet: no brain has written one. `code` is `board_unavailable`. | `application/json` [ErrorResponse](#schema-errorresponse) |
+
 ### GET `/admin/v1/hub`
 
 **Where the admin plane streams live** · `getHub`
@@ -5277,6 +5307,51 @@ Type: object
 | `variant` | string |  | The recipe variant a placement's seat runs (its config's `variant.id`). |  |
 | `runtime` | string |  | The runtime a placement's seat runs it under (its config's `runtime.id`). |  |
 | `context_length` | integer |  | The context, in tokens, a placement's seat's model is made for (its config's `context_length`), when its recipe says. | ≥ 1 |
+| `pull` | [SeatPulls](#schema-seatpulls) |  |  |  |
+| `prefill_rate` | [SeatPrefillRate](#schema-seatprefillrate) |  |  |  |
+
+<a id="schema-seatpulls"></a>
+
+### SeatPulls
+
+How the seat pulls its work, as its node (of protocol 3) last
+reported it on its heartbeat: its state, why when held or off, the
+version of the brain's plan it follows (`ConsumePlan.version`, the
+board's; null on its own eligibility) and its queues in the order it
+sweeps them. Left out for a node of protocol 2, and until reported.
+
+Type: [SeatPull](#schema-seatpull)
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| … | all of [SeatPull](#schema-seatpull) |  |  |  |
+
+<a id="schema-seatprefillrate"></a>
+
+### SeatPrefillRate
+
+The seat's measured prefill rate: input not cached its engine read a
+second, from the requests it served (protocol.yaml
+`SeatState.prefill_rate`). A conversation's window on it is half the
+estimated miss of a turn's input. Left out until its node has
+measured one.
+
+Type: integer
+
+Notes: ≥ 1
+
+<a id="schema-queueboard"></a>
+
+### QueueBoard
+
+The brain's board as `getQueues` answers it.
+
+Type: [Board](#schema-board) & object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| … | all of [Board](#schema-board) |  |  |  |
+| `age_ms` | integer | yes | How old the board is, in milliseconds of the store's clock. | ≥ 0 |
 
 <a id="schema-seatview"></a>
 
@@ -5298,6 +5373,8 @@ Type: [Seat](#schema-seat) & object
 | `in_flight` | integer | yes |  |  |
 | `problems` | array of string | yes | What the coordinator sees wrong with it, e.g. a model not in the catalog or an archived account. |  |
 | `since` | string (date-time) |  | When the seat's state, its `status` and `reason`, began: the time of the node's report that changed either. A report that repeats them keeps it. Left out while the seat is `pending` or `offline`. |  |
+| `pull` | [SeatPulls](#schema-seatpulls) |  |  |  |
+| `prefill_rate` | [SeatPrefillRate](#schema-seatprefillrate) |  |  |  |
 
 <a id="schema-hub"></a>
 
@@ -5386,7 +5463,7 @@ Type: object
 
 | Field | Type | Required | Description | Notes |
 |---|---|---|---|---|
-| `code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable` | yes |  |  |
+| `code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable`, `board_unavailable` | yes |  |  |
 | `message` | string | yes |  |  |
 | `param` | string |  | The request field at fault. |  |
 | `incident` | string |  | The id a store failure was logged under. |  |
@@ -5443,7 +5520,7 @@ Type: object
 | `error` | object | yes |  |  |
 | `error.message` | string | yes |  |  |
 | `error.type` | string, one of `invalid_request`, `not_found`, `too_many_requests`, `server_error`, `model_error`, `authentication_error`, `permission_error` | yes | The standard's types, plus `authentication_error` and `permission_error` for the admin plane and key checks. |  |
-| `error.code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable` | yes |  |  |
+| `error.code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable`, `board_unavailable` | yes |  |  |
 | `error.param` | string \| null |  |  |  |
 | `error.voice` | object |  |  |  |
 | `error.voice.request_id` | string |  |  |  |
@@ -6881,6 +6958,22 @@ Type: object
 | `done_bytes` | integer | yes |  | ≥ 0 |
 | `total_bytes` | integer | yes |  | ≥ 0 |
 
+<a id="schema-seatpull"></a>
+
+### SeatPull
+
+How a seat pulls, from a node of protocol 3: on its heartbeat, its
+seats' report and its status; left out by a node of protocol 2.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `state` | string, one of `pulling`, `waiting`, `full`, `held`, `off` | yes | `pulling`: it has a free slot and sweeps its queues. `waiting`: it has a free slot and found every queue empty, and holds a standing pull on each. `full`: every slot it may take is serving or claiming. `held`: its plan holds it (`reason`). `off`: it pulls nothing: it is not `up`, a pair's follower, or its node is not on NATS (`reason`). |  |
+| `reason` | string \| null | yes | Why it is held or off; null otherwise. |  |
+| `plan_version` | integer \| null | yes | The version of the plan it follows (`ConsumePlan.version`), null while it pulls on its own eligibility (no plan, or one that does not name it). |  |
+| `queues` | array of string | yes | The work subjects it consumes, in the order it sweeps them; empty when it is held. | items ≤ 64 |
+
 <a id="schema-engine"></a>
 
 ### Engine
@@ -7041,6 +7134,93 @@ Type: object
 | `at` | string (date-time) | yes |  |  |
 | `models` | array of [ModelRoutes](#schema-modelroutes) | yes |  |  |
 
+<a id="schema-boardmodel"></a>
+
+### BoardModel
+
+A model's shape, and a change of it in progress (the design's "A
+model changing shape"). The brain alone changes a model's shape:
+when configuration's (one provider account, or several) differs
+from the board's, it prepares the change (`next`): it makes the new
+shape's consumers and sends plans in which the seats consume the new
+shape's queues beside the old, and only once its keeper has read
+every new queue, in a pass after the board that prepared it, does
+it flip `shape`, keeping the old one as `previous`, whose queues are
+consumed until the longest wait has passed and they are empty.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `model` | string | yes | A catalog model id. |  |
+| `shape` | string, one of `m`, `p` | yes | `m` when the enabled seats that serve it in configuration run under one provider account, `p` when under more than one, once a change to it is flipped. The api publishes in the shape the board says, however old the board, while the board holds the model, and by configuration's rule for one it does not hold. |  |
+| `provider_account` | string \| null | yes | In the `m` shape, its one provider account (today's `account`): only that account's seats consume its queues, and the api publishes there only a request that may spend it; null in the `p` shape. |  |
+| `next` | null \| object | yes | The change prepared, not flipped yet; null for none. |  |
+| `previous` | null \| object | yes | The shape it left, its queues still consumed until they drain; null for none. |  |
+
+<a id="schema-queuereading"></a>
+
+### QueueReading
+
+One queue, as its consumer was read after the brain's last tick (its
+keeper reads the queues once it has published the plans, so a board
+reads them a tick late).
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `subject` | string | yes | The queue's subject, whole, under the root. |  |
+| `shape` | string, one of `m`, `p`, `s` | yes | A partition's shape, or `s` for a seat's own queue. |  |
+| `model` | string \| null | yes | The partition's model; null for a seat's own queue. |  |
+| `provider_account` | string \| null | yes | The partition's provider account (today's `account`), in the `p` shape; null otherwise. |  |
+| `data_class` | string \| null | yes | The partition's data class; null for a seat's own queue. |  |
+| `need` | string \| null, one of `tools`, `any`, `null` | yes | The partition's need; null for a seat's own queue. |  |
+| `depth` | integer | yes | Tickets waiting in it, its consumer's pending. | ≥ 0 |
+| `oldest_age_ms` | integer \| null | yes | How long its oldest ticket has waited; null when it is empty. | ≥ 0 |
+| `waiting_pulls` | integer | yes | Pulls standing on it, from seats with a free slot and nothing to take. | ≥ 0 |
+| `ack_pending` | integer | yes | Tickets pulled and not yet acked. | ≥ 0 |
+| `service_ms` | integer \| null | yes | Recent service time of its model, from the ledger's last minute; null with none. With `depth` over its consuming seats' free slots, the expected wait. | ≥ 0 |
+| `seats` | array of string | yes | The seats consuming it, `<node>/<seat>`. |  |
+
+<a id="schema-boardseat"></a>
+
+### BoardSeat
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `seat` | string | yes | `<node>/<seat>`. |  |
+| `hold` | string \| null | yes | Why it is held, pulling nothing; null when it consumes. |  |
+| `consume` | array of string | yes | The queues' subjects it consumes, in order; empty when held. |  |
+| `concurrency` | integer | yes |  | ≥ 1 |
+| `in_flight` | integer | yes |  | ≥ 0 |
+| `conversations_held` | integer | yes | How many conversations its runtime keeps the prompts of; 0 for a hosted upstream. | ≥ 0 |
+
+<a id="schema-board"></a>
+
+### Board
+
+The brain's board as `board` holds it (`store.md`, "The board"),
+written each tick in the same transaction as node liveness: each
+model's shape, each queue's reading and each seat's plan. The api
+reads it to choose a partition (each queue's expected wait, from its
+depth, its consuming seats' free slots and its service time) and a
+conversation's window (0 for a home seat held, consuming nothing, or
+with its own queue full), and reads past a board older than 5 s; the
+brain's `ConsumePlan` for each node is its seats' plans.
+
+Type: object
+
+| Field | Type | Required | Description | Notes |
+|---|---|---|---|---|
+| `version` | integer | yes | Milliseconds of Postgres's clock when the board was written, and always above the version before it (the stored version plus one when the clock has not passed it), as the route table's. |  |
+| `at` | string (date-time) | yes |  |  |
+| `models` | array of [BoardModel](#schema-boardmodel) | yes |  |  |
+| `queues` | array of [QueueReading](#schema-queuereading) | yes |  |  |
+| `seats` | array of [BoardSeat](#schema-boardseat) | yes |  |  |
+
 <a id="schema-registration"></a>
 
 ### Registration
@@ -7112,22 +7292,6 @@ Type: object
 | `nats.password` | string |  | That account's password, present with `user` alone; the answer is sent `Cache-Control: no-store`. |  |
 | `assignment` | [Assignment](#schema-assignment) | yes |  |  |
 
-<a id="schema-seatpull"></a>
-
-### SeatPull
-
-How a seat pulls, from a node of protocol 3: on its heartbeat, its
-seats' report and its status; left out by a node of protocol 2.
-
-Type: object
-
-| Field | Type | Required | Description | Notes |
-|---|---|---|---|---|
-| `state` | string, one of `pulling`, `waiting`, `full`, `held`, `off` | yes | `pulling`: it has a free slot and sweeps its queues. `waiting`: it has a free slot and found every queue empty, and holds a standing pull on each. `full`: every slot it may take is serving or claiming. `held`: its plan holds it (`reason`). `off`: it pulls nothing: it is not `up`, a pair's follower, or its node is not on NATS (`reason`). |  |
-| `reason` | string \| null | yes | Why it is held or off; null otherwise. |  |
-| `plan_version` | integer \| null | yes | The version of the plan it follows (`ConsumePlan.version`), null while it pulls on its own eligibility (no plan, or one that does not name it). |  |
-| `queues` | array of string | yes | The work subjects it consumes, in the order it sweeps them; empty when it is held. | items ≤ 64 |
-
 <a id="schema-seatstate"></a>
 
 ### SeatState
@@ -7146,6 +7310,7 @@ Type: object
 | `in_flight` | integer | yes |  | ≥ 0 |
 | `pull` | [SeatPull](#schema-seatpull) |  |  |  |
 | `conversations` | array of string |  | The conversations the seat's engine holds, as far as its node knows: the `conversation` of each ticket it was granted, the newest first, at most as many as its runtime holds (llama-server its slots, TensorFold 80, vLLM 32 as a floor, a hosted seat none). The api corrects where it records each conversation by it (`seat_conversation`, store.md): this seat's rows older than the heartbeat, but for those listed, go. Left out by a node of protocol 2. | items ≤ 128 |
+| `prefill_rate` | integer |  | How fast the seat's engine reads a prompt: input not cached read a second, as its node measures it from the requests the seat served (each one's input less what its engine's prompt cache held, over its time from the request to its first output; one with less than 256 such tokens is not counted), averaged over the recent ones. The api sets a conversation's window on this seat from it: half the estimated miss, `size / prefill_rate`, at most 10 s and half the time left. Left out until the node has measured one, and by a node of protocol 2. | ≥ 1 |
 
 <a id="schema-heartbeat"></a>
 

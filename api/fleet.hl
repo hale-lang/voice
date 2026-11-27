@@ -166,6 +166,12 @@ type SeatState {
     // newest first, one a line (protocol.yaml `SeatState.conversations`)
     has_conversations: Bool = false;
     conversations: String = "";
+    // from a node of protocol 3, how the seat pulls (protocol.yaml
+    // `SeatPull`, its JSON as the store keeps it; "" when not said) and its
+    // measured prefill rate, input not cached read a second (0 when not
+    // said)
+    pull: String = "";
+    prefill_rate: Int = 0;
 }
 
 /// How long the api keeps where a conversation is with nothing telling it
@@ -473,6 +479,8 @@ locus NodePlane {
                 done_bytes: st.progress.done_bytes,
                 total_bytes: st.progress.total_bytes,
                 context: st.context,
+                pull: st.pull,
+                prefill_rate: st.prefill_rate,
                 since: at,
             };
             self.store.put_seat_state(row) or fail store_failed(err);
@@ -675,10 +683,59 @@ fn seat_state_list(body: String, name: String) -> SeatStateList fallible(ApiErro
                 name,
             ) or raise;
         }
+        if kind_of(e, "pull") == "object" {
+            st.pull = pull_of(std::json::find_field_raw(e, "pull"), name) or raise;
+        }
+        if kind_of(e, "prefill_rate") == "number" {
+            st.prefill_rate = required_amount(e, "prefill_rate") or raise;
+            if st.prefill_rate < 1 { fail invalid("a seat's prefill rate is at least 1", name); }
+        }
         push(out.items, st) or fail invalid("at most 16 seat states", name);
         it = std::json::array_next(it);
     }
     return out;
+}
+
+/// How a seat pulls (protocol.yaml `SeatPull`), as JSON the store keeps:
+/// its state, its reason, the plan version it follows (null on its own
+/// eligibility) and its queues in order, at most 64; anything else
+/// refused.
+@bounded_by(raw)
+fn pull_of(raw: String, name: String) -> String fallible(ApiError) {
+    let p = std::str::trim(raw);
+    let state = required_string(p, "state") or raise;
+    if state != "pulling" && state != "waiting" && state != "full" && state != "held"
+        && state != "off"
+    {
+        fail invalid("a seat's pull state is pulling, waiting, full, held or off", name);
+    }
+    let reason = nullable_string(p, "reason") or raise;
+    let kind = kind_of(p, "plan_version");
+    if kind != "number" && kind != "null" {
+        fail invalid("a seat's plan version is an integer or null", name);
+    }
+    let version = if kind == "number" {
+        to_string(required_amount(p, "plan_version") or raise)
+    } else {
+        "null"
+    };
+    if kind_of(p, "queues") != "array" { fail invalid("a seat's queues are a list", name); }
+    let queues = st::JsonList { };
+    let mut n = 0;
+    let mut it = std::json::array_first(std::json::find_field_raw(p, "queues"));
+    while !it.done {
+        let q = std::str::trim(it.element);
+        if !std::str::starts_with(q, "\"") || !std::str::ends_with(q, "\"") || len(q) < 3 {
+            fail invalid("a seat's queues are subjects", name);
+        }
+        n = n + 1;
+        if n > 64 { fail invalid("a seat pulls at most 64 queues", name); }
+        queues.add(st::jq(std::json::unescape_string(q[1..(len(q) - 1)])));
+        it = std::json::array_next(it);
+    }
+    return "{\"state\": " + st::jq(state) + ", \"reason\": "
+        + (if len(reason) > 0 { st::jq(reason) } else { "null" }) + ", \"plan_version\": " + version
+        + ", \"queues\": [" + queues.text() + "]}";
 }
 
 /// A seat's conversations (protocol.yaml `SeatState.conversations`), one

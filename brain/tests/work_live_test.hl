@@ -6,7 +6,8 @@
 // nothing; a full queue refuses its newcomer (10077) while another takes
 // its own; and a stream found gone is created again and told. Each run
 // works under a root of its own, so its stream is its own, and deletes it
-// at the end.
+// at the end. The queues are read back as the brain's board reads them:
+// each one's backlog, and its oldest ticket's age.
 import ".." as brain;
 import "../../lib/work" as work;
 import "../../lib/pond/realtime/nats" as nats;
@@ -84,7 +85,7 @@ fn main() {
     let any = root + ".work.m.echo-1.internal.any";
     let tools = root + ".work.m.echo-1.internal.tools";
     let own = root + ".work.s.laptop.a";
-    std::test::assert_eq_str(subjects, any + "\n" + tools + "\n" + own + "\n", "three queues");
+    std::test::assert_eq_str(subjects, own + "\n" + any + "\n" + tools + "\n", "three queues");
 
     let first = brain::upkeep(c, root, subjects, false);
     passed(first, "the first pass");
@@ -155,6 +156,37 @@ fn main() {
     std::test::assert(other.seq > 0, "while another queue takes its own");
     let full = nats::js_stream_info(c, name) or nats::StreamInfo { };
     std::test::assert_eq_int(full.messages, 1025, "and no waiting ticket was dropped");
+
+    // the queues read back for the brain's board: the full one's backlog
+    // and its oldest ticket's age, the other's one ticket, the seat's own
+    // empty; a queue with no consumer is left out
+    let read = brain::read_queues(
+        c,
+        root,
+        subjects + root + ".work.m.none.internal.any\n",
+        std::time::nanos(std::time::current()) / 1000000 + 5000,
+    );
+    std::test::assert(len(read.step) == 0, "the queues are read: " + read.detail);
+    let lines = brain::Readings { };
+    brain::fill_readings(lines, read.lines);
+    let full_one = lines.get(any) or brain::Reading { };
+    std::test::assert(
+        full_one.present && full_one.depth == 1024 && full_one.ack_pending == 0
+            && full_one.waiting == 0 && full_one.oldest_ms >= 5000,
+        "the full queue: 1024 waiting, its oldest at least 5 s old by the clock given: "
+            + read.lines,
+    );
+    let one_more = lines.get(tools) or brain::Reading { };
+    std::test::assert(one_more.present && one_more.depth == 1, "the other holds its one");
+    let empty = lines.get(own) or brain::Reading { };
+    std::test::assert(
+        empty.present && empty.depth == 0 && empty.oldest_ms == -1,
+        "the seat's own is empty, with no oldest",
+    );
+    std::test::assert(
+        !std::str::contains(read.lines, ".none."),
+        "a queue with no consumer is left out",
+    );
 
     // the stream lost: the next pass creates it again, with its consumers,
     // and tells its new incarnation

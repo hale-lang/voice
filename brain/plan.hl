@@ -1,0 +1,548 @@
+// The controller's plan (docs/design/queue-routing.md, "The brain: from
+// table writer to controller"; internal.yaml `Board`; protocol.yaml
+// `ConsumePlan`). Each tick the working brain, in the transaction that
+// writes node liveness:
+//
+// - judges each seat as the route table does (routes.hl `hold_of`): one
+//   that fails is held, with why;
+// - reads its queues' readings, as its keeper last read them from their
+//   consumers (work.hl `read_queues`: depth, ack pending, standing pulls,
+//   the oldest ticket's age), and each model's recent service time from
+//   the ledger's last minute (`SERVICE_READ`);
+// - orders each seat's queues (`ordered`): its own queue first, then its
+//   partitions; for a seat that serves several models, by pressure (the
+//   oldest ticket's age over its model's service time), with hysteresis;
+//   and last, the same partitions in the other shape, as a node with no
+//   plan consumes both, so tickets the api published before a model
+//   changed shape are served (their consumers, made before, stay; one
+//   that does not exist is a pull refused, which the node passes over);
+// - writes the board, one row, versioned as the route table is, and hands
+//   each node's plan to its keeper, which publishes it on
+//   `<root>.node.<node>.consume` with the board's version.
+//
+// Phase 1 orders and holds; it never takes a partition from a seat it
+// configures, so none loses its last consumer.
+
+import "../lib/work" as work;
+
+/// Ticks a new order of a seat's queues must hold before the seat is given
+/// it, and how many times the pressure of the queue it moves ahead its new
+/// place's has to be (the design's "twice the old head's for three ticks").
+const ORDER_TICKS: Int = 3;
+const ORDER_FACTOR: Float = 2.0;
+
+/// The ledger's last minute, per catalog model: how many requests seats
+/// served and their mean service time, in ms (the node's `engine_ms`, from
+/// the seat receiving the request to its result; else the wall time less
+/// the queue's). Read seat by seat through the ledger's index by served
+/// seat (store.md, migration 44), never over the whole ledger. A value that
+/// is not a JSON number counts as none.
+const SERVICE_READ: String = "SELECT row_to_json(t) FROM (SELECT u.model, count(*) AS n, round(avg(u.ms))::bigint AS service_ms FROM seat s CROSS JOIN LATERAL (SELECT coalesce(x.record->>'resolved_model', x.requested_model) AS model, coalesce(CASE WHEN jsonb_typeof(x.record->'timing'->'engine_ms') = 'number' THEN (x.record->'timing'->>'engine_ms')::numeric END, CASE WHEN jsonb_typeof(x.record->'timing'->'wall_ms') = 'number' THEN greatest((x.record->'timing'->>'wall_ms')::numeric - CASE WHEN jsonb_typeof(x.record->'timing'->'queue_ms') = 'number' THEN (x.record->'timing'->>'queue_ms')::numeric ELSE 0 END, 0) END) AS ms FROM usage x WHERE x.served->>'seat' = s.node || '/' || s.id AND x.created_at > now() - interval '1 minute' AND x.status IN ('served', 'incomplete')) u WHERE u.ms IS NOT NULL GROUP BY u.model) t";
+
+// ---- what the tick reads --------------------------------------------------
+
+/// One queue's reading, as the keeper last read its consumer: tickets
+/// waiting (`num_pending`), pulled and not acked, standing pulls, and its
+/// oldest ticket's age in ms (-1 when it is empty).
+type Reading {
+    subject: String = "";
+    depth: Int = 0;
+    ack_pending: Int = 0;
+    waiting: Int = 0;
+    oldest_ms: Int = -1;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus Readings { capacity { pool rows of Reading indexed_by subject; } }
+
+/// A model's recent service time.
+type Service { model: String = ""; ms: Int = 0; present: Bool = false; }
+
+@form(hashmap)
+locus Services { capacity { pool rows of Service indexed_by model; } }
+
+/// A seat's order as the last tick gave it (its partitions, its own queue
+/// left out), and the ticks a different one has held.
+type SeatOrder {
+    seat: String = "";
+    order: String = "";
+    streak: Int = 0;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus SeatOrders { capacity { pool rows of SeatOrder indexed_by seat; } }
+
+/// A queue's pressure: its oldest ticket's age over its model's service
+/// time.
+type Pressure { subject: String = ""; value: Float = 0.0; present: Bool = false; }
+
+@form(hashmap)
+locus Pressures { capacity { pool rows of Pressure indexed_by subject; } }
+
+/// A seat's queues (`seat_queues`'s lines for it), and the seats consuming
+/// a queue (JSON strings, comma-separated).
+type Lines { key: String = ""; text: String = ""; present: Bool = false; }
+
+@form(hashmap)
+locus LinesBy { capacity { pool rows of Lines indexed_by key; } }
+
+/// The keeper's readings (`read_queues`: `<subject>\t<depth>\t<ack
+/// pending>\t<waiting>\t<oldest ms>` a line) into `out`.
+@bounded_by(text)
+fn fill_readings(out: Readings, text: String) {
+    let v = std::str::bytes_view(text);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        let subject = tab_field(line, 0);
+        if len(subject) > 0 {
+            out.set(
+                Reading {
+                    subject: subject,
+                    depth: std::str::parse_int(tab_field(line, 1)) or 0,
+                    ack_pending: std::str::parse_int(tab_field(line, 2)) or 0,
+                    waiting: std::str::parse_int(tab_field(line, 3)) or 0,
+                    oldest_ms: std::str::parse_int(tab_field(line, 4)) or - 1,
+                    present: true,
+                },
+            );
+        }
+    }
+}
+
+/// `SERVICE_READ`'s rows into `out`.
+@bounded_by(csv)
+fn fill_services(out: Services, csv: String) {
+    let v = std::str::bytes_view(csv);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let row = std::str::trim(std::str::slice(v, start, nl));
+        start = nl + 1;
+        let model = st::pg_text(row, "model");
+        if len(model) > 0 && std::json::string_field(row, "service_ms").kind == "number" {
+            out.set(
+                Service {
+                    model: model,
+                    ms: std::json::find_int_field(row, "service_ms"),
+                    present: true,
+                },
+            );
+        }
+    }
+}
+
+/// The orders the last tick left (`Planned.orders`: `<seat>\t<streak>\t<its
+/// partitions, space-separated>` a line) into `out`. A subject holds no
+/// whitespace (lib/work `token`).
+@bounded_by(text)
+fn fill_orders(out: SeatOrders, text: String) {
+    let v = std::str::bytes_view(text);
+    let mut start = 0;
+    while start < v.n {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        let seat = tab_field(line, 0);
+        if len(seat) > 0 {
+            out.set(
+                SeatOrder {
+                    seat: seat,
+                    streak: std::str::parse_int(tab_field(line, 1)) or 0,
+                    order: tab_field(line, 2),
+                    present: true,
+                },
+            );
+        }
+    }
+}
+
+/// A queue's pressure (the design's "oldest age over recent service
+/// time", lib/work's `SERVICE_UNKNOWN_MS` for a model with none): 0 while it
+/// holds nothing.
+fn pressure_of(r: Reading, service_ms: Int) -> Float {
+    if !r.present || r.depth <= 0 || r.oldest_ms < 0 { return 0.0; }
+    let ms = if service_ms > 0 { service_ms } else { work::SERVICE_UNKNOWN_MS };
+    return Float(r.oldest_ms) / Float(ms);
+}
+
+// ---- a seat's order -------------------------------------------------------
+
+/// A seat's partitions in the order it is given (`ordered`): `order`, how
+/// many ticks in a row a different one has held (`streak`), and whether
+/// this tick changed it.
+type Ordered {
+    order: work::Subjects = work::Subjects { };
+    streak: Int = 0;
+    changed: Bool = false;
+}
+
+/// The pressure of `subject` in `p`, 0 for none.
+fn pressure_in(p: Pressures, subject: String) -> Float {
+    let r = p.get(subject) or Pressure { };
+    return r.value;
+}
+
+/// Whether `items` holds `subject`.
+fn holds_subject(items: bounded[String; 64], subject: String) -> Bool {
+    for s in items {
+        if s == subject { return true; }
+    }
+    return false;
+}
+
+/// The order of a seat's partitions this tick, from `base` (configuration's
+/// order, which no pressure leaves it in), `current` (the order it was
+/// given, `streak` the ticks a different one has held) and each queue's
+/// pressure (`p`). The order it would have is `base` sorted by pressure,
+/// the highest first (ties in `base`'s order); at the first place where
+/// that differs from `current`, the queue it would put there must have at
+/// least `ORDER_FACTOR` times the pressure of the one there now, for
+/// `ORDER_TICKS` ticks in a row, before the seat is given it, so a small
+/// change never flaps the order. With no pressure anywhere the order it
+/// would have is `base`, and the seat goes back to it the same way.
+/// `current` loses the queues `base` no longer holds and gains, at its end,
+/// those it did not.
+fn ordered(base: work::Subjects, current: work::Subjects, streak: Int, p: Pressures) -> Ordered {
+    let mut now = work::Subjects { };
+    for s in current.items {
+        if holds_subject(base.items, s) && !holds_subject(now.items, s) {
+            push(now.items, s) or discard;
+        }
+    }
+    for s in base.items {
+        if !holds_subject(now.items, s) { push(now.items, s) or discard; }
+    }
+    // base sorted by pressure, the highest first, ties in base's order
+    let mut want = work::Subjects { };
+    let n = count(base.items);
+    let mut k = 0;
+    while k < n {
+        let mut best = "";
+        let mut best_p = -1.0;
+        for s in base.items {
+            if !holds_subject(want.items, s) {
+                let ps = pressure_in(p, s);
+                if ps > best_p {
+                    best = s;
+                    best_p = ps;
+                }
+            }
+        }
+        push(want.items, best) or discard;
+        k = k + 1;
+    }
+    let mut j = 0;
+    let mut differs = -1;
+    for s in want.items {
+        if differs < 0 && (at(now.items, j) or "") != s { differs = j; }
+        j = j + 1;
+    }
+    if differs < 0 { return Ordered { order: now, streak: 0 }; }
+    let rising = pressure_in(p, at(want.items, differs) or "");
+    let held = pressure_in(p, at(now.items, differs) or "");
+    if rising < held * ORDER_FACTOR { return Ordered { order: now, streak: 0 }; }
+    if streak + 1 < ORDER_TICKS { return Ordered { order: now, streak: streak + 1 }; }
+    return Ordered { order: want, streak: 0, changed: true };
+}
+
+/// A list of subjects, space-separated (`fill_orders`).
+fn spaced(items: bounded[String; 64]) -> String {
+    let mut out = "";
+    for s in items {
+        out = if len(out) == 0 { s } else { out + " " + s };
+    }
+    return out;
+}
+
+/// Subjects from `spaced`.
+@bounded_by(text)
+fn unspaced(text: String) -> work::Subjects {
+    let mut out = work::Subjects { };
+    let v = std::str::bytes_view(text);
+    let mut from = 0;
+    while from < v.n {
+        let rest = std::str::slice(v, from, v.n);
+        let sp = std::str::index_of(rest, " ");
+        let end = if sp < 0 { v.n } else { from + sp };
+        let s = std::str::slice(v, from, end);
+        if len(s) > 0 { push(out.items, s) or discard; }
+        from = end + 1;
+    }
+    return out;
+}
+
+// ---- the plan -------------------------------------------------------------
+
+/// What a tick plans (`plan`): the board's body (its `models`, `queues` and
+/// `seats`), each node's seats' plans (`<node>\t<SeatPlan JSON list>` a
+/// line, for the keeper to publish), the orders for the next tick
+/// (`fill_orders`), and the seats whose order changed, said once each
+/// (`<seat>\t<why>` a line).
+type Planned {
+    board: String = "";
+    plans: String = "";
+    orders: String = "";
+    said: String = "";
+}
+
+/// A JSON list of strings.
+fn jlist(items: bounded[String; 64]) -> String {
+    let out = st::JsonList { };
+    for s in items {
+        out.add(st::jq(s));
+    }
+    return "[" + out.text() + "]";
+}
+
+fn jq_or_null(s: String) -> String {
+    return if len(s) > 0 { st::jq(s) } else { "null" };
+}
+
+/// The plan of a tick under `root`: from the seats judged (`seats`,
+/// `SEAT_READ`'s rows), the seats configured to serve and what they serve
+/// (`work`, `WORK_READ`'s), the ledger's service times (`services`,
+/// `SERVICE_READ`'s), the keeper's last readings (`readings`) and the
+/// orders the last tick left (`orders`).
+@bounded_by(seats)
+fn plan(
+    root: String,
+    seats: String,
+    work: String,
+    services: String,
+    readings: String,
+    orders: String
+) -> Planned {
+    let shapes = Shapes { };
+    fill_shapes(shapes, work);
+    let queues = seat_queues(root, work, shapes);
+    let read = Readings { };
+    fill_readings(read, readings);
+    let service = Services { };
+    fill_services(service, services);
+    let before = SeatOrders { };
+    fill_orders(before, orders);
+
+    // each seat's queues, and each queue's pressure and model
+    let by_seat = LinesBy { };
+    let pressures = Pressures { };
+    let qv = std::str::bytes_view(queues);
+    let mut start = 0;
+    while start < qv.n {
+        let nl = st::line_end(qv, start);
+        let line = std::str::slice(qv, start, nl);
+        start = nl + 1;
+        let seat = tab_field(line, 0);
+        if len(seat) > 0 {
+            let had = by_seat.get(seat) or Lines { };
+            by_seat.set(Lines { key: seat, text: had.text + line + "\n", present: true });
+            let subject = tab_field(line, 1);
+            let model = tab_field(line, 3);
+            let s = service.get(model) or Service { };
+            let r = read.get(subject) or Reading { };
+            pressures.set(
+                Pressure { subject: subject, value: pressure_of(r, s.ms), present: true },
+            );
+        }
+    }
+
+    // each seat: held, or its queues in order
+    let board_seats = st::JsonList { };
+    let consumers = LinesBy { };
+    let plans = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let next_orders = std::bytes::BytesBuilder { initial_cap: 1024 };
+    let mut said = "";
+    let mut node = "";
+    let mut node_plans = "";
+    let sv = std::str::bytes_view(seats);
+    start = 0;
+    while start < sv.n {
+        let nl = st::line_end(sv, start);
+        let row = std::str::trim(std::str::slice(sv, start, nl));
+        start = nl + 1;
+        if len(row) > 0 {
+            let ref = st::pg_text(row, "seat");
+            let id = st::pg_text(row, "id");
+            let here = st::pg_text(row, "node");
+            if here != node {
+                if len(node) > 0 { plans.append_str(node + "\t[" + node_plans + "]\n"); }
+                node = here;
+                node_plans = "";
+            }
+            let hold = hold_of(row);
+            let mut p = work::SeatPlan { seat: id, hold: hold };
+            if len(hold) == 0 {
+                let mine = by_seat.get(ref) or Lines { };
+                let mut own = "";
+                let mut base = work::Subjects { };
+                let mut other = work::Subjects { };
+                let mut models = "\n";
+                let mut several = 0;
+                let account = st::pg_text(row, "account");
+                let mv = std::str::bytes_view(mine.text);
+                let mut pos = 0;
+                while pos < mv.n {
+                    let e = st::line_end(mv, pos);
+                    let line = std::str::slice(mv, pos, e);
+                    pos = e + 1;
+                    if tab_field(line, 2) == "s" {
+                        own = tab_field(line, 1);
+                    } else if len(line) > 0 {
+                        push(base.items, tab_field(line, 1)) or discard;
+                        // the same partition in the other shape, last
+                        push(
+                            other.items,
+                            work::partition(
+                                root,
+                                tab_field(line, 3),
+                                tab_field(line, 2) == "m",
+                                account,
+                                tab_field(line, 5),
+                                tab_field(line, 6),
+                            ),
+                        ) or discard;
+                        let model = tab_field(line, 3);
+                        if !std::str::contains(models, "\n" + model + "\n") {
+                            models = models + model + "\n";
+                            several = several + 1;
+                        }
+                    }
+                }
+                if len(own) == 0 { own = work::seat_subject(root, here, id); }
+                let mut order = base;
+                // a seat serving several models orders them by pressure
+                if several > 1 {
+                    let was = before.get(ref) or SeatOrder { };
+                    let o = ordered(base, unspaced(was.order), was.streak, pressures);
+                    order = o.order;
+                    next_orders.append_str(
+                        ref + "\t" + to_string(o.streak) + "\t" + spaced(o.order.items) + "\n",
+                    );
+                    if o.changed {
+                        let head = at(o.order.items, 0) or "";
+                        let r = read.get(head) or Reading { };
+                        said = said + ref + "\t" + head + "\t"
+                            + (if r.depth > 0 && r.oldest_ms >= 0 {
+                                "its oldest ticket has waited " + to_string(r.oldest_ms)
+                                    + " ms, pressure " + to_string(pressure_in(pressures, head))
+                            } else {
+                                "no queue of its waits: back to configuration's order"
+                            }) + "\n";
+                    }
+                }
+                push(p.consume, own) or discard;
+                for s in order.items {
+                    push(p.consume, s) or discard;
+                }
+                for s in p.consume {
+                    let had = consumers.get(s) or Lines { };
+                    consumers.set(
+                        Lines {
+                            key: s,
+                            text: if len(had.text) > 0 {
+                                had.text + ", " + st::jq(ref)
+                            } else {
+                                st::jq(ref)
+                            },
+                            present: true,
+                        },
+                    );
+                }
+                // after them, its partitions in the other shape, as a node
+                // with no plan consumes both: a ticket the api published
+                // there before a change of shape is served, until changes
+                // of shape are sequenced
+                for s in other.items {
+                    if !holds_subject(p.consume, s) { push(p.consume, s) or discard; }
+                }
+            }
+            node_plans = node_plans + (if len(node_plans) > 0 { ", " } else { "" })
+                + work::seat_plan_json(p);
+            let concurrency = seat_concurrency(row);
+            board_seats.add(
+                "{\"seat\": " + st::jq(ref) + ", \"hold\": " + jq_or_null(hold) + ", \"consume\": "
+                    + jlist(p.consume) + ", \"concurrency\": "
+                    + to_string(if concurrency > 0 { concurrency } else { 1 })
+                    + ", \"in_flight\": " + to_string(int_or(row, "seat_in_flight", 0))
+                    + ", \"conversations_held\": "
+                    + to_string(
+                        concurrency::conversations_held(
+                            st::pg_text(row, "kind"),
+                            st::pg_text(row, "server"),
+                            int_or(row, "cache_tokens", 0),
+                            int_or(row, "context_length", 0),
+                            concurrency,
+                        ),
+                    )
+                    + "}",
+            );
+        }
+    }
+    if len(node) > 0 { plans.append_str(node + "\t[" + node_plans + "]\n"); }
+
+    // each queue once, with its reading and the seats consuming it
+    let board_queues = st::JsonList { };
+    let taken = TakenSubjects { };
+    start = 0;
+    while start < qv.n {
+        let nl = st::line_end(qv, start);
+        let line = std::str::slice(qv, start, nl);
+        start = nl + 1;
+        let subject = tab_field(line, 1);
+        if len(subject) > 0 && len(taken_once(taken, subject)) > 0 {
+            let shape = tab_field(line, 2);
+            let model = tab_field(line, 3);
+            let r = read.get(subject) or Reading { };
+            let s = service.get(model) or Service { };
+            let c = consumers.get(subject) or Lines { };
+            let need = tab_field(line, 6);
+            board_queues.add(
+                "{\"subject\": " + st::jq(subject) + ", \"shape\": " + st::jq(shape)
+                    + ", \"model\": " + jq_or_null(model) + ", \"provider_account\": "
+                    + jq_or_null(tab_field(line, 4)) + ", \"data_class\": "
+                    + jq_or_null(tab_field(line, 5)) + ", \"need\": " + jq_or_null(need)
+                    + ", \"depth\": " + to_string(r.depth) + ", \"oldest_age_ms\": "
+                    + (
+                        if r.depth > 0 && r.oldest_ms >= 0 {
+                            to_string(r.oldest_ms)
+                        } else {
+                            "null"
+                        }
+                    )
+                    + ", \"waiting_pulls\": " + to_string(r.waiting) + ", \"ack_pending\": "
+                    + to_string(r.ack_pending) + ", \"service_ms\": "
+                    + (if s.present && shape != "s" { to_string(s.ms) } else { "null" })
+                    + ", \"seats\": [" + c.text + "]}",
+            );
+        }
+    }
+
+    // each model a seat makes queues for, in its shape, in the order its
+    // queues first come
+    let board_models = st::JsonList { };
+    start = 0;
+    while start < qv.n {
+        let nl = st::line_end(qv, start);
+        let line = std::str::slice(qv, start, nl);
+        start = nl + 1;
+        let model = tab_field(line, 3);
+        if len(model) > 0 && len(taken_once(taken, "\n" + model)) > 0 {
+            board_models.add(
+                "{\"model\": " + st::jq(model) + ", \"shape\": " + st::jq(tab_field(line, 2)) + "}",
+            );
+        }
+    }
+    let p = plans.finish() or b"";
+    let o = next_orders.finish() or b"";
+    return Planned {
+        board: "{\"models\": [" + board_models.text() + "], \"queues\": [" + board_queues.text()
+            + "], \"seats\": [" + board_seats.text() + "]}",
+        plans: std::str::from_bytes(p),
+        orders: std::str::from_bytes(o),
+        said: said,
+    };
+}

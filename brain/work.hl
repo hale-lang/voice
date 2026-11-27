@@ -1,31 +1,39 @@
 // The work stream and its queues' consumers (docs/design/queue-routing.md,
 // "The stream" and "Consumers"; internal.yaml `WorkStream`, `WorkConsumer`
-// and `QueuesReset`), which the working brain keeps. The api queues a
+// and `QueuesReset`), which the working brain keeps, and the plans it
+// publishes to nodes (protocol.yaml `ConsumePlan`). The api queues a
 // request on it when every seat that could serve the request pulls
 // (api/queue.hl), and nodes pull from its queues (node/pull.hl); any other
 // request is still offered through the route table.
 //
 // Each tick the working brain reads the seats configured to serve
-// (`WORK_READ`), works out the queues they make (`partitions`) and hands
-// them to the keeper (`WorkKeeper`), a pinned locus with a NATS connection
-// of its own, so the tick never waits on NATS. A standby hands it nothing,
-// and its keeper never dials. Given the queues, the keeper makes sure of
-// the stream and of one consumer per queue (`upkeep`), a JetStream request
-// each, every tick: the stream's settings brought up to date where NATS
-// changes them in place, the stream made again where it cannot, and the
-// new stream's incarnation told on `<root>.queues.reset` whenever the
-// keeper created it. A consumer for a queue no seat makes any longer is
-// left as it is: deleting one waits for the controller (step (e)).
+// (`WORK_READ`), works out the queues they make (`partitions`) and each
+// node's plan (plan.hl), and hands them to the keeper (`WorkKeeper`), a
+// pinned locus with a NATS connection of its own, so the tick never waits
+// on NATS. A standby hands it nothing, and its keeper never dials. Given
+// the queues, the keeper makes sure of the stream and of one consumer per
+// queue (`upkeep`), a JetStream request each, every tick: the stream's
+// settings brought up to date where NATS changes them in place, the stream
+// made again where it cannot, and the new stream's incarnation told on
+// `<root>.queues.reset` whenever the keeper created it. Then it publishes
+// each node's plan on `<root>.node.<node>.consume` when it changed, with
+// the board's version, and every 30 s regardless (`PLAN_REPEAT_MS`), and
+// reads each queue's consumer (`read_queues`): its readings go back to the
+// brain for its next tick. A consumer for a queue no seat makes any longer
+// is left as it is: deleting one waits for the consumer lifecycle.
 //
 // NATS or JetStream not answering is said once, and the keeper tries again
-// on the next tick; the route table is written meanwhile, as ever.
+// on the next tick; the route table and the board are written meanwhile,
+// and nodes pull on the last plan they were given.
 
 import "../lib/work" as work;
 
 /// JetStream's refusals the keeper acts on (its `err_code`): no such
 /// stream; a stream of that name with other settings; settings an update
-/// cannot change in place (storage, retention to or from a work queue).
+/// cannot change in place (storage, retention to or from a work queue); no
+/// such consumer.
 const NO_STREAM: Int = 10059;
+const NO_CONSUMER: Int = 10014;
 const STREAM_NAME_IN_USE: Int = 10058;
 const UPDATE_REFUSED: Int = 10052;
 
@@ -102,18 +110,14 @@ fn makes_queues(row: String) -> Bool {
     );
 }
 
-/// The queues the seats of `rows` (`WORK_READ`, one a line) make under
-/// `root`, each once, one a line. A model's queues are in the `m` shape
-/// when its seats run under one provider account and in the `p` shape,
-/// one per account, when they run under more; for each data class a seat
-/// carries, `any`, and `tools` too when the seat carries tools. Each seat
-/// also has its own queue. Read from configuration alone, never from which
-/// seats are up, so a model's shape changes only when its seats do; by
-/// lib/work's rule (`makes_queues`, `several_with`, `partition`), which the
-/// api publishes by.
+/// The models' shapes the seats of `rows` (`WORK_READ`, one a line) give
+/// them, into `shapes`: a model's first provider account among the seats
+/// that make queues, and whether another serves it too (lib/work
+/// `makes_queues`, `several_with`). Read from configuration alone, never
+/// from which seats are up, so a model's shape changes only when its seats
+/// do.
 @bounded_by(rows)
-fn partitions(root: String, rows: String) -> String {
-    let shapes = Shapes { };
+fn fill_shapes(shapes: Shapes, rows: String) {
     let lines = std::str::bytes_view(rows);
     let mut start = 0;
     while start < lines.n {
@@ -137,51 +141,108 @@ fn partitions(root: String, rows: String) -> String {
             }
         }
     }
-    let taken = TakenSubjects { };
-    let mut text = "";
-    start = 0;
+}
+
+/// The queues each seat of `rows` (`WORK_READ`, one a line) consumes under
+/// `root`, the models in the shapes `shapes` holds (`fill_shapes`), one a
+/// line: `<node>/<seat>`, the queue's subject, its shape (`m`, `p`, or `s`
+/// for the seat's own), its model, provider account (in the `p` shape),
+/// data class and need, tab-separated ("" for what the queue has not). A
+/// seat's own queue first, then, for each model it serves, each data class
+/// it carries: `any`, and `tools` too when the seat carries tools; in the
+/// order configuration gives them, the order a seat consumes them in with
+/// no pressure. A pair's follower consumes none. By lib/work's rule
+/// (`makes_queues`, `partition`), which the api publishes by.
+@bounded_by(rows)
+fn seat_queues(root: String, rows: String, shapes: Shapes) -> String {
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let lines = std::str::bytes_view(rows);
+    let mut start = 0;
     while start < lines.n {
         let nl = st::line_end(lines, start);
         let row = std::str::trim(std::str::slice(lines, start, nl));
         start = nl + 1;
         if len(row) > 0 && makes_queues(row) {
+            let node = st::pg_text(row, "node");
+            let ref = node + "/" + st::pg_text(row, "id");
             let account = st::pg_text(row, "account");
             let tools = work::carries_tools(
                 st::pg_text(row, "kind"),
                 std::json::find_field_raw(row, "tools"),
+            );
+            out.append_str(
+                ref + "\t" + work::seat_subject(root, node, st::pg_text(row, "id"))
+                    + "\ts\t\t\t\t\n",
             );
             let classes = std::json::find_field_raw(row, "data_classes");
             let mut m = std::json::array_first(std::json::find_field_raw(row, "models"));
             while !m.done {
                 let model = json_string(m.element);
                 let s = shapes.get(model) or Shape { };
+                let shape = if s.several { "p" } else { "m" };
+                let under = if s.several { account } else { "" };
                 let mut c = std::json::array_first(classes);
                 while !c.done {
                     let class = json_string(c.element);
-                    text = text
-                        + taken_once(
-                            taken,
-                            work::partition(root, model, s.several, account, class, "any"),
-                        );
+                    let head = ref + "\t";
+                    let tail = "\t" + shape + "\t" + model + "\t" + under + "\t" + class + "\t";
+                    out.append_str(
+                        head + work::partition(root, model, s.several, account, class, "any") + tail
+                            + "any\n",
+                    );
                     if tools {
-                        text = text
-                            + taken_once(
-                                taken,
-                                work::partition(root, model, s.several, account, class, "tools"),
-                            );
+                        out.append_str(
+                            head + work::partition(root, model, s.several, account, class, "tools")
+                                + tail
+                                + "tools\n",
+                        );
                     }
                     c = std::json::array_next(c);
                 }
                 m = std::json::array_next(m);
             }
-            text = text
-                + taken_once(
-                    taken,
-                    work::seat_subject(root, st::pg_text(row, "node"), st::pg_text(row, "id")),
-                );
         }
     }
-    return text;
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
+}
+
+/// The `k`th tab-separated field of `line` (from 0), "" past its end.
+fn tab_field(line: String, k: Int) -> String {
+    let v = std::str::bytes_view(line);
+    let mut at = 0;
+    let mut i = 0;
+    while i < k {
+        let tab = std::str::index_of(std::str::slice(v, at, v.n), "\t");
+        if tab < 0 { return ""; }
+        at = at + tab + 1;
+        i = i + 1;
+    }
+    let rest = std::str::slice(v, at, v.n);
+    let tab = std::str::index_of(rest, "\t");
+    return if tab < 0 { rest } else { std::str::slice(v, at, at + tab) };
+}
+
+/// The queues the seats of `rows` (`WORK_READ`, one a line) make under
+/// `root`, each once, one a line, in the order `seat_queues` first names
+/// them: the consumers the keeper keeps.
+@bounded_by(rows)
+fn partitions(root: String, rows: String) -> String {
+    let shapes = Shapes { };
+    fill_shapes(shapes, rows);
+    let queues = seat_queues(root, rows, shapes);
+    let taken = TakenSubjects { };
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let lines = std::str::bytes_view(queues);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let line = std::str::slice(lines, start, nl);
+        start = nl + 1;
+        if len(line) > 0 { out.append_str(taken_once(taken, tab_field(line, 1))); }
+    }
+    let b = out.finish() or b"";
+    return std::str::from_bytes(b);
 }
 
 /// `subject` and a line break the first time, "" after. `taken` holds a
@@ -205,11 +266,28 @@ fn json_string(raw: String) -> String {
 
 // ---- keeping them ---------------------------------------------------------
 
-/// The queues the working brain wants kept, one a line, for the keeper.
-type Wanted { subjects: String = ""; }
+/// What the working brain hands its keeper each tick: the queues to keep,
+/// one a line; each node's plan (plan.hl `Planned.plans`, "" when the
+/// board was not written this tick) and the board's version they are part
+/// of; and the brain's term, which grows each time it takes the lock, so a
+/// keeper starts its plans afresh under a new one.
+type Wanted {
+    subjects: String = "";
+    plans: String = "";
+    version: Int = 0;
+    term: Int = 0;
+}
 
 /// From the brain's tick to its keeper, in the process only.
 topic WorkWanted { payload: Wanted; subject: "voice.brain.work_wanted"; }
+
+/// The queues' readings, from the keeper to the brain's next tick (plan.hl
+/// `fill_readings`): `<subject>\t<depth>\t<ack pending>\t<standing
+/// pulls>\t<oldest ticket's age in ms, -1 for none>` a line.
+type Read { lines: String = ""; }
+
+/// From the keeper to the brain, in the process only.
+topic QueuesRead { payload: Read; subject: "voice.brain.queues_read"; }
 
 /// How one pass of `upkeep` went.
 type Upkeep {
@@ -342,12 +420,210 @@ fn upkeep(c: nats::NatsClient, root: String, subjects: String, owed: Bool) -> Up
     return out;
 }
 
+/// How reading the queues went (`read_queues`): the readings, or what
+/// failed.
+type QueuesState {
+    lines: String = "";
+    step: String = "";
+    kind: String = "";
+    code: Int = 0;
+    detail: String = "";
+}
+
+/// Each queue of `subjects` (one a line) under `root`, as its consumer and
+/// the stream say now (`Read`): its tickets waiting (`num_pending`, the
+/// backlog), pulled and not acked, and the pulls standing on it, from
+/// `CONSUMER.INFO`; and, when tickets wait, its oldest's age at `now_ms`
+/// (Unix ms), from the stream's first message on its subject. A queue with
+/// no consumer yet is left out; any failure other than a JetStream refusal
+/// ends the pass. Each call judged by its own result.
+@bounded_by(subjects)
+fn read_queues(c: nats::NatsClient, root: String, subjects: String, now_ms: Int) -> QueuesState {
+    let stream = work::stream_name(root);
+    let out = std::bytes::BytesBuilder { initial_cap: 4096 };
+    let none = nats::NatsError { };
+    let lines = std::str::bytes_view(subjects);
+    let mut start = 0;
+    while start < lines.n {
+        let nl = st::line_end(lines, start);
+        let subject = std::str::trim(std::str::slice(lines, start, nl));
+        start = nl + 1;
+        if len(subject) > 0 {
+            let mut e = none;
+            let info = nats::js_consumer_info(c, stream, work::consumer_name(subject)) or {
+                e = err;
+                nats::ConsumerInfo { }
+            };
+            if len(e.kind) > 0 && e.kind != "jetstream" {
+                return QueuesState {
+                    step: "reading a queue's consumer",
+                    kind: e.kind,
+                    code: e.code,
+                    detail: e.detail,
+                };
+            }
+            if len(e.kind) == 0 {
+                let mut oldest = -1;
+                if info.num_pending > 0 {
+                    let m = nats::js_stream_msg_next(c, stream, subject, 0) or {
+                        e = err;
+                        nats::StoredMsg { }
+                    };
+                    if len(e.kind) > 0 && e.kind != "jetstream" && e.kind != "no_messages" {
+                        return QueuesState {
+                            step: "reading a queue's oldest ticket",
+                            kind: e.kind,
+                            code: e.code,
+                            detail: e.detail,
+                        };
+                    }
+                    if len(e.kind) == 0 && m.time_ns > 0 {
+                        let age = now_ms - m.time_ns / 1000000;
+                        oldest = if age > 0 { age } else { 0 };
+                    }
+                }
+                out.append_str(
+                    subject + "\t" + to_string(info.num_pending) + "\t"
+                        + to_string(info.num_ack_pending) + "\t" + to_string(info.num_waiting)
+                        + "\t" + to_string(oldest) + "\n",
+                );
+            }
+        }
+    }
+    let b = out.finish() or b"";
+    return QueuesState { lines: std::str::from_bytes(b) };
+}
+
+/// A node's plan as its keeper last published it: its seats' part (the
+/// JSON list), the board's version it went with, when (monotonic ms), and
+/// under which of the brain's terms.
+type Sent {
+    node: String = "";
+    seats: String = "";
+    version: Int = 0;
+    at_ms: Int = 0;
+    term: Int = 0;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus SentPlans { capacity { pool rows of Sent indexed_by node; } }
+
+/// A node's plan as it goes on `<root>.node.<node>.consume`
+/// (protocol.yaml `ConsumePlan`): `seats`, a JSON list of `SeatPlan`s, at
+/// `version`.
+fn plan_message(version: Int, seats: String) -> String {
+    return "{\"version\": " + to_string(version) + ", \"seats\": " + seats + "}";
+}
+
+/// A seat plan's hold in `seats` (a JSON list of `SeatPlan`s) for seat
+/// `id`: its reason, "" when it consumes, `\n` when `seats` does not name
+/// it.
+fn hold_in(seats: String, id: String) -> String {
+    let mut it = std::json::array_first(seats);
+    while !it.done {
+        if st::pg_text(it.element, "seat") == id { return st::pg_text(it.element, "hold"); }
+        it = std::json::array_next(it);
+    }
+    return "\n";
+}
+
+/// Each node's plan (`plans`, `<node>\t<seats>` a line, plan.hl), published
+/// over `c` on `<root>.node.<node>.consume` when it is not the one last
+/// published under the brain's `term` (`sent`), with the board's `version`
+/// it came with; and again, as it was, every `PLAN_REPEAT_MS` (`now_ms`
+/// monotonic), since core NATS delivers at most once and a node ignores a
+/// plan no newer than its own. A seat held or let go is said once. What
+/// NATS refused, `kind` "" for nothing.
+@unbounded
+fn publish_plans(
+    c: nats::NatsClient,
+    root: String,
+    plans: String,
+    version: Int,
+    term: Int,
+    sent: SentPlans,
+    now_ms: Int
+) -> nats::NatsError {
+    let mut e = nats::NatsError { };
+    if len(plans) == 0 { return e; }
+    let mut sent_any = false;
+    let v = std::str::bytes_view(plans);
+    let mut start = 0;
+    while start < v.n && len(e.kind) == 0 {
+        let nl = st::line_end(v, start);
+        let line = std::str::slice(v, start, nl);
+        start = nl + 1;
+        let node = tab_field(line, 0);
+        let seats = tab_field(line, 1);
+        if len(node) > 0 {
+            let had = sent.get(node) or Sent { };
+            let fresh = !had.present || had.term != term;
+            let mut at_version = had.version;
+            let mut due = false;
+            if fresh || had.seats != seats {
+                at_version = version;
+                due = true;
+                if !fresh { say_holds(node, had.seats, seats); }
+            } else if now_ms - had.at_ms >= work::PLAN_REPEAT_MS {
+                due = true;
+            }
+            if due {
+                c.pub_msg(
+                    work::consume_subject(root, node),
+                    "",
+                    std::bytes::from_string(plan_message(at_version, seats)),
+                ) or { e = err; };
+                if len(e.kind) == 0 {
+                    sent_any = true;
+                    sent.set(
+                        Sent {
+                            node: node,
+                            seats: seats,
+                            version: at_version,
+                            at_ms: now_ms,
+                            term: term,
+                            present: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if sent_any && len(e.kind) == 0 { c.flush() or { e = err; }; }
+    return e;
+}
+
+/// Say each seat of `node` that its new plan (`now`) holds or lets go,
+/// against the one published before (`was`).
+@unbounded
+fn say_holds(node: String, was: String, now: String) {
+    let mut it = std::json::array_first(now);
+    while !it.done {
+        let id = st::pg_text(it.element, "seat");
+        let hold = st::pg_text(it.element, "hold");
+        let before = hold_in(was, id);
+        if hold != before {
+            let seat = std::log::kv("seat", node + "/" + id);
+            if len(hold) > 0 {
+                log_info(
+                    "a seat is held: it pulls nothing",
+                    fields2(seat, std::log::kv("why", hold)),
+                );
+            } else if before != "\n" {
+                log_info("a seat is let go: it pulls again", seat);
+            }
+        }
+        it = std::json::array_next(it);
+    }
+}
+
 /// Keeps the work stream and its consumers, on a thread of its own: each
-/// `WorkWanted` from the working brain's tick is one pass (`upkeep`), the
-/// newest replacing one not begun yet. It dials only once it is handed
-/// work, and drops its connection after any failure other than a
-/// JetStream refusal, dialling again on the next pass. Trouble is said
-/// once while it lasts, and its end once.
+/// `WorkWanted` from the working brain's tick is one pass (`upkeep`, the
+/// plans, `read_queues`), the newest replacing one not begun yet. It dials
+/// only once it is handed work, and drops its connection after any failure
+/// other than a JetStream refusal, dialling again on the next pass. Trouble
+/// is said once while it lasts, and its end once.
 locus WorkKeeper {
     params {
         // voice's own NATS (grafted, the habitat's broker: its account, the
@@ -362,16 +638,25 @@ locus WorkKeeper {
         client: nats::NatsClient = nats::NatsClient { };
         credential: std::secret::Credential = std::secret::Credential { };
         connected: Bool = false;
-        // the newest queues handed over, and whether a pass is due for them
+        // the newest queues and plans handed over, and whether a pass is
+        // due for them
         wanted: String = "";
+        plans: String = "";
+        version: Int = 0;
+        term: Int = 0;
         due: Bool = false;
+        // each node's plan as last published
+        sent: SentPlans = SentPlans { };
         // a new incarnation not told yet
         owed: Bool = false;
         // the trouble last said ("" none), and the consumers last said
         trouble: String = "";
         consumers: Int = -1;
     }
-    bus { subscribe WorkWanted as on_wanted; }
+    bus {
+        subscribe WorkWanted as on_wanted;
+        publish QueuesRead;
+    }
 
     birth() {
         self.client.url = self.url;
@@ -385,6 +670,9 @@ locus WorkKeeper {
     @bounded_by(w)
     fn on_wanted(w: Wanted) {
         self.wanted = w.subjects;
+        self.plans = w.plans;
+        self.version = w.version;
+        self.term = w.term;
         self.due = true;
     }
 
@@ -444,7 +732,6 @@ locus WorkKeeper {
             );
             return;
         }
-        self.trouble_is("", "");
         if u.consumers != self.consumers {
             log_info(
                 "the work queues' consumers are in place",
@@ -452,6 +739,41 @@ locus WorkKeeper {
             );
             self.consumers = u.consumers;
         }
+        let e = publish_plans(
+            self.client,
+            self.root,
+            self.plans,
+            self.version,
+            self.term,
+            self.sent,
+            std::time::monotonic_ns() / 1000000,
+        );
+        if len(e.kind) > 0 {
+            self.client.close();
+            self.connected = false;
+            self.trouble_is(
+                "plans " + e.kind,
+                "publishing a node's plan: " + e.kind + ": " + e.detail,
+            );
+            return;
+        }
+        let r = read_queues(
+            self.client,
+            self.root,
+            self.wanted,
+            std::time::nanos(std::time::current()) / 1000000,
+        );
+        if len(r.step) > 0 {
+            self.client.close();
+            self.connected = false;
+            self.trouble_is(
+                r.step + " " + r.kind + " " + to_string(r.code),
+                r.step + ": " + r.kind + ": " + r.detail,
+            );
+            return;
+        }
+        QueuesRead <- Read { lines: r.lines };
+        self.trouble_is("", "");
     }
 
     /// Say trouble once while it is the same (`key`), and its end once.

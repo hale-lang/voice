@@ -1,0 +1,348 @@
+// The controller's plan (plan.hl): why a seat is held, how a seat's queues
+// are ordered by pressure without flapping, and the board and each node's
+// plan as the tick writes and hands them over.
+import ".." as brain;
+import "../../lib/work" as work;
+
+/// One row as `SEAT_READ` gives it; `extra` overrides by going first
+/// (JSON's first key wins in `find_*`).
+fn row(extra: String, node: String, id: String, serves: String) -> String {
+    return "{" + extra + "\"seat\": \"" + node + "/" + id + "\", \"node\": \"" + node
+        + "\", \"id\": \"" + id + "\", \"account\": \"local\", \"serves\": " + serves
+        + ", \"data_classes\": [\"internal\"], \"concurrency\": 2, \"kind\": \"static\", \"placement\": null, \"server\": null, \"cache_tokens\": null, \"context_length\": null, \"enabled\": true, \"assignment_version\": 3"
+        + ", \"local\": {\"paused\": false, \"paused_seats\": []}, \"applied_version\": 3, \"draining\": false, \"beat_age\": 2"
+        + ", \"seat_status\": \"up\", \"seat_in_flight\": 1, \"account_status\": \"active\", \"cluster_rank\": null, \"follower_up\": null, \"used\": null, \"exhausted_until\": null, \"exhausted\": false}";
+}
+
+/// One row as `WORK_READ` gives it.
+fn work_row(node: String, id: String, account: String, models: String) -> String {
+    return "{\"node\": \"" + node + "\", \"id\": \"" + id + "\", \"account\": \"" + account
+        + "\", \"models\": " + models
+        + ", \"data_classes\": [\"internal\"], \"kind\": \"static\", \"tools\": {}, \"cluster_rank\": null}";
+}
+
+const ONE: String = "[{\"model\": \"echo-1\", \"as\": null}]";
+const TWO: String = "[{\"model\": \"echo-1\", \"as\": null}, {\"model\": \"late\", \"as\": null}]";
+
+fn holds() {
+    std::test::assert_eq_str(brain::hold_of(row("", "n", "a", ONE)), "", "an up seat is not held");
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"enabled\": false, ", "n", "a", ONE)),
+        "the seat is disabled",
+        "a disabled seat",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"beat_age\": 20, ", "n", "a", ONE)),
+        "its node is not up",
+        "a silent node's",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"draining\": true, ", "n", "a", ONE)),
+        "its node is draining",
+        "a draining node's",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"seat_status\": \"starting\", ", "n", "a", ONE)),
+        "the seat is starting",
+        "a seat not up",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(
+            row("\"local\": {\"paused\": false, \"paused_seats\": [\"a\"]}, ", "n", "a", ONE),
+        ),
+        "a local control on its node holds it",
+        "one a local control holds",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(
+            row(
+                "\"exhausted\": true, \"exhausted_until\": \"2099-01-01T00:00:00Z\", ",
+                "n",
+                "a",
+                ONE,
+            ),
+        ),
+        "its account local is exhausted until 2099-01-01T00:00:00Z",
+        "one whose account is exhausted, until its reset",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"cluster_rank\": 1, ", "n", "a", ONE)),
+        "a pair's follower: its leader pulls for it",
+        "a pair's follower",
+    );
+    std::test::assert_eq_str(
+        brain::hold_of(row("\"cluster_rank\": 0, \"follower_up\": false, ", "n", "a", ONE)),
+        "its pair's follower is not up",
+        "a leader whose follower is down",
+    );
+    std::test::assert(
+        !brain::judge(row("\"draining\": true, ", "n", "a", ONE), 0.0).routes
+            && brain::judge(row("", "n", "a", ONE), 0.0).routes,
+        "a seat routes exactly when it is not held",
+    );
+}
+
+/// The `n`th line of `text` (from 0), "" past its end.
+fn line_of(text: String, n: Int) -> String {
+    let v = std::str::bytes_view(text);
+    let mut start = 0;
+    let mut k = 0;
+    while start < v.n {
+        let rest = std::str::slice(v, start, v.n);
+        let nl = std::str::index_of(rest, "\n");
+        let end = if nl < 0 { v.n } else { start + nl };
+        if k == n { return std::str::slice(v, start, end); }
+        k = k + 1;
+        start = end + 1;
+    }
+    return "";
+}
+
+fn subjects(a: String, b: String, c: String) -> work::Subjects {
+    let mut out = work::Subjects { };
+    for s in [a, b, c] {
+        if len(s) > 0 { push(out.items, s) or discard; }
+    }
+    return out;
+}
+
+fn pressed(a: Float, b: Float, c: Float) -> brain::Pressures {
+    let p = brain::Pressures { };
+    p.set(brain::Pressure { subject: "a", value: a, present: true });
+    p.set(brain::Pressure { subject: "b", value: b, present: true });
+    p.set(brain::Pressure { subject: "c", value: c, present: true });
+    return p;
+}
+
+fn first(o: brain::Ordered) -> String {
+    return at(o.order.items, 0) or "";
+}
+
+fn hysteresis() {
+    let base = subjects("a", "b", "c");
+    // no pressure: configuration's order
+    let calm = brain::ordered(base, work::Subjects { }, 0, pressed(0.0, 0.0, 0.0));
+    std::test::assert(
+        brain::spaced(calm.order.items) == "a b c" && calm.streak == 0 && !calm.changed,
+        "with no pressure, configuration's order",
+    );
+    // b's backlog: twice a's pressure and more, three ticks in a row
+    let p = pressed(0.0, 4.0, 0.0);
+    let t1 = brain::ordered(base, calm.order, 0, p);
+    let t2 = brain::ordered(base, t1.order, t1.streak, p);
+    std::test::assert(
+        first(t1) == "a" && t1.streak == 1 && first(t2) == "a" && t2.streak == 2,
+        "a backlog moves nothing for two ticks",
+    );
+    let t3 = brain::ordered(base, t2.order, t2.streak, p);
+    std::test::assert(
+        brain::spaced(t3.order.items) == "b a c" && t3.changed && t3.streak == 0,
+        "and on the third, its queue goes first",
+    );
+    // a small change does not flap it: a's pressure now above b's, but not
+    // twice it
+    let near = pressed(6.0, 4.0, 0.0);
+    let mut o = t3;
+    let mut k = 0;
+    while k < 5 {
+        o = brain::ordered(base, o.order, o.streak, near);
+        std::test::assert(
+            first(o) == "b" && o.streak == 0 && !o.changed,
+            "a's pressure under twice b's moves nothing",
+        );
+        k = k + 1;
+    }
+    // a run broken before three ticks starts again
+    let far = pressed(9.0, 4.0, 0.0);
+    let r1 = brain::ordered(base, o.order, o.streak, far);
+    let r2 = brain::ordered(base, r1.order, r1.streak, far);
+    let broken = brain::ordered(base, r2.order, r2.streak, near);
+    std::test::assert(
+        r2.streak == 2 && first(broken) == "b" && broken.streak == 0,
+        "two ticks of a pressing harder, then less: nothing moves, the count starts again",
+    );
+    // drained: back to configuration's order after three ticks
+    let drained = pressed(0.0, 0.0, 0.0);
+    let d1 = brain::ordered(base, broken.order, broken.streak, drained);
+    let d2 = brain::ordered(base, d1.order, d1.streak, drained);
+    let d3 = brain::ordered(base, d2.order, d2.streak, drained);
+    std::test::assert(
+        first(d2) == "b" && brain::spaced(d3.order.items) == "a b c" && d3.changed,
+        "once every queue is empty, configuration's order again, on the third tick",
+    );
+    // a queue gone from configuration leaves the order; a new one joins at
+    // its end
+    let changed = brain::ordered(subjects("c", "b", ""), d3.order, 0, drained);
+    std::test::assert_eq_str(
+        brain::spaced(changed.order.items),
+        "b c",
+        "the order loses what configuration dropped",
+    );
+    let grown = brain::ordered(subjects("a", "b", "c"), subjects("b", "a", ""), 0, pressed(
+        0.0,
+        5.0,
+        0.0,
+    ));
+    std::test::assert_eq_str(
+        brain::spaced(grown.order.items),
+        "b a c",
+        "and gains what it added, at its end",
+    );
+    std::test::assert(
+        brain::pressure_of(
+            brain::Reading { subject: "x", depth: 3, oldest_ms: 6000, present: true },
+            2000,
+        ) == 3.0
+            && brain::pressure_of(
+                brain::Reading { subject: "x", depth: 3, oldest_ms: 6000, present: true },
+                0,
+            ) == 6.0
+            && brain::pressure_of(
+                brain::Reading { subject: "x", depth: 0, oldest_ms: -1, present: true },
+                2000,
+            ) == 0.0,
+        "pressure is the oldest's age over the service time (1 s with none); 0 when empty",
+    );
+}
+
+fn planned() {
+    let seats = row("", "n", "multi", TWO) + "\n" + row("", "n", "one", ONE) + "\n"
+        + row("\"draining\": true, ", "z", "held", ONE) + "\n";
+    let work = work_row("n", "multi", "local", "[\"echo-1\", \"late\"]") + "\n"
+        + work_row("n", "one", "local", "[\"echo-1\"]") + "\n"
+        + work_row("z", "held", "other", "[\"echo-1\"]") + "\n";
+    let echo_local = "voice.work.p.echo-1.local.internal.any";
+    let echo_other = "voice.work.p.echo-1.other.internal.any";
+    let late = "voice.work.m.late.internal.any";
+    // late's queue backs up: its oldest 9 s against its service time of 1 s
+    let readings = echo_local + "\t0\t0\t1\t-1\n" + late + "\t5\t1\t0\t9000\n";
+    let services = "{\"model\": \"late\", \"n\": 3, \"service_ms\": 1000}\n{\"model\": \"echo-1\", \"n\": 9, \"service_ms\": 400}\n";
+    // two ticks already pressed it
+    let orders = "n/multi\t2\t" + echo_local + " " + late + "\n";
+    let p = brain::plan("voice", seats, work, services, readings, orders);
+    std::test::assert(std::json::valid_object(p.board), "the board is one JSON object: " + p.board);
+    let models = std::json::find_field_raw(p.board, "models");
+    std::test::assert(
+        std::str::contains(models, "{\"model\": \"echo-1\", \"shape\": \"p\"}")
+            && std::str::contains(models, "{\"model\": \"late\", \"shape\": \"m\"}"),
+        "each model in its shape: echo-1 under two accounts, late under one: " + models,
+    );
+    // the multi-model seat: its own queue, then late's first, said once
+    let plans = p.plans;
+    std::test::assert(
+        std::str::starts_with(plans, "n\t[") && std::str::contains(plans, "\nz\t["),
+        "a plan per node: " + plans,
+    );
+    let n_plan = brain::tab_field(line_of(plans, 0), 1);
+    let parsed = work::consume_plan_of("{\"version\": 7, \"seats\": " + n_plan + "}") or {
+        std::test::assert(
+            false,
+            "a node's plan is protocol.yaml's: " + err.message + ": " + n_plan,
+        );
+        work::ConsumePlan { }
+    };
+    let multi = at(parsed.seats, 0) or work::SeatPlan { };
+    std::test::assert(
+        multi.seat == "multi" && len(multi.hold) == 0
+            && brain::spaced(multi.consume)
+            == "voice.work.s.n.multi " + late + " " + echo_local
+            + " voice.work.m.echo-1.internal.any voice.work.p.late.local.internal.any",
+        "the seat that serves two models takes late's backed-up queue first, after its own; its partitions in the other shape last: "
+            + brain::spaced(multi.consume),
+    );
+    let one = at(parsed.seats, 1) or work::SeatPlan { };
+    std::test::assert(
+        one.seat == "one"
+            && brain::spaced(one.consume)
+            == "voice.work.s.n.one " + echo_local + " voice.work.m.echo-1.internal.any",
+        "a seat of one model keeps configuration's order: " + brain::spaced(one.consume),
+    );
+    std::test::assert(
+        std::str::contains(p.said, "n/multi\t" + late + "\t") && std::str::contains(
+            p.said,
+            "9000 ms",
+        ),
+        "the new order is said, with why: " + p.said,
+    );
+    std::test::assert_eq_str(
+        p.orders,
+        "n/multi\t0\t" + late + " " + echo_local + "\n",
+        "the order kept for the next tick: only a seat of several models has one",
+    );
+    // the held seat: why, and nothing to consume
+    let z_plan = brain::tab_field(line_of(plans, 1), 1);
+    std::test::assert(
+        std::str::contains(z_plan, "\"hold\": \"its node is draining\"")
+            && std::str::contains(z_plan, "\"consume\": []"),
+        "a held seat consumes nothing: " + z_plan,
+    );
+    // the board's queues: readings, service time, the seats consuming each
+    let mut q_late = "";
+    let mut q_other = "";
+    let mut q_own = "";
+    let mut it = std::json::array_first(std::json::find_field_raw(p.board, "queues"));
+    while !it.done {
+        let subject = std::json::find_string_field(it.element, "subject");
+        if subject == late { q_late = it.element; }
+        if subject == echo_other { q_other = it.element; }
+        if subject == "voice.work.s.n.multi" { q_own = it.element; }
+        it = std::json::array_next(it);
+    }
+    std::test::assert(
+        std::json::find_int_field(q_late, "depth") == 5
+            && std::json::find_int_field(q_late, "oldest_age_ms") == 9000
+            && std::json::find_int_field(q_late, "ack_pending") == 1
+            && std::json::find_int_field(q_late, "service_ms") == 1000
+            && std::json::find_string_field(q_late, "shape") == "m"
+            && std::json::find_string_field(q_late, "model") == "late"
+            && std::str::contains(q_late, "\"provider_account\": null")
+            && std::str::contains(q_late, "\"seats\": [\"n/multi\"]"),
+        "late's queue: its backlog, its oldest, its service time, its one consumer: " + q_late,
+    );
+    std::test::assert(
+        std::str::contains(q_other, "\"provider_account\": \"other\"")
+            && std::str::contains(q_other, "\"oldest_age_ms\": null")
+            && std::str::contains(q_other, "\"seats\": []")
+            && std::json::find_int_field(q_other, "service_ms") == 400,
+        "a queue whose one seat is held: unread, consumed by none: " + q_other,
+    );
+    std::test::assert(
+        std::json::find_string_field(q_own, "shape") == "s"
+            && std::str::contains(q_own, "\"model\": null")
+            && std::str::contains(q_own, "\"service_ms\": null"),
+        "a seat's own queue names no model: " + q_own,
+    );
+    // the board's seats
+    let mut s_held = "";
+    let mut s_multi = "";
+    it = std::json::array_first(std::json::find_field_raw(p.board, "seats"));
+    while !it.done {
+        let seat = std::json::find_string_field(it.element, "seat");
+        if seat == "z/held" { s_held = it.element; }
+        if seat == "n/multi" { s_multi = it.element; }
+        it = std::json::array_next(it);
+    }
+    std::test::assert(
+        std::json::find_string_field(s_held, "hold") == "its node is draining"
+            && std::json::find_int_field(s_multi, "concurrency") == 2
+            && std::json::find_int_field(s_multi, "in_flight") == 1
+            && std::json::find_int_field(s_multi, "conversations_held") == 2
+            && std::str::contains(s_multi, "\"hold\": null"),
+        "each seat: held or not, its concurrency, in flight and conversations held: " + s_multi,
+    );
+
+    // nothing read yet (a brain just started): the same seats, configuration's
+    // order, the board's readings empty
+    let bare = brain::plan("voice", seats, work, "", "", "");
+    std::test::assert(
+        std::str::contains(bare.plans, "\"consume\": [\"voice.work.s.n.multi\", \"" + echo_local)
+            && len(bare.said) == 0,
+        "with nothing read, configuration's order: " + bare.plans,
+    );
+}
+
+fn main() {
+    holds();
+    hysteresis();
+    planned();
+}

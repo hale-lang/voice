@@ -29,6 +29,8 @@ type SeatLine {
     serves: String = "[]";
     data_classes: String = "[]";
     routes: Bool = false;
+    // why it routes not, "" when it does: the hold the board writes for it
+    hold: String = "";
     exhausted: Bool = false;
     exhausted_until: String = "";
     rank: Float = 0.0;
@@ -37,8 +39,10 @@ type SeatLine {
 
 /// What a seat needs to be judged: the seat, its node, its account, the
 /// node's report and the seat's state, its account's fullest window and
-/// the earliest reset of a full one, and its heartbeat's age in seconds.
-const SEAT_READ: String = "SELECT row_to_json(t) FROM (SELECT s.node || '/' || s.id AS seat, s.node, s.id, s.account, s.serves, s.data_classes, s.concurrency, s.config->>'placement' AS placement, s.config->'runtime'->>'server' AS server, s.config->'cache_tokens' AS cache_tokens, s.config->'context_length' AS context_length, s.enabled, n.assignment_version, ns.local, ns.applied_version, ns.draining, extract(epoch FROM now() - ns.last_heartbeat_at)::int AS beat_age, st.status AS seat_status, st.in_flight AS seat_in_flight, a.status AS account_status, (s.config->'cluster'->>'rank')::int AS cluster_rank, (SELECT fst.status = 'up' AND NOT coalesce(fns.draining, false) AND extract(epoch FROM now() - fns.last_heartbeat_at)::int <= 15 AND coalesce(fns.applied_version, -1) >= fnode.assignment_version FROM seat_state fst JOIN node fnode ON fnode.id = fst.node LEFT JOIN node_state fns ON fns.node = fst.node WHERE fst.node = s.config->'cluster'->>'peer' AND fst.seat = s.id AND fnode.status <> 'revoked') AS follower_up, (SELECT max(used_percent) FROM quota_window q WHERE q.account = s.account) AS used, (SELECT min(resets_at) FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted_until, EXISTS (SELECT 1 FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted FROM seat s JOIN node n ON n.id = s.node JOIN account a ON a.id = s.account LEFT JOIN node_state ns ON ns.node = s.node LEFT JOIN seat_state st ON st.node = s.node AND st.seat = s.id WHERE n.status <> 'revoked' ORDER BY s.node, s.id) t";
+/// the earliest reset of a full one, and its heartbeat's age in seconds;
+/// and its engine's kind (the node's declared capabilities, null for a
+/// node that never registered), for the conversations it holds.
+const SEAT_READ: String = "SELECT row_to_json(t) FROM (SELECT s.node || '/' || s.id AS seat, s.node, s.id, s.account, s.serves, s.data_classes, s.concurrency, (SELECT e->>'kind' FROM jsonb_array_elements(ns.capabilities->'engines') e WHERE e->>'id' = s.engine LIMIT 1) AS kind, s.config->>'placement' AS placement, s.config->'runtime'->>'server' AS server, s.config->'cache_tokens' AS cache_tokens, s.config->'context_length' AS context_length, s.enabled, n.assignment_version, ns.local, ns.applied_version, ns.draining, extract(epoch FROM now() - ns.last_heartbeat_at)::int AS beat_age, st.status AS seat_status, st.in_flight AS seat_in_flight, a.status AS account_status, (s.config->'cluster'->>'rank')::int AS cluster_rank, (SELECT fst.status = 'up' AND NOT coalesce(fns.draining, false) AND extract(epoch FROM now() - fns.last_heartbeat_at)::int <= 15 AND coalesce(fns.applied_version, -1) >= fnode.assignment_version FROM seat_state fst JOIN node fnode ON fnode.id = fst.node LEFT JOIN node_state fns ON fns.node = fst.node WHERE fst.node = s.config->'cluster'->>'peer' AND fst.seat = s.id AND fnode.status <> 'revoked') AS follower_up, (SELECT max(used_percent) FROM quota_window q WHERE q.account = s.account) AS used, (SELECT min(resets_at) FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted_until, EXISTS (SELECT 1 FROM quota_window q WHERE q.account = s.account AND q.used_percent >= 100) AS exhausted FROM seat s JOIN node n ON n.id = s.node JOIN account a ON a.id = s.account LEFT JOIN node_state ns ON ns.node = s.node LEFT JOIN seat_state st ON st.node = s.node AND st.seat = s.id WHERE n.status <> 'revoked' ORDER BY s.node, s.id) t";
 
 const MODEL_READ: String = "SELECT id FROM catalog_model WHERE removed_at IS NULL ORDER BY created_at, id";
 
@@ -59,22 +63,11 @@ fn judge(row: String, jitter: Float) -> SeatLine {
         serves: std::str::trim(std::json::find_field_raw(row, "serves")),
         data_classes: std::str::trim(std::json::find_field_raw(row, "data_classes"))
     };
-    let id = st::pg_text(row, "id");
-    let local = std::json::find_field_raw(row, "local");
-    let held = std::json::find_bool_field(local, "paused")
-        || names_seat(std::json::find_field_raw(local, "paused_seats"), id);
-    let beat = int_or(row, "beat_age", 1000000);
-    let applied = int_or(row, "applied_version", -1);
-    // the beat is written with the store's clock and judged with it
-    let node_up = beat <= NODE_UP_SECONDS && !std::json::find_bool_field(row, "draining");
-    let seat_up = std::json::find_bool_field(row, "enabled")
-        && st::pg_text(row, "seat_status") == "up"
-        && applied >= std::json::find_int_field(row, "assignment_version")
-        && !held;
     let active = st::pg_text(row, "account_status") == "active";
     out.exhausted = active && std::json::find_bool_field(row, "exhausted");
     out.exhausted_until = st::pg_text(row, "exhausted_until");
-    out.routes = node_up && seat_up && active && !out.exhausted && part_routes(row);
+    out.hold = hold_of(row);
+    out.routes = len(out.hold) == 0;
 
     let concurrency = seat_concurrency(row);
     let in_flight = int_or(row, "seat_in_flight", 0);
@@ -90,6 +83,55 @@ fn judge(row: String, jitter: Float) -> SeatLine {
         + (Float(in_flight) / Float(if concurrency > 0 { concurrency } else { 1 })) * 0.01
         + jitter * 0.001;
     return out;
+}
+
+/// Why the seat of `SEAT_READ`'s row serves nothing now, "" when it may
+/// (the route table's seats, and the board's seats that are not held): it
+/// is enabled, reported `up` for its node's current assignment, held by no
+/// local control, on a node that is up (a heartbeat younger than three
+/// intervals) and not draining, for an account that is active and not
+/// exhausted, and, a placement's part across two nodes, its leader's while
+/// its follower's is up. The first that fails, in that order.
+fn hold_of(row: String) -> String {
+    let id = st::pg_text(row, "id");
+    if !std::json::find_bool_field(row, "enabled") { return "the seat is disabled"; }
+    // the beat is written with the store's clock and judged with it
+    if int_or(row, "beat_age", 1000000) > NODE_UP_SECONDS { return "its node is not up"; }
+    if std::json::find_bool_field(row, "draining") { return "its node is draining"; }
+    if int_or(row, "applied_version", -1) < std::json::find_int_field(row, "assignment_version") {
+        return "its node has not applied its assignment";
+    }
+    let status = st::pg_text(row, "seat_status");
+    if len(status) == 0 { return "the seat has no state from its node"; }
+    if status != "up" { return "the seat is " + status; }
+    let local = std::json::find_field_raw(row, "local");
+    if std::json::find_bool_field(local, "paused")
+        || names_seat(std::json::find_field_raw(local, "paused_seats"), id)
+    {
+        return "a local control on its node holds it";
+    }
+    let account = st::pg_text(row, "account");
+    let account_status = st::pg_text(row, "account_status");
+    if account_status != "active" {
+        return "its account " + account + " is " + (if len(account_status) > 0 {
+            account_status
+        } else {
+            "missing"
+        });
+    }
+    if std::json::find_bool_field(row, "exhausted") {
+        let until = st::pg_text(row, "exhausted_until");
+        return "its account " + account + " is exhausted"
+            + (if len(until) > 0 { " until " + until } else { "" });
+    }
+    if !part_routes(row) {
+        return if std::json::find_int_field(row, "cluster_rank") != 0 {
+            "a pair's follower: its leader pulls for it"
+        } else {
+            "its pair's follower is not up"
+        };
+    }
+    return "";
 }
 
 /// The requests a seat of `SEAT_READ`'s row serves at once: a placement's,

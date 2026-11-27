@@ -710,6 +710,13 @@ if [ -n "${DATABASE_URL:-}" ]; then
     # the board: laptop/static consuming its own queue, then echo-1's
     psql -X -q -t -A "$DATABASE_URL" -c "SELECT s->>'hold', s->'consume'->>0 FROM board, jsonb_array_elements(body->'seats') s WHERE s->>'seat' = 'laptop/static'" | grep -qx '|voice.work.s.laptop.static' \
       || { echo "the board does not have laptop/static consuming its own queue first"; psql -X "$DATABASE_URL" -c 'SELECT body FROM board'; exit 1; }
+    # the admin plane reads it as the contract says (getQueues), and the node
+    # says how the seat pulls on its heartbeat, kept with the seat
+    (cd spec/validate && node queues.mjs ../../build/openapi.bundled.json "$api" laptop/static "$work/admin.token")
+    for i in $(seq 1 50); do curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static" | python3 -c 'import json,sys; p = json.load(sys.stdin).get("pull") or {}; sys.exit(0 if p.get("state") == "waiting" and isinstance(p.get("plan_version"), int) else 1)' && break; sleep 0.2; done
+    curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static" | python3 -c 'import json,sys; p = json.load(sys.stdin).get("pull") or {}; sys.exit(0 if p.get("state") == "waiting" and isinstance(p.get("plan_version"), int) else 1)' \
+      || { echo "the seat does not say how it pulls: $(curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static")"; exit 1; }
+    echo "the admin plane reads the board, and the seat's pulls as its node says them"
     # its account exhausted, which only the brain knows: the brain holds the
     # seat, and it stops pulling; given headroom again, it pulls again
     psql -X -q "$DATABASE_URL" -c "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'e2e', 100, now() + interval '1 hour', now())"

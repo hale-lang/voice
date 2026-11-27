@@ -29,8 +29,9 @@ info:
     over the work subjects, `WorkStream`, consumed by one durable pull
     consumer per queue, `WorkConsumer`, shared by every seat that consumes
     it. The brain alone creates them, idempotently each tick for every
-    queue some seat is eligible for, and deletes a consumer no seat has
-    been eligible for in an hour; nodes never create one. The brain also
+    queue some seat is eligible for, and deletes one no seat has consumed
+    for the longest wait (10 minutes) once it is empty, and only while it
+    still holds its lock; nodes never create one. The brain also
     writes the board to Postgres each tick (`Board`; `store.md`, "The
     board"), from which the api chooses a partition and the brain plans
     each node's seats (`protocol.yaml`, `ConsumePlan`). The route table
@@ -339,7 +340,17 @@ components:
     BoardModel:
       type: object
       x-voice-protocol: 3
-      required: [model, shape]
+      description: |
+        A model's shape, and a change of it in progress (the design's "A
+        model changing shape"). The brain alone changes a model's shape:
+        when configuration's (one provider account, or several) differs
+        from the board's, it prepares the change (`next`): it makes the new
+        shape's consumers and sends plans in which the seats consume the new
+        shape's queues beside the old, and only once its keeper has read
+        every new queue, in a pass after the board that prepared it, does
+        it flip `shape`, keeping the old one as `previous`, whose queues are
+        consumed until the longest wait has passed and they are empty.
+      required: [model, shape, provider_account, next, previous]
       properties:
         model:
           type: string
@@ -349,8 +360,43 @@ components:
           enum: [m, p]
           description: |
             `m` when the enabled seats that serve it in configuration run
-            under one provider account, `p` when under more than one. The
-            api publishes in the shape the board says.
+            under one provider account, `p` when under more than one, once
+            a change to it is flipped. The api publishes in the shape the
+            board says, however old the board, while the board holds the
+            model, and by configuration's rule for one it does not hold.
+        provider_account:
+          type: [string, 'null']
+          description: |
+            In the `m` shape, its one provider account (today's `account`):
+            only that account's seats consume its queues, and the api
+            publishes there only a request that may spend it; null in the
+            `p` shape.
+        next:
+          description: The change prepared, not flipped yet; null for none.
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [shape, provider_account, after]
+              properties:
+                shape: { type: string, enum: [m, p] }
+                provider_account: { type: [string, 'null'] }
+                after:
+                  type: integer
+                  description: |
+                    The board's version before the one that prepared it:
+                    the keeper's readings must come from a later pass.
+        previous:
+          description: The shape it left, its queues still consumed until they drain; null for none.
+          oneOf:
+            - type: 'null'
+            - type: object
+              required: [shape, provider_account, since]
+              properties:
+                shape: { type: string, enum: [m, p] }
+                provider_account: { type: [string, 'null'] }
+                since:
+                  type: integer
+                  description: When it flipped, in milliseconds of Postgres's clock.
 
     QueueReading:
       type: object

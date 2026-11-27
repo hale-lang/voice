@@ -797,11 +797,20 @@ Each second the one that works:
   and made again where it cannot (err_code 10052), and, whenever the keeper
   created the stream, its incarnation (its creation time in ms) told on
   `voice.queues.reset`. Then one durable pull consumer per queue
-  (`WorkConsumer`), each a JetStream request, every tick. A consumer for a
-  queue no seat makes any longer stays; deleting it comes with the
-  consumer lifecycle. NATS or JetStream not answering is said once and
-  tried again next tick; the table and the board are written meanwhile. A
-  standby keeps nothing;
+  (`WorkConsumer`), each a JetStream request, every tick. A consumer of
+  voice's (`w_`) that no queue the seats make is any longer is deleted
+  once it is empty (nothing waiting, nothing pulled and not acked) and has
+  been no queue's for the longest wait (10 minutes; the keeper lists the
+  stream's consumers each pass), and one holding a ticket waits until it
+  drains. **Fencing**: before it deletes a consumer, or deletes the stream
+  to make it again, the keeper asks Postgres, on a connection of its own,
+  whether the session of the brain that handed it the work (its pid and
+  start, read when it took the lock) still holds the brain's lock; a brain
+  that lost the lock with a pass in hand (stopped, its session ended, a
+  standby working) deletes nothing, since either loses the tickets the
+  working brain keeps. Creating stays idempotent. NATS or JetStream not
+  answering is said once and tried again next tick; the table and the
+  board are written meanwhile. A standby keeps nothing;
 - plans which queues each seat consumes, in what order
   ([`brain/plan.hl`](../brain/plan.hl); the design's "The brain: from table
   writer to controller"), and writes it on the board. Each seat is judged
@@ -828,7 +837,18 @@ Each second the one that works:
   and as it was every 30 s, saying once each seat it holds or lets go; then
   it reads every queue's consumer and hands the readings back for the next
   tick's board. Readings are a tick behind, so a backlog moves a seat's
-  order on the third or fourth tick after it builds. With the brain down,
+  order on the third or fourth tick after it builds. **A model changing
+  shape** (a seat added under a second provider account, or the last one
+  under the others removed) is sequenced on the board (`BoardModel`): the
+  brain prepares the change (`next`), so the keeper makes the new shape's
+  consumers and the plans name the new queues beside the old (in the `m`
+  shape only its one account's seats consume it); once the keeper has read
+  every new queue in a pass after that board, the board flips (`shape`),
+  the old one kept as `previous` and consumed after the new until the
+  longest wait has passed and its queues read empty; then it is let go, and
+  its consumers deleted as above. Each flip and let-go is said once. A
+  seat's order is kept by model, class and need, so a change of shape keeps
+  its place. With the brain down,
   nodes pull on the last plan they were given, and a node with none on its
   own eligibility.
 
@@ -1006,10 +1026,13 @@ when it cannot reach the coordinator.
    looked) is offered instead, nothing having been published.
 4. **Queued.** The api publishes a ticket for each attempt (`lib/work`
    `Ticket`: what eligibility needs and where to claim it, never the
-   request's content) to one partition of the work stream: the model's
-   `m` subject when the seats configured to serve it run under one
-   provider account, else the `p` subject of one account the request may
-   spend (by lib/work's rule, which the brain makes the queues by), of
+   request's content) to one partition of the work stream, in the shape
+   the brain's board gives the model, however old the board (by
+   configuration's rule, lib/work's, for a model it does not hold yet):
+   the model's `m` subject, under its one provider account, else the `p`
+   subject of one account the request may spend (a request that may not
+   spend the `m` account, while the brain prepares a change of shape, is
+   offered as below), of
    those not exhausted the ones with the most headroom (their windows in
    `quota_window` as admission reads them), then one of two drawn at
    random (weighted by their consuming seats' free slots, as the brain's

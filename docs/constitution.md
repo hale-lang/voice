@@ -47,7 +47,7 @@ holds them is a token a request presents, never an OS account.
 |---|---|
 | `hale check --matrix .` at the repository's root | yes: every (program, environment) pair, base and environment constitution; a seed with a `main locus` that no environment lists fails (`entrypoint ./decide is in no environment`) |
 | `hale check api`, `hale build api`, `hale test api` | no: a plain check reads no environment, so a violation passes it (proved below) |
-| `hale check api --env api` | no: `--env` reads the nearest manifest, which is the program's own `api/hale.toml` (its `[deps]`), and that declares no environment (`no environment `api` in …/api/hale.toml`) |
+| `hale check api --env api` | no: `--env` reads the nearest manifest, which is the program's own `api/hale.toml` (its `[deps]`), and that declares no environment (`no environment `api` in …/api/hale.toml`; [hale #2221](https://github.com/hale-lang/hale/issues/2221)) |
 | `hale check api --adopt VoiceApi` | yes, for that program alone: `VoiceApi` extends `Voice`, so the base comes with it; for trying a claim without the matrix |
 
 CI runs `hale check --matrix .` in the api, brain, decide and node jobs
@@ -57,27 +57,69 @@ CI runs `hale check --matrix .` in the api, brain, decide and node jobs
 
 | Invariant | Status | Enforced by, or why not |
 |---|---|---|
-| The node never reaches Postgres | enforced | `node_never_reaches_postgres`, with one hole: a connection built and used in the same fn is not seen (Gap 2) |
+| The node never reaches Postgres | enforced, except a connection built and used in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)) | `node_never_reaches_postgres` |
 | Only the api grants (answers a seat's claim) | enforced | `node_never_grants`, `brain_never_grants` |
-| Only the api enqueues tickets; only seats claim and take them | enforced | `node_never_writes_a_ticket`, `brain_never_writes_a_ticket`, `api_never_claims`, `api_never_reads_a_ticket`, `api_never_consumes_work`, `brain_never_reads_a_ticket`, `brain_never_claims`, `brain_never_consumes_work` |
-| Only the brain keeps the work stream and its consumers | enforced | `api_never_keeps_the_stream`, `node_never_keeps_the_stream` |
-| The hosted tool is confined: its code reaches neither the store nor NATS | enforced | `fetch_reaches_no_driver` |
-| Queue routing's codec is data alone: it does no I/O and touches no secret (every program) | enforced | `protocol_codec_does_no_io`, `protocol_codec_holds_no_secret` (the base, `Voice`) |
-| voice-decide is an engine: it knows nothing of the coordinator | enforced | `decide_never_reaches_postgres`, `decide_never_reaches_nats`, `decide_speaks_no_voice_protocol` |
+| Only the api enqueues tickets; only seats claim them | enforced | `node_never_writes_a_ticket`, `brain_never_writes_a_ticket`, `api_never_claims`, `api_never_reads_a_ticket`, `brain_never_reads_a_ticket`, `brain_never_claims` |
+| Only seats take work off the stream | enforced, except a puller built and used in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)) | `api_never_consumes_work`, `brain_never_consumes_work` |
+| Only the brain keeps the work stream and its consumers | enforced, for the calls that name it | `api_never_keeps_the_stream`, `node_never_keeps_the_stream`; a raw JetStream API request (`nats::js_call`, a client's `request`) is a subject, which no claim sees ([hale #2225](https://github.com/hale-lang/hale/issues/2225)) |
+| The hosted tool is confined: its code reaches neither the store nor NATS | enforced, except a client or connection built and used in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)) | `fetch_reaches_no_driver` |
+| Queue routing's codec is data alone: it does no I/O and touches no secret (every program) | enforced, except a locus literal whose `birth` does it ([hale #2220](https://github.com/hale-lang/hale/issues/2220)) | `protocol_codec_does_no_io`, `protocol_codec_holds_no_secret` (the base, `Voice`) |
+| voice-decide is an engine: it knows nothing of the coordinator | enforced, except a connection or client built and used in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)), and a topic bound to pond's NATS adapter (not yet filed) | `decide_never_reaches_postgres`, `decide_never_reaches_nats`, `decide_speaks_no_voice_protocol` |
 | The brain is never on the request path | partly | The brain never writes, reads, claims, grants or consumes a request's work, and never publishes into a stream (`brain_never_*`). Not what it subscribes to: its subjects are runtime strings handed to pond's NATS client, which no claim sees |
-| Prompts never reach JetStream | partly | The node and the brain publish nothing into a stream (`node_never_publishes_into_a_stream`, `brain_never_publishes_into_a_stream`). The api does publish (tickets, and usage on the organization's nerves), and that what it publishes carries no body is data flow, which claims do not track: a ticket has no body because `work::Ticket` has no such field, a fact of the type, not of a claim |
-| No credential leakage; secrets only through `std::secret` | partly | The brain's own code never handles secret material; only the drivers it dials with do (`brain_holds_no_secret`). A hosted fetch sending no credential is not provable yet (Gaps 3 and 6), nor where the vault is read (Gap 4) |
-| Logs are structured (internals.md, "Logs") | partly | The brain writes only through `std::log` (`brain_logs_structured`). The api and the node also print where the output is the product (`api admin-token`, `api arrange`, the node's install); saying "every server path logs through `std::log`" needs `program` minus those commands (Gap 5), so CI's grep stays |
-| The node never runs tool calls; hosted tools run only in the api | not yet | A tool call is an HTTP request or a process the model asked for; the node's engines make the same calls for the seat. Claims see effect classes (`syscall`, `block`) and named code, not what a call is for or where it goes (Gap 4) |
-| No bypass flags; voice runs no agent CLI | not yet | A flag is a value in an argv handed to `std::process::run`; claims see neither values nor the native process calls (Gap 4) |
-| The node's local API stays on loopback; only the api is exposed | not yet | The address a listener binds is a runtime value (`--host`, default `127.0.0.1`); claims see no values (Gap 9) |
+| Prompts never reach JetStream | partly | The node and the brain call none of pond's JetStream publishes (`node_never_publishes_into_a_stream`, `brain_never_publishes_into_a_stream`); a plain NATS publish on a work subject, which the stream stores, is a subject no claim sees ([hale #2225](https://github.com/hale-lang/hale/issues/2225)). The api does publish (tickets, and usage on the organization's nerves), and that what it publishes carries no body is data flow, which claims do not track: a ticket has no body because `work::Ticket` has no such field, a fact of the type, not of a claim |
+| No credential leakage; secrets only through `std::secret` | partly | The brain's own code never handles secret material; only the drivers it dials with do (`brain_holds_no_secret`), except an imported (non-driver) locus built and used in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)) or a locus literal whose `birth` uses a secret ([hale #2220](https://github.com/hale-lang/hale/issues/2220)). A hosted fetch sending no credential is not provable yet ([hale #2218](https://github.com/hale-lang/hale/issues/2218), [hale #2224](https://github.com/hale-lang/hale/issues/2224)), nor where the vault is read ([hale #2222](https://github.com/hale-lang/hale/issues/2222)) |
+| Logs are structured (internals.md, "Logs") | partly | The brain writes only through `std::log` (`brain_logs_structured`), except through an imported sink built and called in one fn ([hale #2216](https://github.com/hale-lang/hale/issues/2216)) or a literal whose `birth` prints ([hale #2220](https://github.com/hale-lang/hale/issues/2220)). The api and the node also print where the output is the product (`api admin-token`, `api arrange`, the node's install); saying "every server path logs through `std::log`" needs `program` minus those commands ([hale #2223](https://github.com/hale-lang/hale/issues/2223)), so CI's grep stays |
+| The node never runs tool calls; hosted tools run only in the api | not yet | A tool call is an HTTP request or a process the model asked for; the node's engines make the same calls for the seat. Claims see effect classes (`syscall`, `block`) and named code, not what a call is for or where it goes ([hale #2219](https://github.com/hale-lang/hale/issues/2219), [hale #2222](https://github.com/hale-lang/hale/issues/2222)) |
+| No bypass flags; voice runs no agent CLI | not yet | A flag is a value in an argv handed to `std::process::run`; claims see neither values nor the native process calls ([hale #2219](https://github.com/hale-lang/hale/issues/2219), [hale #2222](https://github.com/hale-lang/hale/issues/2222)) |
+| The node's local API stays on loopback; only the api is exposed | not yet | The address a listener binds is a runtime value (`--host`, default `127.0.0.1`); claims see no values ([hale #2227](https://github.com/hale-lang/hale/issues/2227)) |
 | Callers never name a node; nothing is discovered; local controls only restrict; a model's weights come only from an allowed recipe; state never travels as events | not | These are about values, messages and data, not who reaches what. The contract (`spec/`) and the code's own checks hold them |
 
 **voice-decide** is held to the law like the others: it is an engine a node
 starts, and knows nothing of the coordinator. Importing `lib/law` puts 2.9
-KB of unused code in its binary (Gap 12), and a change under `decide/`
+KB of unused code in its binary ([hale #2230](https://github.com/hale-lang/hale/issues/2230)), and a change under `decide/`
 rebuilds the decision runtime's images in CI, which publishes nothing
 unless run by hand.
+
+## What "enforced" means until hale fixes these
+
+A green `hale check --matrix .` proves each claim over the program as the
+checker models it, and four holes in that model can let a real violation
+pass (fail open). Until hale closes them, a claim marked "enforced, except"
+in the table above holds for every shape but the ones listed here. Each
+listed shape was tried in a scratch copy, and the violation passed
+`--matrix` (exit 0).
+
+| Hole | The shape that passes | Claims it weakens |
+|---|---|---|
+| [hale #2216](https://github.com/hale-lang/hale/issues/2216): a method call on a literal of an imported seed's locus adds no edge | `let c = pq::PgConn { }; c.open()` or `pq::PgConn { }.open()`; `let p = nats::JsPuller { … }; p.fetch(c, …)`; `let c = nats::NatsClient { … }; c.open()`; `let s = logfmt::RecordSink { }; s.on_event(e)` | `node_never_reaches_postgres`, `decide_never_reaches_postgres`, `decide_never_reaches_nats`, `fetch_reaches_no_driver`, `api_never_consumes_work`, `brain_never_consumes_work`, `brain_logs_structured`, `brain_holds_no_secret` (an imported seed's locus, not a driver, that uses a secret: `let k = x::K { }; k.k(v)` passes, `k: x::K` as a parameter is refused), and the base's two should `lib/work` ever import a seed. The same object held in a field or passed as a parameter is seen |
+| [hale #2220](https://github.com/hale-lang/hale/issues/2220): a locus literal does not reach its `birth` | in `lib/work`, `std::http::BodyReader { req: … }`, which sends its request in `birth`, with no method called | `protocol_codec_does_no_io`, `protocol_codec_holds_no_secret`, `brain_holds_no_secret`, `brain_logs_structured`: every claim over an effect, wherever a literal's `birth` performs it |
+| [hale #2218](https://github.com/hale-lang/hale/issues/2218): `std::m::*` omits on-demand stdlib files | none today: the only module group here is the gate `std::log::*`, and a gate that masks too little fails closed | none |
+| [hale #2219](https://github.com/hale-lang/hale/issues/2219): a stdlib path call is only a leaf `syscall` | none today: the claims over `effects(syscall)` still see it (`std::http::get` in `lib/work` is refused), and no claim names a stdlib module as a target | none (it blocks the tool-call and bypass-flag invariants instead) |
+
+One refusal is luckier than it looks: a brain that builds a
+`std::http::BodyReader` with a `bearer` is refused by `brain_holds_no_secret`,
+but because the on-demand stdlib file that declares `BodyReader` joins the
+brain's `program` (the witness starts at `std::http::BodyReader::__start`),
+not because the literal reaches its `birth`.
+
+Two shapes pass that no hale issue covers yet, and the claims do not
+pretend to:
+
+- **A topic bound to pond's NATS adapter.** `bindings { Pinged:
+  nats::NatsAdapter { … }; }` with a publish on `Pinged` passes
+  `decide_never_reaches_nats`: the binding is no edge from the publisher to
+  the adapter. The same shape would publish onto a work subject past
+  `node_never_publishes_into_a_stream`. (Not yet filed.)
+- **Subjects.** A plain NATS publish on a work subject, which JetStream
+  stores, or a raw JetStream API request (`nats::js_call`, a client's
+  `request` on `$JS.API.…`), reaches the stream through no function the
+  law names ([hale #2225](https://github.com/hale-lang/hale/issues/2225)).
+
+The claims over queue routing's codec (`*_never_writes_a_ticket`,
+`*_never_reads_a_ticket`, `*_never_claims`, `*_never_grants`) are weakened
+by none of the four: `lib/work` declares no locus, so every use is a path
+call the checker sees. What they do not stop is a program writing the same
+JSON by hand; a claim names code, not a message's shape.
 
 ## The claims, by program
 
@@ -268,7 +310,7 @@ test that imports a program is a world of its own, the imported main's law
 is evaluated there, and `program` is then the test's own code. Voice's
 tests play the program's peers (a test of the api pulls and claims as a
 node does, a test of the brain serves as the api does), so with `adopt` in
-source `hale check --workspace` fails 18 test programs (Gap 1). Bound in
+source `hale check --workspace` fails 18 test programs ([hale #2217](https://github.com/hale-lang/hale/issues/2217)). Bound in
 `hale.toml`, the law applies to the entrypoints the matrix lists, and to no
 test.
 
@@ -278,7 +320,7 @@ Claims compile to nothing. Importing `lib/law` brings its imports into the
 program: the api's binary is the same size with it as without, and so is
 the brain's; the node's gains 144 bytes, one reclaim-site descriptor pond's
 Postgres driver brings, and voice-decide's code 2.9 KB, pond NATS's wire
-codecs for two of its types, none of it ever run (Gap 12). To let the
+codecs for two of its types, none of it ever run ([hale #2230](https://github.com/hale-lang/hale/issues/2230)). To let the
 checker follow every call, this change binds fourteen receivers to typed
 locals, in the api (`api/inference.hl`, the offer of an attempt) and the
 node (its metrics, its pullers, two files); the programs do as before, and
@@ -286,85 +328,26 @@ their tests pass.
 
 ## Gaps: what hale would need
 
-Each is something the hale toolchain would add or fix; voice states the
-invariant as soon as it can.
+Filed on hale; each reproduced on hale's main.
 
-1. **`program` in an imported main's law is the importer's code.** A
-   constitution adopted by a main is evaluated in a test that imports it
-   with `program` resolving to the test's seed, so a test playing the
-   program's peers violates it (`fn test_a_peer() { dep::touch(1); }` in a
-   test of a program adopting `forbid reaches(program, store)` fails with
-   `` witness: `test_a_peer` -> `dep::touch` ``). Ask: evaluate an imported
-   main's law with `program` as that main's seed, as GH #733 holds for its
-   groups, or let a test world leave an imported main's law to the main's
-   own check.
-2. **A call on a local locus literal of an imported seed is no edge.**
-   `let c = dep::Conn { }; c.query(1)` (typed or not) adds no call from the
-   fn, so `forbid reaches(f, dep_group)` holds while the call runs; a
-   parameter `c: dep::Conn` or a field resolves. It fails open, where an
-   untyped receiver fails closed. Ask: resolve it, or fail closed.
-3. **`avoiding std::http::*` does not mask the module's loci.** `forbid
-   reaches(fetch, effects(secret_use)) avoiding std::http::*` over a fn that
-   reads a `std::http::BodyReader` is refused with the witness
-   `` Fetch::f -> std::http::BodyReader::chunk -> … -> std::secret::Credential::__send_in_head ``,
-   which runs through the gate; a declared group of `std::http::*` as the
-   gate does the same. Ask: a gate masks every declaration of its module.
-4. **Effects too coarse to tell the network from a file or a process.**
-   `std::http::get`, `std::http::request`, `std::process::run` and
-   `std::io::tcp::connect` are calls into no module group
-   (`forbid reaches(f, std::http::*)` holds over `std::http::request`), and
-   `std::io::fs::*` and `std::env::*` cannot be named. All of them are
-   `syscall`. Ask: path calls count as reaching their module, or built-in
-   classes `net`, `fs` and `process` (with `env` as it is), so "the node's
-   serving path dials nothing but its engine" or "only the vault's reader
-   reads the vault" can be said. (`require attributed(all syscall)` is the
-   road open today: it asks a purpose of 115 of the node's fns.)
-5. **No "all but".** `avoiding G` may not overlap the source, so `forbid
-   reaches(program, stream_publish) avoiding ticket_gate` is refused
-   (`masking an endpoint makes the claim weaker than it reads`), and a
-   group cannot be `program` minus a few commands. Ask: a difference
-   (`program except { … }`), so "every JetStream publish passes through the
-   ticket gate or the teller" and "every server path logs through
-   `std::log`" can be said without listing every locus.
-6. **A locus literal does not reach its `birth`.** A fn building `Reads { }`
-   whose `birth` reads the environment is not judged to reach
-   `effects(env)`, nor a `std::secret::Credential { vault: … }` its vault
-   read, nor a `BodyReader { bearer: … }` its header. Ask: a construction
-   edge to the literal's `birth`, and a claim over what a construction site
-   sets ("no `BodyReader` in `hosted_fetch` sets `bearer`").
-7. **Subjects across processes.** Voice's request plane (tickets, claims,
-   grants, events, replies) is pond's NATS client with runtime subjects,
-   because a keyed topic over a binding is one subject every subscriber
-   filters (internals.md, "Subjects"). Ask: keyed topics bound to a broker
-   with a subject per key (`voice.node.{node}.serve`), so the plane is
-   declared topics, and fleet claims over them; then "the brain never
-   subscribes to a request or reply subject" is a `fleet locus` claim.
-8. **Data flow.** "No prompt reaches JetStream" is that no value derived
-   from a request's input is an argument of `js_publish*`. Ask: an
-   information-flow claim over a type's fields and a call's arguments
-   (hale's spec puts information flow out of scope today).
-9. **Values of a listener.** Ask: a claim over the addresses a program
-   listens on, proven constant (`require listens(G, loopback)`), from rows
-   like the topology's `observe` ones; then "the node's local API stays on
-   loopback" and "only the api is exposed" are claims.
-10. **Receivers the checker cannot type.** A method call on a stdlib call's
-    result (`std::metrics::gauge(…).set(v)`), on an `or`-unwrapped stdlib
-    call (`std::io::file::open(…) or { … }`), on an `if` whose branches
-    return an interface (`Offer`), or on an element of an array of loci
-    (`self.ps[i].close(c)`) is uncertified. This change binds each to a
-    typed local; ask: type them.
-11. **A constitution cannot extend `std::law::Standard`** (`constitution X
-    extends std::law::Standard` is a parse error), so `brain_logs_structured`
-    restates its clause.
-12. **An import used only by claims emits code.** Importing `lib/law` puts
-    pond NATS's wire codecs into voice-decide (2.9 KB of code) and a
-    reclaim-site descriptor into the node, none of it reachable. Ask: emit
-    nothing for an imported type nothing uses.
-13. **Doc comments on groups and constitutions** are refused as
-    documenting nothing; `lib/law` uses `//`.
-14. **`--env` reads the nearest manifest.** Voice's programs each have a
-    `hale.toml` of their own (`[deps]`), so `hale check api --env api` finds
-    no environment, and only `hale check --matrix` at the root applies the
-    law; `hale build --env` likewise. Ask: `--env` resolves environments
-    from the workspace manifest that lists the entrypoint, so a single
-    program can be checked, built and run under its law.
+| Issue | Kind | What voice would state with it |
+|---|---|---|
+| [hale #2216](https://github.com/hale-lang/hale/issues/2216) | fail-open bug | closes the one-fn hole in the eight claims above |
+| [hale #2217](https://github.com/hale-lang/hale/issues/2217) | bug | `adopt` in source without failing the tests that import a program |
+| [hale #2218](https://github.com/hale-lang/hale/issues/2218) | fail-open bug | "a hosted fetch carries no credential", as `avoiding std::http::*` |
+| [hale #2219](https://github.com/hale-lang/hale/issues/2219) | fail-open bug | stdlib calls as reaching their module: the node's tool-call ban, no agent CLI |
+| [hale #2220](https://github.com/hale-lang/hale/issues/2220) | fail-open bug | closes the `birth` hole in the claims over effects |
+| [hale #2221](https://github.com/hale-lang/hale/issues/2221) | bug | `hale check api --env api` and `hale build --env` under the law |
+| [hale #2222](https://github.com/hale-lang/hale/issues/2222) | feature | `net`, `fs`, `process` under `syscall`: who dials, who reads the vault |
+| [hale #2223](https://github.com/hale-lang/hale/issues/2223) | feature | `program except { … }`: every JetStream publish through the ticket gate, every server path through `std::log` |
+| [hale #2224](https://github.com/hale-lang/hale/issues/2224) | feature | a claim over a construction site's fields: no `BodyReader` in `hosted_fetch` sets `bearer` |
+| [hale #2225](https://github.com/hale-lang/hale/issues/2225) | feature | keyed topics with a broker subject per key and fleet claims: the brain never subscribes to a request or reply subject |
+| [hale #2226](https://github.com/hale-lang/hale/issues/2226) | feature | information flow: no request's input reaches `js_publish*` |
+| [hale #2227](https://github.com/hale-lang/hale/issues/2227) | feature | a listener's bind address: the node's local API on loopback, only the api exposed |
+| [hale #2228](https://github.com/hale-lang/hale/issues/2228) | feature | typed receivers, so the fourteen typed locals this change adds are not needed |
+| [hale #2229](https://github.com/hale-lang/hale/issues/2229) | feature | `extends std::law::Standard`, so `brain_logs_structured` need not restate it |
+| [hale #2230](https://github.com/hale-lang/hale/issues/2230) | codegen | an import only claims use emits no code (voice-decide's 2.9 KB, the node's 144 B) |
+| [hale #2231](https://github.com/hale-lang/hale/issues/2231) | docs | `///` on `group` and `constitution` |
+
+Not yet filed: a topic bound in `bindings { }` to an imported adapter
+locus adds no edge from its publishers to the adapter (above).

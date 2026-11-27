@@ -14,8 +14,11 @@
 // all on nodes registered with protocol 3, while this instance sees the
 // work stream (`QueueKeeper`). Each is published in its model's shape (lib/work
 // `partition`), the brain's rule, to one partition (`chosen`): the provider
-// accounts not exhausted, those with the most headroom, then one of two
-// drawn at random.
+// accounts not exhausted, those with the most headroom, then of two drawn at
+// random, weighted by their consuming seats' free slots, the one with the
+// shorter expected wait on the brain's board (`with_board`). A board older than `BOARD_STALE_MS` (the brain down) is
+// not read: the first draw is taken, and a conversation's window is its
+// own, as when no brain had written one.
 //
 // The instance's `QueueBook`, shared by its requests and its keeper:
 // - the work stream's incarnation as last seen (its creation time, ms; 0
@@ -309,13 +312,19 @@ type SeatFacts { items: bounded[SeatFact; 64]; }
 
 /// One partition a queued request may be published to: its subject, the
 /// provider account it is under ("" in the `m` shape, which names none),
-/// that account's fullest window and whether one is at 100%.
+/// that account's fullest window and whether one is at 100%, and, from the
+/// brain's board (`with_board`), the free slots of the seats consuming it
+/// and its expected wait (-1 each when the board does not say).
 type Partition {
     subject: String = "";
     account: String = "";
     used: Float = 0.0;
     exhausted: Bool = false;
+    free: Int = -1;
+    wait_ms: Int = -1;
 }
+
+type PartitionList { items: bounded[Partition; 16]; }
 
 /// How a request is queued (`queue_plan_of`). `on` false: offered with
 /// `serve`, `why` saying why.
@@ -337,6 +346,11 @@ type QueuePlan {
     // its partition)
     conversation: String = "";
     home: Candidate = Candidate { };
+    // why its home seat's window is 0, from the board: held, consuming
+    // nothing, or its own queue full ("" when the window is its own)
+    home_skip: String = "";
+    // read from a board fresh enough to choose by (`with_board`)
+    board: Bool = false;
 }
 
 /// A seat as a claim's grant needs it: everything but its config, which may
@@ -434,60 +448,234 @@ fn queue_plan_of(
 
 /// The partition a queued request is published to (the design's "Choosing a
 /// partition"), of `q`'s, leaving out those whose every seat failed it
-/// (`avoid`, `\n<node>/<seat>\n` each): the provider accounts that are not
-/// exhausted (unless every one is), then those with the most headroom (their
-/// fullest window within 10 points of the emptiest), then of two drawn at
-/// random (`a`, `b`, any integers), the one with the shorter expected wait.
-/// The expected wait is the board's (depth over free slots, times recent
-/// service time), which comes with the controller (step (e)); until then
-/// every partition's is the same and the first draw is taken. "" when
-/// none is left.
+/// (`avoid`, `\n<node>/<seat>\n` each) and those whose provider account is
+/// exhausted (as the route table leaves its seats out; admission refuses a
+/// request whose every partition is, `every_exhausted`): those with the most
+/// headroom (their fullest window within 10 points of the emptiest), then of
+/// two drawn at random (`a`, `b`, any integers; `drawn`), the one with the
+/// shorter expected wait on the board (`with_board`), the first when the
+/// board does not say. "" when none is left.
 fn chosen(q: QueuePlan, avoid: String, a: Int, b: Int) -> String {
+    let mut least = 1000.0;
     let mut open = 0;
-    let mut fresh = 0;
     for p in q.partitions {
-        if partition_untried(q, p, avoid) {
+        if partition_untried(q, p, avoid) && !p.exhausted {
             open = open + 1;
-            if !p.exhausted { fresh = fresh + 1; }
+            if p.used < least { least = p.used; }
         }
     }
     if open == 0 { return ""; }
-    let mut least = 1000.0;
-    for p in q.partitions {
-        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted) && p.used < least {
-            least = p.used;
-        }
-    }
-    let mut kept = 0;
-    for p in q.partitions {
-        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted)
-            && p.used <= least + 10.0
-        {
-            kept = kept + 1;
-        }
-    }
-    let i = (if a < 0 { -a } else { a }) % kept;
-    let mut j = (if b < 0 { -b } else { b }) % kept;
-    if j == i && kept > 1 { j = (j + 1) % kept; }
-    let mut first = "";
-    let mut second = "";
-    let mut k = 0;
-    for p in q.partitions {
-        if partition_untried(q, p, avoid) && (fresh == 0 || !p.exhausted)
-            && p.used <= least + 10.0
-        {
-            if k == i { first = p.subject; }
-            if k == j { second = p.subject; }
-            k = k + 1;
-        }
-    }
-    return if expected_wait_ms(second) < expected_wait_ms(first) { second } else { first };
+    let i = drawn(q, avoid, least, a, -1);
+    let j = drawn(q, avoid, least, b, i);
+    let first = at(q.partitions, i) or Partition { };
+    let second = if j >= 0 { at(q.partitions, j) or first } else { first };
+    let shorter = first.wait_ms >= 0 && second.wait_ms >= 0 && second.wait_ms < first.wait_ms;
+    return if shorter { second.subject } else { first.subject };
 }
 
-/// A partition's expected wait, from the board: none to read until the
-/// controller writes one (step (e)), so every partition's is the same.
-fn expected_wait_ms(subject: String) -> Int {
-    return 0;
+/// Whether partition `p` of `q` is one `chosen` draws from: a seat that has
+/// not failed the request (`avoid`), its account not exhausted, its fullest
+/// window within 10 points of the emptiest's (`least`).
+fn drawable(q: QueuePlan, p: Partition, avoid: String, least: Float) -> Bool {
+    return partition_untried(q, p, avoid) && !p.exhausted && p.used <= least + 10.0;
+}
+
+/// The place in `q.partitions` of one drawn at random (`r`, any integer)
+/// from those `drawable`, but the one at `skip` (-1 for none): weighted by
+/// the free slots of the seats consuming each (the board's), or, when none
+/// is known to have one, evenly. -1 when none is left.
+fn drawn(q: QueuePlan, avoid: String, least: Float, r: Int, skip: Int) -> Int {
+    let mut n = 0;
+    let mut weight = 0;
+    let mut k = 0;
+    for p in q.partitions {
+        if k != skip && drawable(q, p, avoid, least) {
+            n = n + 1;
+            if p.free > 0 { weight = weight + p.free; }
+        }
+        k = k + 1;
+    }
+    if n == 0 { return -1; }
+    let mut pick = (if r < 0 { -r } else { r }) % (if weight > 0 { weight } else { n });
+    k = 0;
+    for p in q.partitions {
+        if k != skip && drawable(q, p, avoid, least) {
+            let w = if weight > 0 { if p.free > 0 { p.free } else { 0 } } else { 1 };
+            if pick < w { return k; }
+            pick = pick - w;
+        }
+        k = k + 1;
+    }
+    return -1;
+}
+
+/// Whether every partition of `q` is under an exhausted provider account
+/// (and there is one): nothing may serve the request until a window resets.
+fn every_exhausted(q: QueuePlan) -> Bool {
+    let mut any = false;
+    for p in q.partitions {
+        if !p.exhausted { return false; }
+        any = true;
+    }
+    return any;
+}
+
+// ---- the board -------------------------------------------------------------
+
+/// A board older than this, by the store's clock, is not read: the brain
+/// that writes it each second is down, and a standby takes over within
+/// about 11 s. Meanwhile partitions are chosen and windows set as when no
+/// brain had written one.
+const BOARD_STALE_MS: Int = 5000;
+/// The expected wait of a partition the board says no seat consumes: longer
+/// than any ticket waits, so the other draw is taken.
+const NO_SEAT_WAIT_MS: Int = 600000;
+
+/// A partition's expected wait, in ms, from the board (the design's "depth
+/// over free slots, times recent service time"): `depth` tickets waiting,
+/// `free` slots free among the seats consuming it of `concurrency` in all,
+/// its model's recent service time `service_ms` (lib/work
+/// `SERVICE_UNKNOWN_MS` with none). With no slot free a slot frees about
+/// every service time over the concurrency, and the ticket waits behind
+/// `depth`; with no seat consuming it, `NO_SEAT_WAIT_MS`.
+fn expected_wait_ms(depth: Int, free: Int, concurrency: Int, service_ms: Int) -> Int {
+    if concurrency <= 0 { return NO_SEAT_WAIT_MS; }
+    let service = if service_ms > 0 { service_ms } else { work::SERVICE_UNKNOWN_MS };
+    if free > 0 { return depth * service / free; }
+    return (depth + 1) * service / concurrency;
+}
+
+/// A JSON string's text, "" for anything else.
+fn string_of(raw: String) -> String {
+    let e = std::str::trim(raw);
+    if len(e) < 2 || !std::str::starts_with(e, "\"") || !std::str::ends_with(e, "\"") {
+        return "";
+    }
+    return std::json::unescape_string(e[1..(len(e) - 1)]);
+}
+
+/// One queue or seat as the board says it (`with_board`).
+type BoardSpot {
+    key: String = "";
+    depth: Int = 0;
+    service_ms: Int = -1;
+    // the queue's consuming seats (a JSON list), or the seat's plan
+    seats: String = "[]";
+    hold: String = "";
+    consume: String = "[]";
+    free: Int = 0;
+    concurrency: Int = 0;
+    present: Bool = false;
+}
+
+@form(hashmap)
+locus BoardSpots { capacity { pool rows of BoardSpot indexed_by key; } }
+
+/// `q` with what the brain's board (`Store.board`, its age by the store's
+/// clock in `age_ms`) says of it, under `root`: each partition's consuming
+/// seats' free slots, by which `chosen` draws, and its expected wait
+/// (`expected_wait_ms`, from the queue's depth and service time and those
+/// free slots), and why its home seat's window is 0
+/// (`home_skip`): the seat held, consuming nothing (not on the board, or
+/// its plan names not its own queue), or its own queue already holding as
+/// many tickets as its concurrency. A board missing, or older than
+/// `BOARD_STALE_MS`, leaves `q` as it is.
+@bounded_by(board)
+fn with_board(q: QueuePlan, board: String, root: String) -> QueuePlan {
+    if !q.on || len(board) == 0 { return q; }
+    if std::json::string_field(board, "age_ms").kind != "number"
+        || std::json::find_int_field(board, "age_ms") > BOARD_STALE_MS
+    {
+        return q;
+    }
+    let own = if len(q.home.seat.ref) > 0 {
+        work::seat_subject(root, q.home.seat.node, q.home.seat.id)
+    } else {
+        ""
+    };
+    let mut wanted = "\n" + own + "\n";
+    for p in q.partitions {
+        wanted = wanted + p.subject + "\n";
+    }
+    let spots = BoardSpots { };
+    let mut it = std::json::array_first(std::json::find_field_raw(board, "queues"));
+    while !it.done {
+        let subject = std::json::find_string_field(it.element, "subject");
+        if len(subject) > 0 && std::str::contains(wanted, "\n" + subject + "\n") {
+            spots.set(
+                BoardSpot {
+                    key: subject,
+                    depth: std::json::find_int_field(it.element, "depth"),
+                    service_ms: if std::json::string_field(it.element, "service_ms").kind
+                        == "number"
+                    {
+                        std::json::find_int_field(it.element, "service_ms")
+                    } else {
+                            -1
+                    },
+                    seats: std::str::trim(std::json::find_field_raw(it.element, "seats")),
+                    present: true,
+                },
+            );
+        }
+        it = std::json::array_next(it);
+    }
+    it = std::json::array_first(std::json::find_field_raw(board, "seats"));
+    while !it.done {
+        let seat = std::json::find_string_field(it.element, "seat");
+        if len(seat) > 0 {
+            let concurrency = std::json::find_int_field(it.element, "concurrency");
+            let free = concurrency - std::json::find_int_field(it.element, "in_flight");
+            spots.set(
+                BoardSpot {
+                    key: "\n" + seat,
+                    hold: string_of(std::json::find_field_raw(it.element, "hold")),
+                    consume: std::str::trim(std::json::find_field_raw(it.element, "consume")),
+                    free: if free > 0 { free } else { 0 },
+                    concurrency: if concurrency > 0 { concurrency } else { 0 },
+                    present: true,
+                },
+            );
+        }
+        it = std::json::array_next(it);
+    }
+    let mut out = q;
+    out.board = true;
+    let mut parts = PartitionList { };
+    for p in q.partitions {
+        let mut x = p;
+        let r = spots.get(p.subject) or BoardSpot { };
+        if r.present {
+            let mut free = 0;
+            let mut concurrency = 0;
+            let mut s = std::json::array_first(r.seats);
+            while !s.done {
+                let seat = spots.get("\n" + string_of(s.element)) or BoardSpot { };
+                free = free + seat.free;
+                concurrency = concurrency + seat.concurrency;
+                s = std::json::array_next(s);
+            }
+            x.free = free;
+            x.wait_ms = expected_wait_ms(r.depth, free, concurrency, r.service_ms);
+        }
+        push(parts.items, x) or discard;
+    }
+    out.partitions = parts.items;
+    if len(own) > 0 {
+        let home = spots.get("\n" + q.home.seat.ref) or BoardSpot { };
+        let queue = spots.get(own) or BoardSpot { };
+        if !home.present {
+            out.home_skip = "its home seat is not on the board: it consumes nothing";
+        } else if len(home.hold) > 0 {
+            out.home_skip = "its home seat is held: " + home.hold;
+        } else if !std::str::contains(home.consume, work::jq(own)) {
+            out.home_skip = "its home seat does not consume its own queue";
+        } else if queue.present && home.concurrency > 0 && queue.depth >= home.concurrency {
+            out.home_skip = "its home seat's own queue holds " + to_string(queue.depth)
+                + " tickets, as many as it serves at once";
+        }
+    }
+    return out;
 }
 
 /// Whether partition `p` of `q` has a seat that has not failed the
@@ -528,7 +716,8 @@ fn seat_refs(q: QueuePlan) -> String {
 const WINDOW_MOST_MS: Int = 10000;
 /// The window of a seat with no measured prefill rate (the design: "until a
 /// seat has one, W is 1 s"). Nodes do not report one yet: every window is
-/// this, until they do.
+/// this, until they do. A window is 0 where the board says the home seat
+/// cannot take the turn soon (`with_board`, `home_skip`).
 const WINDOW_UNMEASURED_MS: Int = 1000;
 
 /// A turn's home seat (the design's "Where a conversation is"), of `q`'s

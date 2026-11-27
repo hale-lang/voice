@@ -25,7 +25,7 @@ const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"reason\": nul
 const NODE_CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\"}]}";
 
 /// The models, each its own partition.
-const MODELS: String = "echo-1 flaky hold quiet still late mixed";
+const MODELS: String = "echo-1 flaky hold quiet still late mixed turns slowt";
 
 fn ms() -> Int { return std::time::monotonic_ns() / 1000000; }
 
@@ -135,6 +135,12 @@ locus Instance {
         let id = field(line, 0);
         let flags = field(line, 1);
         let body = field(line, 2);
+        if std::str::starts_with(flags, "pin:") {
+            // where its conversation's last turn was granted, as if it had been
+            let key = std::json::find_string_field(body, "prompt_cache_key");
+            self.e.store.put_seat_conversation(work::conversation_of(key), flags[4..len(flags)])
+            or discard;
+        }
         let mut fd = -1;
         let mut listener = -1;
         if flags == "gone" {
@@ -183,7 +189,7 @@ locus Instance {
             "/node/v1/heartbeat",
             self.q1,
             "{\"in_flight\": 0, \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
-                + up("good") + ", " + up("m3") + "]}",
+                + up("good") + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + "]}",
         );
         self.plane(
             "/node/v1/heartbeat",
@@ -201,7 +207,17 @@ locus Instance {
         let keys = api::Keys { store: store };
         let nodes = api::Nodes { store: store, link: self.e.link };
         let seats = api::Seats { store: store, link: self.e.link };
-        for model in ["echo-1", "flaky", "hold", "quiet", "still", "late", "mixed"] {
+        for model in [
+            "echo-1",
+            "flaky",
+            "hold",
+            "quiet",
+            "still",
+            "late",
+            "mixed",
+            "turns",
+            "slowt"
+        ] {
             catalog.create(api::CatalogModelCreate { id: model }) or discard;
         }
         accounts.create(api::AccountCreate { id: "local", name: "Local" }) or discard;
@@ -239,6 +255,15 @@ locus Instance {
             "{\"text\": \"good\", \"first_output_ms\": 1500}",
         );
         seat(seats, "q1", "m3", "mixed", "", "{\"text\": \"pushed\"}");
+        seat(seats, "q1", "t1", "turns", "", "{\"text\": \"from t1\"}");
+        seat(
+            seats,
+            "q1",
+            "t2",
+            "turns",
+            "slowt",
+            "{\"text\": \"from t2\", \"first_output_ms\": 1500}",
+        );
         seat(seats, "fake", "a", "echo-1", "late", "{\"text\": \"fake\"}");
         seat(seats, "fake", "b", "echo-1", "late", "{\"text\": \"fake\"}");
         seat(seats, "fake", "c", "quiet", "still", "{\"text\": \"fake\"}");
@@ -258,7 +283,7 @@ locus Instance {
                 + to_string(std::json::find_int_field(assignment, "version"))
                 + ", \"seats\": [" + up("s1") + ", " + up("s2") + ", " + up("bad") + ", "
                 + up("good")
-                + ", " + up("m3") + "]}",
+                + ", " + up("m3") + ", " + up("t1") + ", " + up("t2") + "]}",
         );
         let freg = self.plane(
             "/node/v1/register",
@@ -349,22 +374,43 @@ locus FakeSeat {
         }
         let mut pulled = false;
         if std::io::fs::file_exists(self.dir + "/fake.echo") {
-            pulled = self.pull_one("echo-1") || pulled;
+            let echo = work::model_subject(self.root, "echo-1", "internal", "any");
+            pulled = self.pull_one("echo-1", echo, "fake/a", "fake/b") || pulled;
+            // its own queues, where the turns homed on its seats wait first
+            pulled = self.pull_one(
+                "echo-1",
+                work::seat_subject(self.root, "fake", "a"),
+                "fake/a",
+                "fake/b",
+            )
+                || pulled;
+            pulled = self.pull_one(
+                "echo-1",
+                work::seat_subject(self.root, "fake", "b"),
+                "fake/b",
+                "fake/a",
+            )
+                || pulled;
         }
         if std::io::fs::file_exists(self.dir + "/fake.late") {
-            pulled = self.pull_one("late") || pulled;
+            pulled = self.pull_one(
+                "late",
+                work::model_subject(self.root, "late", "internal", "any"),
+                "fake/a",
+                "fake/b",
+            )
+                || pulled;
         }
         if !pulled { std::time::sleep(30ms); }
     }
 
     @unbounded
-    fn pull_one(model: String) -> Bool {
-        let subject = work::model_subject(self.root, model, "internal", "any");
+    fn pull_one(model: String, subject: String, me: String, other: String) -> Bool {
         let m = nats::js_next(
             self.c,
             work::stream_name(self.root),
             work::consumer_name(subject),
-            1000,
+            300,
         ) or nats::NatsMsg { };
         if len(m.reply) == 0 { return false; }
         let t = work::ticket_of(std::str::from_bytes(m.data)) or {
@@ -374,12 +420,12 @@ locus FakeSeat {
         let log = self.dir + "/fake.log";
         let id = work::message_id(t.request_id, t.attempt, t.copy);
         if std::str::contains(self.granted, "\n" + id + "\n") {
-            let again = self.claim(t, "fake/b");
+            let again = self.claim(t, other);
             note(log, "retaken\t" + t.request_id + "\t" + reason_of(again));
             nats::js_ack(self.c, m) or discard;
             return true;
         }
-        let first = self.claim(t, "fake/a");
+        let first = self.claim(t, me);
         let a = work::answer_of(first) or work::ClaimAnswer { reason: "unread" };
         if !a.granted {
             note(log, "declined\t" + t.request_id + "\t" + a.reason);
@@ -391,10 +437,10 @@ locus FakeSeat {
             return true;
         }
         self.granted = self.granted + id + "\n";
-        note(log, "grant\t" + t.request_id + "\tfake/a");
+        note(log, "grant\t" + t.request_id + "\t" + me);
         if model == "echo-1" {
-            note(log, "second\t" + t.request_id + "\t" + reason_of(self.claim(t, "fake/b")));
-            note(log, "repeat\t" + t.request_id + "\t" + reason_of(self.claim(t, "fake/a")));
+            note(log, "second\t" + t.request_id + "\t" + reason_of(self.claim(t, other)));
+            note(log, "repeat\t" + t.request_id + "\t" + reason_of(self.claim(t, me)));
             // put back: another seat pulls it and claims it, in vain
             nats::js_nak(self.c, m, 0) or discard;
             std::time::sleep(100ms);
@@ -526,12 +572,24 @@ main locus App {
             std::test::assert(false, "the work stream: " + err.detail);
             return 0;
         };
-        for model in ["echo-1", "flaky", "hold", "quiet", "still", "late", "mixed"] {
+        for model in [
+            "echo-1",
+            "flaky",
+            "hold",
+            "quiet",
+            "still",
+            "late",
+            "mixed",
+            "turns",
+            "slowt"
+        ] {
             self.consumer(work::model_subject(self.root, model, "internal", "any"));
         }
-        for s in ["s1", "s2", "bad", "good", "m3"] {
+        for s in ["s1", "s2", "bad", "good", "m3", "t1", "t2"] {
             self.consumer(work::seat_subject(self.root, "q1", s));
         }
+        self.consumer(work::seat_subject(self.root, "fake", "a"));
+        self.consumer(work::seat_subject(self.root, "fake", "b"));
         let info = nats::js_stream_info(self.c, stream) or nats::StreamInfo { };
         return info.created_ns / 1000000;
     }
@@ -581,6 +639,114 @@ main locus App {
         return if nl < 0 { rest } else { rest[0..nl] };
     }
 
+    /// A seat's own queue's consumer, as JetStream says it.
+    fn own_queue(seat: String) -> nats::ConsumerInfo {
+        return nats::js_consumer_info(
+            self.c,
+            work::stream_name(self.root),
+            work::consumer_name(work::seat_subject(self.root, "q1", seat)),
+        ) or nats::ConsumerInfo { name: "unread" };
+    }
+
+    /// A conversation's turns: served on its home seat through the seat's
+    /// own queue, the partition never published to; a recorded seat over
+    /// the one its key hashes to; and, its home busy past the window, by
+    /// another seat through the partition, the home seat's later claim on
+    /// its own copy declined `taken`, the turn granted once.
+    @unbounded
+    fn turns() {
+        let dir = self.dir;
+        // keys whose turns hash to t2 first, and to t1 first
+        let mut to_t2 = "";
+        let mut to_t1 = "";
+        let mut i = 0;
+        while i < 200 && (len(to_t2) == 0 || len(to_t1) == 0) {
+            let k = "conv-" + to_string(i);
+            if api::key_hash(k + "\nq1/t2") > api::key_hash(k + "\nq1/t1") {
+                if len(to_t2) == 0 { to_t2 = k; }
+            } else if len(to_t1) == 0 {
+                to_t1 = k;
+            }
+            i = i + 1;
+        }
+        let partition = self.queue("turns").delivered_stream_seq;
+        let own = self.own_queue("t2").delivered_stream_seq;
+        let h1 = self.hand(
+            "api-1",
+            "",
+            "{\"model\": \"turns\", \"input\": \"hi\", \"prompt_cache_key\": \"" + to_t2 + "\"}",
+        );
+        let first = self.answer("api-1", h1, 20000);
+        std::test::assert_eq_str(field(first, 0), "200", "a turn is served: " + first);
+        std::test::assert(
+            std::str::contains(field(first, 1), "from t2"),
+            "on its home seat: " + first,
+        );
+        std::test::assert(
+            self.own_queue("t2").delivered_stream_seq > own,
+            "through the seat's own queue",
+        );
+        // a recorded seat comes before the one its key hashes to
+        let h2 = self.hand(
+            "api-1",
+            "pin:q1/t2",
+            "{\"model\": \"turns\", \"input\": \"hi\", \"prompt_cache_key\": \"" + to_t1 + "\"}",
+        );
+        let second = self.answer("api-1", h2, 20000);
+        std::test::assert_eq_str(field(second, 0), "200", "the recorded seat's turn: " + second);
+        std::test::assert(
+            std::str::contains(field(second, 1), "from t2"),
+            "on the seat its last turn was granted to: " + second,
+        );
+        std::test::assert_eq_int(
+            self.queue("turns").delivered_stream_seq,
+            partition,
+            "the partition never took them: each claimed within its window",
+        );
+        // the home seat busy: the partition takes the turn after the window
+        let busy = self.hand("api-2", "", "{\"model\": \"slowt\", \"input\": \"hi\"}");
+        std::time::sleep(300ms);
+        let h3 = self.hand(
+            "api-1",
+            "",
+            "{\"model\": \"turns\", \"input\": \"hi\", \"prompt_cache_key\": \"" + to_t2 + "\"}",
+        );
+        let third = self.answer("api-1", h3, 20000);
+        std::test::assert_eq_str(field(third, 0), "200", "a turn whose home is busy: " + third);
+        std::test::assert(
+            std::str::contains(field(third, 1), "from t1"),
+            "served by another seat: " + third,
+        );
+        let waited = std::json::find_int_field(
+            std::json::find_field_raw(
+                std::json::find_field_raw(field(third, 1), "voice"),
+                "timing",
+            ),
+            "queue_ms",
+        );
+        std::test::assert(waited >= 900, "after its window: " + to_string(waited) + " ms");
+        std::test::assert(
+            self.queue("turns").delivered_stream_seq > partition,
+            "through the partition",
+        );
+        std::test::assert_eq_str(
+            field(self.answer("api-2", busy, 20000), 0),
+            "200",
+            "slowt served",
+        );
+        let rid = std::json::find_string_field(field(third, 1), "id");
+        std::test::assert(
+            within(dir + "/tally", rid + "\ttaken\tt2", 8000),
+            "the home seat's claim on its own copy, once free, declined taken: "
+                + read(dir + "/tally"),
+        );
+        std::test::assert_eq_int(
+            occurrences(read(dir + "/tally"), rid + "\tgranted\t"),
+            1,
+            "the turn granted once across its two copies",
+        );
+    }
+
     @unbounded
     fn scenarios() {
         let dir = self.dir;
@@ -626,11 +792,17 @@ main locus App {
             std::str::contains(field(got, 1), "hello from q1"),
             "its seat's answer: " + field(got, 1),
         );
+        // through its home seat's own queue (its opening's derived key
+        // makes it a conversation's turn) or its partition, acknowledged
+        // at the grant
         let echo = self.queue("echo-1");
+        let home = self.own_queue(served[3..len(served)]);
         std::test::assert(
-            echo.delivered_stream_seq >= 1 && echo.num_pending == 0 && echo.num_ack_pending == 0,
-            "through its partition, acknowledged at the grant: delivered "
-                + to_string(echo.delivered_stream_seq),
+            echo.delivered_stream_seq + home.delivered_stream_seq >= 1 && echo.num_ack_pending == 0
+                && home.num_ack_pending == 0,
+            "through the work stream, acknowledged at the grant: delivered "
+                + to_string(echo.delivered_stream_seq) + " + "
+                + to_string(home.delivered_stream_seq),
         );
 
         // a seat of protocol 2 that could serve it: offered with `serve`
@@ -704,12 +876,22 @@ main locus App {
             "499",
             "a caller gone is answered nothing: " + left,
         );
-        let still = nats::js_stream_msg_next(
+        // its copy: on its home seat's own queue (the caller gone within
+        // its window), or on the partition
+        let mut still = nats::js_stream_msg_next(
             self.c,
             work::stream_name(self.root),
-            work::model_subject(self.root, "still", "internal", "any"),
+            work::seat_subject(self.root, "fake", "c"),
             0,
         ) or nats::StoredMsg { };
+        if len(still.data) == 0 {
+            still = nats::js_stream_msg_next(
+                self.c,
+                work::stream_name(self.root),
+                work::model_subject(self.root, "still", "internal", "any"),
+                0,
+            ) or nats::StoredMsg { };
+        }
         let t = work::ticket_of(std::str::from_bytes(still.data)) or work::Ticket { };
         std::test::assert(len(t.reply_to) > 0, "its ticket is still in the stream");
         let gone = self.c.request(
@@ -775,6 +957,9 @@ main locus App {
             "by the seat that claimed it: " + late,
         );
 
+        // a conversation's turns: on its home seat's own queue first
+        self.turns();
+
         // many requests from both instances, claimed by the node and the
         // fake seat, which holds a standing pull beside the node's: each
         // granted once
@@ -783,12 +968,19 @@ main locus App {
         let mut ids = "";
         let mut n = 0;
         while n < 24 {
+            // each its own conversation, so their homes spread over the seats
             ids = ids + "api-1\t"
-                + self.hand("api-1", "", "{\"model\": \"echo-1\", \"input\": \"hi\"}")
-                + "\n";
+                + self.hand(
+                    "api-1",
+                    "",
+                    "{\"model\": \"echo-1\", \"input\": \"hi " + to_string(n) + "\"}",
+                ) + "\n";
             ids = ids + "api-2\t"
-                + self.hand("api-2", "", "{\"model\": \"echo-1\", \"input\": \"hi\"}")
-                + "\n";
+                + self.hand(
+                    "api-2",
+                    "",
+                    "{\"model\": \"echo-1\", \"input\": \"hello " + to_string(n) + "\"}",
+                ) + "\n";
             n = n + 1;
         }
         // every answer in, and each slot's report of its claim told
@@ -824,10 +1016,9 @@ main locus App {
             );
             if fake_grants == 1 {
                 by_fake = by_fake + 1;
-                std::test::assert_eq_str(
-                    seat_ref,
-                    "fake/a",
-                    rid + ": served by the seat granted it",
+                std::test::assert(
+                    std::str::contains(now_fake, "grant\t" + rid + "\t" + seat_ref),
+                    rid + ": served by the seat granted it, " + seat_ref,
                 );
                 std::test::assert(
                     std::str::contains(now_fake, "second\t" + rid + "\ttaken"),
@@ -846,9 +1037,13 @@ main locus App {
             }
             k = k + 1;
         }
+        // the fake seat competed for them: granted some, or declined
+        // `taken` on a copy another seat was granted
         std::test::assert(
-            by_fake > 0 && by_node > 0,
-            "both claimed some: fake " + to_string(by_fake) + ", node " + to_string(by_node),
+            by_node > 0 && by_fake + occurrences(now_fake, "declined\t") > 0,
+            "both claimed: the fake seat granted " + to_string(by_fake) + ", declined "
+                + to_string(occurrences(now_fake, "declined\t")) + ", the node "
+                + to_string(by_node),
         );
         let contested = occurrences(now_node, "\ttaken\t")
             + occurrences(now_node, "\tno_responders\t")

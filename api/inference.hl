@@ -347,7 +347,7 @@ locus Inference {
     ) -> Claimed {
         let avoid = avoid_of(attempts);
         let draws = std::os::getrandom(4) or std::bytes::from_string("0000");
-        let subject = chosen(
+        let mut subject = chosen(
             q,
             avoid,
             (std::bytes::at(draws, 0) or 0) * 256 + (std::bytes::at(draws, 1) or 0),
@@ -358,37 +358,102 @@ locus Inference {
         for p in q.partitions {
             if p.subject == subject { account = p.account; }
         }
+        // a turn of a conversation with a home seat goes to its home's
+        // provider account's partition, while it has a seat that has not
+        // failed it
+        for p in q.partitions {
+            if len(p.account) > 0 && p.account == q.home.seat.account
+                && partition_untried(q, p, avoid)
+            {
+                subject = p.subject;
+                account = p.account;
+            }
+        }
         let left = w.until_ns - std::time::monotonic_ns();
         if left <= 0 { return Claimed { state: "expired" }; }
-        let ticket = ticket_of_request(
-            r,
-            request_id,
-            attempt,
-            reply_to,
-            self.instance,
-            account,
-            q.need,
-            std::time::from_nanos(std::time::nanos(std::time::current()) + left),
-            avoid,
-        );
+        let until = std::time::from_nanos(std::time::nanos(std::time::current()) + left);
         let mut seen = self.link.queues();
-        let put = offer.put(
-            subject,
-            work::message_id(request_id, attempt, "shared"),
-            left / 1000000,
-            work::ticket_json(ticket),
-        );
-        if put == "no_stream" {
-            return Claimed { state: "unqueued", why: "no stream takes " + subject };
+        // a conversation's turn waits on its home seat's own queue first
+        // (the design's "The window"), unless that seat failed it
+        let home = q.home.seat;
+        let window = if len(home.ref) > 0 && !std::str::contains(avoid, "\n" + home.ref + "\n") {
+            window_ms(estimated_input_tokens(r.body), 0, left / 1000000)
+        } else {
+            0
+        };
+        let mut shared_at = std::time::monotonic_ns();
+        let mut seat_copy = false;
+        if window > 0 {
+            let seat_subject = work::seat_subject(self.link.root(), home.node, home.id);
+            let put = offer.put(
+                seat_subject,
+                work::message_id(request_id, attempt, "seat"),
+                left / 1000000,
+                work::ticket_json(
+                    ticket_of_request(
+                        r,
+                        request_id,
+                        attempt,
+                        reply_to,
+                        self.instance,
+                        account,
+                        q.need,
+                        until,
+                        avoid,
+                        q.conversation,
+                        "seat",
+                    ),
+                ),
+            );
+            if put == "no_stream" {
+                return Claimed { state: "unqueued", why: "no stream takes " + seat_subject };
+            }
+            if len(put) > 0 && put != "full" { return Claimed { state: "lost", why: put }; }
+            // its queue full: straight to its partition
+            if len(put) == 0 {
+                seat_copy = true;
+                shared_at = shared_at + window * 1000000;
+            }
         }
-        if put == "full" { return Claimed { state: "full", why: subject }; }
-        if len(put) > 0 { return Claimed { state: "lost", why: put }; }
+        let shared = work::ticket_json(
+            ticket_of_request(
+                r,
+                request_id,
+                attempt,
+                reply_to,
+                self.instance,
+                account,
+                q.need,
+                until,
+                avoid,
+                q.conversation,
+                "shared",
+            ),
+        );
+        let mut published = false;
         let eligible = seat_refs(q);
         let poll = SLOT_POLL / 1ns;
         let mut watched = std::time::monotonic_ns();
         while true {
             let now = std::time::monotonic_ns();
             if now >= w.until_ns { return Claimed { state: "expired" }; }
+            if !published && now >= shared_at {
+                // the shared copy, on the partition, under its own message id
+                let put = offer.put(
+                    subject,
+                    work::message_id(request_id, attempt, "shared"),
+                    (w.until_ns - now) / 1000000,
+                    shared,
+                );
+                published = true;
+                if put == "no_stream" && !seat_copy {
+                    return Claimed { state: "unqueued", why: "no stream takes " + subject };
+                }
+                // a full partition is answered at once, as the design says,
+                // whatever copy waits on a home seat
+                if put == "full" { return Claimed { state: "full", why: subject }; }
+                if len(put) > 0 { return Claimed { state: "lost", why: put }; }
+            }
             if now - watched >= poll {
                 watched = now;
                 if caller_gone(r.conn_fd) { return Claimed { state: "gone" }; }
@@ -399,7 +464,8 @@ locus Inference {
                     offer.republish((w.until_ns - now) / 1000000);
                 }
             }
-            let left_now = w.until_ns - now;
+            let mut left_now = w.until_ns - now;
+            if !published && shared_at - now < left_now { left_now = shared_at - now; }
             let slice = if left_now < poll { left_now } else { poll };
             let m = offer.claim(slice * 1ns);
             if m.kind == "lost" {
@@ -414,6 +480,12 @@ locus Inference {
                         m.claim.seat,
                         m.claim.copy,
                     );
+                    // where the conversation is now: the seat granted its turn
+                    if len(q.conversation) > 0
+                        && std::str::contains(q.holding, "\n" + m.claim.seat + "\n")
+                    {
+                        self.store.put_seat_conversation(q.conversation, m.claim.seat) or discard;
+                    }
                     return Claimed {
                         state: "granted",
                         c: c,
@@ -1861,10 +1933,11 @@ locus Inference {
         // holds what it said: the seat its key hashes to is offered first,
         // the key it names or, naming none, the one derived from its turn
         // (read only when there is a choice of seat)
-        if count(out.items) > 1 {
-            let key = affinity_of(r);
-            if len(key) > 0 { out = first_for(out, key); }
-        }
+        // (read only when there is a choice of seat, or the request may be
+        // queued, whose tickets name its conversation)
+        let incarnation = self.link.queues();
+        let key = if count(out.items) > 1 || incarnation > 0 { affinity_of(r) } else { "" };
+        if count(out.items) > 1 && len(key) > 0 { out = first_for(out, key); }
         if count(out.items) == 0 {
             let why = if out.serving == 0 {
                 "no seat serves model " + r.model
@@ -1880,7 +1953,6 @@ locus Inference {
         }
         // queued when every seat that could serve it pulls (queue.hl); read
         // only while this instance sees the work stream
-        let incarnation = self.link.queues();
         if incarnation > 0 {
             let facts = self.seat_facts(seats, p, k, r) or fail metering_failed(err);
             out.queue = queue_plan_of(
@@ -1899,6 +1971,16 @@ locus Inference {
                     message: "no seat serving model " + r.model
                         + " that this request may go to carries tools, which it lists",
                 };
+            }
+            // a conversation's turn: its home seat, the seat its last turn
+            // was granted to (`seat_conversation`), else the one its key
+            // hashes to
+            if out.queue.on && len(key) > 0 {
+                out.queue.conversation = work::conversation_of(key);
+                let row = self.store.seat_conversation(
+                    out.queue.conversation,
+                ) or fail metering_failed(err);
+                out.queue.home = home_of(out.queue, row.seat, out.items);
             }
         }
         return out;
@@ -1949,6 +2031,16 @@ locus Inference {
                         allowed: allowed(s, p, k, r),
                         used: fullest_window(windows),
                         exhausted: window_full(windows),
+                        holds: concurrency::conversations_held(
+                            engine_kind_of(f.capabilities, s.engine),
+                            std::json::find_string_field(
+                                std::json::find_field_raw(s.config, "runtime"),
+                                "server",
+                            ),
+                            std::json::find_int_field(s.config, "cache_tokens"),
+                            std::json::find_int_field(s.config, "context_length"),
+                            s.concurrency,
+                        ),
                     },
                 ) or discard;
             }

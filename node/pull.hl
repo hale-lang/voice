@@ -87,9 +87,41 @@ type SeatPull {
     // when (monotonic ns) pulling it again puts it back with a delay
     ineligible: String = "";
     ineligible_until: Int = 0;
+    // the conversations its engine holds, as far as the node knows: those
+    // of the tickets it was granted, the newest first, at most what its
+    // runtime holds (lib/concurrency `conversations_held`)
+    held: Held = Held { };
 }
 
+/// A seat's conversations, each 32 hex digits of a hash of its key
+/// (protocol.yaml `Ticket.conversation`), the newest first.
+type Held { items: bounded[String; 128]; }
+
 type SeatPulls { items: bounded[SeatPull; 16]; }
+
+/// `h` with `conversation` its newest, kept once, at most `most` of them
+/// (and at most 128): the oldest goes first.
+fn held_with(h: Held, conversation: String, most: Int) -> Held {
+    let mut out = Held { };
+    if most <= 0 { return out; }
+    push(out.items, conversation) or discard;
+    for c in h.items {
+        if c != conversation && count(out.items) < most { push(out.items, c) or discard; }
+    }
+    return out;
+}
+
+/// A seat's conversations as the heartbeat says them (protocol.yaml
+/// `SeatState.conversations`).
+fn held_json(h: Held) -> String {
+    let mut out = "[";
+    let mut first = true;
+    for c in h.items {
+        out = out + (if first { "" } else { ", " }) + q(c);
+        first = false;
+    }
+    return out + "]";
+}
 
 /// A pull to open: on the puller `slot`, standing for one ticket, or a
 /// sweep for `batch`.
@@ -349,10 +381,13 @@ fn seat_pull_json(p: SeatPull) -> String {
         + ", \"queues\": " + strings_json(p.queues) + "}";
 }
 
-/// `, "pull": {...}` for seat `id` when `pulls` holds it, "" when not.
+/// `, "pull": {...}, "conversations": [...]` for seat `id` when `pulls`
+/// holds it, "" when not.
 fn pull_field(pulls: SeatPulls, id: String) -> String {
     for p in pulls.items {
-        if p.seat == id { return ", \"pull\": " + seat_pull_json(p); }
+        if p.seat == id {
+            return ", \"pull\": " + seat_pull_json(p) + ", \"conversations\": " + held_json(p.held);
+        }
     }
     return "";
 }
@@ -563,6 +598,7 @@ locus Pulls {
                         p.reason = held.reason;
                         p.ineligible = held.ineligible;
                         p.ineligible_until = held.ineligible_until;
+                        p.held = held.held;
                     }
                 }
                 push(next.items, p) or discard;
@@ -715,6 +751,21 @@ locus Pulls {
     /// The api declined seat `seat` as ineligible for the ticket
     /// `message_id`: pulled again soon, it goes back with a delay, so the
     /// seat does not claim it over and over while another could take it.
+    /// Seat `seat` was granted a turn of `conversation`: its engine holds
+    /// it now, the newest of the `most` it holds.
+    fn held(seat: String, conversation: String, most: Int) {
+        let mut i = 0;
+        while i < count(self.seats.items) {
+            let mut s = at(self.seats.items, i) or SeatPull { };
+            if s.seat == seat {
+                s.held = held_with(s.held, conversation, most);
+                set(self.seats.items, i, s) or discard;
+            }
+            i = i + 1;
+        }
+        self.dirty = true;
+    }
+
     fn declined(seat: String, message_id: String, now: Int) {
         let mut i = 0;
         while i < count(self.seats.items) {

@@ -475,12 +475,14 @@ The seat a conversation's last turn was granted to, so its next turn goes
 first to the seat whose engine holds its prompt cache. A conversation is
 the first 32 lower-case hex digits of the sha256 of the request's affinity
 key (`protocol.yaml`, `Ticket.conversation`), never the key itself. The
-api writes the row when it grants an attempt, and reads it at admission,
-one row by its key; a seat's node will correct its rows by the
-conversations it reports its engine holds, and old rows will be pruned by
-age, with steps (c) and (d) of queue routing's phase 1
-(`docs/design/queue-routing.md`, "Building phase 1"). Neither is read on a
-request's path yet.
+api writes the row when it grants an attempt to a seat whose engine holds
+conversations, and reads it at admission, one row by its key. A seat's
+node corrects its rows by the conversations it reports its engine holds
+(`SeatState.conversations`, on each heartbeat): the seat's rows from
+before the heartbeat was sent (an interval before it came, so a grant the
+node does not know of yet stays) go, but for those it lists, which point
+at it unless a later grant moved them. Each api instance prunes, at most
+once a minute, the rows nothing told again for a day.
 
 ```sql
 -- at the grant
@@ -488,6 +490,13 @@ insert into seat_conversation (conversation, seat, at) values ($conversation, $s
 on conflict (conversation) do update set seat = excluded.seat, at = excluded.at;
 -- at admission
 select seat, at from seat_conversation where conversation = $conversation;
+-- a heartbeat's conversations for $seat, sent after $heard, in one transaction
+delete from seat_conversation where seat = $seat and at < $heard and conversation <> all ($held);
+insert into seat_conversation (conversation, seat, at) select c, $seat, $heard from unnest($held) c
+on conflict (conversation) do update set seat = excluded.seat, at = excluded.at
+where seat_conversation.at < excluded.at;
+-- pruned by age
+delete from seat_conversation where at < now() - interval '1 day';
 ```
 
 ## Migrations

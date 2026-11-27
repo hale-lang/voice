@@ -78,3 +78,43 @@ fn placed(config: String) -> Int {
         std::json::find_int_field(config, "context_length"),
     );
 }
+
+// ---- the conversations a seat holds ---------------------------------------
+//
+// How many conversations' prompts a seat's engine keeps, so a returning
+// turn reads only what is new (docs/design/queue-routing.md,
+// "Conversations"): the node keeps as many of each seat's conversations as
+// this, the newest first, and reports them on its heartbeat, and the api
+// sends a conversation's turn to its seat first only when it holds any.
+//   - llama-server: its slots, each holding one prompt (`llama_slots`).
+//   - TensorFold: its kept prompt states, a fixed ~6.4 MiB each whatever the
+//     prompt's length, four per conversation, in its 2 GiB prompt cache:
+//     `TENSORFOLD_CONVERSATIONS`.
+//   - vLLM: prefix caching over paged blocks, evicted least recently used,
+//     so not a count: its batch, `VLLM_MAX_SEQS`, as a floor.
+//   - the decision server: none (each question is whole).
+//   - an openai-compatible (hosted) seat: none, its provider's prompt cache
+//     being the provider account's, not the seat's.
+//   - the static engine: its concurrency, a drill standing in for a runtime.
+
+/// TensorFold's conversations: 2 GiB of prompt states of ~6.4 MiB, four a
+/// conversation.
+const TENSORFOLD_CONVERSATIONS: Int = 80;
+
+/// The conversations a seat of engine kind `kind` holds: a managed seat's
+/// by its runtime's `server` (its cache `cache_tokens`, its model made for
+/// `native` tokens); a static seat its `concurrency`; any other none.
+fn conversations_held(
+    kind: String,
+    server: String,
+    cache_tokens: Int,
+    native: Int,
+    concurrency: Int
+) -> Int {
+    if kind == "static" { return if concurrency > 0 { concurrency } else { 1 }; }
+    if kind != "managed" { return 0; }
+    if server == "tensorfold" { return TENSORFOLD_CONVERSATIONS; }
+    if server == "vllm" { return VLLM_MAX_SEQS; }
+    if server == "decision" { return 0; }
+    return llama_slots(cache_tokens, native);
+}

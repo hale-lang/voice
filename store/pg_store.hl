@@ -1397,6 +1397,55 @@ locus PgStore {
         self.lock.leave();
     }
 
+    fn correct_seat_conversations(seat: String, held: String, heard: Time) fallible(StoreError) {
+        self.lock.enter();
+        self.correct_locked(seat, held, heard) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+    }
+
+    fn correct_locked(seat: String, held: String, heard: Time) fallible(StoreError) {
+        self.begin() or raise;
+        let a = db::Args { };
+        a.add(seat);
+        a.add(std::time::iso8601(heard));
+        a.add(held);
+        self.step(
+            "DELETE FROM seat_conversation WHERE seat = $1 AND at < $2::timestamptz AND conversation <> ALL (string_to_array($3, E'\\n'))",
+            a,
+        ) or raise;
+        let b = db::Args { };
+        b.add(seat);
+        b.add(std::time::iso8601(heard));
+        b.add(held);
+        self.step(
+            "INSERT INTO seat_conversation (conversation, seat, at) SELECT c, $1, $2::timestamptz FROM unnest(string_to_array($3, E'\\n')) c WHERE length(c) = 32 AND c !~ '[^0-9a-f]' ON CONFLICT (conversation) DO UPDATE SET seat = excluded.seat, at = excluded.at WHERE seat_conversation.at < excluded.at",
+            b,
+        ) or raise;
+        let st = self.conn.commit();
+        if !st.ok {
+            self.conn.rollback();
+            fail StoreError { message: "commit: " + st.err.detail };
+        }
+    }
+
+    fn prune_seat_conversations(before: Time) -> Int fallible(StoreError) {
+        self.lock.enter();
+        let a = db::Args { };
+        a.add(std::time::iso8601(before));
+        let line = self.row(
+            "WITH gone AS (DELETE FROM seat_conversation WHERE at < $1::timestamptz RETURNING 1) SELECT row_to_json(t) FROM (SELECT count(*) AS n FROM gone) t",
+            a,
+        ) or {
+            self.lock.leave();
+            fail err;
+        };
+        self.lock.leave();
+        return std::json::find_int_field(line, "n");
+    }
+
     // ---- the operator token
 
     fn operator_token(fresh: String) -> String fallible(StoreError) {

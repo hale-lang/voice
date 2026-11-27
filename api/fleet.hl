@@ -162,7 +162,20 @@ type SeatState {
     progress: FetchProgress = FetchProgress { };
     // a managed seat's server's context, in tokens, once it says; 0 until
     context: Int = 0;
+    // from a node of protocol 3, the conversations its engine holds, the
+    // newest first, one a line (protocol.yaml `SeatState.conversations`)
+    has_conversations: Bool = false;
+    conversations: String = "";
 }
+
+/// How long the api keeps where a conversation is with nothing telling it
+/// again (a grant, or its seat's heartbeat listing it): a seat that still
+/// holds it lists it on every heartbeat, so only the rows of seats gone,
+/// or of nodes that do not say, grow this old.
+const CONVERSATION_KEPT_S: Int = 86400;
+
+/// How often an api instance prunes the older rows, at most.
+const CONVERSATION_PRUNE_MS: Int = 60000;
 
 /// `FetchProgress` (protocol.yaml): how far a managed seat's fetch is.
 type FetchProgress { done_bytes: Int = 0; total_bytes: Int = 0; }
@@ -257,6 +270,8 @@ locus NodePlane {
     params {
         store: st::Store;
         link: Link;
+        // monotonic ms of this instance's last prune of old conversations
+        pruned: Int = 0;
     }
 
     /// `registerNode`: the node's capabilities and local controls replace
@@ -312,6 +327,35 @@ locus NodePlane {
         self.put_states(n.id, h.seats) or raise;
         if h.assignment_version >= 0 && h.assignment_version < n.assignment_version {
             tell_assignment(self.store, self.link, n.id) or fail store_failed(err);
+        }
+        self.correct_conversations(n.id, h.seats);
+    }
+
+    /// Where each conversation is, corrected by what node `node`'s seats
+    /// say their engines hold (protocol.yaml `SeatState.conversations`;
+    /// queue.hl): a seat's rows from before the heartbeat was sent (an
+    /// interval before it came, so a grant it does not know of yet is
+    /// kept) go, but for those it lists. And, at most once a minute, the
+    /// rows nothing told again for a day are pruned. A store that fails is
+    /// not the node's: its heartbeat stands.
+    fn correct_conversations(node: String, seats: bounded[SeatState; 16]) {
+        let heard = std::time::from_nanos(
+            std::time::nanos(std::time::current()) - HEARTBEAT_MS * 1000000,
+        );
+        for s in seats {
+            if s.has_conversations {
+                self.store.correct_seat_conversations(node + "/" + s.id, s.conversations, heard)
+                or discard;
+            }
+        }
+        let now = std::time::monotonic_ns() / 1000000;
+        if self.pruned == 0 || now - self.pruned >= CONVERSATION_PRUNE_MS {
+            self.pruned = now;
+            self.store.prune_seat_conversations(
+                std::time::from_nanos(
+                    std::time::nanos(std::time::current()) - CONVERSATION_KEPT_S * 1000000000,
+                ),
+            ) or discard;
         }
     }
 
@@ -624,7 +668,35 @@ fn seat_state_list(body: String, name: String) -> SeatStateList fallible(ApiErro
             st.context = required_amount(e, "context") or raise;
             if st.context < 1 { fail invalid("a seat's context is at least 1", name); }
         }
+        if kind_of(e, "conversations") == "array" {
+            st.has_conversations = true;
+            st.conversations = conversation_lines(
+                std::json::find_field_raw(e, "conversations"),
+                name,
+            ) or raise;
+        }
         push(out.items, st) or fail invalid("at most 16 seat states", name);
+        it = std::json::array_next(it);
+    }
+    return out;
+}
+
+/// A seat's conversations (protocol.yaml `SeatState.conversations`), one
+/// a line: at most 128, each 32 lower-case hex digits.
+@bounded_by(raw)
+fn conversation_lines(raw: String, name: String) -> String fallible(ApiError) {
+    let mut out = "";
+    let mut n = 0;
+    let mut it = std::json::array_first(raw);
+    while !it.done {
+        let e = std::str::trim(it.element);
+        let c = if len(e) == 34 && std::str::starts_with(e, "\"") { e[1..33] } else { "" };
+        if !st::conversation_hash(c) {
+            fail invalid("a seat's conversations are 32 lower-case hex digits each", name);
+        }
+        n = n + 1;
+        if n > 128 { fail invalid("a seat holds at most 128 conversations", name); }
+        out = out + c + "\n";
         it = std::json::array_next(it);
     }
     return out;

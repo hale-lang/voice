@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259; conversations (the rest of step (d)) and the controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260; the controller pending.
 
 Proposed, 2026-11-26.
 
@@ -412,10 +412,9 @@ first 32 lower-case hex digits of the sha256 of that key, the one
   of the conversation hashes its tickets carried, as many as the engine
   holds, and sends it with every heartbeat; the list replaces that seat's
   rows older than the heartbeat, so a conversation the engine evicted
-  stops pointing at it. This, and pruning old rows by age, come with steps
-  (c) and (d) (Building phase 1): the node's list with its pulls, the
-  api's use of it with its tickets. Until then no request's path writes
-  or reads the table.
+  stops pointing at it. Old rows are pruned by age (a day with nothing
+  telling them again). Both came with step (d) (Building phase 1), the
+  node's list with them.
 - **The api reads it at admission**, one indexed row. With none, or one
   whose seat no longer consumes the partition, the home seat is the one
   the key hashes highest with among the partition's consuming seats
@@ -469,6 +468,14 @@ seat frees in time. On the client's report, `miss` is about 8.6 s and `W`
 about 4.3 s. `W` is 0, straight to the shared partition, when the home
 seat is held or not consuming, when its queue already holds as many
 tickets as its concurrency, or when its runtime holds no conversations.
+
+As built in step (d): nodes report no prefill rate yet, so every `W` is
+1 s (or half the time left); `W` is 0 for a home seat whose runtime holds
+no conversations (a hosted seat) and for one that failed the turn
+(`avoid`); a home seat held, not consuming, or with a full queue of its
+own is known from the board, so those three wait for the controller (step
+(e)), and until then such a turn waits its `W` and then goes to its
+partition too.
 
 ## The brain: from table writer to controller
 

@@ -1101,6 +1101,14 @@ interface Store {
     fn seat_conversation(conversation: String) -> SeatConversationRow fallible(StoreError);
     /// `conversation`'s turn was granted to `seat` (`<node>/<seat>`), now.
     fn put_seat_conversation(conversation: String, seat: String) fallible(StoreError);
+    /// What seat `seat`'s node said its engine holds on a heartbeat sent
+    /// after `heard` (`held`, a conversation a line): the seat's rows older
+    /// than `heard` go, but for those listed, and each listed points at the
+    /// seat as of `heard` unless a later grant moved it elsewhere.
+    fn correct_seat_conversations(seat: String, held: String, heard: Time) fallible(StoreError);
+    /// Forget the conversations last granted or held before `before`; how
+    /// many.
+    fn prune_seat_conversations(before: Time) -> Int fallible(StoreError);
 
     /// The operator token, the admin plane's one credential (api/operator.hl):
     /// the one kept, or `fresh` kept now when none is, so every api over the
@@ -2158,6 +2166,67 @@ locus MemoryStore {
             },
         ) or discard;
         self.conversation_rows = next;
+    }
+
+    @unbounded
+    fn correct_seat_conversations(seat: String, held: String, heard: Time) fallible(StoreError) {
+        let listed = "\n" + held + (if std::str::ends_with(held, "\n") { "" } else { "\n" });
+        let mut next = SeatConversationRows { };
+        for r in self.conversation_rows.rows {
+            let mine = std::str::contains(listed, "\n" + r.conversation + "\n");
+            if r.seat == seat && !mine && std::time::nanos(r.at) < std::time::nanos(heard) {
+                continue;
+            }
+            if mine && std::time::nanos(r.at) < std::time::nanos(heard) {
+                push(
+                    next.rows,
+                    SeatConversationRow {
+                        present: true,
+                        conversation: r.conversation,
+                        seat: seat,
+                        at: heard,
+                    },
+                ) or discard;
+            } else {
+                push(next.rows, r) or discard;
+            }
+        }
+        // those listed it held no row of
+        let v = std::str::bytes_view(held);
+        let mut at = 0;
+        while at < v.n {
+            let rest = std::str::slice(v, at, v.n);
+            let nl = std::str::index_of(rest, "\n");
+            let end = if nl < 0 { v.n } else { at + nl };
+            let c = std::str::slice(v, at, end);
+            at = end + 1;
+            let mut known = false;
+            for r in next.rows {
+                if r.conversation == c { known = true; }
+            }
+            if conversation_hash(c) && !known && count(next.rows) < SEAT_CONVERSATIONS_KEPT {
+                push(
+                    next.rows,
+                    SeatConversationRow { present: true, conversation: c, seat: seat, at: heard },
+                ) or discard;
+            }
+        }
+        self.conversation_rows = next;
+    }
+
+    @unbounded
+    fn prune_seat_conversations(before: Time) -> Int fallible(StoreError) {
+        let mut next = SeatConversationRows { };
+        let mut gone = 0;
+        for r in self.conversation_rows.rows {
+            if std::time::nanos(r.at) < std::time::nanos(before) {
+                gone = gone + 1;
+            } else {
+                push(next.rows, r) or discard;
+            }
+        }
+        self.conversation_rows = next;
+        return gone;
     }
 
     fn operator_token(fresh: String) -> String fallible(StoreError) {

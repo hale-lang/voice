@@ -453,12 +453,14 @@ returning version;
 ### The board
 
 Queue routing's successor of the route table (`docs/design/queue-routing.md`;
-`internal.yaml`, `Board`), not read on a request's path yet: one row, each
-model's shape, each queue's reading and each seat's plan, versioned as the
-route table is. The working brain writes it each tick in the same
-transaction as node liveness; `body` is the board's `models`, `queues` and
-`seats`. The route table stays until the push path goes, and a migration
-then drops it.
+`internal.yaml`, `Board`): one row, each model's shape, each queue's reading
+and each seat's plan, versioned as the route table is. The working brain
+writes it each tick in the same transaction as node liveness, after a
+savepoint, so a failure of its own costs the route table nothing; `body` is
+the board's `models`, `queues` and `seats`. The api reads it when it
+queues a request, with its age by the store's clock
+(`extract(epoch from now() - at)`), and reads past one older than 5 s. The
+route table stays until the push path goes, and a migration then drops it.
 
 ```sql
 insert into board (id, version, at, body)

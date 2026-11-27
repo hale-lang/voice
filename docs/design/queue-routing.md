@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260; the controller pending.
+Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260, the board and plans #261; the consumer lifecycle, shape switches and fencing, observability and the prefill rate pending.
 
 Proposed, 2026-11-26.
 
@@ -368,12 +368,24 @@ provider accounts it is served under, and names none. It goes to exactly
 one:
 
 1. Exhausted provider accounts (a provider window at 100%, as `judge`
-   reads it) are left out, as the route table leaves them out today.
+   reads it) are left out, as the route table leaves them out today. As
+   built (step (e)): a request whose every partition is exhausted is
+   refused at admission, `503 no_eligible_seat`, as the offer path refuses
+   it (the route table holds none of their seats); the contract's `503
+   no_capacity` with `Retry-After` at the earliest reset (Failure modes)
+   is built on neither path yet.
 2. The provider accounts with the most headroom first, as the rank's
    first term today; headroom within 10 points counts as equal.
 3. Among those, two partitions drawn at random, weighted by their
    consuming free slots, and the one with the shorter expected wait on the
-   board (depth over free slots, times recent service time) is taken.
+   board (depth over free slots, times recent service time) is taken. As
+   built (step (e)): the draws are even where the board says no partition
+   has a free slot (or says nothing); with no slot free the wait is
+   the depth and one more, a slot each service time over the consuming
+   seats' concurrency; a partition no seat consumes waits longer than any
+   ticket; a model with no service time in the last minute counts a
+   second; and a board older than 5 s by the store's clock is not read, so
+   the first draw is taken.
 
 **Headroom is read at admission.** The api reads each provider
 account's windows from `quota_window` (`store.md`) when it admits the
@@ -472,10 +484,12 @@ tickets as its concurrency, or when its runtime holds no conversations.
 As built in step (d): nodes report no prefill rate yet, so every `W` is
 1 s (or half the time left); `W` is 0 for a home seat whose runtime holds
 no conversations (a hosted seat) and for one that failed the turn
-(`avoid`); a home seat held, not consuming, or with a full queue of its
-own is known from the board, so those three wait for the controller (step
-(e)), and until then such a turn waits its `W` and then goes to its
-partition too.
+(`avoid`). From step (e), the board makes it 0 for a home seat held, not
+consuming (not on the board, or a plan that does not name its own queue),
+or whose own queue holds as many tickets as its concurrency; such a turn
+goes to its partition chosen as any request's, not to its home's provider
+account's, which only matters while the home may still claim the shared
+copy. A board older than 5 s says nothing of it.
 
 ## The brain: from table writer to controller
 
@@ -505,6 +519,21 @@ brain:
    regardless (core NATS delivers at most once); a heartbeat reporting an
    older plan is answered with the current one, as an assignment is today.
 6. **Ensures** the stream and the consumers.
+
+As built (step (e)): the queues' readings are the keeper's, taken after
+it publishes the plans, so each tick's board reads the queues as the tick
+before left them, and a backlog moves a seat's order on the third or
+fourth tick after it builds. Hysteresis applies at every place of a seat's
+order, not only its head: at the first place where the order by pressure
+differs from the one given, the queue it would put there needs twice the
+pressure of the one there, three ticks in a row; with no pressure anywhere
+the order by pressure is configuration's, and the seat goes back to it the
+same way. A seat serving one model keeps configuration's order. A node's
+plan keeps the version of the board it last changed in, so the 30 s
+repeat is a plan the node already holds, read past; under a brain that
+has just taken the lock every plan is published afresh. The heartbeat
+answering an older plan with the current one is not built: the repeat
+covers a lost plan within 30 s.
 
 Plainly: a placement's seat serves one model, so on a fleet of placements
 reordering moves nothing between models. There phase 1 gains the end of

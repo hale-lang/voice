@@ -701,12 +701,25 @@ if [ -n "${DATABASE_URL:-}" ]; then
     python3 scripts/nats-request.py "${NATS_URL#nats://}" '$JS.API.STREAM.INFO.VOICE_WORK' | python3 -c 'import json, sys; c = json.load(sys.stdin)["config"]; sys.exit(0 if c["retention"] == "workqueue" and c["discard"] == "new" and c.get("discard_new_per_subject") and c["max_msgs_per_subject"] == 1024 else 1)' \
       || { echo "the work stream's settings are not internal.yaml's"; exit 1; }
     echo "the working brain keeps the work stream and its queues' consumers"
-    # the node pulls from them: laptop/static, finding its queues empty,
-    # holds a standing pull on each (its own first), with no plan yet
-    pulls() { curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; p = [s for s in json.load(sys.stdin)["seats"] if s["id"] == "static"][0].get("pull") or {}; print(p.get("state"), p.get("plan_version"), (p.get("queues") or [""])[0])'; }
-    for i in $(seq 1 100); do [ "$(pulls)" = "waiting None voice.work.s.laptop.static" ] && break; sleep 0.2; done
-    [ "$(pulls)" = "waiting None voice.work.s.laptop.static" ] || { echo "the node does not wait on its queues: $(pulls)"; cat "$work/node.log"; exit 1; }
-    echo "the node's seat pulls from its queues, waiting on each"
+    # the node pulls from them by the brain's plan: laptop/static, finding
+    # its queues empty, holds a standing pull on each (its own first)
+    pulls() { curl -fsS "http://127.0.0.1:${NODE_PORT}/node/v1/status" | python3 -c 'import json,sys; p = [s for s in json.load(sys.stdin)["seats"] if s["id"] == "static"][0].get("pull") or {}; print(p.get("state"), "planned" if isinstance(p.get("plan_version"), int) else p.get("plan_version"), (p.get("queues") or ["-"])[0])'; }
+    for i in $(seq 1 100); do [ "$(pulls)" = "waiting planned voice.work.s.laptop.static" ] && break; sleep 0.2; done
+    [ "$(pulls)" = "waiting planned voice.work.s.laptop.static" ] || { echo "the node does not wait on its queues by the brain's plan: $(pulls)"; cat "$work/node.log"; cat "$work/brain1.log"; exit 1; }
+    echo "the node's seat pulls from its queues by the brain's plan, waiting on each"
+    # the board: laptop/static consuming its own queue, then echo-1's
+    psql -X -q -t -A "$DATABASE_URL" -c "SELECT s->>'hold', s->'consume'->>0 FROM board, jsonb_array_elements(body->'seats') s WHERE s->>'seat' = 'laptop/static'" | grep -qx '|voice.work.s.laptop.static' \
+      || { echo "the board does not have laptop/static consuming its own queue first"; psql -X "$DATABASE_URL" -c 'SELECT body FROM board'; exit 1; }
+    # its account exhausted, which only the brain knows: the brain holds the
+    # seat, and it stops pulling; given headroom again, it pulls again
+    psql -X -q "$DATABASE_URL" -c "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'e2e', 100, now() + interval '1 hour', now())"
+    for i in $(seq 1 50); do [ "$(pulls)" = "held planned -" ] && break; sleep 0.2; done
+    [ "$(pulls)" = "held planned -" ] || { echo "the brain did not hold the seat of an exhausted account: $(pulls)"; cat "$work/brain1.log"; exit 1; }
+    grep -q 'a seat is held: it pulls nothing.*laptop/static' "$work/brain1.log" || { echo "the brain did not say it held the seat"; cat "$work/brain1.log"; exit 1; }
+    psql -X -q "$DATABASE_URL" -c "DELETE FROM quota_window WHERE account = 'static' AND name = 'e2e'"
+    for i in $(seq 1 50); do [ "$(pulls)" = "waiting planned voice.work.s.laptop.static" ] && break; sleep 0.2; done
+    [ "$(pulls)" = "waiting planned voice.work.s.laptop.static" ] || { echo "the seat did not pull again once its account had headroom: $(pulls)"; exit 1; }
+    echo "the brain held the seat of an exhausted account, which stopped pulling, and let it go again"
   fi
   (cd spec/validate && node routes.mjs ../../build/openapi.bundled.json "$api" laptop/static echo-1 "$work/admin.token")
   kill "$first"

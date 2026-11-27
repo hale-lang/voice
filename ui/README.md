@@ -53,8 +53,9 @@ reusable parts become a library.
 ## Developing
 
 Against the api, which serves configuration and the node plane for real
-(in memory, starting empty), answers routes from the route table a brain
-writes (`503 route_table_unavailable` until one has), and usage and the
+(in memory, starting empty), answers routes and queues from the route table
+and the board a brain writes (`503 route_table_unavailable` and `503
+board_unavailable` until one has), and usage and the
 event stream from its ledger and change rows:
 
 ```sh
@@ -124,7 +125,7 @@ One per part of the admin API, listed on the rail in layers
 (`apps/admin/src/nav.ts`, which places each screen under its layer's
 route, `#/models/nodes/<node>`; a route from before the layers opens where
 its screen lives now): Overview; Models (Catalogue, Placements, Nodes,
-Recipes, Runtimes, Accounts, Routes, Requests, Live); Projects;
+Recipes, Runtimes, Accounts, Routes, Queues, Requests, Live); Projects;
 Conversations (Chat, Conversations, Tools: the hosted tools Chat offers);
 and apart, Changes and API. A route of the Harness layer from before opens
 the overview, its Tools under Conversations.
@@ -132,6 +133,9 @@ the overview, its Tools under Conversations.
 - **Overview:** quota headroom per account, node health, spend against
   budget, recent usage.
 - **Route table:** per model, the ranked slots and why.
+- **Queues:** queue routing's board: per model its partitions with their
+  tickets waiting and their oldest's age, and per seat its plan beside how
+  its node says it pulls and the plan it follows.
 - **Requests** and **Conversations:** the ledger, each a live table filtered and paged in the URL; a row opens the request or the conversation.
 - **Accounts:** quota windows, limits.
 - **Nodes:** capabilities, cap, seats and their state, enrollment and token

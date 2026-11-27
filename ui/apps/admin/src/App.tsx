@@ -11,6 +11,7 @@ import { Network } from './screens/Network';
 import { Nodes } from './screens/Nodes';
 import { Usage } from './screens/Usage';
 import { Routes } from './screens/Routes';
+import { Queues } from './screens/Queues';
 import { Changes } from './screens/Changes';
 import { Accounts } from './screens/Accounts';
 import { Models } from './screens/Models';
@@ -37,6 +38,7 @@ const SCREENS: Record<ScreenKey, (p: ScreenProps) => ReactNode> = {
   runtimes: Runtimes,
   accounts: Accounts,
   routes: Routes,
+  queues: Queues,
   requests: Usage,
   conversations: Usage,
   network: Network,

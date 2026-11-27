@@ -19,6 +19,7 @@ test('every screen has a route of its own, which opens it with its item', () => 
     runtimes: '#/models/runtimes',
     accounts: '#/models/accounts',
     routes: '#/models/routes',
+    queues: '#/models/queues',
     requests: '#/models/requests',
     network: '#/models/live',
     projects: '#/projects',
@@ -123,7 +124,7 @@ test('the rail: Overview, the Models layer, Projects, Conversations, and the sys
     rail.map((g) => [g.label ?? null, !!g.apart, g.items.map((it) => it.label)]),
     [
       [null, false, ['Overview']],
-      ['Models', false, ['Catalogue', 'Placements', 'Nodes', 'Recipes', 'Runtimes', 'Accounts', 'Routes', 'Requests', 'Live']],
+      ['Models', false, ['Catalogue', 'Placements', 'Nodes', 'Recipes', 'Runtimes', 'Accounts', 'Routes', 'Queues', 'Requests', 'Live']],
       [null, false, ['Projects']],
       ['Conversations', false, ['Chat', 'Conversations', 'Tools']],
       [null, true, ['Changes', 'API']],

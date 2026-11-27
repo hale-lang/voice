@@ -1944,6 +1944,18 @@ locus Inference {
         let key = if count(out.items) > 1 || incarnation > 0 { affinity_of(r) } else { "" };
         if count(out.items) > 1 && len(key) > 0 { out = first_for(out, key); }
         if count(out.items) == 0 {
+            // every provider account it may spend exhausted: the route table
+            // leaves their seats out, as the api does with none (`eligible`)
+            if out.serving > 0 {
+                let spent = spent_of(self.store, seats, p, k, r) or fail metering_failed(err);
+                if spent.all {
+                    fail spent_refusal(
+                        r.model,
+                        spent,
+                        std::time::nanos(std::time::current()),
+                    );
+                }
+            }
             let why = if out.serving == 0 {
                 "no seat serves model " + r.model
             } else {
@@ -1983,16 +1995,14 @@ locus Inference {
                         + " that this request may go to carries tools, which it lists",
                 };
             }
-            // every provider account it may spend exhausted: refused as the
-            // route table refuses it, whose seats it leaves out
+            // every provider account of the seats it may be granted to
+            // exhausted: refused as an offered request no seat is left for
             if out.queue.on && every_exhausted(out.queue) {
-                fail ApiError {
-                    status: 503,
-                    kind: "server_error",
-                    code: ErrorCode::no_eligible_seat,
-                    message: "every account serving model " + r.model
-                        + " that this request may spend is exhausted: a provider window is at 100%",
-                };
+                fail spent_refusal(
+                    r.model,
+                    plan_spent(out.queue),
+                    std::time::nanos(std::time::current()),
+                );
             }
             // a conversation's turn: its home seat, the seat its last turn
             // was granted to (`seat_conversation`), else the one its key
@@ -2067,6 +2077,7 @@ locus Inference {
                         allowed: allowed(s, p, k, r),
                         used: fullest_window(windows),
                         exhausted: window_full(windows),
+                        until_ns: spent_until_ns(windows),
                         holds: concurrency::conversations_held(
                             engine_kind_of(f.capabilities, s.engine),
                             std::json::find_string_field(
@@ -2086,9 +2097,10 @@ locus Inference {
 
     /// True when `s` could take the request: enabled, carrying its data
     /// class, spending an account the key may spend (the one it names, if
-    /// it names one) that is not archived, reported `up` by its node for
-    /// the node's current assignment, on a node that is up, not draining
-    /// and not holding the seat by a local control.
+    /// it names one) that is not archived and not exhausted (a provider
+    /// window at 100%, as the brain judges it), reported `up` by its node
+    /// for the node's current assignment, on a node that is up, not
+    /// draining and not holding the seat by a local control.
     fn eligible(
         s: st::SeatRow,
         p: st::ProjectRow,
@@ -2096,8 +2108,41 @@ locus Inference {
         r: InferenceRequest
     ) -> Bool fallible(ApiError) {
         if !allowed(s, p, k, r) { return false; }
+        let windows = self.store.windows(s.account) or fail metering_failed(err);
+        if window_full(windows) { return false; }
         return seat_ready(self.store, s) or fail metering_failed(err);
     }
+}
+
+/// The provider accounts of the seats serving `r`'s model that it may go to
+/// (`allowed`), judged: `all` when there is one and each is exhausted, a
+/// provider window at 100% (an archived one is not: `unmet` names it).
+@bounded_by(seats)
+fn spent_of(
+    store: st::Store,
+    seats: st::SeatRows,
+    p: st::ProjectRow,
+    k: st::KeyRow,
+    r: InferenceRequest
+) -> Spent fallible(st::StoreError) {
+    let mut out = Spent { };
+    for s in seats.rows {
+        if seat_serves(s, r.model) && allowed(s, p, k, r) {
+            let mut seen = false;
+            for a in out.accounts {
+                if a == s.account { seen = true; }
+            }
+            if !seen {
+                let a = store.account(s.account) or raise;
+                if !a.present || a.archived { return Spent { }; }
+                let windows = store.windows(s.account) or raise;
+                if !window_full(windows) { return Spent { }; }
+                out = spent_with(out, s.account, spent_until_ns(windows));
+            }
+        }
+    }
+    out.all = count(out.accounts) > 0;
+    return out;
 }
 
 /// Why no seat may take `r` though seats serve its model: the first

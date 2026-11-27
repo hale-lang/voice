@@ -266,8 +266,9 @@ one every seat it was offered failed (the `502`, `failed`, its `attempts`
 each seat's error, `served` the last seat tried), one that waited for a
 slot and none freed in time (`no_capacity`, `deadline_exceeded`), and one
 whose caller went away while it was offered (`cancelled`). A request
-refused before it was offered (its key, its model, a rate limit, its body:
-`401`, `404`, `429 rate_limited`, `400`) has no row. The row holds the whole `UsageRecord` beside the columns a read
+refused before it was offered (its key, its model, a rate limit, its body,
+every provider account it may spend exhausted: `401`, `404`, `429
+rate_limited`, `400`, `503 no_capacity`) has no row. The row holds the whole `UsageRecord` beside the columns a read
 filters and sums by: `GET /admin/v1/usage` pages it newest first (cursor =
 the row's order), `/usage/{request_id}` reads one, `/usage/summary`
 totals requests, tokens and spend by any of project, key, model, account,
@@ -1045,8 +1046,8 @@ when it cannot reach the coordinator.
    depth over its consuming seats' free slots, times its model's recent
    service time; with no slot free, a slot each service time over their
    concurrency). Exhausted accounts' partitions are never published to: a
-   request whose every one is exhausted is refused `503 no_eligible_seat`,
-   as the route table, which leaves their seats out, refuses it. A board
+   request whose every one is exhausted is refused `503 no_capacity`, as an
+   offered one is (below). A board
    older than 5 s by the store's clock (the brain down) is not read: of the
    two drawn the first is taken. Its message id is
    `<request id>.<attempt>.shared` and its `Nats-TTL` the wait it has left. A seat with a free slot pulls it and
@@ -1095,8 +1096,13 @@ when it cannot reach the coordinator.
 5. **Offered: pick a seat** from the route table in memory (today, from the fleet's
    state in the store; see "The brain"): the best-ranked seat
    for the model among the permitted accounts, with room by the api's own
-   count. If the model's accounts are all exhausted, the answer is
-   `503 no_capacity` with the earliest reset. If every seat is busy, the api
+   count. If every provider account the request may spend on the model is
+   exhausted (a provider window at 100%; with no route table the api leaves
+   such seats out itself), the answer is `503 no_capacity`, naming them,
+   with `Retry-After` the seconds until the first of them has no window at
+   100% (the latest reset of its full windows; a minute when none has said,
+   at least a second), and no row in the ledger, as for any request refused
+   before a seat had an attempt of it. If every seat is busy, the api
    waits for a slot, until the request's deadline or for 60 s, then
    answers `429 no_capacity`. A conversation is offered the same seat
    first each turn, so that seat's prompt cache holds what it said: the

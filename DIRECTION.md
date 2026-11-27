@@ -154,9 +154,9 @@ request, bound to NATS from the MVP on: an api instance publishes `serve` on
 the node's subject, and the node streams the answer to the reply subject
 that request named. No instance holds a node's connection, so nothing is
 forwarded. [`docs/internals.md`](./docs/internals.md) documents the architecture,
-and [`docs/constitution.md`](./docs/constitution.md) what `hale check` proves of
-it: which program may reach Postgres, enqueue, claim, grant and keep the work
-stream, as claims each program is checked under.
+and [`docs/constitution.md`](./docs/constitution.md) what `hale check --matrix`
+proves of it: which program may reach Postgres, enqueue, claim, grant and
+keep the work stream, as claims `hale.toml` binds to every program.
 
 - `axiom` **The MVP runs the real process model.** The api and the brain are
   separate processes from the start (one api, one [brain](./brain/)), so the

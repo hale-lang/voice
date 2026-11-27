@@ -9,20 +9,49 @@ hale v0.38.0 (voice's pin) can say them. A claim compiles to nothing; one
 that a change breaks fails the check with the path that breaks it.
 
 The law is one policy seed, [`lib/law`](../lib/law/law.hl): the vocabulary
-(groups over the libraries the programs share) and one constitution per
-program, since what each may reach differs.
+(groups over the libraries the programs share), a base constitution every
+program is held to, `Voice`, and one constitution per program, since what
+each may reach differs. The repository's [`hale.toml`](../hale.toml) binds
+them, hale's mechanism for a project of several programs:
 
-| Program | Constitution | Checked by |
+```toml
+[claims]
+base = "Voice"
+
+[environments.api]
+constitution = "VoiceApi"
+entrypoints = ["api"]
+# ... and node (VoiceNode), brain (VoiceBrain), decide (VoiceDecide)
+```
+
+| Program | Held to | Environment |
 |---|---|---|
-| api | `VoiceApi` | `hale check api --adopt VoiceApi` |
-| node | `VoiceNode` | `hale check node --adopt VoiceNode` |
-| brain | `VoiceBrain` | `hale check brain --adopt VoiceBrain` |
+| api | `Voice` + `VoiceApi` | `api` |
+| node | `Voice` + `VoiceNode` | `node` |
+| brain | `Voice` + `VoiceBrain` | `brain` |
+| decide (voice-decide) | `Voice` + `VoiceDecide` | `decide` |
 
-Each program imports `lib/law`, and CI checks it under its constitution
-(`.github/workflows/ci.yml`, "The constitution holds"). `program` in a claim
-is the checked program's own declarations: every locus and fn of its seed,
-none of an import's. The api declares one group of its own the law names,
-`hosted_fetch` ([`api/web_fetch.hl`](../api/web_fetch.hl)).
+Each program imports `lib/law`, so the names resolve in its world; the
+import itself binds nothing. `program` in a claim is the checked program's
+own declarations: every locus and fn of its seed, none of an import's. The
+api declares one group of its own the law names, `hosted_fetch`
+([`api/web_fetch.hl`](../api/web_fetch.hl)). An environment here names a
+program, not a deployment: one per program, because each is held to a
+different law, and hale requires every entrypoint in an environment to
+resolve its constitution alike. The api's roles are mapped to `[]`: what
+holds them is a token a request presents, never an OS account.
+
+### Which commands enforce it
+
+| Command | Holds a program to the law |
+|---|---|
+| `hale check --matrix .` at the repository's root | yes: every (program, environment) pair, base and environment constitution; a seed with a `main locus` that no environment lists fails (`entrypoint ./decide is in no environment`) |
+| `hale check api`, `hale build api`, `hale test api` | no: a plain check reads no environment, so a violation passes it (proved below) |
+| `hale check api --env api` | no: `--env` reads the nearest manifest, which is the program's own `api/hale.toml` (its `[deps]`), and that declares no environment (`no environment `api` in …/api/hale.toml`) |
+| `hale check api --adopt VoiceApi` | yes, for that program alone: `VoiceApi` extends `Voice`, so the base comes with it; for trying a claim without the matrix |
+
+CI runs `hale check --matrix .` in the api, brain, decide and node jobs
+(`.github/workflows/ci.yml`, "The constitution holds for every program").
 
 ## The invariants
 
@@ -33,6 +62,8 @@ none of an import's. The api declares one group of its own the law names,
 | Only the api enqueues tickets; only seats claim and take them | enforced | `node_never_writes_a_ticket`, `brain_never_writes_a_ticket`, `api_never_claims`, `api_never_reads_a_ticket`, `api_never_consumes_work`, `brain_never_reads_a_ticket`, `brain_never_claims`, `brain_never_consumes_work` |
 | Only the brain keeps the work stream and its consumers | enforced | `api_never_keeps_the_stream`, `node_never_keeps_the_stream` |
 | The hosted tool is confined: its code reaches neither the store nor NATS | enforced | `fetch_reaches_no_driver` |
+| Queue routing's codec is data alone: it does no I/O and touches no secret (every program) | enforced | `protocol_codec_does_no_io`, `protocol_codec_holds_no_secret` (the base, `Voice`) |
+| voice-decide is an engine: it knows nothing of the coordinator | enforced | `decide_never_reaches_postgres`, `decide_never_reaches_nats`, `decide_speaks_no_voice_protocol` |
 | The brain is never on the request path | partly | The brain never writes, reads, claims, grants or consumes a request's work, and never publishes into a stream (`brain_never_*`). Not what it subscribes to: its subjects are runtime strings handed to pond's NATS client, which no claim sees |
 | Prompts never reach JetStream | partly | The node and the brain publish nothing into a stream (`node_never_publishes_into_a_stream`, `brain_never_publishes_into_a_stream`). The api does publish (tickets, and usage on the organization's nerves), and that what it publishes carries no body is data flow, which claims do not track: a ticket has no body because `work::Ticket` has no such field, a fact of the type, not of a claim |
 | No credential leakage; secrets only through `std::secret` | partly | The brain's own code never handles secret material; only the drivers it dials with do (`brain_holds_no_secret`). A hosted fetch sending no credential is not provable yet (Gaps 3 and 6), nor where the vault is read (Gap 4) |
@@ -42,14 +73,22 @@ none of an import's. The api declares one group of its own the law names,
 | The node's local API stays on loopback; only the api is exposed | not yet | The address a listener binds is a runtime value (`--host`, default `127.0.0.1`); claims see no values (Gap 9) |
 | Callers never name a node; nothing is discovered; local controls only restrict; a model's weights come only from an allowed recipe; state never travels as events | not | These are about values, messages and data, not who reaches what. The contract (`spec/`) and the code's own checks hold them |
 
-**voice-decide** fits: it is an engine a node starts, and its invariants
-(no Postgres, no NATS, no queue routing) are claims of the same kind, each
-proved to refuse a violation the same way. It is left out for now: importing
-`lib/law` links pond NATS's message codecs into its binary (17 KB, unused),
-a runtime voice publishes pinned by digest, and changes under `decide/`
-rebuild every backend's image in CI. Adopting it waits for Gap 12.
+**voice-decide** is held to the law like the others: it is an engine a node
+starts, and knows nothing of the coordinator. Importing `lib/law` puts 2.9
+KB of unused code in its binary (Gap 12), and a change under `decide/`
+rebuilds the decision runtime's images in CI, which publishes nothing
+unless run by hand.
 
 ## The claims, by program
+
+`Voice`, the base (queue routing's codec is data alone: it does no I/O and
+touches no secret, so a ticket, a claim or a plan carries only what its
+caller put in it):
+
+```hale,fragment
+protocol_codec_does_no_io: forbid reaches(work_protocol, effects(syscall));
+protocol_codec_holds_no_secret: forbid reaches(work_protocol, effects(secret_use));
+```
 
 `VoiceApi` (the api enqueues tickets and answers claims, and never takes a
 seat's part):
@@ -85,6 +124,14 @@ brain_holds_no_secret: forbid reaches(program, effects(secret_use)) avoiding dri
 brain_logs_structured: forbid reaches(program, effects(stdio)) avoiding std::log::*;
 ```
 
+`VoiceDecide` (an engine, which knows nothing of the coordinator):
+
+```hale,fragment
+decide_never_reaches_postgres: forbid reaches(program, postgres);
+decide_never_reaches_nats: forbid reaches(program, drivers);
+decide_speaks_no_voice_protocol: forbid reaches(program, work_protocol);
+```
+
 The vocabulary, in `lib/law`: `postgres` (pond's `pq`, `db` and
 `migrations`), `drivers` (those and pond's NATS client), `stream_publish`
 (`js_publish`, `js_publish_id`, `js_publish_headers`), `stream_consume`
@@ -92,7 +139,8 @@ The vocabulary, in `lib/law`: `postgres` (pond's `pq`, `db` and
 (creating, updating and deleting streams and consumers), and queue routing's
 codec ([`lib/work`](../lib/work/work.hl)) by side: `ticket_writing`
 (`ticket_json`), `ticket_reading` (`ticket_of`), `claiming` (`claim_json`,
-`claim_subject`, `answer_of`) and `granting` (`claim_of`, `decline_json`).
+`claim_subject`, `answer_of`) and `granting` (`claim_of`, `decline_json`),
+and `work_protocol` (all of it).
 
 ## What claims can say on v0.38.0
 
@@ -124,8 +172,9 @@ codec ([`lib/work`](../lib/work/work.hl)) by side: `ticket_writing`
   `process`: those are all `syscall`.
 - **A policy seed** (no `main locus`) shares constitutions and groups;
   its groups may glob its own imports (`pq::*`), and an adopter sees them as
-  `law::postgres`. `adopt` in a main locus, `--adopt` on `hale check`, and
-  `[environments]` in a workspace manifest all bind one.
+  `law::postgres`. `[claims] base` and `[environments]` in the workspace
+  manifest (checked by `hale check --matrix`), `adopt` in a main locus, and
+  `--adopt` on `hale check` each bind one; importing one binds nothing.
 
 ## Adding a claim
 
@@ -133,9 +182,11 @@ codec ([`lib/work`](../lib/work/work.hl)) by side: `ticket_writing`
    a group (`group granting = { work::claim_of, work::decline_json };`); a
    program's own code goes in a group in that program, which every program
    adopting the constitution must then declare (`hosted_fetch`).
-2. Add the sentence to the program's constitution in `lib/law`, under a
-   name that says the invariant (`node_never_grants`).
-3. `hale check <program> --adopt <Constitution>`. A claim that does not
+2. Add the sentence to `Voice` if every program holds it, else to the
+   program's own constitution in `lib/law`, under a name that says the
+   invariant (`node_never_grants`). A new program gets an environment in
+   `hale.toml`; `--matrix` refuses one that has none.
+3. `hale check --matrix .`. A claim that does not
    hold names the path; one the checker cannot follow (an untyped receiver,
    an indirect call) fails closed as `cannot be certified` and names the
    call, which a typed local fixes (this change binds fourteen).
@@ -144,12 +195,17 @@ codec ([`lib/work`](../lib/work/work.hl)) by side: `ticket_writing`
 
 ## What a refusal looks like
 
-A violation names the claim, the path and where to edit:
+`hale check --matrix .` names the pair that failed, then the claim, the
+path and where to edit:
 
 ```text
-lib/law/law.hl:78:5: type error: claim `node_never_grants` violated: `program` reaches `law::granting` — witness: `bite` -> `work::decline_json`
+=== ./node @ node ===
+lib/law/law.hl:91:5: type error: claim `node_never_grants` violated: `program` reaches `law::granting` — witness: `bite` -> `work::decline_json`
 node/pull.hl:973:30: type error: claim `node_never_grants`: the boundary into `law::granting` is crossed by this call
 lib/work/work.hl:429:4: type error: claim `node_never_grants`: the forbidden destination `work::decline_json` is declared here
+
+1 pair(s) failed:
+  node @ node
 ```
 
 An edge the checker cannot follow fails closed (here, before
@@ -161,9 +217,9 @@ lib/law/law.hl:64:5: type error: claim `api_never_claims` cannot be certified: `
 
 ## Each claim refuses its violation
 
-Each claim was broken in a scratch copy, with the change shown, and
-`hale check <program> --adopt <Constitution>` refused it (exit 1) with the
-first line shown.
+Each claim was broken in a scratch copy of the repository, with the change
+shown, and `hale check --matrix .` refused it (exit 1) in that program's
+pair alone, with the line shown; the base's two in every pair.
 
 | Claim | The violation | The refusal |
 |---|---|---|
@@ -185,34 +241,48 @@ first line shown.
 | `brain_never_publishes_into_a_stream` | brain: `nats::js_publish(c, …)` | `` `program` reaches `law::stream_publish` — witness: `bite` -> `nats::js_publish` `` |
 | `brain_holds_no_secret` | brain: `std::secret::Credential { vault: v }.fingerprint()` | `` `program` reaches `effects(secret_use)` — witness: `bite` -> `std::secret::Credential::fingerprint` `` |
 | `brain_logs_structured` | brain: `println("tick")` | `` `program` reaches `effects(stdio)` — witness: `bite` `` |
+| `decide_never_reaches_postgres` | decide: a locus holding `pq::PgConn` calls `open()` | `` `program` reaches `law::postgres` — witness: `BiteStore::ready` -> `pq::PgConn::open` `` |
+| `decide_never_reaches_nats` | decide: `nats::new_inbox()` | `` `program` reaches `law::drivers` — witness: `bite` -> `nats::new_inbox` `` |
+| `decide_speaks_no_voice_protocol` | decide: `work::consume_subject("voice", node)` | `` `program` reaches `law::work_protocol` — witness: `bite` -> `work::consume_subject` `` |
+| `protocol_codec_does_no_io` (base) | lib/work: a fn reading a file | `` `law::work_protocol` reaches `effects(syscall)` — witness: `work::bite_read` ``, in all four pairs |
+| `protocol_codec_holds_no_secret` (base) | lib/work: a fn fingerprinting a credential | `` `law::work_protocol` reaches `effects(secret_use)` — witness: `work::bite_key` -> `std::secret::Credential::fingerprint` ``, in all four pairs |
 
-voice-decide's three, proved the same way before it was left out:
-`program` reaching `law::postgres` (`BiteStore::ready` ->
-`pq::PgConn::open`), pond's NATS client (`bite` -> `nats::new_inbox`) and
-queue routing's codec (`bite` -> `work::consume_subject`).
+And the converse, so an import is not mistaken for enforcement:
+
+- **Importing is not binding.** With `api_never_claims` broken the same way,
+  a plain `hale check api` passes (`ok: 52 file(s) typechecked`, exit 0):
+  the api imports `lib/law` and is held to none of it. `hale check --matrix
+  .` refuses the same tree.
+- **An unbound program is refused.** With `[environments.decide]` removed
+  from `hale.toml`, `hale check --matrix .` fails (exit 1): `entrypoint
+  ./decide is in no environment. Every entrypoint must say where it deploys
+  — one that is listed nowhere is checked against no claimset at all`, and
+  `1 pair(s) failed: ./decide (unbound)`.
 
 ## Why not adopt in source
 
-The natural place for the law is the program itself, `claims { adopt
-VoiceNode; }` in its main locus, so `hale check node`, `hale build node` and
-every editor hold it. On v0.38.0 that breaks voice's tests: a test that
-imports a program is a world of its own, the imported main's law is
-evaluated there, and `program` is then the test's own code. Voice's tests
-play the program's peers (a test of the api pulls and claims as a node
-does, a test of the brain serves as the api does), so they violate the law
-of the program they test: with `adopt` in source, `hale check --workspace`
-fails 18 test programs. Until Gap 1 is closed the law is bound at the check,
-with `--adopt`, as CI does.
+`claims { adopt VoiceNode; }` in a main locus would also hold `hale check
+node` and `hale build node` to the law, and the toml binding needs no such
+line, so there is none. It would also break voice's tests on v0.38.0: a
+test that imports a program is a world of its own, the imported main's law
+is evaluated there, and `program` is then the test's own code. Voice's
+tests play the program's peers (a test of the api pulls and claims as a
+node does, a test of the brain serves as the api does), so with `adopt` in
+source `hale check --workspace` fails 18 test programs (Gap 1). Bound in
+`hale.toml`, the law applies to the entrypoints the matrix lists, and to no
+test.
 
 ## Zero runtime code
 
 Claims compile to nothing. Importing `lib/law` brings its imports into the
 program: the api's binary is the same size with it as without, and so is
-the brain's; the node's gains 144 bytes (one reclaim-site descriptor pond's
-Postgres driver brings, never run). To let the checker follow every call,
-this change binds fourteen receivers to typed locals, in the api
-(`api/inference.hl`, the offer of an attempt) and the node (its metrics, its
-pullers, two files); the programs do as before, and their tests pass.
+the brain's; the node's gains 144 bytes, one reclaim-site descriptor pond's
+Postgres driver brings, and voice-decide's code 2.9 KB, pond NATS's wire
+codecs for two of its types, none of it ever run (Gap 12). To let the
+checker follow every call, this change binds fourteen receivers to typed
+locals, in the api (`api/inference.hl`, the offer of an attempt) and the
+node (its metrics, its pullers, two files); the programs do as before, and
+their tests pass.
 
 ## Gaps: what hale would need
 
@@ -227,7 +297,7 @@ invariant as soon as it can.
    `` witness: `test_a_peer` -> `dep::touch` ``). Ask: evaluate an imported
    main's law with `program` as that main's seed, as GH #733 holds for its
    groups, or let a test world leave an imported main's law to the main's
-   own check. Then voice adopts in source.
+   own check.
 2. **A call on a local locus literal of an imported seed is no edge.**
    `let c = dep::Conn { }; c.query(1)` (typed or not) adds no call from the
    fn, so `forbid reaches(f, dep_group)` holds while the call runs; a
@@ -287,8 +357,14 @@ invariant as soon as it can.
     extends std::law::Standard` is a parse error), so `brain_logs_structured`
     restates its clause.
 12. **An import used only by claims emits code.** Importing `lib/law` puts
-    pond NATS's wire codecs into voice-decide (17 KB) and a reclaim-site
-    descriptor into the node, none of it reachable. Ask: emit nothing for an
-    imported type nothing uses.
+    pond NATS's wire codecs into voice-decide (2.9 KB of code) and a
+    reclaim-site descriptor into the node, none of it reachable. Ask: emit
+    nothing for an imported type nothing uses.
 13. **Doc comments on groups and constitutions** are refused as
     documenting nothing; `lib/law` uses `//`.
+14. **`--env` reads the nearest manifest.** Voice's programs each have a
+    `hale.toml` of their own (`[deps]`), so `hale check api --env api` finds
+    no environment, and only `hale check --matrix` at the root applies the
+    law; `hale build --env` likewise. Ask: `--env` resolves environments
+    from the workspace manifest that lists the entrypoint, so a single
+    program can be checked, built and run under its law.

@@ -1,11 +1,11 @@
 // Voice's constitution (docs/constitution.md): the architectural invariants
-// `hale check` proves of each program, as claims over its closed world.
-// A policy seed: it declares no `main locus`. Each program imports it and
-// is checked under its own constitution, `hale check api --adopt VoiceApi`
-// (node: VoiceNode, brain: VoiceBrain), as CI does; `program` is then that
-// program's own declarations. Not by `adopt` in the main locus yet: a test
-// importing a program would be held to it, its own code as `program`
-// (docs/constitution.md, "Why not adopt in source").
+// `hale check --matrix` proves of each program, as claims over its closed
+// world. A policy seed: it declares no `main locus`. Every program imports
+// it, and the repository's hale.toml binds the law: `Voice`, the base,
+// to every program, and each program's own constitution through its
+// environment (`[environments.api]`: `VoiceApi`). `program` in a claim is
+// then the checked program's own declarations. Importing this seed binds
+// nothing: a plain `hale check api` holds the api to none of it.
 //
 // The vocabulary is the libraries the programs share: pond's Postgres
 // driver and NATS client, and queue routing's protocol (lib/work). A claim
@@ -53,14 +53,27 @@ group claiming = { work::claim_json, work::claim_subject, work::answer_of };
 // message, which only the api holds).
 group granting = { work::claim_of, work::decline_json };
 
+// Queue routing's codec, all of it.
+group work_protocol = { work::* };
+
 // The drivers that dial with a credential: Postgres and NATS.
 group drivers = { pq::*, db::*, migs::*, nats::* };
+
+// ---- every program ---------------------------------------------------------
+
+// The base, every program's (hale.toml `[claims] base`): queue routing's
+// codec is data alone. It does no I/O and touches no secret, so a ticket,
+// a claim or a plan carries only what its caller put in it.
+constitution Voice {
+    protocol_codec_does_no_io: forbid reaches(work_protocol, effects(syscall));
+    protocol_codec_holds_no_secret: forbid reaches(work_protocol, effects(secret_use));
+}
 
 // ---- the programs -----------------------------------------------------------
 
 // The api: it enqueues tickets and answers claims; it never claims a
 // ticket or takes one off the stream, which is a seat's.
-constitution VoiceApi {
+constitution VoiceApi extends Voice {
     api_never_claims: forbid reaches(program, claiming);
     api_never_reads_a_ticket: forbid reaches(program, ticket_reading);
     api_never_consumes_work: forbid reaches(program, stream_consume);
@@ -72,7 +85,7 @@ constitution VoiceApi {
 
 // The node: it pulls tickets and claims them; it never enqueues one,
 // answers a claim, publishes into a stream or reaches Postgres.
-constitution VoiceNode {
+constitution VoiceNode extends Voice {
     node_never_reaches_postgres: forbid reaches(program, postgres);
     node_never_writes_a_ticket: forbid reaches(program, ticket_writing);
     node_never_grants: forbid reaches(program, granting);
@@ -85,7 +98,7 @@ constitution VoiceNode {
 // grants or consumes a request's work, and never publishes into a stream.
 // Its own code never holds a secret: the credentials it is given go to the
 // drivers that dial with them.
-constitution VoiceBrain {
+constitution VoiceBrain extends Voice {
     brain_never_writes_a_ticket: forbid reaches(program, ticket_writing);
     brain_never_reads_a_ticket: forbid reaches(program, ticket_reading);
     brain_never_claims: forbid reaches(program, claiming);
@@ -96,4 +109,13 @@ constitution VoiceBrain {
     // every line it writes goes through std::log (std::law::Standard's
     // clause, which a constitution cannot extend by its path yet)
     brain_logs_structured: forbid reaches(program, effects(stdio)) avoiding std::log::*;
+}
+
+// voice-decide: the decision runtime a node starts, an engine like any
+// other. It knows nothing of the coordinator: no Postgres, no NATS, no
+// queue routing.
+constitution VoiceDecide extends Voice {
+    decide_never_reaches_postgres: forbid reaches(program, postgres);
+    decide_never_reaches_nats: forbid reaches(program, drivers);
+    decide_speaks_no_voice_protocol: forbid reaches(program, work_protocol);
 }

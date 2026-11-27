@@ -7145,6 +7145,7 @@ Type: object
 | `context` | integer |  | A managed seat's server, once it answers: the context, in tokens, it took (llama-server's `n_ctx`, vLLM's `max_model_len`). Left out until it says. | ≥ 1 |
 | `in_flight` | integer | yes |  | ≥ 0 |
 | `pull` | [SeatPull](#schema-seatpull) |  |  |  |
+| `conversations` | array of string |  | The conversations the seat's engine holds, as far as its node knows: the `conversation` of each ticket it was granted, the newest first, at most as many as its runtime holds (llama-server its slots, TensorFold 80, vLLM 32 as a floor, a hosted seat none). The api corrects where it records each conversation by it (`seat_conversation`, store.md): this seat's rows older than the heartbeat, but for those listed, go. Left out by a node of protocol 2. | items ≤ 128 |
 
 <a id="schema-heartbeat"></a>
 

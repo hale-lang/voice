@@ -38,7 +38,79 @@ fn facts(items: bounded[api::SeatFact; 8]) -> api::SeatFacts {
 }
 
 fn plan(fs: api::SeatFacts, need: String) -> api::QueuePlan {
-    return api::queue_plan_of("voice", "glm-4.7-flash", "internal", need, 1764151200000, fs);
+    return api::queue_plan_of(
+        "voice",
+        "glm-4.7-flash",
+        "internal",
+        need,
+        1764151200000,
+        fs,
+        api::BoardShape { },
+    );
+}
+
+/// `plan`, with the board giving the model `shape`.
+fn planned_on(fs: api::SeatFacts, shape: api::BoardShape) -> api::QueuePlan {
+    return api::queue_plan_of(
+        "voice",
+        "glm-4.7-flash",
+        "internal",
+        "any",
+        1764151200000,
+        fs,
+        shape,
+    );
+}
+
+/// The board's shape over configuration's: a model changing shape is
+/// published in the shape the board says until the brain flips it.
+fn shapes_by_board() {
+    let board = "{\"version\": 3, \"age_ms\": 90000, \"models\": [{\"model\": \"glm-4.7-flash\", \"shape\": \"m\", \"provider_account\": \"local\", \"next\": {\"shape\": \"p\", \"provider_account\": null, \"after\": 2}, \"previous\": null}, {\"model\": \"other\", \"shape\": \"p\", \"provider_account\": null, \"next\": null, \"previous\": null}], \"queues\": [], \"seats\": []}";
+    let glm = api::board_shape(board, "glm-4.7-flash");
+    std::test::assert(
+        glm.present && glm.shape == "m" && glm.account == "local",
+        "the board's shape and its one account, however old the board",
+    );
+    std::test::assert(
+        api::board_shape(board, "other").shape == "p" && !api::board_shape(board, "none").present
+            && !api::board_shape("", "other").present,
+        "p; a model the board does not hold, or no board: none",
+    );
+    // a second account's seat configured: configuration says p, the board
+    // still m under local
+    let two = facts(
+        [fact("spark/coder", "local", 3, true, true), fact("cloud/up", "hosted", 3, true, true)],
+    );
+    let m = planned_on(two, glm);
+    std::test::assert(
+        m.on && !m.several && count(m.partitions) == 1
+            && (at(m.partitions, 0) or api::Partition { }).subject
+            == "voice.work.m.glm-4%2E7-flash.internal.any"
+            && count(m.seats) == 1,
+        "published in the board's m shape, for its one account's seats",
+    );
+    let only_hosted = facts(
+        [fact("spark/coder", "local", 3, true, false), fact("cloud/up", "hosted", 3, true, true)],
+    );
+    let off = planned_on(only_hosted, glm);
+    std::test::assert(
+        !off.on && std::str::contains(off.why, "under account local"),
+        "a request that may not spend that account is offered meanwhile: " + off.why,
+    );
+    // the board flipped to p: one partition per account
+    let p = planned_on(two, api::BoardShape { shape: "p", present: true });
+    std::test::assert(
+        p.on && p.several && count(p.partitions) == 2,
+        "the p shape once the board says it",
+    );
+    // configuration back to one account, the board still p: p under it
+    let one = facts([fact("spark/coder", "local", 3, true, true)]);
+    let still = planned_on(one, api::BoardShape { shape: "p", present: true });
+    std::test::assert_eq_str(
+        (at(still.partitions, 0) or api::Partition { }).subject,
+        "voice.work.p.glm-4%2E7-flash.local.internal.any",
+        "the board's p shape until it flips back",
+    );
 }
 
 fn path_choice() {
@@ -57,7 +129,15 @@ fn path_choice() {
         "",
         "naming no provider account",
     );
-    let none = api::queue_plan_of("voice", "glm-4.7-flash", "internal", "any", 0, one);
+    let none = api::queue_plan_of(
+        "voice",
+        "glm-4.7-flash",
+        "internal",
+        "any",
+        0,
+        one,
+        api::BoardShape { },
+    );
     std::test::assert(!none.on, "no work stream seen: offered");
     std::test::assert(std::str::contains(none.why, "work stream"), "saying so: " + none.why);
 
@@ -729,6 +809,7 @@ fn turns() {
 fn main() {
     turns();
     path_choice();
+    shapes_by_board();
     partition_choice();
     boards();
     ticket_and_headers();

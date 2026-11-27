@@ -83,9 +83,12 @@ locus FakeApi {
     fn answer(c: work::Claim) -> String {
         let rid = c.request_id;
         let kind = rid[0..1];
+        // the slow seat's requests read a long prompt: its prefill rate is
+        // measured from them
         let grant = "{\"type\": \"serve\", \"request_id\": " + node::q(rid) + ", \"seat\": "
             + node::q(c.seat) + ", \"model\": " + node::q(if kind == "c" { "slow" } else { "echo" })
-            + ", \"body\": {\"model\": \"echo\", \"input\": \"hi\"}, \"reply_to\": "
+            + ", \"body\": {\"model\": \"echo\", \"input\": "
+            + node::q(if kind == "c" { long_input() } else { "hi" }) + "}, \"reply_to\": "
             + node::q(self.root + ".reply." + rid) + "}";
         if kind == "t" { return work::decline_json("taken"); }
         if kind == "x" { return work::decline_json("gone"); }
@@ -105,6 +108,33 @@ locus FakeApi {
         }
         return grant;
     }
+}
+
+/// A prompt of 4000 characters: about 1000 tokens, a token per four
+/// characters as the static engine counts them.
+@unbounded
+fn long_input() -> String {
+    let mut out = "";
+    let mut i = 0;
+    while i < 100 {
+        out = out + "a prompt the engine reads before it says ";
+        i = i + 1;
+    }
+    return out;
+}
+
+/// Seat `seat`'s `field` in the node's status (`<data>/session.json`), its
+/// raw JSON; "" when the status does not say it.
+fn seat_field(data: String, seat: String, field: String) -> String {
+    let status = std::io::fs::read_file(data + "/session.json") or "";
+    let mut it = std::json::array_first(std::json::find_field_raw(status, "seats"));
+    while !it.done {
+        if std::json::find_string_field(it.element, "id") == seat {
+            return std::str::trim(std::json::find_field_raw(it.element, field));
+        }
+        it = std::json::array_next(it);
+    }
+    return "";
 }
 
 /// The seats' states as the node's heartbeat last carried them.
@@ -417,6 +447,23 @@ main locus App {
         let c1_done = std::str::index_of(std::io::fs::read_file(log) or "", "result c1 ");
         let c2_claimed = std::str::index_of(std::io::fs::read_file(log) or "", "claim c2 ");
         std::test::assert(c2_claimed > c1_done, "claimed once c1 was done");
+        // the slow seat's prefill rate, measured on the static engine: about
+        // 1000 tokens read before its first output, 2 s after it began, so
+        // about 500 a second; on its status and its heartbeat
+        let rate = std::str::parse_int(seat_field(self.data, "slow", "prefill_rate")) or 0;
+        std::test::assert(
+            rate >= 400 && rate <= 520,
+            "slow's prefill rate, input over time to first output: " + to_string(rate),
+        );
+        std::test::assert(
+            within(self.data + "/beats", "\"prefill_rate\": ", 6000),
+            "the heartbeat carries it",
+        );
+        std::test::assert_eq_str(
+            seat_field(self.data, "s1", "prefill_rate"),
+            "",
+            "a seat whose requests read too little to time has none yet",
+        );
 
         // a plan: s1 consumes planned-x alone, s2 is held, slow (unnamed)
         // pulls on its own eligibility

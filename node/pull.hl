@@ -91,6 +91,27 @@ type SeatPull {
     // of the tickets it was granted, the newest first, at most what its
     // runtime holds (lib/concurrency `conversations_held`)
     held: Held = Held { };
+    // its engine's measured prefill rate, input not cached read a second
+    // (`prefill_with`); 0 until measured
+    prefill: Int = 0;
+}
+
+/// The fewest input tokens not cached a request must have for its time to
+/// first output to measure the seat's prefill rate: below it, the time is
+/// mostly the engine's fixed cost, not reading.
+const PREFILL_MIN_TOKENS: Int = 256;
+
+/// A seat's prefill rate (`rate`, input not cached read a second, 0 for
+/// none yet) once a request it served had `uncached` input tokens its
+/// engine's prompt cache did not hold and reached its first output in
+/// `first_ms`: the request's own rate, averaged with the recent ones (a
+/// quarter its own, so one slow turn moves it little). A request with
+/// fewer than `PREFILL_MIN_TOKENS` such tokens, or no output, leaves it.
+fn prefill_with(rate: Int, uncached: Int, first_ms: Int) -> Int {
+    if uncached < PREFILL_MIN_TOKENS || first_ms <= 0 { return rate; }
+    let sample = uncached * 1000 / first_ms;
+    if sample <= 0 { return rate; }
+    return if rate <= 0 { sample } else { (rate * 3 + sample) / 4 };
 }
 
 /// A seat's conversations, each 32 hex digits of a hash of its key
@@ -381,12 +402,13 @@ fn seat_pull_json(p: SeatPull) -> String {
         + ", \"queues\": " + strings_json(p.queues) + "}";
 }
 
-/// `, "pull": {...}, "conversations": [...]` for seat `id` when `pulls`
-/// holds it, "" when not.
+/// `, "pull": {...}, "conversations": [...]` and, once measured,
+/// `"prefill_rate": n` for seat `id` when `pulls` holds it, "" when not.
 fn pull_field(pulls: SeatPulls, id: String) -> String {
     for p in pulls.items {
         if p.seat == id {
-            return ", \"pull\": " + seat_pull_json(p) + ", \"conversations\": " + held_json(p.held);
+            return ", \"pull\": " + seat_pull_json(p) + ", \"conversations\": " + held_json(p.held)
+                + (if p.prefill > 0 { ", \"prefill_rate\": " + to_string(p.prefill) } else { "" });
         }
     }
     return "";
@@ -599,6 +621,7 @@ locus Pulls {
                         p.ineligible = held.ineligible;
                         p.ineligible_until = held.ineligible_until;
                         p.held = held.held;
+                        p.prefill = held.prefill;
                     }
                 }
                 push(next.items, p) or discard;
@@ -764,6 +787,25 @@ locus Pulls {
             i = i + 1;
         }
         self.dirty = true;
+    }
+
+    /// Seat `seat` served a request with `uncached` input tokens not in
+    /// its engine's prompt cache, its first output after `first_ms`: its
+    /// prefill rate (`prefill_with`).
+    fn read_prefill(seat: String, uncached: Int, first_ms: Int) {
+        let mut i = 0;
+        while i < count(self.seats.items) {
+            let mut s = at(self.seats.items, i) or SeatPull { };
+            if s.seat == seat {
+                let rate = prefill_with(s.prefill, uncached, first_ms);
+                if rate != s.prefill {
+                    s.prefill = rate;
+                    set(self.seats.items, i, s) or discard;
+                    self.dirty = true;
+                }
+            }
+            i = i + 1;
+        }
     }
 
     fn declined(seat: String, message_id: String, now: Int) {

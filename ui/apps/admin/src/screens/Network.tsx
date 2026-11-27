@@ -8,6 +8,7 @@ import { buildGraph, resolvedModel, type FleetRequest, edgePath, layoutGraph, re
 import { demoFleet, demoInFlight, demoCompletions, demoContext, demoInstances, DEMO_TICK_MS } from './network-demo';
 import s from './Network.module.css';
 import { FACETS, filterOptions, filterFleet, type Filters } from './network-filters';
+import { age } from './queues-view';
 
 const EMPTY: Fleet = { nodes: [], accounts: [], projects: [], usage: [] };
 
@@ -19,6 +20,9 @@ export function Network(_: ScreenProps) {
   // what is placed: a placement across two hosts is drawn as one unit; read
   // again as a node, a seat or a placement changes (events.ts)
   const placements = useGet('/admin/v1/placements');
+  // the brain's board: each model's queue, while a brain writes it (none
+  // before, or with no database: the map draws no queue)
+  const queues = useGet('/admin/v1/queues');
   // voice's own requests for the projects (their system keys'): a layer of
   // their own, off until asked for
   const [internal, setInternal] = useState(false);
@@ -79,8 +83,9 @@ export function Network(_: ScreenProps) {
       return whole && whole.id === r.id ? { ...r, metadata: whole.metadata } : r;
     }),
     ...(heard ? { instances: heard.map((i) => ({ ...i, up: now - Date.parse(i.at) < INSTANCE_LAPSE_MS })) } : {}),
+    ...(queues.data ? { queues: queues.data } : {}),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }), [nodes.data, accounts.data, projects.data, placements.data, usage.data, heard, now, wholeKey]);
+  }), [nodes.data, accounts.data, projects.data, placements.data, usage.data, queues.data, heard, now, wholeKey]);
 
   return <div className={s.screen}>
     <header className={s.header}>
@@ -361,7 +366,7 @@ function Constellation({ layout, graph, selected, focusedIds, focusedEdges, puls
           if (e.key === 'Escape') setPins(old => { const next = new Map(old); next.delete(v.id); return next; });
         }}
         onMouseEnter={() => onHover(v.id)} onMouseLeave={() => onHover(null)} onFocus={() => onHover(v.id)} onBlur={() => onHover(null)} aria-label={`${v.kind} ${v.kind === 'seat' ? v.id.slice(5) : v.name}, ${v.state}${v.part ? `, ${v.part.role} of ${v.part.placement} with ${v.part.partner.slice(5)}` : ''}${v.active ? `, ${v.active} in flight` : ''}${v.partnerActive ? `, computing for its leader's ${v.partnerActive} in flight` : ''}`} aria-pressed={selected.includes(v.id)}>
-        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}{retired && !bad && <span className={s.stateLabel}>{v.state}</span>}
+        <Marker kind={v.kind} />{pins.has(v.id) && <span className={s.pinMark} aria-label="Pinned">⌖</span>}<span className={`${s.entityLabel} ${v.kind === 'seat' && !focusedIds.has(v.id) ? s.quietLabel : ''}`}>{v.name.length > 18 ? `${v.name.slice(0, 16)}…` : v.name}{v.kind === 'model' && v.aliases?.length ? <span className={s.aliasLine}>{v.aliases.join(' · ')}</span> : null}</span>{(bad || waiting) && <span className={s.stateLabel}>{bad ? '✕' : '◐'} {v.state}</span>}{v.kind === 'seat' && v.pull === 'held' && !bad && !waiting && <span className={s.stateLabel} title="the brain's plan holds it: it pulls nothing">◐ held</span>}{v.kind === 'model' && v.queue && v.queue.depth > 0 && <span className={`${s.queueBadge} ${v.queue.tone === 'fail' ? 'c-fail' : v.queue.tone === 'wait' ? 'c-wait' : 'c-active'}`} title={`${v.queue.depth} waiting · oldest ${age(v.queue.oldestMs)}`}>{v.queue.depth} queued</span>}{retired && !bad && <span className={s.stateLabel}>{v.state}</span>}
       </button>;
     })}
     </div></div>

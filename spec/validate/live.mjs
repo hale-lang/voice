@@ -121,6 +121,8 @@ const refusals = {
   createChatCompletion: { json: [503, 'no_eligible_seat'], stream: [503, 'no_eligible_seat'] },
   // no brain works here, so no route table reaches the api
   getRoutes: { json: [503, 'route_table_unavailable'] },
+  // nor any board
+  getQueues: { json: [503, 'board_unavailable'] },
   // nothing here can serve a request, so the ledger holds no record to read
   getUsage: { json: [404, 'not_found', 'NotFound'] },
   // nor, so, any request recorded whole

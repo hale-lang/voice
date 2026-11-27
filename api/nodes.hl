@@ -110,6 +110,44 @@ type SeatRead {
     // tell it; none while it is offline or pending
     has_since: Bool = false;
     since: Time = `1970-01-01T00:00:00Z`;
+    // how it pulls (protocol.yaml `SeatPull`, as the store keeps it; "" for
+    // none) and its measured prefill rate (0 for none), as its node last
+    // reported them
+    pull: String = "";
+    prefill_rate: Int = 0;
+}
+
+/// How a seat pulls, as its node last reported it (protocol.yaml
+/// `SeatPull`). `reason` "" and `plan_version` -1 are `null`.
+type SeatPullRead {
+    state: String = "off";
+    has_reason: Bool = false;
+    reason: String = "";
+    has_plan_version: Bool = false;
+    plan_version: Int = 0;
+    queues: bounded[String; 64];
+}
+
+/// The stored `SeatPull` JSON (fleet.hl `pull_of`) as `SeatPullRead`.
+@bounded_by(json)
+fn seat_pull_read(json: String) -> SeatPullRead {
+    let reason = std::json::string_field(json, "reason");
+    let mut out = SeatPullRead {
+        state: std::json::find_string_field(json, "state"),
+        has_reason: reason.kind == "string",
+        reason: if reason.kind == "string" { reason.text } else { "" },
+        has_plan_version: std::json::string_field(json, "plan_version").kind == "number",
+        plan_version: std::json::find_int_field(json, "plan_version"),
+    };
+    let mut it = std::json::array_first(std::json::find_field_raw(json, "queues"));
+    while !it.done {
+        let q = std::str::trim(it.element);
+        if len(q) >= 2 {
+            push(out.queues, std::json::unescape_string(q[1..(len(q) - 1)])) or discard;
+        }
+        it = std::json::array_next(it);
+    }
+    return out;
 }
 
 type SeatReads { items: bounded[SeatRead; 16]; }
@@ -142,6 +180,11 @@ type SeatView {
     // when its state (status and reason) began
     has_since: Bool = false;
     since: Time = `1970-01-01T00:00:00Z`;
+    // how it pulls, and its prefill rate, as its node last reported them
+    has_pull: Bool = false;
+    pull: SeatPullRead = SeatPullRead { };
+    has_prefill_rate: Bool = false;
+    prefill_rate: Int = 0;
 }
 
 /// `SeatSummary`: a seat as a node and its lists carry it, without its
@@ -179,6 +222,11 @@ type SeatSummary {
     // when its state (status and reason) began
     has_since: Bool = false;
     since: Time = `1970-01-01T00:00:00Z`;
+    // how it pulls, and its prefill rate, as its node last reported them
+    has_pull: Bool = false;
+    pull: SeatPullRead = SeatPullRead { };
+    has_prefill_rate: Bool = false;
+    prefill_rate: Int = 0;
 }
 
 /// A node's seats, at most 16 (`createSeat`), each a `SeatSummary`.
@@ -1005,6 +1053,10 @@ fn seat_view_of(r: SeatRead) -> SeatView fallible(CtlError) {
         context: r.context,
         has_since: r.has_since,
         since: r.since,
+        has_pull: len(r.pull) > 0,
+        pull: seat_pull_read(r.pull),
+        has_prefill_rate: r.prefill_rate > 0,
+        prefill_rate: r.prefill_rate,
     };
     v.serves = r.serves;
     v.data_classes = r.data_classes;
@@ -1057,6 +1109,10 @@ fn seat_summary_of(r: SeatRead) -> SeatSummary {
         context_length: native,
         has_since: r.has_since,
         since: r.since,
+        has_pull: len(r.pull) > 0,
+        pull: seat_pull_read(r.pull),
+        has_prefill_rate: r.prefill_rate > 0,
+        prefill_rate: r.prefill_rate,
     };
     for m in r.serves {
         push(
@@ -1221,6 +1277,8 @@ fn seat_view(store: st::Store, s: st::SeatRow, n: st::NodeRow) -> SeatRead falli
                     v.context = st.context;
                     v.has_since = true;
                     v.since = st.since;
+                    v.pull = st.pull;
+                    v.prefill_rate = st.prefill_rate;
                 }
             }
         }
@@ -1366,7 +1424,7 @@ fn seat_json(s: SeatRead) -> String {
             ""
         }) + (if s.has_context { ", \"context\": " + to_string(s.context) } else { "" })
         + (if s.has_since { ", \"since\": " + jtime(s.since) } else { "" }) + ", \"in_flight\": "
-        + to_string(s.in_flight) + ", \"problems\": [" + problems + "]}";
+        + to_string(s.in_flight) + ", \"problems\": [" + problems + "]" + pulled_json(s) + "}";
 }
 
 /// A seat as a node and its lists carry it (`SeatSummary`): `seat_json`
@@ -1400,7 +1458,16 @@ fn seat_summary_json(s: SeatRead) -> String {
             ", \"context_length\": " + to_string(v.context_length)
         } else {
             ""
-        }) + "}";
+        }) + pulled_json(s) + "}";
+}
+
+/// `, "pull": {...}, "prefill_rate": n` for what seat `s`'s node said of
+/// them; "" for neither.
+fn pulled_json(s: SeatRead) -> String {
+    return (if len(s.pull) > 0 { ", \"pull\": " + s.pull } else { "" })
+        + (
+            if s.prefill_rate > 0 { ", \"prefill_rate\": " + to_string(s.prefill_rate) } else { "" }
+        );
 }
 
 /// `Node`, or `NodeWithToken` when it carries its token: its seats as

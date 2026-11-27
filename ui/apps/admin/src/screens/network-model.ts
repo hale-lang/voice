@@ -4,6 +4,7 @@ import type { Flight } from '../api/events';
 import { href } from '../nav.ts';
 import { withLasted } from '../seat-since.ts';
 import { when } from '@hale/components/src/format.ts';
+import { liveQueues, age, planTime, type Board, type AgeTone } from './queues-view.ts';
 
 /**
  * A request as the graph draws it: as the ledger lists it, with the
@@ -24,15 +25,17 @@ export type RequestContext = { repository?: string; apiInstance?: string };
  * `instances`: the api instances heard beating, each with its last beat and whether it beats now; left out, none has
  * been heard, and no instance is taken for retired. `inFlight`: the requests in flight now, by id.
  */
-export type Fleet = { nodes: NodeSummary[]; accounts: Account[]; projects: Schemas['Project'][]; usage: FleetRequest[]; placements?: Schemas['Placement'][]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[]; inFlight?: string[] };
+export type Fleet = { nodes: NodeSummary[]; accounts: Account[]; projects: Schemas['Project'][]; usage: FleetRequest[]; placements?: Schemas['Placement'][]; contexts?: Record<string, RequestContext>; instances?: { id: string; at: string; up: boolean }[]; inFlight?: string[]; queues?: Board };
 /** A seat's part in a placement across two hosts: its role, and its partner's seat vertex. */
 export type SeatPart = { placement: string; role: 'leader' | 'follower'; partner: string };
 /**
  * `aliases`: on a model, the names projects give it now (`ModelAlias`), each once: a label on the model, never a vertex of its own.
+ * `queue`: on a model, its tickets waiting across its partitions and its oldest's age, from the brain's board when it is fresh.
+ * `pull`: on a seat, how its node says it pulls (`held`, `pulling`, `waiting`, `full`, `off`).
  * `part`: a seat's part in a placement across two hosts. `partnerActive`: on a follower's seat and host, the requests in
  * flight on its leader's seat, which it computes half of; its own reported numbers stay its own.
  */
-export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string; aliases?: string[]; placement?: string; part?: SeatPart; partnerActive?: number };
+export type Vertex = { id: string; name: string; kind: Kind; state: string; active: number; details: [string, string][]; href?: string; parent?: string; aliases?: string[]; placement?: string; part?: SeatPart; partnerActive?: number; queue?: { depth: number; oldestMs: number | null; tone: AgeTone }; pull?: string };
 /**
  * `standing`: the fleet's standing topology (a project to the api instances, an api instance to every host), drawn faint whether or not anything flows; never traffic.
  * `bond`: a placement's leader seat to its follower's, the two halves of one model; `cable`: the link between their hosts.
@@ -182,7 +185,11 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
         : part.role === 'leader' ? [['Role', `Leader: takes its requests, and computes them with ${part.at.follower_seat} across the link`], ['Placement', `${part.at.id}${part.at.model !== part.at.id ? ` · ${part.at.model}` : ''} across ${part.at.nodes.join(' + ')}`], ['Partner seat', part.at.follower_seat!]]
         : [['Role', `Follower: serves through its leader, ${part.at.seat}; it takes no request of its own`], ['Placement', `${part.at.id}${part.at.model !== part.at.id ? ` · ${part.at.model}` : ''} across ${part.at.nodes.join(' + ')}`], ['Partner seat', part.at.seat]];
       const flight: [string, string] = leader ? ['In flight', `none of its own; computes half of its leader's ${leader.in_flight}`] : ['In flight / cap', `${s.in_flight} / ${s.concurrency ?? 1}`];
-      add({ id: entityId('seat', s.ref), name: s.id, kind: 'seat', parent: entityId('node', n.id), state: s.status, active: s.in_flight, ...(leader ? { partnerActive: leader.in_flight } : {}), ...(placement ? { placement: placement.id } : {}), ...(part ? { part: { placement: part.placement, role: part.role, partner: part.partner } } : {}), href: href('nodes', n.id, s.id), details: [['Seat', s.ref], ...role, ['Engine', s.engine], ...(runtime ? [['Runtime', runtime] as [string, string]] : []), ['Account', s.account], ['State', withLasted(s.status, s.since)], ...(s.since ? [['Since', when(s.since)] as [string, string]] : []), flight, ['Reason', s.reason ?? (s.problems.join('; ') || 'none reported')]] });
+      // how it pulls its work, as its node said (protocol 3): its plan, held
+      // or its queues, and how fast it reads a prompt
+      const pulls: [string, string][] = s.pull ? [['Pulls', `${s.pull.state}${s.pull.reason ? `: ${s.pull.reason}` : ''} · ${s.pull.queues.length} queues`], ['Plan', s.pull.plan_version == null ? 'its own eligibility' : `the brain's, of ${when(planTime(s.pull.plan_version))}`]] : [];
+      if (s.prefill_rate) pulls.push(['Prefill', `${s.prefill_rate} tokens/s`]);
+      add({ id: entityId('seat', s.ref), name: s.id, kind: 'seat', parent: entityId('node', n.id), state: s.status, active: s.in_flight, ...(leader ? { partnerActive: leader.in_flight } : {}), ...(placement ? { placement: placement.id } : {}), ...(part ? { part: { placement: part.placement, role: part.role, partner: part.partner } } : {}), ...(s.pull ? { pull: s.pull.state } : {}), href: href('nodes', n.id, s.id), details: [['Seat', s.ref], ...role, ['Engine', s.engine], ...(runtime ? [['Runtime', runtime] as [string, string]] : []), ['Account', s.account], ['State', withLasted(s.status, s.since)], ...(s.since ? [['Since', when(s.since)] as [string, string]] : []), flight, ...pulls, ['Reason', s.reason ?? (s.problems.join('; ') || 'none reported')]] });
       connect(entityId('node', n.id), entityId('seat', s.ref), 'hosts');
       // a follower reaches its model only through its leader, across the bond
       if (part?.role === 'follower') continue;
@@ -314,6 +321,17 @@ export function buildGraph(fleet: Fleet, options: GraphOptions = {}): Graph {
   const apis = [...vertices.values()].filter(v => v.kind === 'api' && v.state !== RETIRED).map(v => v.id);
   for (const p of fleet.projects) for (const a of apis) connect(entityId('project', p.id), a, 'standing');
   for (const a of apis) for (const n of fleet.nodes) connect(a, entityId('node', n.id), 'standing');
+  // each model's queue, from the brain's board while it is fresh: its tickets
+  // waiting across its partitions, a badge, its oldest's age the badge's tone
+  const board = liveQueues(fleet.queues);
+  if (!board.stale) {
+    for (const v of vertices.values()) {
+      const q = v.kind === 'model' ? board.byModel.get(v.name) : undefined;
+      if (!q) continue;
+      v.queue = { depth: q.depth, oldestMs: q.oldestMs, tone: q.tone };
+      v.details.push(['Queued', q.depth ? `${q.depth} waiting across ${q.partitions} partitions · oldest ${age(q.oldestMs)}` : `none waiting · ${q.partitions} partitions`]);
+    }
+  }
   const visible = [...vertices.values()].slice(0, 160);
   const ids = new Set(visible.map(v => v.id));
   return { vertices: visible, edges: [...edges.values()].filter(e => ids.has(e.source) && ids.has(e.target)), total: vertices.size, requests, pairs: pairs.filter(p => [p.leader, p.follower, ...p.hosts].every(id => ids.has(id))) };

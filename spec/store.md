@@ -1671,3 +1671,19 @@ until it registers again, and its seats' requests are offered as before.
 ```sql
 alter table node_state add column protocol integer;  -- the protocol the node last registered with (2 or 3); null before migration 48
 ```
+
+### Migration 49: how a seat pulls, and how fast it reads a prompt
+
+Queue routing's step (e) (docs/design/queue-routing.md, Observability, The
+window): a node of protocol 3 reports, per seat on its heartbeat, how the
+seat pulls (`SeatState.pull`: its state, the plan version it follows, its
+queues) and its measured prefill rate (`SeatState.prefill_rate`). The admin
+plane shows both with the seat; the api sets a conversation's window from
+its home seat's rate. A report that carries neither (the seats' report as
+the node applies an assignment, or a node of protocol 2) keeps what the
+row holds.
+
+```sql
+alter table seat_state add column pull jsonb;            -- how the seat pulls, as its node last reported it (protocol.yaml SeatPull); null for a node of protocol 2
+alter table seat_state add column prefill_rate integer;  -- input not cached read a second, as its node last measured it; null until it has
+```

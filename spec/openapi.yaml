@@ -3147,6 +3147,46 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
 
+  /admin/v1/queues:
+    get:
+      tags: [routes]
+      operationId: getQueues
+      summary: The brain's board, as it last wrote it
+      description: |
+        Queue routing's board (`docs/design/queue-routing.md`,
+        Observability), the latest the brain wrote to Postgres: each model's
+        shape and any change of it in progress; each queue (a model's
+        partition, or a seat's own) with its depth, its oldest ticket's age,
+        the pulls standing on it, the tickets pulled and not acked, its
+        model's recent service time and the seats consuming it; and each
+        seat's plan (held and why, or its queues in order), concurrency, in
+        flight and conversations held. The queues' readings are the brain's
+        keeper's, a tick behind the board. `age_ms` is how old the board is
+        by the store's clock; one older than a few seconds says the brain is
+        down, and the api reads past it. How each seat pulls as its node
+        last reported it, and the plan version it follows, are on the seat
+        (`SeatSummary.pull`). Read from the store, so it answers at once.
+      security:
+        - operatorToken: []
+      responses:
+        '200':
+          description: The board.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueueBoard'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          description: 'No board yet: no brain has written one. `code` is `board_unavailable`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+
   /admin/v1/hub:
     get:
       tags: [routes]
@@ -7394,6 +7434,42 @@ components:
           type: integer
           minimum: 1
           description: The context, in tokens, a placement's seat's model is made for (its config's `context_length`), when its recipe says.
+        pull:
+          $ref: '#/components/schemas/SeatPulls'
+        prefill_rate:
+          $ref: '#/components/schemas/SeatPrefillRate'
+
+    SeatPulls:
+      description: |
+        How the seat pulls its work, as its node (of protocol 3) last
+        reported it on its heartbeat: its state, why when held or off, the
+        version of the brain's plan it follows (`ConsumePlan.version`, the
+        board's; null on its own eligibility) and its queues in the order it
+        sweeps them. Left out for a node of protocol 2, and until reported.
+      allOf:
+        - $ref: './protocol.yaml#/components/schemas/SeatPull'
+
+    SeatPrefillRate:
+      type: integer
+      minimum: 1
+      description: |
+        The seat's measured prefill rate: input not cached its engine read a
+        second, from the requests it served (protocol.yaml
+        `SeatState.prefill_rate`). A conversation's window on it is half the
+        estimated miss of a turn's input. Left out until its node has
+        measured one.
+
+    QueueBoard:
+      description: The brain's board as `getQueues` answers it.
+      allOf:
+        - $ref: './internal.yaml#/components/schemas/Board'
+        - type: object
+          required: [age_ms]
+          properties:
+            age_ms:
+              type: integer
+              minimum: 0
+              description: How old the board is, in milliseconds of the store's clock.
 
     SeatView:
       description: A seat as configured here, with its state on its node, its `config` among it.
@@ -7442,6 +7518,10 @@ components:
                 time of the node's report that changed either. A report that
                 repeats them keeps it. Left out while the seat is `pending` or
                 `offline`.
+            pull:
+              $ref: '#/components/schemas/SeatPulls'
+            prefill_rate:
+              $ref: '#/components/schemas/SeatPrefillRate'
 
     # ---- admin plane: changes --------------------------------------------
 
@@ -7654,6 +7734,7 @@ components:
             - conflict
             - internal_error
             - route_table_unavailable
+            - board_unavailable
         message: { type: string }
         param: { type: string, description: The request field at fault. }
         incident: { type: string, description: The id a store failure was logged under. }
@@ -7742,6 +7823,7 @@ components:
                 - conflict
                 - internal_error
                 - route_table_unavailable
+                - board_unavailable
             param:
               type: [string, 'null']
             voice:

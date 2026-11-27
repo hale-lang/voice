@@ -710,6 +710,13 @@ if [ -n "${DATABASE_URL:-}" ]; then
     # the board: laptop/static consuming its own queue, then echo-1's
     psql -X -q -t -A "$DATABASE_URL" -c "SELECT s->>'hold', s->'consume'->>0 FROM board, jsonb_array_elements(body->'seats') s WHERE s->>'seat' = 'laptop/static'" | grep -qx '|voice.work.s.laptop.static' \
       || { echo "the board does not have laptop/static consuming its own queue first"; psql -X "$DATABASE_URL" -c 'SELECT body FROM board'; exit 1; }
+    # the admin plane reads it as the contract says (getQueues), and the node
+    # says how the seat pulls on its heartbeat, kept with the seat
+    (cd spec/validate && node queues.mjs ../../build/openapi.bundled.json "$api" laptop/static "$work/admin.token")
+    for i in $(seq 1 50); do curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static" | python3 -c 'import json,sys; p = json.load(sys.stdin).get("pull") or {}; sys.exit(0 if p.get("state") == "waiting" and isinstance(p.get("plan_version"), int) else 1)' && break; sleep 0.2; done
+    curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static" | python3 -c 'import json,sys; p = json.load(sys.stdin).get("pull") or {}; sys.exit(0 if p.get("state") == "waiting" and isinstance(p.get("plan_version"), int) else 1)' \
+      || { echo "the seat does not say how it pulls: $(curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static")"; exit 1; }
+    echo "the admin plane reads the board, and the seat's pulls as its node says them"
     # its account exhausted, which only the brain knows: the brain holds the
     # seat, and it stops pulling; given headroom again, it pulls again
     psql -X -q "$DATABASE_URL" -c "INSERT INTO quota_window (account, name, used_percent, resets_at, observed_at) VALUES ('static', 'e2e', 100, now() + interval '1 hour', now())"
@@ -811,17 +818,22 @@ case "$out" in *'hello again'*) ;; *) echo "the node never applied the new assig
 if [ -n "${DATABASE_URL:-}" ] && [ "${E2E_BROKER:-}" != grafted ]; then
   # queued (queue routing, step (d)): the work stream the brain made is
   # there and laptop's node pulls, so the request was published as a
-  # ticket, first to its home seat's own queue (its opening's derived key
-  # makes it a conversation's turn, homed on laptop/static, the one seat),
-  # pulled, claimed and granted there, and laptop served it as it serves an
-  # offer; a turn not claimed within its window goes to echo-1's partition
-  # too
+  # ticket, pulled, claimed, granted and served as an offer is served. Its
+  # opening's derived key makes it a conversation's turn, homed on
+  # laptop/static, the one seat: its ticket goes first to the seat's own
+  # queue for its window, half the estimated miss of its input. Once the
+  # node has measured the seat's prefill rate (from a request long enough
+  # to time), a turn of a few tokens misses next to nothing, its window is
+  # 0, and it goes straight to echo-1's partition; with no rate yet, the
+  # window is 1 s, on its own queue
   consumed() { python3 scripts/nats-request.py "${NATS_URL#nats://}" "\$JS.API.CONSUMER.INFO.VOICE_WORK.$1" | python3 -c 'import json,sys; c = json.load(sys.stdin); print(c["delivered"]["stream_seq"], c["num_ack_pending"])'; }
   echo_queue=$(python3 -c 'import hashlib; print("w_" + hashlib.sha256(b"voice.work.m.echo-1.internal.any").hexdigest()[:16])')
   own=$(consumed "$own_consumer")
   shared=$(consumed "$echo_queue")
-  [ "${own%% *}" -ge 1 ] || { echo "no turn went through laptop/static's own queue: $own (echo-1's: $shared)"; cat "$work/api.log"; exit 1; }
-  echo "the request was queued: a ticket on laptop/static's own queue (delivered ${own%% *}, echo-1's partition ${shared%% *}), claimed, granted and served"
+  rate=$(curl -fsS -H @"$work/admin.h" "$api/admin/v1/nodes/laptop/seats/static" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("prefill_rate") or "")')
+  [ $(( ${own%% *} + ${shared%% *} )) -ge 1 ] || { echo "no turn went through the work stream: laptop/static's own queue $own, echo-1's $shared"; cat "$work/api.log"; exit 1; }
+  [ -n "$rate" ] || [ "${own%% *}" -ge 1 ] || { echo "with no prefill rate, no turn went through laptop/static's own queue: $own (echo-1's: $shared)"; cat "$work/api.log"; exit 1; }
+  echo "the request was queued (laptop/static's own queue delivered ${own%% *}, echo-1's partition ${shared%% *}; its prefill rate ${rate:-not measured}), claimed, granted and served"
 fi
 
 responds() { curl -s -X POST "$api/v1/responses" -H "authorization: Bearer $key" -d '{"model": "echo-1", "input": "hi"}' || true; }

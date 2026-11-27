@@ -1,6 +1,6 @@
 # Queue routing
 
-Implementation status: phase 1: groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260, the board and plans #261, the consumer lifecycle, shape switches and fencing #262; observability and the prefill rate pending.
+Implementation status: phase 1 complete except removing the old path (f): groundwork #255, decisions #256, stream #257, node pull #258, api tickets #259, conversations #260, the board and plans #261, the consumer lifecycle, shape switches and fencing #262, observability and the prefill rate #263.
 
 Proposed, 2026-11-26.
 
@@ -514,6 +514,16 @@ goes to its partition chosen as any request's, not to its home's provider
 account's, which only matters while the home may still claim the shared
 copy. A board older than 5 s says nothing of it.
 
+From step (e) too, each node measures each seat's `prefill_rate`: per
+request a seat served, its input less what its engine's prompt cache held
+over its time from the request to its first output (a request with fewer
+than 256 such tokens is not counted, its time being mostly the engine's
+fixed cost), a quarter each new request's beside the recent ones'. It
+reports the rate on its heartbeat and status (`SeatState.prefill_rate`);
+the api keeps it with the seat's state (store.md, migration 49) and sets a
+turn's `W` from its home seat's, 1 s until the seat has one. The static
+engine reports no cached input, so all its input counts.
+
 ## The brain: from table writer to controller
 
 Leadership stays: one brain works, holding the advisory lock
@@ -727,6 +737,27 @@ plan and standing pulls (step (c)). `openapi.yaml`: `getQueues` replaces
 - **Logs and readings**: the brain logs a plan change once, per seat, with
   why; the node's readings count standing pulls, claims made, claims
   declined by reason and tickets put back.
+
+As built (step (e)): `GET /admin/v1/queues` answers the board as stored,
+with its age by the store's clock (`QueueBoard`; `503 board_unavailable`
+before a brain has written one). How a seat pulls (its state, the plan
+version it follows, its queues in order) and its prefill rate, as its node
+last reported them, are the seat's (`SeatSummary.pull`,
+`SeatSummary.prefill_rate`, kept in `seat_state`, migration 49), so the
+nodes' own lists carry them. The Routes screen stays while the offer path
+does (until (f)); Queues sits beside it in the Models layer: per model its
+shape and any change of it, its partitions with their tickets waiting,
+oldest age (by tone: past 5 s waiting, past 30 s long), standing pulls,
+claims in progress, service time and consuming seats; per seat its plan
+(held and why, or its queues in order), its own queue, its load, how its
+node says it pulls and the plan it follows, and its prefill rate. The live
+view draws each model's backlog as a badge on the model, its oldest's age
+the badge's tone, a held seat marked held, and each seat's pulls, plan and
+prefill rate in its details, from the board while it is fresh. Both read
+as every screen does (react-query, refetched on the admin plane's
+interval): the hub does not tell board versions yet, nor does the live
+view draw queues as vertices of their own or light a request on its queue
+while it waits; those are left for later.
 
 ## Pond: what JetStream support there is
 

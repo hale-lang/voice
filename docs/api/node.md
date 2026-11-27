@@ -377,7 +377,7 @@ Type: object
 | `error` | object | yes |  |  |
 | `error.message` | string | yes |  |  |
 | `error.type` | string, one of `invalid_request`, `not_found`, `too_many_requests`, `server_error`, `model_error`, `authentication_error`, `permission_error` | yes | The standard's types, plus `authentication_error` and `permission_error` for the admin plane and key checks. |  |
-| `error.code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable` | yes |  |  |
+| `error.code` | string, one of `invalid_request`, `unsupported`, `request_too_large`, `context_length_exceeded`, `invalid_key`, `model_not_found`, `model_not_permitted`, `account_not_permitted`, `data_class_refused`, `previous_response_not_found`, `rate_limited`, `budget_exhausted`, `no_eligible_seat`, `no_capacity`, `metering_unavailable`, `upstream_failed`, `deadline_exceeded`, `not_found`, `conflict`, `internal_error`, `route_table_unavailable`, `board_unavailable` | yes |  |  |
 | `error.param` | string \| null |  |  |  |
 | `error.voice` | object |  |  |  |
 | `error.voice.request_id` | string |  |  |  |
@@ -488,6 +488,7 @@ Type: object
 | `in_flight` | integer | yes |  | ≥ 0 |
 | `pull` | [SeatPull](#schema-seatpull) |  |  |  |
 | `conversations` | array of string |  | The conversations the seat's engine holds, as far as its node knows: the `conversation` of each ticket it was granted, the newest first, at most as many as its runtime holds (llama-server its slots, TensorFold 80, vLLM 32 as a floor, a hosted seat none). The api corrects where it records each conversation by it (`seat_conversation`, store.md): this seat's rows older than the heartbeat, but for those listed, go. Left out by a node of protocol 2. | items ≤ 128 |
+| `prefill_rate` | integer |  | How fast the seat's engine reads a prompt: input not cached read a second, as its node measures it from the requests the seat served (each one's input less what its engine's prompt cache held, over its time from the request to its first output; one with less than 256 such tokens is not counted), averaged over the recent ones. The api sets a conversation's window on this seat from it: half the estimated miss, `size / prefill_rate`, at most 10 s and half the time left. Left out until the node has measured one, and by a node of protocol 2. | ≥ 1 |
 
 <a id="schema-engine"></a>
 

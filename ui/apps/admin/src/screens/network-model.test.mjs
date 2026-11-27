@@ -680,3 +680,22 @@ test("a viewer's saved choice of retired api instances: the old switch's on is a
   for (const mode of ['in-view', 'always', 'never']) assert.equal(retiredMode(mode), mode);
   assert.equal(retiredMode('sometimes'), 'in-view');
 });
+
+test("a model's queue from the brain's board while it is fresh, and a seat's pull as its node says it", () => {
+  const fleet = demoFleet(0, 1_800_000_000_000);
+  const seat = fleet.nodes.find(n => n.id === 'host-4').seats.find(s => s.ref === 'host-4/openai');
+  const model = seat.serves[0].model;
+  const pulled = { ...fleet, nodes: fleet.nodes.map(n => n.id !== 'host-4' ? n : { ...n, seats: n.seats.map(s => s.ref !== seat.ref ? s : { ...s, pull: { state: 'held', reason: 'its account is exhausted', plan_version: 1_800_000_000_000, queues: [] }, prefill_rate: 3100 }) }) };
+  const board = { version: 1, at: '2027-01-15T08:00:00Z', age_ms: 900, models: [{ model, shape: 'm', provider_account: seat.account, next: null, previous: null }], queues: [{ subject: `voice.work.m.${model}.internal.any`, shape: 'm', model, provider_account: null, data_class: 'internal', need: 'any', depth: 7, oldest_age_ms: 40_000, waiting_pulls: 0, ack_pending: 0, service_ms: 1200, seats: [] }], seats: [] };
+  const graph = buildGraph({ ...pulled, queues: board });
+  const m = graph.vertices.find(v => v.id === entityId('model', model));
+  assert.deepEqual(m.queue, { depth: 7, oldestMs: 40_000, tone: 'fail' }, 'its backlog, its oldest long');
+  assert(m.details.some(([k, v]) => k === 'Queued' && v.startsWith('7 waiting')));
+  const s = graph.vertices.find(v => v.id === entityId('seat', seat.ref));
+  assert.equal(s.pull, 'held');
+  assert(s.details.some(([k, v]) => k === 'Pulls' && v.startsWith('held: its account is exhausted')));
+  assert(s.details.some(([k, v]) => k === 'Prefill' && v === '3100 tokens/s'));
+  const stale = buildGraph({ ...pulled, queues: { ...board, age_ms: 60_000 } });
+  assert.equal(stale.vertices.find(v => v.id === entityId('model', model)).queue, undefined, 'a stale board draws no queue');
+  assert.equal(buildGraph(fleet).vertices.find(v => v.id === entityId('model', model)).queue, undefined, 'nor does none');
+});

@@ -882,6 +882,11 @@ graph stop at the api's edge, the UI is an untrusted client like any other,
 and every rule is enforced by the api. The seam, the proposed stack and the
 screens are in [`ui/README.md`](../ui/README.md). It builds against the stub,
 and follows changes through the admin event stream (`GET /admin/v1/events`).
+Queue routing's board has a screen of its own in the Models layer, Queues
+(`GET /admin/v1/queues`): each model's partitions with their tickets
+waiting and their oldest's age, and each seat's plan beside how its node
+says it pulls (`SeatSummary.pull`) and its prefill rate; the live view
+draws each model's backlog as a badge on the model and marks a held seat.
 
 ## The contract
 
@@ -1070,8 +1075,10 @@ when it cannot reach the coordinator.
    below). Its ticket goes first to that seat's own queue,
    `<request id>.<attempt>.seat`, which the seat pulls before any
    partition; with no claim within the window (half the estimated miss,
-   at most 10 s and half the time left: 1 s while nodes report no prefill
-   rate) the `shared` copy goes to the partition too, under the home seat's
+   the turn's input over the home seat's prefill rate as its node measures
+   and reports it on its heartbeat, at most 10 s and half the time left;
+   1 s until the seat has a rate) the `shared` copy goes to the partition
+   too, under the home seat's
    provider account in the `p` shape, where the home may still claim it.
    The window is 0, the turn straight to a partition chosen as any other's,
    when the board says the home seat is held, consumes nothing (not on the

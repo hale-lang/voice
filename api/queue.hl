@@ -290,8 +290,8 @@ locus QueueKeeper {
 /// and is enabled, whether its node is revoked, its rank in a pair
 /// (lib/work `rank_of`), the protocol its node registered with, whether it
 /// carries tools (lib/work `carries_tools`), whether the request may go to it
-/// (`allowed`), and its provider account's fullest window and whether one is
-/// at 100%.
+/// (`allowed`), and its provider account's fullest window, whether one is
+/// at 100%, and when none will be (`spent_until_ns`).
 type SeatFact {
     seat: st::SeatRow = st::SeatRow { };
     engine_name: String = "";
@@ -303,6 +303,9 @@ type SeatFact {
     allowed: Bool = false;
     used: Float = 0.0;
     exhausted: Bool = false;
+    // exhausted: when its account has no window at 100% (Unix ns), 0 when
+    // a window at 100% has not said when it resets
+    until_ns: Int = 0;
     // the conversations its engine holds (lib/concurrency
     // `conversations_held`): none for a hosted seat
     holds: Int = 0;
@@ -312,14 +315,16 @@ type SeatFacts { items: bounded[SeatFact; 64]; }
 
 /// One partition a queued request may be published to: its subject, the
 /// provider account it is under ("" in the `m` shape, which names none),
-/// that account's fullest window and whether one is at 100%, and, from the
-/// brain's board (`with_board`), the free slots of the seats consuming it
-/// and its expected wait (-1 each when the board does not say).
+/// that account's fullest window, whether one is at 100% and until when
+/// (`SeatFact.until_ns`), and, from the brain's board (`with_board`), the
+/// free slots of the seats consuming it and its expected wait (-1 each when
+/// the board does not say).
 type Partition {
     subject: String = "";
     account: String = "";
     used: Float = 0.0;
     exhausted: Bool = false;
+    until_ns: Int = 0;
     free: Int = -1;
     wait_ms: Int = -1;
 }
@@ -470,6 +475,7 @@ fn queue_plan_of(
                         account: if several { f.seat.account } else { "" },
                         used: f.used,
                         exhausted: f.exhausted,
+                        until_ns: f.until_ns,
                     },
                 ) or discard;
             }
@@ -509,11 +515,12 @@ fn board_shape(board: String, model: String) -> BoardShape {
 /// partition"), of `q`'s, leaving out those whose every seat failed it
 /// (`avoid`, `\n<node>/<seat>\n` each) and those whose provider account is
 /// exhausted (as the route table leaves its seats out; admission refuses a
-/// request whose every partition is, `every_exhausted`): those with the most
-/// headroom (their fullest window within 10 points of the emptiest), then of
-/// two drawn at random (`a`, `b`, any integers; `drawn`), the one with the
-/// shorter expected wait on the board (`with_board`), the first when the
-/// board does not say. "" when none is left.
+/// request whose every partition is, `every_exhausted`, `503 no_capacity`):
+/// those with the most headroom (their fullest window within 10 points of
+/// the emptiest), then of two drawn at random (`a`, `b`, any integers;
+/// `drawn`), the one with the shorter expected wait on the board
+/// (`with_board`), the first when the board does not say. "" when none is
+/// left.
 fn chosen(q: QueuePlan, avoid: String, a: Int, b: Int) -> String {
     let mut least = 1000.0;
     let mut open = 0;
@@ -577,6 +584,21 @@ fn every_exhausted(q: QueuePlan) -> Bool {
         any = true;
     }
     return any;
+}
+
+/// `q`'s provider accounts, every partition of it exhausted
+/// (`every_exhausted`): the accounts of the seats it may be granted to,
+/// and the earliest time one of them has no window at 100%.
+fn plan_spent(q: QueuePlan) -> Spent {
+    let mut out = Spent { all: every_exhausted(q) };
+    if !out.all { return out; }
+    for c in q.seats {
+        out = spent_with(out, c.seat.account, 0);
+    }
+    for p in q.partitions {
+        out = spent_with(out, "", p.until_ns);
+    }
+    return out;
 }
 
 // ---- the board -------------------------------------------------------------
@@ -929,6 +951,98 @@ fn fullest_window(windows: String) -> Float {
 /// exhausted, as the brain judges it.
 fn window_full(windows: String) -> Bool {
     return fullest_window(windows) >= 100.0;
+}
+
+// ---- exhausted provider accounts -------------------------------------------
+
+/// The `Retry-After` of a request refused for its provider accounts when
+/// none of their windows at 100% says when it resets: the node's next
+/// report of them may.
+const SPENT_RETRY_AFTER: Int = 60;
+
+/// When an account, of its windows as the store holds them (`Store.windows`,
+/// a JSON array), has none at 100% again: the latest reset of those at 100%
+/// (Unix ns); 0 when none is at 100%, or one of them has not said when it
+/// resets.
+@bounded_by(windows)
+fn spent_until_ns(windows: String) -> Int {
+    let mut latest = 0;
+    let mut it = std::json::array_first(windows);
+    while !it.done {
+        let used = std::str::parse_float(
+            std::str::trim(std::json::find_field_raw(it.element, "used_percent")),
+        ) or 0.0;
+        if used >= 100.0 {
+            let at = rfc3339(
+                std::json::find_string_field(it.element, "resets_at"),
+            ) or std::time::from_nanos(0);
+            let ns = std::time::nanos(at);
+            if ns <= 0 { return 0; }
+            if ns > latest { latest = ns; }
+        }
+        it = std::json::array_next(it);
+    }
+    return latest;
+}
+
+/// The provider accounts a request may spend, judged at admission: whether
+/// every one is exhausted (`all`, and there is one), their names, and the
+/// earliest time one of them has no window at 100%, of those that said
+/// (Unix ns; 0 when none has).
+type Spent {
+    all: Bool = false;
+    accounts: bounded[String; 16];
+    until_ns: Int = 0;
+}
+
+/// `s` with `account` among its accounts ("" adds none) and `until_ns`
+/// (0 for none known) taken when it is earlier.
+fn spent_with(s: Spent, account: String, until_ns: Int) -> Spent {
+    let mut out = s;
+    if len(account) > 0 {
+        let mut known = false;
+        for a in out.accounts {
+            if a == account { known = true; }
+        }
+        if !known { push(out.accounts, account) or discard; }
+    }
+    if until_ns > 0 && (out.until_ns == 0 || until_ns < out.until_ns) { out.until_ns = until_ns; }
+    return out;
+}
+
+/// The seconds a request refused for its exhausted accounts waits before it
+/// asks again, at `now_ns` (Unix ns): until the earliest of them has no
+/// window at 100%, rounded up, at least 1; `SPENT_RETRY_AFTER` when none has
+/// said.
+fn spent_retry_after(s: Spent, now_ns: Int) -> Int {
+    if s.until_ns <= 0 { return SPENT_RETRY_AFTER; }
+    let secs = (s.until_ns - now_ns + 999999999) / 1000000000;
+    return if secs < 1 { 1 } else { secs };
+}
+
+/// The refusal of a request for `model` every provider account it may spend
+/// is exhausted (`s.all`), at `now_ns`: `503 no_capacity`, naming them and
+/// when the first has headroom again, with `Retry-After` until then. Both
+/// paths answer it: an offered request no seat is left for (inference.hl
+/// `admit`), and a queued one whose every partition is exhausted.
+fn spent_refusal(model: String, s: Spent, now_ns: Int) -> ApiError {
+    let mut names = "";
+    for a in s.accounts {
+        names = if len(names) == 0 { a } else { names + ", " + a };
+    }
+    let when = if s.until_ns > 0 {
+        ", until " + std::time::iso8601(std::time::from_nanos(s.until_ns)) + " at the earliest"
+    } else {
+        ", and none has said when its window resets"
+    };
+    return ApiError {
+        status: 503,
+        kind: "server_error",
+        code: ErrorCode::no_capacity,
+        message: "every provider account this request may spend on model " + model
+            + " is exhausted, a provider window at 100%: " + names + when,
+        retry_after: spent_retry_after(s, now_ns),
+    };
 }
 
 /// How a queued attempt's wait for a claim ended (`Inference.claimed`).

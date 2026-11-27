@@ -1,0 +1,549 @@
+// A request whose every provider account is exhausted (a provider window at
+// 100%) is `503 no_capacity`, with `Retry-After` until the earliest of them
+// has no window at 100% (its full windows' latest reset), on both paths: an
+// offered request no seat is left for, and a queued one whose every
+// partition is exhausted. A request with an account that is not exhausted
+// is served as before; one no seat could ever take is still `503
+// no_eligible_seat`; and the refusal, like any refused before a seat had an
+// attempt of it, writes no row to the ledger.
+import ".." as api;
+import "../../node" as node;
+import "../../store" as st;
+import "../../lib/work" as work;
+
+/// A seat's upstream: a short answer and its usage.
+const SSE: String = "data: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\ndata: {\"model\":\"stub-7b\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n\n";
+
+/// A link to nodes whose seats answer `SSE`, in process. With `incarnation`
+/// above 0 it sees a work stream, so a request whose seats all pull is
+/// queued; its ticket's subject is kept (`subject`), and the stream takes
+/// none, so the request is offered after all.
+locus Seats {
+    params {
+        incarnation: Int = 0;
+        subject: String = "";
+        offers: Int = 0;
+    }
+    fn place() -> String { return "nats://nats.test:4222"; }
+    fn root() -> String { return "voice"; }
+    fn queues() -> Int { return self.incarnation; }
+    fn queue(request_id: String, attempt: Int, reply_to: String) -> api::Offer {
+        return Answer { link: self, ended: true };
+    }
+    fn assign(node: String, body: String) -> Bool { return true; }
+    @unbounded
+    fn offer(to: String, request_id: String, reply_to: String, msg: Bytes) -> api::Offer {
+        let body = std::str::from_bytes(msg);
+        let id = std::json::find_string_field(body, "request_id");
+        self.offers = self.offers + 1;
+        let run = node::compat_play(
+            id,
+            std::json::find_string_field(body, "model"),
+            "stub-7b",
+            std::str::trim(std::json::find_field_raw(body, "body")),
+            node::compat_config(
+                "{\"base_url\": \"http://upstream.test/v1\", \"model\": \"stub-7b\"}",
+            ),
+            200,
+            SSE,
+        );
+        return Answer {
+            link: self,
+            script: run.script,
+            result: node::result_message(id, run, 3, 9),
+        };
+    }
+}
+
+/// One offer, played: its events, then its result. As a queued attempt, its
+/// ticket goes on no stream.
+locus Answer {
+    params {
+        link: Seats = Seats { };
+        script: String = "";
+        at: Int = 0;
+        result: String = "";
+        ended: Bool = false;
+    }
+    fn ack() -> api::ServeOutcome { return api::ServeOutcome { ack: "accepted" }; }
+    @unbounded
+    fn next(wait: Duration) -> api::LinkMsg {
+        while self.at < len(self.script) {
+            let rest = self.script[self.at..len(self.script)];
+            let nl = std::str::index_of(rest, "\n");
+            let line = if nl < 0 { rest } else { rest[0..nl] };
+            self.at = self.at + (if nl < 0 { len(rest) } else { nl + 1 });
+            if std::str::starts_with(line, "pause ") || len(line) == 0 { continue; }
+            return api::LinkMsg { kind: "event", json: line };
+        }
+        if !self.ended {
+            self.ended = true;
+            return api::LinkMsg { kind: "result", json: self.result };
+        }
+        std::time::sleep(wait);
+        return api::LinkMsg { kind: "none" };
+    }
+    fn put(subject: String, msg_id: String, ttl_ms: Int, ticket: String) -> String {
+        self.link.subject = subject;
+        return "no_stream";
+    }
+    fn republish(ttl_ms: Int) -> Int { return 0; }
+    fn claim(wait: Duration) -> api::ClaimIn { return api::ClaimIn { kind: "lost" }; }
+    fn decline(reason: String) { }
+    fn grant(grant: Bytes, seat: String, copy: String) { }
+    fn finish() { self.ended = true; }
+}
+
+const CAPS: String = "{\"engines\": [{\"id\": \"static\", \"kind\": \"static\", \"models\": null, \"config_schema\": {\"type\": \"object\", \"required\": [\"text\"]}}]}";
+const LOCAL: String = "{\"paused\": false, \"paused_seats\": [], \"reason\": null}";
+
+fn plane(e: api::DataPlane, path: String, token: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: path,
+            headers: "Authorization: Bearer " + token,
+            body: body,
+        },
+    );
+}
+
+fn ask(e: api::DataPlane, key: String, body: String) -> std::http::Response {
+    return e.handle(
+        std::http::Request {
+            method: "POST",
+            path: "/v1/responses",
+            headers: "Authorization: Bearer " + key,
+            body: body,
+        },
+    );
+}
+
+fn expect(r: std::http::Response, status: Int, what: String) {
+    std::test::assert_eq_int(r.status, status, what + ": " + r.body);
+}
+
+/// Node `lab`, on `protocol`, with seat `one` under account `alpha` and seat
+/// `two` under `beta`, both serving `echo-1`; seat `one` carries tools.
+/// Accounts `alpha`, `beta` and `gamma` (no seat spends it), and a key of
+/// project `work`, which may spend any and send data of class `internal`
+/// or `customer`.
+@unbounded
+fn fleet(e: api::DataPlane, protocol: Int) -> String {
+    let catalog = api::Catalog { store: e.store };
+    let accounts = api::Accounts { store: e.store };
+    let projects = api::Projects { store: e.store };
+    let keys = api::Keys { store: e.store };
+    let nodes = api::Nodes { store: e.store, link: e.link };
+    let seats = api::Seats { store: e.store, link: e.link };
+    catalog.create(api::CatalogModelCreate { id: "echo-1" }) or discard;
+    catalog.create(api::CatalogModelCreate { id: "echo-2" }) or discard;
+    for a in ["alpha", "beta", "gamma"] {
+        accounts.create(api::AccountCreate { id: a, name: a }) or discard;
+    }
+    let mut p = api::ProjectCreate { id: "work", name: "Work" };
+    push(p.data_classes, "internal") or discard;
+    push(p.data_classes, "customer") or discard;
+    projects.create(p) or discard;
+    let made = nodes.create(api::NodeCreate { id: "lab" }) or api::Node {
+        status: api::NodeStatus::pending,
+    };
+    let token = made.enrollment_token;
+    for s in ["one", "two"] {
+        let mut sc = api::SeatCreate {
+            node: "lab",
+            id: s,
+            engine: "static",
+            account: if s == "one" { "alpha" } else { "beta" },
+            config: std::json::Value::parse(
+                if s == "one" {
+                    "{\"text\": \"hi\", \"tool_call\": {\"name\": \"lookup\"}}"
+                } else {
+                    "{\"text\": \"hi\"}"
+                },
+            ) or std::json::Value::null(),
+        };
+        push(sc.serves, st::SeatModel { model: "echo-1" }) or discard;
+        seats.create(sc) or {
+            std::test::assert(false, "seat " + s + ": " + api::ctl_problem(err).message);
+        };
+    }
+    let reg = plane(
+        e,
+        "/node/v1/register",
+        token,
+        "{\"protocol\": " + to_string(protocol) + ", \"version\": \"0.1.0\", \"capabilities\": "
+            + CAPS + ", \"local\": " + LOCAL + "}",
+    );
+    let version = std::json::find_int_field(
+        std::json::find_field_raw(reg.body, "assignment"),
+        "version",
+    );
+    expect(
+        plane(
+            e,
+            "/node/v1/seats",
+            token,
+            "{\"assignment_version\": " + to_string(version)
+                + ", \"seats\": [{\"id\": \"one\", \"status\": \"up\", \"in_flight\": 0}, {\"id\": \"two\", \"status\": \"up\", \"in_flight\": 0}]}",
+        ),
+        204,
+        "lab reports its seats",
+    );
+    let key = keys.create(api::KeyCreate { project: "work", name: "k" }) or api::Key {
+        status: api::KeyStatus::revoked,
+    };
+    std::test::assert(key.has_secret, "a key");
+    return key.secret;
+}
+
+fn now_ns() -> Int { return std::time::nanos(std::time::current()); }
+
+fn at(ns: Int) -> String { return std::time::iso8601(std::time::from_nanos(ns)); }
+
+/// A window as the store holds it: `used` percent, resetting at `resets_ns`
+/// (Unix ns; 0 for a window that has not said).
+fn window(name: String, used: Int, resets_ns: Int) -> String {
+    return "{\"name\": \"" + name + "\", \"used_percent\": " + to_string(used) + ", \"resets_at\": "
+        + (if resets_ns > 0 { "\"" + at(resets_ns) + "\"" } else { "null" })
+        + ", \"observed_at\": \"" + at(now_ns()) + "\"}";
+}
+
+fn windows(e: api::DataPlane, account: String, ws: String) {
+    e.store.put_windows(account, "[" + ws + "]") or {
+        std::test::assert(false, "windows of " + account);
+    };
+}
+
+/// The ledger's rows now.
+fn rows(e: api::DataPlane) -> Int {
+    let usage = api::Usage { store: e.store };
+    let l = usage.list(api::UsageAsk { }) or api::UsageList { };
+    return count(l.data);
+}
+
+/// `r`, refused for its exhausted accounts: `503 no_capacity`, its message
+/// naming `accounts` and `until`, `Retry-After` within a second of `secs`.
+fn spent(r: std::http::Response, accounts: String, until: String, secs: Int, what: String) {
+    expect(r, 503, what);
+    let err = std::json::find_field_raw(r.body, "error");
+    std::test::assert_eq_str(std::json::find_string_field(err, "code"), "no_capacity", what);
+    std::test::assert_eq_str(std::json::find_string_field(err, "type"), "server_error", what);
+    let msg = std::json::find_string_field(err, "message");
+    std::test::assert(
+        std::str::contains(msg, " is exhausted, a provider window at 100%: " + accounts + ", ")
+            && std::str::contains(msg, until),
+        what + ": the message names its accounts and until when: " + msg,
+    );
+    std::test::assert(
+        std::str::starts_with(r.headers, "Retry-After: "),
+        what + ": with Retry-After: " + r.headers,
+    );
+    let got = std::str::parse_int(r.headers[len("Retry-After: ")..len(r.headers)]) or - 1;
+    std::test::assert(
+        got <= secs && got >= secs - 1,
+        what + ": Retry-After " + to_string(got) + ", want " + to_string(secs),
+    );
+}
+
+fn no_seat(r: std::http::Response, message: String, what: String) {
+    expect(r, 503, what);
+    let err = std::json::find_field_raw(r.body, "error");
+    std::test::assert_eq_str(std::json::find_string_field(err, "code"), "no_eligible_seat", what);
+    std::test::assert_eq_str(std::json::find_string_field(err, "message"), message, what);
+    std::test::assert(!std::str::contains(r.headers, "Retry-After"), what + ": none to wait for");
+}
+
+/// The seat that served `r`.
+fn served(r: std::http::Response, what: String) -> String {
+    expect(r, 200, what);
+    let v = std::json::find_field_raw(r.body, "voice");
+    return std::json::find_string_field(std::json::find_field_raw(v, "served"), "seat");
+}
+
+fn served_by(r: std::http::Response, seat: String, what: String) {
+    std::test::assert_eq_str(served(r, what), seat, what);
+}
+
+/// The offer path: no work stream.
+fn offered() {
+    let link = Seats { };
+    let e = api::DataPlane { link: link };
+    let key = fleet(e, 2);
+    let ask_echo = "{\"model\": \"echo-1\", \"input\": \"hi\"}";
+    let t = now_ns();
+    let hour: Int = 3600 * 1000000000;
+
+    // alpha exhausted: its five-hour window resets in an hour, its
+    // seven-day one in two, so it has headroom again in two; beta has
+    // headroom, and serves
+    windows(
+        e,
+        "alpha",
+        window("five_hour", 100, t + hour) + ", " + window("seven_day", 100, t + 2 * hour),
+    );
+    windows(e, "beta", window("five_hour", 99, t + hour));
+    served_by(ask(e, key, ask_echo), "lab/two", "an account with headroom serves it");
+    let before = rows(e);
+    std::test::assert(before > 0, "the request served is in the ledger");
+
+    // beta exhausted too, until its five-hour window resets in half an
+    // hour (its seven-day one is not full): the earliest of the two
+    windows(
+        e,
+        "beta",
+        window("five_hour", 100, t + hour / 2) + ", " + window("seven_day", 40, t + 100 * hour),
+    );
+    let offers = link.offers;
+    let r = ask(e, key, ask_echo);
+    spent(
+        r,
+        "alpha, beta",
+        at(t + hour / 2),
+        (t + hour / 2 - now_ns()) / 1000000000 + 1,
+        "every account exhausted",
+    );
+    std::test::assert(
+        std::str::contains(
+            std::json::find_string_field(std::json::find_field_raw(r.body, "error"), "message"),
+            "on model echo-1 ",
+        ),
+        "naming the model: " + r.body,
+    );
+    spent(
+        ask(e, key, "{\"model\": \"echo-1\", \"input\": \"hi\", \"stream\": true}"),
+        "alpha, beta",
+        at(t + hour / 2),
+        (t + hour / 2 - now_ns()) / 1000000000 + 1,
+        "a streamed one too, answered whole",
+    );
+    std::test::assert_eq_int(rows(e), before, "a refusal before any attempt writes no row");
+    std::test::assert_eq_int(link.offers, offers, "and is offered to no seat");
+
+    // one the request names, exhausted while another has headroom: refused,
+    // never moved to the other
+    windows(e, "alpha", window("five_hour", 10, t + hour));
+    spent(
+        ask(
+            e,
+            key,
+            "{\"model\": \"echo-1\", \"input\": \"hi\", \"voice\": {\"account\": \"beta\"}}",
+        ),
+        "beta",
+        at(t + hour / 2),
+        (t + hour / 2 - now_ns()) / 1000000000 + 1,
+        "the account it names exhausted",
+    );
+    served_by(
+        ask(
+            e,
+            key,
+            "{\"model\": \"echo-1\", \"input\": \"hi\", \"voice\": {\"account\": \"alpha\"}}",
+        ),
+        "lab/one",
+        "the one with headroom it names serves it",
+    );
+
+    // a window at 100% that has not said when it resets: a minute; one
+    // whose reset has passed (its node not told yet): a second
+    windows(e, "alpha", window("five_hour", 100, 0));
+    windows(e, "beta", window("five_hour", 100, 0));
+    let unknown = ask(e, key, ask_echo);
+    expect(unknown, 503, "no reset said");
+    std::test::assert_eq_str(unknown.headers, "Retry-After: 60", "a minute: " + unknown.body);
+    std::test::assert(
+        std::str::contains(unknown.body, "alpha, beta, and none has said when its window resets"),
+        "saying so: " + unknown.body,
+    );
+    windows(e, "alpha", window("five_hour", 100, t - hour));
+    let passed = ask(e, key, ask_echo);
+    expect(passed, 503, "a reset passed");
+    std::test::assert_eq_str(passed.headers, "Retry-After: 1", "at least a second: " + passed.body);
+
+    // what no seat could ever take is still no_eligible_seat, the accounts
+    // exhausted or not
+    no_seat(
+        ask(e, key, "{\"model\": \"echo-2\", \"input\": \"hi\"}"),
+        "no seat serves model echo-2",
+        "a model no seat serves",
+    );
+    no_seat(
+        ask(
+            e,
+            key,
+            "{\"model\": \"echo-1\", \"input\": \"hi\", \"voice\": {\"data_class\": \"customer\"}}",
+        ),
+        "no seat serving model echo-1 takes data class customer (those this key may spend take internal)",
+        "a data class no seat takes",
+    );
+    no_seat(
+        ask(
+            e,
+            key,
+            "{\"model\": \"echo-1\", \"input\": \"hi\", \"voice\": {\"account\": \"gamma\"}}",
+        ),
+        "no seat serving model echo-1 spends account gamma, the one this request names (the seats spend alpha, beta)",
+        "an account no seat spends",
+    );
+    std::test::assert_eq_int(rows(e), before + 1, "only the request served since is in the ledger");
+}
+
+/// The queue path: a work stream, the seats on a node that pulls.
+fn queued() {
+    let link = Seats { incarnation: 1 };
+    let e = api::DataPlane { link: link };
+    let key = fleet(e, work::PROTOCOL_PULL);
+    let t = now_ns();
+    let hour: Int = 3600 * 1000000000;
+    let tools = "{\"model\": \"echo-1\", \"input\": \"hi\", \"tools\": [{\"type\": \"function\", \"name\": \"lookup\", \"parameters\": {\"type\": \"object\"}}]}";
+
+    // neither exhausted: queued to a partition, which no stream takes, then
+    // offered, as before
+    let first = served(
+        ask(e, key, "{\"model\": \"echo-1\", \"input\": \"hi\"}"),
+        "queued, then offered",
+    );
+    std::test::assert(first == "lab/one" || first == "lab/two", "by one of its seats: " + first);
+    std::test::assert(len(link.subject) > 0, "a ticket was put: " + link.subject);
+    let before = rows(e);
+
+    // alpha exhausted: a request that lists tools may be granted only to
+    // seat one, which carries them, and its every partition is exhausted
+    windows(e, "alpha", window("five_hour", 100, t + hour));
+    windows(e, "beta", window("five_hour", 30, t + hour / 4));
+    link.subject = "";
+    spent(
+        ask(e, key, tools),
+        "alpha",
+        at(t + hour),
+        (t + hour - now_ns()) / 1000000000 + 1,
+        "every partition exhausted",
+    );
+    std::test::assert_eq_str(link.subject, "", "no ticket put");
+    std::test::assert_eq_int(rows(e), before, "and no row written");
+
+    // one that does not: beta's partition, the one not exhausted
+    link.subject = "";
+    served_by(
+        ask(e, key, "{\"model\": \"echo-1\", \"input\": \"hi\"}"),
+        "lab/two",
+        "beta has headroom",
+    );
+    // its home seat's own queue (the seat it may go to), or beta's partition
+    std::test::assert(
+        link.subject == "voice.work.s.lab.two"
+            || (std::str::contains(link.subject, "beta")
+                    && !std::str::contains(link.subject, "alpha")),
+        "its ticket for beta's seat: " + link.subject,
+    );
+
+    // both exhausted: refused as the offer path refuses it
+    windows(e, "beta", window("five_hour", 100, t + hour / 4));
+    spent(
+        ask(e, key, "{\"model\": \"echo-1\", \"input\": \"hi\"}"),
+        "alpha, beta",
+        at(t + hour / 4),
+        (t + hour / 4 - now_ns()) / 1000000000 + 1,
+        "every account exhausted, queued",
+    );
+    no_seat(
+        ask(e, key, "{\"model\": \"echo-2\", \"input\": \"hi\"}"),
+        "no seat serves model echo-2",
+        "a model no seat serves, queued",
+    );
+}
+
+/// The judgement itself: an account's windows, the plan's partitions, the
+/// seconds to wait.
+@unbounded
+fn judged() {
+    let t = now_ns();
+    let hour: Int = 3600 * 1000000000;
+    std::test::assert_eq_int(api::spent_until_ns("[]"), 0, "no window: not exhausted");
+    std::test::assert_eq_int(
+        api::spent_until_ns("[" + window("a", 99, t + hour) + "]"),
+        0,
+        "none at 100%",
+    );
+    std::test::assert_eq_int(
+        api::spent_until_ns(
+            "[" + window("a", 100, t + hour) + ", " + window("b", 100, t + 3 * hour) + ", "
+                + window("c", 50, t + 9 * hour) + "]",
+        ) / 1000000000,
+        (t + 3 * hour) / 1000000000,
+        "the latest reset of those at 100%",
+    );
+    std::test::assert_eq_int(
+        api::spent_until_ns("[" + window("a", 100, t + hour) + ", " + window("b", 100, 0) + "]"),
+        0,
+        "one at 100% that has not said: not known",
+    );
+
+    // as Postgres writes a window (`quota_window`, its time with an offset)
+    std::test::assert_eq_int(
+        api::spent_until_ns(
+            "[{\"name\": \"five_hour\", \"used_percent\": 100.0, \"resets_at\": \"2026-11-27T13:00:00.25+01:00\", \"observed_at\": \"2026-11-27T11:00:00+00:00\"}]",
+        ) / 1000000,
+        std::time::nanos(
+            std::time::parse_time("2026-11-27T12:00:00.25Z") or std::time::from_nanos(0),
+        )
+            / 1000000,
+        "a reset with an offset and a fraction",
+    );
+
+    let mut q = api::QueuePlan { on: true, several: true };
+    push(
+        q.partitions,
+        api::Partition { subject: "p.a", account: "a", exhausted: true, until_ns: t + 2 * hour },
+    ) or discard;
+    push(
+        q.partitions,
+        api::Partition { subject: "p.b", account: "b", exhausted: true, until_ns: t + hour },
+    ) or discard;
+    push(q.partitions, api::Partition { subject: "p.c", account: "c", exhausted: true }) or discard;
+    for s in ["a", "b", "c"] {
+        push(
+            q.seats,
+            api::Candidate { seat: st::SeatRow { ref: "n/" + s, account: s } },
+        ) or discard;
+    }
+    let s = api::plan_spent(q);
+    std::test::assert(s.all, "every partition exhausted");
+    std::test::assert_eq_int(count(s.accounts), 3, "its accounts");
+    std::test::assert_eq_int(s.until_ns, t + hour, "the earliest known");
+    std::test::assert_eq_int(api::spent_retry_after(s, t), 3600, "an hour");
+    std::test::assert_eq_int(api::spent_retry_after(s, t + hour - 1), 1, "rounded up");
+    std::test::assert_eq_int(api::spent_retry_after(s, t + 2 * hour), 1, "at least a second");
+    std::test::assert_eq_int(
+        api::spent_retry_after(api::Spent { all: true }, t),
+        60,
+        "none said: a minute",
+    );
+    let e = api::spent_refusal("echo-1", s, t);
+    std::test::assert_eq_int(e.status, 503, "503");
+    std::test::assert(e.code == api::ErrorCode::no_capacity, "no_capacity");
+    std::test::assert_eq_int(e.retry_after, 3600, "Retry-After");
+    std::test::assert_eq_str(
+        e.message,
+        "every provider account this request may spend on model echo-1 is exhausted, a provider window at 100%: a, b, c, until "
+            + at(t + hour) + " at the earliest",
+        "naming them and until when",
+    );
+
+    // one partition with headroom: not refused, and chosen
+    let mut open = q;
+    push(open.partitions, api::Partition { subject: "p.d", account: "d", used: 20.0 }) or discard;
+    push(open.seats, api::Candidate { seat: st::SeatRow { ref: "n/d", account: "d" } }) or discard;
+    std::test::assert(!api::plan_spent(open).all, "an account with headroom");
+    std::test::assert_eq_str(
+        api::chosen(open, "\n", 3, 5),
+        "p.d",
+        "its partition is the one chosen",
+    );
+}
+
+fn main() {
+    judged();
+    offered();
+    queued();
+}

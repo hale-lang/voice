@@ -391,12 +391,11 @@ provider accounts it is served under, and names none. It goes to exactly
 one:
 
 1. Exhausted provider accounts (a provider window at 100%, as `judge`
-   reads it) are left out, as the route table leaves them out today. As
-   built (step (e)): a request whose every partition is exhausted is
-   refused at admission, `503 no_eligible_seat`, as the offer path refuses
-   it (the route table holds none of their seats); the contract's `503
-   no_capacity` with `Retry-After` at the earliest reset (Failure modes)
-   is built on neither path yet.
+   reads it) are left out, as the route table leaves them out today. A
+   request whose every partition is exhausted is refused at admission,
+   `503 no_capacity` with `Retry-After` at the earliest reset (Failure
+   modes), as the offer path refuses one the route table holds no seat
+   for.
 2. The provider accounts with the most headroom first, as the rank's
    first term today; headroom within 10 points counts as equal.
 3. Among those, two partitions drawn at random, weighted by their
